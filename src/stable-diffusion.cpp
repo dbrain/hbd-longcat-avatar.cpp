@@ -3365,9 +3365,15 @@ struct SamplePlan {
         // actually denoises. (Honour an explicit custom sigma list if the user gave one.)
         if (sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
             sample_params->custom_sigmas_count <= 0) {
-            sigmas      = build_longcat_dmd_sigmas(8, 1000, 7.0f);
-            total_steps = static_cast<int>(sigmas.size()) - 1;
-            sample_steps = total_steps;
+            // The DMD distill schedule is natively 8 steps. build_longcat_dmd_sigmas
+            // re-derives a valid distilled schedule for any step count (the distill
+            // indices scale with the count), so --steps can trade a little quality
+            // for speed. Default to 8 (the count the LoRA was distilled for) unless
+            // the user explicitly asked for fewer via --steps.
+            int dmd_steps = (sample_steps > 0 && sample_steps < 8) ? sample_steps : 8;
+            sigmas        = build_longcat_dmd_sigmas(dmd_steps, 1000, 7.0f);
+            total_steps   = static_cast<int>(sigmas.size()) - 1;
+            sample_steps  = total_steps;
             LOG_INFO("LongCat-Avatar DMD distilled schedule: %d steps", total_steps);
         }
 

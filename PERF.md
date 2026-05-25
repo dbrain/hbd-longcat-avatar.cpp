@@ -37,7 +37,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | lap | lever | wall (s) | peak VRAM (MiB) | quality | commit |
 |-----|-------|----------|-----------------|---------|--------|
 | 00  | BASELINE (`--vae-on-cpu`) + lever-1 fixes (fps 25 default, audio auto-mux) | 768.7 | 10535 | coherent (ac16≈0.83 all frames) | 83e3957 |
-| 01  | GPU VAE decode + spatial tiling (default-on for avatar) | 238.4 | 10779 | PSNR 40.1dB vs lap00 (min 36.2) | (this lap) |
+| 01  | GPU VAE decode + spatial tiling (default-on for avatar) | 238.4 | 10779 | PSNR 40.1dB vs lap00 (min 36.2) | 736eb79 |
+| 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | (this lap) |
 
 (rows appended per lap below)
 
@@ -81,3 +82,20 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
   and explicit `--vae-tiling`/`--vae-tile-size` both still take precedence. So the
   standard config (no `--vae-on-cpu`) now gets the fast path automatically.
 - Checkpoint clip: `models/_perf/lap01_gpuvae_tiled.webm`.
+
+### lap 02 — configurable DMD step count (lever 4, sampling)
+- DiT sampling is now the dominant phase (164s of the 238s wall, 69%). The avatar
+  hardcoded an 8-step DMD schedule regardless of `--steps`. `build_longcat_dmd_sigmas`
+  re-derives a valid distilled schedule for ANY step count (distill indices scale
+  with the count), so `--steps` can trade quality for speed.
+- **Wired `--steps` to the DMD schedule**: default stays **8** (the count the DMD
+  LoRA was distilled for — proven, unchanged). `--steps N` with N<8 uses an N-step
+  distilled schedule. N>=8 / unset → 8.
+- **Measured `--steps 6`**: sampling 164.3s → 123.1s, total **238.4s → 197.4s
+  (-17%)**, same VRAM. Output stays coherent (ac16≈0.83 all frames). Differs from
+  the 8-step trajectory (mean PSNR 35.6 dB, min 29 dB vs 8-step) — structurally
+  sound but a visibly different render.
+- **NOT made the default**: whether 6-step lip-sync holds vs 8-step is a human
+  eyeball call (the structural metrics can't judge mouth fidelity), and the LoRA's
+  distill target is 8. Shipped as an opt-in `--steps 6` speed lever; default 8.
+- Checkpoint clip: `models/_perf/lap02_6steps.webm` (6-step, for A/B vs lap01 8-step).
