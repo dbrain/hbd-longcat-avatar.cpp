@@ -163,6 +163,27 @@ wall 238.46→237.76s (−0.4%, within step-to-step noise but a clean removal of
 work). **Output bit-identical to BEST (PSNR 99 dB / ac16 0.83 all 25 frames).**
 - Checkpoint clip: `models/_perf/lap03_gate_mul.webm`.
 
+### lap 03b — step-count A/B clips for the owner (OPT-IN quality lever 4, no default change)
+
+Since DiT sampling has no safe default-on speed lever (above), the only remaining
+speed gains are the quality-sensitive `--steps` knob. Rendered a fresh 8/6/4-step set
+on the CURRENT build (gate_mul) at the prod config (25f/480p/seed 42, audio on) so the
+owner can eyeball lip-sync vs speed in the morning. All structurally coherent
+(ac16 ≈ 0.83 on every frame); PSNR-vs-8step measures trajectory divergence, NOT a
+quality verdict — mouth fidelity is the human call.
+
+| steps | wall (s) | sampling (s) | vs 8-step wall | coherence | PSNR vs 8-step |
+|-------|----------|--------------|----------------|-----------|----------------|
+| 8 (default) | 237.8 | 163.7 | — | ac16 0.83 | (reference) |
+| 6 | 196.7 | 122.6 | **−17%** | ac16 0.83 | mean 35.6 / min 29.0 dB |
+| 4 | 155.8 | 81.7 | **−35%** | ac16 0.83 | mean 29.9 / min 23.0 dB |
+
+- Clips: `models/_perf/lap03_gate_mul.webm` (8), `lap03_6steps.webm` (6),
+  `lap03_4steps.webm` (4). **Default unchanged (8).** Recommendation pending the
+  owner's lip-sync eyeball: 6-step looks like the safe speed pick (−17%, modest
+  trajectory drift); 4-step (−35%) is more divergent and likely softens lip detail —
+  judge before adopting. No code change in 03b (the `--steps` plumbing is lap 02).
+
 ### lever 3 — GPU text encode: DEAD END on this VRAM budget (no lap)
 - umT5 text encode is 16.4s one-time on CPU (`--clip-on-cpu`). Tried dropping the
   flag to run it on GPU. → **immediate CUDA OOM at load**: new_sd_ctx allocates
@@ -196,15 +217,31 @@ work). **Output bit-identical to BEST (PSNR 99 dB / ac16 0.83 all 25 frames).**
 - **Opt-in lever:** `--steps 6` → 197.4s total (-17%), coherent, but a different
   render vs 8-step; left non-default (lip-sync fidelity is a human call).
 - **Dead ends recorded:** full-clip GPU VAE (OOM); GPU text encode (load-time OOM,
-  TE+DiT coexist); larger VAE tiles (slower). DiT-sampling deep levers (CUDA-graph
-  reuse across the 8 steps) not attempted — the step is MUL_MAT-compute-bound at
-  ~20s, so launch-overhead caching is low-ROI (cf. memory's prod-vs-profile note).
+  TE+DiT coexist); larger VAE tiles (slower); **CUDA-graph reuse across the 8 DiT
+  steps (lap 03 — PROFILED dead: step is 72% MUL_MAT+FLASH compute, only ~5 ms/step
+  build/launch overhead to recover)**. DiT step now fully profiled (lap 03); no safe
+  default-on pure-speed lever remains, only quality-sensitive steps/quant.
 
 ## NEXT (if a future session continues)
-- DiT sampling (164s) is the remaining 69% of wall. The only large lever left is
-  attacking the 48-block q4_k DiT compute itself: CUDA-graph capture/reuse across
-  the 8 identical-shape steps (deep, multi-day; likely small since compute-bound),
-  or a quant-ladder pass (lever 5) — Q3_K on robust DiT tensors to shrink/speed,
-  measured against PPL/coherence. Both are quality-sensitive and bench-heavy.
-- The PORT-PROGRESS STATUS block is STALE (says generated frames are noise); the
-  current tree renders coherent talking avatars. Update it.
+- **lap 03 closed the safe-pure-speed search on DiT sampling.** The step is now
+  PROFILED and proven compute-bound: MUL_MAT 38% + FLASH_ATTN 34% = 72% irreducible
+  Q4_K compute, build/alloc/copy ~5 ms/step. **CUDA-graph reuse is DEAD** (no
+  launch overhead to recover + every step rebuilds a fresh graph that would never warm
+  up). The ~28% glue is diffuse (CONT/ADD/MUL/SCALE/CONCAT/REPEAT), no single hotspot;
+  the one clean removal (audio gate_mul) banked ~0.4%. **Do not re-attempt CUDA-graph
+  capture or speculative glue micro-opts — measured/argued dead.**
+- The ONLY remaining levers are quality-sensitive, and both attack the 72%:
+  1. **Quant ladder (lever 5)** — DiT is uniform Q4_K (38% MUL_MAT). A Q3_K (or
+     mixed) DiT would shrink the matmul bandwidth, but ggml MMQ behaviour + the
+     ffn.w2/flash F16-overflow guards make it bench-heavy, and coherence must be
+     validated with the `check_qkv` oracle. Keep any new gguf OPT-IN. Untouched.
+  2. **Fewer steps (lever 4)** — A/B clips rendered (lap 03b): 6-step −17%, 4-step
+     −35%, both structurally coherent. **OWNER DECISION PENDING** (lip-sync eyeball;
+     see `models/_perf/lap03_{gate_mul,6steps,4steps}.webm`). Default stays 8.
+- FLASH_ATTN (34%) is the other half of the 72%. The self-attn runs a 2-pass cond/
+  noise split (correctness-load-bearing) + a kv_scale=1/256 F16 guard (adds 3 SCALE
+  ops/call, also load-bearing). No safe reduction found; a fused-scale or
+  single-pass-when-cond-tiny experiment would be micro (<3%) and risk correctness.
+- **The PORT-PROGRESS STATUS block "generated frames still noise" is STALE** — the
+  current tree renders coherent talking avatars (the `-out = -out` flow-sign fix
+  landed; see build_graph). Updated in this session.

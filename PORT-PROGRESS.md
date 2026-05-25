@@ -11,11 +11,26 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
-- 🟢 **PERF/VRAM PHASE — major wins landed (2026-05-25 session 6). See `PERF.md`
-  for the full lap log. NOTE: the older "generated frames still noise" status
-  below is STALE — the current tree renders COHERENT talking avatars (ac16≈0.83
-  on all 25 frames, frame-autocorr `tools/clip_compare.py`).**
-  - **Baseline → best: 768.7s → 238.4s total wall (3.2x faster), peak VRAM
+- 🟢 **PERF/VRAM PHASE — DiT-sampling PROFILED, safe-speed search CLOSED (session 7,
+  2026-05-26). See `PERF.md` lap 03/03b. NOTE: the older "generated frames still
+  noise" status below is STALE — the current tree renders COHERENT talking avatars
+  (ac16≈0.83 on all 25 frames, frame-autocorr `tools/clip_compare.py`).**
+  - **lap 03: profiled one DiT step (the remaining 69% of wall).** Verdict: the step
+    is COMPUTE-BOUND — MUL_MAT 38% + FLASH_ATTN_EXT 34% = 72% irreducible Q4_K
+    compute; graph build/alloc/copy is ~5 ms/step. ⇒ **CUDA-graph reuse (the forecast
+    marquee win) is DEAD** — no launch overhead to recover, and ggml's CUDA-graph
+    path (compiled OFF anyway) keys on a per-build graph that would never warm up.
+    No large safe default-on speed lever exists. Added two env-gated reusable
+    profilers (`LONGCAT_PROFILE` phase timer in `ggml_extend.hpp`, committed; a
+    per-op-type ggml-cuda aggregator, used+reverted to keep the submodule pristine).
+    Shipped one safe micro-win: audio `gate_mul` (drop a pointless full-size zeros-add
+    per block) — nodes 13705→13561, wall −0.4%, output bit-identical (99 dB).
+  - **lap 03b: opt-in step-count A/B clips for the owner** — fresh 8/6/4-step renders
+    (`models/_perf/lap03_{gate_mul,6steps,4steps}.webm`): 6-step −17% / 4-step −35%
+    total wall, both structurally coherent (ac16 0.83). **Default stays 8; 6-vs-4
+    lip-sync is the owner's eyeball call.** Remaining levers are all quality-sensitive
+    (fewer steps, or a Q3_K/mixed quant ladder via the check_qkv oracle).
+  - **Baseline → best: 768.7s → 237.8s total wall (3.2x faster), peak VRAM
     10535 → 10779 MiB (both fit the 12 GB 3060).** Standard render config
     (`--video-frames 25 -W 480 -H 832 --steps 8 --cfg-scale 1.0 --diffusion-fa
     --clip-on-cpu --max-vram 9`, no `--vae-on-cpu`).
@@ -36,11 +51,14 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
     8-step; left non-default (6-vs-8 lip-sync is a human eyeball call).**
   - **Dead ends (recorded in PERF.md):** full-clip GPU VAE (OOM), GPU text encode
     (load-time OOM — umT5 6GB + DiT 8.5GB coexist upfront), larger VAE tiles
-    (slower: 48-tile decode 73.9s vs 32-tile 54s). DiT sampling (164s, now 69% of
-    wall) is the remaining big cost — only deep levers left (CUDA-graph reuse /
-    quant ladder), both quality-sensitive & bench-heavy.
+    (slower: 48-tile decode 73.9s vs 32-tile 54s), **CUDA-graph reuse across the 8 DiT
+    steps (lap 03 — profiled dead, 72% compute / ~5 ms overhead)**. DiT sampling
+    (~164s) remains the biggest cost but is compute-bound; only quality-sensitive
+    levers left (fewer steps / quant ladder).
   - Checkpoint clips in `models/_perf/`: `BEST_8step_gpuvae_25fps_sound.webm`
-    (best), `lap00_baseline.webm`, `lap01_gpuvae_tiled.webm`, `lap02_6steps.webm`.
+    (best; lap03 8-step is bit-identical to it), `lap00_baseline.webm`,
+    `lap01_gpuvae_tiled.webm`, `lap02_6steps.webm`, and the lap-03b A/B set
+    `lap03_gate_mul.webm` (8) / `lap03_6steps.webm` (6) / `lap03_4steps.webm` (4).
     Tools: `tools/clip_compare.py` (per-frame PSNR + ac_lag16 coherence gate).
 
 - 🟢 **AUDIO GRAFT LANDED + VALIDATED END-TO-END (2026-05-25 session 5). whisper encoder +
