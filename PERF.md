@@ -39,6 +39,7 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 00  | BASELINE (`--vae-on-cpu`) + lever-1 fixes (fps 25 default, audio auto-mux) | 768.7 | 10535 | coherent (ac16≈0.83 all frames) | 83e3957 |
 | 01  | GPU VAE decode + spatial tiling (default-on for avatar) | 238.4 | 10779 | PSNR 40.1dB vs lap00 (min 36.2) | 736eb79 |
 | 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | bcda117 |
+| 03  | DiT-step PROFILED + reusable phase/op profilers + audio `gate_mul` (drop pointless zeros-add) | 237.8 (8) | 10779 | bit-identical to BEST (99 dB all frames) | _this lap_ |
 
 (rows appended per lap below)
 
@@ -99,6 +100,68 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
   eyeball call (the structural metrics can't judge mouth fidelity), and the LoRA's
   distill target is 8. Shipped as an opt-in `--steps 6` speed lever; default 8.
 - Checkpoint clip: `models/_perf/lap02_6steps.webm` (6-step, for A/B vs lap01 8-step).
+
+### lap 03 — DiT SAMPLING PROFILED (the headline finding) + audio gate_mul micro-win
+
+**This lap was a deep profile of the DiT step (the remaining 69% of wall, ~20.4s/step
+× 8). Verdict: the step is COMPUTE-BOUND on MUL_MAT + FLASH_ATTN; there is NO large
+safe pure-speed lever, and CUDA-graph reuse (the forecast marquee win) is DEAD.**
+
+**Profiling aids added (both env-gated, zero-cost when off, reusable):**
+- `LONGCAT_PROFILE=1` → per-`execute_graph` phase log in `ggml_extend.hpp`
+  (`nodes / alloc / copy_in / compute` ms). Committed.
+- `LONGCAT_OP_PROFILE=1` → per-op-TYPE wall aggregator in the ggml-cuda node loop
+  (`cudaStreamSynchronize` around each node; inflates absolute time but proportions
+  are exact). This lives in the **ggml submodule** (`ggml-cuda.cu` node loop); it was
+  used to take the breakdown below and then REVERTED to keep the submodule pristine
+  (detached HEAD — committing it would dangle the parent's submodule pointer). To
+  re-take an op profile: re-apply the ~25-line `[OP_PROFILE]` block around
+  `ggml_cuda_compute_forward` in `ggml/src/ggml-cuda/ggml-cuda.cu` and rebuild.
+
+**Per-step phase split (`LONGCAT_PROFILE`, 25f/8-step/480p, prod config):**
+- DiT step compute = **20.40s**; graph build+alloc+copy_in = **~5 ms** (0.02%).
+  ⇒ **per-step launch/build overhead is negligible → CUDA-graph capture/reuse cannot
+  help.** (ggml's CUDA-graph support is also compiled OFF — `GGML_CUDA_GRAPHS`
+  defaults OFF, iter.sh doesn't set it — but even compiled-in it keys on
+  `cgraph->nodes[0]` + a 2-call warmup, and every step rebuilds a fresh graph in a
+  reset compute_ctx, so it would never warm up. Not worth chasing for 5 ms/step.)
+
+**Per-op-TYPE breakdown of ONE DiT step (`LONGCAT_OP_PROFILE`, 13705 nodes, audio on):**
+
+| op | ms | % | calls | notes |
+|----|----|---|-------|-------|
+| **MUL_MAT** | 7586 | **38%** | 730 | Q4_K weight matmuls — compute-bound, the floor |
+| **FLASH_ATTN_EXT** | 6737 | **34%** | 144 | 96 self (2-pass cond+noise/block) + 48 text-cross |
+| CONT | 1744 | 8.7% | 2023 | attention reshape/permute conts (diffuse) |
+| ADD | 1194 | 6.0% | 1213 | residual + modulate-shift broadcasts |
+| MUL | 918 | 4.6% | 626 | modulate-scale + gate broadcasts |
+| SCALE | 455 | 2.3% | 1059 | incl. the kv_scale=1/256 F16-guard scales |
+| CONCAT | 349 | 1.7% | 241 | cond-zero prepends + cond/noise concat |
+| REPEAT | 260 | 1.3% | 673 | `ggml_ext_ones/zeros/full` materializations |
+| NORM | 255 | 1.3% | 242 | LayerNorms |
+| CPY | 217 | 1.1% | 384 | |
+| PAD | 144 | 0.7% | 192 | flash L_k pad-to-256 |
+
+- **MUL_MAT (38%) + FLASH_ATTN (34%) = 72% is irreducible compute** on uniform-Q4_K
+  weights at 480p/10920 tokens. The remaining ~28% is diffuse glue (CONT/ADD/MUL/
+  SCALE/CONCAT/REPEAT), each individually small and bandwidth-bound — no single
+  removable hotspot. **Conclusion: the only material levers left are quality-sensitive
+  (fewer steps, quant ladder) — there is no safe default-on pure-speed win.**
+
+**Audio cross-attn cost measured (lever 3):** audio-on step 20.40s / 13705 nodes vs
+audio-off step 18.44s / 9801 nodes ⇒ **+1.96s/step (+11%), +3904 nodes** (confirms the
+session-5 estimate). The audio path adds, per block, a non-flash per-frame attention
+(K=32) + a SECOND full-token modulate+gate over the ~9100 noise tokens. The
+modulate/gate bandwidth is the cost, not the tiny K=32 attention — not a cheap win.
+
+**Micro-win shipped (safe, default-on): `gate_mul`.** The audio path computed its
+contribution as `gate_add(zeros_like(ao), ao, gate)` — materializing a full
+[4096 × ~9100] zero tensor and adding it, per block. Replaced with a new `gate_mul`
+(gated multiply, no zeros residual; the cond-frame zeros are prepended separately
+anyway). Nodes 13705→13561 (−144 = 48× {scale+repeat+add}). Sampling 164.32s→163.66s,
+wall 238.46→237.76s (−0.4%, within step-to-step noise but a clean removal of pointless
+work). **Output bit-identical to BEST (PSNR 99 dB / ac16 0.83 all 25 frames).**
+- Checkpoint clip: `models/_perf/lap03_gate_mul.webm`.
 
 ### lever 3 — GPU text encode: DEAD END on this VRAM budget (no lap)
 - umT5 text encode is 16.4s one-time on CPU (`--clip-on-cpu`). Tried dropping the

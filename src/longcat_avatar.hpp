@@ -143,6 +143,22 @@ namespace LONGCAT_AVATAR {
             return ggml_add(ctx->ggml_ctx, x, y);
         }
 
+        // gate * y (no residual add), gate per-frame (B,T,1,C) broadcast over
+        // spatial tokens. Equivalent to gate_add(zeros_like(y), y, gate, T) but
+        // skips materializing a full-size zero tensor + its add (the audio path's
+        // contribution is prepended with cond zeros separately).
+        ggml_tensor* gate_mul(GGMLRunnerContext* ctx,
+                              ggml_tensor* y,
+                              ggml_tensor* gate,
+                              int64_t T) {
+            int64_t Nb = y->ne[2];
+            int64_t C  = y->ne[0];
+            y          = ggml_reshape_4d(ctx->ggml_ctx, y, C, y->ne[1] / T, T, Nb);  // [N, T, n_token/T, C]
+            y          = ggml_mul(ctx->ggml_ctx, y, gate);
+            y          = ggml_reshape_3d(ctx->ggml_ctx, y, C, y->ne[1] * y->ne[2], Nb);  // [N, n_token, C]
+            return y;
+        }
+
         // self attention with fused qkv + qk RMSNorm + 3D RoPE.
         // n_cond_tokens (avatar num_cond_latents split, avatar/attention.py
         // Attention.forward with num_cond_latents==1): the first n_cond_tokens (the
@@ -434,8 +450,8 @@ namespace LONGCAT_AVATAR {
 
                     // modulate(mod_norm_attn, ao, a_shift, a_scale) — reuse mod_norm_attn
                     auto ao_m = modulate(ctx, mod_norm_attn, ao, am[0], am[1], T_noise);
-                    // gate add into x's noise tokens
-                    auto add  = gate_add(ctx, ggml_ext_zeros_like(ctx->ggml_ctx, ao_m), ao_m, am[2], T_noise);  // a_gate*ao_m
+                    // gate add into x's noise tokens (a_gate*ao_m, no zeros residual)
+                    auto add  = gate_mul(ctx, ao_m, am[2], T_noise);
                     // add: [C, n_noise_token, 1]. Prepend zeros for cond tokens, add to x.
                     if (n_cond_tokens > 0) {
                         auto zeros = ggml_ext_zeros(ctx->ggml_ctx, hidden_size, n_cond_tokens, x->ne[2], 1);

@@ -2471,6 +2471,13 @@ protected:
         int64_t t_compute_begin = ggml_time_ms();
         ggml_status status      = ggml_backend_graph_compute(runtime_backend, gf);
         int64_t t_compute_end   = ggml_time_ms();
+        if (getenv("LONGCAT_PROFILE") != nullptr) {
+            LOG_INFO("[PROFILE] %s execute_graph: nodes=%d alloc=%lldms copy_in=%lldms compute=%lldms",
+                     get_desc().c_str(), ggml_graph_n_nodes(gf),
+                     (long long)(t_alloc_end - t_alloc_begin),
+                     (long long)(t_copy_end - t_copy_begin),
+                     (long long)(t_compute_end - t_compute_begin));
+        }
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             if (free_compute_buffer_immediately) {
