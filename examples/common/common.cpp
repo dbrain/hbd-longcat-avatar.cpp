@@ -2105,6 +2105,14 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
+    // The LongCat avatar renders at a native save_fps of 25. When an --audio
+    // input is given (avatar usage) and the user left fps at the generic
+    // default (16), use 25 so the output container plays at the correct rate.
+    if (mode == VID_GEN && !audio_path.empty() && fps == 16) {
+        fps = 25;
+        LOG_INFO("avatar: defaulting output fps to 25 (native save_fps); pass --fps to override");
+    }
+
     if (sample_params.shifted_timestep < 0 || sample_params.shifted_timestep > 1000) {
         LOG_ERROR("error: shifted_timestep must be in range [0, 1000]");
         return false;

@@ -5160,6 +5160,10 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     }
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+    // For the avatar path the conditioning audio is an INPUT; capture the 16k
+    // mono waveform here so it can be muxed back into the output container
+    // (so clips come out viewable WITH sound, no manual ffmpeg).
+    std::vector<float> avatar_input_wav;
     GenerationRequest request(sd_ctx, sd_vid_gen_params);
     bool latent_upscale_enabled     = request.hires.enabled;
     GenerationRequest hires_request = request;
@@ -5226,6 +5230,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
             if (strlen(apath) > 0 && sd_ctx->sd->whisper_encoder_model) {
                 std::vector<float> wav;
                 if (LONGCAT_AUDIO::load_wav_16k_mono(apath, wav)) {
+                    avatar_input_wav = wav;  // keep a copy to mux into the output
                     // T_video = generated video frames. The audio windowing maps
                     // T_video -> T latent frames (vae_scale=4). avatar-v1.5 uses a
                     // FIXED save_fps=25 / audio_stride=1 for the audio<->frame
@@ -5546,6 +5551,34 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         }
         int64_t audio_latent_decode_end = ggml_time_ms();
         LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_latent_decode_end - audio_latent_decode_start) * 1.0f / 1000);
+    }
+
+    // Avatar: mux the INPUT conditioning audio back into the output container,
+    // trimmed to the generated video's duration so audio/video stay in sync.
+    if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !avatar_input_wav.empty()) {
+        const uint32_t in_sr = 16000;  // load_wav_16k_mono always returns 16k mono
+        int out_fps          = request.fps > 0 ? request.fps : 25;
+        // request.frames is the requested video length; clamp the audio to it.
+        double video_dur   = (double)request.frames / (double)out_fps;
+        size_t want        = (size_t)(video_dur * (double)in_sr);
+        size_t n           = avatar_input_wav.size();
+        if (want > 0 && want < n) {
+            n = want;  // trim trailing audio beyond the rendered video
+        }
+        sd_audio_t* a = (sd_audio_t*)malloc(sizeof(sd_audio_t));
+        if (a != nullptr) {
+            a->sample_rate  = in_sr;
+            a->channels     = 1;
+            a->sample_count = (uint64_t)n;
+            a->data         = (float*)malloc(n * sizeof(float));
+            if (a->data != nullptr) {
+                std::memcpy(a->data, avatar_input_wav.data(), n * sizeof(float));
+                generated_audio = a;
+                LOG_INFO("avatar: muxing input audio (%zu samples @ %u Hz, %.2fs) into output", n, in_sr, (double)n / (double)in_sr);
+            } else {
+                free(a);
+            }
+        }
     }
 
     if (latents.video_conditioning_frame_count > 0) {
