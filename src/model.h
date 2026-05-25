@@ -48,6 +48,7 @@ enum SDVersion {
     VERSION_OVIS_IMAGE,
     VERSION_ERNIE_IMAGE,
     VERSION_LONGCAT,
+    VERSION_LONGCAT_AVATAR,
     VERSION_COUNT,
 };
 
@@ -149,6 +150,15 @@ static inline bool sd_version_is_longcat(SDVersion version) {
     return false;
 }
 
+// LongCat-Video-Avatar 1.5: Wan-class video DiT with a per-block audio cross-attn graft
+// (whisper feature encoder -> AudioProjModel -> 32 ctx tokens/frame). ai2v (image+audio->video).
+static inline bool sd_version_is_longcat_avatar(SDVersion version) {
+    if (version == VERSION_LONGCAT_AVATAR) {
+        return true;
+    }
+    return false;
+}
+
 static inline bool sd_version_is_ernie_image(SDVersion version) {
     if (version == VERSION_ERNIE_IMAGE) {
         return true;
@@ -185,7 +195,8 @@ static inline bool sd_version_is_dit(SDVersion version) {
         sd_version_is_anima(version) ||
         sd_version_is_z_image(version) ||
         sd_version_is_ernie_image(version) ||
-        sd_version_is_longcat(version)) {
+        sd_version_is_longcat(version) ||
+        sd_version_is_longcat_avatar(version)) {
         return true;
     }
     return false;

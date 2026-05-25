@@ -169,6 +169,7 @@ struct SDGenerationParams {
     std::string control_image_path;
     std::vector<std::string> ref_image_paths;
     std::string control_video_path;
+    std::string audio_path;  // LongCat-Avatar audio-driven lip-sync (16kHz mono wav)
 
     sd_sample_params_t sample_params;
     sd_sample_params_t high_noise_sample_params;

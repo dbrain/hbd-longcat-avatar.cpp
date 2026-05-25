@@ -383,6 +383,7 @@ typedef struct {
     int video_frames;
     int fps;
     float vace_strength;
+    const char* audio_path;  // LongCat-Avatar audio-driven lip-sync (16kHz mono wav)
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;

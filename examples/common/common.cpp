@@ -818,6 +818,10 @@ ArgOptions SDGenerationParams::get_options() {
          "such as 00.png, 01.png, ... etc.",
          &control_video_path},
         {"",
+         "--audio",
+         "path to a 16kHz mono wav for LongCat-Avatar audio-driven lip-sync",
+         &audio_path},
+        {"",
          "--pm-id-images-dir",
          "path to PHOTOMAKER input id images dir",
          &pm_id_images_dir},
@@ -2293,6 +2297,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.video_frames              = video_frames;
     params.fps                       = fps;
     params.vace_strength             = vace_strength;
+    params.audio_path                = audio_path.empty() ? nullptr : audio_path.c_str();
     params.vae_tiling_params         = vae_tiling_params;
     params.cache                     = cache_params;
     params.hires.enabled             = hires_enabled;

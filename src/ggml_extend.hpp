@@ -2515,7 +2515,53 @@ protected:
                 continue;
             }
             auto debug_tensor = sd::make_sd_tensor_from_ggml<float>(tensor);
-            print_sd_tensor(debug_tensor, false, entry.second.c_str());
+            // Print stats (mean/std/min/max/nnan) rather than a full dump — large
+            // intermediates (e.g. DiT tokens) are millions of elements.
+            {
+                const float* dd = debug_tensor.data();
+                int64_t nn      = debug_tensor.numel();
+                double sm = 0, sq = 0, mn = 1e30, mx = -1e30;
+                int64_t nnan = 0;
+                for (int64_t i = 0; i < nn; ++i) {
+                    float v = dd[i];
+                    if (std::isnan(v) || std::isinf(v)) { nnan++; continue; }
+                    sm += v; sq += (double)v * v;
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                double me = sm / (double)nn;
+                double va = sq / (double)nn - me * me;
+                LOG_INFO("[DBG tap] %s shape(%lld,%lld,%lld,%lld) mean=%.5f std=%.5f min=%.4f max=%.4f nnan=%lld/%lld",
+                         entry.second.c_str(),
+                         (long long)tensor->ne[0], (long long)tensor->ne[1],
+                         (long long)tensor->ne[2], (long long)tensor->ne[3],
+                         me, va > 0 ? sqrt(va) : 0.0, mn, mx, (long long)nnan, (long long)nn);
+                // Optional raw dump for the numerical-oracle harness. When
+                // LONGCAT_DUMP_DIR is set, every captured tap is written as a
+                // .bin: int64 ndim, then ndim int64 dims (ggml ne[] order,
+                // little-endian, fastest-varying first), then f32 data.
+                const char* dump_dir = getenv("LONGCAT_DUMP_DIR");
+                if (dump_dir != nullptr && dump_dir[0] != '\0') {
+                    std::string path = std::string(dump_dir) + "/" + entry.second + ".bin";
+                    FILE* f          = fopen(path.c_str(), "wb");
+                    if (f != nullptr) {
+                        int64_t ndim = 4;
+                        while (ndim > 1 && tensor->ne[ndim - 1] == 1) {
+                            ndim--;
+                        }
+                        fwrite(&ndim, sizeof(int64_t), 1, f);
+                        for (int64_t d = 0; d < ndim; ++d) {
+                            int64_t dim = tensor->ne[d];
+                            fwrite(&dim, sizeof(int64_t), 1, f);
+                        }
+                        fwrite(dd, sizeof(float), (size_t)nn, f);
+                        fclose(f);
+                        LOG_INFO("[DBG dump] wrote %s", path.c_str());
+                    } else {
+                        LOG_WARN("[DBG dump] failed to open %s", path.c_str());
+                    }
+                }
+            }
         }
 
         int64_t t_cache_begin = ggml_time_ms();

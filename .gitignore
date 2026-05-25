@@ -13,3 +13,9 @@ output*.png
 models*
 *.log
 preview.png
+
+# longcat port: validation venvs + scratch (never commit)
+.venv*/
+.convert-tmp/
+__pycache__/
+*.pyc

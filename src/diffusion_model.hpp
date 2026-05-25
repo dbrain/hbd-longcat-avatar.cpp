@@ -6,6 +6,7 @@
 #include "ernie_image.hpp"
 #include "flux.hpp"
 #include "hidream_o1.hpp"
+#include "longcat_avatar.hpp"
 #include "ltxv.hpp"
 #include "mmdit.hpp"
 #include "qwen_image.hpp"
@@ -415,6 +416,95 @@ struct WanModel : public DiffusionModel {
                            sd::Tensor<float>(),
                            tensor_or_empty(diffusion_params.vace_context),
                            diffusion_params.vace_strength);
+    }
+};
+
+struct LongCatAvatarModel : public DiffusionModel {
+    std::string prefix;
+    LONGCAT_AVATAR::LongCatAvatarRunner avatar;
+
+    LongCatAvatarModel(ggml_backend_t backend,
+                       ggml_backend_t params_backend,
+                       const String2TensorStorage& tensor_storage_map = {},
+                       const std::string prefix                       = "model.diffusion_model",
+                       SDVersion version                              = VERSION_LONGCAT_AVATAR)
+        : prefix(prefix), avatar(backend, params_backend, tensor_storage_map, prefix, version) {
+    }
+
+    std::string get_desc() override {
+        return avatar.get_desc();
+    }
+
+    void alloc_params_buffer() override {
+        avatar.alloc_params_buffer();
+    }
+
+    void free_params_buffer() override {
+        avatar.free_params_buffer();
+    }
+
+    void free_compute_buffer() override {
+        avatar.free_compute_buffer();
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
+        avatar.get_param_tensors(tensors, prefix);
+    }
+
+    size_t get_params_buffer_size() override {
+        return avatar.get_params_buffer_size();
+    }
+
+    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        avatar.set_weight_adapter(adapter);
+    }
+
+    int64_t get_adm_in_channels() override {
+        return 768;
+    }
+
+    void set_flash_attention_enabled(bool enabled) {
+        avatar.set_flash_attention_enabled(enabled);
+    }
+
+    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        avatar.set_max_graph_vram_bytes(max_vram_bytes);
+    }
+
+    void set_circular_axes(bool circular_x, bool circular_y) override {
+        avatar.set_circular_axes(circular_x, circular_y);
+    }
+
+    sd::Tensor<float> compute(int n_threads,
+                              const DiffusionParams& diffusion_params) override {
+        GGML_ASSERT(diffusion_params.x != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        // Derive num_cond_latents (ai2v ref-image frames) from the per-frame
+        // timesteps: the pipeline forces the cond frame(s) to timestep 0 while the
+        // generated frames carry the current step's t (>0). Counting leading-zero
+        // frames recovers num_cond_latents without extra plumbing.
+        int num_cond_latents     = 0;
+        const auto& ts           = *diffusion_params.timesteps;
+        const float* ts_data     = ts.data();
+        int64_t n_ts             = ts.numel();
+        if (n_ts > 1 && ts_data != nullptr) {
+            for (int64_t i = 0; i < n_ts; ++i) {
+                if (ts_data[i] == 0.0f) {
+                    num_cond_latents++;
+                } else {
+                    break;
+                }
+            }
+            // only treat as a cond split if SOME frames are non-zero (real video)
+            if (num_cond_latents == n_ts) {
+                num_cond_latents = 0;
+            }
+        }
+        avatar.num_cond_latents = num_cond_latents;
+        return avatar.compute(n_threads,
+                              *diffusion_params.x,
+                              *diffusion_params.timesteps,
+                              tensor_or_empty(diffusion_params.context));
     }
 };
 
