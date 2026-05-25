@@ -358,7 +358,20 @@ namespace LONGCAT_AVATAR {
                              ggml_tensor* pe,
                              ggml_tensor* audio,
                              int64_t T,
-                             int64_t n_cond_tokens) {
+                             int64_t n_cond_tokens,
+                             int block_idx = -1) {
+            // block_idx >= 0 enables INTRA-block graph-cut boundaries (after self-attn,
+            // after cross-attn). At full length (93f / ~37k tokens) a single block's
+            // activation peak (FFN gate/up/gu all [11008, n_token] F32 ~4.6 GiB +
+            // self-attn ~3 GiB) still overruns the 12 GB card when reserved as one
+            // segment, so we sub-cut each block into self-attn / cross-attn / FFN
+            // sub-segments. Names are unique per block via block_idx. -1 = no sub-cut.
+            auto subcut = [&](ggml_tensor* t, const char* tag) {
+                if (block_idx >= 0) {
+                    sd::ggml_graph_cut::mark_graph_cut(
+                        t, "longcat.blocks." + std::to_string(block_idx) + "." + tag, "x");
+                }
+            };
             auto adaLN          = std::dynamic_pointer_cast<Linear>(blocks["adaLN_modulation.1"]);
             auto audio_adaLN    = std::dynamic_pointer_cast<Linear>(blocks["audio_adaLN_modulation.1"]);
             auto mod_norm_attn  = std::dynamic_pointer_cast<LayerNorm>(blocks["mod_norm_attn"]);
@@ -382,6 +395,7 @@ namespace LONGCAT_AVATAR {
             auto x_m = modulate(ctx, mod_norm_attn, x, ms[0], ms[1], T);
             auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens);
             x        = gate_add(ctx, x, x_s, ms[2], T);
+            subcut(x, "post_self_attn");
 
             // text cross-attn (ungated). With a num_cond_latents split the cond-frame
             // tokens receive NO text conditioning (their output is zeroed).
@@ -460,6 +474,8 @@ namespace LONGCAT_AVATAR {
                     x = ggml_add(ctx->ggml_ctx, x, add);
                 }
             }
+
+            subcut(x, "post_cross_attn");
 
             // ffn (SwiGLU) with modulation
             auto y = modulate(ctx, mod_norm_ffn, x, ms[3], ms[4], T);
@@ -773,9 +789,30 @@ namespace LONGCAT_AVATAR {
             context = y_proj_2->forward(ctx, context);  // [N, L, hidden]
             tap("tap_y_embed", context);
 
+            // Graph-cut boundaries (mirrors anima.hpp): mark the cross-block-persistent
+            // inputs as a "prelude" group, then mark the residual `x` after every block.
+            // This lets the GGMLRunner's graph-cut path reserve ONE block's activation
+            // buffer (per-segment) instead of the whole 48-block graph's sum, and stream
+            // only that block's weights to GPU. At 93 frames (~37k tokens) the monolithic
+            // forward's compute buffer is ~13.3 GiB — over the 12 GB card even with zero
+            // resident weights — so full-length renders REQUIRE these cuts (plus
+            // --offload-to-cpu + --max-vram, which puts params on a different backend than
+            // the runtime; graph-cut only engages then). 25f fits without cuts; the cuts
+            // are inert unless the segmented path is taken (no extra ops, marks only).
+            sd::ggml_graph_cut::mark_graph_cut(x, "longcat.prelude", "x");
+            sd::ggml_graph_cut::mark_graph_cut(t_emb, "longcat.prelude", "t_emb");
+            sd::ggml_graph_cut::mark_graph_cut(context, "longcat.prelude", "context");
+            if (pe != nullptr) {
+                sd::ggml_graph_cut::mark_graph_cut(pe, "longcat.prelude", "pe");
+            }
+            if (audio != nullptr) {
+                sd::ggml_graph_cut::mark_graph_cut(audio, "longcat.prelude", "audio");
+            }
+
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<LongCatAvatarSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
-                x          = block->forward(ctx, x, t_emb, context, pe, audio, T, n_cond_tokens);
+                x          = block->forward(ctx, x, t_emb, context, pe, audio, T, n_cond_tokens, i);
+                sd::ggml_graph_cut::mark_graph_cut(x, "longcat.blocks." + std::to_string(i) + ".out", "x");
                 if (i == 0) {
                     tap("tap_block0", x);
                 } else if (i == 1) {

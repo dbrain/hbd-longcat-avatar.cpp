@@ -184,6 +184,69 @@ quality verdict — mouth fidelity is the human call.
   trajectory drift); 4-step (−35%) is more divergent and likely softens lip detail —
   judge before adopting. No code change in 03b (the `--steps` plumbing is lap 02).
 
+### lap 04 — FULL-LENGTH (93f) HITS A HARD VRAM WALL; graph-cut + CPU-offload enables 81f (3.24s) — the practical full-length ceiling on 12 GB
+
+**Goal: the owner's morning A/B needs the *native segment length* (93 frames @ 25fps ≈ 3.7s),
+not the 25f clips (which "cut off mid-word").** Rendering 93f surfaced a hard VRAM wall and
+required a real code change to get most of the way there.
+
+**THE 93f WALL (measured):** at 93 frames the latent is 24 frames × 1560 spatial = ~37,440
+tokens. The DiT forward's *activation* compute buffer is **13,310 MiB** — over the 11,909 MiB
+the 3060 actually exposes **even with ZERO resident weights** (`--offload-to-cpu` puts all
+params in RAM; the single compute graph still wants 13.3 GiB). The compute buffer scales
+super-linearly with frames: 25f ≈ 2 GiB · 49f ≈ 4.6 GiB · 93f ≈ 13.3 GiB. With weights
+resident on GPU (8539 MiB) the ceiling is only ~33f; the activation buffer is the wall.
+`--max-vram` graph-cut alone does NOT rescue it — the monolithic forward marks no graph-cut
+boundaries, so `ggml_gallocr_reserve` reserves the whole-graph buffer up front (same class as
+the lap-01 full-clip VAE OOM).
+
+**THE FIX (committed, `src/longcat_avatar.hpp`):** mark graph-cut boundaries on the avatar
+DiT (mirrors `anima.hpp`): a `longcat.prelude` group for the cross-block-persistent inputs
+(`t_emb`/`context`/`pe`/`audio`/initial `x`), then `x` after **every block** PLUS two
+**intra-block** cuts (`post_self_attn`, `post_cross_attn`) so each block splits into
+self-attn / cross-attn / FFN sub-segments. With `--offload-to-cpu` (params on the CPU backend
+≠ the CUDA runtime backend — the condition that *enables* the segmented path) the runner now
+reserves ONE sub-segment's activation buffer at a time and streams only that sub-segment's
+weights to GPU. **The marks are inert when weights are resident** (`can_attempt_graph_cut_
+segmented_compute()` is false when params_backend == runtime_backend), so the fast 25f path is
+unchanged. Build green via iter.sh.
+
+**RESULT — the real ceiling is 81 frames (3.24s), NOT 93.** Even per-sub-segment, block-0's
+**self-attention** sub-segment is an atomic 12,675 MiB at 93f (flash-attn + RoPE conts over
+37k tokens) — it cannot be cut at block/sub-block boundaries, so 93f stays over the card.
+Empirically (steps=1 probes, offload + `--max-vram 9`):
+
+| frames | seconds @25fps | fits 12 GB? | self-attn sub-segment |
+|--------|----------------|-------------|------------------------|
+| 73 | 2.92 | ✅ | < budget |
+| 81 | 3.24 | ✅ (peak 11603 MiB) | ~11.3 GiB |
+| 85 | 3.40 | ❌ OOM (accumulated frag) | — |
+| 93 (native) | 3.72 | ❌ OOM | **12,675 MiB atomic** |
+
+**81f is the shipped full-length.** It covers 81 of the audio's 100 frames (4.0s wav →
+windowed to 81). Reaching the true native 93f would need **splitting the self-attention
+internally** (temporal-chunked flash over the 24 latent frames) — that changes the proven
+full-temporal attention math and is correctness-risky; deferred for the owner to scope. 81f is
+3.24s, far past the 25f "cuts off mid-word" problem, and plenty for a lip-sync A/B.
+
+**COST of offload (the tradeoff):** weights stream from RAM per sub-segment, so DiT sampling
+is ~124 s/step (8.5 GB × 48 blocks × 3 sub-segments re-streamed each step) vs ~20 s/step for
+resident-weight 25f. Full-length is minutes, as expected — it's a turnaround knob, not the hot
+path. VAE tiled decode at 81f is ~175s (10 tiles × ~17.5s; bigger temporal extent per tile).
+
+**Full-length A/B set (81f / 480p / seed 42 / audio on / offload + graph-cut + max-vram 9):**
+
+| steps | wall (s) | sampling (s) | decode (s) | peak VRAM (MiB) | vs 8-step | clip |
+|-------|----------|--------------|------------|-----------------|-----------|------|
+| 8 (default) | 1217.99 | 992.23 | 174.95 | 11603 | — | `models/_perf/fulllen_81f_8step.webm` |
+| 6 | _pending_ | | | | | `fulllen_81f_6step.webm` |
+| 4 | _pending_ | | | | | `fulllen_81f_4step.webm` |
+
+All carry muxed audio (pcm_s16le 16 kHz, verified via ffprobe). **Default step count unchanged
+(8).** The 6-vs-4 lip-sync fidelity at full length is the owner's eyeball call (same as lap 03b
+at 25f). Note: at full length the step count trades the same way as 25f (sampling is linear in
+steps), so 6-step ≈ −25% sampling, 4-step ≈ −50% sampling vs 8-step.
+
 ### lever 3 — GPU text encode: DEAD END on this VRAM budget (no lap)
 - umT5 text encode is 16.4s one-time on CPU (`--clip-on-cpu`). Tried dropping the
   flag to run it on GPU. → **immediate CUDA OOM at load**: new_sd_ctx allocates
