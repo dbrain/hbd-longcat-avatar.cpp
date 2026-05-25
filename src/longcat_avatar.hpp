@@ -230,19 +230,19 @@ namespace LONGCAT_AVATAR {
                 k_cond      = ggml_cont(ctx->ggml_ctx, k_cond);
                 v_cond      = ggml_cont(ctx->ggml_ctx, v_cond);
                 auto x_cond = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_cond, k_cond, v_cond,
-                                                     num_heads, nullptr, true, fa, kv_scale);  // [N, n_cond, C]
+                                                     num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, n_cond, C]
 
                 // noise pass: q_noise × {k,v}_full  (noise tokens see everything)
                 auto q_noise = ggml_view_3d(ctx->ggml_ctx, q_rope, q_rope->ne[0], L_noise, q_rope->ne[2],
                                             q_rope->nb[1], q_rope->nb[2], q_rope->nb[1] * n_cond_tokens);
                 q_noise      = ggml_cont(ctx->ggml_ctx, q_noise);
                 auto x_noise = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_noise, k_rope, v,
-                                                      num_heads, nullptr, true, fa, kv_scale);  // [N, L_noise, C]
+                                                      num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, L_noise, C]
 
                 out = ggml_concat(ctx->ggml_ctx, x_cond, x_noise, 1);  // [N, n_token, C]
             } else {
                 out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_rope, k_rope, v,
-                                             num_heads, nullptr, true, fa, kv_scale);  // [N, n_token, C]
+                                             num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, n_token, C]
             }
             out = proj->forward(ctx, out);
             return out;

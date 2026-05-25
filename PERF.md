@@ -41,6 +41,7 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | bcda117 |
 | 03  | DiT-step PROFILED + reusable phase/op profilers + audio `gate_mul` (drop pointless zeros-add) | 237.8 (8) | 10779 | bit-identical to BEST (99 dB all frames) | 877c258 |
 | 05  | DiT glue cuts: `scale_bias` fuse + redundant qkv-cont removal + audio silu reuse | sampling 162.3 (was 163.7) | 10779 | bit-identical to BEST (99 dB all frames) | 24d2d9c |
+| 06  | `flash_skip_kv_pad`: drop the legacy flash kv-pad mask (NOT the qkv double-buffer) → NATIVE 93f renders | 25f unchanged; 93f offload sampling 965.6 (120.7/step) | 93f self-attn seg 12008→5511 | 25f BIT-IDENTICAL to BEST (99 dB); 93f coherent ac16≈0.82 all 93f | lap-06 (HEAD) |
 
 (rows appended per lap below)
 
@@ -340,6 +341,68 @@ via the lever-2 cont cut, but closing it needs more dense-activation surgery.**
     These are 93f-only (the 25f hot path already fits) — a turnaround-knob win, not
     hot-path. **81f remains the shipped full-length; 93f is one more activation
     lever away, NOT a fundamental wall.** See PORT-PROGRESS for the exact next cut.
+
+### lap 06 — NATIVE 93f CLEARS THE WALL: the 93f self-attn peak was NOT the qkv double-buffer — it was a synthesized flash kv-pad mask (~5 GiB ×2). Skipping it drops the self-attn sub-segment 12,008 → 5,511 MiB and native 93f now renders.
+
+**The lap-05 hypothesis (qkv double-buffer is the prime suspect) was WRONG — proven by
+direct measurement.** Enabling `GGML_ALLOCATOR_DEBUG` (ggml-alloc.c, temporary, reverted)
+dumped the live-tensor set at the 12,008 MiB high-water of the 93f block-0 self-attn
+sub-segment. The two dominant tensors were **5124 MiB + 5151 MiB ≈ 10.3 GiB**, both shaped
+`[L_k_padded=37632 × L_q_noise=35880]`. Everything else (qkv_out, the split cont, q/k/v,
+RoPE temporaries, the F16 k/v casts at 294 MiB each) was ≤ ~600 MiB. So the qkv split's
+double-buffer was never the wall.
+
+**ROOT CAUSE = the legacy flash kv-pad mask.** `ggml_ext_attention_ext`'s flash path
+(`build_kqv`, ggml_extend.hpp) pads `L_k` up to a multiple of 256 when `L_k % 256 != 0`,
+and — when the caller passes `mask == nullptr` (full attention, the avatar self-attn case)
+— SYNTHESIZES a `[L_k_pad × L_q]` mask (`ggml_ext_zeros` + an `-INFINITY` pad column) to
+mask the padded K positions, then casts it to F16. At 25f (`L_k = 10920`) that mask is tiny;
+at native 93f (`L_k = n_token = 37440 → pad 37632`, `L_q_noise ≈ 35880`) it is a **~5.1 GiB
+F32 tensor + its ~F16 cast** — the entire wall. The comment in `build_kqv` already noted
+"the need for padding got removed in ggml 4767bda" — the pad+mask is legacy; modern
+`ggml_flash_attn_ext` + the CUDA MMA kernel handle an unpadded `L_k` with `mask == nullptr`
+directly.
+
+**THE FIX (committed, quality-neutral, opt-in): `flash_skip_kv_pad`.** Added a
+`bool flash_skip_kv_pad = false` parameter to `ggml_ext_attention_ext` (`src/ggml_extend.hpp`).
+When set AND `mask == nullptr`, it skips the `L_k→256` pad entirely (so no synthesized mask).
+Default `false` → every other model/caller is byte-for-byte unchanged. The avatar's three
+self-attn `ggml_ext_attention_ext` calls (cond pass / noise pass / plain) pass `true`
+(`src/longcat_avatar.hpp`); they always pass `mask == nullptr`. Mathematically identical:
+the synthesized mask was all-zeros over the real K positions (a softmax no-op) and `-inf`
+only over PAD positions that no longer exist once we don't pad.
+
+**RESULTS:**
+- **93f self-attn sub-segment reserve: 12,008 → 5,511 MiB (−6,497 MiB).** With the segment
+  now ≤ the `--max-vram 9216` budget, the graph-cut budget-merge also collapses 146 → **49**
+  segments (was 146 → 97) — each merged segment is now a full block instead of a sub-split.
+- **NATIVE 93f (3.72s) RENDERS via `--offload-to-cpu` — previously a hard OOM at any setting.**
+  `models/_perf/fulllen_93f_native.webm` (8-step / 480×832 / seed 42 / audio on / GPU-VAE):
+  sampling **965.59s = 120.7 s/step**, VAE tiled decode 200.83s, wall 1187.79s. Latent
+  healthy (predecode std 1.21, frame-0 cond 0.528, gen frames 1.0–1.26, nnan=0). **Coherent
+  end-to-end: `ac16 ≈ 0.82` on all 93 frames** (matches BEST's ~0.83). 93 frames + pcm_s16le
+  16 kHz audio muxed (ffprobe-verified). This is the PRIZE: native full-length, no quality
+  cut, no continuation-chaining.
+- **25f QUALITY GATE: BIT-IDENTICAL to `BEST_8step_gpuvae_25fps_sound.webm`** — PSNR **99.00 dB**
+  (clip_compare identical cap) on ALL 25 frames, ac16 matches to 3 d.p. Confirms the change is
+  pure memory-layout: the flash MMA kernel yields identical output with/without the legacy pad.
+- **Resident (no-offload) 93f still OOMs** — the monolithic whole-graph reserve is now only
+  **5,323 MiB** (down from a pre-mask figure that OOM'd far harder), but resident DiT weights
+  are 8,539 MiB (8,781 with the GPU VAE) leaving only ~3.0 GiB free, so the 5.3 GiB compute
+  buffer can't coexist. Native-fit-resident would need another ~2.3 GiB of quality-neutral
+  activation cuts (≥2 levers) — out of reach for a single clean cut. Resident frame-count
+  ceiling probed (steps=1): 93f reserve 5,323 MiB OOM · 61f reserve 3,551 MiB OOM · 49f
+  reserve 2,887 MiB *reserves* but runtime-OOMs on the tight ~3.0 GiB margin ⇒ **safe
+  resident ceiling ≈ 40f.** **93f (and everything past ~40f) ships via weight-offload
+  (~120 s/step); it's a full-length turnaround knob, not the 25f hot path.** The offload
+  ceiling now comfortably covers native 93f (segment 5,511 MiB ≪ budget) and would extend
+  further — 93f was the native segment length, so this is the full clip.
+
+**Diagnostic note for future sessions:** `GGML_ALLOCATOR_DEBUG` in `ggml/src/ggml-alloc.c`
+(toggle the `#define` at line ~16, rebuild, revert after) dumps the exact live-tensor set +
+sizes at every compute-buffer high-water — the reliable way to localize a VRAM peak. The
+fine-grained `mark_graph_cut`-inside-self_attn probe approach is FRAGILE (breaks
+`build_segment_graph` for tensors consumed within the same logical region) — don't use it.
 
 ### lever 5 — Q3_K quant ladder: DEAD END on Ampere (measured, no lap)
 - DiT is uniform Q4_K (MUL_MAT 38% of the step). Tested whether a smaller Q3_K DiT

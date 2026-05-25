@@ -11,6 +11,26 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **NATIVE FULL-LENGTH (93f / 3.72s) NOW RENDERS — the 12 GB wall is CLEARED (session 10,
+  2026-05-26). See `PERF.md` lap 06.** The 93f self-attn VRAM peak was NOT the qkv
+  double-buffer the lap-05 handoff flagged — `GGML_ALLOCATOR_DEBUG` localized it to a
+  **synthesized flash kv-pad mask** (`build_kqv` in `ggml_extend.hpp` pads `L_k` to a
+  multiple of 256 and, when `mask==nullptr`, materializes a `[L_k_pad × L_q]` F32 mask +
+  F16 cast — **~5 GiB ×2 at 37k tokens**). FIX: opt-in `flash_skip_kv_pad` param on
+  `ggml_ext_attention_ext` (default off, every other caller byte-identical); the avatar's
+  three self-attn calls pass it (`src/longcat_avatar.hpp`). Modern `ggml_flash_attn_ext` +
+  CUDA MMA handle unpadded `L_k` with `mask==nullptr` directly. **93f self-attn sub-segment
+  12,008 → 5,511 MiB (−6,497).** Native 93f renders via `--offload-to-cpu`
+  (`models/_perf/fulllen_93f_native.webm`, 8-step, sampling 965.6s = **120.7 s/step**, VAE
+  decode 200.8s, coherent ac16≈0.82 all 93f, audio muxed). **25f quality gate BIT-IDENTICAL
+  to BEST (PSNR 99 dB all frames)** — pure memory-layout change. Resident (no-offload) 93f
+  still OOMs (monolithic compute buffer 5,323 MiB vs ~3.0 GiB free after the 8,781 MiB
+  resident weights). Resident ceiling probed: 93f reserve 5,323 MiB OOM, 61f reserve 3,551 MiB
+  OOM, 49f reserve 2,887 MiB fits-but-runtime-OOMs on the tight ~3.0 GiB margin → safe
+  resident ceiling is ~40f. 93f (and 49–93f) ship via weight-offload — full-length is a
+  turnaround knob, not the 25f hot path.
+  Commit on `longcat-avatar-port` (code: `ggml_extend.hpp` + `longcat_avatar.hpp` only).
+
 - 🟢 **FULL-LENGTH (81f / 3.24s) RENDERS LAND via graph-cut + CPU-offload (session 8,
   2026-05-26). See `PERF.md` lap 04.** The native 93-frame segment OOMs a 12 GB card —
   the monolithic DiT forward reserves a ~13.3 GiB activation buffer at ~37k tokens, over

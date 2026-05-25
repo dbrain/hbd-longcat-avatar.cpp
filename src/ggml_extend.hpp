@@ -1294,7 +1294,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       ggml_tensor* mask = nullptr,
                                                       bool skip_reshape = false,
                                                       bool flash_attn   = false,
-                                                      float kv_scale    = 1.0f) {  // avoid overflow
+                                                      float kv_scale    = 1.0f,        // avoid overflow
+                                                      bool flash_skip_kv_pad = false) {  // skip the legacy L_k->256 pad + synthesized mask
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -1387,7 +1388,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     if (flash_attn) {
         // LOG_DEBUG("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         bool can_use_flash_attn = true;
-        if (can_use_flash_attn && L_k % 256 != 0) {
+        // The legacy L_k->256 pad synthesizes a [L_k_pad x L_q] -inf mask when none
+        // was supplied (see build_kqv). That mask is O(L_k*L_q) — fine at small
+        // sequence lengths, but at the avatar's full-length self-attn (~37k tokens)
+        // it is a ~5 GiB F32 tensor (x2 with its F16 cast), the dominant VRAM peak.
+        // Modern ggml flash_attn_ext + the CUDA MMA kernel handle an unpadded L_k
+        // with mask==nullptr directly, so skip the pad entirely for callers that opt
+        // in (mask must be null — a real mask still needs its padding handled).
+        if (flash_skip_kv_pad && mask == nullptr) {
+            // no kv_pad, no synthesized mask
+        } else if (can_use_flash_attn && L_k % 256 != 0) {
             kv_pad = GGML_PAD(L_k, 256) - static_cast<int>(L_k);
         }
 
