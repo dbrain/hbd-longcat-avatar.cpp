@@ -25,7 +25,24 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
   −21% / 4-step 711s −42%, all with muxed audio). Owner's morning lip-sync call: 6-vs-4 at
   full length is the eyeball decision; default step count unchanged (8). Offload streaming
   makes full-length ~124 s/step (turnaround knob, not the hot path).
-- 🟢 **PERF/VRAM PHASE — DiT-sampling PROFILED, safe-speed search CLOSED (session 7,
+- 🟢 **PERF/VRAM lap 05 (session 9, 2026-05-26): re-opened the "compute-bound,
+  exhausted" verdict the owner flagged as premature. See `PERF.md` lap 05.** Ran the
+  four owner levers MEASURED. (1) step-invariant recompute = sub-noise, not worth
+  (assessed, recorded). (2) glue-op sweep: THREE clean cuts SHIPPED (`scale_bias`
+  fuse + redundant qkv-cont removal + audio silu reuse) — sampling 163.7→162.3s
+  (−0.86%), **bit-identical to BEST (99 dB)**. (3) Q4_0 quant: **−2.4% faster** (158.4
+  vs 162.3s 8-step) but quality NOT neutral (30.7 dB vs BEST) → OPT-IN gguf, default
+  stays Q4_K (better than the Q3_K dead-end). (4) BSA SCOPED: **the avatar inference
+  path runs DENSE by design** (ckpt `enable_bsa=False`, `proof_gen.py` forces it off,
+  BSA is batch>1-only in the reference) — so BSA/windowed-attn for the avatar would be
+  a quality CUT, NOT the native attention; do NOT implement it. The 93f VRAM wall is a
+  pure dense-activation memory problem: the lever-2 cont cut narrowed the 93f self-attn
+  sub-segment 12,675→12,008 MiB (**now misses the card by only ~107 MiB**, was ~770);
+  one more quality-neutral activation cut (de-double-buffer the qkv_out↔split_qkv cont,
+  or F16 q_rope/k_rope) likely clears native 93f. **NOTE: the older "safe-speed search
+  CLOSED" / "no default-on speed lever" framing was OVERSTATED — glue + Q4_0 + the 93f
+  activation lever all had real measured headroom left.** Commit `24d2d9c`.
+- 🟢 **PERF/VRAM PHASE — DiT-sampling PROFILED (session 7,
   2026-05-26). See `PERF.md` lap 03/03b. NOTE: the older "generated frames still
   noise" status below is STALE — the current tree renders COHERENT talking avatars
   (ac16≈0.83 on all 25 frames, frame-autocorr `tools/clip_compare.py`).**

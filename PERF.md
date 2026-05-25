@@ -39,7 +39,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 00  | BASELINE (`--vae-on-cpu`) + lever-1 fixes (fps 25 default, audio auto-mux) | 768.7 | 10535 | coherent (ac16≈0.83 all frames) | 83e3957 |
 | 01  | GPU VAE decode + spatial tiling (default-on for avatar) | 238.4 | 10779 | PSNR 40.1dB vs lap00 (min 36.2) | 736eb79 |
 | 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | bcda117 |
-| 03  | DiT-step PROFILED + reusable phase/op profilers + audio `gate_mul` (drop pointless zeros-add) | 237.8 (8) | 10779 | bit-identical to BEST (99 dB all frames) | _this lap_ |
+| 03  | DiT-step PROFILED + reusable phase/op profilers + audio `gate_mul` (drop pointless zeros-add) | 237.8 (8) | 10779 | bit-identical to BEST (99 dB all frames) | 877c258 |
+| 05  | DiT glue cuts: `scale_bias` fuse + redundant qkv-cont removal + audio silu reuse | sampling 162.3 (was 163.7) | 10779 | bit-identical to BEST (99 dB all frames) | 24d2d9c |
 
 (rows appended per lap below)
 
@@ -246,6 +247,99 @@ All carry muxed audio (pcm_s16le 16 kHz, verified via ffprobe). **Default step c
 (8).** The 6-vs-4 lip-sync fidelity at full length is the owner's eyeball call (same as lap 03b
 at 25f). Note: at full length the step count trades the same way as 25f (sampling is linear in
 steps), so 6-step ≈ −25% sampling, 4-step ≈ −50% sampling vs 8-step.
+
+### lap 05 — re-opened the "compute-bound, exhausted" verdict: glue cuts (shipped) + Q4_0 quant (faster, opt-in) + 93f wall narrowed; BSA verdict
+
+The lap-03 "no safe default-on pure-speed lever" conclusion was PARTIALLY premature.
+This lap re-ran the four owner-listed levers MEASURED. Results, honest:
+
+**Lever 1 — step-invariant recompute: ASSESSED, NOT WORTH (sub-noise).** The
+denoise loop runs the DiT 8× (cfg-scale 1.0 → one `compute()` per step, no
+cond/uncond doubling). Step-invariant recompute candidates: `y_embedder`
+(context projection, 2× Linear(4096,4096) on ~512 text tokens), `audio_proj`
+(AudioProjModel, proj1_vf 51200×512 on ~6 tokens), the RoPE `pe` table (already
+a fixed input buffer, set once). Math: the y_embedder is ~2 of the 730 MUL_MATs
+and runs on 512 tokens vs the per-block matmuls on 10920 — together y_embedder +
+audio_proj are <0.5% of a step. Caching them across `compute()` calls means
+persisting output tensors in a backend buffer (each step is a fresh graph in a
+reset compute_ctx) — real gallocr-aliasing risk (cf. siglip2/lap-01 VAE memo) for
+a <0.5% win. **Verdict: the saving is below the step-to-step noise floor; not
+implemented.** (Recorded so a future session doesn't re-derive it.)
+
+**Lever 2 — the ~28% glue ops: SWEPT, three clean cuts SHIPPED (lap 05).** The
+glue is diffuse but not untouchable. Three mathematically-exact, quality-neutral
+removals landed (`src/longcat_avatar.hpp`):
+  1. **`scale_bias` fuse.** `modulate()` and `FinalLayer` computed the adaLN
+     `(scale + 1)` as `ggml_add(scale, ggml_ext_ones(...))` — `ggml_ext_ones` is a
+     SCALE + a REPEAT (materialized ones tensor), then an ADD. Replaced with one
+     fused `ggml_scale_bias(scale, 1, 1)` (CUDA `dst = s*x + b`, single kernel).
+     Removes ~145 REPEATs + ~145 SCALEs/step (maps onto the profiled REPEAT 673 /
+     SCALE 1059 counts) and converts the ADD → scale_bias.
+  2. **Redundant qkv-cont removal.** `self_attn` did `ggml_reshape_4d(ggml_cont(
+     parts[i]))` on each of q/k/v. But `split_qkv` already conts the permuted qkv,
+     so each q/k/v view is a CONTIGUOUS outer-dim sub-block (split is along ne[3]=3)
+     that `reshape_4d` accepts directly (verified: `ggml_is_contiguous` true for an
+     outer-dim slice; render runs, no assert). Removes 3 full-size copies/block
+     (~179 MB @ 25f, ~613 MB @ 93f) × 48 blocks/step.
+  3. **Audio adaLN silu reuse.** The audio path recomputed `silu(t_mod)` that the
+     main adaLN already computed (`t_act`); now reuses it (−1 SiLU/block when audio
+     on).
+  - **Measured: sampling 163.66s → 162.26s @ 25f/8-step (−0.86%).** Output
+    **BIT-IDENTICAL to BEST** (PSNR 99 dB / ac16 identical all 25 frames). Small but
+    real and free — same class as lap-03 `gate_mul`. The remaining glue (the
+    `ggml_ext_attention_ext` internal permute-conts to the flash `[N,n_head,L,d]`
+    layout, the cond/noise split conts, the cross-attn kv-split conts) is either
+    flash-kernel-layout-required or on small tensors (n_ctx 512 / audio 32) — no
+    further large quality-neutral cut found. **The 28% is now genuinely diffuse +
+    mostly structural, not "untried".**
+
+**Lever 3 — Q4_0 quant: FASTER (−2.4%) but NOT quality-neutral → OPT-IN, default
+stays Q4_K.** lap-04 only tested Q3_K (dead: +7% slower + worse). Q4_0 is the
+untested faster-MMQ-path candidate. Requanted the DMD-folded q8_0 → Q4_0
+(`models/longcat-avatar-1.5-dit-dmd-q4_0.gguf`, 8.94 GB, same size as Q4_K).
+  - **Speed: 2-step sampling Q4_0 39.52s vs Q4_K 40.48s; 8-step 158.36s vs
+    162.26s = −2.4%.** Real (Q4_0's simpler block format has a leaner MMQ dp4a path
+    on Ampere than Q4_K's K-means + scale-min unpack). Refutes the implicit
+    "Q4_K is the floor" — Q4_0 IS faster here.
+  - **Quality: NOT neutral.** 8-step Q4_0 vs BEST = mean PSNR **30.70 dB, min
+    25.38 dB** (clip stays coherent, ac16 ~0.83 tracking BEST, latent healthy std
+    0.883 nnan=0) — but 30 dB ≠ the 99 dB bit-identical bar and below the ~37 dB
+    VAE ceiling, so it's a VISIBLY different render. Q4_0's coarser quant shifts the
+    denoise trajectory; mouth/lip fidelity (what matters for an avatar) is a
+    human-eyeball call, same as `--steps 6`. **Default unchanged (Q4_K). Q4_0 gguf
+    kept as an opt-in speed knob; A/B clip `models/_perf/lap05_q4_0_8step.webm`.**
+    Better outcome than Q3_K (which was slower AND worse).
+
+**Lever 4 — BSA / long-seq attention: SCOPED. Verdict: BSA is the WRONG tool for
+this port (it's a quality cut here), and the 93f VRAM wall is now ~107 MiB away
+via the lever-2 cont cut, but closing it needs more dense-activation surgery.**
+  - **The reference avatar inference path runs DENSE, not BSA — by design.** The
+    ckpt config ships `enable_bsa=False, bsa_params=None`; `proof_gen.py` (the
+    single-audio→video path we port) explicitly sets `m.enable_bsa = False`;
+    `modules/avatar/attention.py:69` only uses BSA when `batch>1` ("bsa will not be
+    used in image training / sampling") and DISABLES it in the cond/noise split
+    ("close bsa to prevent the temporal dimension from being divisible by bsa
+    chunks"). BSA (`block_sparse_attention/`) is a DYNAMIC content-dependent sparse
+    pattern (block-mean Q/K → top-k / CDF-threshold block selection) in a 946-LoC
+    custom Triton kernel — used by the BASE long-video model for multi-batch/cp-split,
+    NOT the avatar singletalk. The avatar noise-token self-attn is
+    `_process_attn(q_noise, k, v)` = **full dense over all K/V**. So implementing BSA
+    (or any windowed/temporal-chunked K/V) for the avatar would be a SPARSE
+    APPROXIMATION of the reference dense attention = a QUALITY CUT, which the lever
+    rules forbid. **Do not implement BSA for the avatar port.**
+  - **The 93f wall is purely a dense-activation memory problem (quality-neutral to
+    attack).** lap-04 measured the 93f self-attn sub-segment at 12,675 MiB atomic.
+    The lever-2 qkv-cont removal (3× ~613 MB freed) cut it to **12,008 MiB** (probed:
+    `ggml_gallocr_reserve` wants 12591433856 B). The card exposes ~11,901 MiB free
+    → **93f now misses by only ~107 MiB** (was ~770). 85f still OOMs (frag-class, a
+    580 MiB mid-run alloc fails). So the cont cut measurably narrowed the wall but
+    didn't clear 93f. Closing the last ~107 MiB needs MORE quality-neutral
+    dense-activation reduction in the self-attn sub-segment (candidates, none yet
+    done: avoid the qkv_out↔split_qkv-cont 1.84 GB double-buffering by restructuring
+    the qkv split; free q/k pre-RoPE earlier; F16 the q_rope/k_rope intermediates).
+    These are 93f-only (the 25f hot path already fits) — a turnaround-knob win, not
+    hot-path. **81f remains the shipped full-length; 93f is one more activation
+    lever away, NOT a fundamental wall.** See PORT-PROGRESS for the exact next cut.
 
 ### lever 5 — Q3_K quant ladder: DEAD END on Ampere (measured, no lap)
 - DiT is uniform Q4_K (MUL_MAT 38% of the step). Tested whether a smaller Q3_K DiT
