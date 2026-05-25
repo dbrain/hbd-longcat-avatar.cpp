@@ -3094,6 +3094,13 @@ public:
         }
         return ggml_ext_linear(ctx->ggml_ctx, x, w, b, force_prec_f32, scale);
     }
+
+    // Raw weight/bias accessors for callers that need to slice the weight (e.g.
+    // splitting a fused qkv matmul into per-output matmuls to bound the activation
+    // peak). Only valid when no runtime weight_adapter (LoRA) is active.
+    ggml_tensor* get_weight() { return params["weight"]; }
+    ggml_tensor* get_bias() { return bias ? params["bias"] : nullptr; }
+    bool get_force_prec_f32() const { return force_prec_f32; }
 };
 
 __STATIC_INLINE__ bool support_get_rows(ggml_type wtype) {

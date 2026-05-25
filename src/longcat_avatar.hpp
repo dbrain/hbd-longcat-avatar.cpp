@@ -34,6 +34,14 @@ namespace LONGCAT_AVATAR {
         float eps;
 
     public:
+        // >1 tiles the SwiGLU FFN over token blocks to bound its activation peak
+        // at full length (set by the runner from LONGCAT_FFN_TILES; 1 = original
+        // single-shot path, used for the 25f hot path so it stays bit-identical).
+        int64_t ffn_token_tiles = 1;
+        // >1 tiles the self-attn noise pass over query-row blocks (same idea, for the
+        // self-attention working set). 1 = original single-shot call (25f hot path).
+        int64_t attn_query_tiles = 1;
+
         LongCatAvatarSingleStreamBlock(int64_t hidden_size,
                                        int64_t num_heads,
                                        int64_t ffn_inner,
@@ -179,11 +187,33 @@ namespace LONGCAT_AVATAR {
             int64_t N       = x->ne[2];
             int64_t n_token = x->ne[1];
 
-            auto qkv_out = qkv->forward(ctx, x);  // [N, n_token, 3*C]
-            auto parts   = split_qkv(ctx->ggml_ctx, qkv_out);
-            // split_qkv already conts the permuted qkv, so each q/k/v view is a
-            // contiguous sub-block (split is along the outermost dim) — reshape_4d
-            // accepts it directly without an extra full-size copy.
+            // Self-attn qkv. The fused qkv Linear produces a [3*C, n_token] tensor, and
+            // split_qkv() then reshapes+permutes+CONTs the WHOLE thing into a second
+            // contiguous [3, C, n_token] buffer before viewing q/k/v. At full length
+            // (93f, n_token~37k) qkv_out is ~1.75 GiB and its cont is a SECOND ~1.75 GiB
+            // — the two coexist and are the dominant resident compute-buffer peak
+            // (~3.5 GiB of the 5.3 GiB monolithic reserve; localized via
+            // GGML_ALLOCATOR_DEBUG). Instead, split the qkv WEIGHT (out-dim = 3*C, the
+            // ggml ROW dim ne[1] — Q4_K rows are independently quantized, so row-slices
+            // are exact) into Wq/Wk/Wv views and run three separate matmuls. Each output
+            // is only ~0.58 GiB and no fused [3*C] buffer or its cont is ever
+            // materialized: peak self-attn extraction is q+k+v (~1.75 GiB) instead of
+            // qkv_out+cont (~3.5 GiB). Mathematically identical to the fused matmul.
+            int64_t Cq      = hidden_size;
+            auto qkv_w_full = qkv->get_weight();  // ggml ne=[C, 3C]
+            auto qkv_b_full = qkv->get_bias();    // ggml ne=[3C]
+            const bool pf32_qkv = qkv->get_force_prec_f32();
+            auto qkv_part = [&](int idx) {
+                // weight rows [idx*C, (idx+1)*C) — contiguous along ne[1].
+                auto w = ggml_view_2d(ctx->ggml_ctx, qkv_w_full, qkv_w_full->ne[0], Cq,
+                                      qkv_w_full->nb[1], qkv_w_full->nb[1] * Cq * idx);
+                ggml_tensor* b = nullptr;
+                if (qkv_b_full) {
+                    b = ggml_view_1d(ctx->ggml_ctx, qkv_b_full, Cq, qkv_b_full->nb[0] * Cq * idx);
+                }
+                return ggml_ext_linear(ctx->ggml_ctx, x, w, b, pf32_qkv, 1.0f);  // [C, n_token, N]
+            };
+            ggml_tensor* parts[3] = {qkv_part(0), qkv_part(1), qkv_part(2)};
             auto q       = ggml_reshape_4d(ctx->ggml_ctx, parts[0], head_dim, num_heads, n_token, N);
             auto k       = ggml_reshape_4d(ctx->ggml_ctx, parts[1], head_dim, num_heads, n_token, N);
             auto v       = ggml_reshape_4d(ctx->ggml_ctx, parts[2], head_dim, num_heads, n_token, N);
@@ -232,12 +262,35 @@ namespace LONGCAT_AVATAR {
                 auto x_cond = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_cond, k_cond, v_cond,
                                                      num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, n_cond, C]
 
-                // noise pass: q_noise × {k,v}_full  (noise tokens see everything)
-                auto q_noise = ggml_view_3d(ctx->ggml_ctx, q_rope, q_rope->ne[0], L_noise, q_rope->ne[2],
-                                            q_rope->nb[1], q_rope->nb[2], q_rope->nb[1] * n_cond_tokens);
-                q_noise      = ggml_cont(ctx->ggml_ctx, q_noise);
-                auto x_noise = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_noise, k_rope, v,
-                                                      num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, L_noise, C]
+                // noise pass: q_noise × {k,v}_full  (noise tokens see everything).
+                // Optionally TILE over query blocks: flash-attn output for a query row
+                // is independent of other query rows (each query attends the full K/V),
+                // so splitting q_noise into row-blocks and concatenating outputs is
+                // mathematically exact. This bounds the per-call q-cont + attention
+                // output to a tile (~585 MiB/attn_tiles at 93f) instead of the full
+                // L_noise extent — k_rope/v stay shared. attn_query_tiles==1 (the 25f
+                // hot path) is the original single-shot call, bit-for-bit.
+                ggml_tensor* x_noise = nullptr;
+                int64_t qtiles = attn_query_tiles;
+                if (qtiles > 1 && L_noise > qtiles) {
+                    int64_t base = (L_noise + qtiles - 1) / qtiles;
+                    for (int64_t off = 0; off < L_noise; off += base) {
+                        int64_t len = std::min<int64_t>(base, L_noise - off);
+                        auto q_t    = ggml_view_3d(ctx->ggml_ctx, q_rope, q_rope->ne[0], len, q_rope->ne[2],
+                                                   q_rope->nb[1], q_rope->nb[2],
+                                                   q_rope->nb[1] * (n_cond_tokens + off));
+                        q_t         = ggml_cont(ctx->ggml_ctx, q_t);
+                        auto x_t    = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_t, k_rope, v,
+                                                          num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);
+                        x_noise     = x_noise == nullptr ? x_t : ggml_concat(ctx->ggml_ctx, x_noise, x_t, 1);
+                    }
+                } else {
+                    auto q_noise = ggml_view_3d(ctx->ggml_ctx, q_rope, q_rope->ne[0], L_noise, q_rope->ne[2],
+                                                q_rope->nb[1], q_rope->nb[2], q_rope->nb[1] * n_cond_tokens);
+                    q_noise      = ggml_cont(ctx->ggml_ctx, q_noise);
+                    x_noise      = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_noise, k_rope, v,
+                                                          num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, L_noise, C]
+                }
 
                 out = ggml_concat(ctx->ggml_ctx, x_cond, x_noise, 1);  // [N, n_token, C]
             } else {
@@ -484,12 +537,44 @@ namespace LONGCAT_AVATAR {
 
             subcut(x, "post_cross_attn");
 
-            // ffn (SwiGLU) with modulation
+            // ffn (SwiGLU) with modulation.
             auto y = modulate(ctx, mod_norm_ffn, x, ms[3], ms[4], T);
-            auto g  = ggml_silu(ctx->ggml_ctx, ffn_w1->forward(ctx, y));
-            auto u  = ffn_w3->forward(ctx, y);
-            auto gu = ggml_mul(ctx->ggml_ctx, g, u);
-            y      = ffn_w2->forward(ctx, gu);
+            // The SwiGLU inner (w1/w3 -> silu*up -> w2) materializes three
+            // [ffn_inner=11008, n_token] F32 transients (g, u, gu). At full length
+            // (93f, n_token~37k) that triple is ~4.6 GiB — the dominant resident
+            // compute-buffer peak (the FFN sub-segment). The SwiGLU is purely
+            // per-token, so we TILE it over token blocks: each tile materializes
+            // only [11008, tile] transients, bounding the FFN peak to ~(tile/n_token)
+            // of the full triple. Mathematically identical (no token mixing in the
+            // FFN). ffn_tiles==1 (the default for the 25f hot path) is the original
+            // single-shot path, bit-for-bit. >1 only kicks in at large n_token.
+            int64_t n_tok = y->ne[1];
+            int64_t tiles = ffn_token_tiles;
+            if (tiles > 1 && n_tok > tiles) {
+                // tile size rounded up; last tile shorter. No T-divisibility needed
+                // (the SwiGLU is per-token; modulation already applied to y).
+                int64_t base = (n_tok + tiles - 1) / tiles;
+                int64_t C    = y->ne[0];
+                int64_t Nb   = y->ne[2];
+                ggml_tensor* out_ffn = nullptr;
+                for (int64_t off = 0; off < n_tok; off += base) {
+                    int64_t len   = std::min<int64_t>(base, n_tok - off);
+                    auto y_t      = ggml_view_3d(ctx->ggml_ctx, y, C, len, Nb,
+                                                 y->nb[1], y->nb[2], y->nb[1] * off);
+                    y_t           = ggml_cont(ctx->ggml_ctx, y_t);
+                    auto g_t      = ggml_silu(ctx->ggml_ctx, ffn_w1->forward(ctx, y_t));
+                    auto u_t      = ffn_w3->forward(ctx, y_t);
+                    auto gu_t     = ggml_mul(ctx->ggml_ctx, g_t, u_t);
+                    auto o_t      = ffn_w2->forward(ctx, gu_t);  // [C, len, Nb]
+                    out_ffn       = out_ffn == nullptr ? o_t : ggml_concat(ctx->ggml_ctx, out_ffn, o_t, 1);
+                }
+                y = out_ffn;
+            } else {
+                auto g  = ggml_silu(ctx->ggml_ctx, ffn_w1->forward(ctx, y));
+                auto u  = ffn_w3->forward(ctx, y);
+                auto gu = ggml_mul(ctx->ggml_ctx, g, u);
+                y       = ffn_w2->forward(ctx, gu);
+            }
             x      = gate_add(ctx, x, y, ms[5], T);
 
             return x;
@@ -817,8 +902,37 @@ namespace LONGCAT_AVATAR {
                 sd::ggml_graph_cut::mark_graph_cut(audio, "longcat.prelude", "audio");
             }
 
+            // FFN token-tiling: bound the SwiGLU's [11008, n_token] transient triple
+            // at full length. Off (tiles=1, bit-identical single-shot) below a token
+            // threshold so the 25f hot path is unchanged; LONGCAT_FFN_TILES overrides
+            // (0/unset = auto: 1 below threshold, else a count that keeps each tile
+            // ~10k tokens). The FFN is purely per-token so tiling is exact.
+            int64_t n_token_total = x->ne[1];
+            int64_t ffn_tiles     = 1;
+            int64_t attn_tiles    = 1;
+            {
+                const char* fenv = getenv("LONGCAT_FFN_TILES");
+                if (fenv != nullptr && atoi(fenv) > 0) {
+                    ffn_tiles = atoi(fenv);
+                } else if (n_token_total > 16000) {
+                    // auto: target ~10k tokens/tile (matches the 25f single-shot extent
+                    // that already fits comfortably).
+                    ffn_tiles = (n_token_total + 9999) / 10000;
+                }
+                // attn query-tiling is OPT-IN only (LONGCAT_ATTN_TILES): the
+                // concat-accumulated output buffer grows per tile and gallocr can't
+                // reuse it, so auto-tiling raised the peak (3629 -> 4494 MiB at 93f).
+                // Kept as a knob; not auto-engaged.
+                const char* aenv = getenv("LONGCAT_ATTN_TILES");
+                if (aenv != nullptr && atoi(aenv) > 0) {
+                    attn_tiles = atoi(aenv);
+                }
+            }
+
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<LongCatAvatarSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
+                block->ffn_token_tiles  = ffn_tiles;
+                block->attn_query_tiles = attn_tiles;
                 x          = block->forward(ctx, x, t_emb, context, pe, audio, T, n_cond_tokens, i);
                 sd::ggml_graph_cut::mark_graph_cut(x, "longcat.blocks." + std::to_string(i) + ".out", "x");
                 if (i == 0) {
