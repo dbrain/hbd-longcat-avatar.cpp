@@ -247,7 +247,18 @@ All carry muxed audio (pcm_s16le 16 kHz, verified via ffprobe). **Default step c
 at 25f). Note: at full length the step count trades the same way as 25f (sampling is linear in
 steps), so 6-step ≈ −25% sampling, 4-step ≈ −50% sampling vs 8-step.
 
-### lever 3 — GPU text encode: DEAD END on this VRAM budget (no lap)
+### lever 5 — Q3_K quant ladder: DEAD END on Ampere (measured, no lap)
+- DiT is uniform Q4_K (MUL_MAT 38% of the step). Tested whether a smaller Q3_K DiT
+  speeds up the matmuls. Requant the DMD-folded q8_0 intermediate → Q3_K (6.84 GB vs
+  Q4_K 8.94 GB, −2.1 GB) via `sd-cli -M convert --tensor-type-rules
+  "model.diffusion_model.=q3_K"`.
+- **VERIFY-FIRST measurement (25f / 2-step / resident weights, the cheap fast path):**
+  Q4_K **20.4 s/step** vs Q3_K **21.8 s/step (+7% SLOWER)**. Despite 2.1 GB less weight
+  bandwidth, ggml's Q3_K MMQ kernel costs more per matmul on Ampere (3-bit unpack), and
+  this DiT is COMPUTE-bound (lap 03), not bandwidth-bound at batch-2 — so smaller weights
+  don't help. Same finding class as the memory note "Q5_K_M slower than Q4_K_M on Ampere;
+  Q4_K is near the floor." **No speed gain + worse quality → not pursued.** Q3_K gguf
+  deleted (kept nothing slower-and-worse around). Q4_K stays the prod DiT quant.
 - umT5 text encode is 16.4s one-time on CPU (`--clip-on-cpu`). Tried dropping the
   flag to run it on GPU. → **immediate CUDA OOM at load**: new_sd_ctx allocates
   ALL param buffers upfront, so umT5 (6 GB) + DiT (8.5 GB) = 14.5 GB coexist at
