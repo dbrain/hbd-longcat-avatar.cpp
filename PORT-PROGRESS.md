@@ -11,6 +11,20 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **FULL-LENGTH (81f / 3.24s) RENDERS LAND via graph-cut + CPU-offload (session 8,
+  2026-05-26). See `PERF.md` lap 04.** The native 93-frame segment OOMs a 12 GB card —
+  the monolithic DiT forward reserves a ~13.3 GiB activation buffer at ~37k tokens, over
+  the card even with zero resident weights. Fix (`src/longcat_avatar.hpp`, committed):
+  per-block + intra-block (self-attn / cross-attn / FFN) graph-cut boundaries mirroring
+  `anima.hpp`, so with `--offload-to-cpu --max-vram 9` the GGMLRunner segmented path
+  reserves one sub-segment's buffer at a time and streams its weights from CPU. **Fits up
+  to 81 frames (peak 11603 MiB); 85f+ and the native 93f OOM** (the per-block self-attn
+  sub-segment is an atomic 12.6 GiB at 93f — would need intra-attention temporal chunking).
+  Marks are inert when weights are resident, so the 25f fast path is unchanged. Full-length
+  A/B set in `models/_perf/fulllen_81f_{8,6,4}step.webm` (8-step wall 1218s / 6-step 967s
+  −21% / 4-step 711s −42%, all with muxed audio). Owner's morning lip-sync call: 6-vs-4 at
+  full length is the eyeball decision; default step count unchanged (8). Offload streaming
+  makes full-length ~124 s/step (turnaround knob, not the hot path).
 - 🟢 **PERF/VRAM PHASE — DiT-sampling PROFILED, safe-speed search CLOSED (session 7,
   2026-05-26). See `PERF.md` lap 03/03b. NOTE: the older "generated frames still
   noise" status below is STALE — the current tree renders COHERENT talking avatars

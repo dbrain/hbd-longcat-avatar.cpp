@@ -239,8 +239,8 @@ path. VAE tiled decode at 81f is ~175s (10 tiles × ~17.5s; bigger temporal exte
 | steps | wall (s) | sampling (s) | decode (s) | peak VRAM (MiB) | vs 8-step | clip |
 |-------|----------|--------------|------------|-----------------|-----------|------|
 | 8 (default) | 1217.99 | 992.23 | 174.95 | 11603 | — | `models/_perf/fulllen_81f_8step.webm` |
-| 6 | _pending_ | | | | | `fulllen_81f_6step.webm` |
-| 4 | _pending_ | | | | | `fulllen_81f_4step.webm` |
+| 6 | 966.58 | 743.68 | ~175 | 11603 | **−21%** | `fulllen_81f_6step.webm` |
+| 4 | 710.92 | 495.63 | 175.06 | 11603 | **−42%** | `fulllen_81f_4step.webm` |
 
 All carry muxed audio (pcm_s16le 16 kHz, verified via ffprobe). **Default step count unchanged
 (8).** The 6-vs-4 lip-sync fidelity at full length is the owner's eyeball call (same as lap 03b
