@@ -38,7 +38,7 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 |-----|-------|----------|-----------------|---------|--------|
 | 00  | BASELINE (`--vae-on-cpu`) + lever-1 fixes (fps 25 default, audio auto-mux) | 768.7 | 10535 | coherent (ac16≈0.83 all frames) | 83e3957 |
 | 01  | GPU VAE decode + spatial tiling (default-on for avatar) | 238.4 | 10779 | PSNR 40.1dB vs lap00 (min 36.2) | 736eb79 |
-| 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | (this lap) |
+| 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | bcda117 |
 
 (rows appended per lap below)
 
@@ -99,3 +99,15 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
   eyeball call (the structural metrics can't judge mouth fidelity), and the LoRA's
   distill target is 8. Shipped as an opt-in `--steps 6` speed lever; default 8.
 - Checkpoint clip: `models/_perf/lap02_6steps.webm` (6-step, for A/B vs lap01 8-step).
+
+### lever 3 — GPU text encode: DEAD END on this VRAM budget (no lap)
+- umT5 text encode is 16.4s one-time on CPU (`--clip-on-cpu`). Tried dropping the
+  flag to run it on GPU. → **immediate CUDA OOM at load**: new_sd_ctx allocates
+  ALL param buffers upfront, so umT5 (6 GB) + DiT (8.5 GB) = 14.5 GB coexist at
+  init and blow the 12 GB card before any compute runs.
+- Putting umT5 on GPU would need lazy load order (load TE → encode → free → load
+  DiT), which the init path doesn't do — deeper offload surgery for a ~14s
+  one-time win. Not worth it. **Keep umT5 on CPU (`--clip-on-cpu`).**
+- Free win already banked in lap 01: with the VAE on GPU, the ref-image
+  `encode_first_stage` dropped 16.3s (CPU) → 1.9s (GPU). That was the bigger
+  one-time cost and it's gone.
