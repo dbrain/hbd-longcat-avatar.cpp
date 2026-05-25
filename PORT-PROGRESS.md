@@ -11,6 +11,25 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 07 (session 11, 2026-05-26): QKV-SPLIT — −1.7 GiB resident @ 93f AND −9.5% on the
+  25f hot path, both bit-identical. See `PERF.md` lap 07.** `GGML_ALLOCATOR_DEBUG` re-localized the
+  resident (no-offload, monolithic) 93f peak: after lap-06 removed the flash mask, the peak was the
+  **fused `attn.qkv` Linear output (~1.75 GiB) + its `split_qkv` permute-CONT (~1.75 GiB)** stacked.
+  Fix: split the qkv WEIGHT (out-dim rows; Q4_K rows are independently quantized → exact row-slice)
+  into Wq/Wk/Wv and run three separate matmuls — no fused `[3*C]` buffer or its cont ever
+  materializes (`get_weight()`/`get_bias()` accessors added to `Linear`; the split is in
+  `self_attn`, `src/longcat_avatar.hpp`). **93f resident monolithic 5,323 → 3,629 MiB (−1,694);
+  25f sampling 162.3 → 146.8 s (−9.5%, one fewer 1.75 GiB permute-cont/block × 48); 25f BIT-IDENTICAL
+  to BEST (99 dB); 93f offload BIT-IDENTICAL to lap-06 native (99 dB all 93 frames), 120.7 → 117.4
+  s/step, segs 49 → 33.** Also shipped FFN token-tiling (`LONGCAT_FFN_TILES`, auto >16k tok; 1 =
+  single-shot/bit-identical on the 25f path) to bound the SwiGLU `[11008, n_token]` triple at full
+  length. **Resident 93f still OOMs by ~530 MiB:** the 3,629 floor is four ~585 MiB `[4096, n_token]`
+  F32 tensors (q_rope MUST be F32 — flash kernel asserts it — + residual x + k_rope/v). F16-casting
+  k/v did NOT move the peak (they're downstream of the peak offset) and self-attn query-tiling made
+  it WORSE (shared k/v stay live, concat grows) — both measured + reverted/opt-in. 93f ships via
+  offload (~117 s/step); resident-fit would need a structural rework of the self-attn working set.
+  Commit `2ce48ee` on `longcat-avatar-port` (code: `ggml_extend.hpp` + `longcat_avatar.hpp`).
+
 - 🟢 **NATIVE FULL-LENGTH (93f / 3.72s) NOW RENDERS — the 12 GB wall is CLEARED (session 10,
   2026-05-26). See `PERF.md` lap 06.** The 93f self-attn VRAM peak was NOT the qkv
   double-buffer the lap-05 handoff flagged — `GGML_ALLOCATOR_DEBUG` localized it to a

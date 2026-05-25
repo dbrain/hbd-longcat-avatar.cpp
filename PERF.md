@@ -41,7 +41,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 02  | configurable DMD steps (default 8; `--steps 6` opt-in) | 238.4 (8) / 197.4 (6) | 10779 | 8-step unchanged; 6-step coherent, ~35.6dB vs 8-step | bcda117 |
 | 03  | DiT-step PROFILED + reusable phase/op profilers + audio `gate_mul` (drop pointless zeros-add) | 237.8 (8) | 10779 | bit-identical to BEST (99 dB all frames) | 877c258 |
 | 05  | DiT glue cuts: `scale_bias` fuse + redundant qkv-cont removal + audio silu reuse | sampling 162.3 (was 163.7) | 10779 | bit-identical to BEST (99 dB all frames) | 24d2d9c |
-| 06  | `flash_skip_kv_pad`: drop the legacy flash kv-pad mask (NOT the qkv double-buffer) → NATIVE 93f renders | 25f unchanged; 93f offload sampling 965.6 (120.7/step) | 93f self-attn seg 12008→5511 | 25f BIT-IDENTICAL to BEST (99 dB); 93f coherent ac16≈0.82 all 93f | lap-06 (HEAD) |
+| 06  | `flash_skip_kv_pad`: drop the legacy flash kv-pad mask (NOT the qkv double-buffer) → NATIVE 93f renders | 25f unchanged; 93f offload sampling 965.6 (120.7/step) | 93f self-attn seg 12008→5511 | 25f BIT-IDENTICAL to BEST (99 dB); 93f coherent ac16≈0.82 all 93f | lap-06 |
+| 07  | split fused qkv → per-output matmuls (kills the 1.75 GiB qkv permute-cont) + FFN token-tiling (auto >16k tok) | 25f sampling 162.3→**146.8 (−9.5%)**; 93f offload 939.2 (117.4/step) | 93f RESIDENT monolithic 5323→**3629** (−1694); offload segs merge 49→33 | 25f **BIT-IDENTICAL to BEST (99 dB)**; 93f offload **BIT-IDENTICAL to lap-06 native (99 dB all 93f)** | 2ce48ee (HEAD) |
 
 (rows appended per lap below)
 
@@ -403,6 +404,64 @@ only over PAD positions that no longer exist once we don't pad.
 sizes at every compute-buffer high-water — the reliable way to localize a VRAM peak. The
 fine-grained `mark_graph_cut`-inside-self_attn probe approach is FRAGILE (breaks
 `build_segment_graph` for tensors consumed within the same logical region) — don't use it.
+NOTE: gallocr reports the live set at the FINAL high-water *header*, but the peak OFFSET is
+reached by tensors allocated EARLIER (it sizes the chunk to the max offset ever used, not the
+max simultaneous-live sum). Read the offsets, not just the trailing tensor list — the peak is
+"what coexists at the highest offset", which the per-header dumps + offsets together reveal.
+
+### lap 07 — the resident 93f peak was the FUSED QKV BUFFER (+ its permute-cont), NOT the flash mask: split qkv into per-output matmuls → −1.7 GiB resident & −9.5% on the 25f hot path
+
+**`GGML_ALLOCATOR_DEBUG` re-localized the 93f resident (no-offload, monolithic) peak.** After
+lap-06 killed the flash kv-pad mask, the resident 93f monolithic compute buffer was **5,323 MiB**
+(weights 8,539–8,781 MiB → no room). The debug dump showed the high-water offset was driven by
+**two ~1,755 MiB `[3*C, n_token]` F32 buffers stacked** (offsets ~1.8→3.6 GiB): the fused
+`attn.qkv` Linear output AND the `split_qkv` permute-CONT of it. At 93f (~37,440 tokens) each is
+~1.75 GiB. (This is the qkv double-buffer the lap-05 handoff *first* suspected — lap-06 correctly
+found the mask was the *segmented* peak, but the qkv pair is the *resident monolithic* peak once
+the mask is gone.)
+
+**FIX (committed, bit-identical, default-on): split the fused qkv matmul into three per-output
+matmuls.** The fused `attn.qkv` weight is `[in=C, out=3C]` (ggml ne=`[C,3C]`); the out-dim 3C is
+the ggml ROW dim, and Q4_K rows are independently quantized, so a contiguous **row-slice** of the
+weight is an exact Wq/Wk/Wv. Run `q=Wq·x`, `k=Wk·x`, `v=Wv·x` separately (`get_weight()`/`get_bias()`
+accessors added to `Linear`; the qkv `Linear` is bypassed in `self_attn`). No fused `[3*C]` buffer
+or its permute-cont is ever materialized. Mathematically identical to the fused matmul (same rows,
+F32 accum).
+- **93f RESIDENT monolithic compute buffer: 5,323 → 3,629 MiB (−1,694).** (Still OOMs resident —
+  see below.)
+- **25f sampling: 162.3 → 146.8 s (−9.5%).** Real, not noise: it removes one full `[3*C, n_token]`
+  permute-CONT per block × 48 blocks (the split_qkv cont was the cost). A speed win on the hot path,
+  not just VRAM.
+- **25f output BIT-IDENTICAL to BEST (PSNR 99 dB / ac16 identical, all 25 frames).**
+- **93f offload (the shipped full-length path): sampling 965.6 → 939.2 s (120.7 → 117.4 s/step),
+  budget-merge segments 49 → 33** (smaller self-attn segment merges more aggressively), and the
+  8-step 93f offload clip is **BIT-IDENTICAL to the lap-06 native 93f (PSNR 99 dB all 93 frames)** —
+  proves the split is exact at full length too. `models/_perf/lap07_fulllen_93f_8step.webm`.
+
+**Also shipped: FFN token-tiling.** The SwiGLU inner (`w1`/`w3` → silu·up → `w2`) materializes three
+`[ffn_inner=11008, n_token]` F32 transients (~4.6 GiB at 93f). The FFN is purely per-token, so it's
+tiled over token blocks (`LONGCAT_FFN_TILES`, auto-on >16k tokens at ~10k tok/tile; **1 = the
+bit-identical single-shot path on the 25f hot path**). This kept the FFN region below the self-attn
+peak in the resident graph (it was NOT in the 3,629 MiB peak set).
+
+**RESIDENT 93f STILL OOMs by ~530 MiB — and the remaining floor is HARD.** The 3,629 MiB peak is
+**four ~585 MiB `[4096, n_token]` F32 tensors** coexisting in the self-attn working set: q_rope
+(must stay F32 — `ggml_flash_attn_ext` ASSERTS `q->type==F32`), the residual `x`, and two of
+{k_rope, v, the qkv matmul outputs}. Resident-fit needs compute ≤ ~3.1 GiB (GPU-VAE) / ≤ ~3.36 GiB
+(VAE-on-CPU). **Levers TRIED this lap that did NOT move the peak (all measured, reverted):**
+  - **F16-cast k_rope and v before attention** (with the kv_scale guard, exactly what build_kqv
+    does internally; added `k/v_prescaled_f16` params to skip the redundant internal cast). Peak
+    unchanged at 3,629 MiB — the four 585 MiB F32 tensors at the peak are NOT k_rope/v (their F16
+    versions are downstream of the peak offset). The casts add graph ops for zero resident win and
+    were reverted. (q can't be F16 → flash assert.)
+  - **Self-attn query-block tiling** (`LONGCAT_ATTN_TILES`, opt-in, kept but NOT auto): tiling the
+    noise pass over query rows raised the peak 3,629 → 4,494 MiB. Unlike the FFN (where `w1/w3` read
+    only the tile of `y`), the self-attn tiles all read the FULL shared k_rope/v (~1,170 MiB, live
+    throughout), so tiling adds a growing concat-accumulated output buffer on TOP of the unchanged
+    shared inputs. **Self-attn query-tiling is a DEAD lever for VRAM on this shape — don't auto-engage.**
+
+**Clips:** `models/_perf/lap07_qkvsplit_25f.webm` (25f, = BEST), `lap07_fulllen_93f_8step.webm`
+(93f offload, = lap-06 native).
 
 ### lever 5 — Q3_K quant ladder: DEAD END on Ampere (measured, no lap)
 - DiT is uniform Q4_K (MUL_MAT 38% of the step). Tested whether a smaller Q3_K DiT
@@ -454,6 +513,22 @@ fine-grained `mark_graph_cut`-inside-self_attn probe approach is FRAGILE (breaks
   default-on pure-speed lever remains, only quality-sensitive steps/quant.
 
 ## NEXT (if a future session continues)
+- **lap 07 update — the "compute-bound, no speed lever" verdict was AGAIN partly premature.**
+  Splitting the fused qkv matmul dropped 25f sampling −9.5% (162.3 → 146.8 s) AND the 93f resident
+  peak −1.7 GiB — by REMOVING a per-block full-size permute-cont, not by touching the matmul/flash
+  compute. The lesson holds: PROFILE the allocator + op set, don't assume the floor.
+- **Two threads left for a future session, both for RESIDENT 93f (the ~530 MiB still over):**
+  1. **Structural self-attn working-set rework.** The 3,629 MiB resident floor is four ~585 MiB
+     `[4096, n_token]` F32 tensors. q_rope must stay F32 (flash asserts). The realistic cut is to
+     restructure so that fewer than four full-token F32 buffers coexist — e.g. fuse q_norm/RoPE to
+     write q_rope in place over q (avoid a separate buffer), or compute v lazily after q/k are
+     consumed. Needs careful liveness reasoning (gallocr schedules by dependency, not source order —
+     the lap-07 F16-cast attempts failed because they were downstream of the peak offset). Measure
+     with `GGML_ALLOCATOR_DEBUG` + OFFSETS (see the diagnostic note in lap 07).
+  2. **Front B (helps ALL lengths incl. 25f): the hot-path kernels are still untouched** — lap-03
+     profiled MUL_MAT 38% + FLASH_ATTN 34%. The qkv-split already shaved the glue; the genuine
+     compute (Q4_K MMQ at head_dim 128 / flash-attn for d=128 on Ampere) has had NO custom-kernel
+     work. The ggml submodule is editable. This is the biggest remaining speed surface.
 - **lap 03 closed the safe-pure-speed search on DiT sampling.** The step is now
   PROFILED and proven compute-bound: MUL_MAT 38% + FLASH_ATTN 34% = 72% irreducible
   Q4_K compute, build/alloc/copy ~5 ms/step. **CUDA-graph reuse is DEAD** (no
