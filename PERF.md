@@ -36,7 +36,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 
 | lap | lever | wall (s) | peak VRAM (MiB) | quality | commit |
 |-----|-------|----------|-----------------|---------|--------|
-| 00  | BASELINE (`--vae-on-cpu`) + lever-1 fixes (fps 25 default, audio auto-mux) | 768.7 | 10535 | coherent (ac16≈0.83 all frames) | (this lap) |
+| 00  | BASELINE (`--vae-on-cpu`) + lever-1 fixes (fps 25 default, audio auto-mux) | 768.7 | 10535 | coherent (ac16≈0.83 all frames) | 83e3957 |
+| 01  | GPU VAE decode + spatial tiling (default-on for avatar) | 238.4 | 10779 | PSNR 40.1dB vs lap00 (min 36.2) | (this lap) |
 
 (rows appended per lap below)
 
@@ -54,3 +55,29 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 - Lever 1 validated: output webm has a `pcm_s16le @ 16000 Hz` audio stream
   auto-muxed (verified via ffprobe); fps defaults to 25 when `--audio` is given.
 - Checkpoint clip: `models/_perf/lap00_baseline.webm`.
+
+### lap 01 — GPU VAE decode + spatial tiling (lever 2, THE big one)
+- **First tried: drop `--vae-on-cpu`, full-clip GPU decode.** → **CUDA OOM** at
+  peak ~11.9 GiB. The Wan-VAE temporal decode builds the whole clip (7 latent
+  frames → 25 video frames, all per-frame decode ops + concats) into ONE graph;
+  the activations for 480x832 don't fit 12 GB. `--max-vram` graph-cut does not
+  rescue it (VAE intermediates, not just matmul offload). Dead end as-is.
+  - The per-frame `decode_partial` path in `wan.hpp` is disabled ("chunk 1 result
+    is weird") because the CausalConv3d feature cache holds graph-node pointers
+    that don't survive across separate `compute()` calls (gallocr-aliasing trap,
+    cf. siglip2 memo) — would need host round-tripping of the cache. Deferred.
+- **What won: GPU VAE + `--vae-tiling` (spatial 2D tiling).** Latent 60x104 →
+  ~15 tiles of 32, each a small-spatial full-temporal decode graph, stitched with
+  overlap. **VAE decode 569.7s → 54.03s (10.5x), total wall 768.7s → 238.4s
+  (3.2x), peak VRAM 10779 MiB (fits, no OOM).** DiT sampling (164s) is now the
+  dominant phase.
+  - Quality gate: `clip_compare.py` GPU-tiled vs CPU baseline = **mean PSNR
+    40.06 dB, min 36.24 dB**, ac16 identical to 3 d.p. The divergence is GPU-vs-CPU
+    float + tile-seam blending; 40 dB is above the ~37.6 dB VAE-vs-input ceiling,
+    so visually equivalent. Audio still muxed (pcm_s16le 16kHz verified).
+- **Shipped as the avatar default** (`stable-diffusion.cpp generate_video`): when
+  the VAE is on GPU and tiling wasn't explicitly requested, enable spatial tiling
+  for the avatar (logs "enabling VAE spatial tiling by default"). `--vae-on-cpu`
+  and explicit `--vae-tiling`/`--vae-tile-size` both still take precedence. So the
+  standard config (no `--vae-on-cpu`) now gets the fast path automatically.
+- Checkpoint clip: `models/_perf/lap01_gpuvae_tiled.webm`.

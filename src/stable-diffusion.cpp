@@ -5160,6 +5160,18 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     }
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
+    // Avatar: the full-clip Wan-VAE temporal decode at 480p OOMs a 12GB card
+    // (~11.9 GiB peak -> CUDA OOM). Spatial tiling bounds the per-tile activation
+    // footprint (peak ~10.8 GiB) and decodes ~10x faster than CPU (54s vs 570s).
+    // So when the VAE runs on GPU and tiling was not explicitly requested, turn it
+    // on by default for the avatar. Forcing the VAE to CPU (--vae-on-cpu) or
+    // passing --vae-tiling/--vae-tile-size explicitly both still take precedence.
+    if (sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+        !sd_ctx->sd->vae_tiling_params.enabled &&
+        !ggml_backend_is_cpu(sd_ctx->sd->backend_for(SDBackendModule::VAE))) {
+        sd_ctx->sd->vae_tiling_params.enabled = true;
+        LOG_INFO("avatar: enabling VAE spatial tiling by default (GPU decode; avoids OOM, ~10x faster than CPU). Pass --vae-on-cpu to disable.");
+    }
     // For the avatar path the conditioning audio is an INPUT; capture the 16k
     // mono waveform here so it can be muxed back into the output container
     // (so clips come out viewable WITH sound, no manual ffmpeg).
