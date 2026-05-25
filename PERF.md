@@ -111,3 +111,37 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 - Free win already banked in lap 01: with the VAE on GPU, the ref-image
   `encode_first_stage` dropped 16.3s (CPU) → 1.9s (GPU). That was the bigger
   one-time cost and it's gone.
+
+### VAE tile-size tuning — 32 (default) is optimal (no lap)
+- ~1.5 GB VRAM headroom (peak 10779 of 12288) suggested larger tiles (fewer
+  tiles → less per-tile gallocr/warmup overhead) might speed up the decode.
+- Measured `--vae-tile-size 48x48`: VAE decode **54s → 73.9s (SLOWER)**, same VRAM.
+  The bigger per-tile spatial graph (more activation work per op + larger overlap
+  recompute) costs more than the per-tile overhead it removes. So the default
+  32-latent tile is the sweet spot. No change shipped.
+
+## SUMMARY (this session)
+
+- **Baseline → best: 768.7s → 238.4s total wall (3.2x), VRAM 10535 → 10779 MiB
+  (both fit 12 GB).** All renders stay coherent (ac16≈0.83) and the output webm
+  carries muxed audio at 25 fps.
+- Phase shape now (8-step default): model load ~13s | text encode (umT5, CPU)
+  16.4s | DiT sampling 164s | VAE decode 54s.
+- **Winning levers:** (1) fps-25 default + input-audio auto-mux (viewable clips,
+  lever 1); (2) **GPU VAE decode via spatial tiling, default-on for the avatar —
+  the headline 10.5x VAE / 3.2x total win (lever 2)**.
+- **Opt-in lever:** `--steps 6` → 197.4s total (-17%), coherent, but a different
+  render vs 8-step; left non-default (lip-sync fidelity is a human call).
+- **Dead ends recorded:** full-clip GPU VAE (OOM); GPU text encode (load-time OOM,
+  TE+DiT coexist); larger VAE tiles (slower). DiT-sampling deep levers (CUDA-graph
+  reuse across the 8 steps) not attempted — the step is MUL_MAT-compute-bound at
+  ~20s, so launch-overhead caching is low-ROI (cf. memory's prod-vs-profile note).
+
+## NEXT (if a future session continues)
+- DiT sampling (164s) is the remaining 69% of wall. The only large lever left is
+  attacking the 48-block q4_k DiT compute itself: CUDA-graph capture/reuse across
+  the 8 identical-shape steps (deep, multi-day; likely small since compute-bound),
+  or a quant-ladder pass (lever 5) — Q3_K on robust DiT tensors to shrink/speed,
+  measured against PPL/coherence. Both are quality-sensitive and bench-heavy.
+- The PORT-PROGRESS STATUS block is STALE (says generated frames are noise); the
+  current tree renders coherent talking avatars. Update it.

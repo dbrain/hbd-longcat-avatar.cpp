@@ -11,6 +11,38 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF/VRAM PHASE — major wins landed (2026-05-25 session 6). See `PERF.md`
+  for the full lap log. NOTE: the older "generated frames still noise" status
+  below is STALE — the current tree renders COHERENT talking avatars (ac16≈0.83
+  on all 25 frames, frame-autocorr `tools/clip_compare.py`).**
+  - **Baseline → best: 768.7s → 238.4s total wall (3.2x faster), peak VRAM
+    10535 → 10779 MiB (both fit the 12 GB 3060).** Standard render config
+    (`--video-frames 25 -W 480 -H 832 --steps 8 --cfg-scale 1.0 --diffusion-fa
+    --clip-on-cpu --max-vram 9`, no `--vae-on-cpu`).
+  - **Lever 1 (correctness): fps defaults to 25 (native save_fps) when `--audio`
+    is given; the input conditioning WAV is auto-muxed into the output container**
+    (trimmed to video duration) so clips come out viewable WITH sound — no manual
+    ffmpeg. Verified: output webm carries a pcm_s16le 16 kHz audio stream.
+    (`common.cpp resolve_and_validate`, `stable-diffusion.cpp generate_video`.)
+  - **Lever 2 (THE big one): GPU VAE decode via spatial tiling, default-on for the
+    avatar.** The full-clip Wan-VAE temporal decode OOMs a 12 GB card (~11.9 GiB);
+    spatial tiling bounds per-tile activations. **VAE decode 569.7s (CPU) → 54.0s
+    (GPU-tiled), 10.5x.** `generate_video` enables tiling by default when the VAE
+    is on GPU and tiling wasn't requested (`--vae-on-cpu` / explicit `--vae-tiling`
+    take precedence). Quality vs CPU baseline: mean PSNR 40 dB (above the ~37.6 dB
+    VAE-vs-input ceiling), ac16 identical → visually equivalent.
+  - **Lever 4 (opt-in): `--steps` now drives the DMD schedule (default 8).
+    `--steps 6` → 197.4s total (-17%), stays coherent, but a different render than
+    8-step; left non-default (6-vs-8 lip-sync is a human eyeball call).**
+  - **Dead ends (recorded in PERF.md):** full-clip GPU VAE (OOM), GPU text encode
+    (load-time OOM — umT5 6GB + DiT 8.5GB coexist upfront), larger VAE tiles
+    (slower: 48-tile decode 73.9s vs 32-tile 54s). DiT sampling (164s, now 69% of
+    wall) is the remaining big cost — only deep levers left (CUDA-graph reuse /
+    quant ladder), both quality-sensitive & bench-heavy.
+  - Checkpoint clips in `models/_perf/`: `BEST_8step_gpuvae_25fps_sound.webm`
+    (best), `lap00_baseline.webm`, `lap01_gpuvae_tiled.webm`, `lap02_6steps.webm`.
+    Tools: `tools/clip_compare.py` (per-frame PSNR + ac_lag16 coherence gate).
+
 - 🟢 **AUDIO GRAFT LANDED + VALIDATED END-TO-END (2026-05-25 session 5). whisper encoder +
   AudioProjModel + per-block audio cross-attn + CLI `--audio` all wired; audio render runs
   to a clip and MEANINGFULLY DIFFERS from the no-audio render in the lower-face region.**
