@@ -121,8 +121,10 @@ namespace LONGCAT_AVATAR {
             int64_t Nb = x->ne[2];
             int64_t C  = x->ne[0];
             x          = ggml_reshape_4d(ctx->ggml_ctx, x, C, x->ne[1] / T, T, Nb);  // [N, T, n_token/T, C]
-            // scale+1 then *x then + shift  (broadcast over spatial dim)
-            auto scale1 = ggml_add(ctx->ggml_ctx, scale, ggml_ext_ones(ctx->ggml_ctx, scale->ne[0], scale->ne[1], scale->ne[2], scale->ne[3]));
+            // scale+1 then *x then + shift  (broadcast over spatial dim).
+            // (scale + 1) is a fused ggml_scale_bias (s=1, b=1) — one elementwise op
+            // instead of materializing a full ones tensor (SCALE+REPEAT) and adding it.
+            auto scale1 = ggml_scale_bias(ctx->ggml_ctx, scale, 1.0f, 1.0f);
             x           = ggml_mul(ctx->ggml_ctx, x, scale1);
             x           = ggml_add(ctx->ggml_ctx, x, shift);
             x           = ggml_reshape_3d(ctx->ggml_ctx, x, C, x->ne[1] * x->ne[2], Nb);  // [N, n_token, C]
@@ -179,9 +181,12 @@ namespace LONGCAT_AVATAR {
 
             auto qkv_out = qkv->forward(ctx, x);  // [N, n_token, 3*C]
             auto parts   = split_qkv(ctx->ggml_ctx, qkv_out);
-            auto q       = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, parts[0]), head_dim, num_heads, n_token, N);
-            auto k       = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, parts[1]), head_dim, num_heads, n_token, N);
-            auto v       = ggml_reshape_4d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, parts[2]), head_dim, num_heads, n_token, N);
+            // split_qkv already conts the permuted qkv, so each q/k/v view is a
+            // contiguous sub-block (split is along the outermost dim) — reshape_4d
+            // accepts it directly without an extra full-size copy.
+            auto q       = ggml_reshape_4d(ctx->ggml_ctx, parts[0], head_dim, num_heads, n_token, N);
+            auto k       = ggml_reshape_4d(ctx->ggml_ctx, parts[1], head_dim, num_heads, n_token, N);
+            auto v       = ggml_reshape_4d(ctx->ggml_ctx, parts[2], head_dim, num_heads, n_token, N);
 
             q = q_norm->forward(ctx, q);
             k = k_norm->forward(ctx, k);
@@ -450,8 +455,10 @@ namespace LONGCAT_AVATAR {
 
                     auto ao = audio_cross_attn(ctx, x_noise, a_noise, T_noise, n_per_frame);  // [C, n_noise_token, 1]
 
-                    // audio adaLN modulation over noise frames: t[:, n_cond:]
-                    auto ta_act = ggml_silu(ctx->ggml_ctx, t_mod);  // t_mod: [C_t, T, 1]
+                    // audio adaLN modulation over noise frames: t[:, n_cond:].
+                    // Reuse the SiLU(t_mod) already computed for the main adaLN
+                    // (t_act) instead of recomputing it — same input, same op.
+                    auto ta_act = t_act;  // [C_t, T, 1]
                     // slice noise frames of t_mod
                     if (n_cond_frames > 0) {
                         ta_act = ggml_view_3d(ctx->ggml_ctx, ta_act, ta_act->ne[0], T_noise, ta_act->ne[2],
@@ -522,7 +529,8 @@ namespace LONGCAT_AVATAR {
             x          = norm_final->forward(ctx, x);
             int64_t C  = x->ne[0];
             x          = ggml_reshape_4d(ctx->ggml_ctx, x, C, x->ne[1] / T, T, N);  // [N, T, n_token/T, C]
-            auto scale1 = ggml_add(ctx->ggml_ctx, ms[1], ggml_ext_ones(ctx->ggml_ctx, ms[1]->ne[0], ms[1]->ne[1], ms[1]->ne[2], ms[1]->ne[3]));
+            // (scale + 1) fused as ggml_scale_bias (see modulate()).
+            auto scale1 = ggml_scale_bias(ctx->ggml_ctx, ms[1], 1.0f, 1.0f);
             x           = ggml_mul(ctx->ggml_ctx, x, scale1);
             x           = ggml_add(ctx->ggml_ctx, x, ms[0]);
             x           = ggml_reshape_3d(ctx->ggml_ctx, x, C, x->ne[1] * x->ne[2], N);
