@@ -11,6 +11,40 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 13 (session 18): QUALITY-DROP LADDER (owner-directed) — 4 runtime-selectable rungs
+  GPU-TE→Q4_0→Q3_K→Q2_K, each side-by-side clipped. HEADLINE: Q3_K (6.84 GB) & Q2_K (5.24 GB) UNLOCK
+  NATIVE 93f RESIDENT (no offload) — the lap-08b/10/11 ~89 MiB blocker dissolves with a smaller gguf.
+  Q2_K is the floor and STILL renders coherent (model is noise-tolerant). Q4_K + CPU-TE reference path
+  UNTOUCHED. Parent-only, ggml submodule pristine `c3685f55`, branch green. See `PERF.md` lap 13 for the
+  full ladder table.**
+  Gate = eyeball-coherent (NOT 99 dB); PSNR-vs-BEST reported FYI only. Step-count fixed at 8.
+  - **Rung 1 GPU-TE (Q4_K):** 25f peak 10515 MiB, coherent (PSNR-FYI 44.9 dB), 81f still offload. Clip
+    `models/_perf/ladder1_gpute.mp4`.
+  - **Rung 2 +Q4_0:** 17.0 s/step (−2.4%), coherent (30.8 dB). **93f-resident = NO** — Q4_0 is the same
+    8.94 GB on disk as Q4_K, so same resident footprint, same OOM. Q4_0 = speed knob, NOT a VRAM win.
+    Clip `ladder2_gpute_q4_0.mp4`.
+  - **Rung 3 +Q3_K ★ VRAM PRIZE:** DiT 6.84 GB (−2.1 GB) → 25f peak **8513 MiB** (−2000), and **native
+    93f renders RESIDENT** (peak 10269 MiB, full 8-step coherent clip `q3_k_93f_resident.webm`, 93 frames
+    + audio, latent std 0.88 nnan=0). Slower per step (18.8 @ 25f). Resident-93f sampling ~114 s/step
+    (monolithic) — ~30% slower than Q4_K-offload 88 s/step, but needs no offload machinery & lifts the
+    resident frame-ceiling from ~81f to the native 93f. Clip `ladder3_gpute_q3_k.mp4`.
+  - **Rung 4 +Q2_K ★ FLOOR, STILL COHERENT:** DiT 5.24 GB (−3.7 GB) → 25f peak **8169 MiB**, 93f-resident
+    peak **8737 MiB** (~3.2 GB headroom). Eyeball-coherent — face intact, mouth tracks audio, faint grain
+    only; latent healthy (std 0.92/0.81, nnan=0). **Did NOT visibly break.** Slowest (21.2 @ 25f). Clip
+    `ladder4_gpute_q2_k.mp4`. Q2_K is ggml's smallest K-quant — no rung built past it (further down needs
+    imatrix/IQ-quants, out of scope).
+  - **PRESETS (runtime-selectable, no rebuild):** "quality" = Q4_K + `--clip-on-cpu` (bit-identical BEST,
+    81f needs `--offload-to-cpu`); "fast" = **Q3_K + GPU-TE** (−2 GB, native 93f RESIDENT, coherent).
+    Q2_K = smallest-footprint floor for chaining many resident segments.
+  - **WHY IT WORKED:** laps 08b/10/11 proved native-93f-resident had no quality-neutral rope/pool fix
+    (missed the card by ~89 MiB across two un-shareable allocators on top of the 8.5 GB Q4_K weights). The
+    ladder sidesteps it: a Q3_K DiT frees ~2 GB of resident weight ≫ the 89 MiB shortfall, so the same
+    unchanged reserve+pool now fit. The cumulative-VRAM payoff, delivered by an owner-authorized quality
+    trade. **Build deps:** Q3_K/Q2_K ggufs built via `sd-cli -M convert --tensor-type-rules
+    "model.diffusion_model.=q3_K|q2_K"` from the DMD-folded q8_0 intermediate (TMPDIR=$PWD/.convert-tmp,
+    memory-capped docker, `--gpus all` required for libcuda even though quant is CPU-side). Tools:
+    `tools/ladder_render.sh` + `tools/sidebyside.py`.
+
 - 🟢 **PERF lap 12 (session 17): umT5 text-encode ON GPU (deferred DiT load) — NET −15 s / −7%, OPT-IN;
   + ROOFLINE microbench → VERDICT "AT the roofline, no hand-kernel swing"; + continuation-chaining
   SCOPED below. Parent-only (ggml submodule pristine `c3685f55`), branch green. See `PERF.md` lap 12.**

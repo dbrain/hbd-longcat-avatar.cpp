@@ -50,6 +50,7 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 10  | **fused-RoPE made DEFAULT** — root-caused the lap-09 42 dB divergence: it was NOT gallocr aliasing (a minimal same-topology repro under real gallocr, `tools/test_rope_pe_gallocr.cpp`, was already only ~5e-5 off — not a clobber) but **FMA CONTRACTION in `rope-pe.cu`** (nvcc fused `a*c±b*s` into `fmaf`, skipping the product rounding the chain's separate `ggml_mul`+`ggml_add` does → ~5e-5/op, compounded over 48 blk × 8 steps → trajectory drift). Fix: `__fmul_rn`/`__fadd_rn`/`__fsub_rn` (un-contractable). Now **max\|chain−fused\|=0.0** in BOTH isolation AND real-gallocr repros, and the **25f render is 99 dB bit-identical to BEST on all frames** with the op ON. Flipped default-on (opt out `LONGCAT_NO_FUSED_ROPE=1`). | 25f sampling **139.9 (−5% vs 147)**; DiT 17.42 s/step | 25f peak 10513 (unchanged); 93f-resident compute reserve **3,629 → 3,044 MiB (−585)** but still OOMs (MMQ pool is the last blocker) | DEFAULT (fused) **BIT-IDENTICAL to BEST (99 dB all 25 frames)** | submodule (rope-pe.cu) + parent (rope.hpp), this lap |
 
 | 12  | **umT5 text-encode on GPU** via deferred DiT weight load (load TE→encode→free TE→load DiT, so umT5 6 GB + DiT 8.5 GB never coexist). **NET WALL −15.0 s (−7.0%)** on the canonical 25f/8-step (214.9 → 199.9 s, same build A/B): umT5 encode **16.9 s (CPU) → 0.34 s (GPU)**, deferred DiT load +2.75 s. **Code is byte-identical on the default `--clip-on-cpu` path (99 dB vs BEST).** GPU-TE output is COHERENT (ac16 0.838, cond frame 99 dB) but **44.9 dB vs BEST** — GPU-vs-CPU umT5 float rounding drifts the chaotic DMD trajectory (same class as F16-rope/Q4_0). So GPU-TE ships **OPT-IN** (drop `--clip-on-cpu`), default stays CPU-TE (BEST-matching). Was a hard load-OOM before this lap. + **ROOFLINE microbench** `tools/roofline_dit.cpp`: hot Q4_K matmuls + flash-attn timed in isolation. | 25f sampling 140 s (unchanged); umT5 7.0% → 0.15% of wall | 25f GPU-TE peak unchanged (TE freed before DiT loads — never coexist) | default (CPU-TE) **BIT-IDENTICAL to BEST (99 dB)**; GPU-TE coherent 44.9 dB | parent (this lap) |
+| 13  | **QUALITY-DROP LADDER** (owner-directed; gate = eyeball-coherent, NOT 99 dB). Four runtime-selectable rungs descending GPU-TE→Q4_0→Q3_K→Q2_K, each its own side-by-side clip. **HEADLINE: Q3_K (6.84 GB) & Q2_K (5.24 GB) unlock NATIVE 93f RESIDENT** (no `--offload-to-cpu`) — Q4_K/Q4_0 (8.94 GB) could not (lap-11 ~89 MiB miss). Q2_K never visibly broke (model is noise-tolerant per owner). All rungs runtime-selectable; **Q4_K + CPU-TE bit-identical reference path UNTOUCHED.** | 25f GPU-TE 199.9 s (all rungs ≈ 200–232 s, quant-dependent); 93f resident Q3_K 1121 s / Q2_K (probe) | 25f peak **Q4_K 10513 → Q3_K 8513 → Q2_K 8169 MiB**; 93f-resident peak Q3_K 10269 / Q2_K 8737 | all rungs eyeball-coherent (ac16≈0.83 tracking BEST); PSNR-FYI 44.9/30.8/28.6/25.4 dB | parent (this lap) — code: ladder render/sidebyside tools + new ggufs (gitignored) |
 
 (rows appended per lap below)
 
@@ -973,3 +974,101 @@ scoped in PORT-PROGRESS.md as the next high-value work item.**
 
 **Box state:** GPU free at end (9 MiB idle), no orphaned containers (all runs used `--name` + auto-`--rm`;
 verified `docker ps`), ggml submodule pristine at `c3685f55` (parent-only lap), branch green.
+
+### lap 13 — QUALITY-DROP LADDER (owner-directed): GPU-TE → Q4_0 → Q3_K → Q2_K, each rung clipped separately. Q3_K & Q2_K UNLOCK NATIVE 93f RESIDENT. Q2_K is the floor and still renders coherent.
+
+**Brief:** descend in INCREMENTAL rungs, each clipped side-by-side vs the prior rung + the 8-step
+reference so the owner can attribute any drop to a specific lever. Step-count fixed at 8 for
+comparability. Gate = **"renders coherent / no gross artifacts," judged by eyeball** (the owner finds
+the model noise-tolerant for the animated-character use case) — NOT a PSNR threshold. PSNR-vs-BEST is
+reported **FYI only**. Only BROKEN (NaN/noise/garbage) is auto-out. Everything stays runtime-selectable;
+the **Q4_K + CPU-TE bit-identical reference path is kept intact** (never deleted).
+
+**THE LADDER TABLE** (8-step / 480×832 / seed 42 / audio, GPU-TE on all rungs unless noted; comparison
+length 81f, fast-knob length 25f). DiT-size column is the gguf on disk. "93f-resident?" = does native
+93 frames render WITHOUT `--offload-to-cpu`. PSNR-FYI = mean dB vs BEST (CPU-TE Q4_K) — a TRAJECTORY
+distance, NOT a quality verdict; all rungs are eyeball-coherent.
+
+| rung | levers (cumulative) | DiT gguf | 25f wall (s) / s·step⁻¹ | 25f peak VRAM | 81f wall (s) / s·step⁻¹ | 81f peak VRAM | 93f-resident? | 93f-res peak | max-resident frames | PSNR-FYI vs BEST | clip |
+|------|---------------------|---------:|------------------------:|--------------:|------------------------:|--------------:|:-------------:|-------------:|:-------------------:|-----------------:|------|
+| ref | 8-step CPU-TE Q4_K (BEST) | 8.94 GB | 214.9 / 17.4 | 10513 | 1218 / 88 (offload) | 11603 | no (lap-11) | — | ~81–85f | (reference) | `BEST_8step_gpuvae_25fps_sound.webm` / `fulllen_81f_8step.webm` |
+| **1** | + **GPU-TE** (drop `--clip-on-cpu`) | 8.94 GB | **199.5 / 17.4** | 10515 | 887 / 88 (offload) | 11861 | no | — | ~81–85f | **44.9** (min 41.3) | `ladder1_gpute.mp4` |
+| **2** | + **Q4_0** DiT | 8.94 GB | 210.3 / 17.0 | 10513 | 876 / 87 (offload) | 11861 | **no** (OOM, same 8.94 GB weights as Q4_K) | — | ~81–85f | **30.8** (min 25.4) | `ladder2_gpute_q4_0.mp4` |
+| **3** | + **Q3_K** DiT | **6.84 GB** | 219.0 / 18.8 | **8513** | 925 / 92 (**RESIDENT**) | 9859 | **YES** | 10269 | **≥93f (native max)** | **28.6** (min 23.4) | `ladder3_gpute_q3_k.mp4` + `q3_k_93f_resident.webm` |
+| **4** | + **Q2_K** DiT | **5.24 GB** | 231.6 / 21.2 | **8169** | 971 / 99 (**RESIDENT**) | 8327 | **YES** | 8737 | **≥93f (native max)** | **25.4** (min 20.0) | `ladder4_gpute_q2_k.mp4` |
+
+**PER-RUNG FINDINGS:**
+
+- **Rung 1 — GPU-TE alone (Q4_K).** GPU text-encode (lap-12, deferred DiT load) ships the −7% wall win;
+  under the eyeball gate it PASSES (44.9 dB but ac16 0.831–0.835 = identical structure to BEST, frame-0
+  cond 99 dB). 25f peak 10515 MiB (TE freed before DiT loads — never coexist). 81f still needs offload
+  (Q4_K weights 8.94 GB → resident ceiling ~81–85f, lap-11). Side-by-side `ladder1_gpute.mp4` =
+  [8-step CPU-TE (ref) | GPU-TE | 4-step CPU-TE (ref)] — middle panel clearly on par with the references.
+
+- **Rung 2 — GPU-TE + Q4_0.** Q4_0 sampling 17.0 s/step (−2.4% vs Q4_K 17.4, confirms lap-05; Q4_0's
+  simpler block format has a leaner MMQ dp4a path). Eyeball-coherent. **93f-resident = NO:** Q4_0 is the
+  SAME 8.94 GB on disk as Q4_K, so resident weight footprint is unchanged — it OOMs on the identical
+  lap-11 two-allocator squeeze (`cuMemCreate` pool grow fails). **Q4_0 buys speed, not VRAM headroom.**
+  Side-by-side `ladder2_gpute_q4_0.mp4` = [Q4_K (rung1) | Q4_0 (rung2) | 8-step ref].
+
+- **Rung 3 — GPU-TE + Q3_K. ★ THE VRAM PRIZE.** Q3_K DiT is **6.84 GB (−2.1 GB vs Q4_K)** → resident
+  weights drop ~2 GB → **native 93f now renders RESIDENT** (the lap-08b/10/11 blocker that no
+  quality-neutral rope/pool cut could clear is dissolved simply by a smaller gguf). 25f peak **8513 MiB**
+  (−2000 vs Q4_K). 93f-resident peak 10269 MiB, latent healthy (std 0.88, nnan=0), full 8-step clip
+  coherent end-to-end (`q3_k_93f_resident.webm`, 93 frames + audio). Q3_K is SLOWER per step (18.8 vs
+  17.4 — 3-bit unpack, lap-05's "Q3_K slower on Ampere" — but speed is not the ladder's goal). **Resident
+  93f sampling is ~114 s/step** (monolithic whole-graph) — actually slightly SLOWER than offload's 88
+  s/step (the segmented offload path packs smaller per-segment activation graphs more efficiently); the
+  value of resident is that it WORKS with no offload machinery and the resident frame-ceiling jumps from
+  ~81f to the native 93f. Side-by-side `ladder3_gpute_q3_k.mp4` = [Q4_0 (rung2) | Q3_K (rung3) | 8-step ref].
+
+- **Rung 4 — GPU-TE + Q2_K. ★ THE FLOOR — STILL COHERENT.** Q2_K DiT is **5.24 GB (−3.7 GB vs Q4_K)**.
+  25f peak **8169 MiB** (lowest), 81f resident peak **8327 MiB**, 93f-resident peak **8737 MiB** (≈3.2 GB
+  headroom to spare — comfortably resident). Despite 2-bit weights the render is **eyeball-coherent**:
+  clean talking portrait, face intact, mouth tracking audio, no gross artifacts (faint background grain
+  only). Latent healthy at every length (25f std 0.92, 93f std 0.81, nnan=0). ac16 0.83–0.84 still tracks
+  BEST. **Q2_K did NOT visibly break** — the DMD-distilled avatar is remarkably quant-tolerant, exactly as
+  the owner predicted for the animated-character use case. Q2_K is SLOWEST per step (21.2 @ 25f / 99 @ 81f
+  — 2-bit unpack is the heaviest MMQ path on Ampere). Side-by-side `ladder4_gpute_q2_k.mp4` =
+  [Q3_K (rung3) | Q2_K (rung4) | 8-step ref]. **The ladder reached the lowest standard K-quant without a
+  coherence break; no rung past Q2_K is built (Q2_K is ggml's smallest K-quant; further down needs
+  imatrix/IQ-quants, out of scope).**
+
+**WHY THE SMALLER GGUF — NOT a rope/pool cut — IS WHAT UNLOCKED RESIDENT 93f:** laps 08b/10/11 spent
+three sessions proving the native-93f-resident blocker (a 3,044 MiB gallocr reserve + a 292 MiB runtime
+F16 pool transient sitting on top of the 8,539 MiB Q4_K weights, missing the 11,909 MiB card by ~89 MiB)
+had NO quality-neutral fix at the rope or pool layer. The quality-drop ladder sidesteps it entirely: a
+**Q3_K DiT frees ~2 GB of resident weight**, which is far more than the ~89 MiB shortfall, so the same
+unchanged compute reserve + pool now fit. This is the cumulative-VRAM payoff the campaign was after —
+delivered by trading a measured-acceptable amount of quality, exactly the lever the owner authorized.
+
+**RUNTIME PRESETS (recommended, both runtime-selectable — no rebuild, just flags + gguf choice):**
+- **"quality" preset** = the untouched reference: `-m …-dit-dmd-q4_k.gguf --clip-on-cpu` (CPU-TE,
+  8-step). Bit-identical to BEST (99 dB). Use when byte-fidelity to the blessed render matters; 81f needs
+  `--offload-to-cpu`.
+- **"fast" preset** = `-m …-dit-dmd-q3_k.gguf` + GPU-TE (drop `--clip-on-cpu`), 8-step. Coherent,
+  −2 GB VRAM, and **renders native 93f RESIDENT with no offload** (the headline practical win — full 3.7 s
+  clip in one resident pass). If the owner wants the absolute smallest footprint for chaining many
+  segments, **Q2_K** is the floor (≈3.2 GB headroom at 93f resident, still coherent) at the cost of the
+  slowest per-step time.
+- Q4_0 is a niche middle knob (slightly faster than Q4_K but NO VRAM win — same 8.94 GB); prefer Q3_K when
+  VRAM/resident-93f is the goal, Q4_K-CPU-TE when fidelity is the goal.
+
+**RESIDENT-vs-OFFLOAD SPEED NOTE (honest):** at 93f, resident sampling (Q3_K 114 s/step) is ~30% slower
+per step than the Q4_K offload path (88 s/step) because the resident run builds one monolithic 37k-token
+graph while offload uses the lap-04 segmented graph-cut (smaller per-segment activation buffers, more
+efficiently packed by gallocr). So resident-93f's value is **correctness/simplicity + a higher resident
+frame-ceiling for chaining**, not raw speed. For a one-shot 93f render, Q4_K-offload and Q3_K-resident are
+within ~30% of each other in wall time; the resident path's win is needing no host-RAM weight streaming.
+
+**ASSETS (all under `models/`, gitignored):** ggufs `…-dit-dmd-{q4_k,q4_0,q3_k,q2_k}.gguf` (Q4_K + Q4_0
+pre-existing; **Q3_K 6.84 GB + Q2_K 5.24 GB built this lap** from the DMD-folded q8_0 intermediate via
+`sd-cli -M convert --tensor-type-rules "model.diffusion_model.=q3_K|q2_K"`, TMPDIR=$PWD/.convert-tmp,
+memory-capped docker). Side-by-side clips `models/_perf/ladder{1,2,3,4}_*.mp4` + the resident-93f prize
+`models/_perf/q3_k_93f_resident.webm`. Render+sidebyside helpers: `tools/ladder_render.sh`,
+`tools/sidebyside.py`. The DMD-folded q3_K/q2_K ggufs are KEEPERS (the new presets); intermediate
+`.convert-tmp` cleared.
+
+**Box state:** GPU free at end (9 MiB idle), no orphaned containers (all runs + the resident-93f probes
+used `--name` + `--rm`/explicit `docker rm -f`; verified `docker ps` + `nvidia-smi`), ggml submodule
+pristine at `c3685f55` (parent-only lap), branch green.
