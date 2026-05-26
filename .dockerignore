@@ -5,3 +5,7 @@ test/
 .cache/
 *.swp
 models/
+.venv-oracle/
+.venv-vae/
+.convert-tmp/
+.claude/

@@ -11,6 +11,48 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PRODUCTIONISED (session 22, "Agent B"): HTTP API + GPU-CLEAR-WHEN-IDLE + kobbler prod
+  service. The avatar now has the same usable, GPU-polite experience as the sibling services
+  (qwen3-tts / siglip2 / parakeet). Parent-only, no C++ change (the productionization layer is a
+  Python supervisor driving the existing `sd-cli`), branch green. VALIDATED end-to-end on the RTX
+  3060.**
+  - **GPU-CLEAR PATTERN = subprocess-per-render.** `tools/avatar_server.py` (zero pip deps, pure
+    stdlib) is a thin supervisor that spawns `sd-cli vid_gen` PER request. `sd-cli` loads ~9 GB
+    (DiT + VAE + whisper + umT5), renders, frees everything and EXITS — so between renders NO process
+    holds GPU and **idle VRAM = ~9 MiB** (the CUDA floor). This IS the sibling "kill the worker →
+    reclaim ALL GPU instantly" isolation pattern; the worker is the whole `sd-cli` process and it
+    self-terminates. The owner's resident LLM gets the full 12 GB back the moment a render finishes.
+    **VERIFIED via nvidia-smi**: idle 9 → single-clip peak 10513 (resident) / chain ~5.7 GiB
+    (offload) → back to **9 MiB** on completion, both runs.
+  - **API (JSON in, video out):** `GET /health` (status + live GPU MiB), `POST /generate` (single
+    OR chained — same endpoint), `POST /unload` (explicit idle-clear; no-op when idle, `force:true`
+    kills in-flight), `GET /` (HTML usage). **ONE render at a time** — concurrent `/generate` → HTTP
+    429 (verified); bad input → 400 (verified). All knobs per-request with sane defaults:
+    `image`/`audio` (path | data-URI | base64 | http url), `prompt`, `steps`[8],
+    `audio_mouth_scale`[1.0], `audio_lowpass_hz`[0], `segment_frames`[49] / `duration_sec`,
+    `cont_cond_frames`[13], `segments`[1], `resolution`["480x832"], `quant`[q4_k|q4_0],
+    `cfg_scale`[1.0], `seed`[42], `offload`[auto — chains & >40f offload], `vae_tiling`[true],
+    `return`[file|bytes].
+  - **VALIDATED RENDERS:** single-clip 25f/6-step → exactly 25 frames VP8 + pcm_s16le 16 kHz audio
+    muxed, 193.7s; 2-segment chain (mouth_scale 0.7, auto-offload) → exactly 37 frames (25 +
+    25−13) + audio, 392.6s, sustained VRAM ~5.5 GiB. **GOTCHA FOUND:** forcing `offload:false` on a
+    chain OOMs at the seg-1 VAE decode (resident DiT+whisper+VAE leave no headroom for the 3.16 GiB
+    decode buffer) — the `offload:"auto"` default (chains→offload) is the correct guard; documented.
+  - **KOBBLER WIRING:** prod service `docker/longcat-avatar/` (Dockerfile + README), PROFILE-GATED
+    (`--profile longcat-avatar`, port 8809→8080) so it never auto-runs beside the LLM. Builds `sd-cli`
+    from the LOCAL sibling checkout (fork not on a registry — `LONGCAT_AVATAR_SRC`), ships
+    `avatar_server.py` on a CUDA-runtime + python3 + ffmpeg image, models bind-mounted RO at /models.
+    `docker compose --profile longcat-avatar config` validates; service is absent from default `up`.
+    Dev iteration: `docker/longcat-avatar-dev/iter.sh serve` (added python3 to the builder image).
+  - **HOW TO RUN:** dev — `ITER_PORT=8095 docker/longcat-avatar-dev/iter.sh serve`; prod —
+    `docker compose --profile longcat-avatar up -d longcat-avatar`. Full API + curls in
+    `kobbler/docker/longcat-avatar/README.md`.
+  - **LEFT / FOLLOW-UPS (none blocking):** prod image build kicked off (CUDA compile from local
+    source) — the binary path is identical to the validated dev binary, so functionally proven; if
+    the prod build needs a re-verify, `docker compose --profile longcat-avatar up` then re-run the
+    health + single-clip curl. SSE/progress streaming not added (sd-cli has no progress IPC; the
+    `/health` busy flag + per-render log tail cover liveness — a future lever if wanted).
+
 - 🟢 **lap 16 (session 21, "Agent A"): MOUTH-EXAG KNOBS (runtime) + CHAINING SEAM DRIFT KILLED
   (per-segment exposure-match, default-on) + PERF/VRAM CROSSOVER TABLE. Parent-only, ggml submodule
   pristine `c3685f55`, branch green, single-clip bit-identical. Q4_K + 8-step LOCKED. Full detail in
