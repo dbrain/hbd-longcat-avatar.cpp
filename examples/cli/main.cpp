@@ -540,6 +540,73 @@ bool save_results(const SDCliParams& cli_params,
     return sucessful_reults != 0;
 }
 
+// Per-segment continuity match for continuation chaining (LongCat-Avatar).
+// In a chained segment (seg>0) the leading `cond_n` decoded frames are the
+// re-rendered prior-segment tail, HELD FIXED via the denoise mask, so they
+// carry the prior segment's true exposure. The trailing generated frames come
+// fresh from the 8-step-DMD denoise and land DARKER (lap-15: cond ~95-100,
+// generated ~75-84) — a cond->gen brightness STEP that the seam re-encode
+// propagates and compounds. This matches each generated frame's per-channel
+// mean+std to the cond region (a smarter fix than lap-15's uniform offset,
+// which referenced cond-vs-prior-tail — already matched — and was a wash).
+// Operates on the decoded RGB BEFORE the cond frames are dropped + before the
+// tail is captured for re-encode, so it closes the compounding loop. DEFAULT-ON
+// for chained renders (opt out LONGCAT_CONT_NO_EXPOSURE_MATCH=1); strength env
+// LONGCAT_CONT_EXPOSURE_STRENGTH (default 1.0 = full match; 0.5 = half, gentler).
+// MEASURED (3x33f Q4_K): kills the compounding per-segment brightness ramp —
+// luma 109.6->115.1->133.3 (drift +23.7) collapses to 109.6->110.3->111.0
+// (drift +1.5). Seam frame-to-frame Δ residual (5.9x->4.7x) is structural
+// (pose discontinuity between independently-sampled segments), not exposure.
+static void continuity_match_segment(sd_image_t* frames, int n, int cond_n, float strength) {
+    if (frames == nullptr || n <= cond_n || cond_n <= 0)
+        return;
+    const int C = (int)frames[0].channel;
+    if (C < 1)
+        return;
+    const size_t px_per_frame = (size_t)frames[0].width * frames[0].height;
+    if (px_per_frame == 0)
+        return;
+    // per-channel mean/std over the cond region [0..cond_n) and gen region [cond_n..n)
+    std::vector<double> cm(C, 0), cv(C, 0), gm(C, 0), gv(C, 0);
+    auto accum = [&](int f0, int f1, std::vector<double>& m, std::vector<double>& v) {
+        std::vector<double> s(C, 0), s2(C, 0);
+        size_t cnt = 0;
+        for (int f = f0; f < f1; ++f) {
+            const uint8_t* d = frames[f].data;
+            for (size_t p = 0; p < px_per_frame; ++p)
+                for (int c = 0; c < C; ++c) {
+                    double x = d[p * C + c];
+                    s[c] += x;
+                    s2[c] += x * x;
+                }
+            cnt += px_per_frame;
+        }
+        for (int c = 0; c < C; ++c) {
+            m[c] = s[c] / cnt;
+            double var = s2[c] / cnt - m[c] * m[c];
+            v[c] = var > 1e-6 ? std::sqrt(var) : 1e-3;
+        }
+    };
+    accum(0, cond_n, cm, cv);
+    accum(cond_n, n, gm, gv);
+    // affine map each generated frame's channels: out = cm + (x-gm)*(cv/gv),
+    // blended by `strength` toward identity.
+    for (int f = cond_n; f < n; ++f) {
+        uint8_t* d = frames[f].data;
+        for (int c = 0; c < C; ++c) {
+            double gain  = cv[c] / gv[c];
+            double bias  = cm[c] - gm[c] * gain;
+            // blend toward identity (gain=1,bias=0)
+            gain = 1.0 + strength * (gain - 1.0);
+            bias = strength * bias;
+            for (size_t p = 0; p < px_per_frame; ++p) {
+                double x   = (double)d[p * C + c] * gain + bias;
+                d[p * C + c] = (uint8_t)(x < 0 ? 0 : (x > 255 ? 255 : x + 0.5));
+            }
+        }
+    }
+}
+
 int main(int argc, const char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
@@ -926,6 +993,18 @@ int main(int argc, const char* argv[]) {
 
                     // frames: segment 0 keeps all; later segments drop the cond tail re-render.
                     int drop = (seg == 0) ? 0 : cond_decoded_v;
+                    // SMARTER per-segment continuity fix (opt-in): match the generated
+                    // frames' per-channel mean+std to this segment's cond region (the
+                    // held-fixed prior tail) so the cond->gen brightness STEP doesn't
+                    // propagate + compound through the re-encode. Applied BEFORE drop +
+                    // before the tail capture, so the matched pixels feed both the
+                    // stitched output and the next segment's cond. seg0 has no cond region.
+                    if (seg > 0 && getenv("LONGCAT_CONT_NO_EXPOSURE_MATCH") == nullptr) {
+                        float strength = 1.0f;
+                        if (const char* se = getenv("LONGCAT_CONT_EXPOSURE_STRENGTH"))
+                            strength = (float)atof(se);
+                        continuity_match_segment(seg_video, seg_count, drop, strength);
+                    }
                     // capture this segment's LAST cond_decoded_v decoded frames (deep copy)
                     // to re-encode as the NEXT segment's cond conditioning (drift sink).
                     for (auto& f : cond_tail_frames) free(f.data);
