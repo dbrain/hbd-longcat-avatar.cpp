@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
@@ -812,60 +813,77 @@ int main(int argc, const char* argv[]) {
 
                 std::vector<float> stitched_audio;  // 16k mono, full timeline
                 uint32_t audio_sr = 0;
-                std::vector<float> prev_latent;     // prior segment's full diffusion latent
+                // DRIFT SINK (decode->re-encode): a chained segment conditions on the
+                // prior segment's tail. v1 fed the prior segment's RAW diffusion latent
+                // tail straight back — but that skips the reference pipeline's per-chain
+                // re-regularization, so 8-step DMD sampling error (color/exposure cast +
+                // identity morph) COMPOUNDED at each seam. The fix mirrors generate_vc:
+                // DECODE the prior segment's tail to pixels (we already have them — they
+                // are the segment's decoded output frames) and RE-ENCODE them through the
+                // Wan VAE back to a fresh diffusion latent. The encode->decode round-trip
+                // snaps the cond back onto the VAE data manifold every step, the drift
+                // sink the reference relies on. We feed the LAST cond_decoded_v decoded
+                // frames; sd_ctx_encode_video_frames returns num_cond_latents latents.
+                std::vector<sd_image_t> cond_tail_frames;  // last cond_decoded_v decoded frames of prior seg
+                std::vector<float> cond_latent_buf;        // re-encoded cond latent fed to current seg
+                // A/B escape hatch: LONGCAT_CONT_RAW_LATENT=1 restores the v1 raw-latent
+                // passthrough (the drifting path) for measuring the seam fix. Default is
+                // the decode->re-encode drift sink.
+                bool raw_latent = getenv("LONGCAT_CONT_RAW_LATENT") != nullptr;
+                std::vector<float> prev_latent;  // v1 raw passthrough only
                 int prev_lw = 0, prev_lh = 0, prev_lt = 0, prev_lc = 0;
-                std::vector<float> cond_latent_buf; // the tail fed to the current segment
-                // Drift control: a chained segment conditions on the prior segment's
-                // GENERATED latent, so latent color/brightness statistics drift and
-                // COMPOUND per segment (the reference's decode->re-encode roundtrip
-                // re-regularizes each time; the latent passthrough skips that). As a
-                // cheap counter, match each cond-latent tail's per-channel mean/std to
-                // segment 0's reference stats so each segment starts from the same
-                // distribution. MEASURED (3x93f A/B): reduces the latent color-cast
-                // magnitude (seg2 blue B 176->104) but does NOT fix the visible chroma
-                // drift (per-channel latent stat-match is too coarse for the nonlinear
-                // VAE) and slightly sharpens the per-seam brightness step. Left OPT-IN
-                // (LONGCAT_CONT_RENORM=1); the real fix is decode->re-encode (needs the
-                // multi-frame Wan-VAE encode bug fixed) or more --steps for chained runs.
-                bool cont_renorm = getenv("LONGCAT_CONT_RENORM") != nullptr;
-                std::vector<float> ref_mean, ref_std;  // per-channel, from segment 0
 
                 for (int seg = 0; seg < n_segments; ++seg) {
                     if (seg == 0) {
                         vid_gen_params.cont_latent        = nullptr;
                         vid_gen_params.cont_latent_frames = 0;
                         vid_gen_params.audio_frame_offset = 0;
-                    } else {
-                        // take the LAST num_cond_latents latent frames of the prior segment
-                        // (layout [Wl,Hl,Tl,Cl,1], temporal dim 2) as the cond conditioning.
-                        size_t plane = (size_t)prev_lw * prev_lh;  // per (frame,channel) plane
-                        cond_latent_buf.assign((size_t)plane * num_cond_latents * prev_lc, 0.f);
-                        // copy tail frames preserving [Wl,Hl,N,Cl] contiguity.
+                    } else if (raw_latent) {
+                        // v1: feed the prior segment's RAW diffusion-latent tail (drifts).
+                        size_t plane = (size_t)prev_lw * prev_lh;
+                        int    keep  = std::min(num_cond_latents, prev_lt);
+                        cond_latent_buf.assign((size_t)plane * keep * prev_lc, 0.f);
                         for (int c = 0; c < prev_lc; ++c) {
-                            for (int nf = 0; nf < num_cond_latents; ++nf) {
-                                int src_t = prev_lt - num_cond_latents + nf;
+                            for (int nf = 0; nf < keep; ++nf) {
+                                int src_t        = prev_lt - keep + nf;
                                 const float* src = prev_latent.data() + ((size_t)c * prev_lt + src_t) * plane;
-                                float* dst       = cond_latent_buf.data() + ((size_t)c * num_cond_latents + nf) * plane;
+                                float* dst       = cond_latent_buf.data() + ((size_t)c * keep + nf) * plane;
                                 std::memcpy(dst, src, plane * sizeof(float));
                             }
                         }
-                        // per-channel stat-match the cond tail to segment 0's reference.
-                        if (cont_renorm && !ref_mean.empty()) {
-                            size_t n_per_c = plane * num_cond_latents;
-                            for (int c = 0; c < prev_lc; ++c) {
-                                float* base = cond_latent_buf.data() + (size_t)c * n_per_c;
-                                double s = 0, s2 = 0;
-                                for (size_t i = 0; i < n_per_c; ++i) { s += base[i]; s2 += (double)base[i] * base[i]; }
-                                double mu = s / n_per_c;
-                                double sd = std::sqrt(std::max(1e-8, s2 / n_per_c - mu * mu));
-                                double scale = ref_std[c] / sd;
-                                for (size_t i = 0; i < n_per_c; ++i)
-                                    base[i] = (float)((base[i] - mu) * scale + ref_mean[c]);
-                            }
-                            LOG_INFO("continuation: stat-matched cond latent to segment-0 per-channel stats");
-                        }
                         vid_gen_params.cont_latent        = cond_latent_buf.data();
-                        vid_gen_params.cont_latent_frames = num_cond_latents;
+                        vid_gen_params.cont_latent_frames = keep;
+                        vid_gen_params.audio_frame_offset = seg * new_per_seg;
+                    } else {
+                        // re-encode the prior segment's decoded tail frames -> fresh
+                        // diffusion latent (the drift sink). Take the trailing
+                        // num_cond_latents latent frames as the cond conditioning.
+                        int rlw = 0, rlh = 0, rlt = 0, rlc = 0;
+                        float* reenc = sd_ctx_encode_video_frames(
+                            sd_ctx.get(), cond_tail_frames.data(), (int)cond_tail_frames.size(),
+                            gen_params.width, gen_params.height, &rlw, &rlh, &rlt, &rlc);
+                        if (reenc == nullptr) {
+                            LOG_ERROR("continuation: re-encode of segment %d tail failed", seg);
+                            return 1;
+                        }
+                        // keep the LAST num_cond_latents latent frames (layout
+                        // [Wl,Hl,Tl,Cl,1], temporal dim 2).
+                        size_t plane = (size_t)rlw * rlh;
+                        int    keep  = std::min(num_cond_latents, rlt);
+                        cond_latent_buf.assign((size_t)plane * keep * rlc, 0.f);
+                        for (int c = 0; c < rlc; ++c) {
+                            for (int nf = 0; nf < keep; ++nf) {
+                                int src_t        = rlt - keep + nf;
+                                const float* src = reenc + ((size_t)c * rlt + src_t) * plane;
+                                float* dst       = cond_latent_buf.data() + ((size_t)c * keep + nf) * plane;
+                                std::memcpy(dst, src, plane * sizeof(float));
+                            }
+                        }
+                        free(reenc);
+                        LOG_INFO("continuation: re-encoded %zu tail frames -> %d cond latents (drift sink)",
+                                 cond_tail_frames.size(), keep);
+                        vid_gen_params.cont_latent        = cond_latent_buf.data();
+                        vid_gen_params.cont_latent_frames = keep;
                         vid_gen_params.audio_frame_offset = seg * new_per_seg;
                     }
                     // distinct seed per segment so the noise frames differ
@@ -877,40 +895,43 @@ int main(int argc, const char* argv[]) {
                     sd_image_t* seg_video = nullptr;
                     int seg_count         = 0;
                     sd_audio_t* seg_audio = nullptr;
-                    float* lat_out        = nullptr;
-                    int lw = 0, lh = 0, lt = 0, lc = 0;
+                    // Default (drift sink) re-encodes pixels, so no raw latent needed.
+                    // raw_latent mode requests the diffusion latent to pass through.
+                    float* lat_out = nullptr;
+                    int    lw = 0, lh = 0, lt = 0, lc = 0;
                     if (!generate_video_ex(sd_ctx.get(), &vid_gen_params, &seg_video, &seg_count, &seg_audio,
-                                           &lat_out, &lw, &lh, &lt, &lc)) {
+                                           raw_latent ? &lat_out : nullptr,
+                                           raw_latent ? &lw : nullptr, raw_latent ? &lh : nullptr,
+                                           raw_latent ? &lt : nullptr, raw_latent ? &lc : nullptr)) {
                         LOG_ERROR("continuation segment %d failed", seg + 1);
                         free_sd_audio(seg_audio);
                         free(seg_video);
                         free(lat_out);
                         return 1;
                     }
-
-                    // stash this segment's latent for the next iteration's conditioning
-                    if (lat_out != nullptr) {
+                    if (raw_latent && lat_out != nullptr) {
                         prev_latent.assign(lat_out, lat_out + (size_t)lw * lh * lt * lc);
                         prev_lw = lw; prev_lh = lh; prev_lt = lt; prev_lc = lc;
-                        // capture segment-0 per-channel reference stats for drift control
-                        if (seg == 0 && cont_renorm) {
-                            size_t per_c = (size_t)lw * lh * lt;
-                            ref_mean.assign(lc, 0.f); ref_std.assign(lc, 0.f);
-                            for (int c = 0; c < lc; ++c) {
-                                const float* base = prev_latent.data() + (size_t)c * per_c;
-                                double s = 0, s2 = 0;
-                                for (size_t i = 0; i < per_c; ++i) { s += base[i]; s2 += (double)base[i] * base[i]; }
-                                double mu = s / per_c;
-                                ref_mean[c] = (float)mu;
-                                ref_std[c]  = (float)std::sqrt(std::max(1e-8, s2 / per_c - mu * mu));
-                            }
-                            LOG_INFO("continuation: captured segment-0 per-channel reference stats (%d channels)", lc);
-                        }
                         free(lat_out);
                     }
 
                     // frames: segment 0 keeps all; later segments drop the cond tail re-render.
                     int drop = (seg == 0) ? 0 : cond_decoded_v;
+                    // capture this segment's LAST cond_decoded_v decoded frames (deep copy)
+                    // to re-encode as the NEXT segment's cond conditioning (drift sink).
+                    for (auto& f : cond_tail_frames) free(f.data);
+                    cond_tail_frames.clear();
+                    if (seg + 1 < n_segments && !raw_latent) {
+                        int tail_start = seg_count - cond_decoded_v;
+                        if (tail_start < 0) tail_start = 0;
+                        for (int i = tail_start; i < seg_count; ++i) {
+                            sd_image_t copy = seg_video[i];
+                            size_t nbytes   = (size_t)copy.width * copy.height * copy.channel;
+                            copy.data       = (uint8_t*)malloc(nbytes);
+                            std::memcpy(copy.data, seg_video[i].data, nbytes);
+                            cond_tail_frames.push_back(copy);
+                        }
+                    }
                     for (int i = 0; i < seg_count; ++i) {
                         if (i < drop) {
                             free(seg_video[i].data);  // discard re-rendered cond frame
@@ -935,6 +956,8 @@ int main(int argc, const char* argv[]) {
                     }
                     free_sd_audio(seg_audio);
                 }
+                for (auto& f : cond_tail_frames) free(f.data);
+                cond_tail_frames.clear();
 
                 num_results = (int)results.size();
                 LOG_INFO("continuation: stitched %d segments -> %d frames", n_segments, num_results);

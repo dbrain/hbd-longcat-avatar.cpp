@@ -5834,3 +5834,59 @@ SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep) {
         sd_ctx->sd->keep_diffusion_model_resident = keep;
     }
 }
+
+SD_API float* sd_ctx_encode_video_frames(sd_ctx_t* sd_ctx,
+                                         const sd_image_t* frames,
+                                         int num_frames,
+                                         int width,
+                                         int height,
+                                         int* latent_width_out,
+                                         int* latent_height_out,
+                                         int* latent_frames_out,
+                                         int* latent_channels_out) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || frames == nullptr || num_frames <= 0) {
+        return nullptr;
+    }
+    // Assemble the RGB frame stack into a [W, H, T, C, 1] [0,1] tensor (the layout
+    // encode_first_stage expects for the Wan-VAE temporal encode), then VAE-encode to
+    // a DIFFUSION latent — exactly the space generate_video_ex hands back / the next
+    // segment consumes as cont_latent. This is the chaining drift sink.
+    int C = (int)frames[0].channel;
+    sd::Tensor<float> x({(int64_t)width, (int64_t)height, (int64_t)num_frames, (int64_t)C, 1});
+    for (int t = 0; t < num_frames; ++t) {
+        const sd_image_t& img = frames[t];
+        if ((int)img.width != width || (int)img.height != height || (int)img.channel != C) {
+            LOG_ERROR("sd_ctx_encode_video_frames: frame %d shape %ux%ux%u != expected %dx%dx%d",
+                      t, img.width, img.height, img.channel, width, height, C);
+            return nullptr;
+        }
+        for (int ic = 0; ic < C; ++ic) {
+            for (int ih = 0; ih < height; ++ih) {
+                for (int iw = 0; iw < width; ++iw) {
+                    x.index(iw, ih, t, ic, 0) = sd_image_get_f32(img, iw, ih, ic, true);
+                }
+            }
+        }
+    }
+
+    auto latent = sd_ctx->sd->encode_first_stage(x);  // diffusion latent [W,H,T,C,1]
+    if (latent.empty()) {
+        LOG_ERROR("sd_ctx_encode_video_frames: VAE encode failed");
+        return nullptr;
+    }
+    int64_t Wl = latent.shape()[0];
+    int64_t Hl = latent.shape()[1];
+    int64_t Tl = latent.shape()[2];
+    int64_t Cl = latent.dim() > 3 ? latent.shape()[3] : 1;
+    size_t n   = (size_t)latent.numel();
+    float* buf = (float*)malloc(n * sizeof(float));
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    std::memcpy(buf, latent.data(), n * sizeof(float));
+    if (latent_width_out) *latent_width_out = (int)Wl;
+    if (latent_height_out) *latent_height_out = (int)Hl;
+    if (latent_frames_out) *latent_frames_out = (int)Tl;
+    if (latent_channels_out) *latent_channels_out = (int)Cl;
+    return buf;
+}

@@ -11,9 +11,55 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **FEATURE lap 15 (session 20): SEAM DRIFT FIX — decode→re-encode drift sink. The lap-14
+  "multi-frame Wan-VAE encode is BROKEN" diagnosis was WRONG (it was a harness input-shape bug,
+  not a code bug); the encode works at T>1. Switched chaining from raw-latent passthrough to
+  decode→re-encode. 2×93f seam: VISIBLE JUMP 5.51× → acceptable 2.76×. Parent-only code, ggml
+  submodule pristine `c3685f55`, branch green. See `PERF.md` lap 15.**
+  - **VAE-ENCODE "BUG" WAS A HARNESS ARTIFACT.** The lap-14 `GGML_ASSERT(a->ne[2]==b->ne[2])`
+    crash (blamed on `wan.hpp:1056` chunk-concat) reproduces ONLY when a **4D** `[W,H,T,C]` tensor
+    is fed to `WanVAERunner::encode` — `_compute` then `unsqueeze(2)`s it into a folded-channel
+    `[W,H,1,T*C]` shape, so by the first downsample Conv2d the channel dim is `C*T` (e.g. 480=96×5)
+    ≠ the weight's IC. The real crash is in `Resample::forward → Conv2d → ggml_im2col` (`ggml.c:4458`),
+    NOT the encode-loop concat. **Fix = feed a 5D `[W,H,T,C,1]` input** (the layout the production
+    sampler latent / oracle bins already use). The Wan-VAE multi-frame temporal encode was always
+    correct: `sd-vae-roundtrip` (5D input) **encode→decode round-trips at T=5 = 39.03 dB, T=13 = 39.61 dB**
+    (both above the ~37.6 dB VAE-vs-input ceiling, healthy latents `[60,104,2/4,16]` nnan=0).
+    **`src/wan.hpp` is UNCHANGED** (no code fix needed — it was never broken). New harness inputs:
+    `models/_testinputs/vae_input_t{5,13}.bin` (5D).
+  - **DRIFT SINK (the real fix):** new API `sd_ctx_encode_video_frames()` (`stable-diffusion.cpp` +
+    `include/stable-diffusion.h`) VAE-encodes a stack of decoded RGB frames → diffusion latent
+    (matches `generate_video_ex`'s `final_latent_out` / the next segment's `cont_latent` space).
+    The CLI (`examples/cli/main.cpp`) now, after each segment, takes the LAST `cond_decoded_v` DECODED
+    frames, re-encodes them, and feeds the trailing `num_cond_latents` latent frames as the next
+    segment's cond — instead of the v1 raw diffusion-latent passthrough. The encode→decode round-trip
+    re-regularizes the cond to the Wan-VAE manifold every chain step (the reference `generate_vc`'s
+    drift sink). A/B escape hatch `LONGCAT_CONT_RAW_LATENT=1` restores v1 for measurement.
+  - **SEAM Δ (2×93f Q4_K, seam @f93, lap-14 regime):** BEFORE (raw passthrough) **5.51× [VISIBLE JUMP]**
+    → AFTER (re-encode) **2.76× [acceptable]** — the hard seam JUMP is gone. Identity carries (cosine
+    0.9995). Clips: `models/_perf/chain2x93_{before_rawlatent,after_reencode}.webm` +
+    deliverable `models/_perf/chained_q4k_fixed.webm`.
+  - **RESIDUAL (honest):** the re-encode smooths the seam TRANSITION but does NOT fully kill the
+    per-segment exposure drift — at 2×93f, seg1 still darkens (seg0 R98 → seg1 R75; per-seg color-drift
+    sum ~39 in both). The darkening is a **cond→generated brightness STEP inside each segment** (the
+    cond frames decode bright ~95-100, the 8-step-DMD-generated frames sit ~75-84), NOT a uniform
+    per-segment offset. **Documented mitigations tried/blocked:** (a) "more steps" — BLOCKED: the DMD
+    schedule is CLAMPED to the distilled 8 (`stable-diffusion.cpp:3460` `dmd_steps = (s>0 && s<8)?s:8`),
+    so `--steps>8` is a no-op; raising it needs the distill-schedule logic changed (out of scope, brief
+    says don't touch step default). (b) pixel-space per-segment uniform exposure anchor — MEASURED a
+    WASH (the drift is a within-segment cond→gen step, not a uniform offset; correction was ~0.8/255,
+    seam unchanged 2.76×) — REMOVED, not shipped (same verdict class as lap-14's latent renorm). The
+    residual cond→gen brightness step is an 8-step-DMD generation limitation; the re-encode is the
+    correct architectural fix and clears the VISIBLE-JUMP class. At shorter segments (33f) the drift is
+    mild in both paths (the bug is a 93f-segment phenomenon).
+  - **NOTE:** the avatar ctx loads the VAE encoder (not decode-only — the AI2V ref-image path needs it),
+    so `sd_ctx_encode_video_frames` works in the normal chained run with no extra flags. Single-clip path
+    (`--segments 1`) bypasses ALL chaining code → bit-identical to BEST (25f/99 dB UNTOUCHED).
+
 - 🟡 **FEATURE lap 14 (session 19): CONTINUATION CHAINING — multi-segment clips END-TO-END,
   but COLOR DRIFTS across segments (seam-quality risk realized). Parent-only code, ggml
-  submodule pristine `c3685f55`, branch green. Owner eyeball gate.**
+  submodule pristine `c3685f55`, branch green. Owner eyeball gate. [SUPERSEDED by lap 15 above —
+  the drift is reduced via decode→re-encode; the "VAE encode broken" claim was a harness artifact.]**
   **WHAT SHIPPED (the LongCat headline feature — arbitrary-length avatar clips):**
   - **`--segments N` + `--cont-cond-frames K`** (CLI, `examples/cli/main.cpp` + `common.{h,cpp}`):
     renders N chained 93f segments and stitches them into one continuous clip + muxes the full

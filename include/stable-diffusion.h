@@ -481,6 +481,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 // later segments don't render against freed GPU memory.
 SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep);
 
+// LongCat-Avatar continuation chaining (drift sink): VAE-encode a stack of decoded
+// RGB frames back to a DIFFUSION latent, matching the space of generate_video_ex's
+// final_latent_out / the cont_latent consumed by the next segment. This is the
+// reference pipeline's decode->re-encode round-trip: re-regularizing the prior
+// segment's tail to the Wan-VAE manifold every chain step kills the per-seam
+// color/identity drift that a raw latent passthrough compounds. The frames are the
+// last N decoded video frames of the prior segment (same W/H as the render).
+// Returns a malloc'd latent (caller frees via free()) in ggml-ne order
+// [latent_width, latent_height, latent_frames, latent_channels, 1], or NULL on error.
+SD_API float* sd_ctx_encode_video_frames(sd_ctx_t* sd_ctx,
+                                         const sd_image_t* frames,
+                                         int num_frames,
+                                         int width,
+                                         int height,
+                                         int* latent_width_out,
+                                         int* latent_height_out,
+                                         int* latent_frames_out,
+                                         int* latent_channels_out);
+
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 
 SD_API upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,
