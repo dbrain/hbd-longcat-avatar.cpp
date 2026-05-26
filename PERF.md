@@ -42,7 +42,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 03  | DiT-step PROFILED + reusable phase/op profilers + audio `gate_mul` (drop pointless zeros-add) | 237.8 (8) | 10779 | bit-identical to BEST (99 dB all frames) | 877c258 |
 | 05  | DiT glue cuts: `scale_bias` fuse + redundant qkv-cont removal + audio silu reuse | sampling 162.3 (was 163.7) | 10779 | bit-identical to BEST (99 dB all frames) | 24d2d9c |
 | 06  | `flash_skip_kv_pad`: drop the legacy flash kv-pad mask (NOT the qkv double-buffer) → NATIVE 93f renders | 25f unchanged; 93f offload sampling 965.6 (120.7/step) | 93f self-attn seg 12008→5511 | 25f BIT-IDENTICAL to BEST (99 dB); 93f coherent ac16≈0.82 all 93f | lap-06 |
-| 07  | split fused qkv → per-output matmuls (kills the 1.75 GiB qkv permute-cont) + FFN token-tiling (auto >16k tok) | 25f sampling 162.3→**146.8 (−9.5%)**; 93f offload 939.2 (117.4/step) | 93f RESIDENT monolithic 5323→**3629** (−1694); offload segs merge 49→33 | 25f **BIT-IDENTICAL to BEST (99 dB)**; 93f offload **BIT-IDENTICAL to lap-06 native (99 dB all 93f)** | 2ce48ee (HEAD) |
+| 07  | split fused qkv → per-output matmuls (kills the 1.75 GiB qkv permute-cont) + FFN token-tiling (auto >16k tok) | 25f sampling 162.3→**146.8 (−9.5%)**; 93f offload 939.2 (117.4/step) | 93f RESIDENT monolithic 5323→**3629** (−1694); offload segs merge 49→33 | 25f **BIT-IDENTICAL to BEST (99 dB)**; 93f offload **BIT-IDENTICAL to lap-06 native (99 dB all 93f)** | 2ce48ee |
+| 08  | KERNEL PROFILE: flash-attn d=128 **verified on MMA tensor-core path** (not a fallback); MUL_MAT Q4_K **verified on MMQ int8-tensor-core** — both optimal for this shape on sm_86. No mis-dispatch. Levers scoped: custom kernels = fork-class low-ROI; FFN w1+w3 fuse = ~1% (parked, do converter-side); kv_scale fold = sub-noise | 25f sampling 147 (unchanged) | unchanged | 25f **BIT-IDENTICAL to BEST (99 dB)** | (no change) HEAD c0ea6d3 |
 
 (rows appended per lap below)
 
@@ -462,6 +463,40 @@ peak in the resident graph (it was NOT in the 3,629 MiB peak set).
 
 **Clips:** `models/_perf/lap07_qkvsplit_25f.webm` (25f, = BEST), `lap07_fulllen_93f_8step.webm`
 (93f offload, = lap-06 native).
+
+### lap 08 — KERNEL-LEVEL PROFILE OF THE HOT PATH (the campaign target): flash-attn d=128 IS on the MMA/tensor-core path, and MUL_MAT-Q4_K IS on the MMQ int8-tensor-core kernel — BOTH are on the optimal ggml-CUDA kernel for this shape on sm_86. No fallback to fix; no config knob mis-set. (no code change shipped)
+
+This lap directly answered the campaign's central question — **"is flash-attn d=128 on MMA or a slow non-MMA fallback (like the head_dim-72 VL TILE-kernel trap)?"** — and re-profiled MUL_MAT to the specific dispatch path. Method: re-applied the env-gated `LONGCAT_OP_PROFILE` block to the **ggml-cuda node loop** (`cudaEvent` around every `ggml_cuda_compute_forward`, plus a MUL_MAT bucketing by `src1->ne[1]`), built, took the breakdown on the **real 12503-node DiT-step graph** (25f/480p/audio-on, resident weights), then REVERTED the submodule (kept pristine; re-apply the ~42-line block in `ggml/src/ggml-cuda/ggml-cuda.cu` around `ggml_cuda_compute_forward` to re-take).
+
+**Fresh per-DiT-step op breakdown (sync-inflated absolute ms, proportions exact):**
+
+| op | ms | n | notes |
+|----|----|---|-------|
+| **MUL_MAT** | 7662 | 826 | **M>4096 bucket = 7094 ms / n=481 = 92.6% of all matmul** — the per-block Q4_K weight matmuls at n_token~10920 |
+| **FLASH_ATTN_EXT** | 5617 | 144 | 96 self (cond+noise/block) + 48 text-cross |
+| CONT | 1220 | 1831 | flash-layout permute-conts + cond/noise split slice-conts |
+| ADD | 1124 | 1116 | residual + modulate-shift broadcasts |
+| MUL | 917 | 626 | modulate-scale + gate broadcasts |
+| SCALE | 448 | 819 | ~half is the kv_scale=1/256 F16-guard scales |
+| NORM | 255 | 242 | LayerNorms |
+| CONCAT | 206 | 145 | cond/noise concat + cond-zero prepends |
+| REPEAT | 176 | 288 | |
+| UNARY | 141 | 102 | SiLU |
+| CPY | 108 | 288 | |
+
+MUL_MAT (7662) + FLASH (5617) = **13279 / 18250 ≈ 72.8%** — confirms lap-03 on the post-lap-07 tree.
+
+**FINDING 1 — FLASH_ATTN_EXT d=128 IS ON THE TENSOR-CORE MMA PATH (verified by reading the dispatcher, NOT assumed).** `ggml_cuda_get_best_fattn_kernel` (`fattn.cu`): the avatar's self-attn has `K->ne[0]=128` (passes the head-dim switch), `K/V type F16` (after the kv cast), `Q->ne[0]=128 != {40,72}`, and `turing_mma_available(cc)` is **true** on sm_86 (cc=860 ≥ GGML_CUDA_CC_TURING=750). The vec-kernel branch requires `Q->ne[1] <= 2` (it's ~9360), so it falls through to **`BEST_FATTN_KERNEL_MMA_F16`** (line 478). The d=128 path is the standard MMA tensor-core kernel — NOT the head_dim-72 TILE trap from the VL memo (that fell to TILE precisely because 72 is excluded at `Q->ne[0] != 72` and has no MMA config; 128 is a first-class MMA head dim). **There is no flash-attn fallback to fix — the big win the campaign hypothesized does not exist here.**
+- The MMA tile config is also right: `mask==nullptr` (self-attn) + `gqa_ratio==1` (n_head==n_kv_head==32, no GQA) ⇒ `use_gqa_opt=false`, `ncols2=1`, and large `Q->ne[1]` selects `ncols1=64` — the large-batch MMA config, the correct choice for this dense full-attention shape. No knob is mis-set.
+
+**FINDING 2 — MUL_MAT Q4_K IS ON THE MMQ INT8-TENSOR-CORE KERNEL (the optimal path for these M).** `ggml_cuda_mul_mat` (`ggml-cuda.cu`): Q4_K weight × F32 activation at M=n_token~10920 ⇒ `use_mul_mat_vec_q` is false (M ≫ MMVQ_MAX_BATCH_SIZE), so **`use_mul_mat_q` (MMQ) fires**. `ggml_cuda_should_use_mmq(Q4_K, sm_86, ...)` returns true unconditionally on Ampere (`turing_mma_available` short-circuit). MMQ quantizes the activation to Q8_1 and runs the int8 MMA kernel — the well-tuned llama.cpp path. This is the SAME finding class as the memory notes "at large M, MMQ mma beats dp4a; Q4_K near floor" + "FORCE_CUBLAS dequant is a net regression for quant weights." Confirmed: the genuine matmul compute is on the best kernel.
+
+**LEVERS SCOPED + their honest ROI (none shipped — all either dead, fork-class, or sub-1%):**
+- **Custom d=128 flash kernel / custom Q4_K MMQ tiling:** the two consumers are *already* on ggml's tuned tensor-core kernels. Beating them is the multi-day CUDA fork the campaign authorized — but the parakeet lap-7 + qwen3-tts INT8-mma memos repeatedly measured hand-rolled GEMM/attention at a *fraction* of ggml's throughput (1.7% of peak in one case). The ROI is the same class as the parked lap-12 native-m16n8k8 kernel: order-of-magnitude worse than the redeploy/glue wins. **Not pursued without a measured reason to believe a hand kernel beats the vendor-tuned one on THIS shape.**
+- **MUL_MAT activation-quantize de-dup (the one concrete structural redundancy found):** MMQ re-quantizes src1→Q8_1 *per call*, so the lap-07 qkv 3-split (and the FFN's separate w1/w3) quantize the shared activation 3× / 2× respectively. **Re-fusing qkv is OFF the table** — lap-07 proved the split's removed 1.75-GiB permute-cont dominates the extra quantize (net −9.5%). **Fusing FFN w1+w3 into one [4096→22016] matmul** would save 1 quantize of y/block (bit-exact, same FLOPs) — but the w1/w3 are separate gguf Q4_K tensors, so it needs a load-time weight-concat into a persistent buffer, which hits the siglip2/lap-01 **gallocr-aliasing trap** (the runner uses a fresh compute_ctx per step). Multi-hour + aliasing-risk for a forecast ~1% (quantize is a small fraction of each 14.7-ms-avg big matmul). **Parked as the single best remaining MUL_MAT lever IF a future session wants to chase it — do it as a converter-side concat (emit a fused `ffn.w13` tensor) to dodge the aliasing trap, not a runtime concat.**
+- **kv_scale=1/256 SCALE-fold:** the F16-overflow guard adds full-tensor SCALE on k and v before the F16 cast in *every* flash call (~half the 448-ms SCALE bucket). k_rope/v are shared by the cond+noise passes, so pre-scaling them ONCE in `self_attn` (with a "k/v already scaled" flag into `build_kqv`) drops the cond-pass duplicate scales. Bit-exact (uniform scalar) but the saving is sub-1% (the cond slice is only 1560 of 10920 rows) — **below the step-to-step noise floor; not implemented** (recorded so it isn't re-derived).
+
+**VERDICT: the post-lap-07 hot path is genuinely on the optimal ggml-CUDA kernels for the avatar's shape on sm_86 — confirmed by reading both dispatchers, not by assuming a floor.** The "compute-bound" call that prior laps kept finding premature was premature about the *glue/VRAM* surface (laps 05/06/07 each found real wins there); the *kernel* surface (MUL_MAT MMQ + FLASH MMA) is, this time, measured to be on the vendor-tuned path with no mis-dispatch and no cheap structural redundancy. The next real speed gain requires either (a) a hand-written CUDA kernel that beats ggml's tuned MMQ/MMA on this shape (fork-class, low prior probability per the cross-project memos), (b) the converter-side FFN w1+w3 fuse (~1%, aliasing-safe if done at convert), or (c) the quality-sensitive `--steps`/quant knobs (owner's call, already A/B'd). **25f sampling stays 147 s (8-step), bit-identical to BEST (99 dB all frames); branch green. No code change shipped this lap.**
 
 ### lever 5 — Q3_K quant ladder: DEAD END on Ampere (measured, no lap)
 - DiT is uniform Q4_K (MUL_MAT 38% of the step). Tested whether a smaller Q3_K DiT

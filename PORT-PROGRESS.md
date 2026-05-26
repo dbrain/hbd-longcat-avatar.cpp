@@ -11,6 +11,29 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 08 (session 12, 2026-05-26): HOT-PATH KERNEL PROFILE — flash-attn d=128 is on the
+  MMA tensor-core path, MUL_MAT-Q4_K is on the MMQ int8-tensor-core kernel; BOTH optimal for this
+  shape on sm_86. NO code change shipped. See `PERF.md` lap 08.** Directly answered the campaign's
+  central question (is flash-attn d=128 on MMA or a slow non-MMA fallback like the head_dim-72 VL
+  TILE trap?): read `ggml_cuda_get_best_fattn_kernel` — d=128 + F16 k/v + `turing_mma_available`
+  true on sm_86 + Q->ne[1]≫2 ⇒ falls through to **`BEST_FATTN_KERNEL_MMA_F16`** (the head_dim-72
+  trap fires only because 72 is *excluded* from MMA; 128 is first-class). MMA tile config is also
+  correct (mask null + gqa_ratio 1 ⇒ ncols2=1/ncols1=64, the large-batch config). MUL_MAT: Q4_K ×
+  F32 at M~10920 ⇒ MMQ int8-tensor-core (the tuned llama.cpp kernel), confirmed via
+  `ggml_cuda_mul_mat` + `ggml_cuda_should_use_mmq`. Fresh op profile on the real 12503-node DiT
+  step: MUL_MAT 7662 ms (M>4096 bucket = 92.6%) + FLASH 5617 ms = **72.8%**, on the optimal kernels.
+  **Levers scoped, none shipped:** custom d=128 flash / Q4_K MMQ kernel = the fork-class multi-day
+  rewrite the campaign authorized, but prior cross-project memos (parakeet lap-7, qwen3 INT8-mma)
+  repeatedly measured hand kernels at a fraction of ggml's tuned throughput — low prior, not pursued
+  without a measured reason; **FFN w1+w3 fuse** (one [4096→22016] matmul, saves 1 Q8_1 activation
+  re-quant/block, bit-exact) is the single best remaining MUL_MAT lever at ~1% but needs a
+  *converter-side* fused-weight tensor to dodge the gallocr-aliasing trap (parked for a future
+  session); **kv_scale=1/256 SCALE-fold** = sub-noise, recorded not implemented. 25f sampling 147 s
+  (8-step), **bit-identical to BEST (99 dB all frames)**, branch green at `c0ea6d3` (no change).
+  Re-take the profile with the env-gated `LONGCAT_OP_PROFILE` block (re-apply ~42 lines in
+  `ggml/src/ggml-cuda/ggml-cuda.cu` around `ggml_cuda_compute_forward`, then revert — kept submodule
+  pristine).
+
 - 🟢 **PERF lap 07 (session 11, 2026-05-26): QKV-SPLIT — −1.7 GiB resident @ 93f AND −9.5% on the
   25f hot path, both bit-identical. See `PERF.md` lap 07.** `GGML_ALLOCATOR_DEBUG` re-localized the
   resident (no-offload, monolithic) 93f peak: after lap-06 removed the flash mask, the peak was the
