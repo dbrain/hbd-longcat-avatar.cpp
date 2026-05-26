@@ -44,6 +44,7 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 06  | `flash_skip_kv_pad`: drop the legacy flash kv-pad mask (NOT the qkv double-buffer) → NATIVE 93f renders | 25f unchanged; 93f offload sampling 965.6 (120.7/step) | 93f self-attn seg 12008→5511 | 25f BIT-IDENTICAL to BEST (99 dB); 93f coherent ac16≈0.82 all 93f | lap-06 |
 | 07  | split fused qkv → per-output matmuls (kills the 1.75 GiB qkv permute-cont) + FFN token-tiling (auto >16k tok) | 25f sampling 162.3→**146.8 (−9.5%)**; 93f offload 939.2 (117.4/step) | 93f RESIDENT monolithic 5323→**3629** (−1694); offload segs merge 49→33 | 25f **BIT-IDENTICAL to BEST (99 dB)**; 93f offload **BIT-IDENTICAL to lap-06 native (99 dB all 93f)** | 2ce48ee |
 | 08  | KERNEL PROFILE: flash-attn d=128 **verified on MMA tensor-core path** (not a fallback); MUL_MAT Q4_K **verified on MMQ int8-tensor-core** — both optimal for this shape on sm_86. No mis-dispatch. Levers scoped: custom kernels = fork-class low-ROI; FFN w1+w3 fuse = ~1% (parked, do converter-side); kv_scale fold = sub-noise | 25f sampling 147 (unchanged) | unchanged | 25f **BIT-IDENTICAL to BEST (99 dB)** | (no change) HEAD c0ea6d3 |
+| 08b | RESIDENT-93f investigation: re-localized the 3,629 floor (it is **six ~585 MiB RoPE-internal** cont/repeat/mul buffers, NOT the matmul outputs the lap-07 handoff named). F16-rope cuts it to **2,983 (−646)** but FAILS the 99 dB gate (43 dB, trajectory drift) AND still runtime-OOMs on the MMQ VMM pool. Bit-identical lowmem-F32-rope (half-width concat) REGRESSES the resident peak (→3,860). **No quality-neutral resident win exists at the rope layer.** Precise fix = bound the MMQ pool, or a custom F32 fused-RoPE CUDA op. | 25f sampling 147 (unchanged) | 93f resident floor 3,629 (unmoved quality-neutrally) | 25f **BIT-IDENTICAL** (no code shipped) | (no change) HEAD c78e86c |
 
 (rows appended per lap below)
 
@@ -552,14 +553,69 @@ MUL_MAT (7662) + FLASH (5617) = **13279 / 18250 ≈ 72.8%** — confirms lap-03 
   Splitting the fused qkv matmul dropped 25f sampling −9.5% (162.3 → 146.8 s) AND the 93f resident
   peak −1.7 GiB — by REMOVING a per-block full-size permute-cont, not by touching the matmul/flash
   compute. The lesson holds: PROFILE the allocator + op set, don't assume the floor.
-- **Two threads left for a future session, both for RESIDENT 93f (the ~530 MiB still over):**
-  1. **Structural self-attn working-set rework.** The 3,629 MiB resident floor is four ~585 MiB
-     `[4096, n_token]` F32 tensors. q_rope must stay F32 (flash asserts). The realistic cut is to
-     restructure so that fewer than four full-token F32 buffers coexist — e.g. fuse q_norm/RoPE to
-     write q_rope in place over q (avoid a separate buffer), or compute v lazily after q/k are
-     consumed. Needs careful liveness reasoning (gallocr schedules by dependency, not source order —
-     the lap-07 F16-cast attempts failed because they were downstream of the peak offset). Measure
-     with `GGML_ALLOCATOR_DEBUG` + OFFSETS (see the diagnostic note in lap 07).
+### lap 08b — RESIDENT-93f investigation (no code shipped; the 3,629 floor RE-LOCALIZED + the bit-identical wall measured)
+
+A full `GGML_ALLOCATOR_DEBUG` re-localization of the 93f RESIDENT (no-offload, monolithic) peak
+**corrected the lap-07 attribution.** The 3,629 MiB peak is NOT "four [4096,n_token] F32 tensors
+incl. q_rope/x/k_rope/v" — it is **SIX ~585 MiB tensors that are RoPE INTERNALS** (the op dump at the
+high-water shows them as `CONT` / `REPEAT` / `MUL`, not the q/k/v matmul outputs or the residual x).
+Each `apply_rope` call (`src/rope.hpp`) materializes, per call: the `[d/2, L, n_head*N, 2]` input
+`ggml_cont` (585) + **two full-size `ggml_repeat` buffers** (585 each — the interleaved rope repeats
+`x_even`/`x_odd` across the size-2 within-pair dim so it can elementwise-`ggml_mul` against `pe`).
+At the peak, Q's rope working set (~5×585) coexists with K's. The repeats are the waste, and they are
+intrinsic to the elementwise-mul rope formulation (a full-size output needs a full-size `ggml_mul`
+src0; neither the half-width `x` view nor the head-less `pe` is full-size, so one must be repeated).
+
+**LEVERS MEASURED (all reverted — tree green at c78e86c):**
+- **RoPE math in F16 for q/k/v** (q/k are RMS-normed/bounded; v already F16-cast in build_kqv). Cuts the
+  93f resident compute buffer **3,629 → 2,983 MiB (−646)**. BUT **FAILS the bit-identical gate**: 25f vs
+  BEST drops to mean 43 dB / min 35 dB (frame-0 cond still 99 dB; gen frames coherent ac16≈0.83 but a
+  visibly DIFFERENT render — same class as Q4_0 / `--steps 6`). The F16 rounding of the q·k logits,
+  accumulated over 48 blocks × 8 steps on the huge residual stream, drifts the denoise trajectory
+  beyond noise. Per the quality gate (hard 99 dB), reverted. **AND it still does not render resident:**
+  even at 2,983 MiB the run runtime-OOMs — the **MMQ Q8_1 activation-quant VMM pool** (`ggml-cuda.cu`
+  `pool.alloc` / `cuMemCreate`) needs ~300–400 MiB ON TOP of weights(8,539)+compute, and 8,539+2,983 =
+  11,522 leaves only ~387 MiB of the 11,909 usable — not enough for the pool. So F16-rope buys neither
+  quality nor a resident render.
+- **Low-VRAM F32 rope (`lowmem` interleaved path: compute the two within-pair output halves at
+  [1,d/2,L,nh*N] ~292 MiB and `ggml_concat`, never repeating to [2,...]).** **BIT-IDENTICAL (25f = BEST,
+  99 dB all frames; sampling 147 s, no regression)** — the math is the same F32 products+adds. BUT it
+  did NOT lower the *resident* peak (it REGRESSED it to ~3,860): the two rope OUTPUTS (q_rope+k_rope,
+  585 each, bit-identical-required F32) plus the downstream qkv/proj `MUL_MAT` still floor the peak, and
+  gallocr packs the concat outputs at higher offsets. (It DOES shrink the per-rope *intermediate* set,
+  so it may help the SEGMENTED offload self-attn segment — untested; a future session could keep it
+  purely for the shipped offload path if a measurement shows the segment shrinks.)
+- **V-side early-F16, in-place rope muls, serialized repeats** — all bit-identical, none moved the
+  resident peak (V/serialization aren't in the peak set; in-place was already gallocr-reused).
+
+**VERDICT: the ~530 MiB resident-93f gap CANNOT be cleared QUALITY-NEUTRALLY at the rope layer.** The
+peak is q_rope+k_rope as F32 (2×585) plus the dense qkv/proj region; the only thing that lowers it
+(F16 rope math) fails the 99 dB gate AND still misses on the runtime MMQ pool. **The precise structural
+change that WOULD clear it (for owner greenlight), in decreasing safety:**
+  1. **Bound/disable the MMQ Q8_1 VMM pool growth** so the runtime overhead above the gallocr reserve
+     shrinks — then even modest compute cuts fit. This is a ggml-cuda change (cap the pool, or force the
+     big self-attn/proj matmuls through a path that doesn't need the on-demand pool), independent of the
+     math. Highest ROI, lowest quality risk.
+  2. **A custom F32 fused-RoPE CUDA op** (`ggml-cuda`, editable submodule) that applies the precomputed
+     `pe` rotation in one kernel writing q_rope directly over a single buffer — no `cont`+2×`repeat`+
+     `mul`+`add` chain, no intermediate full-size buffers. Bit-identical F32, would drop each rope's
+     working set to ~1×585 (just the output). This is the clean structural fix but it's a CUDA-kernel
+     write (fork-class, the campaign-authorized but low-ROI tier).
+  Do NOT ship the F16-rope (quality cut) or the bit-identical lowmem-rope-for-resident (regresses the
+  resident peak) — neither achieves the goal. 93f continues to ship via `--offload-to-cpu` (~117 s/step,
+  lap-07), which is unaffected.
+  Diagnostic recipe used (revert after): `#define GGML_ALLOCATOR_DEBUG` in `ggml/src/ggml-alloc.c` +
+  augment the high-water dump to print `ggml_op_name(tensor->op)` + src0/src1 names; run a `--steps 1
+  --video-frames 93` (no `--offload-to-cpu`) `--verbose` probe; grep `max_size[0]` for the peak and parse
+  the per-tensor `[chunk: start-end] (MB)` lines that follow (one tensor per `[DEBUG] ggml_extend.hpp:60`
+  line). NOTE: `systemd-run -p MemoryMax=14G` OOMs the host-RAM model load (DiT 8.9G + umT5 6G resident
+  exceeds 14G); raise the cap or omit for resident probes.
+
+- **Older lap-07 thread (now superseded by lap-08b above):**
+  1. **Structural self-attn working-set rework.** ~~The 3,629 MiB resident floor is four ~585 MiB
+     `[4096, n_token]` F32 tensors. q_rope must stay F32 (flash asserts).~~ (CORRECTED by lap-08b: the
+     floor is six ~585 MiB RoPE-internal buffers — the `cont` + two `repeat` per rope call, NOT the
+     matmul outputs. See lap-08b for the measured levers + the precise fix.)
   2. **Front B (helps ALL lengths incl. 25f): the hot-path kernels are still untouched** — lap-03
      profiled MUL_MAT 38% + FLASH_ATTN 34%. The qkv-split already shaved the glue; the genuine
      compute (Q4_K MMQ at head_dim 128 / flash-attn for d=128 on Ampere) has had NO custom-kernel

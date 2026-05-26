@@ -11,6 +11,28 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 08b (session 13, 2026-05-26): RESIDENT-93f investigation — NO quality-neutral win
+  exists at the rope layer; no code shipped, tree green at `c78e86c`. See `PERF.md` lap 08b.**
+  `GGML_ALLOCATOR_DEBUG` (with an op-type-augmented high-water dump) **re-localized the 3,629 MiB
+  93f resident peak** and CORRECTED the lap-07 attribution: it is **six ~585 MiB tensors that are
+  RoPE INTERNALS** (`apply_rope`'s `[d/2,L,nh*N,2]` input `ggml_cont` + the two full-size
+  `ggml_repeat` buffers, per call — Q's set overlaps K's), NOT the q/k/v matmul outputs or residual
+  x the handoff named. **Levers measured + reverted:** (1) **RoPE math in F16** for q/k/v cuts the
+  peak 3,629→**2,983 (−646 MiB)** but FAILS the bit-identical gate (25f vs BEST mean **43 dB**/min
+  35 dB — coherent ac16≈0.83 but a visibly different render, trajectory drift from F16 q·k logits
+  over 48 blk × 8 steps) AND still runtime-OOMs on the **MMQ Q8_1 VMM pool** (needs ~300-400 MiB
+  above weights 8,539 + compute; 8,539+2,983 leaves only ~387 of 11,909 usable) — so it buys neither
+  quality nor a resident render; (2) **bit-identical low-VRAM F32 rope** (compute the two within-pair
+  output halves at ~292 MiB + `ggml_concat`, no `[2,...]` repeat) is **25f BIT-IDENTICAL (99 dB,
+  sampling 147 s)** but REGRESSES the *resident* peak to ~3,860 (the two F32 rope OUTPUTS + downstream
+  `MUL_MAT` still floor it; gallocr packs the concats higher) — may help the SEGMENTED offload path
+  (untested); (3) V-early-F16 / in-place muls / serialized repeats — all bit-identical, none in the
+  peak set. **VERDICT: the ~530 MiB resident gap can't be cleared quality-neutrally at the rope
+  layer.** Precise fix for owner greenlight: (a) bound/disable the MMQ activation-quant VMM pool
+  growth (ggml-cuda; lowest risk), or (b) a custom F32 fused-RoPE CUDA op writing q_rope in one
+  kernel over a single buffer (no cont+2×repeat+mul chain) — fork-class. 93f keeps shipping via
+  `--offload-to-cpu` (~117 s/step, lap-07), unaffected. 25f hot path bit-identical, unchanged.
+
 - 🟢 **PERF lap 08 (session 12, 2026-05-26): HOT-PATH KERNEL PROFILE — flash-attn d=128 is on the
   MMA tensor-core path, MUL_MAT-Q4_K is on the MMQ int8-tensor-core kernel; BOTH optimal for this
   shape on sm_86. NO code change shipped. See `PERF.md` lap 08.** Directly answered the campaign's
