@@ -46,14 +46,30 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
   prior segment's GENERATED latent; the reference's decode→re-encode roundtrip re-regularizes the
   latent to the VAE distribution every chain step, which the latent-passthrough skips → drift
   accumulates. The 8-step DMD schedule (vs reference 50-step `generate_vc`) likely amplifies it.
-  **FIX ATTEMPT IN FLIGHT:** per-channel latent stat-match — renormalize each cond-latent tail to
-  segment-0's per-channel mean/std (`LONGCAT_NO_CONT_RENORM=1` to disable). A/B render
-  (`chained_multiseg_renorm.webm`) rendering at handoff; numbers pending.
-  **IF RENORM INSUFFICIENT — the real fix:** fix the multi-frame Wan-VAE encode bug (chunk-output
-  ne[2] mismatch at `wan.hpp:1056`) and condition on decode→re-encoded pixels (reference-faithful,
-  drift-resistant), OR raise `--steps` for chained renders. Single-clip path / Q4_K reference /
-  step-count all UNTOUCHED. CLI: `--segments 3 --cont-cond-frames 13` (default cond-frames 13 = the
+  **FIX ATTEMPT (per-channel latent stat-match, MEASURED — INSUFFICIENT):** renormalize each
+  cond-latent tail to segment-0's per-channel mean/std (`LONGCAT_CONT_RENORM=1`, OPT-IN). 3×93f
+  A/B (`chained_multiseg_norenorm.webm` vs `_renorm.webm`): renorm REDUCED the latent color-cast
+  magnitude (seg2 blue channel B 176→104, much closer to seg0's ~97) but did NOT fix the visible
+  chroma drift (the per-channel latent match is too coarse for the nonlinear VAE — seg1 still
+  greenish, seg2 still teal in the decoded pixels) and slightly SHARPENED the per-seam brightness
+  STEP (seam2 8.47×→12.16× by the Δ metric; within-seg median dropped 5.3→4.8). Net: marginal,
+  not a fix. Left opt-in; default OFF.
+  **THE REAL FIX (next session):** fix the multi-frame Wan-VAE encode bug (chunk-output ne[2]
+  mismatch at `wan.hpp:1056`, reproduced on CPU via `sd-vae-roundtrip` at T=5) and condition on
+  decode→re-encoded pixels — the reference's `generate_vc` does exactly this, and the VAE roundtrip
+  re-regularizes the latent to the data manifold every chain step (the missing drift sink). OR
+  raise `--steps` for chained renders (the 8-step DMD likely amplifies the drift vs the reference's
+  50-step). Single-clip path / Q4_K reference / step-count all UNTOUCHED. CLI: `--segments 3 --cont-cond-frames 13` (default cond-frames 13 = the
   reference's `num_cond_frames`).
+  **CLI USAGE (owner):** add `--segments N` (+ optional `--cont-cond-frames K`, default 13) to the
+  normal avatar `vid_gen` command, e.g.
+  `sd-cli -M vid_gen -m <q3_k dit> --t5xxl <umt5> --vae <wanvae> --audio-vae <whisper>
+   --init-img girl.png --audio speech.wav -p "a person talking" --cfg-scale 1.0
+   --video-frames 93 -W 480 -H 832 --steps 8 --segments 3 --cont-cond-frames 13
+   --diffusion-fa --seed 42 --max-vram 9 -o chained.webm`.
+  Clip length = `video_frames + (N-1)*(video_frames - cond_decoded)` frames @ 25 fps (93f×3, 13-frame
+  overlap → 253f / 10.08 s). Each segment is ~19 min (915 s sample + 201 s decode) at 93f-resident
+  Q3_K on the RTX 3060; cap `--segments` accordingly. `LONGCAT_NO_CONT_RENORM=1` disables drift control.
 
 - 🟢 **PERF lap 13 (session 18): QUALITY-DROP LADDER (owner-directed) — 4 runtime-selectable rungs
   GPU-TE→Q4_0→Q3_K→Q2_K, each side-by-side clipped. HEADLINE: Q3_K (6.84 GB) & Q2_K (5.24 GB) UNLOCK

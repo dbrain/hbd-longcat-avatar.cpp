@@ -821,8 +821,13 @@ int main(int argc, const char* argv[]) {
                 // re-regularizes each time; the latent passthrough skips that). As a
                 // cheap counter, match each cond-latent tail's per-channel mean/std to
                 // segment 0's reference stats so each segment starts from the same
-                // distribution. Toggle off with LONGCAT_NO_CONT_RENORM=1.
-                bool cont_renorm = getenv("LONGCAT_NO_CONT_RENORM") == nullptr;
+                // distribution. MEASURED (3x93f A/B): reduces the latent color-cast
+                // magnitude (seg2 blue B 176->104) but does NOT fix the visible chroma
+                // drift (per-channel latent stat-match is too coarse for the nonlinear
+                // VAE) and slightly sharpens the per-seam brightness step. Left OPT-IN
+                // (LONGCAT_CONT_RENORM=1); the real fix is decode->re-encode (needs the
+                // multi-frame Wan-VAE encode bug fixed) or more --steps for chained runs.
+                bool cont_renorm = getenv("LONGCAT_CONT_RENORM") != nullptr;
                 std::vector<float> ref_mean, ref_std;  // per-channel, from segment 0
 
                 for (int seg = 0; seg < n_segments; ++seg) {
