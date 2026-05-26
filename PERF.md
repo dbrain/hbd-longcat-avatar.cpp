@@ -1154,3 +1154,95 @@ overlap on the re-encode path** is the recommended config; the re-encode is defa
 longcat-chain-{before,after} + `--rm`; verified `docker ps`/`nvidia-smi`), ggml submodule pristine at
 `c3685f55` (parent-only lap), `src/wan.hpp` unchanged, branch green. Single-clip path (`--segments 1`)
 bypasses all chaining code → 25f/99 dB BEST untouched.
+
+### lap 16 — MOUTH-EXAG KNOBS (runtime) + CHAINING SEAM DRIFT KILLED (per-segment exposure-match) + PERF/VRAM CROSSOVER TABLE (the headroom story)
+
+Three deliverables this lap (all parent-only, ggml submodule pristine `c3685f55`, branch green;
+Q4_K + 8-step-DMD-default LOCKED, single-clip path bit-identical).
+
+**TASK 1 — mouth-exaggeration knobs (RUNTIME).** Two reversible controls, default = current
+behavior (bit-identical):
+- **`--audio-mouth-scale`** (default 1.0): scales the audio cross-attn gated residual add — the
+  SINGLE additive term that drives the face from audio (`longcat_avatar.hpp` block, after `gate_mul`,
+  before the residual `ggml_add`) — uniformly across all 48 blocks. <1 = milder mouth, >1 = more
+  exaggerated; timing untouched (it lives in WHICH tokens attend, not their magnitude). Threaded as a
+  per-render field `LongCatAvatarRunner.audio_mouth_scale` → `LongCatAvatar` → each block (mirrors
+  `ffn_token_tiles`); env `LONGCAT_AUDIO_MOUTH_SCALE` overrides (the CLI bridge) so the API can set the
+  field directly. **scale==1.0 skips the `ggml_scale` op entirely → bit-identical default.**
+- **`--audio-lowpass <hz>`** (default 0 = off): 2nd-order Butterworth low-pass on the 16 kHz mono input
+  wav before whisper encode (`longcat_audio.hpp::load_wav_16k_mono`), re-introducing the v1.0
+  wav2vec2 path's transient softening that the v1.5 Whisper path dropped. Env `LONGCAT_AUDIO_LOWPASS`.
+- Sanity: 25f Q4_K `--audio-mouth-scale 0.7` renders a visibly milder mouth (frame-12 mean|Δ| 3.2 vs
+  BEST, localized to the face region; sampling 140.1 s — the scale op adds no measurable cost).
+  Clip `models/_perf/mouth_0.7.webm`. Owner will tune the exact value with cleaner audio.
+
+**TASK 2 — chaining seams PERFECTED at short Q4_K segments (per-segment exposure-match).** Tested
+chaining at **3×33f Q4_K** (`--cont-cond-frames 13` → 4 cond latents → 13 decoded cond / 20 new per
+segment; resident, `--vae-tile-size 16x16` to fit the resident VAE decode buffer alongside the kept-
+resident DiT). New diagnostic `tools/exposure_analysis.py` (per-frame RGB/luma + per-segment means +
+seam-step). **DIAGNOSIS:** the lap-15 residual at short segments is NOT mild — it is a per-segment
+BRIGHTNESS RAMP that COMPOUNDS (the opposite direction from lap-15's 93f darkening):
+
+| 3×33f Q4_K | seg0 luma | seg1 luma | seg2 luma | drift | seam2 @f53 Δ | seg2 meanRGB |
+|------------|----------:|----------:|----------:|------:|-------------:|--------------|
+| BEFORE (re-encode only, lap-15 default) | 109.6 | 115.1 | **133.3** | **+23.7** | 5.92× | 147/142/112 (bright/blue cast) |
+| AFTER (lap-16 exposure-match, default-on) | 109.6 | 110.3 | **111.0** | **+1.5** | 4.71× | 122/115/96 (matches seg0) |
+
+**ORIGIN (localized):** the chain holds the cond frames fixed via the denoise mask
+(`stable-diffusion.cpp:2066` `noised_input*mask + init_latent*(1-mask)`), so they carry the prior
+segment's true exposure; the fresh 8-step-DMD generated frames land at a DIFFERENT exposure (a
+cond→gen STEP inside each segment), and the decode→re-encode propagates that step into the next
+segment's cond → COMPOUNDS. **FIX (default-on for chains, opt out `LONGCAT_CONT_NO_EXPOSURE_MATCH=1`,
+strength `LONGCAT_CONT_EXPOSURE_STRENGTH` default 1.0):** match each generated frame's per-channel
+mean+std to its OWN segment's cond region (the held-fixed prior tail), in pixel space, BEFORE the cond
+frames are dropped + the tail is re-encoded — closing the compounding loop. This is the SMARTER fix
+lap-15 called for; lap-15's uniform offset referenced cond-vs-prior-tail (already matched ~0.8/255)
+and was a wash. **RESULT: the compounding brightness/chroma drift is KILLED** (drift +23.7 → +1.5;
+seg2 cast gone). The residual seam frame-to-frame Δ (5.9× → 4.7×) is now STRUCTURAL — a real
+pose/mouth discontinuity between independently-sampled segments (distinct seed + audio_offset per
+segment), NOT exposure — and is the irreducible floor of the cut-and-stitch chaining design at the
+8-step DMD schedule. Clip `models/_perf/chained_q4k_clean.webm` (= `chain3x33_exposure_match.webm`).
+**RECOMMENDED SEGMENT LENGTH for chaining: 49f (`--cont-cond-frames 13` → 36 new/seg)** — best
+new:overlap throughput (per Task 3), resident, and the exposure-match flattens the drift at any length.
+Single-clip (`--segments 1`) bypasses the chain loop → untouched.
+
+**TASK 3 — PERF/VRAM CROSSOVER (Q4_K, 8-step, 480×832, GPU-VAE tile-32, `--clip-on-cpu`, `--max-vram 9`,
+single non-chained renders; per-NEW-frame accounts for the 13-frame chaining overlap → new = frames−13):**
+
+| frames | new (−13 overlap) | s/step | sampling (s) | decode (s) | **total (s)** | **s / NEW frame** | peak VRAM (MiB) | mode |
+|-------:|------------------:|-------:|-------------:|-----------:|--------------:|------------------:|----------------:|------|
+| 25 | 12 | 17.5 | 140.1 | 54.1 | 214.7 | **17.89** | 10967 | resident |
+| 33 | 20 | 24.6 | 196.8 | 71.4 | 288.4 | **14.42** | 10967 | resident |
+| 41 | 28 | 33.0 | 264.2 | 88.7 | 373.2 | **13.33** | 10967 | resident |
+| **49** | **36** | 42.2 | 337.3 | 106.0 | 463.7 | **12.88** ← SWEET SPOT | 10967 | resident |
+| 81 | 68 | 88.2 | 705.3 | 174.8 | 900.7 | 13.25 | 10967 | resident (ceiling) |
+| 93 | 80 | 114.0 | 912.0 | 201.0 | 1134.7 | 14.18 | 10967 (load spike) / **~5043 sustained** | OFFLOAD (93f OOMs resident) |
+| 49 (offload) | 36 | 44.7 | 357.8 | 106.1 | 485.0 | 13.47 | **~5703 sampling** | offload (min-VRAM) |
+
+**(a) SWEET SPOT = 49f** (12.88 s/new-frame). Per-new-frame improves 25f (17.9) → 49f (12.9) as the
+fixed per-render overhead (model already loaded + the 13-frame overlap) amortizes over more new frames,
+then FLATTENS (41–81f all ~13.0–13.3) and REGRESSES at 93f-offload (14.2, the weight-streaming tax).
+**Resident frame ceiling re-measured this lap: 81f FITS resident (peak 10967), 93f OOMs** (the lap-10/11
+3,044 MiB self-attn reserve `cudaMalloc` fails — the documented ~89 MiB miss). So pick **49f** for best
+throughput, up to **81f** if you want longer resident segments at ~flat cost.
+
+**(b) MIN-PEAK-VRAM config = `--offload-to-cpu`.** The RESIDENT peak is FLAT at **10967 MiB for ALL
+lengths 25–81f** (DiT weights 8.5 GB + the `--max-vram 9` compute cap + GPU VAE dominate; frame count
+doesn't move it) → only **~1.3 GiB free** of the 12 GB card. With `--offload-to-cpu` the DiT weights live
+in RAM and stream per sub-segment, so the **sustained sampling peak drops to ~5.7 GiB (49f) / ~5.0 GiB
+(93f)** → **~6.2–6.9 GiB free** for a co-resident LLM. (The load-phase transient is only ~1.2 GiB; an
+earlier 10967 "offload peak" reading was contaminated by a prior resident render's residual in the
+sampler — the clean phase-split measurement is load 1191 / sampling 5703 MiB at 49f.)
+
+**(c) COST of min-VRAM vs sweet-spot.** At 49f, offload total **485.0 s vs resident 463.7 s = +4.6%
+slower** for **−5,264 MiB peak** (frees ~6.4 GiB). The offload tax is FAR smaller than the lap-07 93f
+figure suggested (117 s/step there) — at 49f offload is 44.7 vs 42.2 s/step resident (+6%), because the
+shorter segment's per-step weight re-stream amortizes well. **So the headroom recommendation: run the
+avatar at 49f `--offload-to-cpu` for a ~6 GiB-free co-run with an LLM at only ~5% wall cost** — and pair
+with Agent B's GPU-clear-when-idle so the avatar holds ZERO VRAM between renders. If the GPU is
+avatar-dedicated during a render, 49f resident is 4.6% faster but leaves only ~1.3 GiB free.
+
+**Box state:** GPU free at end (9 MiB idle), all bench/probe/chain containers `docker rm -f`'d +
+verified (`docker ps`/`nvidia-smi` = no stray longcat containers), VRAM sampler killed, ggml submodule
+pristine `c3685f55`, branch green. Single-clip path bit-identical (changes scoped to the `--segments>1`
+chain loop + the runtime mouth knobs which default to 1.0/off = no-op).

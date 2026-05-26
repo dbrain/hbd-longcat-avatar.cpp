@@ -11,6 +11,35 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **lap 16 (session 21, "Agent A"): MOUTH-EXAG KNOBS (runtime) + CHAINING SEAM DRIFT KILLED
+  (per-segment exposure-match, default-on) + PERF/VRAM CROSSOVER TABLE. Parent-only, ggml submodule
+  pristine `c3685f55`, branch green, single-clip bit-identical. Q4_K + 8-step LOCKED. Full detail in
+  `PERF.md` lap 16. NEXT AGENT (API/productionise) starts here.**
+  - **TASK 1 — mouth-exag knobs (RUNTIME, both reversible / default = unchanged):**
+    - `--audio-mouth-scale` (default 1.0): scales the audio→face gated residual add (the single
+      additive term, `longcat_avatar.hpp` block after `gate_mul`) across all 48 blocks. <1 = milder,
+      >1 = more. Threaded as `LongCatAvatarRunner.audio_mouth_scale` → `LongCatAvatar` → each block;
+      env `LONGCAT_AUDIO_MOUTH_SCALE` overrides (CLI bridge). **API: set the runner field directly.**
+      scale==1.0 skips the op → bit-identical. Sanity clip `models/_perf/mouth_0.7.webm`.
+    - `--audio-lowpass <hz>` (default 0=off): 2nd-order Butterworth LP on the input wav
+      (`longcat_audio.hpp::load_wav_16k_mono`), env `LONGCAT_AUDIO_LOWPASS`.
+  - **TASK 2 — chaining seams (3×33f Q4_K tested):** the lap-15 residual is a per-segment BRIGHTNESS
+    RAMP that COMPOUNDS (luma seg0/1/2 = 109.6/115.1/133.3, drift +23.7). NEW fix (default-on for
+    chains, opt out `LONGCAT_CONT_NO_EXPOSURE_MATCH=1`, strength `LONGCAT_CONT_EXPOSURE_STRENGTH`):
+    per-segment per-channel mean+std match of the generated frames to their OWN cond region, in pixel
+    space before drop+re-encode → closes the compounding loop. **Drift +23.7 → +1.5 (KILLED);** seg2
+    bright/blue cast gone. Residual seam frame-to-frame Δ (5.9×→4.7×) is now STRUCTURAL pose
+    discontinuity between independently-sampled segments, not exposure — the cut-and-stitch floor at
+    8-step DMD. Clean deliverable `models/_perf/chained_q4k_clean.webm`. New tool
+    `tools/exposure_analysis.py`. **Recommended chaining config: 49f + `--cont-cond-frames 13`.**
+  - **TASK 3 — perf/VRAM crossover (Q4_K, 8-step, full table in PERF.md):** SWEET SPOT = **49f**
+    (12.88 s/new-frame, accounting for the 13-frame overlap); per-new-frame improves 25f→49f then
+    flattens 41–81f (~13) and regresses at 93f-offload. Resident ceiling **81f** (93f OOMs, the
+    documented ~89 MiB miss). MIN-VRAM = **`--offload-to-cpu`**: resident peak is FLAT 10967 MiB
+    (~1.3 GiB free) for ALL lengths; offload sustained sampling peak **~5.7 GiB (49f)** → ~6.4 GiB
+    free for an LLM co-run, at only **+4.6% wall** (485.0 vs 463.7 s at 49f). Pair with Agent B's
+    GPU-clear-when-idle for the full headroom story.
+
 - 🟢 **FEATURE lap 15 (session 20): SEAM DRIFT FIX — decode→re-encode drift sink. The lap-14
   "multi-frame Wan-VAE encode is BROKEN" diagnosis was WRONG (it was a harness input-shape bug,
   not a code bug); the encode works at T>1. Switched chaining from raw-latent passthrough to
