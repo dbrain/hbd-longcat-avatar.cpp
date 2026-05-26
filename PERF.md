@@ -45,6 +45,7 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 07  | split fused qkv → per-output matmuls (kills the 1.75 GiB qkv permute-cont) + FFN token-tiling (auto >16k tok) | 25f sampling 162.3→**146.8 (−9.5%)**; 93f offload 939.2 (117.4/step) | 93f RESIDENT monolithic 5323→**3629** (−1694); offload segs merge 49→33 | 25f **BIT-IDENTICAL to BEST (99 dB)**; 93f offload **BIT-IDENTICAL to lap-06 native (99 dB all 93f)** | 2ce48ee |
 | 08  | KERNEL PROFILE: flash-attn d=128 **verified on MMA tensor-core path** (not a fallback); MUL_MAT Q4_K **verified on MMQ int8-tensor-core** — both optimal for this shape on sm_86. No mis-dispatch. Levers scoped: custom kernels = fork-class low-ROI; FFN w1+w3 fuse = ~1% (parked, do converter-side); kv_scale fold = sub-noise | 25f sampling 147 (unchanged) | unchanged | 25f **BIT-IDENTICAL to BEST (99 dB)** | (no change) HEAD c0ea6d3 |
 | 08b | RESIDENT-93f investigation: re-localized the 3,629 floor (it is **six ~585 MiB RoPE-internal** cont/repeat/mul buffers, NOT the matmul outputs the lap-07 handoff named). F16-rope cuts it to **2,983 (−646)** but FAILS the 99 dB gate (43 dB, trajectory drift) AND still runtime-OOMs on the MMQ VMM pool. Bit-identical lowmem-F32-rope (half-width concat) REGRESSES the resident peak (→3,860). **No quality-neutral resident win exists at the rope layer.** Precise fix = bound the MMQ pool, or a custom F32 fused-RoPE CUDA op. | 25f sampling 147 (unchanged) | 93f resident floor 3,629 (unmoved quality-neutrally) | 25f **BIT-IDENTICAL** (no code shipped) | (no change) HEAD c78e86c |
+| 09  | **Custom fused-RoPE CUDA op** `ggml_rope_pe` (new GGML_OP_ROPE_PE, CUDA-only) — replaces the `apply_rope` cont+2×repeat+mul+add chain with ONE kernel reading x+pe → q_rope. **Proven BIT-IDENTICAL in isolation** (`tools/test_rope_pe.cpp`: max\|chain−fused\|=1.2e-7 @ real [128,32,257]). When wired ON it cut DiT **18.35→17.42 s/step (−5.1%)**, sampling **147→139.9 s**. **BUT the full 25f render diverges to 42 dB (NOT 99 dB)** despite the identical op output — a downstream graph/gallocr interaction, root cause NOT found this lap. **Op gated OPT-IN** (`LONGCAT_FUSED_ROPE=1`); default = chain, re-verified **99 dB bit-identical to BEST**. Branch green. | 25f sampling 147 (default) / **139.9 with op (−5%)** | 25f peak 10513 (unchanged; rope buffers are the 93f-resident smell, not 25f peak) | default **BIT-IDENTICAL to BEST (99 dB)**; op-on **FAILS gate (42 dB)** | submodule + parent (this lap) |
 
 (rows appended per lap below)
 
@@ -642,3 +643,97 @@ change that WOULD clear it (for owner greenlight), in decreasing safety:**
 - **The PORT-PROGRESS STATUS block "generated frames still noise" is STALE** — the
   current tree renders coherent talking avatars (the `-out = -out` flow-sign fix
   landed; see build_graph). Updated in this session.
+
+### lap 09 — FULL PIPELINE ACCOUNTING (Phase 1) + custom fused-RoPE CUDA op (Phase 2)
+
+**Method:** fresh `LONGCAT_PROFILE=1` 25f standard render (8-step, 480×832, audio, resident
+weights, GPU 9 MiB idle — no prod processes, so the numbers are the model's own footprint) +
+a 0.4 s `nvidia-smi memory.used` sampler across the whole wall. Re-confirms the lap-03/07 shape
+on the current tree.
+
+#### TIME — full render wall (25f standard, 8-step)
+
+| phase | seconds | % wall | notes |
+|-------|--------:|-------:|-------|
+| model load | ~13.0 | 5.6% | gguf tensor read 4.38 s + ctx/backend init + buffer alloc |
+| ref-image VAE encode | 1.88 | 0.8% | GPU (was 16.3 s on CPU pre-lap-01) |
+| umT5 text encode (CPU) | 16.25 | 7.0% | one-time; `--clip-on-cpu` (GPU OOMs at load, TE+DiT coexist) |
+| whisper audio encode | 0.96 | 0.4% | mel → whisper-v3 encoder, one-time |
+| **DiT sampling (8 steps)** | **147.26** | **63.1%** | **18.35 s/step** compute; the headline phase |
+| VAE tiled decode | 54.06 | 23.2% | 10 tiles × 5.34 s (32-latent spatial tiling) |
+| **TOTAL** | **~233.4** | | (no `--steps`/quant change) |
+
+Within ONE DiT step (lap-08 op profile, sync-inflated ms, proportions exact, holds on this tree):
+MUL_MAT 7662 ms (M>4096 bucket 92.6%) + FLASH_ATTN 5617 ms = **72.8%** on the optimal MMQ/MMA
+kernels. The diffuse glue (CONT 1220 / ADD 1124 / MUL 917 / SCALE 448 / REPEAT 176 …) is the rest;
+the **RoPE cont+repeat+mul chain lives inside CONT+MUL+REPEAT** — the Phase-2 target.
+
+#### VRAM — peak accounting (sampled)
+
+| length | peak MiB (sampled) | breakdown |
+|--------|-------------------:|-----------|
+| **25f** DiT sampling | **10,513** | weights 8,781 (DiT 8,539 + VAE 242) + DiT compute buffer 1,451 + MMQ Q8_1 VMM pool ~280 |
+| 25f VAE decode | 3,683 | VAE weights 242 + per-tile decode buffer ~3,440 (32-latent tile, 5,577-node graph) |
+| **93f** RESIDENT (no offload) | OOM (needs ~530 MiB over) | weights 8,539 + **compute floor 3,629** (six ~585 MiB RoPE-internal cont/repeat buffers, lap-08b) + MMQ pool ~300-400 → > 11,909 usable |
+| 93f via `--offload-to-cpu` | fits | segmented graph-cut path, ~117 s/step (lap-07) |
+
+25f has ~1.4 GiB headroom (10,513 of 11,909). The rope buffers are NOT the 25f peak — they are the
+**93f-resident** peak. So the fused-RoPE op's VRAM payoff is a 93f-resident lever, not a 25f one.
+
+#### RANKED SMELLS (Phase 1 hunt)
+
+1. **DiT sampling = 63% of wall, all on optimal kernels** (lap-08 verified MMA + MMQ). The only
+   non-quality levers left here are structural glue, already mostly banked (laps 05/07).
+2. **VAE tiled decode = 23%** (54 s). 10 tiles × 5.34 s; tile-size 32 is the measured sweet spot
+   (48 was slower). Not re-attacked — it's a separate graph, lower ROI than DiT.
+3. **umT5 text encode = 7% / 16 s one-time on CPU.** GPU OOMs at load (TE 6 GB + DiT 8.5 GB coexist).
+   Would need lazy load-order surgery for a one-time 14 s win. Parked (lap-05).
+4. **RoPE cont+2×repeat+mul chain** — the lap-08b ~6×585 MiB resident-93f smell + ~1.2 s/step of
+   CONT over the 1831-node step. The Phase-2 target.
+5. **MMQ Q8_1 VMM pool** (~280-400 MiB on-demand) — the actual runtime blocker that keeps 93f from
+   rendering resident even after a rope cut (lap-08b). Bounding it is the lowest-risk 93f-resident fix.
+
+#### PHASE 2 — custom fused-RoPE CUDA op `ggml_rope_pe`
+
+Built a new `GGML_OP_ROPE_PE` (CUDA-only; CPU backend simply doesn't claim support — the avatar runs
+the whole DiT on a single CUDA `runtime_backend`, no sched, so no CPU impl is needed). Blast radius
+kept tight: `ggml/include/ggml.h` (enum before COUNT + `ggml_rope_pe` decl), `ggml/src/ggml.c` (both
+GGML_OP name arrays + both `static_assert(GGML_OP_COUNT==97)` + the builder), `ggml/src/ggml-cuda/`
+(`rope-pe.cu`/`.cuh` + dispatch case + `supports_op` case). One thread per output **pair**: reads
+`x[2j]`, `x[2j+1]` and `cos_j=pe[0,0,j,t]`, `sin_j=pe[0,1,j,t]`, writes
+`out[2j]=x_e·c − x_o·s`, `out[2j+1]=x_o·c + x_e·s` directly into the contiguous `[d_head,L,n_head·N]`
+output — **no cont, no 2× full-size repeat, no separate mul+add buffers**.
+
+- **CORRECTNESS — PROVEN BIT-IDENTICAL IN ISOLATION.** `tools/test_rope_pe.cpp` builds BOTH the
+  verbatim `apply_rope` chain and `ggml_rope_pe` in one CUDA graph on identical random input and
+  diffs: **max\|chain−fused\| = 1.2e-7 at the real [d_head=128, n_head=32, L=257] shape** (and 6e-8
+  at a tiny shape). The op's math + layout are exactly the chain. (Compile inside the builder:
+  `g++ -std=c++17 -I ggml/include tools/test_rope_pe.cpp -Wl,--start-group build/ggml/src/ggml-cuda/libggml-cuda.a build/ggml/src/libggml.a build/ggml/src/libggml-cpu.a build/ggml/src/libggml-base.a -Wl,--end-group -lcudart -lcuda -lcublas -lnccl -lpthread -ldl`.)
+- **PERF when wired ON:** DiT **18.35 → 17.42 s/step (−5.1%)**, sampling **147.26 → 139.87 s (−5.0%)**.
+  25f peak VRAM unchanged at 10,513 (rope buffers aren't the 25f peak). So the op is a real **−5% all-length
+  speed lever** AND the structural fix that should clear the 93f-resident floor — IF the render gate passes.
+- **THE BLOCKER — full render diverges despite the identical op.** With the op ON, the 25f render is
+  **mean 42.4 dB / min 33.9 dB vs the old chain** (frame-0 cond exact at 99 dB, generated frames drift) —
+  the SAME "coherent but different trajectory" signature as the F16-rope/Q4_0/6-step renders, i.e. it
+  **FAILS the hard 99 dB gate**. This is NOT a math bug (op is bit-identical in isolation) and NOT the
+  obvious in-place suspects (`ggml_ext_scale` on k is non-inplace + conts; the cond/noise slicing conts
+  its views). Reproducibility is ruled out: old-chain re-render = **99 dB vs BEST** on this exact build.
+  The remaining explanation is a **downstream graph/gallocr interaction** — the fused op collapses ~10
+  rope nodes to 1, changing the allocator's liveness picture so some downstream buffer reuses/overlaps the
+  q_rope/k_rope output (the gallocr-aliasing class the siglip2/lap-01 memos warn about). Root cause NOT
+  isolated this lap (needs `GGML_ALLOCATOR_DEBUG` on the op's output offsets vs the flash/residual scratch).
+- **DISPOSITION:** op left **OPT-IN** (`LONGCAT_FUSED_ROPE=1`); default path = the chain, re-verified
+  **99 dB bit-identical to BEST**. Branch green. The op + oracle (`tools/test_rope_pe.cpp`) are committed
+  as proven-correct infrastructure so the next agent starts from "math done, debug the graph interaction,"
+  not from scratch.
+
+#### NEXT (lap-10 candidates, in ROI order)
+
+1. **Root-cause the fused-RoPE render divergence** (the −5% all-length + 93f-resident win is real if cleared):
+   run `LONGCAT_FUSED_ROPE=1` with `GGML_ALLOCATOR_DEBUG` and dump the q_rope/k_rope output chunk offsets
+   vs the self-attn flash scratch + residual-add buffers; if they overlap, force the op's output
+   non-reusable (e.g. a trailing `ggml_cont`, or mark it, or insert a barrier) and re-test the gate. Cheap
+   experiment, high payoff. Likely a 1-op fix once the overlapping consumer is named.
+2. **Bound the MMQ Q8_1 VMM pool** (lap-08b's lowest-risk 93f-resident fix) — independent of rope; with the
+   fused-RoPE cut + a bounded pool, native 93f resident should fit.
+3. Converter-side FFN w1+w3 fuse (~1%, lap-08) — only if 1+2 land.

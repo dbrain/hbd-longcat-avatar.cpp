@@ -11,6 +11,29 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 09 (session 14, 2026-05-26): FULL PIPELINE ACCOUNTING + custom fused-RoPE CUDA op
+  `ggml_rope_pe` — op PROVEN bit-identical in isolation, gives −5% per DiT step when ON, but the
+  full render FAILS the 99 dB gate (42 dB, graph/gallocr interaction, NOT a math bug). Op gated
+  OPT-IN (`LONGCAT_FUSED_ROPE=1`); default = chain, re-verified 99 dB vs BEST. Branch green. See
+  `PERF.md` lap 09 for the TIME + VRAM tables + the divergence analysis.**
+  PHASE 1 (fresh `LONGCAT_PROFILE=1` 25f render, GPU idle 9 MiB so numbers are the model's own):
+  **TIME** — model load ~13 s / ref-img VAE enc 1.9 s / **umT5 CPU 16.25 s (7%)** / whisper 1.0 s /
+  **DiT sampling 147.3 s (63%, 18.35 s/step)** / **VAE tiled decode 54.1 s (23%, 10×5.34 s)** / total
+  ~233 s. **VRAM** — 25f peak **10,513 MiB** = weights 8,781 (DiT 8,539 + VAE 242) + DiT compute 1,451
+  + MMQ Q8_1 VMM pool ~280; 25f has ~1.4 GiB headroom. 93f-resident OOMs by ~530 MiB (compute floor
+  3,629 = the six ~585 MiB RoPE-internal buffers + MMQ pool). **The rope buffers are the 93f peak, NOT
+  the 25f peak** — so the fused op is a 93f-resident lever, not a 25f-VRAM one.
+  PHASE 2 — new `GGML_OP_ROPE_PE` (CUDA-only; CPU never claims support, avatar runs DiT on a single
+  CUDA backend). One kernel reads x+pe and writes q_rope directly (no cont+2×repeat+mul+add).
+  `tools/test_rope_pe.cpp` proves **max|chain−fused|=1.2e-7 @ [128,32,257]** (exact math). Wired ON:
+  DiT **18.35→17.42 s/step (−5.1%)**, sampling **147→139.9 s**, 25f peak unchanged. **BUT the 25f render
+  drifts to 42 dB (fails the hard 99 dB gate)** even though the op output is identical — a downstream
+  gallocr-aliasing-class interaction (op collapses ~10 rope nodes to 1, changing buffer liveness), NOT
+  math. Reproducibility ruled out (old-chain rebuild = 99 dB vs BEST). **lap-10 cheap next step: rerun
+  with `GGML_ALLOCATOR_DEBUG`, find the buffer that overlaps the fused q_rope/k_rope output, force it
+  non-reusable (likely a 1-op fix). Then the −5% all-length + 93f-resident win lands.** Commits:
+  ggml submodule + parent pointer (both buildable, green).
+
 - 🟢 **PERF lap 08b (session 13, 2026-05-26): RESIDENT-93f investigation — NO quality-neutral win
   exists at the rope layer; no code shipped, tree green at `c78e86c`. See `PERF.md` lap 08b.**
   `GGML_ALLOCATOR_DEBUG` (with an op-type-augmented high-water dump) **re-localized the 3,629 MiB

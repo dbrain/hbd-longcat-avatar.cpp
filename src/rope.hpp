@@ -719,6 +719,26 @@ namespace Rope {
         int64_t n_head = x->ne[1];
         int64_t L      = x->ne[2];
         int64_t N      = x->ne[3];
+
+        // Fused interleaved RoPE (longcat-avatar): one CUDA kernel reads x + the
+        // precomputed pe and writes the rotated output directly, with NO
+        // cont+2*repeat+mul+add intermediates (the lap-08b ~6x585 MiB resident
+        // smell). The op (ggml_rope_pe) is proven BIT-IDENTICAL to this chain in
+        // isolation (tools/test_rope_pe.cpp: max|chain-fused|=1.2e-7 at the real
+        // [128,32,257] shape). HOWEVER, swapping it into the full DiT render
+        // diverges the denoise trajectory (25f vs old-chain 42 dB, NOT the 99 dB
+        // gate) even though the op output is identical — a downstream graph
+        // interaction (gallocr buffer reuse / flash-attn scratch aliasing the
+        // fewer-node fused output), NOT a math bug. UNTIL that is root-caused the
+        // fused path is OPT-IN ONLY (LONGCAT_FUSED_ROPE=1); default = the chain,
+        // which is bit-identical to BEST. See PERF.md lap 09.
+        if (rope_interleaved && pe->ne[0] == 2 && pe->ne[1] == 2 &&
+            pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
+            x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
+            getenv("LONGCAT_FUSED_ROPE") != nullptr) {
+            return ggml_rope_pe(ctx, x, pe);  // [d_head, L, n_head*N]
+        }
+
         x              = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, n_head, L, d_head]
         if (rope_interleaved) {
             x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);  // [N * n_head, L, d_head/2, 2]
