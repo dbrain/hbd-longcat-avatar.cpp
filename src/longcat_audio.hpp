@@ -713,7 +713,8 @@ namespace LONGCAT_AUDIO {
                                  int T_video,
                                  const AudioWindowConfig& cfg,
                                  sd::Tensor<float>& first_out,
-                                 sd::Tensor<float>& latter_out) {
+                                 sd::Tensor<float>& latter_out,
+                                 int frame_offset = 0) {
         const int W   = cfg.audio_window;       // 5
         const int S   = cfg.n_feats;            // 5
         const int64_t C = cfg.channels;         // 1280
@@ -721,9 +722,12 @@ namespace LONGCAT_AUDIO {
         const int mid = W / 2;                  // 2
 
         int video_length = (int)(full_audio_emb.size() / ((size_t)S * C));
-        // audio_emb[t][w][s][c]: full_audio_emb[clamp(t-mid+w)][s][c]
+        // audio_emb[t][w][s][c]: full_audio_emb[clamp(frame_offset+t-mid+w)][s][c].
+        // frame_offset shifts the window into the GLOBAL audio timeline so a
+        // continuation segment starting at global video-frame `frame_offset`
+        // windows the correct slice of the audio (lip-sync continues across segments).
         auto audio_emb = [&](int t, int w, int s, int64_t c) -> float {
-            int idx = t - mid + w;
+            int idx = frame_offset + t - mid + w;
             idx     = std::max(0, std::min(idx, video_length - 1));
             return full_audio_emb[((size_t)idx * S + s) * C + c];
         };

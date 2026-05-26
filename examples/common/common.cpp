@@ -876,6 +876,16 @@ ArgOptions SDGenerationParams::get_options() {
          "video frames (default: 1)",
          &video_frames},
         {"",
+         "--segments",
+         "LongCat-Avatar: render N chained segments (each conditioned on the prior "
+         "segment's tail) and stitch them into one continuous clip (default: 1)",
+         &segments},
+        {"",
+         "--cont-cond-frames",
+         "LongCat-Avatar: number of prior-segment tail frames used as conditioning "
+         "for the next segment when --segments > 1 (default: 13)",
+         &cont_cond_frames},
+        {"",
          "--fps",
          "fps (default: 24)",
          &fps},

@@ -128,6 +128,18 @@ public:
     bool vae_decode_only         = false;
     bool external_vae_is_invalid = false;
     bool free_params_immediately = false;
+    // LongCat-Avatar continuation chaining: keep the DiT params resident across
+    // back-to-back generate_video calls (segments). The TE is still freed once by the
+    // deferred-load flow, but the DiT must NOT be freed after each segment or the next
+    // segment renders against freed GPU memory (illegal access). Set by the caller via
+    // sd_ctx_keep_diffusion_model_resident() before a chained run.
+    bool keep_diffusion_model_resident = false;
+    // Cached avatar text conditioning for chained segments: the prompt is constant
+    // across segments, but GPU-TE freed the umT5 weights after segment 0 to make room
+    // for the resident DiT, so segments 1+ cannot re-run the TE. Compute once, reuse.
+    bool avatar_text_cond_cached = false;
+    SDCondition avatar_cached_cond;
+    SDCondition avatar_cached_uncond;
 
     bool circular_x = false;
     bool circular_y = false;
@@ -2917,6 +2929,9 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
+    sd_vid_gen_params->cont_latent                           = nullptr;
+    sd_vid_gen_params->cont_latent_frames                    = 0;
+    sd_vid_gen_params->audio_frame_offset                    = 0;
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
     sd_vid_gen_params->vae_tiling_params                     = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
@@ -4810,6 +4825,41 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
         int64_t t2 = ggml_time_ms();
         LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
+    } else if (sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+               sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+        // CONTINUATION (video continuation, generate_vc): instead of a single ref
+        // image, condition on the LAST N LATENT frames of the PRIOR segment. The
+        // caller passes the prior segment's diffusion-latent tail directly (no VAE
+        // decode/re-encode roundtrip), so num_cond_latents = cont_latent_frames.
+        // The cond latents are written to the head of init_latent and held fixed
+        // (denoise_mask 0, timestep 0); the remaining frames are noise and continue
+        // from them. The cond/noise self-attn two-pass split + the per-frame denoise
+        // mask already generalize from N==1 to N>1 (the avatar derives num_cond_latents
+        // from the leading zero-timestep frames at DiT-forward time).
+        int64_t num_cond_latents = sd_vid_gen_params->cont_latent_frames;
+        LOG_INFO("CONTINUATION (conditioning on %lld prior-segment tail latent frames)", (long long)num_cond_latents);
+
+        int64_t t1 = ggml_time_ms();
+        latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+        int64_t Wl = latents.init_latent.shape()[0];
+        int64_t Hl = latents.init_latent.shape()[1];
+        int64_t Cl = latents.init_latent.shape()[3];
+        if (num_cond_latents > latents.init_latent.shape()[2]) {
+            LOG_ERROR("continuation: cont_latent_frames %lld exceeds segment latent frames %lld",
+                      (long long)num_cond_latents, (long long)latents.init_latent.shape()[2]);
+            return std::nullopt;
+        }
+        // wrap the caller's contiguous f32 cont latent as [Wl, Hl, N, Cl, 1].
+        sd::Tensor<float> cont_latent({Wl, Hl, num_cond_latents, Cl, 1});
+        std::memcpy(cont_latent.data(), sd_vid_gen_params->cont_latent,
+                    (size_t)cont_latent.numel() * sizeof(float));
+        sd::ops::slice_assign(&latents.init_latent, 2, 0, num_cond_latents, cont_latent);
+
+        latents.denoise_mask = sd::full<float>({latents.init_latent.shape()[0], latents.init_latent.shape()[1], latents.init_latent.shape()[2], 1, 1}, 1.f);
+        sd::ops::fill_slice(&latents.denoise_mask, 2, 0, num_cond_latents, 0.0f);
+
+        int64_t t2 = ggml_time_ms();
+        LOG_INFO("continuation latent conditioning prepared, taking %" PRId64 " ms", t2 - t1);
     } else if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !start_image.empty()) {
         // ai2v: the reference portrait is VAE-encoded to ONE temporal cond latent
         // (num_cond_latents = 1), prepended as the first latent frame; generated
@@ -4938,14 +4988,36 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     condition_params.zero_out_masked = true;
 
     int64_t prepare_start_ms = ggml_time_ms();
-    embeds.cond              = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
+    // Chained avatar segments reuse the cached text conditioning (the umT5 weights
+    // were freed after segment 0). The avatar leaves c_concat/c_vector empty, so the
+    // cached cond/uncond carry the full text conditioning.
+    bool use_text_cache = sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+                          sd_ctx->sd->keep_diffusion_model_resident &&
+                          sd_ctx->sd->avatar_text_cond_cached;
+    if (use_text_cache) {
+        LOG_INFO("avatar: reusing cached text conditioning (chained segment)");
+        embeds.cond = sd_ctx->sd->avatar_cached_cond;
+        if (request.use_uncond) {
+            embeds.uncond = sd_ctx->sd->avatar_cached_uncond;
+        }
+    } else {
+        embeds.cond          = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                    condition_params);
+        if (request.use_uncond) {
+            condition_params.text = request.negative_prompt;
+            embeds.uncond         = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
+                                                                                        condition_params);
+        }
+        // Stash for subsequent chained segments before the TE is freed.
+        if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && sd_ctx->sd->keep_diffusion_model_resident) {
+            sd_ctx->sd->avatar_cached_cond     = embeds.cond;
+            sd_ctx->sd->avatar_cached_uncond   = embeds.uncond;
+            sd_ctx->sd->avatar_text_cond_cached = true;
+        }
+    }
     embeds.cond.c_concat     = latents.concat_latent;
     embeds.cond.c_vector     = latents.clip_vision_output;
     if (request.use_uncond) {
-        condition_params.text  = request.negative_prompt;
-        embeds.uncond          = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
-                                                                                     condition_params);
         embeds.uncond.c_concat = latents.concat_latent;
         embeds.uncond.c_vector = latents.clip_vision_output;
     }
@@ -4953,7 +5025,7 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
-    if (sd_ctx->sd->free_params_immediately) {
+    if (sd_ctx->sd->free_params_immediately && !use_text_cache) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
     // Avatar umT5-on-GPU: now that the TE is freed, bring the DiT weights onto the
@@ -5021,7 +5093,7 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
     sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(video_latent, true);
     int64_t t5            = ggml_time_ms();
     LOG_INFO("decode_first_stage completed, taking %.2fs", (t5 - t4) * 1.0f / 1000);
-    if (sd_ctx->sd->free_params_immediately) {
+    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
     }
     if (vid.empty()) {
@@ -5222,11 +5294,16 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
     return true;
 }
 
-SD_API bool generate_video(sd_ctx_t* sd_ctx,
-                           const sd_vid_gen_params_t* sd_vid_gen_params,
-                           sd_image_t** frames_out,
-                           int* num_frames_out,
-                           sd_audio_t** audio_out) {
+SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
+                              const sd_vid_gen_params_t* sd_vid_gen_params,
+                              sd_image_t** frames_out,
+                              int* num_frames_out,
+                              sd_audio_t** audio_out,
+                              float** final_latent_out,
+                              int* latent_width_out,
+                              int* latent_height_out,
+                              int* latent_frames_out,
+                              int* latent_channels_out) {
     if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
         return false;
     }
@@ -5238,6 +5315,9 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     }
     if (num_frames_out != nullptr) {
         *num_frames_out = 0;
+    }
+    if (final_latent_out != nullptr) {
+        *final_latent_out = nullptr;
     }
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
@@ -5351,7 +5431,11 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                         sd_ctx->sd->whisper_encoder_model->set_flash_attention_enabled(false);
                         sd::Tensor<float> whisper_hs = sd_ctx->sd->whisper_encoder_model->compute(sd_ctx->sd->n_threads, mel_t);  // [1280, T_enc, 33]
                         sd_ctx->sd->whisper_encoder_model->free_compute_buffer();
-                        sd_ctx->sd->whisper_encoder_model->free_params_buffer();
+                        // Keep whisper params resident across chained segments (each
+                        // segment re-windows its own audio slice); otherwise free them.
+                        if (!sd_ctx->sd->keep_diffusion_model_resident) {
+                            sd_ctx->sd->whisper_encoder_model->free_params_buffer();
+                        }
                         LOG_INFO("audio: whisper encoder out [%lld, %lld, %lld]",
                                  (long long)whisper_hs.shape()[0], (long long)whisper_hs.shape()[1], (long long)whisper_hs.shape()[2]);
 
@@ -5366,7 +5450,11 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                         LOG_INFO("audio: duration %.2fs -> video_length %d (fps %d), windowing first %d frames",
                                  audio_duration, video_length, fps, T_video);
                         sd::Tensor<float> first, latter;
-                        int N_t_audio = LONGCAT_AUDIO::build_proj_inputs(full, T_video, acfg, first, latter);
+                        int audio_off = sd_vid_gen_params->audio_frame_offset;
+                        if (audio_off != 0) {
+                            LOG_INFO("audio: continuation frame_offset %d (global timeline)", audio_off);
+                        }
+                        int N_t_audio = LONGCAT_AUDIO::build_proj_inputs(full, T_video, acfg, first, latter, audio_off);
                         LOG_INFO("audio: window inputs first[%lld,%lld] latter[%lld,%lld] N_t=%d (latent T=%d)",
                                  (long long)first.shape()[0], (long long)first.shape()[1],
                                  (long long)latter.shape()[0], (long long)latter.shape()[1], N_t_audio, T);
@@ -5613,7 +5701,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         }
         LOG_INFO("sampling(latent upscale) completed, taking %.2fs",
                  (sampling_end - sampling_start) * 1.0f / 1000);
-    } else if (sd_ctx->sd->free_params_immediately) {
+    } else if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
 
@@ -5651,10 +5739,17 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !avatar_input_wav.empty()) {
         const uint32_t in_sr = 16000;  // load_wav_16k_mono always returns 16k mono
         int out_fps          = request.fps > 0 ? request.fps : 25;
+        // For a continuation segment, the muxed audio starts at the segment's
+        // offset in the global timeline (audio_frame_offset @ 25fps).
+        double seg_start_dur = (double)sd_vid_gen_params->audio_frame_offset / 25.0;
+        size_t start_off     = (size_t)(seg_start_dur * (double)in_sr);
+        if (start_off > avatar_input_wav.size()) {
+            start_off = avatar_input_wav.size();
+        }
         // request.frames is the requested video length; clamp the audio to it.
         double video_dur   = (double)request.frames / (double)out_fps;
         size_t want        = (size_t)(video_dur * (double)in_sr);
-        size_t n           = avatar_input_wav.size();
+        size_t n           = avatar_input_wav.size() - start_off;
         if (want > 0 && want < n) {
             n = want;  // trim trailing audio beyond the rendered video
         }
@@ -5665,7 +5760,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
             a->sample_count = (uint64_t)n;
             a->data         = (float*)malloc(n * sizeof(float));
             if (a->data != nullptr) {
-                std::memcpy(a->data, avatar_input_wav.data(), n * sizeof(float));
+                std::memcpy(a->data, avatar_input_wav.data() + start_off, n * sizeof(float));
                 generated_audio = a;
                 LOG_INFO("avatar: muxing input audio (%zu samples @ %u Hz, %.2fs) into output", n, in_sr, (double)n / (double)in_sr);
             } else {
@@ -5682,6 +5777,26 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
 
     if (latents.ref_image_num > 0) {
         final_latent = sd::ops::slice(final_latent, 2, latents.ref_image_num, final_latent.shape()[2]);
+    }
+
+    // Continuation chaining: hand the post-sampling diffusion latent back to the
+    // caller (before VAE decode) so the tail can condition the next segment without
+    // a lossy decode/re-encode roundtrip.
+    if (final_latent_out != nullptr && !final_latent.empty()) {
+        int64_t Wl = final_latent.shape()[0];
+        int64_t Hl = final_latent.shape()[1];
+        int64_t Tl = final_latent.shape()[2];
+        int64_t Cl = final_latent.dim() > 3 ? final_latent.shape()[3] : 1;
+        size_t n   = (size_t)final_latent.numel();
+        float* buf = (float*)malloc(n * sizeof(float));
+        if (buf != nullptr) {
+            std::memcpy(buf, final_latent.data(), n * sizeof(float));
+            *final_latent_out = buf;
+            if (latent_width_out) *latent_width_out = (int)Wl;
+            if (latent_height_out) *latent_height_out = (int)Hl;
+            if (latent_frames_out) *latent_frames_out = (int)Tl;
+            if (latent_channels_out) *latent_channels_out = (int)Cl;
+        }
     }
 
     auto result = decode_video_outputs(sd_ctx, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
@@ -5703,4 +5818,19 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         free_sd_audio(generated_audio);
     }
     return true;
+}
+
+SD_API bool generate_video(sd_ctx_t* sd_ctx,
+                           const sd_vid_gen_params_t* sd_vid_gen_params,
+                           sd_image_t** frames_out,
+                           int* num_frames_out,
+                           sd_audio_t** audio_out) {
+    return generate_video_ex(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out, audio_out,
+                             nullptr, nullptr, nullptr, nullptr, nullptr);
+}
+
+SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep) {
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr) {
+        sd_ctx->sd->keep_diffusion_model_resident = keep;
+    }
 }

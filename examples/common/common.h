@@ -188,6 +188,9 @@ struct SDGenerationParams {
 
     float moe_boundary                   = 0.875f;
     int video_frames                     = 1;
+    // LongCat-Avatar continuation chaining (multi-segment clips).
+    int segments                         = 1;   // >1 -> chain N resident segments
+    int cont_cond_frames                 = 13;  // prior-segment tail frames used as conditioning
     int fps                              = 16;
     float vace_strength                  = 1.f;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};

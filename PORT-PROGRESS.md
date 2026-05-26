@@ -11,6 +11,50 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟡 **FEATURE lap 14 (session 19): CONTINUATION CHAINING — multi-segment clips END-TO-END,
+  but COLOR DRIFTS across segments (seam-quality risk realized). Parent-only code, ggml
+  submodule pristine `c3685f55`, branch green. Owner eyeball gate.**
+  **WHAT SHIPPED (the LongCat headline feature — arbitrary-length avatar clips):**
+  - **`--segments N` + `--cont-cond-frames K`** (CLI, `examples/cli/main.cpp` + `common.{h,cpp}`):
+    renders N chained 93f segments and stitches them into one continuous clip + muxes the full
+    audio. Validated: **3×93f → 253 frames / 10.08s clip** (`models/_perf/chained_multiseg*.webm`),
+    audio-muxed, runs clean (no OOM at the 11.8 GiB resident peak). Runtime-driven, no rebuild.
+  - **Latent-passthrough conditioning** (NOT pixel re-encode): `generate_video_ex()` hands the
+    post-sampling diffusion latent back; the CLI feeds the prior segment's LAST `num_cond_latents`
+    (= `1+(K-1)/4`) latent frames as the next segment's fixed cond (`sd_vid_gen_params_t.cont_latent`
+    + `cont_latent_frames`; held via denoise-mask 0 / timestep 0 — generalizes the N==1 ai2v path).
+    **WHY NOT the reference's decode→re-encode:** the multi-frame Wan-VAE *encode* is BROKEN in
+    this port — `GGML_ASSERT(a->ne[2]==b->ne[2])` at the chunk-concat (`wan.hpp:1056`), reproduced
+    on CPU via `sd-vae-roundtrip` at T=5 (the avatar only ever encoded T=1). Latent-passthrough
+    sidesteps it AND is lossless (no VAE roundtrip).
+  - **Audio window offset** (`build_proj_inputs(... frame_offset)`, `longcat_audio.hpp`): each
+    segment windows its slice of the driving audio at global frame `seg*(seg_frames-cond_decoded)`,
+    so lip-sync continues. Per-segment mux also offset (`stable-diffusion.cpp`).
+  - **Resident chaining** (`sd_ctx_keep_diffusion_model_resident()`): back-to-back `generate_video`
+    calls would free the DiT/VAE/whisper params (one-shot `free_params_immediately` design) → later
+    segments rendered against FREED GPU memory (3 successive illegal-access crashes, each one
+    layer deeper: DiT free, then TE free [+ text-cond cache], then whisper free, then VAE free).
+    Now all kept resident across segments when chaining; text conditioning is computed once
+    (segment 0) and CACHED (the GPU-TE umT5 is freed after seg 0 to fit the DiT, so segments 1+
+    can't re-run it). **Fast preset: Q3_K + GPU-TE, 93f resident per segment.**
+  - **SEAM TOOL** `tools/seam_analysis.py`: frame-to-frame |Δ| at the stitch points vs within-segment.
+  **THE PROBLEM (honest report — v1 seams are NOT clean):** structure/identity/pose/scene + lip
+  motion DO carry across all 3 segments (the hard part works — montage shows the same girl/scene),
+  but a **global color/exposure drift COMPOUNDS per segment**: seg0 RGB ~125/119/97 → seg1 ~80/88/92
+  → seg2 ~55/65/**176** (heavy blue cast). Seam Δ-vs-within-median: **seam1 @f93 = 2.95× (borderline
+  acceptable), seam2 @f173 = 8.47× (VISIBLE JUMP)**. **Root cause:** each segment conditions on the
+  prior segment's GENERATED latent; the reference's decode→re-encode roundtrip re-regularizes the
+  latent to the VAE distribution every chain step, which the latent-passthrough skips → drift
+  accumulates. The 8-step DMD schedule (vs reference 50-step `generate_vc`) likely amplifies it.
+  **FIX ATTEMPT IN FLIGHT:** per-channel latent stat-match — renormalize each cond-latent tail to
+  segment-0's per-channel mean/std (`LONGCAT_NO_CONT_RENORM=1` to disable). A/B render
+  (`chained_multiseg_renorm.webm`) rendering at handoff; numbers pending.
+  **IF RENORM INSUFFICIENT — the real fix:** fix the multi-frame Wan-VAE encode bug (chunk-output
+  ne[2] mismatch at `wan.hpp:1056`) and condition on decode→re-encoded pixels (reference-faithful,
+  drift-resistant), OR raise `--steps` for chained renders. Single-clip path / Q4_K reference /
+  step-count all UNTOUCHED. CLI: `--segments 3 --cont-cond-frames 13` (default cond-frames 13 = the
+  reference's `num_cond_frames`).
+
 - 🟢 **PERF lap 13 (session 18): QUALITY-DROP LADDER (owner-directed) — 4 runtime-selectable rungs
   GPU-TE→Q4_0→Q3_K→Q2_K, each side-by-side clipped. HEADLINE: Q3_K (6.84 GB) & Q2_K (5.24 GB) UNLOCK
   NATIVE 93f RESIDENT (no offload) — the lap-08b/10/11 ~89 MiB blocker dissolves with a smaller gguf.

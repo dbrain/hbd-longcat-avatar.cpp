@@ -384,6 +384,19 @@ typedef struct {
     int fps;
     float vace_strength;
     const char* audio_path;  // LongCat-Avatar audio-driven lip-sync (16kHz mono wav)
+    // LongCat-Avatar continuation chaining: when cont_latent != NULL these are the
+    // LAST cont_latent_frames latent frames of the PRIOR segment (the diffusion
+    // latents themselves, NOT pixels — avoids a lossy VAE decode/re-encode roundtrip
+    // and the multi-frame VAE-encode path). They become the fixed conditioning
+    // (num_cond_latents = cont_latent_frames; denoise-mask 0, timestep 0) and the new
+    // segment continues from them. cont_latent layout is the avatar diffusion-latent
+    // ggml-ne order [W_lat, H_lat, cont_latent_frames, C_lat, 1] (contiguous f32),
+    // W_lat=width/vae_scale, H_lat=height/vae_scale, C_lat = the model's latent channels.
+    // audio_frame_offset is this segment's start position (in 25fps video frames) in
+    // the global audio timeline so lip-sync continues across segments.
+    const float* cont_latent;
+    int cont_latent_frames;
+    int audio_frame_offset;
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
@@ -446,6 +459,27 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_image_t** frames_out,
                            int* num_frames_out,
                            sd_audio_t** audio_out);
+
+// Like generate_video, but for LongCat-Avatar continuation chaining it also returns
+// the final diffusion latent (caller-freed via free()) so the caller can feed the
+// tail back as the next segment's cont_latent. final_latent_out / shape outputs may
+// be NULL if not needed. Shape is the avatar latent ggml-ne order
+// [latent_width, latent_height, latent_frames, latent_channels, 1].
+SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
+                              const sd_vid_gen_params_t* sd_vid_gen_params,
+                              sd_image_t** frames_out,
+                              int* num_frames_out,
+                              sd_audio_t** audio_out,
+                              float** final_latent_out,
+                              int* latent_width_out,
+                              int* latent_height_out,
+                              int* latent_frames_out,
+                              int* latent_channels_out);
+
+// Keep the diffusion (and whisper) model params resident across back-to-back
+// generate_video[_ex] calls — required for LongCat-Avatar continuation chaining so
+// later segments don't render against freed GPU memory.
+SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep);
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 

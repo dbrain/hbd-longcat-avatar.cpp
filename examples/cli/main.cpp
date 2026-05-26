@@ -2,6 +2,7 @@
 #include <string.h>
 #include <time.h>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -781,11 +782,180 @@ int main(int argc, const char* argv[]) {
             results.adopt(generate_image(sd_ctx.get(), &img_gen_params), num_results);
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
-            sd_image_t* generated_video        = nullptr;
-            if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
-                generated_video = nullptr;
+
+            int n_segments = std::max(1, gen_params.segments);
+            if (n_segments > 1) {
+                // LongCat-Avatar continuation chaining: render N segments, each
+                // conditioned on the prior segment's LATENT tail (no decode/re-encode
+                // roundtrip — generate_video_ex hands back the diffusion latent), and
+                // stitch them into one continuous clip. Segment 0 is the full render
+                // from the init image; each later segment drops its leading cond frames
+                // (a re-render of the prior tail) and appends the rest.
+                int cond_vframes = std::max(1, gen_params.cont_cond_frames);  // overlap in VIDEO frames
+                int seg_frames   = gen_params.video_frames;
+                // Wan VAE temporal: num_cond_latents latents <-> 1+(N-1)*4 video frames.
+                int num_cond_latents = 1 + (cond_vframes - 1) / 4;
+                int cond_decoded_v   = 1 + (num_cond_latents - 1) * 4;  // video frames the cond latents decode to
+                if (cond_decoded_v >= seg_frames) {
+                    LOG_ERROR("--cont-cond-frames (%d -> %d latents -> %d decoded frames) must leave new frames in --video-frames (%d)",
+                              cond_vframes, num_cond_latents, cond_decoded_v, seg_frames);
+                    return 1;
+                }
+                int new_per_seg = seg_frames - cond_decoded_v;  // genuinely new video frames per chained segment
+                LOG_INFO("continuation: %d segments, overlap %d video frames = %d cond latents (%d decoded), %d new frames/seg",
+                         n_segments, cond_vframes, num_cond_latents, cond_decoded_v, new_per_seg);
+
+                // Keep the DiT + whisper resident across segments (the TE is freed once
+                // by the GPU-TE deferred-load flow; the DiT must persist or later
+                // segments render against freed GPU memory).
+                sd_ctx_keep_diffusion_model_resident(sd_ctx.get(), true);
+
+                std::vector<float> stitched_audio;  // 16k mono, full timeline
+                uint32_t audio_sr = 0;
+                std::vector<float> prev_latent;     // prior segment's full diffusion latent
+                int prev_lw = 0, prev_lh = 0, prev_lt = 0, prev_lc = 0;
+                std::vector<float> cond_latent_buf; // the tail fed to the current segment
+                // Drift control: a chained segment conditions on the prior segment's
+                // GENERATED latent, so latent color/brightness statistics drift and
+                // COMPOUND per segment (the reference's decode->re-encode roundtrip
+                // re-regularizes each time; the latent passthrough skips that). As a
+                // cheap counter, match each cond-latent tail's per-channel mean/std to
+                // segment 0's reference stats so each segment starts from the same
+                // distribution. Toggle off with LONGCAT_NO_CONT_RENORM=1.
+                bool cont_renorm = getenv("LONGCAT_NO_CONT_RENORM") == nullptr;
+                std::vector<float> ref_mean, ref_std;  // per-channel, from segment 0
+
+                for (int seg = 0; seg < n_segments; ++seg) {
+                    if (seg == 0) {
+                        vid_gen_params.cont_latent        = nullptr;
+                        vid_gen_params.cont_latent_frames = 0;
+                        vid_gen_params.audio_frame_offset = 0;
+                    } else {
+                        // take the LAST num_cond_latents latent frames of the prior segment
+                        // (layout [Wl,Hl,Tl,Cl,1], temporal dim 2) as the cond conditioning.
+                        size_t plane = (size_t)prev_lw * prev_lh;  // per (frame,channel) plane
+                        cond_latent_buf.assign((size_t)plane * num_cond_latents * prev_lc, 0.f);
+                        // copy tail frames preserving [Wl,Hl,N,Cl] contiguity.
+                        for (int c = 0; c < prev_lc; ++c) {
+                            for (int nf = 0; nf < num_cond_latents; ++nf) {
+                                int src_t = prev_lt - num_cond_latents + nf;
+                                const float* src = prev_latent.data() + ((size_t)c * prev_lt + src_t) * plane;
+                                float* dst       = cond_latent_buf.data() + ((size_t)c * num_cond_latents + nf) * plane;
+                                std::memcpy(dst, src, plane * sizeof(float));
+                            }
+                        }
+                        // per-channel stat-match the cond tail to segment 0's reference.
+                        if (cont_renorm && !ref_mean.empty()) {
+                            size_t n_per_c = plane * num_cond_latents;
+                            for (int c = 0; c < prev_lc; ++c) {
+                                float* base = cond_latent_buf.data() + (size_t)c * n_per_c;
+                                double s = 0, s2 = 0;
+                                for (size_t i = 0; i < n_per_c; ++i) { s += base[i]; s2 += (double)base[i] * base[i]; }
+                                double mu = s / n_per_c;
+                                double sd = std::sqrt(std::max(1e-8, s2 / n_per_c - mu * mu));
+                                double scale = ref_std[c] / sd;
+                                for (size_t i = 0; i < n_per_c; ++i)
+                                    base[i] = (float)((base[i] - mu) * scale + ref_mean[c]);
+                            }
+                            LOG_INFO("continuation: stat-matched cond latent to segment-0 per-channel stats");
+                        }
+                        vid_gen_params.cont_latent        = cond_latent_buf.data();
+                        vid_gen_params.cont_latent_frames = num_cond_latents;
+                        vid_gen_params.audio_frame_offset = seg * new_per_seg;
+                    }
+                    // distinct seed per segment so the noise frames differ
+                    vid_gen_params.seed = (gen_params.seed < 0) ? gen_params.seed : gen_params.seed + seg;
+
+                    LOG_INFO("=== continuation segment %d/%d (audio_offset=%d frames) ===",
+                             seg + 1, n_segments, vid_gen_params.audio_frame_offset);
+
+                    sd_image_t* seg_video = nullptr;
+                    int seg_count         = 0;
+                    sd_audio_t* seg_audio = nullptr;
+                    float* lat_out        = nullptr;
+                    int lw = 0, lh = 0, lt = 0, lc = 0;
+                    if (!generate_video_ex(sd_ctx.get(), &vid_gen_params, &seg_video, &seg_count, &seg_audio,
+                                           &lat_out, &lw, &lh, &lt, &lc)) {
+                        LOG_ERROR("continuation segment %d failed", seg + 1);
+                        free_sd_audio(seg_audio);
+                        free(seg_video);
+                        free(lat_out);
+                        return 1;
+                    }
+
+                    // stash this segment's latent for the next iteration's conditioning
+                    if (lat_out != nullptr) {
+                        prev_latent.assign(lat_out, lat_out + (size_t)lw * lh * lt * lc);
+                        prev_lw = lw; prev_lh = lh; prev_lt = lt; prev_lc = lc;
+                        // capture segment-0 per-channel reference stats for drift control
+                        if (seg == 0 && cont_renorm) {
+                            size_t per_c = (size_t)lw * lh * lt;
+                            ref_mean.assign(lc, 0.f); ref_std.assign(lc, 0.f);
+                            for (int c = 0; c < lc; ++c) {
+                                const float* base = prev_latent.data() + (size_t)c * per_c;
+                                double s = 0, s2 = 0;
+                                for (size_t i = 0; i < per_c; ++i) { s += base[i]; s2 += (double)base[i] * base[i]; }
+                                double mu = s / per_c;
+                                ref_mean[c] = (float)mu;
+                                ref_std[c]  = (float)std::sqrt(std::max(1e-8, s2 / per_c - mu * mu));
+                            }
+                            LOG_INFO("continuation: captured segment-0 per-channel reference stats (%d channels)", lc);
+                        }
+                        free(lat_out);
+                    }
+
+                    // frames: segment 0 keeps all; later segments drop the cond tail re-render.
+                    int drop = (seg == 0) ? 0 : cond_decoded_v;
+                    for (int i = 0; i < seg_count; ++i) {
+                        if (i < drop) {
+                            free(seg_video[i].data);  // discard re-rendered cond frame
+                        } else {
+                            results.push_back(seg_video[i]);  // adopt ownership
+                        }
+                    }
+                    free(seg_video);
+
+                    // audio: seg_audio already starts at this segment's offset
+                    // (audio_frame_offset). Drop the cond-frame portion for seg>0,
+                    // then append; this reconstructs the full continuous timeline.
+                    if (seg_audio != nullptr && seg_audio->data != nullptr) {
+                        audio_sr            = seg_audio->sample_rate;
+                        size_t drop_samples = (size_t)((double)drop / 25.0 * (double)audio_sr);
+                        if (drop_samples > seg_audio->sample_count) {
+                            drop_samples = seg_audio->sample_count;
+                        }
+                        stitched_audio.insert(stitched_audio.end(),
+                                              seg_audio->data + drop_samples,
+                                              seg_audio->data + seg_audio->sample_count);
+                    }
+                    free_sd_audio(seg_audio);
+                }
+
+                num_results = (int)results.size();
+                LOG_INFO("continuation: stitched %d segments -> %d frames", n_segments, num_results);
+
+                if (!stitched_audio.empty() && audio_sr > 0) {
+                    sd_audio_t* a = (sd_audio_t*)malloc(sizeof(sd_audio_t));
+                    if (a != nullptr) {
+                        a->sample_rate  = audio_sr;
+                        a->channels     = 1;
+                        a->sample_count = (uint64_t)stitched_audio.size();
+                        a->data         = (float*)malloc(stitched_audio.size() * sizeof(float));
+                        if (a->data != nullptr) {
+                            std::memcpy(a->data, stitched_audio.data(), stitched_audio.size() * sizeof(float));
+                            generated_audio = a;
+                        } else {
+                            free(a);
+                        }
+                    }
+                }
+            } else {
+                sd_image_t* generated_video = nullptr;
+                if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
+                    generated_video = nullptr;
+                }
+                results.adopt(generated_video, num_results);
             }
-            results.adopt(generated_video, num_results);
         }
 
         if (!results) {
