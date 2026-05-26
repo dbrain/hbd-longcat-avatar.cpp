@@ -799,3 +799,76 @@ full-length A/B is needed). Native-93f-RESIDENT remains out of reach in ONE more
 fused rope with a bounded MMQ pool is the path. **Disposition: shipped the −5% all-length speed win +
 the −585 MiB resident rope collapse as the DEFAULT; the resident-93f-fit is a separate follow-up (MMQ
 pool), not a regression.**
+
+### lap 11 — RESIDENT-93f BLOCKER FULLY ACCOUNTED: it is NOT "the MMQ pool grows ~300-400 MiB on top" alone — it's a TWO-ALLOCATOR squeeze (3,044 MiB gallocr reserve + a 292 MiB runtime-pool F16 transient) that exceeds the card by ~89 MiB even with VAE-on-CPU. No quality-neutral, speed-neutral pool fix closes it. 93f stays on offload. (no code shipped; submodule pristine at c3685f55)
+
+**This lap directly attacked the lap-08b/lap-10 "lever 1" (bound the MMQ Q8_1 VMM pool to make
+native 93f fit resident). Method: instrument the ggml-cuda VMM pool (`ggml_cuda_pool_vmm::alloc` +
+the `cuMemCreate` grow path) and the MMQ/op_mul_mat/batched-cublas scratch allocs with env-gated
+(`LONGCAT_POOL_DEBUG`/`LONGCAT_MMQ_DEBUG`) prints, reproduce the resident 93f OOM (`--video-frames 93
+--steps 1`, NO `--offload-to-cpu`), and read the exact failure point + sizes. All instrumentation
+reverted; submodule back to pristine `c3685f55`, parent `4b132c4`. The shipped 25f path re-verified
+99 dB bit-identical to BEST with the diagnostic build (proves the prints were inert).**
+
+**THE BLOCKER IS TWO SEPARATE ALLOCATORS, NOT ONE GROWING POOL (the handoff's framing was incomplete):**
+
+1. **gallocr compute-buffer reserve = 3,044.26 MiB** (`cudaMalloc` of 3,192,132,992 B, a single
+   contiguous block). This is the lap-08b/lap-10 self-attn-working-set floor (already proven
+   irreducible quality-neutrally at the rope layer). FFN token-tiling does NOT move it (verified
+   `LONGCAT_FFN_TILES=6/8/12` → reserve unchanged at exactly 3,044.26 MiB — the FFN is not in the
+   resident peak set; the self-attn is).
+
+2. **a 292.5 MiB runtime ggml-cuda POOL transient** — the FIRST pool allocation in the DiT graph
+   (`pool_used 0.0 → grow 294.0 MiB`). It is an **F16 `[4096 × 37,440]` buffer**
+   (4096·37440·2 B = 306,708,480 B = 292.5 MiB EXACTLY; 37,440 = the 93f token count). Confirmed it
+   is **NOT** the MMQ Q8_1 src1 scratch (mmq.cu, instrumented — no tag fired), **NOT** `op_mul_mat`'s
+   `src1_ddq`/`src1_ddf` (instrumented — no tag), and **NOT** the batched-cuBLAS path (instrumented —
+   no `[DISPATCH]` fired). It is an F16 dequant/conv scratch from a non-MMQ matmul path, allocated
+   from the runtime pool, which gallocr never sees (it is NOT in the 3,044). The handoff's "MMQ Q8_1
+   VMM pool grows ~300-400 MiB on top" was the right SHAPE of the problem but the wrong tensor + size:
+   the pool peak at the first big op is **292 MiB F16**, and the MMQ Q8_1 scratch for the same shape
+   would actually be SMALLER (1.125 B/elem vs F16 2 B/elem).
+
+**THE ARITHMETIC (the handoff's "it SHOULD fit" was off by the CUDA context + the real pool size):**
+- handoff: `8539 + 3044 = 11,583 < 11,901` → should fit; pool ~300-400 pushes over.
+- measured: usable VRAM **11,909 MiB**; resident DiT weights **8,539 MiB** + CUDA context **~122 MiB**
+  + VAE **242 MiB** (when on GPU) → idle-at-DiT **8,939 MiB** (VAE-on-GPU) / **8,661 MiB** (VAE-on-CPU).
+- VAE-on-GPU 93f: the **3,044 reserve itself fails** — at reserve time free ≈ 2,970 < 3,044, miss
+  ~74 MiB (the 242 MiB VAE leaves no room for the reserve).
+- VAE-on-CPU 93f (frees the 242): the **3,044 reserve PASSES** (free 3,249 → 205 after reserve), then
+  the **292 MiB pool transient `cuMemCreate` FAILS** (205 < 292, miss **~89 MiB**). This is the true
+  minimal-config shortfall: `8,661 + 3,044 + 292 = 11,997 > 11,909 by ~88 MiB`.
+
+**MAX RESIDENT FRAME COUNT (measured, VAE-on-CPU, `--steps 1`):** **81f FITS resident** (samples to a
+healthy latent, predecode per-frame std 0.95–0.99, nnan=0); **91f**: reserve passes, pool grow
+(280 MiB) `cuMemCreate` fails; **93f**: reserve passes, pool grow (292 MiB) fails. So the resident
+ceiling with VAE-on-CPU is **~85–89f** — up from the lap-06 "~40f" (VAE-on-GPU) because lap-07 (−1.7 GiB)
++ lap-10 (−585 MiB) shrank the reserve 5,323 → 3,044 and VAE-on-CPU frees another 242. **The campaign
+moved the resident ceiling from ~40f to ~85f; native 93f misses by the last ~89 MiB.**
+
+**WHY NO QUALITY-NEUTRAL, SPEED-NEUTRAL FIX CLOSES IT (each option tested or reasoned from measurement):**
+- **`GGML_CUDA_NO_VMM` (legacy `cudaMalloc` pool)** — added an env gate, rebuilt, ran 93f VAE-on-CPU:
+  **STILL OOMs.** The 292 MiB is a genuine ~89 MiB shortfall, NOT VMM granularity/fragmentation waste
+  (VMM rounds 292.5→294.0, only 1.5 MiB of slack). No allocator swap creates the missing 89 MiB.
+- **Route the pool scratch through the gallocr reserve** (the handoff's preferred option): the 292 MiB
+  is a `ggml_cuda_pool` runtime allocation inside the matmul op, structurally invisible to the
+  graph allocator — folding it into gallocr is a rewrite of ggml's matmul scratch handling
+  (architectural, fork-class, risk to every model). Out of scope for a quality/scratch-only change.
+- **Cap / pre-size the pool** — the pool peak IS the size the op genuinely needs for the activation
+  quant/cast; capping below it makes the op fail or forces a slower per-tile re-quant, violating the
+  "must NOT slow MMQ / 25f stays ~140 s" gate.
+- **Reduce the reserve** — lap-08b already proved the 3,044 self-attn floor has no quality-neutral
+  rope-layer win (F16 rope = 43 dB fail; low-mem F32 rope regresses the resident peak). Confirmed
+  again here: FFN tiling does not touch it.
+- **Free more resident** — VAE-on-CPU already frees the only non-weight GPU resident (242 MiB); the
+  DiT Q4_K weights are LOCKED (campaign constraint) and the ~122 MiB CUDA context is fixed.
+
+**DISPOSITION: native 93f-RESIDENT is INFEASIBLE on this 12 GB card within the quality/speed/quant
+constraints — it misses by ~89 MiB across two un-shareable allocators. 93f ships via `--offload-to-cpu`
+(~117 s/step, lap-07, unchanged + slightly faster post lap-10 rope). 25f hot path BIT-IDENTICAL to BEST
+(99 dB all frames, re-verified). Branch green, submodule pristine.** The only paths to a resident 93f
+would be (a) an architectural ggml change to share runtime-pool scratch with the gallocr reserve, or
+(b) a sub-89-MiB further cut to the self-attn reserve that lap-08b showed does not exist quality-neutrally
+— neither is a clean scratch-only lever, so per the campaign rules we STOP rather than ship a regression
+or a math change. **The resident ceiling did advance to ~85f this campaign (was ~40f); for a render
+LONGER than 81f without offload there is no headroom.**

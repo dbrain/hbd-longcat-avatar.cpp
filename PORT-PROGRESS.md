@@ -11,6 +11,36 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 11 (session 16, 2026-05-26): RESIDENT-93f blocker FULLY ACCOUNTED — INFEASIBLE
+  quality/speed-neutrally; 93f stays on offload. No code shipped; submodule pristine at `c3685f55`,
+  parent `4b132c4`, branch green. See `PERF.md` lap 11.** Attacked the lap-08b/lap-10 "lever 1"
+  (bound the MMQ Q8_1 VMM pool so native 93f fits resident). Instrumented the ggml-cuda VMM pool +
+  every matmul scratch alloc (env-gated, all reverted) and read the exact resident-93f OOM. **Finding:
+  the blocker is TWO un-shareable allocators, not one growing pool — (1) the gallocr compute reserve
+  is a single contiguous `cudaMalloc` of exactly 3,044.26 MiB (the lap-08b/10 self-attn floor; FFN
+  tiling does NOT move it, verified), and (2) the FIRST DiT runtime-pool alloc is a 292.5 MiB F16
+  `[4096×37,440]` transient (37,440 = the 93f token count) — NOT the MMQ Q8_1 src1 scratch, NOT
+  op_mul_mat, NOT batched-cuBLAS (all instrumented, none fired), so it's an F16 dequant/conv scratch
+  invisible to gallocr.** Budget (measured): usable 11,909 MiB; DiT weights 8,539 + CUDA context ~122
+  + VAE 242. **VAE-on-GPU 93f: the 3,044 reserve itself fails (free ~2,970, miss ~74 MiB). VAE-on-CPU
+  (frees the 242) 93f: reserve PASSES, then the 292 MiB pool `cuMemCreate` fails (free 205, miss
+  ~89 MiB)** → `8,661 + 3,044 + 292 = 11,997 > 11,909 by ~88 MiB`. **Max resident frame count measured
+  (VAE-on-CPU, steps=1): 81f FITS (healthy latent, nnan=0); 91f/93f OOM on the pool grow.** Resident
+  ceiling advanced **~40f → ~85f** this campaign (lap-07 −1.7 GiB + lap-10 −585 MiB + VAE-on-CPU −242),
+  but native 93f misses by the last ~89 MiB. **Every quality/speed-neutral fix tested or measured-out:**
+  `GGML_CUDA_NO_VMM` legacy `cudaMalloc` pool **still OOMs** (genuine shortfall, not VMM
+  granularity/frag — 292.5→294 is only 1.5 MiB slack); routing pool scratch into gallocr is an
+  architectural ggml-matmul rewrite (fork-class, out of scope); capping the pool below the op's genuine
+  need fails the op / slows MMQ (violates the "25f stays ~140 s" gate); the 3,044 reserve has no
+  quality-neutral rope-layer cut (lap-08b: F16 rope = 43 dB fail). DiT Q4_K + CUDA context are LOCKED.
+  **DISPOSITION: 93f ships via `--offload-to-cpu` (~117 s/step, lap-07, unchanged + slightly faster
+  post lap-10). 25f hot path re-verified PSNR 99.00 dB / min 99.00 dB on all 25 frames vs BEST with the
+  diagnostic build (proves the instrumentation was inert). For a resident render longer than 81f there
+  is no headroom — STOP rather than ship a regression or a math change.** WATCHDOG NOTE for future
+  sessions: a `timeout`-killed `docker run --rm` leaves the CONTAINER running (client SIGKILL ≠
+  container stop) — it orphaned an 11.7 GiB sd-cli once this lap; always `docker run --name X` +
+  explicit `docker rm -f X`, and check `docker ps | grep -v kobbler` + `nvidia-smi` before reporting.
+
 - 🟢 **PERF lap 10 (session 15, 2026-05-26): fused-RoPE op ROOT-CAUSED + made DEFAULT — banks −5% at
   ALL lengths, 99 dB bit-identical to BEST. See `PERF.md` lap 10. Branch green.**
   The lap-09 42 dB divergence was **NOT gallocr aliasing** (the handoff's hypothesis). A NEW minimal
