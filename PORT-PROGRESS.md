@@ -11,6 +11,100 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 12 (session 17): umT5 text-encode ON GPU (deferred DiT load) — NET −15 s / −7%, OPT-IN;
+  + ROOFLINE microbench → VERDICT "AT the roofline, no hand-kernel swing"; + continuation-chaining
+  SCOPED below. Parent-only (ggml submodule pristine `c3685f55`), branch green. See `PERF.md` lap 12.**
+  **TASK 1 (shipped, opt-in):** solved lap-05's "GPU text-encode OOMs at load (umT5 6 GB + DiT 8.5 GB
+  coexist)" by REORDERING the loads. New code (`src/stable-diffusion.cpp`): when the avatar runs with the
+  TE on the **GPU** (no `--clip-on-cpu`) + `free_params_immediately` + no-mmap, the `model.diffusion_model.`
+  tensors are split out of the load map, DiT alloc is deferred, and a `ModelLoader` copy is stashed.
+  Flow = alloc+load TE (GPU) → VAE-encode ref → umT5 encode (GPU) → free TE → `finalize_deferred_dit_load()`
+  allocs DiT on GPU + 2nd `load_tensors()` for the DiT weights → whisper-encode → sample. **umT5 + DiT never
+  coexist.** **NET WALL (same-build A/B, 25f/8-step): CPU-TE 214.9 s → GPU-TE 199.9 s = −15.0 s (−7.0%)**
+  (umT5 encode 16.9 → 0.34 s; deferred DiT load +2.75 s). **The change is BYTE-IDENTICAL on the default
+  `--clip-on-cpu` path** (predecode latent mean 0.02622/std 0.89283 = BEST; `clip_compare` 99.00 dB / min
+  99.00 dB all 25 frames vs BEST). GPU-TE output is COHERENT (ac16 0.838, cond frame 99 dB) but **44.9 dB
+  vs BEST** — GPU-vs-CPU umT5 float rounding drifts the chaotic DMD trajectory (same class as F16-rope /
+  Q4_0). **DISPOSITION: GPU-TE ships OPT-IN (drop `--clip-on-cpu`); default stays CPU-TE (BEST-matching).**
+  Strictly better than prior (was a hard load-OOM). Clips `models/_perf/task1_{gpute,cpute}_25f.webm`.
+  **TASK 2/3 (roofline, no kernel shipped):** `tools/roofline_dit.cpp` times the hot ops in isolation.
+  **Q4_K matmuls are COMPUTE-bound (AI ~38,800 flop/B ≫ ~280 balance), at ~37 eff TFLOPS = ~98% of the
+  cuBLAS-class achievable GEMM ceiling** — proven by F16-cuBLAS / Q8_0 / Q4_0 all landing in a 35–39 TFLOPS
+  band at the same shape (the 101 INT8-TOPS marketing figure is NOT the applicable roof). **Flash-attn d=128
+  = 63% of fp16-tensor peak, at its realistic softmax-bound ceiling** (correct MMA kernel, lap-08).
+  **VERDICT: hot ops are AT the roofline; a hand kernel CANNOT win; the FFN w1+w3 fuse is sub-1% (quantified)
+  → not pursued.** Per the campaign rule, no kernel written; scoped continuation-chaining instead (below).
+
+
+### CONTINUATION-CHAINING SCOPE (lap 12, NOT BUILT — needs owner greenlight)
+
+**Goal: arbitrary-length avatar clips by chaining 93f segments, each conditioned on the prior
+segment's TAIL, instead of one offload-tax full render.** The reference path is `generate_vc`
+(`~/dev/longcat-video-ref/run_demo_video_continuation.py` → `pipeline_longcat_video.py:generate_vc`,
+the "video continuation" mode). The avatar already has the machinery; continuation is a small
+generalization, NOT a new model path.
+
+**HOW THE REFERENCE CONTINUES (read from `pipeline_longcat_video.py`):**
+- `generate_vc(video=<prior frames>, num_cond_frames=13, num_frames=93, ...)`. The last
+  `num_cond_frames` frames of the prior clip become the conditioning.
+- `prepare_latents`: VAE-encode those cond frames → `num_cond_latents = 1 + (num_cond_frames-1) //
+  vae_scale_factor_temporal` latents (13 frames → `1 + 12/4 = 4` cond latents), normalized, written to
+  `latents[:, :, :num_cond_latents]`. The remaining `num_frames - cond` latents are noise.
+- Denoise loop (the simple `use_kv_cache=False` branch, which is EXACTLY what the avatar already does):
+  `timestep[:, :num_cond_latents] = 0` (cond latents are clean/fixed) and
+  `latents[:, :, num_cond_latents:] = scheduler.step(noise_pred[:, :, num_cond_latents:], ...)` — only the
+  non-cond latents are denoised; the cond latents are held. The DiT gets `num_cond_latents=N` so its
+  self-attn runs the cond/noise two-pass split (cond tokens see only cond, noise tokens see all) over N
+  cond frames instead of 1.
+- After sampling, `torch.cat([cond_latents, latents])` → decode → the OUTPUT keeps only
+  `output[num_cond_frames:]` (the cond frames came from the prior clip; only the newly-generated tail is
+  appended). frame_index / 3D-RoPE positions are assigned over the FULL `num_frames` so the new frames get
+  positions continuing past the cond frames (the avatar's `gen_vid_ids` already does `idx = t*hw + h*w + w`
+  over the full T — no special continuation offset needed; the cond frames occupy positions 0..N-1).
+- `use_kv_cache=True` (`_cache_clean_latents`) is a SPEED optimization (cache the clean cond latents' K/V
+  once instead of recomputing every step). NOT required for correctness — the `False` branch is the avatar's
+  current path. **Skip KV-cache for v1.**
+
+**WHAT THE C++ ALREADY HAS (so this is small):**
+- `LongCatAvatar::num_cond_latents` (`src/longcat_avatar.hpp:959`) + the cond/noise self-attn two-pass split
+  + the text-cross-attn cond-zeroing already generalize to N>1 cond latents (today set to 1 for ai2v).
+- The `denoise_mask` + `process_timesteps` machinery (`stable-diffusion.cpp:1685` / 2050–2054) already pins
+  the cond latents (mask=0 → `noised_input = noised_input*mask + init_latent*(1-mask)`, timestep=0 on cond).
+  Setting N>1 cond latents + a wider mask front is the same code path.
+- `encode_first_stage` already VAE-encodes images → latents; the avatar's audio windowing already maps
+  `T_video → T_latent`.
+
+**THE C++ / CLI CHANGES NEEDED (concrete, in ROI order):**
+1. **CLI: accept a prior-clip tail as conditioning.** Add `--cont-from <prev.webm>` (+ optional
+   `--cont-cond-frames`, default 13) to the avatar `vid_gen` path. Decode the LAST `cond_frames` frames of
+   `<prev.webm>` (reuse the existing ffmpeg/webm reader the muxer already links), resize to W×H, stack to a
+   `[W,H,cond_frames,3]` tensor.
+2. **prepare path (`prepare_video_generation_latents`, the `sd_version_is_longcat_avatar` branch):** when
+   continuing, VAE-encode the cond-frame stack (not a single image) → `cond_frames`-frame latent →
+   `num_cond_latents = 1 + (cond_frames-1)/4`; write to `init_latent[:, :, :num_cond_latents]`; set
+   `denoise_mask = 0` over `[0:num_cond_latents]`, `1` elsewhere (generalizes today's single-cond mask).
+   Set `avatar_model->avatar.num_cond_latents = num_cond_latents`.
+3. **audio alignment:** the audio window must start at the cond-frames boundary so lip-sync continues from
+   the prior segment's end — offset the `build_proj_inputs` window by `num_cond_latents*vae_scale` frames
+   (the cond latents reuse the prior audio; new frames get the next audio slice). One index offset in the
+   `generate_video` audio block (`stable-diffusion.cpp:5242+`).
+4. **output trim + concat:** decode the full segment, then EMIT only `frames[num_cond_frames:]` (drop the
+   re-rendered cond frames); a chaining wrapper (`tools/chain_segments.sh` or in `serve_clips`) concats
+   segment_0 (full) + segment_1..N (tails) + muxes the full audio. The per-segment denoise loop is unchanged
+   (it already only steps the non-cond latents via the mask).
+5. **(later, optional) KV-cache the clean cond latents** (`_cache_clean_latents`) to skip recomputing the N
+   cond frames' K/V every step — a per-step speed win once v1 works; needs a persistent cond-K/V buffer
+   across the 8 steps (gallocr-aliasing care, cf. siglip2/lap-01 memo). Defer.
+
+**RISKS / OPEN QUESTIONS:** (a) seam continuity — does a 4-cond-latent (13-frame) overlap give a seamless
+join, or does the DMD-distilled 8-step schedule (vs the reference's 50-step `generate_vc`) soften the
+continuation? Validate with a 2-segment chain + eyeball the seam. (b) the reference `generate_vc` uses
+`num_inference_steps=50` + `guidance_scale=4.0` (CFG) whereas the avatar is distilled 8-step / cfg=1.0 —
+the cond-latent conditioning math is identical, but the seam quality at 8 steps is unproven (eyeball call,
+same class as `--steps 6`). (c) BSA is OFF for the avatar (lap-05) — keep it off; continuation is dense.
+**Build only on owner greenlight; this is a feature, not a perf lever.** Est. ~1 focused session for v1
+(steps 1–4), since the cond-latent split + mask + VAE-encode already exist.
+
 - 🟢 **PERF lap 11 (session 16, 2026-05-26): RESIDENT-93f blocker FULLY ACCOUNTED — INFEASIBLE
   quality/speed-neutrally; 93f stays on offload. No code shipped; submodule pristine at `c3685f55`,
   parent `4b132c4`, branch green. See `PERF.md` lap 11.** Attacked the lap-08b/lap-10 "lever 1"

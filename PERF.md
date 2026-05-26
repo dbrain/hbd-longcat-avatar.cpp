@@ -49,6 +49,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 
 | 10  | **fused-RoPE made DEFAULT** — root-caused the lap-09 42 dB divergence: it was NOT gallocr aliasing (a minimal same-topology repro under real gallocr, `tools/test_rope_pe_gallocr.cpp`, was already only ~5e-5 off — not a clobber) but **FMA CONTRACTION in `rope-pe.cu`** (nvcc fused `a*c±b*s` into `fmaf`, skipping the product rounding the chain's separate `ggml_mul`+`ggml_add` does → ~5e-5/op, compounded over 48 blk × 8 steps → trajectory drift). Fix: `__fmul_rn`/`__fadd_rn`/`__fsub_rn` (un-contractable). Now **max\|chain−fused\|=0.0** in BOTH isolation AND real-gallocr repros, and the **25f render is 99 dB bit-identical to BEST on all frames** with the op ON. Flipped default-on (opt out `LONGCAT_NO_FUSED_ROPE=1`). | 25f sampling **139.9 (−5% vs 147)**; DiT 17.42 s/step | 25f peak 10513 (unchanged); 93f-resident compute reserve **3,629 → 3,044 MiB (−585)** but still OOMs (MMQ pool is the last blocker) | DEFAULT (fused) **BIT-IDENTICAL to BEST (99 dB all 25 frames)** | submodule (rope-pe.cu) + parent (rope.hpp), this lap |
 
+| 12  | **umT5 text-encode on GPU** via deferred DiT weight load (load TE→encode→free TE→load DiT, so umT5 6 GB + DiT 8.5 GB never coexist). **NET WALL −15.0 s (−7.0%)** on the canonical 25f/8-step (214.9 → 199.9 s, same build A/B): umT5 encode **16.9 s (CPU) → 0.34 s (GPU)**, deferred DiT load +2.75 s. **Code is byte-identical on the default `--clip-on-cpu` path (99 dB vs BEST).** GPU-TE output is COHERENT (ac16 0.838, cond frame 99 dB) but **44.9 dB vs BEST** — GPU-vs-CPU umT5 float rounding drifts the chaotic DMD trajectory (same class as F16-rope/Q4_0). So GPU-TE ships **OPT-IN** (drop `--clip-on-cpu`), default stays CPU-TE (BEST-matching). Was a hard load-OOM before this lap. + **ROOFLINE microbench** `tools/roofline_dit.cpp`: hot Q4_K matmuls + flash-attn timed in isolation. | 25f sampling 140 s (unchanged); umT5 7.0% → 0.15% of wall | 25f GPU-TE peak unchanged (TE freed before DiT loads — never coexist) | default (CPU-TE) **BIT-IDENTICAL to BEST (99 dB)**; GPU-TE coherent 44.9 dB | parent (this lap) |
+
 (rows appended per lap below)
 
 ### lap 00 — baseline
@@ -872,3 +874,102 @@ would be (a) an architectural ggml change to share runtime-pool scratch with the
 — neither is a clean scratch-only lever, so per the campaign rules we STOP rather than ship a regression
 or a math change. **The resident ceiling did advance to ~85f this campaign (was ~40f); for a render
 LONGER than 81f without offload there is no headroom.**
+
+### lap 12 — umT5 text-encode ON GPU (deferred DiT load, NET −15 s / −7%, opt-in) + ROOFLINE microbench → VERDICT: hot ops are AT the realistic roofline, no hand-kernel swing worth it
+
+**TASK 1 — umT5-on-GPU via deferred DiT weight load (SHIPPED, opt-in).** lap-05's "GPU text
+encode OOMs at load (umT5 6 GB + DiT 8.5 GB coexist upfront)" dead-end is now solved by REORDERING
+the loads instead of fitting both. New mechanism (`src/stable-diffusion.cpp`): when the avatar runs
+with the TE on the **GPU** (i.e. `--clip-on-cpu` is NOT passed) AND `free_params_immediately` AND
+no mmap, the DiT (`model.diffusion_model.`) tensors are **split out of the load map** and the DiT
+param-buffer alloc is **deferred**; a copy of the `ModelLoader` is stashed. Flow becomes:
+alloc TE (GPU) + load TE weights → VAE-encode ref → **umT5 text-encode (GPU)** → free TE buffer →
+`finalize_deferred_dit_load()` allocs the DiT on GPU + a second `load_tensors()` reads the DiT
+weights from the stashed loader → whisper-encode → sample. umT5 (6 GB) and DiT (8.5 GB) **never
+coexist** on the 12 GB card. `ModelLoader::load_tensors(map)` only writes tensors present in the
+passed map and re-opens the file by path each call, so the two-pass split is safe + re-entrant.
+
+- **NET WALL DELTA (same-build A/B, canonical 25f/480p/8-step/seed 42/audio):**
+  - CPU-TE (prod, `--clip-on-cpu`): **214.88 s** — umT5 encode **16.88 s**, sampling 140.16 s, decode 54.01 s.
+  - GPU-TE (deferred, no `--clip-on-cpu`): **199.85 s** — umT5 encode **0.34 s**, deferred DiT load **+2.75 s**, sampling 140.22 s, decode 53.98 s.
+  - **⇒ NET −15.0 s (−7.0%), CLEARLY POSITIVE.** umT5 text-encode 16.9 → 0.34 s (−16.5 s); the only added cost is the 2.75 s deferred DiT load (which is just the same DiT weight read happening later, not extra work). Quality discipline: the win is real and net-positive, NOT a wash.
+- **QUALITY — DEFAULT (CPU-TE) IS BYTE-IDENTICAL; GPU-TE IS A DIFFERENT-BUT-COHERENT TRAJECTORY.**
+  The code change is **inert on the default `--clip-on-cpu` path**: that render's predecode latent is
+  `mean 0.02622 / std 0.89283 / nnan 0` — byte-identical to BEST, and `clip_compare.py` = **PSNR 99.00 dB
+  / min 99.00 dB on all 25 frames vs BEST**. So shipping the deferred-load machinery does not touch the
+  proven default. The GPU-TE path predecode latent is `mean 0.02615 / std 0.89282` (drifts in the 4th–5th
+  decimal) and renders **f00 (cond frame) = 99 dB exact** but **generated frames mean 44.9 dB / min 41.3 dB
+  vs BEST** (ac16 0.838, identical to 3 d.p., fully coherent). The drift is the GPU-vs-CPU umT5 text
+  embedding (different float rounding) propagating through text-cross-attn over 48 blk × 8 steps — the
+  SAME chaotic-trajectory class as F16-rope (43 dB) / Q4_0 (30 dB) / `--steps 6`. It is NOT degradation
+  (GPU F32 accum is not less accurate than CPU); it is simply a different valid trajectory than the
+  CPU-TE-built BEST.
+- **DISPOSITION: GPU-TE ships OPT-IN (drop `--clip-on-cpu`), default stays CPU-TE.** Per the campaign's
+  hard 99-dB-vs-BEST gate, a 44.9 dB result is not "bit-identical", so it is not flipped default-on (same
+  call as Q4_0 / `--steps 6`). But this is strictly better than the prior state: GPU text-encode was a
+  hard load-OOM dead-end (lap-05) and is now a working **+7% speed knob** for anyone who doesn't need
+  byte-identity to the CPU-TE BEST. (If the owner wants the GPU-TE trajectory as the new prod baseline,
+  re-bless a GPU-TE render as BEST and it's 99 dB self-consistent + 7% faster.) Validation clips:
+  `models/_perf/task1_gpute_25f.webm` (GPU-TE) / `task1_cpute_25f.webm` (CPU-TE, = BEST 99 dB).
+
+**TASK 2 — ROOFLINE microbench (`tools/roofline_dit.cpp`, NO render).** Times the dominant DiT ops in
+isolation on the RTX 3060 (warmup + 20–30 iters, `ggml_backend_graph_compute` + synchronize) and
+computes effective TFLOPS (2·M·N·K / t) + arithmetic intensity. Build/run: see the header comment
+(g++ + `-Wl,--start-group` the four ggml `.a`s + `-lcudart -lcuda -lcublas -lnccl`).
+
+| hot op (M=10920 tok) | ms | eff TFLOPS | AI (flop/B, weight read) | path |
+|----------------------|---:|-----------:|--------------------------:|------|
+| ffn.w2  [11008→4096] Q4_K | 27.29 | 36.1 | 38,827 | MMQ int8 |
+| ffn.w1  [4096→11008] Q4_K | 26.72 | 36.9 | 38,827 | MMQ int8 |
+| ffn.w3  [4096→11008] Q4_K | 26.76 | 36.8 | 38,827 | MMQ int8 |
+| qkv/proj [4096→4096] Q4_K | 10.35 | 35.4 | 38,827 | MMQ int8 |
+| ffn.w1 **Q8_0** (same shape) | 25.43 | 38.7 | 20,555 | MMQ int8 |
+| ffn.w1 **Q4_0** (same shape) | 25.17 | 39.1 | 38,827 | MMQ int8 |
+| ffn.w1 **F16 / cuBLAS** (same shape) | 26.26 | **37.5** | 10,920 | **fp16 tensor (cuBLAS)** |
+| flash-attn full L=10920 d=128 | 121.40 | 16.1 | — | MMA F16 |
+| flash-attn noise L=9360 d=128 | 89.47 | 16.0 | — | MMA F16 |
+
+**WHICH ROOF APPLIES (rigorous):**
+- **Q4_K matmuls are COMPUTE-bound, NOT BW-bound.** AI = **38,827 flop/byte** of weight read (M=10920
+  reuses every weight byte ~10920×). Machine balance ≈ 101e12 / 360e9 ≈ **280 flop/B** — the AI is
+  **~140× above balance**, so the weight read is free (BW-roof time 0.07 ms ≪ matmul 26.7 ms). The
+  applicable roof is the **compute** roof, not BW.
+- The naive "% of 101 INT8 TOPS marketing peak" reads **35–37%** and would suggest headroom — **but that
+  is the WRONG roof.** The same-shape cross-check proves it: **Q4_K (36.9), Q8_0 (38.7), Q4_0 (39.1), and
+  NVIDIA's own hand-tuned F16 cuBLAS (37.5) all land in a tight 35–39 eff-TFLOPS band.** The realizable
+  GEMM ceiling for these moderate-M shapes on GA106 (28 SMs, 192-bit mem) is **~37–39 eff TFLOPS** (what
+  cuBLAS delivers), not 101 TOPS. The 101-TOPS figure is unreachable for real GEMM at this M. **Q4_K MMQ
+  is at ~98% of the cuBLAS-class achievable ceiling.** ⇒ AT THE ROOFLINE.
+
+- **Flash-attn d=128 = 16.1 eff TFLOPS = 62.9% of the 25.6-TFLOPS fp16-tensor peak.** Above 60%, below
+  80% — but the 25.6 figure is again the marketing tensor-core peak; flash-attn's online-softmax (max,
+  exp, running rescale) is non-tensor-core work that no kernel can convert to MMA flops, so ~63% of the
+  marketing fp16 peak is the practical ceiling for a softmax-bound attention at this L. lap-08 already
+  verified it dispatches to the correct `BEST_FATTN_KERNEL_MMA_F16` tensor-core kernel (not a TILE
+  fallback). ⇒ effectively AT its realistic roofline.
+
+**TASK 3 — VERDICT + action: hand-kernel DISPROVEN; no swing taken; continuation-chaining scoped instead.**
+
+> **ROOFLINE VERDICT (prominent):**
+> - **Q4_K weight matmuls (38% of the step): COMPUTE-bound, AT the roofline.** ~37 eff TFLOPS = ~98% of
+>   the cuBLAS-class achievable GEMM ceiling on this GPU (the marketing 101 INT8 TOPS is NOT the
+>   applicable roof — proven by F16-cuBLAS landing at the same throughput). **A hand kernel CANNOT win.**
+>   Banana stand empty.
+> - **Flash-attn d=128 (34% of the step): ~63% of fp16-tensor marketing peak, AT its realistic ceiling**
+>   (softmax overhead is irreducible; correct MMA kernel confirmed lap-08). **No worthwhile swing.**
+> - **The one structural lever (FFN w1+w3 fuse to share the Q8_1 activation re-quant): NOT worth it,**
+>   confirmed quantitatively. The matmuls are at the GEMM ceiling, so the activation re-quant is a tiny
+>   slice: re-quant moves K·M·4 B (179 MiB) at ≤360 GB/s ≈ 0.5 ms vs a 26.7 ms matmul (~2%); fusing w1+w3
+>   removes ONE of the two quants ≈ 0.3 ms out of the ~53 ms w1+w3 pair = **~0.6%** (matches lap-08's ~1%
+>   estimate), and it needs a converter-side fused-weight tensor to dodge the gallocr-aliasing trap.
+>   Sub-1% for real complexity ⇒ not pursued.
+
+**Per the campaign rule ("IF everything is at the roofline, DON'T grind it — scope the highest-value
+alternative"), no kernel was written.** The hot path is genuinely on the vendor-tuned kernels at the
+realistic roofline (lap-08 read the dispatchers; this lap measured the achieved throughput vs the RIGHT
+roof and against cuBLAS). The remaining real speed levers are all quality-sensitive (`--steps`, quant),
+already A/B'd. **Continuation-chaining (the path to arbitrary-length clips without the offload tax) is
+scoped in PORT-PROGRESS.md as the next high-value work item.**
+
+**Box state:** GPU free at end (9 MiB idle), no orphaned containers (all runs used `--name` + auto-`--rm`;
+verified `docker ps`), ggml submodule pristine at `c3685f55` (parent-only lap), branch green.

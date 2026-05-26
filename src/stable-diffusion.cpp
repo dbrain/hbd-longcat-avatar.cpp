@@ -167,6 +167,16 @@ public:
 
     std::map<std::string, ggml_tensor*> tensors;
 
+    // Deferred DiT weight load (avatar umT5-on-GPU path): when the text encoder is
+    // resident on the GPU, umT5 (~6 GB) + DiT (~8.5 GB) cannot coexist at load. We
+    // load+encode+free the TE first, then load the DiT weights. The loader is kept
+    // alive so the second load_tensors() pass can read the DiT tensors from the file.
+    std::shared_ptr<ModelLoader> deferred_loader;
+    std::map<std::string, ggml_tensor*> deferred_dit_tensors;
+    std::set<std::string> deferred_ignore_tensors;
+    bool dit_load_deferred  = false;
+    bool deferred_use_mmap  = false;
+
     // lora_name => multiplier
     std::unordered_map<std::string, float> curr_lora_state;
 
@@ -985,7 +995,37 @@ public:
         if (cond_stage_model) {
             cond_stage_model->alloc_params_buffer();
         }
-        if (diffusion_model) {
+
+        // Avatar umT5-on-GPU: defer the DiT weight load so umT5 (~6 GB) and the DiT
+        // (~8.5 GB) never coexist on the 12 GB card. We alloc+load+encode+free the
+        // text encoder on the GPU first, then alloc+load the DiT. Only engage when the
+        // TE actually lives on the GPU (otherwise nothing is gained) and weights are
+        // freed-immediately (one-shot CLI). The DiT tensors are split out of the load
+        // map here and loaded by finalize_deferred_dit_load() after the TE is freed.
+        dit_load_deferred = false;
+        if (sd_version_is_longcat_avatar(version) && diffusion_model && cond_stage_model &&
+            free_params_immediately && !sd_ctx_params->enable_mmap &&
+            !ggml_backend_is_cpu(params_backend_for(SDBackendModule::TE)) &&
+            !ggml_backend_is_cpu(params_backend_for(SDBackendModule::DIFFUSION))) {
+            for (auto it = tensors.begin(); it != tensors.end();) {
+                if (starts_with(it->first, "model.diffusion_model.")) {
+                    deferred_dit_tensors[it->first] = it->second;
+                    it                              = tensors.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (!deferred_dit_tensors.empty()) {
+                dit_load_deferred        = true;
+                deferred_ignore_tensors  = ignore_tensors;
+                deferred_use_mmap        = sd_ctx_params->enable_mmap;
+                deferred_loader          = std::make_shared<ModelLoader>(model_loader);
+                LOG_INFO("avatar: deferring DiT weight load (umT5-on-GPU); %zu DiT tensors",
+                         deferred_dit_tensors.size());
+            }
+        }
+
+        if (diffusion_model && !dit_load_deferred) {
             diffusion_model->alloc_params_buffer();
         }
         if (high_noise_diffusion_model) {
@@ -1221,6 +1261,38 @@ public:
         }
 
         ggml_free(ctx);
+        return true;
+    }
+
+    // Avatar umT5-on-GPU: alloc the DiT param buffer (GPU) and load its weights from
+    // the stashed loader, AFTER the text encoder has been freed. Idempotent / no-op
+    // when the load was not deferred. Returns false on alloc/load failure.
+    bool finalize_deferred_dit_load() {
+        if (!dit_load_deferred) {
+            return true;
+        }
+        dit_load_deferred = false;  // run once
+        int64_t t0        = ggml_time_ms();
+        if (diffusion_model) {
+            diffusion_model->alloc_params_buffer();
+        }
+        if (!deferred_loader) {
+            LOG_ERROR("deferred DiT load: loader missing");
+            return false;
+        }
+        bool ok = deferred_loader->load_tensors(deferred_dit_tensors,
+                                                deferred_ignore_tensors,
+                                                n_threads,
+                                                deferred_use_mmap);
+        deferred_loader.reset();
+        deferred_dit_tensors.clear();
+        deferred_ignore_tensors.clear();
+        if (!ok) {
+            LOG_ERROR("deferred DiT weight load failed");
+            return false;
+        }
+        LOG_INFO("avatar: deferred DiT weight load completed, taking %.2fs",
+                 (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
 
@@ -4884,6 +4956,9 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
+    // Avatar umT5-on-GPU: now that the TE is freed, bring the DiT weights onto the
+    // GPU (deferred at load to avoid TE+DiT coexisting). No-op when not deferred.
+    sd_ctx->sd->finalize_deferred_dit_load();
     return embeds;
 }
 
