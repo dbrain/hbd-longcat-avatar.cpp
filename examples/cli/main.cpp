@@ -784,6 +784,15 @@ int main(int argc, const char* argv[]) {
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
 
+            // LongCat-Avatar mouth-exaggeration knobs -> runtime env (the library reads
+            // these per-render; the API will set the equivalent fields directly).
+            if (gen_params.audio_mouth_scale != 1.0f) {
+                setenv("LONGCAT_AUDIO_MOUTH_SCALE", std::to_string(gen_params.audio_mouth_scale).c_str(), 1);
+            }
+            if (gen_params.audio_lowpass > 0.0f) {
+                setenv("LONGCAT_AUDIO_LOWPASS", std::to_string(gen_params.audio_lowpass).c_str(), 1);
+            }
+
             int n_segments = std::max(1, gen_params.segments);
             if (n_segments > 1) {
                 // LongCat-Avatar continuation chaining: render N segments, each

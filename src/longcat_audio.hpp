@@ -143,6 +143,37 @@ namespace LONGCAT_AUDIO {
             }
             LOG_INFO("audio: resampled %u Hz -> 16000 Hz (%zu samples)", sample_rate, out_n);
         }
+
+        // RUNTIME mouth-softening knob: optional 2nd-order Butterworth low-pass on the
+        // 16 kHz mono signal (re-introduces the v1.0 wav2vec2 path's _smooth_transients,
+        // which the v1.5 Whisper path dropped — it softens the plosive/sibilant
+        // transients that spike visemes). Cutoff Hz from LONGCAT_AUDIO_LOWPASS; 0/unset =
+        // off (default, signal unchanged). Forward biquad (causal; the slight group delay
+        // is negligible vs the 50fps audio window).
+        if (const char* lpe = getenv("LONGCAT_AUDIO_LOWPASS")) {
+            float fc = (float)atof(lpe);
+            if (fc > 0.0f && fc < 8000.0f && !out.empty()) {
+                const double fs    = 16000.0;
+                const double wc    = std::tan(M_PI * fc / fs);  // pre-warped
+                const double wc2   = wc * wc;
+                const double k     = std::sqrt(2.0) * wc;       // Butterworth Q=1/sqrt(2)
+                const double norm  = 1.0 / (1.0 + k + wc2);
+                const double b0    = wc2 * norm;
+                const double b1    = 2.0 * b0;
+                const double b2    = b0;
+                const double a1    = 2.0 * (wc2 - 1.0) * norm;
+                const double a2    = (1.0 - k + wc2) * norm;
+                double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+                for (size_t i = 0; i < out.size(); i++) {
+                    double x0 = out[i];
+                    double y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                    x2 = x1; x1 = x0;
+                    y2 = y1; y1 = y0;
+                    out[i] = (float)y0;
+                }
+                LOG_INFO("audio: applied %.0f Hz Butterworth low-pass (mouth-softening)", fc);
+            }
+        }
         return true;
     }
 

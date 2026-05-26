@@ -191,6 +191,9 @@ struct SDGenerationParams {
     // LongCat-Avatar continuation chaining (multi-segment clips).
     int segments                         = 1;   // >1 -> chain N resident segments
     int cont_cond_frames                 = 13;  // prior-segment tail frames used as conditioning
+    // LongCat-Avatar mouth-exaggeration knobs (RUNTIME).
+    float audio_mouth_scale              = 1.0f; // scale the audio->face residual (1.0 = unchanged)
+    float audio_lowpass                  = 0.0f; // input-wav low-pass cutoff Hz (0 = off)
     int fps                              = 16;
     float vace_strength                  = 1.f;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};

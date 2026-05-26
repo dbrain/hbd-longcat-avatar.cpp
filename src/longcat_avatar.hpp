@@ -41,6 +41,12 @@ namespace LONGCAT_AVATAR {
         // >1 tiles the self-attn noise pass over query-row blocks (same idea, for the
         // self-attention working set). 1 = original single-shot call (25f hot path).
         int64_t attn_query_tiles = 1;
+        // RUNTIME mouth-exaggeration knob: scales the audio cross-attn gated residual
+        // (the SINGLE additive term that drives the face from audio — see audio path
+        // below). 1.0 = unchanged (default, bit-identical). <1 = milder mouth, >1 =
+        // more exaggerated. Set per-render by the runner from --audio-mouth-scale /
+        // the API. Timing is untouched (lives in WHICH tokens attend, not magnitude).
+        float audio_mouth_scale = 1.0f;
 
         LongCatAvatarSingleStreamBlock(int64_t hidden_size,
                                        int64_t num_heads,
@@ -526,6 +532,12 @@ namespace LONGCAT_AVATAR {
                     auto ao_m = modulate(ctx, mod_norm_attn, ao, am[0], am[1], T_noise);
                     // gate add into x's noise tokens (a_gate*ao_m, no zeros residual)
                     auto add  = gate_mul(ctx, ao_m, am[2], T_noise);
+                    // RUNTIME mouth-exaggeration knob: scale the audio's entire
+                    // additive influence on the face. 1.0 (default) skips the op =
+                    // bit-identical; <1 = milder mouth, >1 = more exaggerated.
+                    if (audio_mouth_scale != 1.0f) {
+                        add = ggml_scale(ctx->ggml_ctx, add, audio_mouth_scale);
+                    }
                     // add: [C, n_noise_token, 1]. Prepend zeros for cond tokens, add to x.
                     if (n_cond_tokens > 0) {
                         auto zeros = ggml_ext_zeros(ctx->ggml_ctx, hidden_size, n_cond_tokens, x->ne[2], 1);
@@ -686,6 +698,13 @@ namespace LONGCAT_AVATAR {
     class LongCatAvatar : public GGMLBlock {
     protected:
         LongCatAvatarParams params;
+
+    public:
+        // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged). Set per-render by
+        // the runner; pushed onto every block in the forward loop.
+        float audio_mouth_scale = 1.0f;
+
+    protected:
 
     public:
         LongCatAvatar() {}
@@ -933,6 +952,7 @@ namespace LONGCAT_AVATAR {
                 auto block = std::dynamic_pointer_cast<LongCatAvatarSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
                 block->ffn_token_tiles  = ffn_tiles;
                 block->attn_query_tiles = attn_tiles;
+                block->audio_mouth_scale = audio_mouth_scale;
                 x          = block->forward(ctx, x, t_emb, context, pe, audio, T, n_cond_tokens, i);
                 sd::ggml_graph_cut::mark_graph_cut(x, "longcat.blocks." + std::to_string(i) + ".out", "x");
                 if (i == 0) {
@@ -957,6 +977,9 @@ namespace LONGCAT_AVATAR {
         LongCatAvatar avatar;
         std::vector<float> pe_vec;
         int num_cond_latents = 0;  // ai2v ref-image cond frames (set per request)
+        // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
+        // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
+        float audio_mouth_scale = 1.0f;
         // Audio window inputs (host-prepared per request via LONGCAT_AUDIO; empty =
         // no audio → audio cross-attn skipped, identical to text+image-only video).
         sd::Tensor<float> audio_first;   // [32000, 1]
@@ -1054,6 +1077,14 @@ namespace LONGCAT_AVATAR {
                 ggml_tensor* a_first  = make_input(audio_first);
                 ggml_tensor* a_latter = audio_latter.empty() ? nullptr : make_input(audio_latter);
                 audio_hidden          = avatar.audio_proj(&runner_ctx, a_first, a_latter);  // [768, 32, N_t]
+            }
+
+            // RUNTIME mouth-exaggeration knob. Source: the runner field (set by the
+            // API) unless overridden by LONGCAT_AUDIO_MOUTH_SCALE (the CLI path). Read
+            // per-render so it stays runtime (never baked); 1.0 = bit-identical.
+            avatar.audio_mouth_scale = audio_mouth_scale;
+            if (const char* mse = getenv("LONGCAT_AUDIO_MOUTH_SCALE")) {
+                avatar.audio_mouth_scale = (float)atof(mse);
             }
 
             ggml_tensor* out = avatar.forward(&runner_ctx, x, timesteps, context, pe, audio_hidden, n_cond_tokens);

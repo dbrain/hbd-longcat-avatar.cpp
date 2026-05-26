@@ -922,6 +922,16 @@ ArgOptions SDGenerationParams::get_options() {
 
     options.float_options = {
         {"",
+         "--audio-mouth-scale",
+         "LongCat-Avatar: scale the audio->face influence (mouth exaggeration). "
+         "1.0 = unchanged (default), <1 = milder mouth, >1 = more exaggerated",
+         &audio_mouth_scale},
+        {"",
+         "--audio-lowpass",
+         "LongCat-Avatar: low-pass cutoff (Hz) applied to the input wav before audio "
+         "encode, softening viseme-spiking transients. 0 = off (default), try ~3000",
+         &audio_lowpass},
+        {"",
          "--cfg-scale",
          "unconditional guidance scale: (default: 7.0)",
          &sample_params.guidance.txt_cfg},
