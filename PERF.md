@@ -47,6 +47,8 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 08b | RESIDENT-93f investigation: re-localized the 3,629 floor (it is **six ~585 MiB RoPE-internal** cont/repeat/mul buffers, NOT the matmul outputs the lap-07 handoff named). F16-rope cuts it to **2,983 (−646)** but FAILS the 99 dB gate (43 dB, trajectory drift) AND still runtime-OOMs on the MMQ VMM pool. Bit-identical lowmem-F32-rope (half-width concat) REGRESSES the resident peak (→3,860). **No quality-neutral resident win exists at the rope layer.** Precise fix = bound the MMQ pool, or a custom F32 fused-RoPE CUDA op. | 25f sampling 147 (unchanged) | 93f resident floor 3,629 (unmoved quality-neutrally) | 25f **BIT-IDENTICAL** (no code shipped) | (no change) HEAD c78e86c |
 | 09  | **Custom fused-RoPE CUDA op** `ggml_rope_pe` (new GGML_OP_ROPE_PE, CUDA-only) — replaces the `apply_rope` cont+2×repeat+mul+add chain with ONE kernel reading x+pe → q_rope. **Proven BIT-IDENTICAL in isolation** (`tools/test_rope_pe.cpp`: max\|chain−fused\|=1.2e-7 @ real [128,32,257]). When wired ON it cut DiT **18.35→17.42 s/step (−5.1%)**, sampling **147→139.9 s**. **BUT the full 25f render diverges to 42 dB (NOT 99 dB)** despite the identical op output — a downstream graph/gallocr interaction, root cause NOT found this lap. **Op gated OPT-IN** (`LONGCAT_FUSED_ROPE=1`); default = chain, re-verified **99 dB bit-identical to BEST**. Branch green. | 25f sampling 147 (default) / **139.9 with op (−5%)** | 25f peak 10513 (unchanged; rope buffers are the 93f-resident smell, not 25f peak) | default **BIT-IDENTICAL to BEST (99 dB)**; op-on **FAILS gate (42 dB)** | submodule + parent (this lap) |
 
+| 10  | **fused-RoPE made DEFAULT** — root-caused the lap-09 42 dB divergence: it was NOT gallocr aliasing (a minimal same-topology repro under real gallocr, `tools/test_rope_pe_gallocr.cpp`, was already only ~5e-5 off — not a clobber) but **FMA CONTRACTION in `rope-pe.cu`** (nvcc fused `a*c±b*s` into `fmaf`, skipping the product rounding the chain's separate `ggml_mul`+`ggml_add` does → ~5e-5/op, compounded over 48 blk × 8 steps → trajectory drift). Fix: `__fmul_rn`/`__fadd_rn`/`__fsub_rn` (un-contractable). Now **max\|chain−fused\|=0.0** in BOTH isolation AND real-gallocr repros, and the **25f render is 99 dB bit-identical to BEST on all frames** with the op ON. Flipped default-on (opt out `LONGCAT_NO_FUSED_ROPE=1`). | 25f sampling **139.9 (−5% vs 147)**; DiT 17.42 s/step | 25f peak 10513 (unchanged); 93f-resident compute reserve **3,629 → 3,044 MiB (−585)** but still OOMs (MMQ pool is the last blocker) | DEFAULT (fused) **BIT-IDENTICAL to BEST (99 dB all 25 frames)** | submodule (rope-pe.cu) + parent (rope.hpp), this lap |
+
 (rows appended per lap below)
 
 ### lap 00 — baseline
@@ -737,3 +739,63 @@ output — **no cont, no 2× full-size repeat, no separate mul+add buffers**.
 2. **Bound the MMQ Q8_1 VMM pool** (lap-08b's lowest-risk 93f-resident fix) — independent of rope; with the
    fused-RoPE cut + a bounded pool, native 93f resident should fit.
 3. Converter-side FFN w1+w3 fuse (~1%, lap-08) — only if 1+2 land.
+
+### lap 10 — fused-RoPE ROOT-CAUSED (FMA contraction, NOT gallocr aliasing) + made DEFAULT (−5% all lengths, 99 dB bit-identical)
+
+**The lap-09 handoff diagnosed the 42 dB divergence as a "gallocr buffer-aliasing interaction" (the
+op collapsing ~10 rope nodes to 1 changed buffer liveness so a downstream consumer overlapped the
+q_rope/k_rope output). THAT WAS WRONG — and a cheap minimal repro proved it before any render.**
+
+**Repro (`tools/test_rope_pe_gallocr.cpp`, NEW):** unlike the isolation test (which uses
+`ggml_backend_alloc_ctx_tensors` — every tensor its own persistent buffer, so gallocr reuse is never
+exercised), this builds the REAL self-attn topology (rope → cond/noise view-split → `ggml_cont` →
+`ggml_flash_attn_ext` → proj matmul), runs BOTH a chain branch and a fused branch in ONE graph through
+the **actual `ggml_gallocr`** (reserve + alloc_graph), and diffs the two final outputs. Result with the
+lap-09 kernel: **max|chain−fused| = 5.4e-5, mean|a|==mean|b|==0.1010.** A buffer clobber/overlap would
+give garbage or NaN, not a uniform ~5e-5 with matched means. **⇒ NOT aliasing.** (Also confirmed by
+reading `ggml-alloc.c`: `GGML_OP_ROPE_PE` is not in `ggml_op_can_inplace` so its output never reuses a
+parent; and a node's output is allocated BEFORE its inputs are freed, so `dst` can't overlap `a`.)
+
+**ACTUAL ROOT CAUSE = FMA CONTRACTION in `rope-pe.cu`.** The kernel wrote `dst = x_e*c - x_o*s` /
+`x_o*c + x_e*s`; nvcc contracts `a*b ± c*d` into `fmaf` by default, which does NOT round the
+intermediate product. The `apply_rope` chain uses separate `ggml_mul` then `ggml_add` (each product
+rounded to F32 before the add). So fused vs chain differed by ~5e-5/element — negligible in one pass,
+but the DMD denoise is a chaotic fixed-point trajectory: that perturbation compounds over 48 blocks ×
+8 steps and pushes the render off the 99 dB gate (the SAME "coherent but drifted" signature as the
+F16-rope / Q4_0 / 6-step renders, just from a much smaller seed perturbation).
+
+**FIX (committed, `ggml/src/ggml-cuda/rope-pe.cu`):** compute the rope with un-contractable
+round-to-nearest primitives — `__fmul_rn` for each of the four products, `__fsub_rn` for the even lane,
+`__fadd_rn` for the odd lane, in the chain's exact term order. Each product is now rounded to F32
+before the add, IEEE-matching the chain. **Result: max|chain−fused| = 0.000e+00 in BOTH
+`tools/test_rope_pe.cpp` (isolation, was 1.2e-7) AND `tools/test_rope_pe_gallocr.cpp` (real-gallocr
+same-topology, was 5.4e-5).**
+
+**MADE DEFAULT** (`src/rope.hpp`): the gate flipped from opt-in `LONGCAT_FUSED_ROPE=1` to default-on
+with an opt-OUT escape hatch `LONGCAT_NO_FUSED_ROPE=1` (still guarded on the interleaved + F32 +
+pe-shape conditions; non-matching callers fall to the chain).
+
+**VALIDATION:**
+- **25f render, fused op ON (env), vs BEST: PSNR 99.00 dB / min 99.00 dB on ALL 25 frames**
+  (`clip_compare.py`), ac16 matches to 3 d.p. Latent healthy (std 0.893, nnan=0).
+- **25f render, DEFAULT path (no env, fused-on by default): PSNR 99.00 dB / min 99.00 dB on ALL 25
+  frames vs BEST** (`models/_perf/lap10_default_25f.webm`). Its predecode latent stats are byte-identical
+  to the env-ON run (mean 0.02622 / std 0.89283 / nnan 0), confirming default == env-ON. The shipped
+  default now banks the −5% with zero quality cost.
+- **Speed: sampling 147 → 139.85 s (−4.9%), DiT 17.46 s/step (was 18.35), all lengths.** VAE decode
+  54.1 s unchanged. 25f peak VRAM 10,513 MiB unchanged (rope buffers were never the 25f peak).
+- Clips: `models/_perf/lap10_fusedrope_25f.webm` (env-ON) / `lap10_default_25f.webm` (default path).
+
+**93f RESIDENT (no-offload):** the fused op collapses the rope-internal cont/repeat buffers as
+forecast — the 93f resident compute-buffer reserve drops **3,629 → 3,044 MiB (−585, exactly one
+~585 MiB rope buffer)** (probed `--video-frames 93 --steps 1`, no `--offload-to-cpu`). **But 93f
+still does NOT fit resident:** the 3,044 MiB `cudaMalloc` fails OOM on top of the 8,539 MiB resident
+DiT weights (8,539 + 3,044 = 11,583, and the MMQ Q8_1 VMM pool + fragmentation eat the last ~330 MiB
+of the ~11,909 usable). So the fused op narrowed the resident gap by 585 MiB but did not close it —
+the remaining blocker is exactly the lap-08b **lever 1 (bound the MMQ Q8_1 VMM pool)**, now the single
+thing between the −585 rope cut and a resident 93f. **93f continues to ship via `--offload-to-cpu`**
+(~117 s/step, lap-07) — unaffected, and now slightly faster per the −5% rope (re-measure if a
+full-length A/B is needed). Native-93f-RESIDENT remains out of reach in ONE more clean cut; pairing the
+fused rope with a bounded MMQ pool is the path. **Disposition: shipped the −5% all-length speed win +
+the −585 MiB resident rope collapse as the DEFAULT; the resident-93f-fit is a separate follow-up (MMQ
+pool), not a regression.**

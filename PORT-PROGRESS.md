@@ -11,6 +11,29 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **PERF lap 10 (session 15, 2026-05-26): fused-RoPE op ROOT-CAUSED + made DEFAULT — banks −5% at
+  ALL lengths, 99 dB bit-identical to BEST. See `PERF.md` lap 10. Branch green.**
+  The lap-09 42 dB divergence was **NOT gallocr aliasing** (the handoff's hypothesis). A NEW minimal
+  repro `tools/test_rope_pe_gallocr.cpp` builds the REAL self-attn topology (rope → cond/noise split →
+  cont → flash-attn → proj) through the ACTUAL `ggml_gallocr` (the isolation test bypasses gallocr via
+  `alloc_ctx_tensors`) and diffs chain vs fused: the lap-09 kernel was only **5.4e-5** off with matched
+  means — a buffer clobber would be garbage/NaN, not a uniform tiny delta. Confirmed by reading
+  `ggml-alloc.c` (ROPE_PE not in `ggml_op_can_inplace`; output allocated before inputs freed).
+  **ROOT CAUSE = FMA contraction in `rope-pe.cu`**: nvcc fused the rope `a*c±b*s` into `fmaf`, skipping
+  the intermediate-product rounding that the chain's separate `ggml_mul`+`ggml_add` does → ~5e-5/elem,
+  compounded over 48 blocks × 8 DMD steps → chaotic-trajectory drift off the gate. **FIX:** `__fmul_rn`/
+  `__fadd_rn`/`__fsub_rn` (un-contractable round-to-nearest) in the chain's exact term order →
+  **max|chain−fused| = 0.0** in BOTH the isolation AND the new real-gallocr repro. **Made default-on**
+  (`src/rope.hpp`; opt out `LONGCAT_NO_FUSED_ROPE=1`). **VALIDATION:** 25f render on the DEFAULT path
+  = **PSNR 99.00 dB / min 99.00 dB on all 25 frames** vs BEST (predecode latent byte-identical to the
+  env-ON run). **Speed: sampling 147 → 139.9 s (−4.9%), DiT 17.46 s/step (was 18.35), all lengths**;
+  25f peak VRAM 10,513 MiB unchanged. **93f-resident:** the rope-buffer collapse drops the 93f resident
+  compute reserve **3,629 → 3,044 MiB (−585)** but it still OOMs over the 8,539 MiB resident weights —
+  the remaining blocker is the lap-08b MMQ-Q8_1-VMM-pool (lever 1), now the only thing between this and
+  a resident 93f; 93f keeps shipping via `--offload-to-cpu`. Commits: ggml submodule (`rope-pe.cu`) +
+  parent (`rope.hpp` + repro tool + docs), both buildable/green. Clips: `models/_perf/lap10_default_25f.webm`
+  (default path) / `lap10_fusedrope_25f.webm` (env-ON).
+
 - 🟢 **PERF lap 09 (session 14, 2026-05-26): FULL PIPELINE ACCOUNTING + custom fused-RoPE CUDA op
   `ggml_rope_pe` — op PROVEN bit-identical in isolation, gives −5% per DiT step when ON, but the
   full render FAILS the 99 dB gate (42 dB, graph/gallocr interaction, NOT a math bug). Op gated

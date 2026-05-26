@@ -723,19 +723,24 @@ namespace Rope {
         // Fused interleaved RoPE (longcat-avatar): one CUDA kernel reads x + the
         // precomputed pe and writes the rotated output directly, with NO
         // cont+2*repeat+mul+add intermediates (the lap-08b ~6x585 MiB resident
-        // smell). The op (ggml_rope_pe) is proven BIT-IDENTICAL to this chain in
-        // isolation (tools/test_rope_pe.cpp: max|chain-fused|=1.2e-7 at the real
-        // [128,32,257] shape). HOWEVER, swapping it into the full DiT render
-        // diverges the denoise trajectory (25f vs old-chain 42 dB, NOT the 99 dB
-        // gate) even though the op output is identical — a downstream graph
-        // interaction (gallocr buffer reuse / flash-attn scratch aliasing the
-        // fewer-node fused output), NOT a math bug. UNTIL that is root-caused the
-        // fused path is OPT-IN ONLY (LONGCAT_FUSED_ROPE=1); default = the chain,
-        // which is bit-identical to BEST. See PERF.md lap 09.
+        // smell). DEFAULT-ON (opt out with LONGCAT_NO_FUSED_ROPE=1 for the old
+        // chain). The op (ggml_rope_pe) is now BIT-IDENTICAL to this chain — the
+        // lap-09 render divergence (42 dB) was NOT gallocr aliasing (a minimal
+        // same-topology repro under real gallocr was already only ~5e-5 off, i.e.
+        // not a clobber); it was FMA CONTRACTION in the kernel. nvcc contracted the
+        // rope `a*c +/- b*s` into fmaf (skipping the intermediate product rounding),
+        // so the op differed from the chain's separate ggml_mul+ggml_add by ~5e-5 —
+        // tiny, but it compounded over 48 blocks x 8 DMD steps and drifted the chaotic
+        // denoise trajectory off the gate. rope-pe.cu now uses __fmul_rn/__fadd_rn/
+        // __fsub_rn (un-contractable round-to-nearest), giving max|chain-fused|=0.0 in
+        // BOTH tools/test_rope_pe.cpp (isolation) AND tools/test_rope_pe_gallocr.cpp
+        // (real-gallocr same-topology), and a 25f render that is 99 dB bit-identical to
+        // BEST on all frames. See PERF.md lap 10. Speed: DiT 18.35 -> 17.42 s/step
+        // (-5%), sampling 147 -> 139.9 s, all lengths.
         if (rope_interleaved && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
             x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
-            getenv("LONGCAT_FUSED_ROPE") != nullptr) {
+            getenv("LONGCAT_NO_FUSED_ROPE") == nullptr) {
             return ggml_rope_pe(ctx, x, pe);  // [d_head, L, n_head*N]
         }
 
