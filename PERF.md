@@ -63,7 +63,115 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 20  | **REAL ROOT CAUSE of the segmented-gallocr corruption — one allocator fix supersedes BOTH the lap-18 (chain-RoPE-on-offload) and lap-19 (no-merge-small-frame) workarounds.** The lap-18 "fused-RoPE corrupts on offload" AND lap-19 "budget-merge collapses the small-frame residual stream" were the SAME bug: a **view-output liveness defect in `ggml-alloc.c`**. Prelude cuts like `t_emb` are created by `ggml_reshape` → they are **views**; `mark_graph_cut`+`build_segment_graph` set `GGML_TENSOR_FLAG_OUTPUT` on the *view*, but `ggml_gallocr_free_node`/the n_views release path only check a tensor's OWN output flag — so when the view's last in-segment consumer fires (only when a block is merged into the same segment that produces the prelude cuts, i.e. budget-merge or large enough frames), gallocr frees the view's **storage tensor** (`view_src`) and reuses its buffer, clobbering the "protected" output. Delivered `t_emb` std collapses 5.42→0.51 → FFN modulation wrong → residual stream ~475× suppressed (block0.out std 49072→103) and propagates. Fine segmentation worked only because the cut had no in-segment consumer (view_src never released). **Decisive isolation (`--steps 1`, non-perturbing SEG_TAP reading cut buffers + delivered input leafs):** under forced merge, delivered `t_emb` std=0.51665 [broken] vs 5.41715 [correct after fix]; full residual stream bit-identical to fine after fix (block0.out 49072.19554). **Fix (`ggml/src/ggml-alloc.c`):** in the parent-update view-release path, if the view is itself a graph output, never decrement/free its `view_src` — the output aliases that buffer and it must persist for the whole graph. **Removed both workarounds:** `graph_cut_allow_merge` gate (lap-19) and the `allow_fused_rope = !segmented` gate (lap-18) — merge + fused-RoPE now correct on ALL frame counts/offload. Resident path unaffected (the fix only *prevents* a free; resident has no output-view-with-consumer so it never enters the branch). | small-frame offload now MERGES + fused-RoPE on offload: 37f offload "everything on" **30.9 s/step** (sampling 247.8 s, total wall 349 s @ ~5.7 GB) vs lap-19 fine-seg+chain 35.5 s/step → **~13% faster + correct**; 93f offload fused≈chain (coherent, 451 vs 458 s/2-step) | 37f offload ~5.7 GB; resident 25f unchanged | **37f + 93f offload coherent (fused+merged, byte-size-identical to chain refs); resident 25f coherent (value-preserving)** | ggml submodule (`ggml-alloc.c`) + parent (`ggml_extend.hpp`/`rope.hpp` drop lap-18 gate), this lap |
 | 19  | **SMALL-FRAME OFFLOAD BUG ROOT-CAUSED + FIXED (correctness) — the ~40f use case now renders coherent.** [SUPERSEDED by lap 20 — this lap's `graph_cut_allow_merge` workaround was removed once the real allocator bug was found.] The handoff's pre-existing "<~41f offload degenerate" bug (lap-18 #1a) is the graph-cut **budget-merge**: in the FFN-tiling-off regime (≤16k post-patch tokens) merging consecutive base segments into one per-segment gallocr pass **deterministically** collapses the residual stream (block0 std 57923→103, *identical* wrong value at 13-seg and 49-seg → not concurrency). Decisive minimum-repro A/B (37f, `--steps 1`, no full render): default merge (13 seg) block0 std=103 [broken]; `--max-vram 3` (97 seg) block0 std=49072 / min −8.45M = matches resident [correct]. NOT fused-RoPE (chain-RoPE was already forced on offload by lap-18), NOT FFN-tiling, NOT the framework. **Why 93f works but 37f doesn't:** 93f is FFN-*tiled* (>16k tok) and merges fine; only the small-frame FFN-off regime corrupts under merge. **Fix:** `GGMLRunner::graph_cut_allow_merge` (default true) gated off by the avatar when post-patch `n_token<=16000`; `resolve_plan(..., allow_merge)` then skips `apply_max_vram_budget` and uses the finest (unmerged) base segmentation there. Large-frame (93f) + resident paths **untouched** (merge still on / no segmentation). **Validated:** 37f offload 8-step DEFAULT (no env) → ac16 **0.833–0.842 all 37 frames** (coherent; was ~0.2/0). + Re-applied env-gated `LONGCAT_OP_PROFILE` (ggml-cuda node loop) and captured the resident-25f DiT-step breakdown (#5 / GEMM-minimality, see below). | 37f offload ~35.5 s/step (8-step sampling 283.8 s); resident + 93f offload unchanged | 37f offload unchanged ~5.4 GB (finer segments, same weight-stream total) | DEFAULT 37f offload **coherent (ac16 0.833–0.842)**; 93f + resident untouched | parent (`ggml_graph_cut.{h,cpp}` allow_merge, `ggml_extend.hpp` runner flag, `longcat_avatar.hpp` small-frame gate), this lap |
 
+| 21  | **VAE tile-overlap 0.5→0.25 (−20% VAE, SHIPPED default) + chaining-throughput curve + remaining-lever census.** VAE decode time is ∝ total tile area (overcompute); the stock 0.5 overlap makes 2×5=10 tiles at the 60×104 latent, 0.25 makes 2×4=8 → VAE 80.5→**64.2 s @37f** (−16 s wall, total 349→**333.8 s**), validated coherent (ac16 0.833–0.842, no seams). Bigger tiles all lose (tile-48 108.8 s; 60×40 77 s+OOM; 60×60/full OOM — the per-tile full-temporal activation, not weights, is the cap even under offload). **DMD step-cache MEASURED dead-as-free-win** (per-step denoised Δ plateaus ~3%, no <1% step ⇒ = `--steps` knob). Offload weight-stream (+8% @37f, overlapped) and silent-frame audio-cross (sub-noise) also dead. DiT stays at the GEMM roofline. | 37f total 349→**333.8 s** (VAE 80.5→64.2) | 37f offload ~5.7 GB unchanged | **default path coherent (ac16 0.833–0.842, eyeball clean)** | parent (`stable-diffusion.cpp` auto-tiling default), this lap |
+
 (rows appended per lap below)
+
+### lap 21 — VAE tile-overlap win (shipped) + chaining throughput sweet-spot + remaining-lever census
+
+**One free win shipped (VAE −20 %); the runtime-config levers are exhausted (dead/quality-call); and a
+roofline re-audit (§7) found TWO real kernel levers the inherited "all-floored" verdict had buried —
+im2col_3d @7 % bandwidth (~−11 % wall, top priority) and flash-attn @63 % (~−3–5 %).** Method held:
+`--steps 1` minimum-repros for the VAE/throughput sweeps (VAE decode time is step-count-independent),
+full 8-step only for final validation; re-derived the roofline rather than trusting prior laps.
+
+**1. VAE decode re-profiled @37f → tile-overlap is the lever (SHIPPED).**
+- 37f decode = **10 spatial tiles** (2 across W=60, 5 across H=104) of 32², each an 8067-node graph
+  ~7.9 s, **IM2COL_3D = 67.2 %** (the 3×3×3 CausalConv3d im2col, already F16) + CONT 9 % + MUL_MAT 9 %.
+  Total 80.5 s. **Decode time is ∝ total tile area = num_tiles × tile_area** (verified linear across
+  every config below) — i.e. it's all overcompute from tile overlap.
+- **`--vae-tile-overlap` 0.5 → 0.25: 10 → 8 tiles → 80.5 → 64.2 s (−20 %, −16 s wall).** overlap 0.0
+  gives the same 64.5 s (the tiler floors at ~8 tiles for these dims). **Validated at 8-step:** default
+  path total **333.8 s**, VAE 64.2 s, **ac16 0.833–0.842 all 37 frames, eyeballed clean (no seams)** —
+  same latent as 0.5 (DiT untouched), only the blend region narrows 16→8 px. **SHIPPED as the avatar
+  default** (`stable-diffusion.cpp` auto-tiling block sets `target_overlap 0.5→0.25`, only when still at
+  the 0.5 default — an explicit `--vae-tile-overlap` is respected).
+- **DEAD — bigger tiles (all measured @37f offload):** tile-48 = 108.8 s (6 tiles × 2.25 area);
+  60×40 = 77.3 s **+ an OOM** (fragile); 60×60 = **OOM**; full single-tile = **OOM (tries to alloc
+  20.1 GiB)**. The cap is the **per-tile full-temporal activation** (a 60×N spatial × 10-latent-frame
+  decode), NOT the weights — offload frees ~6 GB of weight VRAM but the tile graph still won't fit.
+  So **32-tile / 0.25-overlap is the measured optimum** (8 tiles, ~5.7 GB).
+- **⭐ TOP REMAINING LEVER (re-derived microbench, §7) — the im2col_3d kernel is at 7 % of memory
+  bandwidth, NOT at the conv floor.** `LONGCAT_IM2COL_PROF` measured every im2col_3d call at the VAE's
+  real shapes: **26 GB/s uniformly (2532/2832 calls), vs the 3060's ~360 GB/s peak.** It's a grossly
+  uncoalesced gather, leaving ~14× on the table — sum of real per-call kernel time = **43.7 s = 68 %
+  of the 64 s VAE.** A coalesced im2col or implicit-GEMM (direct conv, never materializing the 27×
+  expansion) at a realistic 150–290 GB/s (~6–11×) → im2col 43.7→~5–8 s → **VAE 64→~26–28 s → total
+  333→~297 s ≈ −11 % wall** — bigger than the shipped VAE-overlap win, and possibly a coalescing fix
+  (~1 day) not a full rewrite. **The prior "67 % im2col = conv floor / fork-class bounded 5–8 %"
+  verdict (incl. this doc's first draft) was WRONG — it never checked the kernel's bandwidth.**
+  Vehicle: fix `ggml/src/ggml-cuda/im2col.cu::im2col_3d_kernel` coalescing, or a CUDA `GGML_OP_CONV_3D`
+  (CPU-only in leejet/ggml; `conv2d.cu` is a 166-line direct template). Temporal VAE chunking
+  (`decode_partial`) still blocked on the CausalConv3d feat-cache gallocr trap.
+
+**2. Resident frame ceiling PINNED (lap-18/19 contradiction resolved).** Resident (weights on VRAM)
+fits the full pipeline through **53f**: sampling 37f=28.5 / 45f=37.4 / 53f=47.1 s-step (linear
+~1.16 s/step/frame), VAE-beside-resident 37f=79.9 / 45f=97.4 / 53f=114.6 s. **61f OOMs** on the
+8.5 GB weight alloc (graph-cut compute reserve leaves <8.5 GB). Resident peak is ~flat **10.8 GB**
+across 37–53f (8.5 GB weights + graph-cut-bounded activations). lap-19's "37f resident OOM" was wrong.
+
+**3. Chaining throughput — the frames-per-segment sweet spot (P3, the product question).**
+Each continuation reprocesses `cont_cond_frames = 13` video frames as context; **new frames = N − 13**.
+The right metric is **wall-seconds per NEW frame = (8×step + VAE@0.25) / (N − 13)** (model stays
+resident across segments, so per-segment wall = sampling + VAE). All step/VAE values MEASURED:
+
+| segment N | new | resident s/step | offload s/step | VAE@0.25 | **resident s/new (VRAM)** | **offload s/new (VRAM)** |
+|-----------|-----|-----------------|----------------|----------|---------------------------|--------------------------|
+| 25f | 12 | (≈14.5) | 19.4 | 43.5 s | — | **16.6 (6.1 GB)** |
+| 37f | 24 | 28.5 | 31.0 | 64.2 s | **12.2 (10.8 GB)** | 13.0 (5.7 GB) |
+| 45f | 32 | 37.4 | 40.0 | 78.1 s | **11.8 (10.8 GB)** | 12.4 (5.8 GB) |
+| 53f | 40 | 47.1 | 50.0 | 91.8 s | **11.7 (10.8 GB)** | **12.3 (5.3 GB)** |
+| 93f | 80 | OOM | 114.4 | 161.1 s | — | 13.5 (6.1 GB) |
+
+- **U-shaped.** Tiny segments lose to the fixed 13-frame redo tax (25f = 16.6, worst); huge offload
+  segments lose to a **ballooning offload tax** (+6–8 % per step ≤53f, **+23 % at 93f**) plus the
+  ~N²-ish self-attention. **93f offload (13.5) is WORSE than 53f (12.3)** — bigger is not better.
+- **SWEET SPOT = 53f, in both modes.** **53f resident = 11.7 s/new-frame (10.8 GB, max speed);
+  53f offload = 12.3 s/new-frame (5.3 GB).** Same segment size — `--offload-to-cpu` is the
+  **speed↔VRAM dial: +5 % wall buys ~5.5 GB freed** for co-running. Avoid <37f (redo tax) and
+  ≥93f (offload tax).
+
+**4. DMD step/block-caching — MEASURED dead as a free win.** `LONGCAT_STEP_DELTA` (new, env-gated,
+non-perturbing) logged per-step denoised rel-L1 over the 8 DMD steps:
+**0.135 → 0.074 → 0.045 → 0.031 → 0.028 → 0.027 → 0.033.** Decays then **plateaus at ~3 %**; no step
+is <1 % (no free-skip window). The sample-cache machinery (easycache/dbcache, wired, skips whole DiT
+forward passes per step at cfg 1.0) would drop quality ≈ lowering `--steps` — a cleaner manual knob
+that already exists (6≈close, 4≈artifacts). Not worth the complexity.
+
+**5. Offload weight-stream — dead (~8 %, overlapped).** 37f offload 31.0 vs resident 28.5 s/step =
++2.5 s (+8 %); the 8.5 GB stream is almost fully overlapped with compute. Prefetch could recover
+≤2.5 s/step and is complex. The ~5.7 GB offload footprint is the desired co-run mode anyway.
+
+**6. Silent-frame audio-cross skip — dead (sub-noise).** audio_cross_attn ~1–2 % of the step
+(non-flash); skipping on silent frames saves ~1–2 %×silent_fraction = below the timing noise floor,
+and needs a per-frame mask + batched-op split (not free). The real silence win is product-level
+(don't render silent stretches — idle-loop splice, a koblem-UI feature).
+
+**7. Re-derived roofline microbenches (the "100 % confident?" audit — DON'T inherit lap-08/12/19).**
+Re-ran `tools/roofline_dit.cpp` (build recipe: `g++ tools/roofline_dit.cpp` in the builder image,
+link the static `build/.../libggml*.a` + `-lcudart -lcublas -lcublasLt -lcuda -lnccl`) and added
+`LONGCAT_IM2COL_PROF` (env-gated cudaEvent per-call BW probe in `im2col.cu`). Findings:
+- **Q4_K matmuls FLOORED** — 36 TFLOPS @ M=10920 = **~93 % of cuBLAS-F16** (38.85 TF, best-in-class);
+  F16/Q8/Q4 all converge to 36–39 TF, weight-read negligible (0.07 ms vs 27 ms) ⇒ compute-bound at
+  the practical GEMM ceiling. The paper INT8 roof (101 TOPS) is unreachable for these shapes (even
+  cuBLAS hits only 38 %). **No matmul win exists.** (Here the inherited verdict held.)
+- **Flash-attn UNDER-saturated** — 16 TFLOPS = **62.7 % of the FP16-tensor roof**, the least-saturated
+  hot op and the single biggest (full self-attn 121 ms/call). Attention can't hit pure-GEMM efficiency
+  (softmax + K/V movement), so realistic recovery via an FA2/3-style kernel ≈ 10–20 % of flash ≈
+  **~3–5 % wall.** Fork-class, secondary.
+- **⭐ im2col_3d at 7 % of bandwidth** — `LONGCAT_IM2COL_PROF` over the real VAE decode: **26 GB/s
+  uniform** (2532/2832 calls; rest 22–27) vs ~360 GB/s peak; sum of real per-call kernel time
+  **43.7 s = 68 % of the 64 s VAE.** Grossly uncoalesced gather. **This is the top remaining lever
+  (~−11 % wall, see §1 bullet)** and was hidden by the inherited "im2col = conv floor" assumption —
+  the lesson the owner flagged: "on the right kernel" ≠ "saturating it." **The blanket
+  "DiT/VAE all at the roofline" claim is FALSE; matmuls yes, flash (63 %) and im2col (7 %) no.**
+
+**Net this lap:** −20 % VAE shipped (total 349→334 s @37f); speed/VRAM + frames-per-segment answered
+with measured curves; DMD-cache / offload-stream / silent-frame measured dead. **AND** the roofline
+audit found two real, measured kernel levers the prior "all-floored" verdict had buried:
+**im2col_3d @7 % BW (~−11 % wall, top priority) and flash-attn @63 % (~−3–5 %).** Both are kernel
+work (next-session). Files: `src/stable-diffusion.cpp` (VAE default + `LONGCAT_STEP_DELTA`),
+`ggml/src/ggml-cuda/im2col.cu` (`LONGCAT_IM2COL_PROF`, env-gated).
 
 ### lap 20 — TRUE root cause: ggml-alloc view-output liveness bug (supersedes lap-18 + lap-19 workarounds)
 

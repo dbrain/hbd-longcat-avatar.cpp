@@ -13,9 +13,14 @@
 > offload now MERGES (~10%/step) AND uses fused-RoPE (+5%) again; resident untouched (value-
 > preserving). 37f + 93f offload validated coherent; 37f residual stream bit-identical to fine.
 > Full detail in **PERF.md lap 20**. Files: `ggml/src/ggml-alloc.c`, `src/ggml_extend.hpp`, `src/rope.hpp`.
-> **REMAINING for next session: P2 perf/VRAM levers (DMD block-caching, silent-frame audio-cross
-> skip), P3 chaining sweet-spot, and the productionisation follow-ups (#2 GPU lock, #3 koblem UI,
-> #6 commit the kobbler docker bits). P1 is DONE.**
+> **P1 DONE (lap 20). P2 + P3 DONE (lap 21):** VAE tile-overlap −20 % shipped as default; resident
+> ceiling pinned ~53f; chaining sweet-spot = 53f (offload = +5 % wall / −5.5 GB dial); DMD-cache /
+> offload-stream / silent-frame all measured dead. **Roofline RE-AUDIT (re-derived, not inherited)
+> found the real remaining lever: `im2col_3d` runs at 7 % of memory bandwidth (26 vs 360 GB/s; 43.7 s
+> = 68 % of the VAE) → a coalesced/implicit-GEMM conv ≈ −11 % total wall, the TOP perf lever; flash-attn
+> @63 % roof ≈ −3–5 %. Both next-session kernel work.** Matmuls genuinely floored (~93 % cuBLAS).
+> **REMAINING: the im2col-kernel lap (~−11 % wall) and/or productionisation (#2 GPU lock, #3 koblem UI,
+> #6 commit the kobbler docker bits). See PERF.md lap 21 §7.**
 
 ### (historical) handoff (updated lap-18)
 The port is **functionally complete + perf-optimized + productionised**. Read this block, then
@@ -154,6 +159,29 @@ Build/run on this box is fine (the no-build rule is the kobbler Rust workspace o
 GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
+
+- 🟢 **lap 21 (session 27): P2 PERF/VRAM SWEEP — one win shipped, free-win surface exhausted, P3
+  chaining sweet-spot answered with measured curves.** (1) **VAE tile-overlap 0.5→0.25 SHIPPED as the
+  avatar default** — VAE decode 80.5→**64.2 s @37f** (−20 %, −16 s wall; total 349→**333.8 s**), 10→8
+  tiles, validated coherent (ac16 0.833–0.842, eyeball clean, same DiT latent). Bigger tiles all OOM or
+  slower (cap = per-tile full-temporal activation, not weights — even under offload). (2) **Resident
+  ceiling PINNED = ~53f** (37/45/53f fit full pipeline; 61f OOMs on weight alloc; lap-19's "37f resident
+  OOM" was wrong). (3) **Chaining frames-per-segment sweet spot = 53f** — wall/new-frame is U-shaped
+  (tiny segments lose to the 13-frame redo tax, ≥93f offload loses to a +23 % offload-tax balloon);
+  **53f resident 11.7 s/new (10.8 GB) vs 53f offload 12.3 s/new (5.3 GB) — `--offload-to-cpu` is the
+  speed↔VRAM dial, only +5 % wall for −5.5 GB.** (4) **DMD step/block-caching MEASURED dead-as-free**
+  (per-step denoised Δ plateaus ~3 %, no <1 % step ⇒ = `--steps` knob); offload-weight-stream (+8 %,
+  overlapped) and silent-frame-skip (sub-noise) also dead. (5) **ROOFLINE RE-AUDIT (re-derived, not
+  inherited — `roofline_dit.cpp` + new `LONGCAT_IM2COL_PROF`) found 2 real kernel levers the old
+  "all-floored" verdict buried:** Q4_K matmuls ARE floored (~93 % of cuBLAS-F16), BUT **im2col_3d runs
+  at only 7 % of memory bandwidth** (26 vs 360 GB/s, uniform across 2532/2832 calls; sum 43.7 s = 68 %
+  of the 64 s VAE) ⇒ a coalesced im2col / implicit-GEMM conv ≈ **−11 % total wall — the TOP remaining
+  lever**; and flash-attn is at 62.7 % of the FP16-tensor roof ⇒ ~−3–5 %. Both are **next-session
+  kernel work** (not runtime config). Quality-call levers remain (`--steps`/quant).
+  Full detail + measured tables in **PERF.md lap 21 (esp. §7)**. Files: `src/stable-diffusion.cpp`
+  (VAE-overlap default + env-gated `LONGCAT_STEP_DELTA`), `ggml/src/ggml-cuda/im2col.cu`
+  (`LONGCAT_IM2COL_PROF`). **Next: either the im2col-kernel lap (~−11 % wall, top perf lever) or P3
+  productionisation (#2 GPU lock, #3 koblem UI, #6 commit kobbler docker bits).**
 
 - 🟢 **lap 20 (session 26): TRUE ROOT CAUSE of the segmented-gallocr corruption — one allocator fix,
   BOTH lap-18 + lap-19 workarounds DELETED.** It was a single bug: **a view-output liveness defect in

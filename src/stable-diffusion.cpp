@@ -2227,6 +2227,24 @@ public:
             if (!denoise_mask.empty()) {
                 denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
             }
+            // [STEP_DELTA] non-perturbing: log relative-L1 change of the denoised x0
+            // estimate between consecutive sampler steps. Measures DMD-step reuse window
+            // (block/step-cache viability). Gated by LONGCAT_STEP_DELTA; zero cost when unset.
+            if (getenv("LONGCAT_STEP_DELTA") != nullptr) {
+                static std::vector<float> sd_prev_denoised;
+                const float* dd = denoised.data();
+                int64_t      dn = denoised.numel();
+                double l1abs = 0.0, l1den = 0.0;
+                if ((int64_t)sd_prev_denoised.size() == dn) {
+                    for (int64_t i = 0; i < dn; ++i) {
+                        l1abs += std::fabs(dd[i] - sd_prev_denoised[i]);
+                        l1den += std::fabs(sd_prev_denoised[i]);
+                    }
+                    LOG_INFO("[STEP_DELTA] step %d rel_L1(denoised_t - denoised_{t-1}) = %.4f (abs %.5g / prev %.5g)",
+                             step, l1den > 0 ? (l1abs / l1den) : 0.0, l1abs, l1den);
+                }
+                sd_prev_denoised.assign(dd, dd + dn);
+            }
             if (sd_should_preview_denoised() && preview.callback != nullptr) {
                 preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
             }
@@ -5397,7 +5415,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         !sd_ctx->sd->vae_tiling_params.enabled &&
         !ggml_backend_is_cpu(sd_ctx->sd->backend_for(SDBackendModule::VAE))) {
         sd_ctx->sd->vae_tiling_params.enabled = true;
-        LOG_INFO("avatar: enabling VAE spatial tiling by default (GPU decode; avoids OOM, ~10x faster than CPU). Pass --vae-on-cpu to disable.");
+        // lap-21: VAE decode time is ∝ total tile area (overcompute). The stock
+        // 0.5 overlap recomputes ~64% extra; at the avatar's 60x104 latent / 32
+        // tile it yields 2x5=10 tiles. Dropping to 0.25 overlap gives 2x4=8 tiles
+        // (the code floors at ~8 here either way) -> VAE decode -20% (80.5->64.2s
+        // @ 37f, validated coherent ac16 0.833-0.842, no visible seams). Bigger
+        // tiles OOM (full decode needs ~20 GiB; 60x60 OOMs; 60x40 is slower+10GB),
+        // so 32-tile/0.25-overlap is the measured optimum. Only lower it from the
+        // stock 0.5 default (an explicit --vae-tile-overlap of any other value is
+        // respected).
+        if (sd_ctx->sd->vae_tiling_params.target_overlap == 0.5f) {
+            sd_ctx->sd->vae_tiling_params.target_overlap = 0.25f;
+        }
+        LOG_INFO("avatar: enabling VAE spatial tiling by default (GPU decode; avoids OOM, ~10x faster than CPU; overlap %.2f). Pass --vae-on-cpu to disable.",
+                 sd_ctx->sd->vae_tiling_params.target_overlap);
     }
     // For the avatar path the conditioning audio is an INPUT; capture the 16k
     // mono waveform here so it can be muxed back into the output container
