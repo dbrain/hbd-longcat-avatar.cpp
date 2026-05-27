@@ -1698,16 +1698,26 @@ public:
                                          const sd::Tensor<float>& init_latent,
                                          const sd::Tensor<float>& denoise_mask) {
         if (diffusion_model->get_desc() == "Wan2.2-TI2V-5B" || sd_version_is_longcat_avatar(version)) {
-            // Per-frame timesteps. The avatar (ai2v) sets the reference-image cond
-            // frame's timestep to 0 (clean) so its adaLN/attention conditioning is
-            // treated as a fully-denoised anchor, matching the pipeline's
-            // `timestep[:, :1] = 0`. The DiT expands [T] over the latent frames.
-            auto new_timesteps = std::vector<float>(static_cast<size_t>(init_latent.shape()[2]), timesteps[0]);
+            // Per-frame timesteps. The avatar sets EVERY fixed-cond latent frame's
+            // timestep to 0 (clean) so its adaLN/attention conditioning is treated as
+            // a fully-denoised anchor. For ai2v that is the single ref-image frame
+            // (`timestep[:, :1] = 0`); for video-continuation (generate_avc) it is ALL
+            // num_cond_latents frames — ref(1) + cond_tail(N) — matching
+            // `timestep[:, :num_cond_latents] = 0` (pipeline L1405-1406). The fixed-cond
+            // frames are exactly those the denoise_mask pins (mask==0), so drive the
+            // zeroing PER-FRAME off the mask rather than only frame 0; otherwise the
+            // cond_tail frames' modulation (the K/V the noise frames attend) is computed
+            // at the noisy `t` and contaminates the generated frames (watercolour melt).
+            int64_t T          = init_latent.shape()[2];
+            auto new_timesteps = std::vector<float>(static_cast<size_t>(T), timesteps[0]);
 
             if (!denoise_mask.empty()) {
-                float value = denoise_mask.dim() == 5 ? denoise_mask.index(0, 0, 0, 0, 0) : denoise_mask.index(0, 0, 0, 0);
-                if (value == 0.f) {
-                    new_timesteps[0] = 0.f;
+                for (int64_t f = 0; f < T; ++f) {
+                    float value = denoise_mask.dim() == 5 ? denoise_mask.index(0, 0, f, 0, 0)
+                                                          : denoise_mask.index(0, 0, f, 0);
+                    if (value == 0.f) {
+                        new_timesteps[static_cast<size_t>(f)] = 0.f;
+                    }
                 }
             }
             return new_timesteps;
@@ -2932,6 +2942,9 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_latent                           = nullptr;
     sd_vid_gen_params->cont_latent_frames                    = 0;
     sd_vid_gen_params->audio_frame_offset                    = 0;
+    sd_vid_gen_params->cont_ref_latent                       = nullptr;
+    sd_vid_gen_params->cont_ref_img_index                    = 10;
+    sd_vid_gen_params->cont_mask_frame_range                 = 3;
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
     sd_vid_gen_params->vae_tiling_params                     = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
@@ -4621,6 +4634,15 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     ImageGenerationLatents latents;
     int64_t prepare_start_ms = ggml_time_ms();
 
+    // Reset the avatar continuation ref-anchor params each render so a prior segment's
+    // 3-way-split state never leaks into a single-clip / ai2v / seg0 render (the model
+    // is resident across chained calls). The cont-latent branch below re-arms them.
+    if (sd_version_is_longcat_avatar(sd_ctx->sd->version)) {
+        if (auto avatar_model = std::dynamic_pointer_cast<LongCatAvatarModel>(sd_ctx->sd->diffusion_model)) {
+            avatar_model->cont_num_ref_latents = 0;
+        }
+    }
+
     sd::Tensor<float> start_image;
     sd::Tensor<float> end_image;
 
@@ -4836,27 +4858,71 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         // from them. The cond/noise self-attn two-pass split + the per-frame denoise
         // mask already generalize from N==1 to N>1 (the avatar derives num_cond_latents
         // from the leading zero-timestep frames at DiT-forward time).
-        int64_t num_cond_latents = sd_vid_gen_params->cont_latent_frames;
-        LOG_INFO("CONTINUATION (conditioning on %lld prior-segment tail latent frames)", (long long)num_cond_latents);
+        int64_t num_cond_tail = sd_vid_gen_params->cont_latent_frames;
+        // REFERENCE ANCHOR (generate_avc): when the caller supplies the original
+        // portrait's latent, PREPEND it as a persistent un-drifted ref frame so the
+        // layout is [ref(1), cond_tail(N), noise...] — the reference keeps this clean
+        // anchor on EVERY segment. num_ref = 1 then, and the cond split / mask / PE
+        // engage the 3-way path. Absent (older raw-latent flow) -> ref-free 2-way path.
+        const bool   have_ref  = sd_vid_gen_params->cont_ref_latent != nullptr;
+        const int64_t num_ref  = have_ref ? 1 : 0;
+        const int64_t num_cond_latents = num_ref + num_cond_tail;  // total fixed-cond frames
+        LOG_INFO("CONTINUATION (ref-anchor=%d + %lld prior-segment tail latent frames, ref_img_index=%d, mask_frame_range=%d)",
+                 (int)num_ref, (long long)num_cond_tail,
+                 sd_vid_gen_params->cont_ref_img_index, sd_vid_gen_params->cont_mask_frame_range);
 
         int64_t t1 = ggml_time_ms();
-        latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
-        int64_t Wl = latents.init_latent.shape()[0];
-        int64_t Hl = latents.init_latent.shape()[1];
-        int64_t Cl = latents.init_latent.shape()[3];
-        if (num_cond_latents > latents.init_latent.shape()[2]) {
-            LOG_ERROR("continuation: cont_latent_frames %lld exceeds segment latent frames %lld",
-                      (long long)num_cond_latents, (long long)latents.init_latent.shape()[2]);
+        // Base noise latent at the requested length (T = request->frames latents, e.g.
+        // 24 for 93 frames). The reference `prepare_latents` builds exactly this, then
+        // the ref is PREPENDED as an EXTRA latent frame (cat([ref_latent, latents]),
+        // pipeline L1378 → T grows to 25), denoised, and STRIPPED before decode
+        // (L1494-1496) — so NO generated frame is lost. We mirror that: keep
+        // request->frames unchanged (it drives the audio windowing) and grow the latent
+        // tensor by num_ref, marking ref_image_num so the trailing decode strips it.
+        sd::Tensor<float> base_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+        int64_t Wl = base_latent.shape()[0];
+        int64_t Hl = base_latent.shape()[1];
+        int64_t Tb = base_latent.shape()[2];  // base (non-ref) latent frames
+        int64_t Cl = base_latent.shape()[3];
+        if (num_cond_tail > Tb) {
+            LOG_ERROR("continuation: cont_latent_frames(%lld) exceeds segment latent frames %lld",
+                      (long long)num_cond_tail, (long long)Tb);
             return std::nullopt;
         }
-        // wrap the caller's contiguous f32 cont latent as [Wl, Hl, N, Cl, 1].
-        sd::Tensor<float> cont_latent({Wl, Hl, num_cond_latents, Cl, 1});
-        std::memcpy(cont_latent.data(), sd_vid_gen_params->cont_latent,
-                    (size_t)cont_latent.numel() * sizeof(float));
-        sd::ops::slice_assign(&latents.init_latent, 2, 0, num_cond_latents, cont_latent);
+        // Overwrite the cond_tail (prior segment's re-encoded tail) into the head of the
+        // base noise latent: latents[:, :, :num_cond_tail] = cond_tail (pipeline L1365).
+        {
+            sd::Tensor<float> cont_latent({Wl, Hl, num_cond_tail, Cl, 1});
+            std::memcpy(cont_latent.data(), sd_vid_gen_params->cont_latent,
+                        (size_t)cont_latent.numel() * sizeof(float));
+            sd::ops::slice_assign(&base_latent, 2, 0, num_cond_tail, cont_latent);
+        }
+        // Prepend the ref anchor as an EXTRA temporal frame → [ref(num_ref), base(Tb)].
+        if (have_ref) {
+            int64_t T_full      = Tb + num_ref;  // = 25 with num_ref=1
+            latents.init_latent = sd::full<float>({Wl, Hl, T_full, Cl, 1}, 0.f);
+            sd::Tensor<float> ref_latent({Wl, Hl, num_ref, Cl, 1});
+            std::memcpy(ref_latent.data(), sd_vid_gen_params->cont_ref_latent,
+                        (size_t)ref_latent.numel() * sizeof(float));
+            sd::ops::slice_assign(&latents.init_latent, 2, 0, num_ref, ref_latent);
+            sd::ops::slice_assign(&latents.init_latent, 2, num_ref, num_ref + Tb, base_latent);
+            latents.ref_image_num = num_ref;  // strip the ref frame(s) before VAE decode
+        } else {
+            latents.init_latent = std::move(base_latent);
+        }
 
         latents.denoise_mask = sd::full<float>({latents.init_latent.shape()[0], latents.init_latent.shape()[1], latents.init_latent.shape()[2], 1, 1}, 1.f);
         sd::ops::fill_slice(&latents.denoise_mask, 2, 0, num_cond_latents, 0.0f);
+
+        // Set the 3-way-split / ref-PE params on the avatar model for this render.
+        if (have_ref) {
+            auto avatar_model = std::dynamic_pointer_cast<LongCatAvatarModel>(sd_ctx->sd->diffusion_model);
+            if (avatar_model) {
+                avatar_model->cont_num_ref_latents  = (int)num_ref;
+                avatar_model->cont_ref_img_index    = sd_vid_gen_params->cont_ref_img_index;
+                avatar_model->cont_mask_frame_range = sd_vid_gen_params->cont_mask_frame_range;
+            }
+        }
 
         int64_t t2 = ggml_time_ms();
         LOG_INFO("continuation latent conditioning prepared, taking %" PRId64 " ms", t2 - t1);

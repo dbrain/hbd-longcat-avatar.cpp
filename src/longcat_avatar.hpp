@@ -48,6 +48,16 @@ namespace LONGCAT_AVATAR {
         // the API. Timing is untouched (lives in WHICH tokens attend, not magnitude).
         float audio_mouth_scale = 1.0f;
 
+        // Video-continuation (generate_avc) 3-way self-attn split params. Set per-render
+        // by the runner via the avatar forward loop. num_ref_latents>0 enables the
+        // ref/cond/noise split; 0 = the ai2v 2-way cond/noise split (single-clip path,
+        // bit-identical). n_per_frame maps the mask_frame_range carve-out (in frames)
+        // to token offsets.
+        int     num_ref_latents  = 0;
+        int     ref_img_index    = 10;
+        int     mask_frame_range = 3;
+        int64_t n_per_frame      = 0;
+
         LongCatAvatarSingleStreamBlock(int64_t hidden_size,
                                        int64_t num_heads,
                                        int64_t ffn_inner,
@@ -184,7 +194,19 @@ namespace LONGCAT_AVATAR {
         // concats. We reproduce that two-pass split exactly — no O(n_token^2) mask, so
         // it works at 480p (~10920 tokens) within the VRAM budget AND keeps flash-attn.
         // n_cond_tokens==0 → plain full self-attention.
-        ggml_tensor* self_attn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, int64_t n_cond_tokens) {
+        // Helper: flash/non-flash attention over a q row-slice [start, start+len) on the
+        // token dim of q_rope, against the given (already cond-style or full) k/v.
+        // q_rope is [d_head, n_token, num_heads*N]; v is [d_head, num_heads, n_token, N].
+        ggml_tensor* attn_qslice(GGMLRunnerContext* ctx, ggml_tensor* q_rope, ggml_tensor* k, ggml_tensor* v,
+                                 int64_t start, int64_t len, bool fa, float kv_scale) {
+            auto q_t = ggml_view_3d(ctx->ggml_ctx, q_rope, q_rope->ne[0], len, q_rope->ne[2],
+                                    q_rope->nb[1], q_rope->nb[2], q_rope->nb[1] * start);
+            q_t      = ggml_cont(ctx->ggml_ctx, q_t);
+            return ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_t, k, v,
+                                          num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);
+        }
+
+        ggml_tensor* self_attn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, int64_t n_cond_tokens, int64_t T) {
             auto qkv    = std::dynamic_pointer_cast<Linear>(blocks["attn.qkv"]);
             auto q_norm = std::dynamic_pointer_cast<UnaryBlock>(blocks["attn.q_norm"]);
             auto k_norm = std::dynamic_pointer_cast<UnaryBlock>(blocks["attn.k_norm"]);
@@ -249,7 +271,84 @@ namespace LONGCAT_AVATAR {
             auto k_rope = Rope::apply_rope(ctx->ggml_ctx, k, pe, true);  // [d_head, n_token, num_heads*N]
 
             ggml_tensor* out;
-            if (n_cond_tokens > 0 && n_cond_tokens < n_token) {
+            if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {
+                // ======= VIDEO-CONTINUATION 3-WAY SPLIT (generate_avc) =======
+                // Layout: [ref(num_ref_latents) | cond_tail | noise]. The leading
+                // n_cond_tokens span = (num_ref + num_cond_tail) frames. This mirrors
+                // avatar/attention.py Attention.forward num_cond_latents>1 branch:
+                //   q_ref   -> attends ONLY ref            (k_ref, v_ref)
+                //   q_cond  -> attends ONLY cond_tail      (k_cond, v_cond)  [NOT ref]
+                //   q_noise -> attends FULL (ref+cond+noise) EXCEPT a mask_frame_range
+                //              carve-out near ref_img_index where it skips the ref tokens.
+                int64_t n_ref_tokens = (int64_t)num_ref_latents * n_per_frame;  // = num_ref_latents_thw
+                int64_t L_noise      = n_token - n_cond_tokens;
+                int64_t num_cond_latents = n_cond_tokens / n_per_frame;  // ref + cond_tail (total)
+
+                // ref pass: q_ref × {k,v}_ref  (ref tokens see only ref)
+                auto k_ref = ggml_view_3d(ctx->ggml_ctx, k_rope, k_rope->ne[0], n_ref_tokens, k_rope->ne[2],
+                                          k_rope->nb[1], k_rope->nb[2], 0);
+                auto v_ref = ggml_view_4d(ctx->ggml_ctx, v, v->ne[0], v->ne[1], n_ref_tokens, v->ne[3],
+                                          v->nb[1], v->nb[2], v->nb[3], 0);
+                k_ref       = ggml_cont(ctx->ggml_ctx, k_ref);
+                v_ref       = ggml_cont(ctx->ggml_ctx, v_ref);
+                auto x_ref  = attn_qslice(ctx, q_rope, k_ref, v_ref, 0, n_ref_tokens, fa, kv_scale);
+
+                // cond pass: q_cond × {k,v}_cond  (cond_tail tokens see only cond_tail)
+                int64_t n_condtail = n_cond_tokens - n_ref_tokens;  // cond_tail token span
+                auto k_cond = ggml_view_3d(ctx->ggml_ctx, k_rope, k_rope->ne[0], n_condtail, k_rope->ne[2],
+                                           k_rope->nb[1], k_rope->nb[2], k_rope->nb[1] * n_ref_tokens);
+                auto v_cond = ggml_view_4d(ctx->ggml_ctx, v, v->ne[0], v->ne[1], n_condtail, v->ne[3],
+                                           v->nb[1], v->nb[2], v->nb[3], v->nb[2] * n_ref_tokens);
+                k_cond      = ggml_cont(ctx->ggml_ctx, k_cond);
+                v_cond      = ggml_cont(ctx->ggml_ctx, v_cond);
+                auto x_cond = attn_qslice(ctx, q_rope, k_cond, v_cond, n_ref_tokens, n_condtail, fa, kv_scale);
+
+                // noise pass. mask_frame_range carve-out (in NOISE-LOCAL frames):
+                //   start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
+                //   end_noise   = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
+                // applied only when 0 <= start_noise < end_noise <= num_noisy_frames.
+                int64_t num_noisy_frames = T - num_cond_latents;
+                int64_t start_noise = (int64_t)ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents;
+                int64_t end_noise   = (int64_t)ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1;
+                ggml_tensor* x_noise = nullptr;
+                if (mask_frame_range > 0 && start_noise >= 0 && end_noise > start_noise && end_noise <= num_noisy_frames) {
+                    // k/v EXCLUDING the ref tokens (= k[ n_ref_tokens : ], cond_tail+noise)
+                    int64_t n_nonref = n_token - n_ref_tokens;
+                    auto k_nonref = ggml_view_3d(ctx->ggml_ctx, k_rope, k_rope->ne[0], n_nonref, k_rope->ne[2],
+                                                 k_rope->nb[1], k_rope->nb[2], k_rope->nb[1] * n_ref_tokens);
+                    auto v_nonref = ggml_view_4d(ctx->ggml_ctx, v, v->ne[0], v->ne[1], n_nonref, v->ne[3],
+                                                 v->nb[1], v->nb[2], v->nb[3], v->nb[2] * n_ref_tokens);
+                    k_nonref      = ggml_cont(ctx->ggml_ctx, k_nonref);
+                    v_nonref      = ggml_cont(ctx->ggml_ctx, v_nonref);
+
+                    int64_t start_pos = start_noise * n_per_frame;  // noise-local token offsets
+                    int64_t end_pos   = end_noise * n_per_frame;
+                    // q_noise is the [n_cond_tokens : n_token) span of q_rope. Sub-slice
+                    // it into front / maskref / back (noise-local offsets, so the global
+                    // q_rope offset is n_cond_tokens + local).
+                    ggml_tensor* parts_noise[3] = {nullptr, nullptr, nullptr};
+                    if (start_pos > 0) {
+                        parts_noise[0] = attn_qslice(ctx, q_rope, k_rope, v, n_cond_tokens, start_pos, fa, kv_scale);
+                    }
+                    parts_noise[1] = attn_qslice(ctx, q_rope, k_nonref, v_nonref,
+                                                 n_cond_tokens + start_pos, end_pos - start_pos, fa, kv_scale);
+                    if (end_pos < L_noise) {
+                        parts_noise[2] = attn_qslice(ctx, q_rope, k_rope, v,
+                                                     n_cond_tokens + end_pos, L_noise - end_pos, fa, kv_scale);
+                    }
+                    for (int p = 0; p < 3; ++p) {
+                        if (parts_noise[p] == nullptr) continue;
+                        x_noise = (x_noise == nullptr) ? parts_noise[p]
+                                                       : ggml_concat(ctx->ggml_ctx, x_noise, parts_noise[p], 1);
+                    }
+                } else {
+                    // no carve-out: noise attends the full ref+cond+noise k/v.
+                    x_noise = attn_qslice(ctx, q_rope, k_rope, v, n_cond_tokens, L_noise, fa, kv_scale);
+                }
+
+                out = ggml_concat(ctx->ggml_ctx, x_ref, x_cond, 1);
+                out = ggml_concat(ctx->ggml_ctx, out, x_noise, 1);  // [N, n_token, C]
+            } else if (n_cond_tokens > 0 && n_cond_tokens < n_token) {
                 // v is [d_head, num_heads, n_token, N]; q_rope/k_rope are
                 // [d_head, n_token, num_heads*N] (token on ne[1]). Slice on the token
                 // dim. (N==1 in the avatar path, so num_heads*N == num_heads.)
@@ -457,7 +556,7 @@ namespace LONGCAT_AVATAR {
 
             // self-attn with modulation
             auto x_m = modulate(ctx, mod_norm_attn, x, ms[0], ms[1], T);
-            auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens);
+            auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens, T);
             x        = gate_add(ctx, x, x_s, ms[2], T);
             subcut(x, "post_self_attn");
 
@@ -703,6 +802,14 @@ namespace LONGCAT_AVATAR {
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged). Set per-render by
         // the runner; pushed onto every block in the forward loop.
         float audio_mouth_scale = 1.0f;
+
+        // Video-continuation (generate_avc) 3-way-split params. num_ref_latents>0
+        // selects the ref/cond/noise split in self_attn; 0 = ai2v 2-way split. Set
+        // per-render by the runner.
+        int     num_ref_latents  = 0;
+        int     ref_img_index    = 10;
+        int     mask_frame_range = 3;
+        int64_t n_per_frame      = 0;  // spatial tokens per latent frame (h_len*w_len)
 
     protected:
 
@@ -953,6 +1060,10 @@ namespace LONGCAT_AVATAR {
                 block->ffn_token_tiles  = ffn_tiles;
                 block->attn_query_tiles = attn_tiles;
                 block->audio_mouth_scale = audio_mouth_scale;
+                block->num_ref_latents   = num_ref_latents;
+                block->ref_img_index     = ref_img_index;
+                block->mask_frame_range  = mask_frame_range;
+                block->n_per_frame       = n_per_frame;
                 x          = block->forward(ctx, x, t_emb, context, pe, audio, T, n_cond_tokens, i);
                 sd::ggml_graph_cut::mark_graph_cut(x, "longcat.blocks." + std::to_string(i) + ".out", "x");
                 if (i == 0) {
@@ -977,6 +1088,13 @@ namespace LONGCAT_AVATAR {
         LongCatAvatar avatar;
         std::vector<float> pe_vec;
         int num_cond_latents = 0;  // ai2v ref-image cond frames (set per request)
+        // Video-continuation (generate_avc) reference-anchor params. num_ref_latents>0
+        // selects the 3-way self-attn split (ref / cond / noise) + the ref-positioned
+        // 3D-RoPE temporal grid (grid_t = [ref_img_index, 0,1,2,...]). 0 = the ai2v /
+        // single-clip path (2-way cond/noise split, plain sequential PE) — UNTOUCHED.
+        int num_ref_latents  = 0;   // leading ref-anchor latent frames (1 for the avatar)
+        int ref_img_index    = 10;  // ref anchor's temporal grid position (reference default)
+        int mask_frame_range = 3;   // noise-near-ref attention carve-out half-width (reference default)
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
         float audio_mouth_scale = 1.0f;
@@ -1036,16 +1154,34 @@ namespace LONGCAT_AVATAR {
             ggml_tensor* timesteps = make_input(timesteps_tensor);
             ggml_tensor* context   = make_optional_input(context_tensor);
 
-            // 3D RoPE positions over the patchified (t,h,w) grid.
-            pe_vec      = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
-                                           static_cast<int>(x->ne[1]),
-                                           static_cast<int>(x->ne[0]),
-                                           std::get<0>(avatar_params.patch_size),
-                                           std::get<1>(avatar_params.patch_size),
-                                           std::get<2>(avatar_params.patch_size),
-                                           1,
-                                           avatar_params.theta,
-                                           avatar_params.axes_dim);
+            // 3D RoPE positions over the patchified (t,h,w) grid. For the
+            // video-continuation path (num_ref_latents>0) the leading ref-anchor
+            // frame(s) get the FIXED temporal position ref_img_index and the rest get
+            // 0,1,2,... (matches avatar/rope_3d.py grid_t = [ref_img_index, 0,1,...]);
+            // otherwise the plain sequential grid (ai2v / single-clip, UNCHANGED).
+            if (num_ref_latents > 0) {
+                pe_vec = Rope::gen_wan_pe_ref(static_cast<int>(x->ne[2]),
+                                              static_cast<int>(x->ne[1]),
+                                              static_cast<int>(x->ne[0]),
+                                              std::get<0>(avatar_params.patch_size),
+                                              std::get<1>(avatar_params.patch_size),
+                                              std::get<2>(avatar_params.patch_size),
+                                              1,
+                                              avatar_params.theta,
+                                              avatar_params.axes_dim,
+                                              num_ref_latents,
+                                              ref_img_index);
+            } else {
+                pe_vec = Rope::gen_wan_pe(static_cast<int>(x->ne[2]),
+                                          static_cast<int>(x->ne[1]),
+                                          static_cast<int>(x->ne[0]),
+                                          std::get<0>(avatar_params.patch_size),
+                                          std::get<1>(avatar_params.patch_size),
+                                          std::get<2>(avatar_params.patch_size),
+                                          1,
+                                          avatar_params.theta,
+                                          avatar_params.axes_dim);
+            }
             int pos_len = static_cast<int>(pe_vec.size() / avatar_params.axes_dim_sum / 2);
             auto pe     = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, avatar_params.axes_dim_sum / 2, pos_len);
             set_backend_tensor_data(pe, pe_vec.data());
@@ -1077,6 +1213,34 @@ namespace LONGCAT_AVATAR {
                 ggml_tensor* a_first  = make_input(audio_first);
                 ggml_tensor* a_latter = audio_latter.empty() ? nullptr : make_input(audio_latter);
                 audio_hidden          = avatar.audio_proj(&runner_ctx, a_first, a_latter);  // [768, 32, N_t]
+
+                // Video-continuation ref-frame audio prepend + trim (generate_avc;
+                // longcat_video_dit_avatar.py L438-441). When a ref-anchor latent frame
+                // is prepended to the latent ([ref, cond_tail, noise]), the audio must
+                // shift to match: duplicate audio frame 0 for the ref slot, then trim to
+                // the latent T (= x->ne[2]). Without this, the ref slot consumes a real
+                // audio frame and every noise frame is driven by audio shifted ~1 latent
+                // frame early (seam lip-sync drift). Only when continuation ref split is
+                // active (num_ref_latents>0 AND there is a cond split).
+                if (num_ref_latents > 0 && n_cond_tokens > 0) {
+                    int64_t Da = audio_hidden->ne[0];
+                    int64_t Sa = audio_hidden->ne[1];
+                    // audio_start_ref = audio_hidden[:, [0], :, :] -> duplicate frame 0.
+                    auto a_ref = ggml_view_3d(runner_ctx.ggml_ctx, audio_hidden, Da, Sa, 1,
+                                              audio_hidden->nb[1], audio_hidden->nb[2], 0);
+                    a_ref      = ggml_cont(runner_ctx.ggml_ctx, a_ref);
+                    // cat([audio_start_ref, audio_hidden], dim=frame) then trim to last T.
+                    audio_hidden       = ggml_concat(runner_ctx.ggml_ctx, a_ref, audio_hidden, 2);
+                    int64_t T_latent   = x->ne[2];  // latent frames incl. ref (= 25)
+                    int64_t N_audio    = audio_hidden->ne[2];
+                    if (N_audio > T_latent) {
+                        int64_t off  = N_audio - T_latent;  // keep the LAST T_latent
+                        audio_hidden = ggml_view_3d(runner_ctx.ggml_ctx, audio_hidden, Da, Sa, T_latent,
+                                                    audio_hidden->nb[1], audio_hidden->nb[2],
+                                                    audio_hidden->nb[2] * off);
+                        audio_hidden = ggml_cont(runner_ctx.ggml_ctx, audio_hidden);
+                    }
+                }
             }
 
             // RUNTIME mouth-exaggeration knob. Source: the runner field (set by the
@@ -1085,6 +1249,19 @@ namespace LONGCAT_AVATAR {
             avatar.audio_mouth_scale = audio_mouth_scale;
             if (const char* mse = getenv("LONGCAT_AUDIO_MOUTH_SCALE")) {
                 avatar.audio_mouth_scale = (float)atof(mse);
+            }
+
+            // Video-continuation 3-way-split params. n_ref_tokens = the leading
+            // ref-anchor frames' token span; n_per_frame is the spatial-token stride
+            // used to map the mask_frame_range carve-out (in frames) to token offsets.
+            // 0 ref latents (ai2v / single-clip) leaves the existing 2-way split intact.
+            {
+                int64_t h_len_g       = x->ne[1] / std::get<1>(avatar_params.patch_size);
+                int64_t w_len_g       = x->ne[0] / std::get<2>(avatar_params.patch_size);
+                avatar.n_per_frame    = h_len_g * w_len_g;
+                avatar.num_ref_latents  = (num_ref_latents > 0 && n_cond_tokens > 0) ? num_ref_latents : 0;
+                avatar.ref_img_index    = ref_img_index;
+                avatar.mask_frame_range = mask_frame_range;
             }
 
             ggml_tensor* out = avatar.forward(&runner_ctx, x, timesteps, context, pe, audio_hidden, n_cond_tokens);

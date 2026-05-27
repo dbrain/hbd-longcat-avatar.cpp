@@ -34,10 +34,12 @@ def build_index(root: Path) -> bytes:
         rows.append(f'<div style="margin:18px 0"><div style="font:13px monospace;color:#aaa">'
                     f'{html.escape(str(p.relative_to(root)))} &middot; {mtime} &middot; {size:.2f} MB</div>{tag}</div>')
     body = "\n".join(rows) or '<p style="color:#aaa">no clips yet — render one and it will appear here.</p>'
-    return (f'<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=10>'
+    return (f'<!doctype html><meta charset=utf-8>'
             f'<title>LongCat-Avatar clips</title>'
             f'<body style="background:#111;color:#ddd;font-family:system-ui;margin:24px">'
-            f'<h2>LongCat-Video-Avatar — clips</h2>{body}</body>').encode()
+            f'<h2>LongCat-Video-Avatar — clips</h2>'
+            f'<p style="color:#777;font:12px monospace">manual reload only (auto-refresh disabled)</p>'
+            f'{body}</body>').encode()
 
 
 def main():

@@ -11,6 +11,50 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **lap 17 (session 23): FAITHFUL VIDEO-CONTINUATION (generate_avc) — the watercolour melt is KILLED.
+  The continuation/chaining path now matches the reference `pipeline_longcat_video_avatar.py::generate_avc`
+  + `avatar/attention.py` + `avatar/rope_3d.py` exactly. AUDIT items #1/#2/#3 FIXED (the prior agent's WIP
+  had only #4/#5 + a BUGGY #3). Single-clip 25f BIT-IDENTICAL to BEST (99.00 dB). Branch green. Q4_K /
+  single-clip / 8-step LOCKED + untouched.**
+  - **The complete continuation mechanism (one coherent unit — half-applied is worse than none):**
+    1. **Ref-anchor PREPEND, not overwrite** (`stable-diffusion.cpp` continuation branch): the persistent
+       portrait anchor is added as an EXTRA latent frame (`init_latent` T = base+num_ref), denoised, then
+       STRIPPED before VAE decode via the existing `latents.ref_image_num` machinery — mirrors the
+       reference `torch.cat([ref_latent, latents])` (T 24→25) + `latents[:, :, num_ref:]`. NO generated
+       frame lost (the WIP overwrote frame 0 → lost a frame + off-by-one RoPE).
+    2. **Per-frame timestep zeroing** (`process_timesteps`): ALL fixed-cond frames (ref + cond_tail) get
+       t=0, driven per-frame off the denoise_mask (mask==0 ⇒ t=0) — `timestep[:, :num_cond_latents]=0`.
+       Was: only frame 0 (so cond_tail adaLN ran at the noisy t and contaminated the K/V the noise frames
+       attend — a prime melt cause). ai2v (num_cond=1) is unchanged ⇒ single-clip bit-identical.
+    3. **Audio ref-frame prepend + trim** (`longcat_avatar.hpp` build_graph): when num_ref_latents>0, the
+       audio_hidden duplicates frame 0 for the ref slot then trims to latent T (matches
+       `longcat_video_dit_avatar.py` L438-441) — fixes the ~1-latent-frame lip-sync seam shift.
+    4. **3-way self-attn split** (ref/cond/noise + mask_frame_range carve-out): kept from the WIP, verified
+       faithful to `attention.py` `num_cond_latents>1`. (2-way single-clip split UNTOUCHED.)
+    5. **Ref-positioned 3D-RoPE** (`grid_t=[ref_img_index, 0,1,…]`): kept from the WIP, verified faithful
+       to `rope_3d.py`.
+  - **REF ANCHOR SOURCE = segment 0's latent frame 0** (the reference's `ref_latent = latent[:, :, :1]`):
+    captured from seg-0's returned latent (= the ai2v VAE-encoded portrait, held fixed) — NOT a separate
+    up-front VAE encode (that OOM'd against the resident DiT). Held constant across all later segments.
+  - **VALIDATION (2-seg 25f resident chain, `models/_perf/chained_v2.webm`):** exactly 37 frames (25 +
+    25−13), audio muxed. **seg0 (f00–24) = BIT-IDENTICAL to BEST** (vlap 255–334, RGB 119–121/112–114/94–95).
+    **seg1 (f25–36) CRISP + identity-stable + exposure-matched** (vlap 295–311 — same sharp band as seg0,
+    NOT collapsing; RGB rock-stable 120.8–121.1/113.4–113.9/94.5–94.8 — NO blue cast, NO brightness ramp,
+    NO watercolour melt). Eyeballed f25/f30/f36: same woman, same coffee-shop scene/lighting, active
+    lip-sync, sharp to the last frame (farthest from anchor). The lap-14/15/16 compounding color drift +
+    detail decay is GONE. **Single-clip 25f re-verified 99.00 dB / min 99.00 dB vs BEST.**
+  - **⚠️ PRE-EXISTING OFFLOAD BUG (NOT mine, NOT continuation):** `--offload-to-cpu` produces a DEGENERATE
+    avatar render (25f single-clip 8.78 dB / ac16 0.35 vs BEST 99 dB) — **reproduced on pristine HEAD
+    `323ec87` with ZERO of my changes**, so the segmented/graph-cut offload path regressed some lap after
+    lap-06/07's "offload bit-identical" claim. This is why the brief's "use `--offload-to-cpu` for chains"
+    now MELTS — it's the offload path, not the continuation math. **Chains must currently run RESIDENT**
+    (no `--offload-to-cpu`); to fit the VAE encode/decode beside the resident DiT (~3.2 GiB free), pass a
+    smaller `--vae-tile-size 16x16` (the validation used this). Fixing offload is a separate task (the
+    segmented avatar forward, `longcat_avatar.hpp` graph-cut marks); out of scope for this faithful-port lap.
+  - **Files:** `src/stable-diffusion.cpp` (timestep + latent prepend + ref_image_num), `src/longcat_avatar.hpp`
+    (audio prepend + 3-way split), `src/rope.hpp` (gen_wan_pe_ref), `src/diffusion_model.hpp` + `include/stable-diffusion.h`
+    + `examples/common/common.{h,cpp}` (params), `examples/cli/main.cpp` (seg-0 anchor capture + per-seg arming).
+
 - 🟢 **PRODUCTIONISED (session 22, "Agent B"): HTTP API + GPU-CLEAR-WHEN-IDLE + kobbler prod
   service. The avatar now has the same usable, GPU-polite experience as the sibling services
   (qwen3-tts / siglip2 / parakeet). Parent-only, no C++ change (the productionization layer is a

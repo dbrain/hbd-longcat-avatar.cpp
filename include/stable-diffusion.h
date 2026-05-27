@@ -397,6 +397,17 @@ typedef struct {
     const float* cont_latent;
     int cont_latent_frames;
     int audio_frame_offset;
+    // LongCat-Avatar continuation REFERENCE ANCHOR (generate_avc). When cont_ref_latent
+    // != NULL it is the ORIGINAL portrait's diffusion latent (1 frame, same ggml-ne
+    // layout [W_lat, H_lat, 1, C_lat, 1]) — the un-drifted clean anchor the reference
+    // keeps on EVERY continuation segment. It is PREPENDED ahead of the cont_latent cond
+    // tail (layout [ref(1), cond_tail(N), noise...]), held fixed (denoise-mask 0, ts 0),
+    // and drives the 3-way self-attn split + ref-positioned 3D-RoPE in the DiT. Without
+    // it, continuation frames drift off the already-drifted prior tail (watercolour melt).
+    // Only consumed when cont_latent is also set (segments>1 continuation path).
+    const float* cont_ref_latent;
+    int cont_ref_img_index;     // ref anchor's temporal grid position (default 10)
+    int cont_mask_frame_range;  // noise-near-ref attention carve-out half-width (default 3)
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;

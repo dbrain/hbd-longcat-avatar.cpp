@@ -600,6 +600,79 @@ namespace Rope {
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
     }
 
+    // Ref-positioned 3D video ids for the avatar video-continuation path. The FIRST
+    // num_ref_latents temporal frames are the un-drifted reference portrait anchor and
+    // get the FIXED temporal grid position `ref_img_index`; the remaining frames
+    // (cond_tail + noise) get the natural sequential grid 0,1,2,... — matching the
+    // reference `avatar/rope_3d.py::precompute_freqs_cis_3d` with
+    //   grid_t = concat([ref_img_index], arange(0, num_frames - num_ref_latents)).
+    // (num_ref_latents==1 in the avatar continuation; generalized here.) The h/w grids
+    // are unchanged. The reference only handles num_ref_latents==1 (a single [frame_index]
+    // prepended); for num_ref_latents>1 we repeat the anchor position for each ref frame,
+    // which preserves the "all ref frames share the same anchor temporal position" intent.
+    __STATIC_INLINE__ std::vector<std::vector<float>> gen_vid_ids_ref(int t,
+                                                                      int h,
+                                                                      int w,
+                                                                      int pt,
+                                                                      int ph,
+                                                                      int pw,
+                                                                      int bs,
+                                                                      int num_ref_latents,
+                                                                      int ref_img_index) {
+        int t_len = (t + (pt / 2)) / pt;
+        int h_len = (h + (ph / 2)) / ph;
+        int w_len = (w + (pw / 2)) / pw;
+
+        std::vector<std::vector<float>> vid_ids(t_len * h_len * w_len, std::vector<float>(3, 0.0));
+
+        // grid_t: ref frames -> ref_img_index ; the rest -> 0,1,2,...
+        std::vector<float> t_ids(t_len, 0.f);
+        int n_nonref = t_len - num_ref_latents;
+        for (int i = 0; i < t_len; ++i) {
+            if (i < num_ref_latents) {
+                t_ids[i] = 1.f * ref_img_index;
+            } else {
+                t_ids[i] = 1.f * (i - num_ref_latents);
+            }
+        }
+        std::vector<float> h_ids = linspace<float>(0.f, 1.f * h_len - 1, h_len);
+        std::vector<float> w_ids = linspace<float>(0.f, 1.f * w_len - 1, w_len);
+
+        for (int i = 0; i < t_len; ++i) {
+            for (int j = 0; j < h_len; ++j) {
+                for (int k = 0; k < w_len; ++k) {
+                    int idx         = i * h_len * w_len + j * w_len + k;
+                    vid_ids[idx][0] = t_ids[i];
+                    vid_ids[idx][1] = h_ids[j];
+                    vid_ids[idx][2] = w_ids[k];
+                }
+            }
+        }
+
+        std::vector<std::vector<float>> vid_ids_repeated(bs * vid_ids.size(), std::vector<float>(3));
+        for (int i = 0; i < bs; ++i) {
+            for (int j = 0; j < (int)vid_ids.size(); ++j) {
+                vid_ids_repeated[i * vid_ids.size() + j] = vid_ids[j];
+            }
+        }
+        return vid_ids_repeated;
+    }
+
+    __STATIC_INLINE__ std::vector<float> gen_wan_pe_ref(int t,
+                                                        int h,
+                                                        int w,
+                                                        int pt,
+                                                        int ph,
+                                                        int pw,
+                                                        int bs,
+                                                        int theta,
+                                                        const std::vector<int>& axes_dim,
+                                                        int num_ref_latents,
+                                                        int ref_img_index) {
+        std::vector<std::vector<float>> ids = gen_vid_ids_ref(t, h, w, pt, ph, pw, bs, num_ref_latents, ref_img_index);
+        return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_qwen2vl_ids(int grid_h,
                                                                       int grid_w,
                                                                       int merge_size,

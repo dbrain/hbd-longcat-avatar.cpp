@@ -909,7 +909,31 @@ int main(int argc, const char* argv[]) {
                 std::vector<float> prev_latent;  // v1 raw passthrough only
                 int prev_lw = 0, prev_lh = 0, prev_lt = 0, prev_lc = 0;
 
+                // REFERENCE ANCHOR (generate_avc): the reference keeps a persistent,
+                // un-drifted anchor latent and PREPENDS it on EVERY continuation segment
+                // -> [ref(1), cond_tail(N), noise...]; without it continuation drifts off
+                // the already-drifted prior tail (watercolour melt). The reference's
+                // anchor is `ref_latent = latent[:, :, :1]` — segment 0's (ai2v) output
+                // latent FRAME 0, which the ai2v path holds fixed = the VAE-encoded
+                // portrait latent. We capture exactly that from segment 0's returned
+                // latent (no separate up-front VAE encode — that would fight the resident
+                // DiT for VRAM). Held constant across all later segments. Opt out
+                // (legacy ref-free continuation) with LONGCAT_CONT_NO_REF_ANCHOR=1.
+                bool use_ref_anchor = (getenv("LONGCAT_CONT_NO_REF_ANCHOR") == nullptr);
+                std::vector<float> ref_anchor_latent;  // [Wl*Hl*1*Cl] contiguous f32 (frame 0)
+                bool ref_anchor_ready = false;
+
                 for (int seg = 0; seg < n_segments; ++seg) {
+                    // Reference anchor: armed for every continuation segment (>0); seg0
+                    // is the plain ai2v render (no cont latent, no ref split) — its
+                    // latent frame 0 BECOMES the anchor for all later segments.
+                    if (seg > 0 && use_ref_anchor && ref_anchor_ready) {
+                        vid_gen_params.cont_ref_latent      = ref_anchor_latent.data();
+                        vid_gen_params.cont_ref_img_index   = gen_params.cont_ref_img_index;
+                        vid_gen_params.cont_mask_frame_range = gen_params.cont_mask_frame_range;
+                    } else {
+                        vid_gen_params.cont_ref_latent = nullptr;
+                    }
                     if (seg == 0) {
                         vid_gen_params.cont_latent        = nullptr;
                         vid_gen_params.cont_latent_frames = 0;
@@ -973,12 +997,14 @@ int main(int argc, const char* argv[]) {
                     sd_audio_t* seg_audio = nullptr;
                     // Default (drift sink) re-encodes pixels, so no raw latent needed.
                     // raw_latent mode requests the diffusion latent to pass through.
+                    // The ref-anchor also needs the latent (segment 0's frame 0).
+                    bool want_latent = raw_latent || (use_ref_anchor && seg == 0);
                     float* lat_out = nullptr;
                     int    lw = 0, lh = 0, lt = 0, lc = 0;
                     if (!generate_video_ex(sd_ctx.get(), &vid_gen_params, &seg_video, &seg_count, &seg_audio,
-                                           raw_latent ? &lat_out : nullptr,
-                                           raw_latent ? &lw : nullptr, raw_latent ? &lh : nullptr,
-                                           raw_latent ? &lt : nullptr, raw_latent ? &lc : nullptr)) {
+                                           want_latent ? &lat_out : nullptr,
+                                           want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
+                                           want_latent ? &lt : nullptr, want_latent ? &lc : nullptr)) {
                         LOG_ERROR("continuation segment %d failed", seg + 1);
                         free_sd_audio(seg_audio);
                         free(seg_video);
@@ -988,6 +1014,22 @@ int main(int argc, const char* argv[]) {
                     if (raw_latent && lat_out != nullptr) {
                         prev_latent.assign(lat_out, lat_out + (size_t)lw * lh * lt * lc);
                         prev_lw = lw; prev_lh = lh; prev_lt = lt; prev_lc = lc;
+                    }
+                    // Capture segment 0's latent FRAME 0 as the persistent ref anchor
+                    // (= the reference's `ref_latent = latent[:, :, :1]`). Layout is
+                    // [Wl, Hl, Tl, Cl] contiguous; frame 0 is the temporal stride 0 slice
+                    // per channel: src[(c*Tl + 0)*plane + p].
+                    if (use_ref_anchor && seg == 0 && lat_out != nullptr && lt > 0) {
+                        size_t plane = (size_t)lw * lh;
+                        ref_anchor_latent.assign(plane * (size_t)lc, 0.f);
+                        for (int c = 0; c < lc; ++c) {
+                            const float* src = lat_out + ((size_t)c * lt + 0) * plane;
+                            std::memcpy(ref_anchor_latent.data() + (size_t)c * plane, src, plane * sizeof(float));
+                        }
+                        ref_anchor_ready = true;
+                        LOG_INFO("continuation: captured ref anchor from seg0 latent frame 0 (%dx%d, %d ch)", lw, lh, lc);
+                    }
+                    if (lat_out != nullptr) {
                         free(lat_out);
                     }
 

@@ -886,6 +886,16 @@ ArgOptions SDGenerationParams::get_options() {
          "for the next segment when --segments > 1 (default: 13)",
          &cont_cond_frames},
         {"",
+         "--cont-ref-img-index",
+         "LongCat-Avatar: continuation reference-anchor temporal grid position "
+         "(generate_avc default: 10)",
+         &cont_ref_img_index},
+        {"",
+         "--cont-mask-frame-range",
+         "LongCat-Avatar: continuation noise-near-ref attention carve-out half-width "
+         "(generate_avc default: 3)",
+         &cont_mask_frame_range},
+        {"",
          "--fps",
          "fps (default: 24)",
          &fps},

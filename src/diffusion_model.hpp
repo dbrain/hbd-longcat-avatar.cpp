@@ -422,6 +422,12 @@ struct WanModel : public DiffusionModel {
 struct LongCatAvatarModel : public DiffusionModel {
     std::string prefix;
     LONGCAT_AVATAR::LongCatAvatarRunner avatar;
+    // Video-continuation (generate_avc) reference-anchor params, set per-render by the
+    // generate_video path before sampling. num_ref_latents>0 selects the 3-way self-attn
+    // split + ref-positioned PE in the runner; 0 = ai2v / single-clip (UNCHANGED).
+    int cont_num_ref_latents  = 0;
+    int cont_ref_img_index    = 10;
+    int cont_mask_frame_range = 3;
 
     LongCatAvatarModel(ggml_backend_t backend,
                        ggml_backend_t params_backend,
@@ -501,6 +507,12 @@ struct LongCatAvatarModel : public DiffusionModel {
             }
         }
         avatar.num_cond_latents = num_cond_latents;
+        // Thread the continuation ref-anchor params onto the runner. Only engage the
+        // 3-way split when there IS a cond split (num_cond_latents>0); otherwise the
+        // ai2v / single-clip path must stay on the 2-way / plain-PE route.
+        avatar.num_ref_latents  = (num_cond_latents > 0) ? cont_num_ref_latents : 0;
+        avatar.ref_img_index    = cont_ref_img_index;
+        avatar.mask_frame_range = cont_mask_frame_range;
         return avatar.compute(n_threads,
                               *diffusion_params.x,
                               *diffusion_params.timesteps,
