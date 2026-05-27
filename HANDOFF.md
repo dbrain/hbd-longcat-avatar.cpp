@@ -155,6 +155,21 @@ small spatial tiles, tiny batch). Write it FRESH against the current leejet/ggml
 de-scoped the old "wait for a merged ggml base" concern: take from the reference if useful, else fresh.
 **Prototype + measure ONE VAE conv shape before promising a number.**
 
+**Real VAE conv GEMM dims (measured lap-24, `LONGCAT_IM2COL_PROF`, 25f decode — design the
+WMMA tiling against THESE, biggest first):** the post-im2col matmul is `[M = OD·OH·OW] × [K =
+27·IC] × [N = OC]` — **huge M, moderate K, small N** (tall-skinny):
+
+| conv (dominant first) | im2col ms (25f) | M = OD·OH·OW | K = 27·IC | N = OC |
+|---|---|---|---|---|
+| IC=96, OD=4, OH=OW=256 | **1908** (51% of im2col) | 262144 | 2592 | ~96–192 |
+| IC=192, OD=4, OH=OW=128 | 796 | 65536 | 5184 | ~192 |
+| IC=384, OD=2, OH=OW=64 | 179 | 8192 | 10368 | ~384 |
+| IC=384, OD=1, OH=OW=32 | 65 (560 calls) | 1024 | 10368 | ~384 |
+
+⇒ **tile M generously (it's 8K–262K), loop K (2592–10368), N needs only 1–3 tiles of 64–128.**
+The top two convs are 70% of im2col_3d; nail IC=96/OH=256 first. Prototype that one shape's
+WMMA implicit-GEMM, microbench vs (im2col_3d + cuBLAS) on it, THEN promise a number.
+
 ---
 
 ## Lever 3 — DiT / sampling (AFTER the VAE, the real fish: 77% of clip wall)
