@@ -140,7 +140,8 @@ Use `LONGCAT_CONT_PROF` to confirm which shapes flip to the fast path and the ne
 ## Lever 2 — conv-3d-direct ⚠️ 7.1× FASTER THAN PROTOTYPE, 1.19× SLOWER THAN cuBLAS — occupancy-bound floor (lap-25)
 
 **Status: correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. F16-accum is a precision trade
-(owner sign-off pending). Decision: keep grinding only if the gather-occupancy wall (below) breaks.**
+(owner sign-off pending). VERDICT (all levers measured, incl. cp.async): occupancy-bottlenecked on
+sm_86 — keep im2col+cuBLAS for the VAE; kept committed default-OFF as a 7.1× artifact. No open Qs.**
 ggml head (lap-25 chain). **VAE decode 25f --steps 1: prototype 128.22 → 17.93 s (7.1×); baseline
 im2col+cuBLAS 15.06 s ⇒ 1.19× slower.** 8-step real-quality A/B: 39.27 dB mean / 33.21 min, ac16
 identical to baseline (0.832/0.834), no end-melt. Full clip +2.8 s (175.2 vs 172.3) — VAE is ~10% of
@@ -189,18 +190,22 @@ is register-limited to 7 blocks/SM using only ~11 KB smem (headroom to ~14 KB). 
 gather latency for *less* occupancy, the already-binding constraint. Net-negative. (And the reads are
 L2-bound, not DRAM-bound, so there's no bandwidth to recover.)
 
-**What's NOT yet tried (the only candidates to actually break parity):** (a) a fundamentally different
-tiling that doesn't hold accumulators across the gather (≈ splitting into two kernels = im2col+cuBLAS,
-i.e. give up on fusion); (b) `cp.async` / pipelined global→smem to hide the gather latency *without*
-extra registers (Ampere `__pipeline_memcpy_async` — does not consume the register file like a
-software-pipelined double-buffer did; **this is the one lever with a real shot** and wasn't tried);
-(c) larger VAE tiles so grids aren't starved (but split-K already covers most of that). Double-buffer
-(register-pipelined), launch_bounds spilling, oc-split-across-warps, k-offset-smem all measured WORSE.
+**ALL parity candidates now measured — VERDICT: occupancy-bottlenecked on sm_86, keep im2col+cuBLAS.**
+- (b) **`cp.async` — MEASURED DEAD (23.94 s vs 17.92).** Ampere async global→smem dodges the *register*
+  cost of pipelining, but the scattered F32 gather + WMMA's F16 requirement force an F32 staging buffer;
+  double-buffering it costs ~16 KB smem → block hits 27.65 KB → occupancy **collapses 43%→24%** (smem
+  becomes the binding constraint, worse than the register limit it was dodging), and the convert-on-
+  consume reintroduces the latency. Output was correct (40.12 dB) — disqualified on speed alone. Same
+  structural failure as smem-halo: **any extra smem on this kernel cuts the binding occupancy.**
+- (a) a tiling that doesn't hold accumulators across the gather is **structurally ≡ im2col+cuBLAS**
+  (two kernels) — i.e. giving up on fusion. There is no fused design that escapes the wall.
+- Measured WORSE (don't retry): register-double-buffer, launch_bounds spilling, oc-split-across-warps,
+  k-offset-smem, F16-input cast (wash — confirms latency- not bandwidth-bound), smem-halo (arithmetic).
 
-**ROI:** VAE ~10% of single-clip wall; whole lever-2 ceiling ~3.9 s/clip (compounds ×N chained). At
-1.19× the kernel is a net LOSS per clip today (+2.8 s) — **do NOT flip the default ON** until it beats
-baseline. Next real shot is `cp.async` (b); if that doesn't cross parity, the fused approach is
-occupancy-bottlenecked on sm_86 and the honest call is to keep im2col+cuBLAS for the VAE.
+**ROI / final call:** VAE ~10% of single-clip wall; whole lever-2 ceiling ~3.9 s/clip (compounds ×N
+chained). At 1.19× the kernel is a net LOSS per clip (+2.8 s) — **default stays OFF; im2col+cuBLAS is
+the right VAE path on sm_86.** The fused kernel is kept committed (default-OFF) as a 7.1× artifact +
+the proven occupancy analysis. **No open questions remain — move to Lever 3 (DiT, 77% of wall).**
 
 ### Reference scope (kept from original handoff)
 
