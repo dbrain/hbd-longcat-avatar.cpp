@@ -1143,6 +1143,19 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                                                 int d1              = 1,
                                                 int d2              = 1,
                                                 bool force_prec_f32 = false) {
+    // lap-24 lever 2: fused WMMA implicit-GEMM conv (no im2col temp). Opt-in A/B via
+    // LONGCAT_CONV3D_DIRECT; F16 weights only (CUDA path asserts F16 kernel + F32 out).
+    static const bool lc_conv3d_direct = getenv("LONGCAT_CONV3D_DIRECT") != nullptr;
+    if (lc_conv3d_direct && !force_prec_f32 && w->type == GGML_TYPE_F16) {
+        int64_t OC = w->ne[3] / IC;
+        int64_t N  = x->ne[3] / IC;
+        x = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
+        if (b != nullptr) {
+            b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);
+            x = ggml_add_inplace(ctx, x, b);
+        }
+        return x;
+    }
     if (force_prec_f32) {
         ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
 

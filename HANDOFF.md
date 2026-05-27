@@ -135,7 +135,29 @@ Use `LONGCAT_CONT_PROF` to confirm which shapes flip to the fast path and the ne
 
 ---
 
-## Lever 2 — conv-3d-direct (Tier-2, bigger, ~15–20% VAE)
+## Lever 2 — conv-3d-direct ⚠️ PROTOTYPE MEASURED 8.5× SLOWER (lap-24, correct but unoptimized)
+
+**Status: kernel written, correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. Do NOT ship as-is.**
+`ggml/src/ggml-cuda/conv-3d-direct.cu` (WMMA implicit-GEMM, adapted from the 1D ref using the
+exact mapping below), wired through `GGML_OP_CONV_3D` CUDA dispatch + `supports_op` + `CausalConv3d`
+(`ggml_ext_conv_3d`, env-gated). **Measured (25f --steps 1): VAE decode 15.09 → 128.22 s — 8.5×
+SLOWER.** Correctness IS fine: PSNR 38.6–40.5 dB / ac16 0.844 ≡ baseline (coherent; the ~40 dB is
+the F16×F16→F32-accum precision shift vs the current path, not a bug — index mapping verified right).
+
+**Why it lost (prime suspect, reason not yet micro-profiled):** the naive tiling re-gathers B (the
+on-the-fly im2col data) **once per oc-tile** — BM=16, oc=96–384 ⇒ **6–24× redundant** execution of
+the expensive gather (6 int-divs/element), whereas im2col+cuBLAS materializes B ONCE and streams it
+with cache reuse. The 16×64 WMMA tiles also have low arithmetic intensity. **A win here is the
+12–20h fork-class GEMM-engineering grind** (large register/warp tiles so one block covers ALL of oc
+⇒ B gathered once per patch-tile; smem/regs B-reuse; K-tiling tuned for K=2592–10368), NOT a port.
+**Before resuming: micro-profile to confirm B-regather is the cost** (e.g. time a variant that loads B
+from a materialized buffer vs on-the-fly), then decide if the engineering ROI beats lever 3 (DiT, 77%
+of clip wall). The prototype is the correct foundation — iterate the tiling on it, don't rewrite.
+
+### Reference scope (kept from original handoff)
+
+The original Tier-2 framing (~15–20% VAE) below assumed the fusion would land near cuBLAS; the
+prototype shows that's gated on real GEMM tiling, not just "fuse im2col in." Original notes:
 
 Fuse im2col INTO the conv matmul so the 27× expansion is never materialized (kills IM2COL_3D 18.4% +
 IM2COL-2D 9.6% + the materialize→reload round-trip).
