@@ -56,11 +56,85 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 
 | 15  | **SEAM DRIFT FIX — decode→re-encode drift sink (feature, not perf)** — lap-14's "multi-frame Wan-VAE encode is BROKEN" was a HARNESS ARTIFACT (4D input → `_compute` `unsqueeze(2)` folds T into channels → Conv2d IC mismatch at `ggml.c:4458`, NOT the `wan.hpp:1056` concat). Encode works at T>1 with a 5D `[W,H,T,C,1]` input: `sd-vae-roundtrip` T=5 **39.03 dB** / T=13 **39.61 dB** round-trip. `src/wan.hpp` UNCHANGED. Switched chaining (`examples/cli/main.cpp` + new API `sd_ctx_encode_video_frames`) from raw-latent passthrough to decode→re-encode of the prior segment's decoded tail (the reference `generate_vc` drift sink). **2×93f Q4_K seam @f93: 5.51× [VISIBLE JUMP] → 2.76× [acceptable].** Residual per-segment darkening (cond→gen brightness step) remains — an 8-step-DMD limit; "more steps" BLOCKED (DMD clamped to 8); uniform exposure anchor MEASURED a wash (removed). Single-clip path bit-identical (bypasses chaining). | 93f offload ~19 min/seg (unchanged) + ~2.3 s/seg re-encode | unchanged | seam VISIBLE→acceptable; single-clip 99 dB untouched | parent + cli (this lap) |
 
+| 18  | **OFFLOAD DEGENERATE-OUTPUT BUG ROOT-CAUSED + FIXED (correctness).** The `--offload-to-cpu` "degenerate render" (handoff #1) is the **custom fused-RoPE op** (`ggml_rope_pe`, default since lap-10): correct under the single monolithic gallocr (resident = 99 dB) but **degenerates to noise under the per-segment gallocr of the offload/graph-cut path** (lap-09 only tested gallocr-aliasing in MONOLITHIC mode, never segmented). Decisive A/B: HEAD 93f offload `LONGCAT_NO_FUSED_ROPE=1` → ac16 0.82–0.84 all 93 frames (coherent, = lap-07 good clip); default (fused) → ac16 ~0 noise. **Fix:** `GGMLRunnerContext::allow_fused_rope = !can_attempt_graph_cut_segmented_compute()` — chain-RoPE on the offload/segmented path, fused-RoPE everywhere else (resident hot path UNTOUCHED, re-verified 99.00 dB vs BEST). Side findings: **25f offload was NEVER valid** (13.8 dB at lap-07 too — only 93f offload was validated), and there's a **separate PRE-EXISTING small-frame offload bug** (<~41f / tiling-off zone: 37f offload 9.95 dB; NOT fused-RoPE, NOT FFN-tiling — `FFN_TILES=2` byte-identical; gallocr-class, lap-07+). | offload 93f 117 s/step (chain-RoPE; ~5% over fused, dwarfed by 6× weight-stream); resident 25f unchanged 99 dB | **MEASURED TRADEOFF (8-step):** 37f resident 11,303 MiB / 28.5 s-step (coherent) · 37f offload 5,447 MiB / 32.2 s-step (DEGENERATE, small-frame bug) · 93f resident OOM (~13 GB) · **93f offload 6,173 MiB / 117 s-step (COHERENT)** → frees ~6 GB for co-running | DEFAULT (fused, resident) 99 dB; offload 93f coherent (ac16 0.83) | parent (`ggml_extend.hpp` ctx flag + `rope.hpp` apply_rope param + `longcat_avatar.hpp`), this lap |
+
 | 17  | **FAITHFUL VIDEO-CONTINUATION (generate_avc) — watercolour melt KILLED (correctness, not perf).** Matched the reference exactly: (1) ref-anchor PREPENDED as an extra latent frame (T base+num_ref) + stripped before decode via `ref_image_num` (was: overwrote frame 0 → lost a frame); (2) per-frame timestep zeroing of ALL cond frames off the denoise_mask (was: only frame 0); (3) audio ref-frame dup-prepend + trim to latent T; (4) 3-way ref/cond/noise self-attn split + (5) ref-positioned 3D-RoPE (both kept from the prior WIP, verified faithful). Ref anchor = seg-0 latent frame 0 (the reference's `latent[:, :, :1]`). **2-seg 25f resident chain = 37 frames, seg1 CRISP/identity-stable/exposure-matched (vlap 295–311 vs seg0 255–334, RGB stable, NO drift/melt).** Single-clip 25f BIT-IDENTICAL to BEST (99.00 dB). **NOTE: `--offload-to-cpu` is a PRE-EXISTING degenerate-render bug (8.78 dB on pristine HEAD `323ec87`, zero of my changes) — chains run RESIDENT + `--vae-tile-size 16x16`.** | resident 25f ~140 s/seg sampling (unchanged) | resident chain fits w/ `--vae-tile-size 16x16` (~3.2 GiB free beside resident DiT) | seg1 crisp + faithful; single-clip 99 dB | parent + cli (this lap) |
 
 (rows appended per lap below)
 
-### lap 00 — baseline
+### lap 18 — `--offload-to-cpu` degenerate output ROOT-CAUSED (fused-RoPE × segmented gallocr) + FIXED + measured tradeoff
+
+**The bug (handoff open-item #1).** `--offload-to-cpu` produced a degenerate avatar
+(generated frames collapse to white noise; only the latent-held cond frame survives).
+The handoff blamed "the segmented graph-cut path, regressed since lap-06/07" and
+reproduced it at 25f.
+
+**Root cause = the custom fused-RoPE op (`ggml_rope_pe`).** Method (minimum-repro A/B,
+the variables the bug needs are all capturable):
+- The whole segmented framework (`ggml_graph_cut.cpp/.h`, `ggml_extend.hpp`) is
+  **byte-identical to lap-07** — the regression is NOT in the framework.
+- Offloading forces the segmented compute path; the only DiT-graph change since lap-07
+  that's default-on is **fused-RoPE (lap-10)**. It's a NEW custom CUDA op.
+- **Decisive A/B (HEAD, 93f offload, 2-step):** default (fused) → generated frames
+  ac16 ≈ 0 (noise). `LONGCAT_NO_FUSED_ROPE=1` (chain RoPE) → ac16 **0.82–0.84 on all
+  93 frames** (coherent, matches the lap-07 good clip `lap07_fulllen_93f_8step.webm`).
+- The op is correct under the **single monolithic gallocr** (resident = 99 dB, lap-10)
+  but degenerates under the **per-segment gallocr** of the offload path. lap-09's
+  `tools/test_rope_pe_gallocr.cpp` only ever exercised the MONOLITHIC gallocr — the
+  segmented path was never tested. (Exact gallocr mechanism not yet pinned — see the
+  "proper fix" follow-up; the op is not `can_inplace`, so it's a liveness/reuse
+  interaction specific to the per-segment subgraph + the fused op's reduced footprint.)
+
+**The fix (shipped, correct-by-construction).** `GGMLRunnerContext::allow_fused_rope`
+is set `= !can_attempt_graph_cut_segmented_compute()` in `GGMLRunner::get_context()`,
+threaded into `Rope::apply_rope(..., bool allow_fused)`: **chain-RoPE on the
+offload/segmented path, fused-RoPE everywhere else.** Rationale: fused-RoPE is a +5%
+*DiT* win on the RESIDENT hot path (where it matters for turnaround); the offload path
+is the slow full-length path (weight-streaming is ~6× the DiT, so the ~5% RoPE delta
+is noise there). Files: `src/ggml_extend.hpp` (ctx flag + `get_context`),
+`src/rope.hpp` (apply_rope param + gate + the generic `Rope::attention` caller),
+`src/longcat_avatar.hpp` (the two avatar self-attn call sites).
+- **Regression guard:** 25f resident 8-step (fix build) = **99.00 dB bit-identical to
+  BEST** — the resident hot path is untouched (fused-RoPE still active there).
+- **Fix proof:** 93f offload DEFAULT config (no env var) = ac16 0.82–0.84 all frames.
+  The auto-detection picks chain-RoPE on offload with no flag needed.
+
+**MEASURED TRADEOFF (480×832, seed 42, 8-step; peak VRAM = max `nvidia-smi` @0.4s):**
+
+| frames | mode | peak VRAM | per-DiT-step | quality (vs resident) | wall (generate_video) |
+|--------|------|-----------|--------------|------------------------|------------------------|
+| 37 | resident | **11,303 MiB** | 28.5 s | coherent (reference) | 328 s |
+| 37 | offload  | **5,447 MiB**  | 32.2 s | **DEGENERATE 9.95 dB** (small-frame bug) | 359 s |
+| 93 | resident | **OOM (~13 GB)** | — | — (can't run) | — |
+| 93 | offload  | **6,173 MiB**  | 117 s | **coherent, ac16 0.83** | 458 s (2-step) |
+
+- **(a) correctness:** 93f offload = coherent, matches the lap-07 reference. Fixed.
+- **(b) wall-time tax:** at 37f (both run) offload is only **~10–13% slower** per step
+  — ~half is the chain-RoPE penalty (fused disabled on offload), ~half weight-stream.
+  At 93f the per-step is 117 s (~4–6× resident-rate) — but resident **OOMs at 93f**,
+  so for full-length offload is the *only* option, not a "tax vs resident".
+- **(c) peak VRAM:** 93f offload **6.2 GB** → frees ~6 GB → siglip2 (2.3 GB) +
+  qwen3-tts (~3 GB) co-run. This is the co-running unlock #1 was after.
+- **Decision rule:** ≤~40f → RESIDENT (faster, + offload's small-frame path is broken);
+  >~40f → OFFLOAD (only option; ~6 GB footprint; coherent).
+
+**Two follow-ups (independent, handoff-able):**
+1. **Proper fused-RoPE-on-offload fix** — make the op survive the per-segment gallocr
+   (recover the ~5% on offload too). Fold in the **pre-existing small-frame offload
+   bug** (<~41f / FFN-tiling-off zone is degenerate — 37f offload 9.95 dB; present at
+   lap-07; NOT fused-RoPE, NOT FFN tiling [`FFN_TILES=2` byte-identical] → same
+   gallocr-class family). Method: capture the rope op's `a`/`pe`/`dst` (and a known
+   small-frame intermediate) in resident vs offload and diff; or `GGML_ALLOCATOR_DEBUG`
+   in the segmented path. The fix should restore fused-RoPE for offload AND fix the
+   small-frame path, which would also enable the clean both-fit tradeoff at 37f.
+2. **98% GEMM / graph-minimality (#5)** — the op-type profiler (`LONGCAT_OP_PROFILE`)
+   was reverted from the ggml submodule with no saved patch; re-apply the ~42-line
+   cudaEvent block around `ggml_cuda_compute_forward` (per lap-03/08 notes) + rebuild +
+   one profiled DiT step. Question: is the step doing MINIMAL work or 98% with ~30%
+   wasted (audio cross-attn every block even during SILENCE; cond-overlap re-sample;
+   always-full-res)? NOT captured this lap (root-causing the RoPE bug took priority).
+
+| (see table row 18 above) |
 - Config: standard + `--vae-on-cpu`.
 - **Wall 768.66s**, peak VRAM 10535 MiB (during DiT sampling; VAE runs on CPU).
 - Per-phase wall: model load ~31s | encode_first_stage (ref-image VAE encode) 16.3s |

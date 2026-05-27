@@ -785,7 +785,8 @@ namespace Rope {
     __STATIC_INLINE__ ggml_tensor* apply_rope(ggml_context* ctx,
                                               ggml_tensor* x,
                                               ggml_tensor* pe,
-                                              bool rope_interleaved = true) {
+                                              bool rope_interleaved = true,
+                                              bool allow_fused      = true) {
         // x: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2], [[cos, -sin], [sin, cos]]
         int64_t d_head = x->ne[0];
@@ -810,7 +811,11 @@ namespace Rope {
         // (real-gallocr same-topology), and a 25f render that is 99 dB bit-identical to
         // BEST on all frames. See PERF.md lap 10. Speed: DiT 18.35 -> 17.42 s/step
         // (-5%), sampling 147 -> 139.9 s, all lengths.
-        if (rope_interleaved && pe->ne[0] == 2 && pe->ne[1] == 2 &&
+        // allow_fused is set false by the caller when this runner executes via the
+        // offload/graph-cut SEGMENTED path: the op is correct monolithic (99 dB) but
+        // DEGENERATES to noise under the per-segment gallocr (offload). See
+        // GGMLRunnerContext::allow_fused_rope + PERF.md lap 18.
+        if (rope_interleaved && allow_fused && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
             x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
             getenv("LONGCAT_NO_FUSED_ROPE") == nullptr) {
@@ -860,8 +865,8 @@ namespace Rope {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
-        q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
-        k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved, ctx->allow_fused_rope);  // [N*n_head, L, d_head]
+        k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved, ctx->allow_fused_rope);  // [N*n_head, L, d_head]
 
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, flash_attn && ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
         return x;

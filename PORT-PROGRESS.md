@@ -1,5 +1,73 @@
 # LongCat-Video-Avatar 1.5 → sd.cpp/ggml — PORT PROGRESS / HANDOFF
 
+## ⭐ NEXT SESSION — START HERE (handoff 2026-05-27, updated lap-18)
+The port is **functionally complete + perf-optimized + productionised**. Read this block, then
+the STATUS section, PERF.md, and AUDIT.md. Branch `longcat-avatar-port`, green.
+- **DONE**: from-scratch ggml port of the 13.6B audio-driven video DiT; single-clip i2v (≤93f) crisp
+  (99dB vs torch oracle, user-approved); **continuation chaining FIXED** (faithful `generate_avc`,
+  no melt, identity/exposure stable across seams); perf **3.4×** (769→226s @25f) and proven at the
+  **compute roofline** (98% achievable GEMM — kernels can't be beaten; hand-kernel disproven);
+  Q4_K is the prod quant (Q3_K visibly worse, Q2_K floor); mouth-exag knobs (`--audio-mouth-scale`,
+  `--audio-lowpass`); **HTTP API + GPU-clear-when-idle** (`tools/avatar_server.py`, idle VRAM ~0,
+  all knobs per-request); kobbler prod service `docker/longcat-avatar/` (profile-gated, image built);
+  **`--offload-to-cpu` FIXED (lap-18)** — full-length (93f) offload now renders coherent (ac16 0.83)
+  at **6.2 GB peak** (frees ~6 GB for co-running), the #1 unlock.
+- **CONFIRMED VRAM**: resident peak **~10.8 GB** (≈1GB headroom). **Offload peak (93f) ~6.2 GB.**
+  So: RESIDENT = exclusive/fast (short clips ≤~40f); OFFLOAD = ~6 GB footprint/coexists (full-length).
+- **lap-18 offload fix (what changed):** the degenerate-output bug = the **custom fused-RoPE op**
+  (`ggml_rope_pe`, default lap-10) corrupts under the per-segment gallocr of the offload path
+  (correct monolithic/resident = 99 dB). Fix: `GGMLRunnerContext::allow_fused_rope =
+  !can_attempt_graph_cut_segmented_compute()` → chain-RoPE on offload, fused everywhere else.
+  Resident re-verified **99.00 dB bit-identical to BEST**; 93f offload now coherent **by default**
+  (no env var). Full measured tradeoff table in **PERF.md lap-18**. NOTE the handoff's "8.78 dB at
+  25f" was a MISLEADING repro: **25f offload was never valid** (degenerate at lap-07 too); the real
+  regression is at 93f and it's fixed.
+- **OPEN ITEMS (ranked)**:
+  1. **Two offload follow-ups (independent, this is the natural next session):**
+     (a) **Proper fused-RoPE-on-offload fix** — make `ggml_rope_pe` survive the per-segment gallocr
+     so offload keeps the +5% DiT too (currently chain-RoPE on offload = ~5% slower, negligible vs
+     the 6× weight-stream at 93f but ~half the tax at small frame counts).
+     (b) **Pre-existing small-frame offload bug** — offload <~41f (FFN-tiling-OFF / ≤16k-token zone)
+     is degenerate (37f offload 9.95 dB; 25f 13.8 dB at lap-07 TOO, so NOT a regression; NOT
+     fused-RoPE, NOT FFN-tiling [`FFN_TILES=2` byte-identical]). Same gallocr-class family as (a).
+     Fixing both → offload works at ALL frame counts (enables short-clip offload for co-running +
+     a clean both-fit 37f tradeoff). **Method (per user):** capture the rope op's `a`/`pe`/`dst`
+     (+ a small-frame intermediate) resident-vs-offload and diff; or `GGML_ALLOCATOR_DEBUG` in the
+     segmented path. Repro: 93f offload (rope bug) / 37f offload (small-frame bug), both fast.
+  2. **GPU lock**: wire avatar into `koblibs/kob-gpu-gate` per `~/dbrain/HANDOFF-llm-gpu-lock.md`
+     as the "future resident workload" (write-lock, no preempt, evict LLM+Python; GPU-clear-idle
+     makes eviction brief). If offload (#1) is fixed → it can instead coexist with the read-bucket
+     lighties and evict only the LLM.
+  3. **koblem UI** (`../koblem`, mirror the Music page — fairly self-contained): script (user/LLM) →
+     TTS (voice desc/existing) → image → longcat prompt → optional advanced knobs → go → clip
+     covering the audio. **Simple defaults for basic use; "advanced" exposes the API knobs**, which
+     are already wired in `tools/avatar_server.py` `/generate`: `steps` (e.g. 1 for a fast draft),
+     `audio_mouth_scale`, `audio_lowpass_hz`, `segment_frames`/`duration_sec`, `cont_cond_frames`,
+     `resolution`, `quant` (q4_k/q4_0), `cfg_scale`, `seed`, `offload`, `vae_tiling`. Plus silence-gap
+     "filler"/idle-loop reuse so silent stretches aren't re-rendered (detect silence in the TTS audio,
+     splice a pre-rendered idle loop instead of generating empty frames).
+  4. **mouth-exag tuning** — knob's in; dial it WITH a cleaner-audio + simpler (anime/3D) character.
+  5. **graph-minimality perf deep-dive** — roofline proved kernels efficient (98% GEMM), NOT that the
+     graph is minimal. The open question: "98% GPU, but is it doing the MINIMAL work for the output, or
+     98% with ~30% wasted?" Candidates for wasted work: audio cross-attn runs every block even during
+     SILENCE; cond-overlap frames re-sampled each chain segment; always full-res; any redundant
+     CONT/REPEAT/recompute. **NOT captured during the lap-18 offload-fix runs** (root-causing the
+     RoPE bug took priority; the op-type profiler `LONGCAT_OP_PROFILE` was reverted from the ggml
+     submodule with no saved patch, so it wasn't "free" to piggyback). Needs: re-apply the ~42-line
+     cudaEvent `[OP_PROFILE]` block around `ggml_cuda_compute_forward` in `ggml/src/ggml-cuda/
+     ggml-cuda.cu` (per lap-03/08) + rebuild + one profiled DiT step. lap-08 already has the resident
+     25f breakdown (MUL_MAT 42% / FLASH 31% / glue 28%) — the NEW question is "minimal vs wasted".
+  6. **commit the kobbler docker bits** (the prod avatar service is uncommitted on kobbler `main`).
+- **PROCESS LESSON (cost real wall-time)**: iterate on the MINIMUM repro (shortest clip/segments/
+  steps); reserve long/quality renders for FINAL validation. See memory `feedback-iterate-minimum-repros`.
+- **MACHINE**: one GPU; avatar GPU-clears when idle; wrap host torch/python in `systemd-run --user
+  --scope -p MemoryMax=14G -p MemorySwapMax=0` (does NOT cap docker — use `docker run --memory` for
+  containers); watch orphaned `iter.sh cli` containers (`docker rm -f`). The torch reference
+  (`~/dev/longcat-video-ref/.venv-gpu` + `repro_chain_min.py`) exists but the 13.6B INT8 doesn't fit
+  12GB resident — reference renders are CPU-slow; source-level comparison is the practical oracle.
+
+---
+
 Living handoff for the C++ port. The product brief is `~/dev/longcat-video-ref/HANDOFF.md`
 (START HERE). This file tracks the *implementation*. Goal: an offline ≤30s 480p
 talking-avatar generator on the RTX 3060. **Phase goal right now: get it VRAM-friendly
@@ -10,6 +78,20 @@ Build/run on this box is fine (the no-build rule is the kobbler Rust workspace o
 GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
+
+- 🟢 **lap 18 (session 24): `--offload-to-cpu` DEGENERATE OUTPUT ROOT-CAUSED + FIXED (the #1 unlock).**
+  Root cause = the custom **fused-RoPE op** (`ggml_rope_pe`, default since lap-10): correct under the
+  monolithic gallocr (resident 99 dB) but corrupts under the **per-segment gallocr** of the offload
+  path → generated frames collapse to noise. (lap-09's gallocr test only ran MONOLITHIC, never
+  segmented.) **Fix:** `GGMLRunnerContext::allow_fused_rope = !can_attempt_graph_cut_segmented_compute()`
+  → chain-RoPE on offload, fused everywhere else. Resident re-verified **99.00 dB vs BEST** (hot path
+  untouched); **93f offload now coherent by default** (ac16 0.83, no env var). **Measured tradeoff
+  (PERF.md lap-18):** 93f offload **6.2 GB peak** (frees ~6 GB co-running) / 117 s-step / coherent;
+  resident OOMs at 93f. Decision rule: ≤~40f resident, >~40f offload. Side-findings: 25f offload was
+  NEVER valid (handoff's "8.78 dB" repro was misleading); a **separate pre-existing small-frame
+  offload bug** (<~41f tiling-off zone, degenerate, NOT rope/NOT FFN-tiling, gallocr-class) remains.
+  Two follow-ups handed off (proper fused-RoPE-on-offload + small-frame bug; 98% GEMM profile). Files:
+  `src/ggml_extend.hpp`, `src/rope.hpp`, `src/longcat_avatar.hpp`.
 
 - 🟢 **lap 17 (session 23): FAITHFUL VIDEO-CONTINUATION (generate_avc) — the watercolour melt is KILLED.
   The continuation/chaining path now matches the reference `pipeline_longcat_video_avatar.py::generate_avc`

@@ -267,8 +267,8 @@ namespace LONGCAT_AVATAR {
             // so the result is mathematically identical but stays in F16 range. The
             // non-flash path materializes F32 scores and is unaffected (kv_scale==1).
             const float kv_scale = fa ? (1.0f / 256.0f) : 1.0f;
-            auto q_rope = Rope::apply_rope(ctx->ggml_ctx, q, pe, true);  // [d_head, n_token, num_heads*N]
-            auto k_rope = Rope::apply_rope(ctx->ggml_ctx, k, pe, true);  // [d_head, n_token, num_heads*N]
+            auto q_rope = Rope::apply_rope(ctx->ggml_ctx, q, pe, true, ctx->allow_fused_rope);  // [d_head, n_token, num_heads*N]
+            auto k_rope = Rope::apply_rope(ctx->ggml_ctx, k, pe, true, ctx->allow_fused_rope);  // [d_head, n_token, num_heads*N]
 
             ggml_tensor* out;
             if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {

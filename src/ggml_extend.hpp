@@ -1680,6 +1680,14 @@ struct GGMLRunnerContext {
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;
     bool circular_y_enabled                                          = false;
+    // false when this runner will execute via the offload/graph-cut SEGMENTED
+    // path: the custom fused-RoPE op (ggml_rope_pe) produces correct output under
+    // a single monolithic gallocr pass (resident, 99 dB) but DEGENERATES under the
+    // per-segment gallocr of the segmented path (offload) — generated frames
+    // collapse to noise. The chain RoPE is segment-safe. Fused-RoPE is a +5% win on
+    // the RESIDENT 25f hot path; the segmented path is the slow full-length offload
+    // path where the DiT delta is negligible, so we trade it for correctness there.
+    bool allow_fused_rope                                            = true;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
@@ -2717,6 +2725,7 @@ public:
         runner_ctx.backend               = runtime_backend;
         runner_ctx.flash_attn_enabled    = flash_attn_enabled;
         runner_ctx.conv2d_direct_enabled = conv2d_direct_enabled;
+        runner_ctx.allow_fused_rope      = !can_attempt_graph_cut_segmented_compute();
         runner_ctx.circular_x_enabled    = circular_x_enabled;
         runner_ctx.circular_y_enabled    = circular_y_enabled;
         runner_ctx.weight_adapter        = weight_adapter;
