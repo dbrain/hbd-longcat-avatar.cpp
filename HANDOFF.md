@@ -170,6 +170,25 @@ WMMA tiling against THESE, biggest first):** the post-im2col matmul is `[M = OD�
 The top two convs are 70% of im2col_3d; nail IC=96/OH=256 first. Prototype that one shape's
 WMMA implicit-GEMM, microbench vs (im2col_3d + cuBLAS) on it, THEN promise a number.
 
+**EXACT implicit-GEMM mapping (reverse-engineered lap-24 from `ggml_compute_forward_conv_3d_impl`,
+`ops.cpp:6839`, + `ggml_conv_3d_direct`, `ggml.c:4848`).** It is structurally **identical to the
+1D reference** (`~/dev/qwen3-tts.cpp/.../conv-1d-direct.cu`) — adapt that kernel, don't reinvent:
+- **C[oc, patch] = Σ_K A[oc,K]·B[K,patch]** (matrix_a row-major, matrix_b col-major, F32 accum).
+- **A = weight**, `ne=[KW,KH,KD, c·oc]`, contiguous ⇒ flat `A[oc,K] = w[(oc*c+ic)*KDKHKW + (kz*KH*KW+ky*KW+kx)]`
+  i.e. K-index `= ic*KDKHKW + kz*KH*KW + ky*KW + kx`, and `ne[3]` packs as `j = oc*c + ic`. So A is
+  already `[oc, K]` row-major contiguous — pass `w` straight in (F16, like the 1D ref's `w`).
+- **N-dim "patch"** = `OD·OH·OW` per batch. n_local→ `od = n/(OH*OW); oh = (n%(OH*OW))/OW; ow = n%OW`.
+- **B-gather** (replaces im2col temp): `sx = ow*s0+kx*d0-p0`, `sy = oh*s1+ky*d1-p1`, `sz = od*s2+kz*d2-p2`;
+  `src[ sx*nb0 + sy*nb1 + sz*nb2 + (batch*c+ic)*nb3 ]` (0 if OOB). **Wan VAE: s=1,d=1,p=0 ⇒ all in-bounds**
+  (CausalConv3d pre-pads externally — same fact lap-23 used for im2col).
+- **C-store**: dst `ne=[OW,OH,OD, oc·n]`, contiguous ⇒ `dst[ patch_in_batch + (batch*oc + oc_idx)*OW*OH*OD ]`.
+- grid `(ceil(patch/BN), ceil(oc/BM), n)`; ref's BM=16/BN=64/BK=16/4-warp tiling is a starting point —
+  **retune** (oc is the small dim → maybe BM=16 fine; patch huge → BN can grow). No CUDA CONV_3D
+  dispatch exists yet — add it to `ggml-cuda.cu` (CPU-only today). Wire `CausalConv3d` (`wan.hpp`) to
+  `ggml_conv_3d_direct` behind an env flag for A/B. Precision: F16×F16→F32 accum like the current
+  im2col+cuBLAS path ⇒ expect coherent but maybe NOT 99 dB bit-exact (lap-11-class accum change);
+  gate with ac16 coherence + owner OK if PSNR <99.
+
 ---
 
 ## Lever 3 — DiT / sampling (AFTER the VAE, the real fish: 77% of clip wall)
