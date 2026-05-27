@@ -22,6 +22,60 @@
 > **REMAINING: the im2col-kernel lap (~−11 % wall) and/or productionisation (#2 GPU lock, #3 koblem UI,
 > #6 commit the kobbler docker bits). See PERF.md lap 21 §7.**
 
+### ⭐ HANDOFF TO NEXT AGENT — VAE im2col kernel lap (lap-23 candidate) — written end of lap-22
+
+**Read this + PERF.md laps 21–22 + AUDIT.md, then go. Perf state is committed and clean; this is a
+fresh kernel effort, handed off because the prior session's context got long (not because it's stuck).**
+
+**Where it stands (all committed, bit-exact, on branch `longcat-avatar-port`):**
+- lap-21 `eb1c8a4`: VAE tile-overlap 0.5→0.25 default (−20 % VAE).
+- lap-22 `1780767` (+ ggml `f34645b2`): im2col_3d **fastdiv** (int64-div → multiply-shift) — VAE 64→43.5 s.
+- **Cumulative VAE 80.5→43.5 s (−46 %); total 8-step render 349→312 s (−10.4 %).** Quality-neutral (99 dB PSNR).
+- Prod default to render with: `--offload-to-cpu --steps 8` at the **53f sweet-spot** (or 37f). Resident
+  ceiling ~53f. Offload = the +5 %-wall / −5.5 GB co-run dial. Chaining redoes `cont_cond_frames`=13.
+
+**The open lever (TOP, ~the rest of the original ~11 % VAE-wall target):** im2col_3d is now at **51 GB/s =
+14 % of the 3060's ~360 GB/s peak**, no longer ALU-bound (fastdiv fixed that) but **gather-read-latency
+bound** — a warp reads a 3×3×3×channel input region with stride jumps; only the WRITE is coalesced.
+Use the committed **`LONGCAT_IM2COL_PROF`** env probe (per-call shape + BW) to measure any attempt.
+- **Tier 1 — smem-halo tiled `im2col_3d` (base-agnostic, no new op, ~1–2 d):** block loads the reused
+  input window (with 3×3×3 halo) for a tile of output positions into shared memory once (coalesced),
+  threads write im2col columns from smem. Reuses input ~27×. **Floor = the 27× WRITE at peak BW ≈ 3–5 s
+  (im2col 22.5→single digits, VAE →~25 s).** Keep the current fastdiv kernel as a FALLBACK for shapes the
+  tiled path doesn't cover (correctness can't regress). Gate every build on a `--steps 1` PSNR-vs-current
+  check (im2col is exact; output must stay 99 dB).
+- **Tier 2 — `conv-3d-direct` (bigger, eliminates the write, do POST-MERGE):** fuse im2col into a WMMA
+  tensor-core GEMM, never materialize the 27× expansion. **Reference kernel already exists:**
+  `~/dev/qwen3-tts.cpp/ggml/src/ggml-cuda/conv-1d-direct.cu` (the user's other fork; computes the B-tile
+  input index on-the-fly in the gemm load — exactly our case in 1D). The 3D extension is mostly index
+  math: `K = in_ch·KD·KH·KW`, decompose `k_idx→(ic,kd,kh,kw)` + output-flat→(od,oh,ow), 3D gather.
+  **CAVEATS (honest):** that kernel's WMMA tiles (`BM/BN/BK`) are tuned for vocoder shapes (K=7·ch, long
+  1D seq, big batch) — the VAE's K=27·96=2592 / small spatial tiles / tiny batch **will need retuning**,
+  so it's "write conv-3d-direct using it as a reference," not a port. And `GGML_OP_CONV_3D` exists in
+  leejet/ggml CPU-only (needs a CUDA kernel + wiring). **Do this on the MERGED/updated ggml base** — the
+  user is about to update `qwen3-tts.cpp/ggml` (behind HEAD) and merge the forks; writing it against
+  leejet/ggml now = rework. **Prototype + measure ONE VAE conv shape before promising a number.**
+
+**Flash-attn — PARKED, low ROI (don't chase first):** `ggml_cuda_get_best_fattn_kernel` already picks
+the optimal `MMA_F16` tensor-core kernel for the avatar's self-attn (sm_86, d=128, L=10920; vec path
+excluded by 10920 % FATTN_KQ_STRIDE ≠ 0). 62.7 % of the FP16-tensor roof is *respectable* for attention;
+gains need upstream-class tuning of a complex kernel for ~3–5 % wall.
+
+**DEAD-ENDS measured this session (do NOT re-try):** `__ldg`/`__restrict__` on the im2col read = **no-op**
+(reused input working set too big to cache; reverted); bigger VAE tiles (tile-48 slower, 60×60/full OOM);
+DMD step/block-cache (per-step denoised Δ plateaus ~3 %, = the `--steps` knob); offload weight-stream
+prefetch (+8 %, already overlapped); silent-frame audio-cross (sub-noise); Q4_K matmuls (floored ~93 % of
+cuBLAS-F16). Diagnostics committed/reusable: `LONGCAT_IM2COL_PROF`, `LONGCAT_STEP_DELTA`,
+`tools/roofline_dit.cpp` (build: `g++ tools/roofline_dit.cpp` in the builder image + static
+`build/.../libggml*.a` + `-lcudart -lcublas -lcublasLt -lcuda -lnccl`).
+
+**On the user (so you don't prematurely "be rational"):** they explicitly want the grind — *push every
+lever to the measured floor, don't bank early to be safe.* "It won't help" is where their biggest past
+wins came from, so MEASURE the eh-won't-help pokes, don't reason them away. They cross-check with a fresh
+agent + codex afterward, so be rigorous and honest: re-derive inherited claims (the "98 % roofline
+everywhere" verdict was wrong — flash 63 %, im2col was 7 %), label measurement clips by step count, and
+quote measured numbers not predictions (fastdiv was predicted ~5×, measured ~2× — say so).
+
 ### (historical) handoff (updated lap-18)
 The port is **functionally complete + perf-optimized + productionised**. Read this block, then
 the STATUS section, PERF.md, and AUDIT.md. Branch `longcat-avatar-port`, green.
