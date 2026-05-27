@@ -51,7 +51,24 @@ wins compound ×N.** That's why we finish the VAE floor before the DiT.
 
 ---
 
-## State: what just shipped (lap-23, committed, bit-exact)
+## State: what just shipped (lap-24, committed, bit-exact)
+
+CONT pixel-shuffle + DiT-attn permute copies coalesced (ggml `740156c2`, `cpy.cu`). The
+slow strided `cpy_scalar` backing `ggml_cont(permute(...))` is replaced, for F32
+cont-to-contiguous, by two kernels: **`cpy_perm_transpose`** (dim0 strided + one unit-stride
+axis f → smem-tiled batched 2D transpose, 53–122 → 328–331 GB/s) and **`cpy_perm_coalesced`**
+(dim0 unit-stride both sides, higher dims permuted → batch-index decomposed once per block,
+kills the per-element int64 divide, 147–221 → 315–468 GB/s). Bit-exact by construction:
+`LONGCAT_CONT_VERIFY` byte-compares vs scalar (6617 conts, 0 mismatch) + --steps-1/8 PSNR
+99.00. **VAE decode 17.70→15.10 s (−14.7%); DiT sampling 139.9→137.5 s (−1.7%); cont-op
+−62%.** CONT moved #1→#5 of the VAE graph. Env: `LONGCAT_CONT_NOTRANSP`, `LONGCAT_CONT_VERIFY`.
+
+**⭐ THE BOTTLENECK MOVED AGAIN — VAE is now MUL_MAT 26.4% (cuBLAS conv-GEMM floor) /
+IM2COL_3D 21.8% / CONCAT 11.4% / IM2COL-2D 11.3% / CONT 8.9%. → DO LEVER 2 NEXT** (conv-3d-direct
+WMMA fuses away both IM2COLs = 33% + the materialize round-trip). CONCAT at 11.4% is newly the
+#3 op and was never investigated — worth a CONT_PROF-style probe if lever 2 stalls.
+
+## (lap-23, prior) what shipped
 
 `im2col_3d` smem-halo **tiled kernel + half2 vectorized F16 store** (`ggml/src/ggml-cuda/im2col.cu`,
 ggml `9966677a` + parent `03ba865`). The Wan-VAE convs are stride=1/dil=1/pad=0 (CausalConv3d pre-pads
@@ -73,20 +90,23 @@ write 64B→128B).
 `LONGCAT_OP_PROFILE` (serializes every op → absolute ms inflated but **proportions exact**; here
 serialized total 17.2 s ≈ real 17.7 s, so proportions ≈ real wall):
 
-| op | ~wall | what it is |
-|---|---|---|
-| **CONT** | ~4.0 s | pixel-shuffle permute-copies (Wan VAE up/down-sample space↔depth) — **new #1** |
-| **MUL_MAT** | ~4.0 s | the conv GEMM — at the cuBLAS F16 tensor-core ceiling, **immovable** |
-| **IM2COL_3D** | ~3.3 s | what lap-23 just optimized (was ~14 s) |
-| IM2COL (2D) | ~1.7 s | |
-| CONCAT | ~1.7 s | |
-| PAD/RMS_NORM/ADD/MUL/UNARY | ~3.6 s | |
+**lap-24 (post-CONT-fix) VAE profile** (`LONGCAT_OP_PROFILE`, per VAE tile graph, % of tile):
 
-(The DiT *sampling* step is a separate graph: MUL_MAT 45% + FLASH_ATTN_EXT 33% — that's lever 3.)
+| op | % | what it is |
+|---|---|---|
+| **MUL_MAT** | 26.4% | the conv GEMM — cuBLAS F16 tensor-core ceiling, **immovable as a GEMM** (but lever 2 fuses im2col INTO it) |
+| **IM2COL_3D** | 21.8% | lap-23 territory — **lever 2 target** |
+| CONCAT | 11.4% | newly the #3 op (was 9.6%); never probed |
+| IM2COL (2D) | 11.3% | **lever 2 target** |
+| CONT | 8.9% | was #1 ~22.8% pre-lap-24; now PERMT/COAL fast paths |
+| PAD/RMS_NORM/ADD/MUL/UNARY | ~19% | |
+
+(Pre-lap-24 CONT was ~4.0 s / 22.8% / #1. The DiT *sampling* step is a separate graph:
+MUL_MAT 45% + FLASH_ATTN_EXT 33% — that's lever 3.)
 
 ---
 
-## Lever 1 — CONT pixel-shuffle (DO FIRST, fully diagnosed, ~4 s)
+## Lever 1 — CONT pixel-shuffle ✅ DONE (lap-24, see "State" above). Kept below for reference.
 
 **Root cause is nailed** (via the committed `LONGCAT_CONT_PROF` probe in `ggml/src/ggml-cuda/cpy.cu`,
 ggml `8e34af2`): the big high-res conts — `ne=[96,256,256,4]`, `[256,256,2,96]`, `[192,128,128,4]`,
@@ -194,4 +214,6 @@ if you need them; not relevant to the perf levers above.
 
 ## Knobs added this phase (all env-gated, default-safe)
 `LONGCAT_IM2COL_TILE="CB,TOH,TOW,P"` (default 8,8,8,4) · `LONGCAT_IM2COL_NOTILE` · `LONGCAT_IM2COL_NOVEC2`
-· `LONGCAT_IM2COL_VERIFY` · `LONGCAT_IM2COL_PROF` · `LONGCAT_CONT_PROF` · `LONGCAT_OP_PROFILE`.
+· `LONGCAT_IM2COL_VERIFY` · `LONGCAT_IM2COL_PROF` · `LONGCAT_CONT_PROF` · `LONGCAT_OP_PROFILE`
+· `LONGCAT_CONT_NOTRANSP` (force old strided cpy_scalar for cont — lap-24 A/B) · `LONGCAT_CONT_VERIFY`
+(byte-compare PERMT/COAL vs scalar reference).
