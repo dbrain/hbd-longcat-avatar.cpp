@@ -1,5 +1,9 @@
 # LongCat-Avatar.cpp — PERF HANDOFF (start here)
 
+> **▶ NEXT CAMPAIGN = the DiT (77% of the clip wall). Its standalone handoff is `HANDOFF-DiT.md` —
+> start there.** This doc is the VAE phase (DONE, laps 13–25): lever 1 (CONT) shipped, lever 2
+> (conv-3d-direct) chased to a proven occupancy floor and removed (tag `lap25-conv3d-direct-occupancy-floor`).
+
 *Self-contained. You do NOT need to read PORT-PROGRESS.md (the "neverending story") to start —
 everything you need for the next levers is here. Cross-reference PERF.md lap-23 + lap-21 §7 only for
 detail. Written end of lap-23, 2026-05-27.*
@@ -158,7 +162,10 @@ only "escape" — a tiling not holding accumulators across the gather — is str
 itself. **Verdict: keep im2col+cuBLAS for the VAE. The real fish is the DiT (Lever 3, 77% of wall).**
 ---
 
-## Lever 3 — DiT / sampling (AFTER the VAE, the real fish: 77% of clip wall)
+## Lever 3 — DiT / sampling (the real fish: 77% of clip wall) → **see `HANDOFF-DiT.md`**
+
+*Full DiT campaign handoff (levers, profiling methodology, mood, eye-test setup) is now in
+**`HANDOFF-DiT.md`**. Summary kept here for context:*
 
 lap-21 §7 pinned matmuls at ~93% cuBLAS and flash-attn at ~63% (fork-class). The owner's standing
 instruction: **"roofline-bound ≠ no lever in the *pathway*."** Don't accept "it's GPU-bound" — re-derive
