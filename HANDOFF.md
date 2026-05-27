@@ -64,10 +64,10 @@ kills the per-element int64 divide, 147–221 → 315–468 GB/s). Bit-exact by 
 −62%.** CONT moved #1→#5 of the VAE graph. Env: `LONGCAT_CONT_NOTRANSP`, `LONGCAT_CONT_VERIFY`.
 
 **⭐ THE BOTTLENECK MOVED AGAIN — VAE is now MUL_MAT 26.4% (cuBLAS conv-GEMM floor) /
-IM2COL_3D 21.8% / CONCAT 11.4% / IM2COL-2D 11.3% / CONT 8.9%. **lap-25 UPDATE: lever 2 retiled +
-fastdiv → 5.0× over the prototype but still 1.7× slower than im2col+cuBLAS (see Lever 2 below); cheap
-pokes exhausted, remaining gap is fork-class GEMM tiling + halo gather → PIVOTED TO LEVER 3 (DiT, 77%
-of clip wall).** CONCAT at 11.4% is still the unprobed #3 VAE op — worth a CONT_PROF-style probe if
+IM2COL_3D 21.8% / CONCAT 11.4% / IM2COL-2D 11.3% / CONT 8.9%. **lap-25 FINAL: lever 2 (fused
+conv-3d-direct) reached 7.1× over its prototype but stayed 1.19× slower than im2col+cuBLAS —
+occupancy-bottlenecked on sm_86, ncu-proven (see Lever 2 below), REMOVED from tree, → DiT is the
+target (Lever 3, 77% of clip wall).** CONCAT at 11.4% is still the unprobed #3 VAE op — worth a CONT_PROF-style probe if
 DiT stalls and you come back to the VAE.
 
 ## (lap-23, prior) what shipped
@@ -137,133 +137,25 @@ Use `LONGCAT_CONT_PROF` to confirm which shapes flip to the fast path and the ne
 
 ---
 
-## Lever 2 — conv-3d-direct ⚠️ 7.1× FASTER THAN PROTOTYPE, 1.19× SLOWER THAN cuBLAS — occupancy-bound floor (lap-25)
+## Lever 2 — conv-3d-direct ❌ ATTEMPTED & REMOVED (lap-25, occupancy-bottlenecked on sm_86)
 
-**Status: correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. F16-accum is a precision trade
-(owner sign-off pending). VERDICT (all levers measured, incl. cp.async): occupancy-bottlenecked on
-sm_86 — keep im2col+cuBLAS for the VAE; kept committed default-OFF as a 7.1× artifact. No open Qs.**
-ggml head (lap-25 chain). **VAE decode 25f --steps 1: prototype 128.22 → 17.93 s (7.1×); baseline
-im2col+cuBLAS 15.06 s ⇒ 1.19× slower.** 8-step real-quality A/B: 39.27 dB mean / 33.21 min, ac16
-identical to baseline (0.832/0.834), no end-melt. Full clip +2.8 s (175.2 vs 172.3) — VAE is ~10% of
-wall, **compounds ×N on chained clips**.
+Fused WMMA implicit-GEMM 3D-conv to replace im2col+cuBLAS. Reached **7.1× over its prototype
+(128.22 → 17.92 s VAE decode, 25f --steps 1) but stayed 1.19× slower than im2col+cuBLAS (15.06 s)**, so
+it was **removed from the tree**. Removal is inert: the default `ggml_ext_conv_3d` path emits no
+`GGML_OP_CONV_3D` node, im2col output is bit-identical (PSNR 99.00). Full kernel + lever-by-lever
+history + ncu data recoverable at **git tag `lap25-conv3d-direct-occupancy-floor`** (ggml submodule) and
+memory `project_longcat_conv3d_occupancy_wall.md`.
 
-### The lever chain (all measured, all committed, all gated)
-| step | VAE s | what / why |
-|---|---|---|
-| lap-24 prototype | 128.22 | B regathered ceil(oc/16)=6–24× (1D-ref grid copied with BM=16) |
-| **retile** | 34.4 | one block covers MSUB oc-subtiles ⇒ B gathered once/patch-tile (the big one, 3.7×) |
-| fastdiv | 27.2 | `fast_div_modulo` kills 6 raw int-divs/elem (lap-23 lesson) |
-| hoist + warps | 25.8 | patch-decomp out of BK loop; tune |
-| **NSUB=2** | 23.96 | each warp owns 2 patch-cols ⇒ weight frag reused 2× (−16% GEMM) |
-| **F16 accum + split-K** | 19.5 | ⭐ the unlock — see ncu below |
-| incremental k-decode | 18.39 | decompose k_outer once, increment (kx→ky→kz→ic) — no per-elem fastdiv |
-| bounds-skip | **17.93** | s=1/d=1/p=0 ⇒ taps always in-bounds, skip 6 compares/elem |
-
-Store bug found+fixed early: direct `store_matrix_sync` to a large-stride **global** dst gives WRONG
-output (8.88 dB) — must stage through c_smem. Knobs: `LONGCAT_CONV3D_DIRECT` · `_MSUB` · `_NSUB` ·
-`_KSPLIT` · `_BFILL` (timing probe) · build `-DC3_ACC_F32` to revert F16 accum.
-
-### ⭐ ROOT CAUSE — ncu ground truth (NOT inference). This answers "why is it slower."
-ncu on `conv3d_mma_kernel` (the inferred bfill-partition story was *wrong* — verify with the profiler):
-- **DRAM 1.3–4.7%, tensor-core 8–18% — BOTH idle.** Not memory-bound, not compute-bound.
-- **warps_active 16.7% → 43–47%** (after F16 accum). **register-limited**: 125 → 70–72 regs/thread ⇒
-  4 → 7 blocks/SM. Stalls: `wait` + `long_scoreboard` (memory *latency*) + `barrier` — textbook
-  under-occupancy. The kernel is **occupancy/latency-bound**, full stop.
-- **F16 WMMA accumulators** (`c3_acc_t`) were the unlock: halved accumulator regs (8→4/frag),
-  125→70 regs, occupancy 16.7%→43%, 23.96→19.5 s. **split-K** (`LONGCAT_CONV3D_KSPLIT`, auto) adds
-  blocks because VAE tiling makes per-conv grids tiny (~50 blocks « 28 SMs); partials atomic-add into
-  a pre-zeroed F32 dst. Together they doubled occupancy and throughput.
-
-### Why it CANNOT cheaply reach parity (the fundamental wall — proven, not asserted)
-**`LONGCAT_CONV3D_BFILL` (gather neutered) = 13.59 s — already BEATS baseline's 15.06 s.** So the
-GEMM + store + all other VAE ops are *competitive*; the **entire** 1.19× gap is the ~4.3 s gather, and
-the gather is **occupancy-bound, not work-bound** (DRAM idle, reads are ~95% L2 hits). The fused kernel
-must hold the GEMM accumulators **live across the whole K-reduction including every gather phase**,
-pinning ~72 regs/thread throughout → 7 blocks/SM → 47% occupancy → the gather's L2 latency + barriers
-can't be hidden. The two-kernel im2col+cuBLAS baseline sidesteps this: im2col carries **no
-accumulators** (≈100% occupancy, saturates), cuBLAS runs its GEMM separately. **Neither carries both
-burdens; the fused kernel does — that's the structural cost of fusion on sm_86.**
-
-**smem-halo gather (the obvious "reduce the 27× reads" lever) is disproven by arithmetic:** the kernel
-is register-limited to 7 blocks/SM using only ~11 KB smem (headroom to ~14 KB). Adding a halo buffer
-(~8–16 KB) pushes smem to ~20–27 KB/block ⇒ **smem caps occupancy to ~4 blocks/SM** — it trades the
-gather latency for *less* occupancy, the already-binding constraint. Net-negative. (And the reads are
-L2-bound, not DRAM-bound, so there's no bandwidth to recover.)
-
-**ALL parity candidates now measured — VERDICT: occupancy-bottlenecked on sm_86, keep im2col+cuBLAS.**
-- (b) **`cp.async` — MEASURED DEAD (23.94 s vs 17.92).** Ampere async global→smem dodges the *register*
-  cost of pipelining, but the scattered F32 gather + WMMA's F16 requirement force an F32 staging buffer;
-  double-buffering it costs ~16 KB smem → block hits 27.65 KB → occupancy **collapses 43%→24%** (smem
-  becomes the binding constraint, worse than the register limit it was dodging), and the convert-on-
-  consume reintroduces the latency. Output was correct (40.12 dB) — disqualified on speed alone. Same
-  structural failure as smem-halo: **any extra smem on this kernel cuts the binding occupancy.**
-- (a) a tiling that doesn't hold accumulators across the gather is **structurally ≡ im2col+cuBLAS**
-  (two kernels) — i.e. giving up on fusion. There is no fused design that escapes the wall.
-- Measured WORSE (don't retry): register-double-buffer, launch_bounds spilling, oc-split-across-warps,
-  k-offset-smem, F16-input cast (wash — confirms latency- not bandwidth-bound), smem-halo (arithmetic).
-
-**ROI / final call:** VAE ~10% of single-clip wall; whole lever-2 ceiling ~3.9 s/clip (compounds ×N
-chained). At 1.19× the kernel is a net LOSS per clip (+2.8 s) — **default stays OFF; im2col+cuBLAS is
-the right VAE path on sm_86.** The fused kernel is kept committed (default-OFF) as a 7.1× artifact +
-the proven occupancy analysis. **No open questions remain — move to Lever 3 (DiT, 77% of wall).**
-
-### Reference scope (kept from original handoff)
-
-The original Tier-2 framing (~15–20% VAE) below assumed the fusion would land near cuBLAS; the
-prototype shows that's gated on real GEMM tiling, not just "fuse im2col in." Original notes:
-
-Fuse im2col INTO the conv matmul so the 27× expansion is never materialized (kills IM2COL_3D 18.4% +
-IM2COL-2D 9.6% + the materialize→reload round-trip).
-
-**Groundwork is already here:** `GGML_OP_CONV_3D` + `ggml_conv_3d_direct` exist in this ggml
-(`ggml/src/ggml.c:4848`, CPU impl only); `ggml/src/ggml-cuda/conv2d.cu` is a CUDA direct-conv template.
-So this is "write the CUDA kernel for the existing op + switch `CausalConv3d` (`src/wan.hpp`) to
-`ggml_conv_3d_direct`" — **no new op to invent.**
-
-**⚠ CRITICAL (this is why a naive port backfires):** `conv2d.cu` is a one-thread-per-output FMA loop on
-**CUDA cores**. Porting it to 3D fuses away the ~5 s of im2col BUT runs the ~4 s of MUL_MAT compute
-(currently at the cuBLAS F16 **tensor-core** ceiling) on CUDA cores → net LOSS. **It MUST be a WMMA
-tensor-core implicit-GEMM.** Reference the owner's WMMA kernel `~/dev/qwen3-tts.cpp/ggml/src/ggml-cuda/
-conv-1d-direct.cu` (computes the B-tile input index on-the-fly inside the GEMM load — exactly our case
-in 1D). Its tiles (BM/BN/BK) are tuned for 1D vocoder shapes; **RETUNE for the VAE** (K = 27·IC ≈ 2592,
-small spatial tiles, tiny batch). Write it FRESH against the current leejet/ggml base — the owner has
-de-scoped the old "wait for a merged ggml base" concern: take from the reference if useful, else fresh.
-**Prototype + measure ONE VAE conv shape before promising a number.**
-
-**Real VAE conv GEMM dims (measured lap-24, `LONGCAT_IM2COL_PROF`, 25f decode — design the
-WMMA tiling against THESE, biggest first):** the post-im2col matmul is `[M = OD·OH·OW] × [K =
-27·IC] × [N = OC]` — **huge M, moderate K, small N** (tall-skinny):
-
-| conv (dominant first) | im2col ms (25f) | M = OD·OH·OW | K = 27·IC | N = OC |
-|---|---|---|---|---|
-| IC=96, OD=4, OH=OW=256 | **1908** (51% of im2col) | 262144 | 2592 | ~96–192 |
-| IC=192, OD=4, OH=OW=128 | 796 | 65536 | 5184 | ~192 |
-| IC=384, OD=2, OH=OW=64 | 179 | 8192 | 10368 | ~384 |
-| IC=384, OD=1, OH=OW=32 | 65 (560 calls) | 1024 | 10368 | ~384 |
-
-⇒ **tile M generously (it's 8K–262K), loop K (2592–10368), N needs only 1–3 tiles of 64–128.**
-The top two convs are 70% of im2col_3d; nail IC=96/OH=256 first. Prototype that one shape's
-WMMA implicit-GEMM, microbench vs (im2col_3d + cuBLAS) on it, THEN promise a number.
-
-**EXACT implicit-GEMM mapping (reverse-engineered lap-24 from `ggml_compute_forward_conv_3d_impl`,
-`ops.cpp:6839`, + `ggml_conv_3d_direct`, `ggml.c:4848`).** It is structurally **identical to the
-1D reference** (`~/dev/qwen3-tts.cpp/.../conv-1d-direct.cu`) — adapt that kernel, don't reinvent:
-- **C[oc, patch] = Σ_K A[oc,K]·B[K,patch]** (matrix_a row-major, matrix_b col-major, F32 accum).
-- **A = weight**, `ne=[KW,KH,KD, c·oc]`, contiguous ⇒ flat `A[oc,K] = w[(oc*c+ic)*KDKHKW + (kz*KH*KW+ky*KW+kx)]`
-  i.e. K-index `= ic*KDKHKW + kz*KH*KW + ky*KW + kx`, and `ne[3]` packs as `j = oc*c + ic`. So A is
-  already `[oc, K]` row-major contiguous — pass `w` straight in (F16, like the 1D ref's `w`).
-- **N-dim "patch"** = `OD·OH·OW` per batch. n_local→ `od = n/(OH*OW); oh = (n%(OH*OW))/OW; ow = n%OW`.
-- **B-gather** (replaces im2col temp): `sx = ow*s0+kx*d0-p0`, `sy = oh*s1+ky*d1-p1`, `sz = od*s2+kz*d2-p2`;
-  `src[ sx*nb0 + sy*nb1 + sz*nb2 + (batch*c+ic)*nb3 ]` (0 if OOB). **Wan VAE: s=1,d=1,p=0 ⇒ all in-bounds**
-  (CausalConv3d pre-pads externally — same fact lap-23 used for im2col).
-- **C-store**: dst `ne=[OW,OH,OD, oc·n]`, contiguous ⇒ `dst[ patch_in_batch + (batch*oc + oc_idx)*OW*OH*OD ]`.
-- grid `(ceil(patch/BN), ceil(oc/BM), n)`; ref's BM=16/BN=64/BK=16/4-warp tiling is a starting point —
-  **retune** (oc is the small dim → maybe BM=16 fine; patch huge → BN can grow). No CUDA CONV_3D
-  dispatch exists yet — add it to `ggml-cuda.cu` (CPU-only today). Wire `CausalConv3d` (`wan.hpp`) to
-  `ggml_conv_3d_direct` behind an env flag for A/B. Precision: F16×F16→F32 accum like the current
-  im2col+cuBLAS path ⇒ expect coherent but maybe NOT 99 dB bit-exact (lap-11-class accum change);
-  gate with ac16 coherence + owner OK if PSNR <99.
-
+**Why it can't win on sm_86 (ncu-PROVEN — do NOT re-attempt without different hardware):** the kernel is
+**occupancy/latency-bound**, not memory- or compute-bound (DRAM 1.3–4.7% idle, tensor cores 8–18% idle,
+~47% warps active). `LONGCAT_CONV3D_BFILL` (gather neutered) = 13.59 s already BEAT baseline 15.06 ⇒ the
+GEMM is competitive; the *entire* gap is the ~4.3 s gather, un-hideable because a fused kernel must hold
+the GEMM accumulators **live across the whole K-reduction including every gather phase**, pinning ~72
+regs/thread → caps occupancy. Every fix for that latency (smem-halo, `cp.async` with F32→F16 staging)
+**adds smem that cuts the binding occupancy** — both measured/proven dead (cp.async 23.94 s, occupancy
+43%→24%). The two-kernel im2col+cuBLAS dodges it (im2col carries no accumulators, ~100% occupancy); the
+only "escape" — a tiling not holding accumulators across the gather — is structurally ≡ im2col+cuBLAS
+itself. **Verdict: keep im2col+cuBLAS for the VAE. The real fish is the DiT (Lever 3, 77% of wall).**
 ---
 
 ## Lever 3 — DiT / sampling (AFTER the VAE, the real fish: 77% of clip wall)
@@ -326,6 +218,4 @@ if you need them; not relevant to the perf levers above.
 · `LONGCAT_IM2COL_VERIFY` · `LONGCAT_IM2COL_PROF` · `LONGCAT_CONT_PROF` · `LONGCAT_OP_PROFILE`
 · `LONGCAT_CONT_NOTRANSP` (force old strided cpy_scalar for cont — lap-24 A/B) · `LONGCAT_CONT_VERIFY`
 (byte-compare PERMT/COAL vs scalar reference).
-· `LONGCAT_CONV3D_DIRECT` (lap-25: route 3D convs through the fused WMMA kernel — default-OFF, still
-1.7× slower than im2col+cuBLAS) · `LONGCAT_CONV3D_MSUB=N` (force oc-subtiles/block for tiling sweeps)
-· `LONGCAT_CONV3D_BFILL` (timing probe: constant-fill B to isolate GEMM from gather — WRONG output).
+(The `LONGCAT_CONV3D_*` knobs were removed with lever 2 — see tag `lap25-conv3d-direct-occupancy-floor`.)
