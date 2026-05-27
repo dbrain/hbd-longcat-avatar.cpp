@@ -137,48 +137,70 @@ Use `LONGCAT_CONT_PROF` to confirm which shapes flip to the fast path and the ne
 
 ---
 
-## Lever 2 — conv-3d-direct ⚠️ RETILED + fastdiv, 5.0× FASTER THAN PROTOTYPE BUT STILL 1.7× SLOWER THAN cuBLAS (lap-25)
+## Lever 2 — conv-3d-direct ⚠️ 7.1× FASTER THAN PROTOTYPE, 1.19× SLOWER THAN cuBLAS — occupancy-bound floor (lap-25)
 
-**Status: correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. Still NOT competitive — do not ship.**
-ggml `c110e284`. The lap-24 8.5×-slower verdict was the B-regather (CONFIRMED): the prototype copied
-the 1D-ref grid `(patch/BN, oc/BM, batch)` with BM=16, so each patch-tile's gather ran ceil(oc/16)=
-6–24× redundantly. **lap-25 fixes:**
-- **Retile** — each block now accumulates `MSUB` oc-subtiles per warp (warp owns one patch column,
-  loops all oc), so B is gathered ONCE per patch-tile. `grid.y = ceil(oc/(MSUB·16))`; MSUB snapped to
-  instantiated {1,2,3,4,5,6,8,12}, default covers all oc in one block ≤12 frags/thread. `C3_WARPS=8`.
-- **fastdiv** — `init_fastdiv_values`/`fast_div_modulo` kill the 6 raw int-divs/element (same lesson as
-  lap-23 im2col); patch→(od,oh,ow) decomp hoisted out of the BK inner loop.
-- **Store bug fixed** — direct `store_matrix_sync` to a large-stride global ptr gave WRONG output
-  (8.88 dB); the proven c_smem-coalesced write per subtile restores bit-exactness. *(Lesson: don't
-  store_matrix_sync straight to a strided global dst — stage through smem.)*
+**Status: correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. F16-accum is a precision trade
+(owner sign-off pending). Decision: keep grinding only if the gather-occupancy wall (below) breaks.**
+ggml head (lap-25 chain). **VAE decode 25f --steps 1: prototype 128.22 → 17.93 s (7.1×); baseline
+im2col+cuBLAS 15.06 s ⇒ 1.19× slower.** 8-step real-quality A/B: 39.27 dB mean / 33.21 min, ac16
+identical to baseline (0.832/0.834), no end-melt. Full clip +2.8 s (175.2 vs 172.3) — VAE is ~10% of
+wall, **compounds ×N on chained clips**.
 
-**Measured (25f --steps 1, VAE decode): prototype 128.22 → 25.77 s (5.0×). Baseline im2col+cuBLAS
-15.06 s ⇒ still 1.71× slower.** PSNR 40.52 dB mean / 38.48 min, ac16 0.842–0.844 flat (no melt).
-Levers tried lap-25: retile (3.7×, the big one) · fastdiv (−21%) · hoist patch decomp (−2.8%) ·
-C3_WARPS 4→8 (−2.5%).
+### The lever chain (all measured, all committed, all gated)
+| step | VAE s | what / why |
+|---|---|---|
+| lap-24 prototype | 128.22 | B regathered ceil(oc/16)=6–24× (1D-ref grid copied with BM=16) |
+| **retile** | 34.4 | one block covers MSUB oc-subtiles ⇒ B gathered once/patch-tile (the big one, 3.7×) |
+| fastdiv | 27.2 | `fast_div_modulo` kills 6 raw int-divs/elem (lap-23 lesson) |
+| hoist + warps | 25.8 | patch-decomp out of BK loop; tune |
+| **NSUB=2** | 23.96 | each warp owns 2 patch-cols ⇒ weight frag reused 2× (−16% GEMM) |
+| **F16 accum + split-K** | 19.5 | ⭐ the unlock — see ncu below |
+| incremental k-decode | 18.39 | decompose k_outer once, increment (kx→ky→kz→ic) — no per-elem fastdiv |
+| bounds-skip | **17.93** | s=1/d=1/p=0 ⇒ taps always in-bounds, skip 6 compares/elem |
 
-**⭐ PARTITION MEASURED (`LONGCAT_CONV3D_BFILL` probe — fills B with a constant, isolates GEMM from
-gather):** full 26.42 s, bfill 17.66 s ⇒ **gather (reads+math) ~8.76 s · GEMM+store+other ~17.66 s.**
-The two cheap pokes moving only ~2.5% each PROVES the GEMM is neither math- nor occupancy-bound: it's
-**WMMA tile-reuse bound** (a_frag reloaded from smem every mma, 16×16 tiles, mma:load ≈ 6:7) and is
-**~3× off cuBLAS** for the same 3D-conv GEMM. The gather is ~2.6× the lap-23 tiled im2col because it
-has **no smem-halo reuse** (~27× redundant x-reads).
+Store bug found+fixed early: direct `store_matrix_sync` to a large-stride **global** dst gives WRONG
+output (8.88 dB) — must stage through c_smem. Knobs: `LONGCAT_CONV3D_DIRECT` · `_MSUB` · `_NSUB` ·
+`_KSPLIT` · `_BFILL` (timing probe) · build `-DC3_ACC_F32` to revert F16 accum.
 
-**To make lever 2 ship-competitive (both are fork-class, est. 12–20 h total):**
-1. **2D register-blocked warp tiling** (the GEMM lever, biggest) — each warp owns `MSUB`×`NSUB`
-   WMMA subtiles so a_frag is reused NSUB× and b_frag MSUB×; raises mma:load toward cuBLAS. Watch
-   register pressure (c_frag[MSUB·NSUB]·8 regs; oc=96 MSUB=6 → NSUB=2 already 96 regs — may need
-   K-double-buffer + smaller tiles, or split oc across grid.y and eat a little regather).
-2. **smem-halo gather** (the gather lever) — stage the reused 3×3×3×IC input window in smem once like
-   the lap-23 im2col kernel, cutting the ~27× x-read amplification to ~1.4×.
-   *Theoretical fused ceiling ≈ im2col-quality gather (~3.3 s) + cuBLAS-quality GEMM (~3 s) − the
-   2.7 GB round-trip im2col pays ⇒ ~5–6 s, which WOULD beat baseline's ~6.3 s 3D-conv cost. The
-   ceiling exists but only if BOTH halves land near-optimal.*
+### ⭐ ROOT CAUSE — ncu ground truth (NOT inference). This answers "why is it slower."
+ncu on `conv3d_mma_kernel` (the inferred bfill-partition story was *wrong* — verify with the profiler):
+- **DRAM 1.3–4.7%, tensor-core 8–18% — BOTH idle.** Not memory-bound, not compute-bound.
+- **warps_active 16.7% → 43–47%** (after F16 accum). **register-limited**: 125 → 70–72 regs/thread ⇒
+  4 → 7 blocks/SM. Stalls: `wait` + `long_scoreboard` (memory *latency*) + `barrier` — textbook
+  under-occupancy. The kernel is **occupancy/latency-bound**, full stop.
+- **F16 WMMA accumulators** (`c3_acc_t`) were the unlock: halved accumulator regs (8→4/frag),
+  125→70 regs, occupancy 16.7%→43%, 23.96→19.5 s. **split-K** (`LONGCAT_CONV3D_KSPLIT`, auto) adds
+  blocks because VAE tiling makes per-conv grids tiny (~50 blocks « 28 SMs); partials atomic-add into
+  a pre-zeroed F32 dst. Together they doubled occupancy and throughput.
 
-**ROI call (lap-25):** VAE is ~10% of single-clip wall; lever 2's whole ceiling is ~22% of VAE ≈
-3.9 s/clip (compounds ×N chained clips). DiT (lever 3) is 77% of wall. Retile PAID (proved the
-hypothesis, 5.0×) but the finish line is the fork-class grind above — **pivoted to lever 3 pending
-owner steer.** Resume lever 2 only if DiT stalls or chained-clip VAE compounding justifies the hours.
+### Why it CANNOT cheaply reach parity (the fundamental wall — proven, not asserted)
+**`LONGCAT_CONV3D_BFILL` (gather neutered) = 13.59 s — already BEATS baseline's 15.06 s.** So the
+GEMM + store + all other VAE ops are *competitive*; the **entire** 1.19× gap is the ~4.3 s gather, and
+the gather is **occupancy-bound, not work-bound** (DRAM idle, reads are ~95% L2 hits). The fused kernel
+must hold the GEMM accumulators **live across the whole K-reduction including every gather phase**,
+pinning ~72 regs/thread throughout → 7 blocks/SM → 47% occupancy → the gather's L2 latency + barriers
+can't be hidden. The two-kernel im2col+cuBLAS baseline sidesteps this: im2col carries **no
+accumulators** (≈100% occupancy, saturates), cuBLAS runs its GEMM separately. **Neither carries both
+burdens; the fused kernel does — that's the structural cost of fusion on sm_86.**
+
+**smem-halo gather (the obvious "reduce the 27× reads" lever) is disproven by arithmetic:** the kernel
+is register-limited to 7 blocks/SM using only ~11 KB smem (headroom to ~14 KB). Adding a halo buffer
+(~8–16 KB) pushes smem to ~20–27 KB/block ⇒ **smem caps occupancy to ~4 blocks/SM** — it trades the
+gather latency for *less* occupancy, the already-binding constraint. Net-negative. (And the reads are
+L2-bound, not DRAM-bound, so there's no bandwidth to recover.)
+
+**What's NOT yet tried (the only candidates to actually break parity):** (a) a fundamentally different
+tiling that doesn't hold accumulators across the gather (≈ splitting into two kernels = im2col+cuBLAS,
+i.e. give up on fusion); (b) `cp.async` / pipelined global→smem to hide the gather latency *without*
+extra registers (Ampere `__pipeline_memcpy_async` — does not consume the register file like a
+software-pipelined double-buffer did; **this is the one lever with a real shot** and wasn't tried);
+(c) larger VAE tiles so grids aren't starved (but split-K already covers most of that). Double-buffer
+(register-pipelined), launch_bounds spilling, oc-split-across-warps, k-offset-smem all measured WORSE.
+
+**ROI:** VAE ~10% of single-clip wall; whole lever-2 ceiling ~3.9 s/clip (compounds ×N chained). At
+1.19× the kernel is a net LOSS per clip today (+2.8 s) — **do NOT flip the default ON** until it beats
+baseline. Next real shot is `cp.async` (b); if that doesn't cross parity, the fused approach is
+occupancy-bottlenecked on sm_86 and the honest call is to keep im2col+cuBLAS for the VAE.
 
 ### Reference scope (kept from original handoff)
 
