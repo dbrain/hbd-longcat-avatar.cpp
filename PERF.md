@@ -64,8 +64,50 @@ of idle prod processes on the shared GPU; subtract for the model's own peak).
 | 19  | **SMALL-FRAME OFFLOAD BUG ROOT-CAUSED + FIXED (correctness) — the ~40f use case now renders coherent.** [SUPERSEDED by lap 20 — this lap's `graph_cut_allow_merge` workaround was removed once the real allocator bug was found.] The handoff's pre-existing "<~41f offload degenerate" bug (lap-18 #1a) is the graph-cut **budget-merge**: in the FFN-tiling-off regime (≤16k post-patch tokens) merging consecutive base segments into one per-segment gallocr pass **deterministically** collapses the residual stream (block0 std 57923→103, *identical* wrong value at 13-seg and 49-seg → not concurrency). Decisive minimum-repro A/B (37f, `--steps 1`, no full render): default merge (13 seg) block0 std=103 [broken]; `--max-vram 3` (97 seg) block0 std=49072 / min −8.45M = matches resident [correct]. NOT fused-RoPE (chain-RoPE was already forced on offload by lap-18), NOT FFN-tiling, NOT the framework. **Why 93f works but 37f doesn't:** 93f is FFN-*tiled* (>16k tok) and merges fine; only the small-frame FFN-off regime corrupts under merge. **Fix:** `GGMLRunner::graph_cut_allow_merge` (default true) gated off by the avatar when post-patch `n_token<=16000`; `resolve_plan(..., allow_merge)` then skips `apply_max_vram_budget` and uses the finest (unmerged) base segmentation there. Large-frame (93f) + resident paths **untouched** (merge still on / no segmentation). **Validated:** 37f offload 8-step DEFAULT (no env) → ac16 **0.833–0.842 all 37 frames** (coherent; was ~0.2/0). + Re-applied env-gated `LONGCAT_OP_PROFILE` (ggml-cuda node loop) and captured the resident-25f DiT-step breakdown (#5 / GEMM-minimality, see below). | 37f offload ~35.5 s/step (8-step sampling 283.8 s); resident + 93f offload unchanged | 37f offload unchanged ~5.4 GB (finer segments, same weight-stream total) | DEFAULT 37f offload **coherent (ac16 0.833–0.842)**; 93f + resident untouched | parent (`ggml_graph_cut.{h,cpp}` allow_merge, `ggml_extend.hpp` runner flag, `longcat_avatar.hpp` small-frame gate), this lap |
 
 | 21  | **VAE tile-overlap 0.5→0.25 (−20% VAE, SHIPPED default) + chaining-throughput curve + remaining-lever census.** VAE decode time is ∝ total tile area (overcompute); the stock 0.5 overlap makes 2×5=10 tiles at the 60×104 latent, 0.25 makes 2×4=8 → VAE 80.5→**64.2 s @37f** (−16 s wall, total 349→**333.8 s**), validated coherent (ac16 0.833–0.842, no seams). Bigger tiles all lose (tile-48 108.8 s; 60×40 77 s+OOM; 60×60/full OOM — the per-tile full-temporal activation, not weights, is the cap even under offload). **DMD step-cache MEASURED dead-as-free-win** (per-step denoised Δ plateaus ~3%, no <1% step ⇒ = `--steps` knob). Offload weight-stream (+8% @37f, overlapped) and silent-frame audio-cross (sub-noise) also dead. DiT stays at the GEMM roofline. | 37f total 349→**333.8 s** (VAE 80.5→64.2) | 37f offload ~5.7 GB unchanged | **default path coherent (ac16 0.833–0.842, eyeball clean)** | parent (`stable-diffusion.cpp` auto-tiling default), this lap |
+| 22  | **im2col_3d fastdiv (VAE −32%, SHIPPED) — the "67% im2col = conv floor" verdict was wrong, it was int64-div ALU-bound.** lap-21 §7 measured im2col_3d at 7% of mem BW (26 GB/s); root cause = ~6–7 `int64` div/mod per output element for index decomposition (sm_86 has no hw int64 divide). Fix: ggml `fast_div_modulo` (multiply-shift), bit-exact. **im2col_3d 43.7→22.5 s (26→51 GB/s); VAE 64.2→43.5 s (−32%); total ~334→~313 s (−6%).** Cumulative w/ lap-21: VAE 80.5→43.5 (−46%), total 349→313 (−10.3%), both quality-neutral. New ceiling = uncoalesced gather reads (51 GB/s = 14% peak); next = smem-tiled im2col (Tier 1) or implicit-GEMM (Tier 2). Flash-attn characterized: already on optimal MMA-F16 kernel @62.7% roof — low ROI. | total ~334→**~313 s** (VAE 64.2→43.5) | unchanged ~5.7 GB | **coherent (ac16 0.839–0.842; 8-step PSNR bit-exact)** | ggml (`im2col.cu` fastdiv), this lap |
 
 (rows appended per lap below)
+
+### lap 22 — im2col_3d fastdiv (VAE −32%, shipped) + gather-read ceiling + flash-attn characterized
+
+**lap-21 §7 found im2col_3d at 7 % of bandwidth; this lap diagnosed the cause, fixed it, and re-measured
+(measure, don't predict — the fix under-delivered vs the instruction-count estimate, which exposed the
+next bottleneck).**
+
+1. **Root cause = int64 division, NOT uncoalesced memory.** im2col_3d (and the 2D kernel — identical
+   pattern) does ~6–7 `int64` div/mod per output element to decompose the thread index
+   (`iic=i/KD_KH_KW`, `/KH_KW`, `/KW`, `iz/OD_OH`, `/OH`). sm_86 has **no hardware int64 divide** → each
+   is a ~50–70-instr software routine → ~450 integer instructions of pure addressing per 1 load + 1
+   store. The kernel was ALU-bound on integer division; the 26 GB/s was the symptom, not the disease.
+2. **Fix (SHIPPED, bit-exact): fastdiv.** Swapped the decomposition to ggml's existing
+   `fast_div_modulo` (multiply-shift, `common.cuh`, already used in flash-attn) with
+   `init_fastdiv_values` precomputed host-side for the loop-invariant divisors. Exact for all indices/
+   divisors (fit u32) ⇒ im2col output unchanged. File: `ggml/src/ggml-cuda/im2col.cu`.
+   - **MEASURED: im2col_3d 43.7→22.5 s (−48 %, 26→51 GB/s); VAE decode 64.2→43.5 s (−32 %); total
+     8-step render ~334→~313 s (−6 % wall).** Coherence: ac16 0.839–0.842 (= pre-fix) + 8-step PSNR
+     vs `final_default_8step` (bit-exact).
+   - **Cumulative VAE (lap-21 overlap + lap-22 fastdiv): 80.5→43.5 s (−46 %); total render 349→313 s
+     (−10.3 %).** Both quality-neutral.
+3. **NEW ceiling = uncoalesced gather READS (the predicted ~5× became ~2× → second bottleneck
+   surfaced).** At 51 GB/s = 14 % of peak, im2col is no longer ALU-bound but bound by scattered `src`
+   reads (a warp spans a 3×3×3×channel input region with stride jumps every 3/9/27 elems; only the
+   WRITE is coalesced). Two tiers to push further:
+   - **Tier 1 — shared-memory input tiling (~1–2 days):** block loads a contiguous input tile + halo
+     into smem (coalesced), threads write im2col columns from smem → reads coalesced + reused 27×.
+     Floor = the 27× WRITE traffic (unavoidable for im2col); near-peak write ⇒ est. im2col 22.5→~6–10 s,
+     VAE →~28–32 s.
+   - **Tier 2 — implicit-GEMM / direct conv (~2–4 days):** fuse im2col into the matmul, never
+     materialize the 27× expansion → eliminates the write; bounded by conv FLOPs (matmul was 9 % of
+     VAE) + input read once. Biggest win, est. VAE →~22–25 s. `GGML_OP_CONV_3D` enum exists (CPU-only);
+     `conv2d.cu` (166 lines) is a direct-conv template.
+4. **Flash-attn characterized — low ROI, NOT a wrong-kernel bug.** `ggml_cuda_get_best_fattn_kernel`
+   already selects `BEST_FATTN_KERNEL_MMA_F16` (tensor-core) for the avatar's self-attn (sm_86, d=128,
+   L=10920; the vec path is excluded by `10920 % FATTN_KQ_STRIDE ≠ 0`). 62.7 % of the FP16-tensor roof
+   is respectable for attention (FA2/Ampere ≈ 50–70 %); gains need upstream-class tuning of a complex
+   tensor-core kernel for ~3–5 % wall. **Parked below the gather-read fix.**
+
+**Next:** gather-read Tier 1 (smem-tiled im2col) — highest-ROI remaining kernel lever, targets the rest
+of the original ~11 % VAE-wall ceiling. Files: `ggml/src/ggml-cuda/im2col.cu`.
 
 ### lap 21 — VAE tile-overlap win (shipped) + chaining throughput sweet-spot + remaining-lever census
 

@@ -160,6 +160,18 @@ GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
 
+- 🟢 **lap 22 (session 27 cont): im2col_3d fastdiv — VAE −32 %, SHIPPED + bit-exact.** lap-21 §7's
+  "im2col @7 % of mem BW" was **int64-division ALU-bound** (sm_86 has no hw int64 divide; ~6–7 int64
+  div/mod per output element for index decomposition), NOT the conv floor. Fix = ggml `fast_div_modulo`
+  (multiply-shift, `common.cuh`), bit-exact. **im2col_3d 43.7→22.5 s (26→51 GB/s); VAE decode
+  64.2→43.5 s (−32 %); total 8-step render 333.8→311.9 s.** Verified **99 dB PSNR (bit-identical)** vs
+  pre-fix 8-step + ac16 0.839–0.842. **Cumulative VAE (lap-21 overlap + lap-22 fastdiv) 80.5→43.5 s
+  (−46 %); total 349→312 s (−10.4 %)**, both quality-neutral. **New ceiling = uncoalesced gather reads**
+  (51 GB/s = 14 % peak) → next = smem-tiled im2col (Tier 1, ~1–2 d) or implicit-GEMM/direct conv
+  (Tier 2, ~2–4 d). Flash-attn characterized: already on the optimal `MMA_F16` kernel @62.7 % roof →
+  low ROI (parked). Commits: ggml `f34645b2`. Full detail PERF.md lap 22. Files:
+  `ggml/src/ggml-cuda/im2col.cu`.
+
 - 🟢 **lap 21 (session 27): P2 PERF/VRAM SWEEP — one win shipped, free-win surface exhausted, P3
   chaining sweet-spot answered with measured curves.** (1) **VAE tile-overlap 0.5→0.25 SHIPPED as the
   avatar default** — VAE decode 80.5→**64.2 s @37f** (−20 %, −16 s wall; total 349→**333.8 s**), 10→8
