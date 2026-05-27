@@ -23,17 +23,22 @@ the STATUS section, PERF.md, and AUDIT.md. Branch `longcat-avatar-port`, green.
   25f" was a MISLEADING repro: **25f offload was never valid** (degenerate at lap-07 too); the real
   regression is at 93f and it's fixed.
 - **OPEN ITEMS (ranked)**:
-  1. **Two offload follow-ups (independent, this is the natural next session):**
-     (a) **Proper fused-RoPE-on-offload fix** — make `ggml_rope_pe` survive the per-segment gallocr
-     so offload keeps the +5% DiT too (currently chain-RoPE on offload = ~5% slower, negligible vs
-     the 6× weight-stream at 93f but ~half the tax at small frame counts).
-     (b) **Pre-existing small-frame offload bug** — offload <~41f (FFN-tiling-OFF / ≤16k-token zone)
-     is degenerate (37f offload 9.95 dB; 25f 13.8 dB at lap-07 TOO, so NOT a regression; NOT
-     fused-RoPE, NOT FFN-tiling [`FFN_TILES=2` byte-identical]). Same gallocr-class family as (a).
-     Fixing both → offload works at ALL frame counts (enables short-clip offload for co-running +
-     a clean both-fit 37f tradeoff). **Method (per user):** capture the rope op's `a`/`pe`/`dst`
-     (+ a small-frame intermediate) resident-vs-offload and diff; or `GGML_ALLOCATOR_DEBUG` in the
-     segmented path. Repro: 93f offload (rope bug) / 37f offload (small-frame bug), both fast.
+  1. **Make offload correct at the REAL use case = ~40f clips** (the VRAM/step-timing sweet spot:
+     37f offload **5.4 GB / 32 s-step** vs resident **11.3 GB / 28.5 s-step** — half the VRAM, only
+     ~13% slower). Two segmented-path bugs, same gallocr-class family:
+     (a) **PRIORITY — pre-existing small-frame offload bug.** offload <~41f (FFN-tiling-OFF /
+     ≤16k-token zone) renders degenerate (37f offload **9.95 dB**, generated frames ac16 ~0.2).
+     Present at lap-07 (25f 13.8 dB), so NOT the fused-RoPE regression; NOT FFN-tiling
+     (`FFN_TILES=2` byte-identical). **This is what breaks the 40f use case** — fix this first.
+     (b) **fused-RoPE-on-offload** — `ggml_rope_pe` corrupts under the per-segment gallocr; currently
+     bypassed via `GGMLRunnerContext::allow_fused_rope=false` on offload (~5% slower). Fixing it
+     recovers the perf on offload (~half the 40f tax). Lower priority than (a).
+     **Method (the variables are all capturable — works resident, fails offload):** capture the rope
+     op's `a`/`pe`/`dst` (+ a small-frame block intermediate) resident-vs-offload and diff; or toggle
+     `GGML_ALLOCATOR_DEBUG` in `ggml/src/ggml-alloc.c` on the segmented path to dump per-segment buffer
+     layout. The whole segmented framework (`ggml_graph_cut.cpp`, `ggml_extend.hpp`) is BYTE-IDENTICAL
+     to lap-07 — the bug is the avatar graph × per-segment gallocr, not the framework. Repro (fast):
+     40f offload (small-frame bug) / 93f offload after reverting the allow_fused_rope bypass (rope bug).
   2. **GPU lock**: wire avatar into `koblibs/kob-gpu-gate` per `~/dbrain/HANDOFF-llm-gpu-lock.md`
      as the "future resident workload" (write-lock, no preempt, evict LLM+Python; GPU-clear-idle
      makes eviction brief). If offload (#1) is fixed → it can instead coexist with the read-bucket
