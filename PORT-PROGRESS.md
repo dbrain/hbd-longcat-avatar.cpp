@@ -1,5 +1,82 @@
 # LongCat-Video-Avatar 1.5 → sd.cpp/ggml — PORT PROGRESS / HANDOFF
 
+## ⭐⭐ HANDOFF TO NEXT AGENT — lap-24: VAE CONT + conv-3d-direct, then DiT (written end of lap-23, 2026-05-27)
+
+**Read this + PERF.md lap-23 + lap-21 §7. lap-23 is committed, bit-exact, clean. This is a fresh
+effort handed off because context got long, NOT because it's stuck.**
+
+**What lap-23 shipped (committed `03ba865` + ggml `9966677a`, bit-exact):** smem-halo TILED `im2col_3d`
+kernel + **half2 vectorized F16 store**. The lap-22 fastdiv kernel was gather-read-latency bound; the
+tiled path stages the reused 3×3×3×ICh input window in shared memory once (coalesced) and writes
+columns from smem, and `half2` widens the F16 write 64B→128B. **im2col_3d 15367→3701 ms (−76%);
+VAE decode 29.2→17.7 s (−39%); big call 50→239 GB/s.** Gate: `LONGCAT_IM2COL_VERIFY` (0/800+ byte
+mismatches) + --steps-1 tiled-vs-fastdiv **PSNR 99.00 dB**; 8-step clip ac16 0.83–0.84 flat (no melt).
+Default tile `LONGCAT_IM2COL_TILE=8,8,8,4`; fastdiv retained as fallback. Knobs: `LONGCAT_IM2COL_TILE`,
+`LONGCAT_IM2COL_NOTILE`, `LONGCAT_IM2COL_NOVEC2`, `LONGCAT_IM2COL_VERIFY`.
+
+**DEAD-END (measured, do NOT retry):** `VEC=8` (uint4 128-bit store) — a wash vs half2 (1885–1906 vs
+1906 ms big call); smaller blockDim.x + bigger smem cancel the wider store. Reverted.
+
+**⭐ THE VAE IS NO LONGER im2col-BOUND — re-profiled (`LONGCAT_OP_PROFILE`, serialized≈real 17.2 vs 17.7s):**
+`CONT 22.8% (~4s)` · `MUL_MAT 22.4% (~4s, cuBLAS floor, immovable)` · `IM2COL_3D 18.4%` · `IM2COL-2D 9.6%`
+· `CONCAT 9.6%` · PAD/RMS_NORM/ADD/MUL ~17%. (The DiT step is a separate graph: MUL_MAT 45% + FLASH 33%.)
+
+**User directive: get the VAE to the floor (CONT + conv-3d-direct, quickest first), THEN pivot to DiT/sampling
+(77% of clip wall — they're itching for it). Use case is LONG CHAINED clips, so VAE is ×N segments — the grind compounds.**
+
+### Lever 1 (DO FIRST — quickest, DIAGNOSED): CONT pixel-shuffle copies (~4s, the new #1)
+- Source: Wan VAE `DupUp3D`/`Resample`/`patchify` (`src/wan.hpp` ~L273–329, ~L975–1024) do 3–4
+  `ggml_cont(ggml_ext_torch_permute(...))` depth↔space chains; 6503 strided cont calls in the decode.
+- **ROOT CAUSE (proven via committed `LONGCAT_CONT_PROF` probe, ggml `8e34af2`):** the big high-res
+  conts (e.g. `ne=[96,256,256,4]`, `[256,256,2,96]`, `[192,128,128,4]`) hit the strided `cpy_scalar`
+  kernel at **~95 GB/s vs ~328 GB/s for contiguous memcpy (3.4× gap)** — uncoalesced because the
+  source's contiguous axis is dim1 (`nb01=elsize`) but cont writes dim0-contiguous, so consecutive
+  threads read `nb00` (~262144 elems) apart. The fast smem-tiled `cpy_scalar_transpose` kernel EXISTS
+  (`ggml/src/ggml-cuda/cpy.cu`) but `can_be_transposed` is too narrow (needs `ne[3]==1` + contiguous
+  batch stride; these are genuine 4D permutes with their own dim2/dim3 strides) so they fall to scalar.
+- **FIX DIRECTION:** a general smem-tiled transpose-copy that coalesces when the source's contiguous
+  axis ≠ dst dim0, batched over the higher dims with their real strides (generalize
+  `cpy_scalar_transpose` / broaden the `can_be_transposed` dispatch). Target ~95→~280 GB/s on the big
+  conts. This is shared model-wide (DiT too) so it's bit-exact-or-bust — gate with `LONGCAT_CONT_PROF`
+  + the --steps-1 PSNR-99 check. **Same playbook as the im2col win.** Use the probe to confirm which
+  shapes flipped to the fast path. (Alternative: a custom fused depth↔space op collapsing the 3-cont
+  chain to 1 pass — more work, parked behind the kernel fix.)
+
+### Lever 2 (BIGGER): conv-3d-direct (Tier-2) — eliminate the im2col materialization
+- **Groundwork better than the old handoff implied:** `GGML_OP_CONV_3D` + `ggml_conv_3d_direct` ALREADY
+  exist in this ggml (`ggml/src/ggml.c:4848`, CPU impl), and `ggml/src/ggml-cuda/conv2d.cu` is a CUDA
+  direct-conv template. So Tier-2 = write the CUDA kernel for the existing op + switch `CausalConv3d`
+  (`src/wan.hpp`) to `ggml_conv_3d_direct`. **No new op needed.**
+- **CRITICAL CAVEAT (measured-implication): it MUST be a WMMA tensor-core implicit-GEMM.** The existing
+  `conv2d.cu` is a naive one-thread-per-output FMA loop on CUDA cores — fusing im2col that way kills the
+  ~5s of im2col (IM2COL_3D 18.4% + IM2COL-2D 9.6%) BUT runs the ~4s of MUL_MAT compute (currently at the
+  cuBLAS F16 tensor-core ceiling) on CUDA cores → would BALLOON. Reference the user's WMMA kernel at
+  `~/dev/qwen3-tts.cpp/ggml/src/ggml-cuda/conv-1d-direct.cu` for the implicit-GEMM B-tile-index-on-the-fly
+  pattern (tiles tuned for 1D vocoder shapes — RETUNE for VAE K=27·IC / small spatial / tiny batch).
+  Write it FRESH against the current leejet/ggml base (user confirmed: ignore the "merged ggml base"
+  concern — take from the reference if useful, else fresh). Prototype + measure ONE VAE conv shape before
+  promising a number. Realistic win ~15–20% of VAE.
+
+### Lever 3 (AFTER VAE): DiT / sampling — 77% of clip wall, the real fish
+- lap-21 §7 said matmuls 93% cuBLAS / flash 63% (fork-class). User's instinct: "roofline-bound ≠ no
+  lever in the *pathway*" — look at op COUNT, fusion, redundant CONT/copies (DiT step CONT was 4.3% =
+  734ms over 1543 calls), precision, and whether anything is mis-dispatched. Re-profile the DiT step
+  graph fresh (`LONGCAT_OP_PROFILE`, block with FLASH_ATTN present) before claiming a target.
+
+### Method / environment (inherit, don't re-derive)
+- Build: `~/dev/kobbler/docker/longcat-avatar-dev/iter.sh build`. Measure: `LONGCAT_IM2COL_PROF`,
+  `LONGCAT_CONT_PROF`, `LONGCAT_OP_PROFILE` (all env-gated, serialize → proportions exact, absolute inflated).
+- Gate EVERY kernel change: --steps-1 render with the change vs `*_NOTILE`/baseline → `tools/clip_compare.py` PSNR **99.00 dB** (host has numpy/ffmpeg; builder image does NOT). For data-movement ops, `LONGCAT_IM2COL_VERIFY`-style byte-compare is the strongest gate.
+- Standard render: `-M vid_gen` q4_k DiT + umt5-q8 + wan-vae-f16 + whisper-enc, `girl_480x832.png` +
+  `speech_16k.wav`, 25f/8-step/seed 42/`--clip-on-cpu`/`--max-vram 9`. --steps-1 for kernel sweeps (VAE time is step-independent).
+- ONE GPU. Stop prod acestep/tts/llama before heavy runs; watch orphaned `longcat-avatar-iter` containers.
+  An avatar render server is currently up: `iter.sh serve` on **:8095** (ITER_PORT=8095); clip viewer
+  `tools/serve_clips.py --dir models --port 8011` (host stdlib, browse rendered clips). Default tile baked 8,8,8,4.
+- User wants every lever pushed to the MEASURED floor — measure the "won't help" pokes, don't reason them
+  away (that's where wins hid). Quote measured numbers, label by step count. They cross-check with a fresh agent + codex.
+
+---
+
 ## ⭐ NEXT SESSION — START HERE (handoff 2026-05-27, updated lap-20)
 
 > **lap-20 (this session): the segmented-gallocr corruption is ROOT-CAUSED + FIXED at the
