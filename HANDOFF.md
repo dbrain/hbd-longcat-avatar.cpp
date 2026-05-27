@@ -64,9 +64,11 @@ kills the per-element int64 divide, 147–221 → 315–468 GB/s). Bit-exact by 
 −62%.** CONT moved #1→#5 of the VAE graph. Env: `LONGCAT_CONT_NOTRANSP`, `LONGCAT_CONT_VERIFY`.
 
 **⭐ THE BOTTLENECK MOVED AGAIN — VAE is now MUL_MAT 26.4% (cuBLAS conv-GEMM floor) /
-IM2COL_3D 21.8% / CONCAT 11.4% / IM2COL-2D 11.3% / CONT 8.9%. → DO LEVER 2 NEXT** (conv-3d-direct
-WMMA fuses away both IM2COLs = 33% + the materialize round-trip). CONCAT at 11.4% is newly the
-#3 op and was never investigated — worth a CONT_PROF-style probe if lever 2 stalls.
+IM2COL_3D 21.8% / CONCAT 11.4% / IM2COL-2D 11.3% / CONT 8.9%. **lap-25 UPDATE: lever 2 retiled +
+fastdiv → 5.0× over the prototype but still 1.7× slower than im2col+cuBLAS (see Lever 2 below); cheap
+pokes exhausted, remaining gap is fork-class GEMM tiling + halo gather → PIVOTED TO LEVER 3 (DiT, 77%
+of clip wall).** CONCAT at 11.4% is still the unprobed #3 VAE op — worth a CONT_PROF-style probe if
+DiT stalls and you come back to the VAE.
 
 ## (lap-23, prior) what shipped
 
@@ -135,24 +137,48 @@ Use `LONGCAT_CONT_PROF` to confirm which shapes flip to the fast path and the ne
 
 ---
 
-## Lever 2 — conv-3d-direct ⚠️ PROTOTYPE MEASURED 8.5× SLOWER (lap-24, correct but unoptimized)
+## Lever 2 — conv-3d-direct ⚠️ RETILED + fastdiv, 5.0× FASTER THAN PROTOTYPE BUT STILL 1.7× SLOWER THAN cuBLAS (lap-25)
 
-**Status: kernel written, correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. Do NOT ship as-is.**
-`ggml/src/ggml-cuda/conv-3d-direct.cu` (WMMA implicit-GEMM, adapted from the 1D ref using the
-exact mapping below), wired through `GGML_OP_CONV_3D` CUDA dispatch + `supports_op` + `CausalConv3d`
-(`ggml_ext_conv_3d`, env-gated). **Measured (25f --steps 1): VAE decode 15.09 → 128.22 s — 8.5×
-SLOWER.** Correctness IS fine: PSNR 38.6–40.5 dB / ac16 0.844 ≡ baseline (coherent; the ~40 dB is
-the F16×F16→F32-accum precision shift vs the current path, not a bug — index mapping verified right).
+**Status: correct, default-OFF behind `LONGCAT_CONV3D_DIRECT`. Still NOT competitive — do not ship.**
+ggml `c110e284`. The lap-24 8.5×-slower verdict was the B-regather (CONFIRMED): the prototype copied
+the 1D-ref grid `(patch/BN, oc/BM, batch)` with BM=16, so each patch-tile's gather ran ceil(oc/16)=
+6–24× redundantly. **lap-25 fixes:**
+- **Retile** — each block now accumulates `MSUB` oc-subtiles per warp (warp owns one patch column,
+  loops all oc), so B is gathered ONCE per patch-tile. `grid.y = ceil(oc/(MSUB·16))`; MSUB snapped to
+  instantiated {1,2,3,4,5,6,8,12}, default covers all oc in one block ≤12 frags/thread. `C3_WARPS=8`.
+- **fastdiv** — `init_fastdiv_values`/`fast_div_modulo` kill the 6 raw int-divs/element (same lesson as
+  lap-23 im2col); patch→(od,oh,ow) decomp hoisted out of the BK inner loop.
+- **Store bug fixed** — direct `store_matrix_sync` to a large-stride global ptr gave WRONG output
+  (8.88 dB); the proven c_smem-coalesced write per subtile restores bit-exactness. *(Lesson: don't
+  store_matrix_sync straight to a strided global dst — stage through smem.)*
 
-**Why it lost (prime suspect, reason not yet micro-profiled):** the naive tiling re-gathers B (the
-on-the-fly im2col data) **once per oc-tile** — BM=16, oc=96–384 ⇒ **6–24× redundant** execution of
-the expensive gather (6 int-divs/element), whereas im2col+cuBLAS materializes B ONCE and streams it
-with cache reuse. The 16×64 WMMA tiles also have low arithmetic intensity. **A win here is the
-12–20h fork-class GEMM-engineering grind** (large register/warp tiles so one block covers ALL of oc
-⇒ B gathered once per patch-tile; smem/regs B-reuse; K-tiling tuned for K=2592–10368), NOT a port.
-**Before resuming: micro-profile to confirm B-regather is the cost** (e.g. time a variant that loads B
-from a materialized buffer vs on-the-fly), then decide if the engineering ROI beats lever 3 (DiT, 77%
-of clip wall). The prototype is the correct foundation — iterate the tiling on it, don't rewrite.
+**Measured (25f --steps 1, VAE decode): prototype 128.22 → 25.77 s (5.0×). Baseline im2col+cuBLAS
+15.06 s ⇒ still 1.71× slower.** PSNR 40.52 dB mean / 38.48 min, ac16 0.842–0.844 flat (no melt).
+Levers tried lap-25: retile (3.7×, the big one) · fastdiv (−21%) · hoist patch decomp (−2.8%) ·
+C3_WARPS 4→8 (−2.5%).
+
+**⭐ PARTITION MEASURED (`LONGCAT_CONV3D_BFILL` probe — fills B with a constant, isolates GEMM from
+gather):** full 26.42 s, bfill 17.66 s ⇒ **gather (reads+math) ~8.76 s · GEMM+store+other ~17.66 s.**
+The two cheap pokes moving only ~2.5% each PROVES the GEMM is neither math- nor occupancy-bound: it's
+**WMMA tile-reuse bound** (a_frag reloaded from smem every mma, 16×16 tiles, mma:load ≈ 6:7) and is
+**~3× off cuBLAS** for the same 3D-conv GEMM. The gather is ~2.6× the lap-23 tiled im2col because it
+has **no smem-halo reuse** (~27× redundant x-reads).
+
+**To make lever 2 ship-competitive (both are fork-class, est. 12–20 h total):**
+1. **2D register-blocked warp tiling** (the GEMM lever, biggest) — each warp owns `MSUB`×`NSUB`
+   WMMA subtiles so a_frag is reused NSUB× and b_frag MSUB×; raises mma:load toward cuBLAS. Watch
+   register pressure (c_frag[MSUB·NSUB]·8 regs; oc=96 MSUB=6 → NSUB=2 already 96 regs — may need
+   K-double-buffer + smaller tiles, or split oc across grid.y and eat a little regather).
+2. **smem-halo gather** (the gather lever) — stage the reused 3×3×3×IC input window in smem once like
+   the lap-23 im2col kernel, cutting the ~27× x-read amplification to ~1.4×.
+   *Theoretical fused ceiling ≈ im2col-quality gather (~3.3 s) + cuBLAS-quality GEMM (~3 s) − the
+   2.7 GB round-trip im2col pays ⇒ ~5–6 s, which WOULD beat baseline's ~6.3 s 3D-conv cost. The
+   ceiling exists but only if BOTH halves land near-optimal.*
+
+**ROI call (lap-25):** VAE is ~10% of single-clip wall; lever 2's whole ceiling is ~22% of VAE ≈
+3.9 s/clip (compounds ×N chained clips). DiT (lever 3) is 77% of wall. Retile PAID (proved the
+hypothesis, 5.0×) but the finish line is the fork-class grind above — **pivoted to lever 3 pending
+owner steer.** Resume lever 2 only if DiT stalls or chained-clip VAE compounding justifies the hours.
 
 ### Reference scope (kept from original handoff)
 
@@ -273,3 +299,6 @@ if you need them; not relevant to the perf levers above.
 · `LONGCAT_IM2COL_VERIFY` · `LONGCAT_IM2COL_PROF` · `LONGCAT_CONT_PROF` · `LONGCAT_OP_PROFILE`
 · `LONGCAT_CONT_NOTRANSP` (force old strided cpy_scalar for cont — lap-24 A/B) · `LONGCAT_CONT_VERIFY`
 (byte-compare PERMT/COAL vs scalar reference).
+· `LONGCAT_CONV3D_DIRECT` (lap-25: route 3D convs through the fused WMMA kernel — default-OFF, still
+1.7× slower than im2col+cuBLAS) · `LONGCAT_CONV3D_MSUB=N` (force oc-subtiles/block for tiling sweeps)
+· `LONGCAT_CONV3D_BFILL` (timing probe: constant-fill B to isolate GEMM from gather — WRONG output).
