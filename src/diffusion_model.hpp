@@ -43,6 +43,10 @@ struct DiffusionParams {
     float frame_rate                                                   = 24.f;
     const sd::Tensor<float>* video_positions                           = nullptr;
     const std::vector<int>* skip_layers                                = nullptr;
+    // Sampler step index (0-based), threaded for cross-step caches (e.g. the
+    // LongCat cond-frame K/V cache: the fixed cond frame's forward is
+    // step-invariant, so steps>0 can reuse step-0's per-block cond K/V). -1 = unknown.
+    int step                                                           = -1;
 };
 
 template <typename T>
@@ -513,6 +517,7 @@ struct LongCatAvatarModel : public DiffusionModel {
         avatar.num_ref_latents  = (num_cond_latents > 0) ? cont_num_ref_latents : 0;
         avatar.ref_img_index    = cont_ref_img_index;
         avatar.mask_frame_range = cont_mask_frame_range;
+        avatar.cur_step         = diffusion_params.step;  // for the cond-frame K/V cache (lap-26)
         return avatar.compute(n_threads,
                               *diffusion_params.x,
                               *diffusion_params.timesteps,

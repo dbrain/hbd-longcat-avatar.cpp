@@ -206,7 +206,7 @@ namespace LONGCAT_AVATAR {
                                           num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);
         }
 
-        ggml_tensor* self_attn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, int64_t n_cond_tokens, int64_t T) {
+        ggml_tensor* self_attn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe, int64_t n_cond_tokens, int64_t T, int block_idx = -1) {
             auto qkv    = std::dynamic_pointer_cast<Linear>(blocks["attn.qkv"]);
             auto q_norm = std::dynamic_pointer_cast<UnaryBlock>(blocks["attn.q_norm"]);
             auto k_norm = std::dynamic_pointer_cast<UnaryBlock>(blocks["attn.k_norm"]);
@@ -364,6 +364,14 @@ namespace LONGCAT_AVATAR {
                 q_cond      = ggml_cont(ctx->ggml_ctx, q_cond);
                 k_cond      = ggml_cont(ctx->ggml_ctx, k_cond);
                 v_cond      = ggml_cont(ctx->ggml_ctx, v_cond);
+                // Cond-frame K/V cache (lap-26): the cond frame's input (init_latent) and
+                // timestep (0) are step-invariant, so post-RoPE k_cond / v_cond are bit-
+                // identical every step. Persist them at step 0; steps>0 reuse them and skip
+                // the cond compute (consume path — WIP). Default off ⇒ no graph change.
+                if (ctx->cond_kv_cache && ctx->sampler_step <= 0 && block_idx >= 0) {
+                    ctx->persist_cache_tensor("longcat.condkv.b" + std::to_string(block_idx) + ".k", k_cond);
+                    ctx->persist_cache_tensor("longcat.condkv.b" + std::to_string(block_idx) + ".v", v_cond);
+                }
                 auto x_cond = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_cond, k_cond, v_cond,
                                                      num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, n_cond, C]
 
@@ -556,7 +564,7 @@ namespace LONGCAT_AVATAR {
 
             // self-attn with modulation
             auto x_m = modulate(ctx, mod_norm_attn, x, ms[0], ms[1], T);
-            auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens, T);
+            auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens, T, block_idx);
             x        = gate_add(ctx, x, x_s, ms[2], T);
             subcut(x, "post_self_attn");
 
@@ -1095,6 +1103,11 @@ namespace LONGCAT_AVATAR {
         int num_ref_latents  = 0;   // leading ref-anchor latent frames (1 for the avatar)
         int ref_img_index    = 10;  // ref anchor's temporal grid position (reference default)
         int mask_frame_range = 3;   // noise-near-ref attention carve-out half-width (reference default)
+        // Sampler step index (set per compute() by the diffusion-model wrapper). Used by
+        // the cond-frame cross-step K/V cache (lap-26): the fixed cond frame's 48-block
+        // forward is step-invariant, so step>0 can reuse step-0's per-block cond K/V.
+        // -1 = unknown (cache disabled). Gated behind LONGCAT_COND_CACHE (default off).
+        int cur_step = -1;
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
         float audio_mouth_scale = 1.0f;
@@ -1204,6 +1217,12 @@ namespace LONGCAT_AVATAR {
             }
 
             auto runner_ctx  = get_context();
+            // Cond-frame cross-step K/V cache (lap-26): thread the sampler step + the
+            // env gate into the runner context so self_attn can persist (step 0) /
+            // reuse (step>0) the step-invariant cond-frame K/V. Default off → no-op.
+            static const bool cond_cache_env = []{ const char* s = getenv("LONGCAT_COND_CACHE"); return s && s[0] == '1'; }();
+            runner_ctx.sampler_step = cur_step;
+            runner_ctx.cond_kv_cache = cond_cache_env && (num_cond_latents > 0) && (num_ref_latents == 0);
 
             // Audio path: run AudioProjModel on the host-windowed inputs to produce
             // audio_hidden_states [768, 32, N_t], threaded into every block's audio

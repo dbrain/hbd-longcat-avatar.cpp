@@ -2114,6 +2114,7 @@ public:
             diffusion_params.frame_rate         = frame_rate;
             diffusion_params.video_positions    = video_positions.empty() ? nullptr : &video_positions;
             diffusion_params.skip_layers        = nullptr;
+            diffusion_params.step               = step;  // cross-step cache hook (lap-26 cond-frame K/V)
 
             compute_sample_controls(control_image,
                                     noised_input,

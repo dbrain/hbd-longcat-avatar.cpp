@@ -1687,6 +1687,13 @@ struct GGMLRunnerContext {
     // LONGCAT_NO_FUSED_ROPE.
     bool allow_fused_rope                                            = true;
     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
+    // Cross-step cond-frame K/V cache (LongCat lap-26). sampler_step is the 0-based
+    // denoise step; cond_kv_cache gates the feature (LONGCAT_COND_CACHE). The fixed
+    // cond frame's forward is step-invariant, so step 0 persists per-block cond K/V
+    // (persist_cache_tensor) and steps>0 reuse them (load_cache_tensor), skipping the
+    // cond-token compute. Default off ⇒ byte-identical.
+    int sampler_step                                                 = -1;
+    bool cond_kv_cache                                               = false;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
