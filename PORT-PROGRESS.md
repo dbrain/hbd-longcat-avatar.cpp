@@ -1,6 +1,23 @@
 # LongCat-Video-Avatar 1.5 → sd.cpp/ggml — PORT PROGRESS / HANDOFF
 
-## ⭐ NEXT SESSION — START HERE (handoff 2026-05-27, updated lap-18)
+## ⭐ NEXT SESSION — START HERE (handoff 2026-05-27, updated lap-20)
+
+> **lap-20 (this session): the segmented-gallocr corruption is ROOT-CAUSED + FIXED at the
+> allocator level — BOTH the lap-18 (chain-RoPE-on-offload) and lap-19 (no-merge-small-frame)
+> workarounds are DELETED.** It was one bug: a view-output liveness defect in
+> `ggml/src/ggml-alloc.c`. Prelude cuts (`t_emb` etc.) are `ggml_reshape` **views**; the cut
+> machinery flags the *view* as OUTPUT but gallocr's free path only checks the tensor's own flag,
+> so it frees+reuses the view's storage (`view_src`) and clobbers the output once a block is merged
+> into the cut's segment (delivered `t_emb` std 5.42→0.51 → FFN modulation wrong → residual stream
+> ~475× suppressed). **Fix:** never release a `view_src` whose view is a graph output. Small-frame
+> offload now MERGES (~10%/step) AND uses fused-RoPE (+5%) again; resident untouched (value-
+> preserving). 37f + 93f offload validated coherent; 37f residual stream bit-identical to fine.
+> Full detail in **PERF.md lap 20**. Files: `ggml/src/ggml-alloc.c`, `src/ggml_extend.hpp`, `src/rope.hpp`.
+> **REMAINING for next session: P2 perf/VRAM levers (DMD block-caching, silent-frame audio-cross
+> skip), P3 chaining sweet-spot, and the productionisation follow-ups (#2 GPU lock, #3 koblem UI,
+> #6 commit the kobbler docker bits). P1 is DONE.**
+
+### (historical) handoff (updated lap-18)
 The port is **functionally complete + perf-optimized + productionised**. Read this block, then
 the STATUS section, PERF.md, and AUDIT.md. Branch `longcat-avatar-port`, green.
 - **DONE**: from-scratch ggml port of the 13.6B audio-driven video DiT; single-clip i2v (≤93f) crisp
@@ -23,22 +40,76 @@ the STATUS section, PERF.md, and AUDIT.md. Branch `longcat-avatar-port`, green.
   25f" was a MISLEADING repro: **25f offload was never valid** (degenerate at lap-07 too); the real
   regression is at 93f and it's fixed.
 - **OPEN ITEMS (ranked)**:
-  1. **Make offload correct at the REAL use case = ~40f clips** (the VRAM/step-timing sweet spot:
-     37f offload **5.4 GB / 32 s-step** vs resident **11.3 GB / 28.5 s-step** — half the VRAM, only
-     ~13% slower). Two segmented-path bugs, same gallocr-class family:
-     (a) **PRIORITY — pre-existing small-frame offload bug.** offload <~41f (FFN-tiling-OFF /
-     ≤16k-token zone) renders degenerate (37f offload **9.95 dB**, generated frames ac16 ~0.2).
-     Present at lap-07 (25f 13.8 dB), so NOT the fused-RoPE regression; NOT FFN-tiling
-     (`FFN_TILES=2` byte-identical). **This is what breaks the 40f use case** — fix this first.
-     (b) **fused-RoPE-on-offload** — `ggml_rope_pe` corrupts under the per-segment gallocr; currently
-     bypassed via `GGMLRunnerContext::allow_fused_rope=false` on offload (~5% slower). Fixing it
-     recovers the perf on offload (~half the 40f tax). Lower priority than (a).
-     **Method (the variables are all capturable — works resident, fails offload):** capture the rope
-     op's `a`/`pe`/`dst` (+ a small-frame block intermediate) resident-vs-offload and diff; or toggle
-     `GGML_ALLOCATOR_DEBUG` in `ggml/src/ggml-alloc.c` on the segmented path to dump per-segment buffer
-     layout. The whole segmented framework (`ggml_graph_cut.cpp`, `ggml_extend.hpp`) is BYTE-IDENTICAL
-     to lap-07 — the bug is the avatar graph × per-segment gallocr, not the framework. Repro (fast):
-     40f offload (small-frame bug) / 93f offload after reverting the allow_fused_rope bypass (rope bug).
+  1. ✅ **DONE (lap-19): offload correct at the ~40f use case.** (a) The pre-existing small-frame
+     offload bug is FIXED — root cause was the graph-cut **budget-merge × FFN-tiling-off regime**
+     (NOT fused-RoPE, NOT FFN-tiling, deterministic); fix = `graph_cut_allow_merge` gated off when
+     `n_token ≤ 16000` so small-frame uses finest segmentation. 37f offload now ac16 0.833–0.842.
+     (b) **STILL OPEN (lower priority): recover fused-RoPE on offload.** Small-frame now runs *fine*
+     (unmerged) segmentation — the gallocr-safest regime — so retest `allow_fused_rope=true` for the
+     small-frame offload path (currently false for ALL offload, lap-18). Quick check: force it on,
+     `--steps 1`, diff block0 std vs resident (57923). If clean → recover ~5% with no downside. 93f
+     stays chain-RoPE (it's merged, where fused still corrupts). See PERF.md lap-19.
+
+  ### ⭐⭐ TOP PRIORITIES FOR NEXT SESSION (user-directed 2026-05-27) ⭐⭐
+  Do P1 and P2 first; rope P3 in opportunistically but do NOT burn a session on it.
+
+  **P1 — ✅ DONE (lap-20): properly fixed the per-segment gallocr bug + killed BOTH workarounds.**
+  Root cause = a view-output liveness defect in `ggml/src/ggml-alloc.c` (the cut machinery flags a
+  *view* as OUTPUT but gallocr frees/reuses the view's `view_src` storage). Fix: never release a
+  `view_src` whose view is a graph output. The lap-19 `graph_cut_allow_merge` gate AND the lap-18
+  `allow_fused_rope=!segmented` gate are both deleted — both were masking this one bug. See PERF.md
+  lap 20. (Original task text kept below for context.)
+  The user was explicit: "every 'it's broken under this scenario — oh ok don't do that scenario' is
+  hiding something that will bite later." The lap-19 fix (`graph_cut_allow_merge=false` when
+  n_token≤16k) was a **workaround that disables a legitimate optimization** to avoid a real,
+  un-pinned bug — and it cost **~10%/step** (37f offload: 35.5 s/step fine-seg vs 32.2 s/step merged).
+  - **What's known (don't re-derive):** merging a block's intra-block sub-cuts (self/cross/FFN)
+    into one per-segment gallocr pass **deterministically** collapses the residual stream in the
+    FFN-tiling-OFF regime (block0 std 57923→103, bit-identical across merge degrees → NOT
+    concurrency; NOT fused-RoPE; NOT FFN-tiling). 93f (FFN-tiled, >16k tok) merges fine. The
+    `GGML_ALLOCATOR_DEBUG` trace of block-0's segment showed its **outputs and external/cached
+    inputs ARE correctly protected** from reuse — so it is NOT a naive gallocr buffer reuse; the
+    mechanism is subtler (candidates not yet ruled out: an inplace op writing a tensor that's still
+    a live source; a view/`view_src` liveness miscount; or node-ORDER in the merged segment graph
+    — `internal_node_indices` is a sorted `std::set<int>` = gf-index order, verify that's truly
+    topological for the merged multi-output walk). Method: `GGML_ALLOCATOR_DEBUG` is wired behind
+    `#define`+`LONGCAT_ALLOC_DEBUG` env (reverted in ggml-alloc.c — re-add the 3-line block);
+    diff the block-0 segment's alloc trace MERGED (`--max-vram 9`) vs FINE (`--max-vram 3`) at 37f
+    `--steps 1` and find the tensor whose buffer differs/aliases. All GPU-cheap (`--steps 1`, no
+    full renders — see method note below). **Fixing this also very likely re-enables fused-RoPE on
+    offload (lap-18 item) — same gallocr-class — collapsing both into one win + recovering ~10%.**
+  - **Acceptance:** 37f offload merged (`graph_cut_allow_merge` removed/true) → ac16 ≥0.83 all
+    frames AND block0 std ≈57923; 93f offload still coherent; resident 25f still 99 dB.
+
+  **P2 — pull every perf/VRAM lever that doesn't cost quality.** User: "any performance levers you
+  see, pull; same with VRAM levers if it doesn't affect performance/quality meaningfully."
+  Candidates (measure each, keep only neutral-or-better):
+  - **DMD-step block-caching** — `cache_dit.hpp`/`easycache.hpp` exist in-tree but are NOT wired
+    for the avatar. At 8 DMD steps the reuse window is small, so MEASURE the residual stability
+    across steps before committing; could skip recomputing stable transformer blocks. Biggest
+    untapped GEMM lever (MUL_MAT 45% + FLASH 33% is otherwise at ~98% roofline — see lap-19 #5).
+  - **Audio-cross-attn skip on SILENT frames** — small (~1–2% × silent-fraction; it's non-flash),
+    but free if the silence mask is already known from the TTS audio. Pairs with the #3 UI
+    "silence filler" idea.
+  - VRAM levers that don't hurt perf/quality (e.g. anything that lets ~40f run RESIDENT — the fast
+    path — instead of offload; see P3 note on the resident ceiling).
+
+  **P3 — (opportunistic, GPU-heavy, LOW priority) chaining frames-vs-time sweet spot for LONG clips.**
+  The product goal is long talking clips via chaining; the open question is **what per-segment
+  length maximizes sustained NEW-frames-per-wall-second.** The tension (user's framing): each chain
+  segment reprocesses `cont_cond_frames` (default 13) as context and emits the rest as NEW frames
+  (37f seg ⇒ 13 reprocessed + ~24 new); **bigger segments amortize the fixed 13-frame reprocess
+  overhead better, but per-step cost rises with length** (more tokens, and the offload weight-stream
+  tax once >~40f). **Key lever to factor in:** ≤~40f can run RESIDENT (no weight-stream, ~28.5 s/step
+  per lap-18) vs offload (~35.5 s/step) — so the optimum may be "largest segment that still fits
+  RESIDENT." (NOTE: my lap-19 37f *resident* run OOM'd at the 3.8 GB DiT compute buffer + ~10.4 GB
+  weights, but lap-18's table claims 37f resident ran at 11.3 GB — **the resident frame ceiling is
+  unpinned; pin it first**, it may be <37f or need a smaller VAE tile.) Compute throughput =
+  new_frames / segment_wall_time and find the max. **Do NOT dedicate a session to bisecting "is 34f
+  slightly better than 37f"** — derive the curve cheaply (per-step time scales with token count,
+  ~measurable from 1–2 `--steps 1` timings per length + the fixed reprocess count) and only spot-
+  check. Fold it in while P1/P2 runs are already on the GPU.
+
   2. **GPU lock**: wire avatar into `koblibs/kob-gpu-gate` per `~/dbrain/HANDOFF-llm-gpu-lock.md`
      as the "future resident workload" (write-lock, no preempt, evict LLM+Python; GPU-clear-idle
      makes eviction brief). If offload (#1) is fixed → it can instead coexist with the read-bucket
@@ -52,16 +123,16 @@ the STATUS section, PERF.md, and AUDIT.md. Branch `longcat-avatar-port`, green.
      "filler"/idle-loop reuse so silent stretches aren't re-rendered (detect silence in the TTS audio,
      splice a pre-rendered idle loop instead of generating empty frames).
   4. **mouth-exag tuning** — knob's in; dial it WITH a cleaner-audio + simpler (anime/3D) character.
-  5. **graph-minimality perf deep-dive** — roofline proved kernels efficient (98% GEMM), NOT that the
-     graph is minimal. The open question: "98% GPU, but is it doing the MINIMAL work for the output, or
-     98% with ~30% wasted?" Candidates for wasted work: audio cross-attn runs every block even during
-     SILENCE; cond-overlap frames re-sampled each chain segment; always full-res; any redundant
-     CONT/REPEAT/recompute. **NOT captured during the lap-18 offload-fix runs** (root-causing the
-     RoPE bug took priority; the op-type profiler `LONGCAT_OP_PROFILE` was reverted from the ggml
-     submodule with no saved patch, so it wasn't "free" to piggyback). Needs: re-apply the ~42-line
-     cudaEvent `[OP_PROFILE]` block around `ggml_cuda_compute_forward` in `ggml/src/ggml-cuda/
-     ggml-cuda.cu` (per lap-03/08) + rebuild + one profiled DiT step. lap-08 already has the resident
-     25f breakdown (MUL_MAT 42% / FLASH 31% / glue 28%) — the NEW question is "minimal vs wasted".
+  5. **graph-minimality perf deep-dive** — ⏳ PARTLY ANSWERED (lap-19). `LONGCAT_OP_PROFILE`
+     re-applied (env-gated, in the ggml submodule working tree) + resident-25f DiT step captured:
+     **MUL_MAT 45% + FLASH 33% = 78%** compute-bound; no hidden "~30% wasted" glue bucket (every
+     non-GEMM op <6%, all real residual/modulation/norm work; CONT fell 8.7%→4.3% post rope-fusion).
+     So the step is close to minimal at the op level. FLASH (33%) = self-attn (2-pass) + text-cross
+     only; **audio-cross-attn is NON-flash** (small per-frame, 32 KV tokens → SOFT_MAX 0.2% + a bit
+     of MUL_MAT, ~1–2% total), so skipping it on SILENT frames is a *small* lever (~1–2% × silent
+     fraction), NOT the ⅓-of-FLASH an earlier draft claimed. Real GEMM reduction needs *less work*:
+     lower quant (lap-13), fewer DMD steps (lap-02), lower res/frames, or DMD-step block-caching
+     (`cache_dit.hpp`/`easycache.hpp` exist, not wired for the avatar). Full table in PERF.md lap-19.
   6. **commit the kobbler docker bits** (the prod avatar service is uncommitted on kobbler `main`).
 - **PROCESS LESSON (cost real wall-time)**: iterate on the MINIMUM repro (shortest clip/segments/
   steps); reserve long/quality renders for FINAL validation. See memory `feedback-iterate-minimum-repros`.
@@ -83,6 +154,56 @@ Build/run on this box is fine (the no-build rule is the kobbler Rust workspace o
 GPU is single (RTX 3060 12GB) — stop prod acestep/tts/llama before heavy runs.
 
 ## STATUS (update this section every session)
+
+- 🟢 **lap 20 (session 26): TRUE ROOT CAUSE of the segmented-gallocr corruption — one allocator fix,
+  BOTH lap-18 + lap-19 workarounds DELETED.** It was a single bug: **a view-output liveness defect in
+  `ggml/src/ggml-alloc.c`.** Prelude graph-cuts (`t_emb`, `context`, `pe`, …) are `ggml_reshape`
+  **views**; `build_segment_graph` sets `GGML_TENSOR_FLAG_OUTPUT` on the *view*, but the gallocr free
+  path (`ggml_gallocr_free_node` + the `n_views` release in `ggml_gallocr_alloc_graph_impl`) only
+  checks a tensor's OWN output flag — so when the view's last *in-segment* consumer fires (only when a
+  block is merged into the cut's segment, i.e. budget-merge OR fused-RoPE reads the merged graph) it
+  frees the view's storage tensor (`view_src`) and reuses the buffer, **clobbering the output**.
+  Delivered `t_emb` std collapses **5.42→0.51** → block-0 FFN modulation wrong → `block0.out` std
+  **49072→103** (~475×), propagating. Fine segmentation only worked because the cut had no in-segment
+  consumer (view_src never released) — so "don't merge" (lap-19) and "don't fuse-rope on offload"
+  (lap-18) both masked the same defect. **Fix:** in the view-release branch, if the view is itself a
+  graph output, never decrement/free its `view_src` (the output aliases it; pin it for the whole graph).
+  **Method:** non-perturbing `--steps 1` SEG_TAP (reads cut buffers + delivered input leafs directly) +
+  static alias/topo checks — no full renders during the hunt; `GGML_GALLOC_NO_FREE` "fixed" it but via a
+  segmentation-sizing confound, the real signal was the delivered-`t_emb` trace. **Removed both
+  workarounds** (`graph_cut_allow_merge` + `allow_fused_rope=!segmented`): small-frame offload MERGES
+  again (~10%/step) and uses fused-RoPE (+5%). **Validated:** 37f offload forced-merge `--steps 1` →
+  residual stream bit-identical to fine (`block0.out` 49072.19554); 37f offload 8-step default
+  (fused+merged) → coherent, 359 s, 5715 MiB; fused≈chain byte-size-identical at 37f + 93f; resident 25f
+  coherent (value-preserving by construction). **NEXT (P2/P3 + productionisation #2/#3/#6) below.**
+  Files: `ggml/src/ggml-alloc.c`, `src/ggml_extend.hpp`, `src/rope.hpp`. Full detail PERF.md lap 20.
+
+- 🟢 **lap 19 (session 25): SMALL-FRAME (~40f) OFFLOAD BUG ROOT-CAUSED + FIXED — the ~40f use case
+  now renders coherent by DEFAULT.** The lap-18 open item #1a (offload <~41f degenerate, 9.95 dB).
+  **Root cause = the graph-cut budget-merge × the FFN-tiling-off regime:** when post-patch
+  `n_token ≤ 16000` (<~41f), `apply_max_vram_budget` merging a block's intra-block sub-cuts
+  (self-attn/cross-attn/FFN) into one per-segment gallocr pass DETERMINISTICALLY collapses the
+  residual stream (block0 std 57923→103, *bit-identical* wrong value across merge degrees → not
+  concurrency, not fused-RoPE, not FFN-tiling). 93f works because it's FFN-*tiled* (>16k tok) and
+  merges cleanly — the bug is specific to the small-frame regime. **Fix:** `GGMLRunner::
+  graph_cut_allow_merge` (default true) gated off by the avatar when `n_token ≤ 16000`;
+  `resolve_plan(..., allow_merge=false)` then skips the budget-merge and uses the finest (unmerged,
+  proven-correct) base segmentation. Large-frame (93f) + resident paths byte-for-byte UNTOUCHED.
+  **Validated:** 37f offload 8-step DEFAULT (no env) → ac16 **0.833–0.842 all 37 frames**
+  (`models/_perf/lap19_smallframe_offload_fix_37f.webm`), ~35.5 s/step, ~5.4 GB. So the VRAM
+  sweet-spot (~40f offload, ½ the resident VRAM, coexists with the read-bucket services) is now
+  correct. **Also (#5):** re-applied env-gated `LONGCAT_OP_PROFILE` and captured the resident-25f
+  DiT-step GEMM breakdown — **MUL_MAT 45% + FLASH_ATTN_EXT 33% = 78%** (compute-bound, matches the
+  98%-GEMM roofline; CONT 8.7%→4.3% post rope-fusion). No hidden "wasted-work" bucket. (FLASH =
+  self-attn + text-cross only; audio-cross is non-flash & small, ~1–2% — so the silent-frame lever
+  is small, NOT ⅓ of FLASH.)
+  Full detail in **PERF.md lap-19**. Files: `src/ggml_graph_cut.{h,cpp}`, `src/ggml_extend.hpp`,
+  `src/longcat_avatar.hpp`. Method note: root-caused entirely on `--steps 1` minimum-repros +
+  code/allocator reading — no full renders during the hunt (see `feedback-iterate-minimum-repros`).
+  - **STILL OPEN (follow-up, NOT done):** recover fused-RoPE on the small-frame offload path — it
+    now uses *fine* segmentation (the gallocr-safest regime), so `allow_fused_rope=true` there may
+    work + recover ~5% (currently still false for all offload per lap-18). 93f stays chain-RoPE
+    (merged, where fused still corrupts).
 
 - 🟢 **lap 18 (session 24): `--offload-to-cpu` DEGENERATE OUTPUT ROOT-CAUSED + FIXED (the #1 unlock).**
   Root cause = the custom **fused-RoPE op** (`ggml_rope_pe`, default since lap-10): correct under the

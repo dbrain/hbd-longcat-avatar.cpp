@@ -811,10 +811,10 @@ namespace Rope {
         // (real-gallocr same-topology), and a 25f render that is 99 dB bit-identical to
         // BEST on all frames. See PERF.md lap 10. Speed: DiT 18.35 -> 17.42 s/step
         // (-5%), sampling 147 -> 139.9 s, all lengths.
-        // allow_fused is set false by the caller when this runner executes via the
-        // offload/graph-cut SEGMENTED path: the op is correct monolithic (99 dB) but
-        // DEGENERATES to noise under the per-segment gallocr (offload). See
-        // GGMLRunnerContext::allow_fused_rope + PERF.md lap 18.
+        // allow_fused is on for both resident and offload since lap-20 (the
+        // per-segment gallocr view-output bug that lap-18 worked around by forcing
+        // chain-RoPE on offload is fixed in ggml-alloc). See
+        // GGMLRunnerContext::allow_fused_rope + PERF.md lap 20.
         if (rope_interleaved && allow_fused && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
             x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
