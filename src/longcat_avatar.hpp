@@ -408,6 +408,22 @@ namespace LONGCAT_AVATAR {
                     auto wk = ggml_cpy(ctx->ggml_ctx, kc, (*ctx->condkv_k)[block_idx]);
                     auto wv = ggml_cpy(ctx->ggml_ctx, vc, (*ctx->condkv_v)[block_idx]);
                     if (ctx->cache_writes) { ctx->cache_writes->push_back(wk); ctx->cache_writes->push_back(wv); }
+                    // LongCat lap-27 OFFLOAD FIX: tag each cpy write into the BLOCK'S
+                    // existing "post_self_attn" subcut group. The graph-cut planner only
+                    // builds segments around subcut-marked tensors + the final output —
+                    // without this, the cpy writes belong to NO segment (they're not
+                    // marked, and they're not on the residual chain), so the offload's
+                    // segmented executor never runs them and condkv_buf stays zeros.
+                    // Sharing the group name with the residual's post_self_attn subcut
+                    // makes them additional outputs of the same segment — no extra
+                    // compute (the cast/scale chain shares ancestors with the attn
+                    // path) and minimal plumbing.
+                    if (block_idx >= 0) {
+                        sd::ggml_graph_cut::mark_graph_cut(
+                            wk, "longcat.blocks." + std::to_string(block_idx) + ".post_self_attn", "condkv_k");
+                        sd::ggml_graph_cut::mark_graph_cut(
+                            wv, "longcat.blocks." + std::to_string(block_idx) + ".post_self_attn", "condkv_v");
+                    }
                 }
                 auto x_cond = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_cond, k_cond, v_cond,
                                                      num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, n_cond, C]
@@ -1370,18 +1386,8 @@ namespace LONGCAT_AVATAR {
                 const char* s = getenv("LONGCAT_NO_COND_CACHE");
                 return s && s[0] == '1';
             }();
-            // Lap-27 test/eval hook: LONGCAT_COND_CACHE_FORCE=1 lets the cond-cache run
-            // on the offload path so the segmented-leaf fix can be verified end-to-end
-            // before the auto-disable is relaxed. Once verified (PSNR 99 vs resident),
-            // this stays as a kill-switch / regression flag.
-            static const bool cond_cache_force_offload = []{
-                const char* s = getenv("LONGCAT_COND_CACHE_FORCE");
-                return s && s[0] == '1';
-            }();
-            const bool is_offload_path = (params_backend != runtime_backend);
             runner_ctx.sampler_step = cur_step;
             runner_ctx.cond_kv_cache = !cond_cache_disabled_env &&
-                                       (!is_offload_path || cond_cache_force_offload) &&
                                        (num_cond_latents > 0) &&
                                        (num_ref_latents == 0) &&
                                        runner_ctx.flash_attn_enabled;
