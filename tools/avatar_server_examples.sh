@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Example curls for the LongCat-Avatar HTTP server (tools/avatar_server.py).
+# Example curls for the native LongCat-Avatar HTTP server
+# (examples/server -> longcat-avatar-server). Same wire shape as the old
+# tools/avatar_server.py supervisor (retired 2026-05-29).
 #
 # Start the server first (dev):
-#   ITER_PORT=8095 kobbler/docker/longcat-avatar-dev/iter.sh serve
+#   ITER_PORT=8095 kobbler/docker/longcat-avatar-dev/iter.sh restart
 # or prod:
-#   docker compose --profile longcat-avatar up -d longcat-avatar   # :8809
+#   docker compose up -d longcat-avatar   # :8809
 #
 # Then:  HOST=localhost:8095 ./tools/avatar_server_examples.sh
 set -euo pipefail

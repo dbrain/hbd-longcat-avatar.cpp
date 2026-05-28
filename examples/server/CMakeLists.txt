@@ -1,4 +1,4 @@
-set(TARGET sd-server)
+set(TARGET longcat-avatar-server)
 
 option(SD_SERVER_BUILD_FRONTEND "Build server frontend with pnpm" ON)
 
@@ -66,6 +66,7 @@ add_executable(${TARGET}
     ../common/common.cpp
     ../common/log.cpp
     ../common/media_io.cpp
+    ../common/avatar_render.cpp
     main.cpp
     runtime.cpp
     async_jobs.cpp
@@ -73,6 +74,9 @@ add_executable(${TARGET}
     routes_openai.cpp
     routes_sdapi.cpp
     routes_sdcpp.cpp
+    routes_longcat.cpp
+    worker_ipc.cpp
+    worker_session.cpp
 )
 if(APPLE)
     sd_set_macos_rpaths(${TARGET})

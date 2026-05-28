@@ -1687,6 +1687,27 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("increase_ref_index", increase_ref_index);
     load_if_exists("embed_image_metadata", embed_image_metadata);
 
+    // LongCat-Avatar fields. The struct already carries them; from_json_str
+    // just wasn't loading them before the native server landed. `audio_path`
+    // is the driving wav (16 kHz mono); `segments` / `cont_cond_frames`
+    // control multi-segment chaining; mouth scale / lowpass tune the
+    // viseme residual at render time (env-bridged inside the avatar lib).
+    // Accept `segment_frames` as an alias for `video_frames` so the
+    // GO-LIVE-PLAN's wire shape matches the supervisor 1:1.
+    load_if_exists("audio_path", audio_path);
+    load_if_exists("audio_mouth_scale", audio_mouth_scale);
+    load_if_exists("audio_lowpass", audio_lowpass);
+    if (j.contains("audio_lowpass_hz") && j["audio_lowpass_hz"].is_number()) {
+        audio_lowpass = j["audio_lowpass_hz"];
+    }
+    load_if_exists("segments", segments);
+    load_if_exists("cont_cond_frames", cont_cond_frames);
+    load_if_exists("cont_ref_img_index", cont_ref_img_index);
+    load_if_exists("cont_mask_frame_range", cont_mask_frame_range);
+    if (j.contains("segment_frames") && j["segment_frames"].is_number_integer()) {
+        video_frames = j["segment_frames"];
+    }
+
     if (j.contains("hires") && j["hires"].is_object()) {
         const json& hires_json = j["hires"];
         if (hires_json.contains("enabled") && hires_json["enabled"].is_boolean()) {
