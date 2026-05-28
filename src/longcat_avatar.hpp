@@ -1337,14 +1337,30 @@ namespace LONGCAT_AVATAR {
             // pre-expand its small scale_bias node (otherwise it would land between
             // NORM and MUL in topo order and block the {NORM, MUL, ADD} autofusion).
             runner_ctx.gf = gf;
-            // Cond-frame cross-step K/V cache (lap-26): thread the sampler step + the
-            // env gate into the runner context so self_attn can persist (step 0) /
-            // reuse (step>0) the step-invariant cond-frame K/V. Default off → no-op.
-            static const bool cond_cache_env = []{ const char* s = getenv("LONGCAT_COND_CACHE"); return s && s[0] == '1'; }();
+            // Cond-frame cross-step K/V cache. Shipped bit-exact in lap-26 (PSNR 99 +
+            // 8% sampling-wall win); stacked with the lap-27.1 fused-modulate to ship
+            // ~+9% combined. DEFAULT ON. Opt out via LONGCAT_NO_COND_CACHE=1.
+            //
+            // HARD-requires the resident path: on offload (--offload-to-cpu /
+            // --max-vram), the segmented graph-cut's bind_segment_cached_inputs
+            // misbinds the persistent cross-compute() leaves and PSNR collapses to
+            // ~12 dB (recurring class — same as the lap-20 view-output liveness
+            // bug). Auto-disabled there; proper fix is parked as a future lap.
+            //
+            // Requires flash-attn: cache stores F16(k*kv_scale) and kv_scale=1/256
+            // is what keeps v F16-safe; the non-flash path (kv_scale=1) would
+            // overflow.
+            static const bool cond_cache_disabled_env = []{
+                const char* s = getenv("LONGCAT_NO_COND_CACHE");
+                return s && s[0] == '1';
+            }();
+            const bool is_offload_path = (params_backend != runtime_backend);
             runner_ctx.sampler_step = cur_step;
-            // Requires flash-attn: the cond K/V cache stores F16(k*kv_scale) and kv_scale<1
-            // (=1/256) is what keeps v F16-safe; the non-flash path (kv_scale=1) would overflow.
-            runner_ctx.cond_kv_cache = cond_cache_env && (num_cond_latents > 0) && (num_ref_latents == 0) && runner_ctx.flash_attn_enabled;
+            runner_ctx.cond_kv_cache = !cond_cache_disabled_env &&
+                                       !is_offload_path &&
+                                       (num_cond_latents > 0) &&
+                                       (num_ref_latents == 0) &&
+                                       runner_ctx.flash_attn_enabled;
             condkv_writes.clear();
             if (runner_ctx.cond_kv_cache) {
                 int64_t t_len_c = x->ne[2];
