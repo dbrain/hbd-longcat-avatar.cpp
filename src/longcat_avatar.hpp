@@ -1285,11 +1285,23 @@ namespace LONGCAT_AVATAR {
         // (Re)allocate the BSA mask if the shape (n_noise, n_token) changed, fill the
         // -INF/0 mask on the host, and upload. Cube structure [T=full, H=cube_h, W=cube_w]
         // with `radius` spatial-cube window. cond-frame tokens (k_t==0) are always allowed.
+        // self_frame_anchor (lap-29-quality): if true, Q at time T also allows ALL K at
+        // time T (full intra-frame attention) — addresses edge-cube asymmetry + time-blind
+        // cross-temporal mixing that causes the "slow rotation" failure mode.
+        // bookend_anchor: if true, additionally allow ALL K at the LAST frame.
+        int  bsa_cached_self_frame  = -1;
+        int  bsa_cached_bookend     = -1;
+        int  bsa_cached_radius      = -1;
         void ensure_bsa_mask(int64_t n_noise, int64_t n_token,
                              int64_t n_per_frame, int64_t h_len, int64_t w_len,
-                             int cube_h, int cube_w, int radius) {
-            if (bsa_buf && bsa_cached_n_token == n_token && bsa_cached_n_noise == n_noise) {
-                return;  // already built for this shape
+                             int cube_h, int cube_w, int radius,
+                             bool self_frame_anchor = false, bool bookend_anchor = false) {
+            const int sfa_i = self_frame_anchor ? 1 : 0;
+            const int bka_i = bookend_anchor ? 1 : 0;
+            if (bsa_buf && bsa_cached_n_token == n_token && bsa_cached_n_noise == n_noise &&
+                bsa_cached_self_frame == sfa_i && bsa_cached_bookend == bka_i &&
+                bsa_cached_radius == radius) {
+                return;  // already built for this shape + flags
             }
             free_bsa_mask();
             ggml_init_params p = { ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
@@ -1311,8 +1323,11 @@ namespace LONGCAT_AVATAR {
             const ggml_fp16_t MASK_DENY  = 0xFC00;  // F16 -infinity
             const ggml_fp16_t MASK_ALLOW = 0x0000;  // F16 +zero
             const int64_t n_cond_local = n_token - n_noise;
+            const int64_t T_total      = n_token / n_per_frame;
+            const int64_t T_last       = T_total - 1;
             for (int64_t qi = 0; qi < n_noise; ++qi) {
                 const int64_t q_orig    = n_cond_local + qi;
+                const int64_t q_t       = q_orig / n_per_frame;
                 const int64_t q_spatial = q_orig % n_per_frame;
                 const int64_t q_h       = q_spatial / w_len;
                 const int64_t q_w       = q_spatial % w_len;
@@ -1327,13 +1342,19 @@ namespace LONGCAT_AVATAR {
                     const int     k_cube_w  = (int) (k_w / cube_w);
                     bool allow = (std::abs(q_cube_h - k_cube_h) <= radius) &&
                                  (std::abs(q_cube_w - k_cube_w) <= radius);
-                    if (k_t == 0) allow = true;  // ref-frame anchor
+                    if (k_t == 0) allow = true;  // ref-frame anchor (always on)
+                    if (self_frame_anchor && k_t == q_t) allow = true;  // intra-frame anchor
+                    if (bookend_anchor && k_t == T_last) allow = true;  // last-frame anchor
                     data[(size_t) qi * n_token + ki] = allow ? MASK_ALLOW : MASK_DENY;
                 }
             }
             ggml_backend_tensor_set(bsa_mask_tensor, data.data(), 0, ggml_nbytes(bsa_mask_tensor));
-            LOG_INFO("[BSA] mask built: n_noise=%lld n_token=%lld cube=[%d,%d] radius=%d bytes=%.1f MiB",
+            bsa_cached_self_frame = sfa_i;
+            bsa_cached_bookend    = bka_i;
+            bsa_cached_radius     = radius;
+            LOG_INFO("[BSA] mask built: n_noise=%lld n_token=%lld cube=[%d,%d] radius=%d self_frame=%d bookend=%d bytes=%.1f MiB",
                      (long long) n_noise, (long long) n_token, cube_h, cube_w, radius,
+                     sfa_i, bka_i,
                      (double) ggml_nbytes(bsa_mask_tensor) / (1024.0 * 1024.0));
         }
 
@@ -1537,11 +1558,20 @@ namespace LONGCAT_AVATAR {
                         const char* s = getenv("LONGCAT_BSA_RADIUS");
                         return (s && s[0]) ? atoi(s) : 1;
                     }();
+                    static const bool bsa_self_frame = []{
+                        const char* s = getenv("LONGCAT_BSA_SELF_FRAME");
+                        return s && s[0] == '1';
+                    }();
+                    static const bool bsa_bookend = []{
+                        const char* s = getenv("LONGCAT_BSA_BOOKEND");
+                        return s && s[0] == '1';
+                    }();
                     int64_t n_token_b = t_len_c * npf_c;
                     int64_t n_noise_b = n_token_b - ncond_c;
                     if (n_noise_b > 0 && (h_len_c % bsa_cube_h) == 0 && (w_len_c % bsa_cube_w) == 0) {
                         ensure_bsa_mask(n_noise_b, n_token_b, npf_c, h_len_c, w_len_c,
-                                        bsa_cube_h, bsa_cube_w, bsa_radius);
+                                        bsa_cube_h, bsa_cube_w, bsa_radius,
+                                        bsa_self_frame, bsa_bookend);
                         if (cur_step > 1) {
                             runner_ctx.bsa_mask = bsa_mask_tensor;
                         }
