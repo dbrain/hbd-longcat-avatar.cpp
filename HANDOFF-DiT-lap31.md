@@ -57,7 +57,14 @@ Commit `ac008e0` (parent only; no ggml submodule bump).
 
 **Wall delta:** −0.5s sampling (107.92 vs 108.45 baseline, ~0.5% sampling, 0.35% wall). Smaller than the 1.18s subagent projection — kv_linear at M=512 is cheaper than the FLOP estimate suggested.
 
-**VRAM:** +~227 MiB (`hidden_size=2304 × n_ctx=512 × N=1 × F16 × 48 layers × 2 K+V`). **Cannot combine with BSA at --max-vram 9** (DiT 8.5 GiB + cond_kv 1.2 GiB + BSA mask 408 MiB + xattn 227 MiB > 12 GiB → OOM).
+**VRAM:** +384 MiB (`hidden_size=4096 × n_ctx=512 × N=1 × F16 × 48 layers × 2 K+V`).
+*Note: the original commit message + this handoff line had wrong arithmetic
+("227 MiB" assumed `hidden_size=2304`; actual avatar_params.hidden_size=4096
+per longcat_avatar.hpp:935 → real cache size is 384 MiB).*
+**Cannot combine with BSA at --max-vram 9** (DiT 8.5 GiB + compute peak 1.45 GiB +
+cond_kv 1.2 GiB + BSA mask 195 MiB at 25f + xattn 384 MiB > 11.9 GiB usable →
+OOM). The BSA-mask-1-bit-pack lap-32 candidate (lap-32 §VRAM survey) reclaims
+~182 MiB and combined with xattn n_ctx-trim opens the triple-stack.
 
 **Opt-in:** `LONGCAT_XATTN_TEXT_CACHE=1` env.
 

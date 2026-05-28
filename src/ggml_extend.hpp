@@ -2540,6 +2540,34 @@ protected:
         return true;
     }
 
+    // LongCat lap-32: offload-path per-segment timing aggregator. When the
+    // LONGCAT_OFFLOAD_PROFILE env is set, every execute_graph() call adds its
+    // wall-time breakdown to these counters; compute_with_graph_cuts dumps and
+    // zeros them per render. Per-call profile (LONGCAT_PROFILE) is per-segment-
+    // noisy; the aggregator gives the "where does offload time go" answer
+    // in one row.
+    struct offload_profile_acc {
+        int64_t total_ms      = 0;
+        int64_t offload_ms    = 0;
+        int64_t restore_ms    = 0;
+        int64_t alloc_ms      = 0;
+        int64_t copy_in_ms    = 0;
+        int64_t compute_ms    = 0;
+        int   n_segments      = 0;
+        int64_t n_nodes_total = 0;
+    };
+    offload_profile_acc offload_profile_;
+    void reset_offload_profile() { offload_profile_ = {}; }
+    void dump_offload_profile(const char* label) const {
+        if (getenv("LONGCAT_OFFLOAD_PROFILE") == nullptr) return;
+        const offload_profile_acc& p = offload_profile_;
+        int64_t other = p.total_ms - p.offload_ms - p.restore_ms - p.alloc_ms - p.copy_in_ms - p.compute_ms;
+        LOG_INFO("[OFFLOAD_PROFILE] %s segs=%d nodes=%lld total=%lldms (offload_H2D=%lldms restore=%lldms alloc=%lldms copy_in=%lldms compute=%lldms other=%lldms)",
+                 label, p.n_segments, (long long)p.n_nodes_total, (long long)p.total_ms,
+                 (long long)p.offload_ms, (long long)p.restore_ms, (long long)p.alloc_ms,
+                 (long long)p.copy_in_ms, (long long)p.compute_ms, (long long)other);
+    }
+
     template <typename T>
     std::optional<sd::Tensor<T>> execute_graph(ggml_cgraph* gf,
                                                int n_threads,
@@ -2593,10 +2621,23 @@ protected:
 
         int64_t t_compute_begin = ggml_time_ms();
         ggml_status status      = ggml_backend_graph_compute(runtime_backend, gf);
+        // Synchronize so the wall measurement covers the actual GPU work
+        // (graph_compute can return before async kernels complete).
+        ggml_backend_synchronize(runtime_backend);
         int64_t t_compute_end   = ggml_time_ms();
+        if (getenv("LONGCAT_OFFLOAD_PROFILE") != nullptr) {
+            offload_profile_.offload_ms += (t_offload_end - t_offload_begin);
+            offload_profile_.alloc_ms   += (t_alloc_end - t_alloc_begin);
+            offload_profile_.copy_in_ms += (t_copy_end - t_copy_begin);
+            offload_profile_.compute_ms += (t_compute_end - t_compute_begin);
+            offload_profile_.n_segments += 1;
+            offload_profile_.n_nodes_total += ggml_graph_n_nodes(gf);
+            offload_profile_.total_ms   += (t_compute_end - t_execute_begin);
+        }
         if (getenv("LONGCAT_PROFILE") != nullptr) {
-            LOG_INFO("[PROFILE] %s execute_graph: nodes=%d alloc=%lldms copy_in=%lldms compute=%lldms",
+            LOG_INFO("[PROFILE] %s execute_graph: nodes=%d offload=%lldms alloc=%lldms copy_in=%lldms compute=%lldms",
                      get_desc().c_str(), ggml_graph_n_nodes(gf),
+                     (long long)(t_offload_end - t_offload_begin),
                      (long long)(t_alloc_end - t_alloc_begin),
                      (long long)(t_copy_end - t_copy_begin),
                      (long long)(t_compute_end - t_compute_begin));
@@ -2749,6 +2790,8 @@ protected:
         free_compute_buffer();
         free_cache_ctx_and_buffer();
 
+        reset_offload_profile();
+        int64_t t_segloop_begin = ggml_time_ms();
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
             int64_t t_segment_begin = ggml_time_ms();
@@ -2802,6 +2845,19 @@ protected:
         backend_tensor_data_map.clear();
         free_cache_ctx_and_buffer();
         free_compute_ctx();
+        if (getenv("LONGCAT_OFFLOAD_PROFILE") != nullptr) {
+            int64_t segloop_total_ms = ggml_time_ms() - t_segloop_begin;
+            // Capture any non-execute_graph segment-loop overhead (reset_segment,
+            // bind_segment_cached_inputs, build_segment_graph, copy_cache, etc.).
+            int64_t segloop_overhead_ms = segloop_total_ms - offload_profile_.total_ms;
+            LOG_INFO("[OFFLOAD_PROFILE] %s segloop wall=%lldms (execute_graph_sum=%lldms + segment_overhead=%lldms across %d segs)",
+                     get_desc().c_str(),
+                     (long long)segloop_total_ms,
+                     (long long)offload_profile_.total_ms,
+                     (long long)segloop_overhead_ms,
+                     offload_profile_.n_segments);
+            dump_offload_profile(get_desc().c_str());
+        }
         return output;
     }
 
