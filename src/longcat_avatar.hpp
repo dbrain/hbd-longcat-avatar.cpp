@@ -300,13 +300,37 @@ namespace LONGCAT_AVATAR {
                 GGML_ASSERT(ctx->condkv_k != nullptr && block_idx < (int)ctx->condkv_k->size() && "cond-kv cache missing");
                 ggml_tensor* k_cond = (*ctx->condkv_k)[block_idx];
                 ggml_tensor* v_cond = (*ctx->condkv_v)[block_idx];
-                // Undo the persist-time scale: F32(F16(k*kv_scale)) / kv_scale, so the wrapper's
-                // own kv_scale+F16 cast reproduces the exact F16(k/256) the dense path uses.
-                k_cond = ggml_ext_scale(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, k_cond, GGML_TYPE_F32), 1.0f / kv_scale);
-                v_cond = ggml_ext_scale(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, v_cond, GGML_TYPE_F32), 1.0f / kv_scale);                ggml_tensor* k_full = ggml_concat(ctx->ggml_ctx, k_cond, k_rope, 1);  // [d_head, n_cond+n_noise, heads]
-                ggml_tensor* v_full = ggml_concat(ctx->ggml_ctx, v_cond, v, 2);       // [d_head, heads, n_cond+n_noise, N]
+                // LongCat lap-28.2: keep cached F16 K/V (already pre-scaled by kv_scale at
+                // persist time), pre-scale + cast the noise K/V to F16, concat F16-with-F16,
+                // and tell the wrapper to skip its in-flight kv_scale + F16 cast. Saves the
+                // F16→F32→×(1/kv_scale) → concat F32 → ×kv_scale → cast→F16 round-trip
+                // (~178 MB per cond+noise tensor × 48 blocks × 7 consume steps). Bit-exact
+                // because kv_scale=1/256 is an exact F16 exponent shift and F16→F32 is
+                // lossless, so the cancellation is mathematical (not numerical drift).
+                auto k_noise_f16 = fa ? ggml_cast(ctx->ggml_ctx,
+                                                   ggml_ext_scale(ctx->ggml_ctx, k_rope, kv_scale),
+                                                   GGML_TYPE_F16)
+                                       : k_rope;
+                auto v_noise_f16 = fa ? ggml_cast(ctx->ggml_ctx,
+                                                   ggml_ext_scale(ctx->ggml_ctx, v, kv_scale),
+                                                   GGML_TYPE_F16)
+                                       : v;
+                ggml_tensor* k_full;
+                ggml_tensor* v_full;
+                if (fa) {
+                    k_full = ggml_concat(ctx->ggml_ctx, k_cond, k_noise_f16, 1);  // F16 [d_head, n_cond+n_noise, heads]
+                    v_full = ggml_concat(ctx->ggml_ctx, v_cond, v_noise_f16, 2);  // F16 [d_head, heads, n_cond+n_noise, N]
+                } else {
+                    // Non-flash fallback (kv_scale==1): persisted cache happens to be F16(*1)=F16(v).
+                    // Round-trip back to F32 and concat as before.
+                    k_full = ggml_concat(ctx->ggml_ctx,
+                                         ggml_cast(ctx->ggml_ctx, k_cond, GGML_TYPE_F32), k_rope, 1);
+                    v_full = ggml_concat(ctx->ggml_ctx,
+                                         ggml_cast(ctx->ggml_ctx, v_cond, GGML_TYPE_F32), v, 2);
+                }
                 out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_rope, k_full, v_full,
-                                             num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);
+                                             num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true,
+                                             /*kv_prescaled_f16=*/fa);
             } else if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {
                 // ======= VIDEO-CONTINUATION 3-WAY SPLIT (generate_avc) =======
                 // Layout: [ref(num_ref_latents) | cond_tail | noise]. The leading

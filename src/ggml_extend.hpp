@@ -1295,7 +1295,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       bool skip_reshape = false,
                                                       bool flash_attn   = false,
                                                       float kv_scale    = 1.0f,        // avoid overflow
-                                                      bool flash_skip_kv_pad = false) {  // skip the legacy L_k->256 pad + synthesized mask
+                                                      bool flash_skip_kv_pad = false,   // skip the legacy L_k->256 pad + synthesized mask
+                                                      bool kv_prescaled_f16 = false) {  // caller already cast K/V to F16(*kv_scale) — skip the in-wrapper scale+cast
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -1337,20 +1338,32 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_pad != 0) {
             k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
         }
-        if (kv_scale != 1.0f) {
-            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
+        // LongCat lap-28.2: if the caller already produced F16(k*kv_scale) (the
+        // cond-K/V cache consume path), skip the redundant ext_scale + cast here.
+        // The persist stores F16(k*kv_scale); the original consume cast→F32→×(1/kv_scale)
+        // → concat F32 → ×kv_scale → cast→F16 round-trip is a mathematical no-op (F16
+        // exponent shift is exact at kv_scale=1/256), just HBM bouncing. Pre-cast on
+        // the noise side + F16-F16 concat lets us feed F16 K/V straight into flash.
+        if (!kv_prescaled_f16) {
+            if (kv_scale != 1.0f) {
+                k_in = ggml_ext_scale(ctx, k_in, kv_scale);
+            }
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
 
         v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
         v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
         if (kv_pad != 0) {
             v_in = ggml_pad(ctx, v_in, 0, kv_pad, 0, 0);
         }
-        if (kv_scale != 1.0f) {
-            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+        if (!kv_prescaled_f16) {
+            if (kv_scale != 1.0f) {
+                v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+            }
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
         }
-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        // else: v_in is already F16 — the permute+cont above stays on F16 (same compute,
+        // different element type). The flash kernel accepts F16 K/V directly.
 
         if (mask_in != nullptr) {
             mask_in = ggml_transpose(ctx, mask_in);
