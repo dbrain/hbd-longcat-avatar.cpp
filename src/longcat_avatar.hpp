@@ -564,7 +564,7 @@ namespace LONGCAT_AVATAR {
         }
 
         // text cross attention: q from x, kv from context. UNGATED.
-        ggml_tensor* text_cross_attn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* context) {
+        ggml_tensor* text_cross_attn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* context, int block_idx = -1) {
             auto q_linear  = std::dynamic_pointer_cast<Linear>(blocks["cross_attn.q_linear"]);
             auto kv_linear = std::dynamic_pointer_cast<Linear>(blocks["cross_attn.kv_linear"]);
             auto proj      = std::dynamic_pointer_cast<Linear>(blocks["cross_attn.proj"]);
@@ -574,6 +574,37 @@ namespace LONGCAT_AVATAR {
             int64_t N       = x->ne[2];
             int64_t n_token = x->ne[1];
             int64_t n_ctx   = context->ne[1];
+
+            const bool fa        = ctx->flash_attn_enabled;
+            // kv_scale guards the F16 cast in the flash path (see self_attn note); the
+            // text-context v is bounded so this is defensive, and a no-op (==1) for the
+            // non-flash path which keeps F32 scores.
+            const float kv_scale = fa ? (1.0f / 256.0f) : 1.0f;
+
+            // LongCat lap-31: text x-attn K/V cache CONSUME (step>1). The text-context
+            // is step-invariant (umT5 runs once pre-sampling), so kv_linear(context) +
+            // permute+cont + k_norm + reshape produce byte-identical K/V every step.
+            // The cached tensors hold F16(K*kv_scale) and F16(V*kv_scale) in shape
+            // [hidden_size, n_ctx, Nb] (post-norm, post-reshape — what the attention
+            // wrapper expects when called with kv_prescaled_f16=true on the FA path).
+            // Only K and V are cached; Q is recomputed per step (token-dependent).
+            const bool xattn_consume = fa && ctx->xattn_text_k && ctx->sampler_step > 1 &&
+                                       block_idx >= 0 && block_idx < (int)ctx->xattn_text_k->size();
+            if (xattn_consume) {
+                auto q = q_linear->forward(ctx, x);
+                q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, n_token, N);
+                q = q_norm->forward(ctx, q);
+                q = ggml_reshape_3d(ctx->ggml_ctx, q, hidden_size, n_token, N);
+
+                ggml_tensor* k_cached = (*ctx->xattn_text_k)[block_idx];
+                ggml_tensor* v_cached = (*ctx->xattn_text_v)[block_idx];
+                auto out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k_cached, v_cached,
+                                                  num_heads, nullptr, false, fa, kv_scale,
+                                                  /*flash_skip_kv_pad=*/false,
+                                                  /*kv_prescaled_f16=*/true);
+                out = proj->forward(ctx, out);
+                return out;
+            }
 
             auto q  = q_linear->forward(ctx, x);        // [N, n_token, C]
             auto kv = kv_linear->forward(ctx, context);  // [N, n_ctx, 2C]
@@ -593,11 +624,27 @@ namespace LONGCAT_AVATAR {
             k = ggml_reshape_3d(ctx->ggml_ctx, k, hidden_size, n_ctx, N);
             v = ggml_reshape_3d(ctx->ggml_ctx, v, hidden_size, n_ctx, N);
 
-            // kv_scale guards the F16 cast in the flash path (see self_attn note); the
-            // text-context v is bounded so this is defensive, and a no-op (==1) for the
-            // non-flash path which keeps F32 scores.
-            const float kv_scale = ctx->flash_attn_enabled ? (1.0f / 256.0f) : 1.0f;
-            auto out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, nullptr, false, ctx->flash_attn_enabled, kv_scale);
+            // LongCat lap-31: text x-attn K/V cache PERSIST (step<=1, FA path only). Store
+            // F16(K*kv_scale) / F16(V*kv_scale) into the persistent buffer. Same prescale
+            // shift as cond-cache lap-28.2 (exact F16 exponent shift at 1/256), so consume
+            // bit-matches dense. Writes get pushed into cache_writes and tagged into the
+            // block's post_cross_attn subcut group so the offload-segmented executor sees
+            // the cpy in the correct segment.
+            if (fa && ctx->xattn_text_k && ctx->sampler_step <= 1 &&
+                block_idx >= 0 && block_idx < (int)ctx->xattn_text_k->size() && ctx->cache_writes) {
+                auto kc = ggml_cast(ctx->ggml_ctx, ggml_ext_scale(ctx->ggml_ctx, k, kv_scale), GGML_TYPE_F16);
+                auto vc = ggml_cast(ctx->ggml_ctx, ggml_ext_scale(ctx->ggml_ctx, v, kv_scale), GGML_TYPE_F16);
+                auto wk = ggml_cpy(ctx->ggml_ctx, kc, (*ctx->xattn_text_k)[block_idx]);
+                auto wv = ggml_cpy(ctx->ggml_ctx, vc, (*ctx->xattn_text_v)[block_idx]);
+                ctx->cache_writes->push_back(wk);
+                ctx->cache_writes->push_back(wv);
+                sd::ggml_graph_cut::mark_graph_cut(
+                    wk, "longcat.blocks." + std::to_string(block_idx) + ".post_cross_attn", "xattn_text_k");
+                sd::ggml_graph_cut::mark_graph_cut(
+                    wv, "longcat.blocks." + std::to_string(block_idx) + ".post_cross_attn", "xattn_text_v");
+            }
+
+            auto out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, nullptr, false, fa, kv_scale);
             out      = proj->forward(ctx, out);
             return out;
         }
@@ -657,7 +704,7 @@ namespace LONGCAT_AVATAR {
 
             // text cross-attn (ungated). With a num_cond_latents split the cond-frame
             // tokens receive NO text conditioning (their output is zeroed).
-            auto x_c = text_cross_attn(ctx, pre_crs_norm->forward(ctx, x), context);
+            auto x_c = text_cross_attn(ctx, pre_crs_norm->forward(ctx, x), context, block_idx);
             if (n_cond_tokens > 0) {
                 int64_t C  = x_c->ne[0];
                 int64_t Nb = x_c->ne[2];
@@ -1263,6 +1310,18 @@ namespace LONGCAT_AVATAR {
         std::vector<ggml_tensor*> condkv_writes; // ggml_cpy nodes for the current graph
         int64_t condkv_ncond                   = -1;
 
+        // LongCat lap-31: text cross-attn K/V cache. Same pattern as condkv: F16
+        // prescaled, persistent on the runtime backend, registered with the runner's
+        // persistent-tensor set so the segmented executor doesn't orphan the leaves.
+        // Cached K is the post-norm, post-permute K (shape [hidden_size, n_ctx, Nb] F16
+        // prescaled). Cached V is the post-permute V (same shape). Both align with what
+        // text_cross_attn's downstream `ggml_ext_attention_ext` expects.
+        ggml_context*  xattn_text_ctx          = nullptr;
+        ggml_backend_buffer_t xattn_text_buf   = nullptr;
+        std::vector<ggml_tensor*> xattn_text_k_vec;  // [n_layers] each [hidden_size, n_ctx, Nb] F16
+        std::vector<ggml_tensor*> xattn_text_v_vec;  // [n_layers] each [hidden_size, n_ctx, Nb] F16
+        int64_t xattn_text_nctx                = -1;
+
         // LongCat lap-28.4 (BSA): persistent host-built F32 mask tensor for the
         // consume-step self-attention. Computed once per resolution: each query token
         // attends to its 3x3 spatial-cube neighborhood + all tokens in the cond frame
@@ -1389,6 +1448,34 @@ namespace LONGCAT_AVATAR {
             // orphans them (PSNR ~12 dB).
             for (ggml_tensor* t : condkv_k_vec) register_persistent_tensor(t);
             for (ggml_tensor* t : condkv_v_vec) register_persistent_tensor(t);
+        }
+
+        void free_xattn_text_cache() {
+            for (ggml_tensor* t : xattn_text_k_vec) unregister_persistent_tensor(t);
+            for (ggml_tensor* t : xattn_text_v_vec) unregister_persistent_tensor(t);
+            if (xattn_text_buf) { ggml_backend_buffer_free(xattn_text_buf); xattn_text_buf = nullptr; }
+            if (xattn_text_ctx) { ggml_free(xattn_text_ctx); xattn_text_ctx = nullptr; }
+            xattn_text_k_vec.clear(); xattn_text_v_vec.clear(); xattn_text_nctx = -1;
+        }
+
+        // (Re)allocate the persistent text x-attn K/V tensors. No-op if already sized for n_ctx.
+        // hidden_size = head_dim * num_heads of the DiT (text-context is reprojected to hidden_size).
+        void ensure_xattn_text_cache(int64_t hidden_size, int64_t n_ctx, int64_t Nb, int n_layers) {
+            if (xattn_text_buf != nullptr && xattn_text_nctx == n_ctx) return;
+            free_xattn_text_cache();
+            ggml_init_params p = { ggml_tensor_overhead() * (size_t)(2 * n_layers + 8), nullptr, /*no_alloc=*/true };
+            xattn_text_ctx = ggml_init(p);
+            xattn_text_k_vec.resize(n_layers); xattn_text_v_vec.resize(n_layers);
+            for (int i = 0; i < n_layers; ++i) {
+                xattn_text_k_vec[i] = ggml_new_tensor_3d(xattn_text_ctx, GGML_TYPE_F16, hidden_size, n_ctx, Nb);
+                xattn_text_v_vec[i] = ggml_new_tensor_3d(xattn_text_ctx, GGML_TYPE_F16, hidden_size, n_ctx, Nb);
+                ggml_set_name(xattn_text_k_vec[i], ("xattn_text.k." + std::to_string(i)).c_str());
+                ggml_set_name(xattn_text_v_vec[i], ("xattn_text.v." + std::to_string(i)).c_str());
+            }
+            xattn_text_buf = ggml_backend_alloc_ctx_tensors(xattn_text_ctx, runtime_backend);
+            xattn_text_nctx = n_ctx;
+            for (ggml_tensor* t : xattn_text_k_vec) register_persistent_tensor(t);
+            for (ggml_tensor* t : xattn_text_v_vec) register_persistent_tensor(t);
         }
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
@@ -1526,6 +1613,10 @@ namespace LONGCAT_AVATAR {
                                        (num_ref_latents == 0) &&
                                        runner_ctx.flash_attn_enabled;
             condkv_writes.clear();
+            // condkv_writes is the shared receiver for ALL persistent K/V cache writes
+            // (lap-26 cond + lap-31 text x-attn). Set unconditionally so the text cache
+            // can push without cond cache enabled.
+            runner_ctx.cache_writes = &condkv_writes;
             if (runner_ctx.cond_kv_cache) {
                 int64_t t_len_c = x->ne[2];
                 int64_t h_len_c = x->ne[1] / std::get<1>(avatar_params.patch_size);
@@ -1534,9 +1625,8 @@ namespace LONGCAT_AVATAR {
                 int64_t ncond_c = std::min<int64_t>(num_cond_latents, t_len_c) * npf_c;
                 int64_t d_head_c = avatar_params.hidden_size / avatar_params.num_heads;
                 ensure_condkv_cache(d_head_c, ncond_c, avatar_params.num_heads, 1, (int)avatar_params.num_layers);
-                runner_ctx.condkv_k     = &condkv_k_vec;
-                runner_ctx.condkv_v     = &condkv_v_vec;
-                runner_ctx.cache_writes = &condkv_writes;
+                runner_ctx.condkv_k = &condkv_k_vec;
+                runner_ctx.condkv_v = &condkv_v_vec;
 
                 // LongCat lap-28.4 (BSA): build / reuse the consume-step mask. Only
                 // exposed to attention when sampler_step > 1 (consume path); step 0 stays
@@ -1580,6 +1670,30 @@ namespace LONGCAT_AVATAR {
                                  (long long) h_len_c, (long long) w_len_c, bsa_cube_h, bsa_cube_w);
                     }
                 }
+            }
+
+            // LongCat lap-31: text cross-attn K/V cache. text_cross_attn.kv_linear(context)
+            // is step-invariant (umT5 runs once before sampling), so post-norm K and V
+            // are byte-identical every step. Persist at step <=1; consume at step >1
+            // (skip kv_linear, k_norm, permute+cont). ~1% wall savings projected. F16
+            // prescaled by kv_scale=1/256 (same exact-exponent shift pattern as lap-28.2
+            // cond cache; bit-exact end-to-end). Off by default — opt in with env
+            // LONGCAT_XATTN_TEXT_CACHE=1. Requires --diffusion-fa (kv_scale path).
+            static const bool xattn_text_cache_enabled_env = []{
+                const char* s = getenv("LONGCAT_XATTN_TEXT_CACHE");
+                return s && s[0] == '1';
+            }();
+            const bool xattn_text_cache_active = xattn_text_cache_enabled_env &&
+                                                 runner_ctx.flash_attn_enabled &&
+                                                 context != nullptr;
+            if (xattn_text_cache_active) {
+                int64_t n_ctx_t = context->ne[1];
+                int64_t Nb_t    = context->ne[2];
+                int     n_layers_t = (int) avatar_params.num_layers;
+                int64_t hidden  = avatar_params.hidden_size;
+                ensure_xattn_text_cache(hidden, n_ctx_t, Nb_t, n_layers_t);
+                runner_ctx.xattn_text_k = &xattn_text_k_vec;
+                runner_ctx.xattn_text_v = &xattn_text_v_vec;
             }
 
             // Audio path: run AudioProjModel on the host-windowed inputs to produce

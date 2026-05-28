@@ -1738,6 +1738,12 @@ struct GGMLRunnerContext {
     std::vector<ggml_tensor*>* condkv_k    = nullptr;  // per-block cached cond K (F16, prescaled)
     std::vector<ggml_tensor*>* condkv_v    = nullptr;  // per-block cached cond V
     std::vector<ggml_tensor*>* cache_writes = nullptr; // ggml_cpy nodes to expand into the graph
+    // LongCat lap-31: cross-attn K/V cache (text). text_cross_attn.kv_linear(context)
+    // is step-invariant (umT5 forward runs once before sampling), so K/V (post-norm,
+    // post-permute, F16 prescaled by kv_scale) are byte-identical every step. Persist
+    // at step 1, consume at step>1. nullptr ⇒ off (default; bit-identical).
+    std::vector<ggml_tensor*>* xattn_text_k = nullptr;  // per-block cached text K (F16 prescaled)
+    std::vector<ggml_tensor*>* xattn_text_v = nullptr;  // per-block cached text V (F16 prescaled)
     // LongCat lap-28.4 (BSA): pre-computed F32 [L_q, L_k] mask passed to consume-step
     // self-attention. -INF for denied positions, 0 elsewhere. Built once per render in
     // the runner (depends only on t/h/w/n_cond), shared across all 48 blocks and 7
