@@ -1785,6 +1785,30 @@ protected:
     sd::ggml_graph_cut::PlanCache graph_cut_plan_cache_;
     std::unordered_set<const ggml_tensor*> params_tensor_set_;
 
+    // LongCat lap-27: tensors that live in a runner-owned PERSISTENT backend buffer
+    // (e.g. LongCatAvatarRunner::condkv_buf — separate from params_buffer and the
+    // ephemeral compute buffer) and that appear in the cgraph as INPUT_EXTERNAL leaves.
+    // Without this registry, reset_segment_runtime_tensors blindly nulls every
+    // INPUT_EXTERNAL's buffer/data/extra between segments — correct for make_input
+    // outputs (compute-buffer-tracked, freed between segments) but ORPHANS persistent
+    // leaves so the per-segment gallocr re-allocates them inside the compute buffer
+    // and the segment reads garbage. PSNR collapses to ~12 dB. Subclasses register
+    // their persistent tensors via register_persistent_tensor(); the reset path skips
+    // them. (INPUT_PARAM also isn't reset, but persistent_tensors_ are not params and
+    // shouldn't be conflated with the params lifecycle.)
+    std::unordered_set<const ggml_tensor*> persistent_tensors_;
+
+    void register_persistent_tensor(const ggml_tensor* t) {
+        if (t != nullptr) {
+            persistent_tensors_.insert(t);
+        }
+    }
+    void unregister_persistent_tensor(const ggml_tensor* t) {
+        if (t != nullptr) {
+            persistent_tensors_.erase(t);
+        }
+    }
+
     template <typename T>
     static sd::Tensor<T> take_or_empty(std::optional<sd::Tensor<T>> tensor) {
         if (!tensor.has_value()) {
@@ -2392,6 +2416,26 @@ protected:
             switch (input.type) {
                 case GraphCutSegment::INPUT_PREVIOUS_CUT:
                 case GraphCutSegment::INPUT_EXTERNAL:
+                    // LongCat lap-27: skip persistent backend leaves (e.g. the avatar's
+                    // cond-K/V cache tensors). They have a valid non-compute backend
+                    // buffer (registered via register_persistent_tensor in the owning
+                    // runner) and must retain their buffer/data/extra so the per-segment
+                    // gallocr leaves them alone and the segment reads the right data.
+                    //
+                    // NOTE (lap-27 investigation): for the avatar's cond-K/V cache, the
+                    // bug isn't fully fixed by this reset-side preserve — the planner
+                    // doesn't even surface condkv.* tensors as segment input_refs in
+                    // offload mode, so this branch never fires for them. The remaining
+                    // bug is in the per-segment gallocr's handling of the `ggml_cpy`
+                    // view-chain whose `view_src` lives in a buffer (condkv_buf) that
+                    // the segment's gallocr doesn't know about. That fix likely needs
+                    // ggml-alloc surgery and is parked. Until then, the cond-cache
+                    // auto-disables on offload (see LongCatAvatarRunner). This branch
+                    // is still useful for OTHER future persistent leaves that do appear
+                    // as input_refs.
+                    if (persistent_tensors_.find(input_tensor) != persistent_tensors_.end()) {
+                        break;
+                    }
                     input_tensor->buffer = nullptr;
                     input_tensor->data   = nullptr;
                     input_tensor->extra  = nullptr;

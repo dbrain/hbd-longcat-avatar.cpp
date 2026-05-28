@@ -1203,6 +1203,10 @@ namespace LONGCAT_AVATAR {
         int64_t condkv_ncond                   = -1;
 
         void free_condkv_cache() {
+            // LongCat lap-27: unregister persistent-tensor entries so the runner's
+            // segmented-reset path doesn't hold stale pointers after the buffer frees.
+            for (ggml_tensor* t : condkv_k_vec) unregister_persistent_tensor(t);
+            for (ggml_tensor* t : condkv_v_vec) unregister_persistent_tensor(t);
             if (condkv_buf) { ggml_backend_buffer_free(condkv_buf); condkv_buf = nullptr; }
             if (condkv_ctx) { ggml_free(condkv_ctx); condkv_ctx = nullptr; }
             condkv_k_vec.clear(); condkv_v_vec.clear(); condkv_ncond = -1;
@@ -1223,6 +1227,12 @@ namespace LONGCAT_AVATAR {
             }
             condkv_buf  = ggml_backend_alloc_ctx_tensors(condkv_ctx, runtime_backend);
             condkv_ncond = n_cond;
+            // LongCat lap-27: register the cond-K/V leaves with the runner-side persistent
+            // set so reset_segment_runtime_tensors (offload path) leaves their buffer/data
+            // pointers intact between segments. Without this, the segmented executor
+            // orphans them (PSNR ~12 dB).
+            for (ggml_tensor* t : condkv_k_vec) register_persistent_tensor(t);
+            for (ggml_tensor* t : condkv_v_vec) register_persistent_tensor(t);
         }
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
@@ -1354,10 +1364,18 @@ namespace LONGCAT_AVATAR {
                 const char* s = getenv("LONGCAT_NO_COND_CACHE");
                 return s && s[0] == '1';
             }();
+            // Lap-27 test/eval hook: LONGCAT_COND_CACHE_FORCE=1 lets the cond-cache run
+            // on the offload path so the segmented-leaf fix can be verified end-to-end
+            // before the auto-disable is relaxed. Once verified (PSNR 99 vs resident),
+            // this stays as a kill-switch / regression flag.
+            static const bool cond_cache_force_offload = []{
+                const char* s = getenv("LONGCAT_COND_CACHE_FORCE");
+                return s && s[0] == '1';
+            }();
             const bool is_offload_path = (params_backend != runtime_backend);
             runner_ctx.sampler_step = cur_step;
             runner_ctx.cond_kv_cache = !cond_cache_disabled_env &&
-                                       !is_offload_path &&
+                                       (!is_offload_path || cond_cache_force_offload) &&
                                        (num_cond_latents > 0) &&
                                        (num_ref_latents == 0) &&
                                        runner_ctx.flash_attn_enabled;
