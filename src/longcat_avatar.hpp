@@ -766,11 +766,17 @@ namespace LONGCAT_AVATAR {
             mod        = ggml_reshape_4d(ctx->ggml_ctx, mod, hidden_size, 2, T, N);
             auto ms    = ggml_ext_chunk(ctx->ggml_ctx, mod, 2, 1);  // shift, scale; each [N, T, 1, C]
 
+            // (scale + 1) fused as ggml_scale_bias (see modulate()).
+            // LongCat lap-27: pre-expand scale1 onto ctx->gf so the {NORM, MUL, ADD}
+            // autofusion fires here too (otherwise SCALE_BIAS lands between NORM and
+            // MUL in topo and breaks adjacency). Same trick as the block modulate path.
+            auto scale1 = ggml_scale_bias(ctx->ggml_ctx, ms[1], 1.0f, 1.0f);
+            if (ctx->gf != nullptr) {
+                ggml_build_forward_expand(ctx->gf, scale1);
+            }
             x          = norm_final->forward(ctx, x);
             int64_t C  = x->ne[0];
             x          = ggml_reshape_4d(ctx->ggml_ctx, x, C, x->ne[1] / T, T, N);  // [N, T, n_token/T, C]
-            // (scale + 1) fused as ggml_scale_bias (see modulate()).
-            auto scale1 = ggml_scale_bias(ctx->ggml_ctx, ms[1], 1.0f, 1.0f);
             x           = ggml_mul(ctx->ggml_ctx, x, scale1);
             x           = ggml_add(ctx->ggml_ctx, x, ms[0]);
             x           = ggml_reshape_3d(ctx->ggml_ctx, x, C, x->ne[1] * x->ne[2], N);
