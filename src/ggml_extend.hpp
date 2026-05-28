@@ -2978,16 +2978,22 @@ protected:
 
         reset_offload_profile();
 
-        // LongCat lap-32.2: H2D-compute pipelining. When LONGCAT_OFFLOAD_PIPELINING=1
-        // AND the secondary CUDA backend init succeeds, we prefetch segment N+1's
-        // partial param H2D onto a separate CUDA stream WHILE segment N's compute
-        // runs on the runtime stream. The runtime stream waits on the prefetch event
-        // before the swap-in, so correctness is preserved.
-        static const bool pipelining_enabled_env = []{
-            const char* s = getenv("LONGCAT_OFFLOAD_PIPELINING");
-            return s && s[0] == '1';
+        // LongCat lap-32.2: H2D-compute pipelining. DEFAULT ON when offload+CUDA
+        // and segment count > 1 (measured -2.3s wall stacked on top of lap-32.1
+        // pinned; bit-exact, no quality risk). Opt out via env
+        // LONGCAT_NO_OFFLOAD_PIPELINING=1 if the secondary backend ever fails to
+        // init or the prefetched_state swap exposes an edge case. We prefetch
+        // segment N+1's partial param H2D onto a separate CUDA stream WHILE
+        // segment N's compute runs on the runtime stream. The runtime stream
+        // waits on the prefetch event before the swap-in, so correctness is
+        // preserved.
+        static const bool pipelining_disabled_env = []{
+            const char* s = getenv("LONGCAT_NO_OFFLOAD_PIPELINING");
+            if (s && s[0] == '1') return true;
+            const char* s2 = getenv("LONGCAT_OFFLOAD_PIPELINING");
+            return s2 && s2[0] == '0';
         }();
-        const bool pipelining_active = pipelining_enabled_env &&
+        const bool pipelining_active = !pipelining_disabled_env &&
                                        plan.segments.size() > 1 &&
                                        ensure_pipelining_backend();
 
@@ -3173,21 +3179,25 @@ public:
             LOG_DEBUG("%s skipping params allocation (no tensors)", get_desc().c_str());
             return true;
         }
-        // LongCat lap-32: when offload + CUDA runtime, allocate params on the CUDA
+        // LongCat lap-32.1: when offload + CUDA runtime, allocate params on the CUDA
         // host buffer type (pinned via cudaMallocHost) instead of the CPU backend's
         // default pageable malloc. Pinned host memory enables async direct DMA on
         // cudaStreamPerThread (~12 GB/s PCIe gen3) vs pageable's synchronous bounce-
         // buffer staging (~6 GB/s). The CPU backend can still read/write these
         // tensors (it's host memory, just pinned) — so all the existing offload
         // plumbing (set_tensor host→device copies, partial-param swap, etc.)
-        // works unchanged. Bit-exact (transport-only). Opt-in via env
-        // LONGCAT_OFFLOAD_PINNED_PARAMS=1 (default off until measured).
-        static const bool pinned_offload_params = []{
-            const char* s = getenv("LONGCAT_OFFLOAD_PINNED_PARAMS");
-            return s && s[0] == '1';
+        // works unchanged. Bit-exact (transport-only). DEFAULT ON for offload+CUDA
+        // (measured -2.5s wall, no quality risk); opt out via env
+        // LONGCAT_NO_OFFLOAD_PINNED_PARAMS=1 if cudaMallocHost ever rejects the
+        // 8 GB allocation on a memory-pressured host.
+        static const bool pinned_offload_params_disabled = []{
+            const char* s = getenv("LONGCAT_NO_OFFLOAD_PINNED_PARAMS");
+            if (s && s[0] == '1') return true;
+            const char* s2 = getenv("LONGCAT_OFFLOAD_PINNED_PARAMS");
+            return s2 && s2[0] == '0';
         }();
         const bool use_pinned_offload =
-            pinned_offload_params &&
+            !pinned_offload_params_disabled &&
             ggml_backend_is_cpu(params_backend) &&
             !ggml_backend_is_cpu(runtime_backend);
         if (use_pinned_offload) {

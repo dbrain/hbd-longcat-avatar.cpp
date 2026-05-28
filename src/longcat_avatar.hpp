@@ -1745,18 +1745,21 @@ namespace LONGCAT_AVATAR {
                         if (cur_step > 1) {
                             runner_ctx.bsa_mask = bsa_mask_tensor;
                             // LongCat lap-31.2: thread the CPU-precomputed bitmap into the
-                            // FA kernel via the ggml-cuda device-resident setter. Opt-in via
-                            // env LONGCAT_BSA_BITMAP=1 (default off until measured). The
-                            // setter call is host-side; the device read happens inside the FA
-                            // K-tile loop and is bit-exact (skipping a fully-denied K-tile is
-                            // mathematically identical to running it — its softmax weights
-                            // are all exp(-INF)=0). Bitmap pointer is the tensor's device
-                            // data ptr; non-null only when the BSA bitmap path is enabled.
-                            static const bool bsa_bitmap_enabled = []{
-                                const char* s = getenv("LONGCAT_BSA_BITMAP");
-                                return s && s[0] == '1';
+                            // FA kernel via the ggml-cuda device-resident setter. DEFAULT ON
+                            // when BSA is enabled (bit-exact -1.98s wall in measurements);
+                            // opt out via LONGCAT_NO_BSA_BITMAP=1 if the FA template's
+                            // ncols1/nbatch_fa ever changes from the (64,64) the bitmap is
+                            // sized for. The setter call is host-side; the device read
+                            // happens inside the FA K-tile loop and is bit-exact (skipping
+                            // a fully-denied K-tile is mathematically identical to running
+                            // it — its softmax weights are all exp(-INF)=0).
+                            static const bool bsa_bitmap_disabled = []{
+                                const char* s = getenv("LONGCAT_NO_BSA_BITMAP");
+                                if (s && s[0] == '1') return true;
+                                const char* s2 = getenv("LONGCAT_BSA_BITMAP");
+                                return s2 && s2[0] == '0';
                             }();
-                            if (bsa_bitmap_enabled && bsa_bitmap_tensor != nullptr &&
+                            if (!bsa_bitmap_disabled && bsa_bitmap_tensor != nullptr &&
                                 bsa_cached_n_qtiles > 0 && bsa_cached_n_kwords > 0) {
                                 ggml_cuda_set_longcat_fa_bsa_bitmap(
                                     bsa_bitmap_tensor->data,
@@ -1776,18 +1779,37 @@ namespace LONGCAT_AVATAR {
                 }
             }
 
-            // LongCat lap-31: text cross-attn K/V cache. text_cross_attn.kv_linear(context)
+            // LongCat lap-31.1: text cross-attn K/V cache. text_cross_attn.kv_linear(context)
             // is step-invariant (umT5 runs once before sampling), so post-norm K and V
             // are byte-identical every step. Persist at step <=1; consume at step >1
-            // (skip kv_linear, k_norm, permute+cont). ~1% wall savings projected. F16
-            // prescaled by kv_scale=1/256 (same exact-exponent shift pattern as lap-28.2
-            // cond cache; bit-exact end-to-end). Off by default — opt in with env
-            // LONGCAT_XATTN_TEXT_CACHE=1. Requires --diffusion-fa (kv_scale path).
-            static const bool xattn_text_cache_enabled_env = []{
+            // (skip kv_linear, k_norm, permute+cont). Measured -0.5s wall, bit-exact.
+            // F16 prescaled by kv_scale=1/256 (same exact-exponent shift pattern as
+            // lap-28.2 cond cache). Requires --diffusion-fa.
+            //
+            // DEFAULT ON for prod. Opt out via env LONGCAT_NO_XATTN_TEXT_CACHE=1
+            // (or LONGCAT_XATTN_TEXT_CACHE=0). Auto-disables when BSA is enabled
+            // AND we're on the resident path (params_backend == runtime_backend),
+            // since DiT 8.5 + cond_kv 1.2 + BSA 195 MiB + xattn 384 MiB + compute
+            // > 12 GiB at --max-vram 9 would OOM. The prod offload path keeps params
+            // on CPU so this stack fits comfortably — xattn stays on there.
+            static const bool xattn_text_cache_explicit_off = []{
+                const char* s = getenv("LONGCAT_NO_XATTN_TEXT_CACHE");
+                if (s && s[0] == '1') return true;
+                const char* s2 = getenv("LONGCAT_XATTN_TEXT_CACHE");
+                return s2 && s2[0] == '0';
+            }();
+            static const bool xattn_text_cache_explicit_on = []{
                 const char* s = getenv("LONGCAT_XATTN_TEXT_CACHE");
                 return s && s[0] == '1';
             }();
-            const bool xattn_text_cache_active = xattn_text_cache_enabled_env &&
+            static const bool bsa_enabled_for_xattn = []{
+                const char* s = getenv("LONGCAT_BSA");
+                return s && s[0] == '1';
+            }();
+            const bool is_resident_path  = (params_backend == runtime_backend);
+            const bool would_oom_in_bsa  = is_resident_path && bsa_enabled_for_xattn;
+            const bool xattn_text_cache_active = !xattn_text_cache_explicit_off &&
+                                                 (xattn_text_cache_explicit_on || !would_oom_in_bsa) &&
                                                  runner_ctx.flash_attn_enabled &&
                                                  context != nullptr;
             if (xattn_text_cache_active) {
