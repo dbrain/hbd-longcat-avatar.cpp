@@ -328,8 +328,12 @@ namespace LONGCAT_AVATAR {
                     v_full = ggml_concat(ctx->ggml_ctx,
                                          ggml_cast(ctx->ggml_ctx, v_cond, GGML_TYPE_F32), v, 2);
                 }
+                // LongCat lap-28.4 (BSA): if a runner-built BSA mask is attached, pass it
+                // to flash. Quality trade — not bit-exact (sparse attention). Mask is
+                // pre-computed once per render and shared across all 48 blocks + 7
+                // consume steps. Persist path (step 0) stays dense for stability.
                 out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_rope, k_full, v_full,
-                                             num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true,
+                                             num_heads, ctx->bsa_mask, true, fa, kv_scale, /*flash_skip_kv_pad=*/true,
                                              /*kv_prescaled_f16=*/fa);
             } else if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {
                 // ======= VIDEO-CONTINUATION 3-WAY SPLIT (generate_avc) =======
@@ -1259,6 +1263,80 @@ namespace LONGCAT_AVATAR {
         std::vector<ggml_tensor*> condkv_writes; // ggml_cpy nodes for the current graph
         int64_t condkv_ncond                   = -1;
 
+        // LongCat lap-28.4 (BSA): persistent host-built F32 mask tensor for the
+        // consume-step self-attention. Computed once per resolution: each query token
+        // attends to its 3x3 spatial-cube neighborhood + all tokens in the cond frame
+        // (ref anchor). Quality trade, env-gated (LONGCAT_BSA=1) — default-off ⇒ dense.
+        ggml_context*         bsa_ctx           = nullptr;
+        ggml_backend_buffer_t bsa_buf           = nullptr;
+        ggml_tensor*          bsa_mask_tensor   = nullptr;
+        int64_t               bsa_cached_n_token = -1;
+        int64_t               bsa_cached_n_noise = -1;
+
+        void free_bsa_mask() {
+            if (bsa_mask_tensor) unregister_persistent_tensor(bsa_mask_tensor);
+            if (bsa_buf) { ggml_backend_buffer_free(bsa_buf); bsa_buf = nullptr; }
+            if (bsa_ctx) { ggml_free(bsa_ctx); bsa_ctx = nullptr; }
+            bsa_mask_tensor   = nullptr;
+            bsa_cached_n_token = -1;
+            bsa_cached_n_noise = -1;
+        }
+
+        // (Re)allocate the BSA mask if the shape (n_noise, n_token) changed, fill the
+        // -INF/0 mask on the host, and upload. Cube structure [T=full, H=cube_h, W=cube_w]
+        // with `radius` spatial-cube window. cond-frame tokens (k_t==0) are always allowed.
+        void ensure_bsa_mask(int64_t n_noise, int64_t n_token,
+                             int64_t n_per_frame, int64_t h_len, int64_t w_len,
+                             int cube_h, int cube_w, int radius) {
+            if (bsa_buf && bsa_cached_n_token == n_token && bsa_cached_n_noise == n_noise) {
+                return;  // already built for this shape
+            }
+            free_bsa_mask();
+            ggml_init_params p = { ggml_tensor_overhead() + 1024, nullptr, /*no_alloc=*/true };
+            bsa_ctx = ggml_init(p);
+            // Build the mask in F16 directly so the flash-attn wrapper's cast becomes
+            // a no-op — otherwise each of 48 attn calls per step ran a 408 MB F32->F16
+            // cast (~3 ms each), dominating any sparse-attention savings.
+            bsa_mask_tensor = ggml_new_tensor_2d(bsa_ctx, GGML_TYPE_F16, n_token, n_noise);
+            ggml_set_name(bsa_mask_tensor, "bsa_mask");
+            bsa_buf            = ggml_backend_alloc_ctx_tensors(bsa_ctx, runtime_backend);
+            bsa_cached_n_token = n_token;
+            bsa_cached_n_noise = n_noise;
+            register_persistent_tensor(bsa_mask_tensor);
+
+            // Build CPU-side. Token layout (per patch_embed): t outer, h middle, w inner.
+            // Token offset n_token-n_noise = n_cond_tokens (cond frames precede noise).
+            // F16 sentinels: -INF = 0xFC00, 0.0 = 0x0000.
+            std::vector<ggml_fp16_t> data((size_t) n_noise * n_token);
+            const ggml_fp16_t MASK_DENY  = 0xFC00;  // F16 -infinity
+            const ggml_fp16_t MASK_ALLOW = 0x0000;  // F16 +zero
+            const int64_t n_cond_local = n_token - n_noise;
+            for (int64_t qi = 0; qi < n_noise; ++qi) {
+                const int64_t q_orig    = n_cond_local + qi;
+                const int64_t q_spatial = q_orig % n_per_frame;
+                const int64_t q_h       = q_spatial / w_len;
+                const int64_t q_w       = q_spatial % w_len;
+                const int     q_cube_h  = (int) (q_h / cube_h);
+                const int     q_cube_w  = (int) (q_w / cube_w);
+                for (int64_t ki = 0; ki < n_token; ++ki) {
+                    const int64_t k_spatial = ki % n_per_frame;
+                    const int64_t k_t       = ki / n_per_frame;
+                    const int64_t k_h       = k_spatial / w_len;
+                    const int64_t k_w       = k_spatial % w_len;
+                    const int     k_cube_h  = (int) (k_h / cube_h);
+                    const int     k_cube_w  = (int) (k_w / cube_w);
+                    bool allow = (std::abs(q_cube_h - k_cube_h) <= radius) &&
+                                 (std::abs(q_cube_w - k_cube_w) <= radius);
+                    if (k_t == 0) allow = true;  // ref-frame anchor
+                    data[(size_t) qi * n_token + ki] = allow ? MASK_ALLOW : MASK_DENY;
+                }
+            }
+            ggml_backend_tensor_set(bsa_mask_tensor, data.data(), 0, ggml_nbytes(bsa_mask_tensor));
+            LOG_INFO("[BSA] mask built: n_noise=%lld n_token=%lld cube=[%d,%d] radius=%d bytes=%.1f MiB",
+                     (long long) n_noise, (long long) n_token, cube_h, cube_w, radius,
+                     (double) ggml_nbytes(bsa_mask_tensor) / (1024.0 * 1024.0));
+        }
+
         void free_condkv_cache() {
             // LongCat lap-27: unregister persistent-tensor entries so the runner's
             // segmented-reset path doesn't hold stale pointers after the buffer frees.
@@ -1438,6 +1516,40 @@ namespace LONGCAT_AVATAR {
                 runner_ctx.condkv_k     = &condkv_k_vec;
                 runner_ctx.condkv_v     = &condkv_v_vec;
                 runner_ctx.cache_writes = &condkv_writes;
+
+                // LongCat lap-28.4 (BSA): build / reuse the consume-step mask. Only
+                // exposed to attention when sampler_step > 1 (consume path); step 0 stays
+                // dense. Env-gated: LONGCAT_BSA=1 to enable, optional cube/radius knobs.
+                static const bool bsa_enabled = []{
+                    const char* s = getenv("LONGCAT_BSA");
+                    return s && s[0] == '1';
+                }();
+                if (bsa_enabled) {
+                    static const int bsa_cube_h = []{
+                        const char* s = getenv("LONGCAT_BSA_CUBE_H");
+                        return (s && s[0]) ? atoi(s) : 4;
+                    }();
+                    static const int bsa_cube_w = []{
+                        const char* s = getenv("LONGCAT_BSA_CUBE_W");
+                        return (s && s[0]) ? atoi(s) : 6;
+                    }();
+                    static const int bsa_radius = []{
+                        const char* s = getenv("LONGCAT_BSA_RADIUS");
+                        return (s && s[0]) ? atoi(s) : 1;
+                    }();
+                    int64_t n_token_b = t_len_c * npf_c;
+                    int64_t n_noise_b = n_token_b - ncond_c;
+                    if (n_noise_b > 0 && (h_len_c % bsa_cube_h) == 0 && (w_len_c % bsa_cube_w) == 0) {
+                        ensure_bsa_mask(n_noise_b, n_token_b, npf_c, h_len_c, w_len_c,
+                                        bsa_cube_h, bsa_cube_w, bsa_radius);
+                        if (cur_step > 1) {
+                            runner_ctx.bsa_mask = bsa_mask_tensor;
+                        }
+                    } else {
+                        LOG_WARN("[BSA] disabled — latent h=%lld w=%lld not divisible by cube [%d,%d]",
+                                 (long long) h_len_c, (long long) w_len_c, bsa_cube_h, bsa_cube_w);
+                    }
+                }
             }
 
             // Audio path: run AudioProjModel on the host-windowed inputs to produce

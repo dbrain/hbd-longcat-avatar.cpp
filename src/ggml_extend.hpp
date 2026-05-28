@@ -1366,7 +1366,15 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // different element type). The flash kernel accepts F16 K/V directly.
 
         if (mask_in != nullptr) {
-            mask_in = ggml_transpose(ctx, mask_in);
+            // LongCat lap-28.4: F16 callers (the BSA path) build the mask directly in
+            // flash's expected [L_k, L_q] layout (ne[0]=L_k, ne[1]=L_q), contiguous.
+            // The default wrapper convention is caller-provides-[L_q, L_k] which then
+            // gets transposed → non-contiguous (fails flash's contiguity assert when
+            // we skip the F32→F16 cast that previously materialized a contiguous F16
+            // buffer). Skip the transpose for F16 masks (BSA-style).
+            if (mask_in->type != GGML_TYPE_F16) {
+                mask_in = ggml_transpose(ctx, mask_in);
+            }
         } else {
             if (kv_pad > 0) {
                 mask_in         = ggml_ext_zeros(ctx, L_k, L_q, 1, 1);
@@ -1387,7 +1395,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                 mask_in = ggml_pad(ctx, mask_in, 0, mask_pad, 0, 0);
             }
 #endif
-            mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
+            // LongCat lap-28.4: if the caller passes an F16 mask (BSA path), skip the
+            // F32->F16 cast — otherwise this fires every attn call (48 per step) on a
+            // ~390 MB tensor and dominates any sparse-attention savings.
+            if (mask_in->type != GGML_TYPE_F16) {
+                mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
+            }
         }
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
@@ -1408,8 +1421,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // Modern ggml flash_attn_ext + the CUDA MMA kernel handle an unpadded L_k
         // with mask==nullptr directly, so skip the pad entirely for callers that opt
         // in (mask must be null — a real mask still needs its padding handled).
-        if (flash_skip_kv_pad && mask == nullptr) {
-            // no kv_pad, no synthesized mask
+        if (flash_skip_kv_pad) {
+            // LongCat lap-28.4: skip the L_k->256 pad whether or not a mask is supplied.
+            // The modern ggml flash kernel handles unaligned L_k + a [L_q, L_k] mask
+            // natively, and the legacy pad path can't extend a caller-supplied mask
+            // beyond L_k anyway (it would also crash ggml_pad on F16 K from the prescaled
+            // cond-cache path).
         } else if (can_use_flash_attn && L_k % 256 != 0) {
             kv_pad = GGML_PAD(L_k, 256) - static_cast<int>(L_k);
         }
@@ -1721,6 +1738,11 @@ struct GGMLRunnerContext {
     std::vector<ggml_tensor*>* condkv_k    = nullptr;  // per-block cached cond K (F16, prescaled)
     std::vector<ggml_tensor*>* condkv_v    = nullptr;  // per-block cached cond V
     std::vector<ggml_tensor*>* cache_writes = nullptr; // ggml_cpy nodes to expand into the graph
+    // LongCat lap-28.4 (BSA): pre-computed F32 [L_q, L_k] mask passed to consume-step
+    // self-attention. -INF for denied positions, 0 elsewhere. Built once per render in
+    // the runner (depends only on t/h/w/n_cond), shared across all 48 blocks and 7
+    // consume steps. nullptr ⇒ dense path (default; bit-exact).
+    ggml_tensor* bsa_mask                  = nullptr;
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
