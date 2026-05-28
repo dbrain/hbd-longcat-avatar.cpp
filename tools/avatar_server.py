@@ -34,7 +34,7 @@ KNOBS (per-request JSON, [default] in brackets):
   steps            [8]        DMD steps (8 is the distilled count; <8 = faster/softer)
   audio_mouth_scale[1.0]      <1 milder mouth, >1 more exaggerated
   audio_lowpass_hz [0]        0=off; ~3000 softens viseme transients
-  segment_frames   [49]       frames per segment (also accepts video_frames)
+  segment_frames   [53]       frames per segment (also accepts video_frames; PERF.md sweet spot)
   duration_sec     [null]     target seconds @25fps -> auto segments (overrides segment count)
   cont_cond_frames [13]       overlap frames between chained segments
   segments         [1]        explicit segment count (ignored if duration_sec set)
@@ -42,7 +42,9 @@ KNOBS (per-request JSON, [default] in brackets):
   quant            ["q4_k"]    q4_k | q4_0 (model file picked from MODELS_DIR)
   cfg_scale        [1.0]
   seed             [42]        <0 = random
-  offload          ["auto"]    auto | true | false  (auto: offload for >~40f or chains)
+  offload          [true]      true | false | auto  (prod assumes offload; auto: >~40f or chains)
+  bsa              null        opt-in {enable, radius, self_frame, bookend, bitmap}; sets LONGCAT_BSA*
+  debug_env        null        free-form {KEY: value} env overrides for the playground (LONGCAT_*, etc.)
   vae_tiling       [true]
   return           ["file"]    "file" -> {video_path,...} | "bytes" -> raw video body
 
@@ -98,6 +100,7 @@ STATE = {
     "last_render_sec": None,
     "renders_done": 0,
     "started_at": time.time(),
+    "draining": False,   # /v1/admin/drain — refuse new generates until cleared
 }
 STATE_LOCK = threading.Lock()
 
@@ -167,7 +170,7 @@ def build_argv(req: dict, image_path: Path, audio_path: Path, out_path: Path):
 
     steps = int(req.get("steps", 8))
     cont_cond_frames = int(req.get("cont_cond_frames", 13))
-    segment_frames = int(req.get("segment_frames", req.get("video_frames", 49)))
+    segment_frames = int(req.get("segment_frames", req.get("video_frames", 53)))
 
     if req.get("duration_sec"):
         segments = _frames_for_duration(float(req["duration_sec"]), segment_frames, cont_cond_frames)
@@ -181,10 +184,10 @@ def build_argv(req: dict, image_path: Path, audio_path: Path, out_path: Path):
     lowpass = float(req.get("audio_lowpass_hz", req.get("audio_lowpass", 0)))
     prompt = str(req.get("prompt", "a person talking"))
 
-    # offload decision: auto = offload for long single segments (>40f resident
-    # ceiling) or any chain (chains keep DiT+VAE+whisper resident, peak ~11.8G —
-    # the brief's min-VRAM story is offload). true/false force it.
-    off = req.get("offload", "auto")
+    # offload decision: prod default is TRUE (the supervisor ships offload-only —
+    # resident is a perf-bench knob). auto = offload for long single segments
+    # (>40f resident ceiling) or any chain. Explicit true/false force it.
+    off = req.get("offload", True)
     if isinstance(off, bool):
         offload = off
     elif str(off).lower() in ("true", "1", "yes", "on"):
@@ -232,6 +235,38 @@ def build_argv(req: dict, image_path: Path, audio_path: Path, out_path: Path):
     if vae_tiling:
         argv += ["--vae-tiling"]
 
+    # BSA + debug env passthrough. Both are env-var-gated in src/longcat_avatar.hpp
+    # / src/ggml_extend.hpp at sd_ctx init time — spawn-per-render makes the
+    # per-request shape correct by construction (each render gets a fresh process
+    # with the env it asked for). Absent → dense default (BSA off).
+    extra_env = {}
+    bsa = req.get("bsa")
+    if isinstance(bsa, dict):
+        if bsa.get("enable"):
+            extra_env["LONGCAT_BSA"] = "1"
+            if "radius" in bsa and bsa["radius"] is not None:
+                extra_env["LONGCAT_BSA_RADIUS"] = str(int(bsa["radius"]))
+            if bsa.get("self_frame"):
+                extra_env["LONGCAT_BSA_SELF_FRAME"] = "1"
+            if "bookend" in bsa and bsa["bookend"] is not None:
+                extra_env["LONGCAT_BSA_BOOKEND"] = str(int(bsa["bookend"]))
+            if "cube_h" in bsa and bsa["cube_h"] is not None:
+                extra_env["LONGCAT_BSA_CUBE_H"] = str(int(bsa["cube_h"]))
+            if "cube_w" in bsa and bsa["cube_w"] is not None:
+                extra_env["LONGCAT_BSA_CUBE_W"] = str(int(bsa["cube_w"]))
+            if bsa.get("bitmap"):
+                extra_env["LONGCAT_BSA_BITMAP"] = "1"
+    debug_env = req.get("debug_env")
+    if isinstance(debug_env, dict):
+        for k, v in debug_env.items():
+            if not isinstance(k, str):
+                continue
+            # Namespace guard: only env keys that look like LongCat perf knobs.
+            # Stops a request from setting LD_PRELOAD/PATH/etc.
+            if not (k.startswith("LONGCAT_") or k.startswith("GGML_") or k.startswith("CUDA_")):
+                continue
+            extra_env[k] = str(v)
+
     meta = {
         "quant": quant, "resolution": f"{width}x{height}", "steps": steps,
         "segment_frames": segment_frames, "segments": segments,
@@ -239,8 +274,9 @@ def build_argv(req: dict, image_path: Path, audio_path: Path, out_path: Path):
         "cfg_scale": cfg_scale, "audio_mouth_scale": mouth,
         "audio_lowpass_hz": lowpass, "offload": offload, "vae_tiling": vae_tiling,
         "prompt": prompt,
+        "extra_env": extra_env if extra_env else None,
     }
-    return argv, meta
+    return argv, meta, extra_env
 
 
 def run_render(req: dict):
@@ -252,15 +288,21 @@ def run_render(req: dict):
         img = _materialize(req.get("image"), job_dir / "ref.png")
         aud = _materialize(req.get("audio"), job_dir / "speech.wav")
         out_path = job_dir / "out.webm"
-        argv, meta = build_argv(req, img, aud, out_path)
+        argv, meta, extra_env = build_argv(req, img, aud, out_path)
 
         with STATE_LOCK:
             STATE["busy"] = True
         t0 = time.time()
+        env = None
+        if extra_env:
+            env = os.environ.copy()
+            env.update(extra_env)
+            print(f">> render env overrides: {extra_env}", flush=True)
         print(f">> render start: {' '.join(argv)}", flush=True)
         # cwd = repo root so build/bin/sd-cli + relative model paths resolve.
         proc = subprocess.Popen(
-            argv, cwd=CFG["repo"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            argv, cwd=CFG["repo"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env,
         )
         with STATE_LOCK:
             STATE["current_pid"] = proc.pid
@@ -332,6 +374,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "status": "ok",
                 "busy": s["busy"],
+                "draining": s.get("draining", False),
+                # spawn-per-render: nothing is "loaded" between renders by construction
+                "loaded": s["busy"],
+                "in_flight": 1 if s["busy"] else 0,
                 "gpu_mem_used_mib": gpu_mem_used_mib(),
                 "renders_done": s["renders_done"],
                 "last_render_sec": s["last_render_sec"],
@@ -366,7 +412,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": f"bad json: {e}"})
             return
 
-        if self.path.startswith("/unload"):
+        # Unified admin shape — /v1/admin/{unload,drain,load} aliases for the
+        # supervisor. Mirrors the qwen3-tts.cpp / siglip2.cpp / parakeet-cpp
+        # vocabulary the kob-gpu-gate eviction path expects.
+        if self.path.startswith("/v1/admin/unload") or self.path.startswith("/unload"):
             force = bool(req.get("force", False))
             with STATE_LOCK:
                 proc = STATE.get("current_proc")
@@ -382,7 +431,25 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if self.path.startswith("/v1/admin/drain"):
+            with STATE_LOCK:
+                STATE["draining"] = True
+                busy = STATE["busy"]
+            self._json(200, {"status": "draining", "busy": busy})
+            return
+
+        if self.path.startswith("/v1/admin/load"):
+            # spawn-per-render — nothing to pre-load; clear the drain flag.
+            with STATE_LOCK:
+                STATE["draining"] = False
+            self._json(200, {"status": "ok", "note": "supervisor pre-loads nothing (spawn-per-render)"})
+            return
+
         if self.path.startswith("/generate"):
+            with STATE_LOCK:
+                if STATE.get("draining"):
+                    self._json(503, {"error": "service draining — not accepting new renders"})
+                    return
             if not req.get("image") or not req.get("audio"):
                 self._json(400, {"error": "image and audio are required"})
                 return
