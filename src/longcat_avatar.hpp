@@ -154,7 +154,14 @@ namespace LONGCAT_AVATAR {
             // norm_f32<…,true,true> kernel collapses 3 HBM-bouncing kernels into one.
             auto scale1 = ggml_scale_bias(ctx->ggml_ctx, scale, 1.0f, 1.0f);
             if (ctx->gf != nullptr) {
+                // LongCat lap-28: also pre-expand `shift`'s view/CONT chain (the chunk-
+                // produced bias). Without this, shift's VIEW+CONT nodes land *between*
+                // MUL and ADD in topo order (post-order DFS from ADD finds shift's
+                // unbuilt srcs after MUL is already built), which the autofusion's
+                // after-MUL view-skip cannot walk past (CONT is not view-like). Pre-
+                // expanding pushes them earlier ⇒ ADD lands directly after MUL.
                 ggml_build_forward_expand(ctx->gf, scale1);
+                ggml_build_forward_expand(ctx->gf, shift);
             }
             x          = norm->forward(ctx, x);
             int64_t Nb = x->ne[2];
@@ -788,7 +795,11 @@ namespace LONGCAT_AVATAR {
             // MUL in topo and breaks adjacency). Same trick as the block modulate path.
             auto scale1 = ggml_scale_bias(ctx->ggml_ctx, ms[1], 1.0f, 1.0f);
             if (ctx->gf != nullptr) {
+                // LongCat lap-28: pre-expand shift (ms[0]) too — same reason as the
+                // block modulate(): keep shift's view/CONT chain out of the [MUL, ADD]
+                // adjacency so the {NORM, MUL, ADD} autofusion fires.
                 ggml_build_forward_expand(ctx->gf, scale1);
+                ggml_build_forward_expand(ctx->gf, ms[0]);
             }
             x          = norm_final->forward(ctx, x);
             int64_t C  = x->ne[0];
