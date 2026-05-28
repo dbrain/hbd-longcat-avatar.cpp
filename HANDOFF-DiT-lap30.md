@@ -1,17 +1,14 @@
 # LongCat-Avatar.cpp — DiT PERF HANDOFF (lap-30, the levers that are STILL left)
 
-*Written end of lap-29 (2026-05-28). Lap-29 shipped **ONE** bit-exact perf win
-(**-8.5% wall, 155.11 → 142.03s mean (3 runs) @ 480/25f/--steps 8 RESIDENT**) by
-bumping the FA MMA kernel's launch_bounds occupancy from 2 to 3 — a single-integer
-change in `ggml/src/ggml-cuda/fattn-mma-f16.cuh`. Five other experiments were
-attempted and all dead-ended (MMQ occupancy bump regressed +27%, Q_in_reg=false
-nuked the win, audio cross-attn KV cache too small to measure + fails bit-exact at
-F16, smaller FA ncols1 is 10× slower, occupancy=4 spills). Read this doc first;
-it supersedes HANDOFF-DiT-lap29.md (kept for archaeology).*
+*Written end of lap-29 (2026-05-28). Lap-29 shipped TWO things:*
+*- **lap-29.1**: FA launch_bounds occupancy 2→3 = **−8.5% wall bit-exact** (155.11→142.03s mean, 480/25f/--steps 8 RESIDENT)*
+*- **lap-29.2**: BSA self_frame/bookend anchors + sparse FA (whole-tile early-skip on -INF mask). Owner-validated quality config exists (r=1 + self_frame, "almost as good as no BSA fiddling, mild camera-like movement at 93f"), but whole-tile sparse skip only recovers the BSA mask-add overhead — BSA r=1+sf with sparse kernel matches dense baseline 142.5s, no net win. Always-skip probe shows ~17s more available with per-K-column skip.*
+
+*Lap-30's PRIMARY MISSION: write the per-K-column sparse-FA kernel to unlock that remaining ~12% wall. **BSA without that perf win is a quality regression with no upside — do not declare BSA "shipped as configurable quality knob" until per-column skip lands.** Read this doc first; supersedes HANDOFF-DiT-lap29.md.*
 
 ---
 
-## ⏱️ FIRST FIVE MINUTES — eye-test server should already be up
+## ⏱️ FIRST FIVE MINUTES
 
 ```
 curl -sI http://10.0.0.208:8011/    # serve_clips.py should answer HTTP 200
@@ -20,32 +17,41 @@ cd ~/dev/longcat-avatar.cpp && nohup python3 tools/serve_clips.py --dir build --
   > /tmp/serve_clips.log 2>&1 & disown
 ```
 
-http://10.0.0.208:8011/ — `lap29_occ3_final.webm` is the lap-29.1 reference clip
-(142.15s, PSNR 99.00 vs lap-27 baseline). Owner reviews when convenient.
+http://10.0.0.208:8011/ — **`lap29_sparse_final.webm`** is the lap-29.2 dense baseline reference clip (142.99s, PSNR 99.00 vs lap-27). The BSA quality reference is **`lap29_bsa_r1_selfframe.webm`** (or the sparse-kernel bit-exact clone `lap29_sparse_final_bsa.webm`) — what owner OK'd as "mild camera movement, have as option for clips."
+
+Standard bench command:
+```
+/tmp/render_bench.sh /src/build/<NAME>.webm "<env kvs>" --steps 8
+# dense:  ""
+# BSA:    "LONGCAT_BSA=1 LONGCAT_BSA_RADIUS=1 LONGCAT_BSA_SELF_FRAME=1"
+```
+
+Bit-exact gate:
+```
+cd ~/dev/longcat-avatar.cpp && python3 tools/clip_compare.py \
+  build/lap28_lap27baseline.webm build/<NEW>.webm   # → PSNR 99.00 mean+min
+```
 
 ---
 
-## 🔥 MOOD / MANDATE (unchanged from lap-29)
+## 🔥 MOOD / MANDATE — READ TWICE, DO NOT SKIP
 
-*"Go mental — get it faster than it should ever be on this hardware."* Owner is
-explicit: *"custom kernel for wins is our bag."* Don't write off a lever because
-"the kernel needs surgery" — that IS the work.
+**MENTALITY:** *"Go mental — get it faster than it should ever be on this hardware. Custom kernel for wins is our bag."* Owner is explicit on this lap: *"let's multi-day per-column skip to get the 12%. no quitting unless 100% proven from all angles to not be a performance win."* The lever cost in days is NOT a reason to walk away — it's the work, not the excuse. "The kernel needs surgery" / "the MMA tile is atomic per-block" / "the K-col compaction needs gather/scatter" — these are the actual problems to solve.
 
-**Every "floor" claim disprovable with a profiler.** New evidence this lap: the
-FA kernel was sold (HANDOFF-DiT-lap28 lever #7) as needing fork-class FA2/FA3
-surgery — actual win came from a **one-integer launch_bounds change**. The lap-28
-ncu numbers (31.7% SOL, 50%-CPI L1TEX stalls, 16.66% occupancy) all named the
-exact same disease: not enough concurrent warps. The fix was telling nvcc to fit
-3 blocks/SM instead of 2. Verify the cheap thing FIRST before scoping kernel forks.
+**EVERY FLOOR CLAIM HAS BEEN DISPROVABLE:**
+- "im2col is at roofline" → was 7% BW (lap-21)
+- "MUL_MAT is floored" → was 7× redundant cond work (lap-26)
+- "FA kernel needs fork-class FA2/FA3 surgery" → was a **one-integer launch_bounds change** (lap-29.1: −8.5% wall)
+- "stock ggml flash applies mask post-QK so BSA can't help" → TRUE, but the cheap fix (whole-tile early-skip) only got us back to baseline — **the real fix is per-K-col skip, which requires inside-the-MMA-loop work** (lap-30 mission)
+
+**Measure. Do not predict.** The always-skip probe (force `return` inside the iter when mask is present) measured the theoretical ceiling at **125.32s = -12% on top of lap-29.1**. That's the target. The honest path between current 142.5s and 125.3s is per-K-column skip, kernel work, several days.
 
 **Gates (mandatory, every change):**
-- Bit-exact: `tools/clip_compare.py <base> <new>` reads **PSNR 99.00**.
-- Quality trade (needs owner OK): ac16 0.83–0.84 flat across all frames + last + 2 seeds.
+- Bit-exact: `tools/clip_compare.py <base> <new>` reads **PSNR 99.00 mean+min**.
+- Quality trade (needs owner OK): BSA gate is owner-OK'd at r=1+self_frame.
 - Standard bench: **480×832, 25 frames, --steps 8, RESIDENT, `--max-vram 9`** — wins MUST show there.
 
-**ONE GPU** (RTX 3060 / sm_86 / 12 GB). Standard bench under `--max-vram 9`. Stop
-prod acestep / tts / llama before heavy runs. `docker rm -f longcat-avatar-iter`
-strays. Never two GPU jobs at once.
+**ONE GPU** (RTX 3060 / sm_86 / 12 GB). Stop prod acestep / tts / llama before heavy runs. `docker rm -f longcat-avatar-iter` strays. Never two GPU jobs at once.
 
 ---
 
@@ -53,211 +59,129 @@ strays. Never two GPU jobs at once.
 
 | commit | tag | what | wall (resident, 480/25f/--steps 8) |
 |---|---|---|---|
-| `72747ac` (parent) / `90670f7a` (ggml) | `kobbler-lap29.1-fa-occupancy-3-2026-05-28` | FA MMA `__launch_bounds__` occupancy 2→3 for DKQ=DV=128 ncols=64 (avatar's consume self-attn shape). nvcc fits 3 blocks/SM with zero register spills — pure free latency hiding for the L1TEX-stall-bound kernel. | 155.11s → **142.03s** mean of 3 runs = **−8.5%** (sampling 121.04 → 107.65s = −11.1%); PSNR 99.00 vs lap-27 reference, all 25 frames |
+| `72747ac` parent / `90670f7a` ggml | `kobbler-lap29.1-fa-occupancy-3-2026-05-28` | FA MMA `__launch_bounds__` occupancy 2→3 for DKQ=DV=128 ncols=64. nvcc fits 3 blocks/SM with zero register spills — free latency hiding for the L1TEX-stall-bound kernel. | 155.11s → **142.03s** mean of 3 = **−8.5%** (sampling 121.04 → 107.65s); PSNR 99.00 |
+| `8d9b71f` parent / `11341ed5` ggml | `kobbler-lap29.2-bsa-quality-knob-sparse-fa-2026-05-28` | BSA self_frame + bookend anchors (env-gated) + sparse-FA whole-tile early-skip kernel. BSA r=1+sf becomes "free" vs dense, but no NET win — see Limitations below. | dense 142.99s (unchanged); BSA r=1+sf 142.49s (was 150.14s pre-sparse-kernel) |
 
-**Stacked cumulative @ 480/25f/--steps 8 resident:** 159.03s (lap-27 baseline) →
-**142.03s** (lap-29.1) = **−10.7%** over 5 ship laps (28.1–28.5 + 29.1).
-
-The 142.03s number is the "current shipped" baseline for lap-30 deltas. Current
-shipped HEAD is `72747ac` (parent) bumping ggml to `90670f7a`, clip is
-`build/lap29_occ3_final.webm`. PSNR 99.00 vs lap-27 baseline maintained.
-
-**Production-quality clips in `build/`:**
-- `lap28_lap27baseline.webm` — same-conditions lap-27 reference (159.03s, **the A/B reference**)
-- `lap28_scale_cast.webm` — lap-28.5 (155.16s)
-- `lap29_baseline.webm` — re-confirm of lap-28.5 baseline on lap-29 HEAD (155.11s)
-- `lap29_occ3.webm`, `lap29_occ3_run2.webm`, `lap29_occ3_final.webm` — lap-29.1 (141.93 / 142.00 / 142.15s)
+**Cumulative since lap-27 baseline:** 159.03s → **142.49s** = **−10.4%** over 6 ship laps.
 
 ---
 
-## What FAILED in lap-29 (write up so it isn't re-burned)
+## 🎯 LAP-30 PRIMARY MISSION — per-K-column sparse FA kernel
 
-### ✗ MMQ launch_bounds occupancy 1→2 — **+27% regression**
+**Target wall:** 142.5s → **~125s = −12%**. Measured via always-skip probe (see below). Bit-exact gate (PSNR 99.00) — skip math is exp(-INF)·anything = 0.
 
-Same lever as lap-29.1 applied to the MMQ kernel (`mmq.cuh:3537` Volta+ branch,
-currently at `__launch_bounds__(nwarps*warp_size, 1)`). nvcc compiled cleanly,
-no spill warnings, but bench: **142.15s → 180.81s = +27.2% regression**.
-Reverted (no commit).
+**Why whole-tile skip wasn't enough (lap-29.2 measurement):**
 
-MMQ kernel is fundamentally different from FA: it's smem-heavy (X tile + Y tile
-dequant buffers), so packing 2 blocks/SM either forces a smaller per-block tile
-(less efficient) or hits smem-bank-conflict contention. The FA win generalized
-poorly. **Rule: launch_bounds occupancy bumps work for L1TEX-stall-bound kernels
-(FA), NOT for smem-throughput-bound kernels (MMQ). Profile before bumping.**
+The lap-29.2 kernel checks "is ANY cell in the Q-tile × K-tile slice allowed?" and skips the iter if not. For our shape (Q tile = 64 Q rows spanning multiple spatial cubes, K tile = 64 K rows in one frame), the Q tile's UNION of allowed K positions is large enough that most K tiles have AT LEAST ONE allowed cell → can't whole-tile-skip. Measured:
 
-### ✗ FA Q_in_reg=true → false — **kills the lap-29.1 win**
+| config | wall | what |
+|---|---|---|
+| dense (no mask) | 142.99s | baseline |
+| BSA r=1+sf, sparse kernel (lap-29.2) | 142.49s | recovers mask-add overhead, no NET win |
+| **always-skip probe** (force return when mask present) | **125.32s** | the 12% ceiling — perf upper bound |
 
-With Q_in_reg=false the kernel re-loads Q from smem every K iter. Bench: **142.15s
-→ 155.62s = back to pre-lap-29.1**. The two are linked: Q-in-registers is what
-makes the 3-block-per-SM compile fit AND what makes the per-iter work small enough
-that the higher occupancy is a net win. Reverted (no commit).
+The probe is wrong-output but proves the K-tile compute that CAN be elided. The 17s gap between real-skip and probe = compute on tiles with SOME allowed cells but mostly deny. Each such tile, the MMA does 64×64 work but most cells contribute exp(-INF)=0 to softmax → wasted work.
 
-### ✗ FA `LONGCAT_FA_NCOLS1=32` — **10× regression**
+**The kernel work:**
 
-Reducing the per-block Q-tile width from 64 to 32 doubles the number of FA blocks
-launched (each handling half the Q rows). Each block still reads the full K
-sequence → 2× K HBM traffic + 2× scheduling overhead. Bench: 1.85s/it (default
-ncols1=64) → **19.34s/it (ncols1=32)** — measured during 2/8 iters before kill.
-The lap-26 dev knob comment "smaller ncols1 → lower register pressure / higher
-occupancy" had the directionality WRONG for this workload. (Occupancy is already
-saturated at the launch_bounds limit, so smaller ncols1 only adds K-read overhead.)
+Inside `flash_attn_ext_f16_iter` (`ggml/src/ggml-cuda/fattn-mma-f16.cuh`, the function I added the whole-tile skip to in lap-29.2), the K iteration runs MMA tiles of `T_A_KQ::I × T_A_KQ::J` (16 × 8 on Turing+). Per-K-column skip means: for each MMA tile chunk of K columns, check if ALL Q rows have that K range fully denied. If yes, skip the MMA call for that chunk; bookkeep `KQ_C[]` is initialized to 0 from previous untouched state (verify this assumption — the accumulator may need explicit zero-init if we're skipping a chunk that would otherwise contribute).
 
-### ✗ FA occupancy=4 — **+1.4% regression vs occupancy=3**
+Three sub-approaches in order of incremental difficulty:
 
-3 blocks/SM is the sweet spot on sm_86 for this shape. Bumping to 4 → nvcc must
-cram more registers/block, slight register spills (no warnings but measurable),
-wall +1.98s. Reverted.
+### (a) Per-MMA-chunk skip — simplest entry
 
-### ✗ Audio cross-attn KV cache — **too small to measure + F16 fails bit-exact**
+Inside the K loop body at lines ~669-695 of `fattn-mma-f16.cuh`, before each `mma(KQ_C[...], K_A, Q_B[...])` call, check the mask slice for the K columns this MMA chunk covers (T_A_KQ::J = 8 K cols per chunk). If all -INF across the Q-tile's rows that the MMA tile's output covers → skip the load_ldmatrix + mma.
 
-Implemented full lap-26-style runner-side persistent buffer + per-block cpy
-writes at step 0/1, consume reads at step>1. F32 buffer (151 MiB) **OOMs under
---max-vram 9** (compute buffer wanted 1409 MiB, total push past 9 GB). Dropped to
-F16 buffer (75 MiB) — fits, runs, but bench shows **+0.5s wall (within noise)**
-and **PSNR mean 44 dB / min 38 dB** — the F16 precision drop in K visibly drifts
-across the 25 frames. Reverted.
+The K_A load_ldmatrix is from `tile_K + i_KQ_0*stride_tile_K + (k_KQ_0 - k0_start)`. So per-chunk check needs the mask block for (Q rows of this tile, K cols [k_KQ_0, k_KQ_0+8)).
 
-Audio cross-attn projection chain is just too small (768→4096 GEMM on M=192
-tokens, called 48 blocks × 6 steps cache-hit ≈ 144ms savings = 0.1% wall, below
-the bench noise floor). The handoff-quoted "~0.3-0.5% wall" was optimistic.
-Lever is dead at this resolution; only worth revisiting if/when standard bench
-gets faster (noise floor shrinks). Lap-26-pattern infrastructure proof-of-concept
-worked though — text cross-attn cache could follow the same shape if needed.
+Bit-exact: skipping the MMA doesn't update KQ_C[], so the partial sum is whatever was there. Need to verify KQ_C[] starts at 0 each iter (it does — declared per-iter on the stack).
 
-### ✗ Reserve: other launch_bounds sites NOT tried
+Expected savings: 60-70% of K-tile compute on mask-present iters → meets the 12% target.
 
-In the same audit I found `, 1)` launch_bounds on:
-- `mmvq.cu:395, :601` — matvec quantized
-- `mmf.cuh:49, :298` — matmul float
-- `fattn-common.cuh:625, :678, :758, :864` — FA combine/reduce kernels (each ~µs/call, marginal)
-- `softmax.cu:302` — parallelize_cols softmax
-- `topk-moe.cu:80`, `ssm-scan.cu:19, :118` — not used by avatar
+### (b) K-column compaction — biggest restructure
 
-The MMQ regression evidence suggests these probably don't all respond. Worth
-trying selectively (mmvq for VAE, mmf for F16 matmuls in the cross-attn
-projections, fattn-common combine kernels), but each needs an ncu-based decision
-or empirical bench-and-revert. **Rule reminder: bump only kernels that are
-L1TEX-stall-bound, not smem-bound.**
+Preprocess the mask once per attention call into a "column survivors" index list. The K loop iterates only over surviving columns. Requires:
+- New scratch buffer for compacted K column indices
+- Modified K tile load to gather from non-contiguous K columns
+- Modified mask load to gather correspondingly
+
+More invasive but generalizes beyond BSA (causal attention, arbitrary user masks). The MMA structure stays intact — just sees a denser K input.
+
+### (c) Pre-grouped K reordering — unlikely worth it
+
+Sort/group K positions so allowed K's are contiguous. Avoids gather. But shuffles K's RoPE positions (the avatar uses 3D-RoPE on K — re-ordering breaks the position encoding). Probably DOA.
+
+**Recommended start:** (a). Smallest change, highest confidence in correctness, single-file edit. Then measure. If (a) gets us to ~130s (most of the way), maybe (b) is unnecessary. If (a) only gets us to ~138s (the per-chunk reductions add overhead that eats the savings), pivot to (b).
+
+**Verification ladder:**
+1. Build with (a). Run dense bench — should still be 142.99s (no mask = no overhead path).
+2. Run BSA r=1+sf bench. Expect 130-135s if (a) works.
+3. PSNR check vs `lap29_bsa_r1_selfframe.webm` — must be 99.00.
+4. PSNR check dense vs `lap28_lap27baseline.webm` — must be 99.00.
+5. If both PSNR clean + wall drops, commit + tag `kobbler-lap30.1-sparse-fa-per-col-2026-MM-DD`.
 
 ---
 
-## The levers that are LEFT for lap-30 (ranked, with current ROI honesty)
+## What FAILED in lap-29 (do not re-burn)
 
-### 1. **Custom sparse-flash kernel** (BSA-aware) — still the biggest authorized upside
+(see HANDOFF-DiT-lap29.md for the full list — most carried forward; new dead-ends from this lap):
 
-Unchanged from lap-29's framing — owner explicit license, BSA mask infra is
-DONE (lap-28.4), kernel is the work. But now scaled differently: with FA share
-dropped from 38.9% to 30.5% of consume-step wall, the BSA upside drops from
-~8-15% to ~6-12% wall. Still the biggest available lever.
+- **MMQ launch_bounds occupancy 1→2**: +27% regression. MMQ is smem-bound, not L1TEX-stall-bound. **Rule: only bump launch_bounds for L1TEX-stall-bound kernels.**
+- **FA Q_in_reg=false**: undoes lap-29.1 win entirely (back to 155.62s). Q-in-registers is load-bearing.
+- **FA `LONGCAT_FA_NCOLS1=32`**: 10× slower. Smaller per-block Q-tile doubles K HBM traffic. The lap-26 dev knob comment claiming "smaller → higher occupancy" had directionality wrong.
+- **FA occupancy=4**: +1.4% spill regression vs occupancy=3.
+- **Audio cross-attn KV cache (lap-26 pattern)**: F32 buffer (151 MiB) OOMs at --max-vram 9; F16 buffer (75 MiB) fits, +0.5s wall (within noise), PSNR mean 44dB / min 38dB. Audio kv_linear chain too small to measure above noise floor.
+- **BSA bookend anchor**: owner verdict, worse than self_frame.
+- **BSA whole-tile sparse FA**: recovers mask-add overhead but no NET win vs dense. **See lap-30 mission for the per-K-column followup.**
 
-**Quality gate is still the blocker.** Owner verdict on radius={1,2} cube[4,6]
-was NOT acceptable. lap-30 should render a quality-experiment matrix BEFORE
-writing the kernel:
-- Asymmetric h/w radius (e.g., rh=4 rw=2 — vertical motion is smaller)
-- Multi-frame anchors (t=0 + t=last + every-Nth)
-- Per-block density (early blocks dense, later sparse)
-- Per-step density (first 2 steps dense, last 6 sparse)
-- Smaller cubes (e.g., [2,3] or [4,4])
+---
 
-These are all env-knob experiments using the existing lap-28.4 mask plumbing
-(`LONGCAT_BSA_CUBE_H`/`_W`/`_RADIUS`). Render each, owner-review, find a
-quality-acceptable config, THEN write the sparse-flash kernel.
+## The levers that are LEFT for lap-30 (ranked)
 
-### 2. **`ggml_ext_attention_ext` non-flash → flash dispatch (audio cross-attn)**
+### 1. **Per-K-column sparse FA kernel** — THE primary mission (12% ceiling)
 
-Audio cross-attn currently uses non-flash (`flash=false`) because the per-frame
-batching collapses N to 1 via the FA wrapper's output view. The non-flash path
-materializes the [L_k=32, L_q=192, n_head*T_n] score tensor in F32 — cheap, but
-running flash would skip materialization. The wrapper bug that forced non-flash
-("FLASH path collapses N to 1" comment in `audio_cross_attn`) is fixable — just
-needs the wrapper to return a non-collapsed output view for N>1. Then audio
-attention runs on the now-faster FA kernel.
+See § Lap-30 Primary Mission above. Owner explicit: *"no quitting unless 100% proven from all angles to not be a performance win."*
 
-Estimated wall delta: ~0.1-0.3%. Small but real, and bit-exact.
+### 2. **Text cross-attn KV cache** (lap-26 pattern, ~0.4% wall)
 
-### 3. **Cross-attn (TEXT) KV cache** — lap-26 pattern, bigger savings than audio
+Same plumbing the audio attempt proved out. Text K/V is [head_dim=128, num_heads=16, n_ctx=512] = ~96 MiB F32 (fits under --max-vram 9, unlike audio's 151 MiB OOM). Cacheable since context is step-invariant. Lap-26 cond-kv code pattern in `src/longcat_avatar.hpp:1387-1408` (`ensure_condkv_cache`) and `:1631-1648` (build_graph cache writes) is the template.
 
-Text cross-attn has a bigger kv_linear (4096→4096 GEMM on L_ctx=512 tokens) +
-permute + cont + k_norm chain, called 48 blocks × 7 redundant steps. Sized ~0.4%
-wall. Same plumbing pattern as the dead audio attempt — runner persistent buffer,
-per-block cpy writes at step 0/1, consume reads at step>1.
+### 3. **MMF / MMVQ launch_bounds audit** (after #1)
 
-The key constraint that killed audio cache (F32 buffer OOMs at --max-vram 9):
-text K/V is [head_dim=128, num_heads=16, n_ctx=512] = 1 MiB per tensor × 48 × 2
-= 96 MiB F32 (vs audio's 151 MiB). Fits.
+`mmf.cuh:49, :298` and `mmvq.cu:395, :601` are at `, 1)` launch_bounds. Try bumping each to 2 with bench-and-revert. **Skip if it spills or regresses** — MMQ taught the rule. Could be 1-3% each if applicable.
 
-PSNR risk: same as audio's F16 attempt (~40dB) if cached F16; bit-exact if F32.
-Try F32 first; if it fits AND bench shows real wall savings (above noise), ship.
+### 4. **FA combine kernels** (`fattn-common.cuh:625, :678, :758, :864`)
 
-### 4. **MMF / MMVQ launch_bounds audit** (after #2, #3)
+Each FA call ends with a small combine/reduce. Bumping occupancy is cheap; estimated <0.1% wall. Only worth a batch with #3.
 
-`mmf.cuh:49, :298` and `mmvq.cu:395, :601` are at `, 1)` launch_bounds. mmf is
-used for F16/BF16/F32 matmul fallbacks (the avatar's pf32-forced Linears may
-route here for some shapes). Try bumping each to 2 with bench-and-revert.
-**Skip if it spills or regresses** — MMQ taught us not all kernels respond.
+### 5. **FA `nbatch_K2` / `nbatch_V2` / `nbatch_fa` tuning** for our DKQ=DV=128 ncols=64 case
 
-### 5. **FA combine kernels** (`fattn-common.cuh:625, :678, :758, :864`)
+Lap-29.1 only changed `occupancy`. Other config knobs in `fattn-mma-f16.cuh:62` (`nbatch_K2=64`, `nbatch_V2=64`, `nbatch_fa=64`) might have headroom now occupancy=3 freed register budget. Sweep 32/96/128 for each, rebuild + bench. Risk: regressions / spills. ~30 min per experiment.
 
-Each FA call ends with a small combine/reduce pass over the multi-pass output.
-Per-call wall is ~µs; bumping occupancy from 1 to 2 is cheap to try but
-estimated <0.1% wall. Low ROI, only worth trying as part of a batch.
+### 6. **ncols=128 case** (per-head Q-batch persistence, handoff lap-29 #2b)
 
-### 6. **FA `nbatch_K2` / `nbatch_V2` / `nbatch_fa` tuning** for our ncols=64 case
+Each block handles 2× more Q rows = 0.5× K HBM reads. Requires new template instantiation in `fattn.cu`. ~4-8h work. Realistic ~1-3% wall on top of lap-29.1. Try AFTER the per-K-col kernel.
 
-Lap-29.1 changed only `occupancy`. The other config knobs (`nbatch_K2=64`,
-`nbatch_V2=64`, `nbatch_fa=64`) might also have headroom now that occupancy=3
-freed register budget. Each is a sweep — try 32/96/128 for each, rebuild +
-bench. Risk: regressions / spills. ~30 min per experiment.
+### 7. **Dead-ends do not re-burn (carry forward)**
 
-### 7. **ncols=128 case** (per-head Q-batch persistence, handoff lap-29 #2b)
-
-Each block handles 2× more Q rows = 0.5× K HBM reads + better Q-amortization.
-Requires:
-- New `GGML_CUDA_FATTN_MMA_CONFIG_CASE(128, 128, 128, ...)` entry
-- Template instantiation in `fattn.cu` (the dispatch only goes up to 64/ncols2 now)
-- Verify register budget fits (occupancy may need to drop back to 2)
-
-~4-8h work. Realistic ~1-3% wall on top of lap-29.1. Try AFTER the cheap levers.
-
-### 8. **Dead-ends (do not re-burn)**
-
-ALL of these have been measured dead:
-- MMQ occupancy bump (+27% regression) — see "What FAILED" above
-- FA Q_in_reg=false (-8.5% revert) — see above
-- FA NCOLS1<64 via env (10× regression) — see above
-- FA occupancy=4 (+1.4% regression) — see above
-- Audio cross-attn KV cache F16 (PSNR fail, no wall savings) — see above
-- BSA via stock ggml flash (+5.7% regression) — see lap-29 handoff
-- MUL_MAT precision pf32 lever (lap-26): MMQ dispatch ignores prec flag.
-- CUDA graphs: ~5ms launch overhead, step is compute-bound.
-- FP8 K/V storage: sm_86 has no FP8 compute.
-- Q3_K weights: +7% slower than Q4_K.
-- conv-3d-direct VAE kernel: 1.19× slower than im2col+cuBLAS.
-- FP32 LayerNorm → FP16-with-FP32-accum: bit-exact blocker.
-- Native m16n8k8 D=72 ViT FA kernel: 12-20h surgery for ~2% wall.
+ALL of these have been measured dead — see HANDOFF-DiT-lap29.md for the full list. New in lap-30: BSA whole-tile skip is recovered (lap-29.2) but is not the perf win — see §1 for the actual path.
 
 ---
 
 ## Method (reproducibly)
 
-**Build:** `~/dev/kobbler/docker/longcat-avatar-dev/iter.sh build` (~18-30s
-incremental, sm_86, ccache).
+**Build:** `~/dev/kobbler/docker/longcat-avatar-dev/iter.sh build` (~18-30s incremental, sm_86, ccache).
 
-**Standard bench (lap-30 reference):** 480x832, 25f, --steps 8, resident
-(no --offload-to-cpu), `--diffusion-fa --seed 42 --clip-on-cpu --max-vram 9`.
-Use `/tmp/render_bench.sh /src/build/<NAME>.webm "<env kvs>" --steps 8`.
+**Standard bench:** 480x832, 25f, --steps 8, resident (no --offload-to-cpu), `--diffusion-fa --seed 42 --clip-on-cpu --max-vram 9`. Use `/tmp/render_bench.sh /src/build/<NAME>.webm "<env kvs>" --steps 8`.
 
-**Bit-exact gate:** `python3 tools/clip_compare.py build/lap28_lap27baseline.webm
-build/<NEW>.webm` — read PSNR 99.00 mean+min.
+**Bit-exact gate:** `python3 tools/clip_compare.py build/lap28_lap27baseline.webm build/<NEW>.webm` — read PSNR 99.00 mean+min. For BSA changes also compare vs `lap29_bsa_r1_selfframe.webm` (BSA reference).
 
-**Profile:** `LONGCAT_OP_PROFILE=1`. Post-lap-29.1 per-step breakdown:
-- MUL_MAT 55.8% (7797 ms, 970 calls) — Q4_K MMQ, **floor on Ampere per project memory + lap-29.2 MMQ retune**
-- FLASH_ATTN_EXT 30.5% (3908 ms, 144 calls) — already tuned (occ=3)
-- ADD 4.0%, CONT 3.2%, SCALE 2.3%, CONCAT 2.0%, MUL 1.8%, ROPE_PE 1.5%, UNARY 1.0%
-- SOFT_MAX 0.2%
+**Profile:** `LONGCAT_OP_PROFILE=1`. Post-lap-29.1 per-step:
+- MUL_MAT 55.8% (Q4_K MMQ — proven floored, do NOT bump)
+- FLASH_ATTN_EXT 30.5% — the lap-30 target (per-K-col skip = ~12% more)
+- ADD 4%, CONT 3%, SCALE 2%, CONCAT 2%, MUL 2%, ROPE_PE 1.5%, UNARY 1%
 
-MUL_MAT + FA = 86.3% — basically unchanged in ratio from pre-lap-29 (86.0%).
-What changed: total compute time shrunk because FA share got faster.
+**Always-skip probe (re-establishing the ceiling):** Edit `ggml/src/ggml-cuda/fattn-mma-f16.cuh`, the nstages<=1 branch's `if (!any_allowed) return;` → `if (true) return;`. Build + bench BSA path. Output is wrong (garbage) but wall is the perf ceiling. Lap-29.2 measurement: 125.32s.
 
 ---
 
@@ -265,14 +189,9 @@ What changed: total compute time shrunk because FA share got faster.
 
 - Eye-test: http://10.0.0.208:8011/
 - Standard bench: 480×832, 25f, --steps 8 RESIDENT, --max-vram 9.
-- New shipped baseline: **142.03s mean**, sampling **107.65s mean**.
-- Owner mentality: *"go mental"* + *"custom kernel for wins is our bag."*
-- BSA mask infra is DONE (lap-28.4) — kernel is the next big move IF quality OK.
-- lap-29.1 (`lap29_occ3_final.webm`) is the current shipped baseline.
-- Measure, do not predict. Quote step-count + PSNR with every number.
-- Bump launch_bounds occupancy ONLY for L1TEX-stall-bound kernels. MMQ taught us
-  this the expensive way (+27% regression when bumped).
-- "I can't explain why" + matching symptom = read actual GPU bytes (lap-27
-  pattern: FNV hash of buffer contents).
-- Commit each win: submodule-first (if ggml touched), then bump parent.
-  Bit-exact PSNR 99.00 every time, OR get owner OK on quality trade.
+- Current shipped baseline: **142.5s** (lap-29.2). Target: **~125s** via per-K-col sparse FA.
+- BSA quality is OWNER-OK'd at r=1+self_frame (mild camera-like movement); enable per-render via `LONGCAT_BSA=1 LONGCAT_BSA_SELF_FRAME=1 LONGCAT_BSA_RADIUS=1`.
+- BSA only ships as default-on IF the per-K-col kernel lands a measurable wall win.
+- Owner mentality: *"no quitting unless 100% proven from all angles to not be a performance win."* Multi-day kernel work is fine — that IS the work.
+- Bump launch_bounds occupancy ONLY for L1TEX-stall-bound kernels. MMQ taught the rule the expensive way (+27% regression).
+- Commit each win: submodule-first (ggml), then bump parent. Bit-exact PSNR 99.00 every time, OR get owner OK on quality trade.
