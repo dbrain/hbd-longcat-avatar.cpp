@@ -1676,6 +1676,13 @@ struct WeightAdapter {
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
+    // LongCat lap-27: cgraph being built. Used by callers (e.g. modulate) that need to
+    // pre-expand a small independent node (e.g. scale_bias on `scale`) so it lands in
+    // the graph BEFORE the dominant chain that depends on it — this fixes the topo
+    // post-order so the {NORM, MUL, ADD} autofusion can fire across the chain (the
+    // scale_bias node would otherwise be inserted between NORM and MUL and break the
+    // fusion's adjacency check). nullptr = no early expansion.
+    ggml_cgraph* gf                                                  = nullptr;
     bool flash_attn_enabled                                          = false;
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;

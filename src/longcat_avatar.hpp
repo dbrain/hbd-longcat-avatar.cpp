@@ -141,14 +141,25 @@ namespace LONGCAT_AVATAR {
                               ggml_tensor* shift,
                               ggml_tensor* scale,
                               int64_t T) {
+            // scale+1 then *x then + shift  (broadcast over spatial dim).
+            // (scale + 1) is a fused ggml_scale_bias (s=1, b=1) — one elementwise op
+            // instead of materializing a full ones tensor (SCALE+REPEAT) and adding it.
+            //
+            // LongCat lap-27: build scale1 BEFORE the norm/mul/add chain and pre-expand
+            // it onto the cgraph so it lands earlier in the post-order topology than
+            // the chain. Otherwise scale1's SCALE node would be inserted between NORM
+            // and MUL when the main forward is expanded (since MUL.src[0]=NORM_out is
+            // DFS'd first), breaking the {NORM, MUL, ADD} autofusion's adjacency check.
+            // Pre-expanded ⇒ NORM, MUL, ADD become consecutive ⇒ the auto-fused
+            // norm_f32<…,true,true> kernel collapses 3 HBM-bouncing kernels into one.
+            auto scale1 = ggml_scale_bias(ctx->ggml_ctx, scale, 1.0f, 1.0f);
+            if (ctx->gf != nullptr) {
+                ggml_build_forward_expand(ctx->gf, scale1);
+            }
             x          = norm->forward(ctx, x);
             int64_t Nb = x->ne[2];
             int64_t C  = x->ne[0];
             x          = ggml_reshape_4d(ctx->ggml_ctx, x, C, x->ne[1] / T, T, Nb);  // [N, T, n_token/T, C]
-            // scale+1 then *x then + shift  (broadcast over spatial dim).
-            // (scale + 1) is a fused ggml_scale_bias (s=1, b=1) — one elementwise op
-            // instead of materializing a full ones tensor (SCALE+REPEAT) and adding it.
-            auto scale1 = ggml_scale_bias(ctx->ggml_ctx, scale, 1.0f, 1.0f);
             x           = ggml_mul(ctx->ggml_ctx, x, scale1);
             x           = ggml_add(ctx->ggml_ctx, x, shift);
             x           = ggml_reshape_3d(ctx->ggml_ctx, x, C, x->ne[1] * x->ne[2], Nb);  // [N, n_token, C]
@@ -1322,6 +1333,10 @@ namespace LONGCAT_AVATAR {
             }
 
             auto runner_ctx  = get_context();
+            // LongCat lap-27: thread the cgraph into the context so modulate() can
+            // pre-expand its small scale_bias node (otherwise it would land between
+            // NORM and MUL in topo order and block the {NORM, MUL, ADD} autofusion).
+            runner_ctx.gf = gf;
             // Cond-frame cross-step K/V cache (lap-26): thread the sampler step + the
             // env gate into the runner context so self_attn can persist (step 0) /
             // reuse (step>0) the step-invariant cond-frame K/V. Default off → no-op.
