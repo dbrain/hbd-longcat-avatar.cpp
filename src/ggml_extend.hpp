@@ -2807,9 +2807,14 @@ protected:
 
         int64_t t_compute_begin = ggml_time_ms();
         ggml_status status      = ggml_backend_graph_compute(runtime_backend, gf);
-        // Synchronize so the wall measurement covers the actual GPU work
-        // (graph_compute can return before async kernels complete).
-        ggml_backend_synchronize(runtime_backend);
+        // Sync only when profiling is active so the "compute" timing reflects
+        // actual GPU wall instead of CPU dispatch-and-return time. In default
+        // prod runs we leave the natural CUDA stream queueing in place — the
+        // next H2D or alloc on the same stream synchronizes implicitly, so
+        // skipping this sync changes the accounting bucket, not the wall.
+        if (getenv("LONGCAT_OFFLOAD_PROFILE") != nullptr) {
+            ggml_backend_synchronize(runtime_backend);
+        }
         int64_t t_compute_end   = ggml_time_ms();
         if (getenv("LONGCAT_OFFLOAD_PROFILE") != nullptr) {
             offload_profile_.offload_ms += (t_offload_end - t_offload_begin);
