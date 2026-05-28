@@ -432,6 +432,16 @@ struct LongCatAvatarModel : public DiffusionModel {
     int cont_num_ref_latents  = 0;
     int cont_ref_img_index    = 10;
     int cont_mask_frame_range = 3;
+    // LongCat lap-32.4: per-request BSA knob. Set per generate_video call from
+    // sd_vid_gen_params_t.bsa_*; the runner consults these in build_graph each
+    // render (env LONGCAT_BSA* override for back-compat with the bench script).
+    // Defaults match sd_vid_gen_params_init: r=1+self_frame preset, off by default.
+    bool bsa_enabled    = false;
+    int  bsa_radius     = 1;
+    bool bsa_self_frame = true;
+    bool bsa_bookend    = false;
+    int  bsa_cube_h     = 4;
+    int  bsa_cube_w     = 6;
 
     LongCatAvatarModel(ggml_backend_t backend,
                        ggml_backend_t params_backend,
@@ -518,6 +528,14 @@ struct LongCatAvatarModel : public DiffusionModel {
         avatar.ref_img_index    = cont_ref_img_index;
         avatar.mask_frame_range = cont_mask_frame_range;
         avatar.cur_step         = diffusion_params.step;  // for the cond-frame K/V cache (lap-26)
+        // LongCat lap-32.4: thread per-request BSA params to the runner. env
+        // LONGCAT_BSA* still override these inside build_graph for back-compat.
+        avatar.bsa_enabled    = bsa_enabled;
+        avatar.bsa_radius     = bsa_radius;
+        avatar.bsa_self_frame = bsa_self_frame;
+        avatar.bsa_bookend    = bsa_bookend;
+        avatar.bsa_cube_h     = bsa_cube_h;
+        avatar.bsa_cube_w     = bsa_cube_w;
         return avatar.compute(n_threads,
                               *diffusion_params.x,
                               *diffusion_params.timesteps,

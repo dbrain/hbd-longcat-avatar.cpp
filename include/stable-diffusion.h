@@ -408,6 +408,17 @@ typedef struct {
     const float* cont_ref_latent;
     int cont_ref_img_index;     // ref anchor's temporal grid position (default 10)
     int cont_mask_frame_range;  // noise-near-ref attention carve-out half-width (default 3)
+    // LongCat-Avatar Block-Sparse Attention (BSA). Per-request quality/speed knob;
+    // not bit-exact (mild quality trade for ~-2s wall on the BSA path). Set
+    // bsa_enabled=1 to engage; otherwise dense attention runs (the default).
+    // Defaults to the "r=1+self_frame" config the project has tested with —
+    // mild camera-like rotation drift, owner-approved at lap-29.2 quality.
+    int   bsa_enabled;     // 0=dense (default), 1=BSA
+    int   bsa_radius;      // cube-near window half-width (default 1)
+    int   bsa_self_frame;  // 0/1, intra-frame anchor (default 1 — tested config)
+    int   bsa_bookend;     // 0/1, last-frame anchor (default 0)
+    int   bsa_cube_h;      // cube height (default 4)
+    int   bsa_cube_w;      // cube width (default 6)
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;

@@ -2964,6 +2964,15 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_ref_latent                       = nullptr;
     sd_vid_gen_params->cont_ref_img_index                    = 10;
     sd_vid_gen_params->cont_mask_frame_range                 = 3;
+    // LongCat-Avatar BSA: dense by default (off); "r=1+self_frame" preset
+    // baked into the defaults so a caller flipping bsa_enabled=1 gets exactly
+    // the config the project tested with (mild rotation-drift trade, owner-OK).
+    sd_vid_gen_params->bsa_enabled                           = 0;
+    sd_vid_gen_params->bsa_radius                            = 1;
+    sd_vid_gen_params->bsa_self_frame                        = 1;
+    sd_vid_gen_params->bsa_bookend                           = 0;
+    sd_vid_gen_params->bsa_cube_h                            = 4;
+    sd_vid_gen_params->bsa_cube_w                            = 6;
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
     sd_vid_gen_params->vae_tiling_params                     = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
@@ -4656,9 +4665,20 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     // Reset the avatar continuation ref-anchor params each render so a prior segment's
     // 3-way-split state never leaks into a single-clip / ai2v / seg0 render (the model
     // is resident across chained calls). The cont-latent branch below re-arms them.
+    // Also thread the per-request BSA params (lap-32.4) onto the model so build_graph
+    // sees this caller's BSA choice. Defaults from sd_vid_gen_params_init mean a caller
+    // that never touches the BSA fields gets dense attention (bit-exact, the prior
+    // default behavior); flipping bsa_enabled=1 engages the BSA path for this render
+    // only with the r=1+self_frame preset.
     if (sd_version_is_longcat_avatar(sd_ctx->sd->version)) {
         if (auto avatar_model = std::dynamic_pointer_cast<LongCatAvatarModel>(sd_ctx->sd->diffusion_model)) {
             avatar_model->cont_num_ref_latents = 0;
+            avatar_model->bsa_enabled    = sd_vid_gen_params->bsa_enabled != 0;
+            avatar_model->bsa_radius     = sd_vid_gen_params->bsa_radius;
+            avatar_model->bsa_self_frame = sd_vid_gen_params->bsa_self_frame != 0;
+            avatar_model->bsa_bookend    = sd_vid_gen_params->bsa_bookend != 0;
+            avatar_model->bsa_cube_h     = sd_vid_gen_params->bsa_cube_h;
+            avatar_model->bsa_cube_w     = sd_vid_gen_params->bsa_cube_w;
         }
     }
 

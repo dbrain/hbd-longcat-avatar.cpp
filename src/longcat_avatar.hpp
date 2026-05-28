@@ -1556,6 +1556,16 @@ namespace LONGCAT_AVATAR {
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
         float audio_mouth_scale = 1.0f;
+
+        // LongCat lap-32.4: per-request BSA knob. Set by LongCatAvatarModel::compute
+        // before each render; build_graph reads these directly. env LONGCAT_BSA*
+        // overrides for back-compat with the env-driven bench script tests.
+        bool bsa_enabled    = false;
+        int  bsa_radius     = 1;
+        bool bsa_self_frame = true;
+        bool bsa_bookend    = false;
+        int  bsa_cube_h     = 4;
+        int  bsa_cube_w     = 6;
         // Audio window inputs (host-prepared per request via LONGCAT_AUDIO; empty =
         // no audio → audio cross-attn skipped, identical to text+image-only video).
         sd::Tensor<float> audio_first;   // [32000, 1]
@@ -1708,40 +1718,29 @@ namespace LONGCAT_AVATAR {
                 runner_ctx.condkv_k = &condkv_k_vec;
                 runner_ctx.condkv_v = &condkv_v_vec;
 
-                // LongCat lap-28.4 (BSA): build / reuse the consume-step mask. Only
-                // exposed to attention when sampler_step > 1 (consume path); step 0 stays
-                // dense. Env-gated: LONGCAT_BSA=1 to enable, optional cube/radius knobs.
-                static const bool bsa_enabled = []{
-                    const char* s = getenv("LONGCAT_BSA");
-                    return s && s[0] == '1';
-                }();
-                if (bsa_enabled) {
-                    static const int bsa_cube_h = []{
-                        const char* s = getenv("LONGCAT_BSA_CUBE_H");
-                        return (s && s[0]) ? atoi(s) : 4;
-                    }();
-                    static const int bsa_cube_w = []{
-                        const char* s = getenv("LONGCAT_BSA_CUBE_W");
-                        return (s && s[0]) ? atoi(s) : 6;
-                    }();
-                    static const int bsa_radius = []{
-                        const char* s = getenv("LONGCAT_BSA_RADIUS");
-                        return (s && s[0]) ? atoi(s) : 1;
-                    }();
-                    static const bool bsa_self_frame = []{
-                        const char* s = getenv("LONGCAT_BSA_SELF_FRAME");
-                        return s && s[0] == '1';
-                    }();
-                    static const bool bsa_bookend = []{
-                        const char* s = getenv("LONGCAT_BSA_BOOKEND");
-                        return s && s[0] == '1';
-                    }();
+                // LongCat lap-28.4 / lap-32.4 (BSA): per-request, with env override.
+                // Source of truth = runner fields set by LongCatAvatarModel::compute()
+                // from sd_vid_gen_params_t. env LONGCAT_BSA* overrides any field that
+                // is set, so the bench script and CLI test paths keep working unchanged.
+                bool eff_bsa_enabled    = this->bsa_enabled;
+                int  eff_bsa_radius     = this->bsa_radius;
+                bool eff_bsa_self_frame = this->bsa_self_frame;
+                bool eff_bsa_bookend    = this->bsa_bookend;
+                int  eff_bsa_cube_h     = this->bsa_cube_h;
+                int  eff_bsa_cube_w     = this->bsa_cube_w;
+                if (const char* s = getenv("LONGCAT_BSA"))            { eff_bsa_enabled    = (s[0] == '1'); }
+                if (const char* s = getenv("LONGCAT_BSA_RADIUS"); s && s[0]) { eff_bsa_radius = atoi(s); }
+                if (const char* s = getenv("LONGCAT_BSA_SELF_FRAME")) { eff_bsa_self_frame = (s[0] == '1'); }
+                if (const char* s = getenv("LONGCAT_BSA_BOOKEND"))    { eff_bsa_bookend    = (s[0] == '1'); }
+                if (const char* s = getenv("LONGCAT_BSA_CUBE_H"); s && s[0]) { eff_bsa_cube_h = atoi(s); }
+                if (const char* s = getenv("LONGCAT_BSA_CUBE_W"); s && s[0]) { eff_bsa_cube_w = atoi(s); }
+                if (eff_bsa_enabled) {
                     int64_t n_token_b = t_len_c * npf_c;
                     int64_t n_noise_b = n_token_b - ncond_c;
-                    if (n_noise_b > 0 && (h_len_c % bsa_cube_h) == 0 && (w_len_c % bsa_cube_w) == 0) {
+                    if (n_noise_b > 0 && (h_len_c % eff_bsa_cube_h) == 0 && (w_len_c % eff_bsa_cube_w) == 0) {
                         ensure_bsa_mask(n_noise_b, n_token_b, npf_c, h_len_c, w_len_c,
-                                        bsa_cube_h, bsa_cube_w, bsa_radius,
-                                        bsa_self_frame, bsa_bookend);
+                                        eff_bsa_cube_h, eff_bsa_cube_w, eff_bsa_radius,
+                                        eff_bsa_self_frame, eff_bsa_bookend);
                         if (cur_step > 1) {
                             runner_ctx.bsa_mask = bsa_mask_tensor;
                             // LongCat lap-31.2: thread the CPU-precomputed bitmap into the
@@ -1774,7 +1773,7 @@ namespace LONGCAT_AVATAR {
                         }
                     } else {
                         LOG_WARN("[BSA] disabled — latent h=%lld w=%lld not divisible by cube [%d,%d]",
-                                 (long long) h_len_c, (long long) w_len_c, bsa_cube_h, bsa_cube_w);
+                                 (long long) h_len_c, (long long) w_len_c, eff_bsa_cube_h, eff_bsa_cube_w);
                     }
                 }
             }
@@ -1802,10 +1801,13 @@ namespace LONGCAT_AVATAR {
                 const char* s = getenv("LONGCAT_XATTN_TEXT_CACHE");
                 return s && s[0] == '1';
             }();
-            static const bool bsa_enabled_for_xattn = []{
-                const char* s = getenv("LONGCAT_BSA");
-                return s && s[0] == '1';
-            }();
+            // lap-32.4: BSA may be enabled via API field OR env override. Re-derive
+            // the "effective bsa_enabled" the same way build_graph just did above
+            // so the OOM-avoidance auto-disable tracks both paths.
+            bool bsa_enabled_for_xattn = this->bsa_enabled;
+            if (const char* s = getenv("LONGCAT_BSA")) {
+                bsa_enabled_for_xattn = (s[0] == '1');
+            }
             const bool is_resident_path  = (params_backend == runtime_backend);
             const bool would_oom_in_bsa  = is_resident_path && bsa_enabled_for_xattn;
             const bool xattn_text_cache_active = !xattn_text_cache_explicit_off &&
