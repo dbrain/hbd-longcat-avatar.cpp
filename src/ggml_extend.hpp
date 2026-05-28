@@ -28,6 +28,7 @@
 #include "ggml.h"
 #include "ggml_extend_backend.h"
 #include "ggml_graph_cut.h"
+#include "ggml-cuda.h"  // ggml_backend_cuda_host_buffer_type — lap-32 pinned offload params
 
 #include "model.h"
 #include "tensor.hpp"
@@ -2874,7 +2875,36 @@ public:
             LOG_DEBUG("%s skipping params allocation (no tensors)", get_desc().c_str());
             return true;
         }
-        params_buffer = ggml_backend_alloc_ctx_tensors(params_ctx, params_backend);
+        // LongCat lap-32: when offload + CUDA runtime, allocate params on the CUDA
+        // host buffer type (pinned via cudaMallocHost) instead of the CPU backend's
+        // default pageable malloc. Pinned host memory enables async direct DMA on
+        // cudaStreamPerThread (~12 GB/s PCIe gen3) vs pageable's synchronous bounce-
+        // buffer staging (~6 GB/s). The CPU backend can still read/write these
+        // tensors (it's host memory, just pinned) — so all the existing offload
+        // plumbing (set_tensor host→device copies, partial-param swap, etc.)
+        // works unchanged. Bit-exact (transport-only). Opt-in via env
+        // LONGCAT_OFFLOAD_PINNED_PARAMS=1 (default off until measured).
+        static const bool pinned_offload_params = []{
+            const char* s = getenv("LONGCAT_OFFLOAD_PINNED_PARAMS");
+            return s && s[0] == '1';
+        }();
+        const bool use_pinned_offload =
+            pinned_offload_params &&
+            ggml_backend_is_cpu(params_backend) &&
+            !ggml_backend_is_cpu(runtime_backend);
+        if (use_pinned_offload) {
+            ggml_backend_buffer_type_t cuda_host_buft = ggml_backend_cuda_host_buffer_type();
+            if (cuda_host_buft != nullptr) {
+                params_buffer = ggml_backend_alloc_ctx_tensors_from_buft(params_ctx, cuda_host_buft);
+                if (params_buffer == nullptr) {
+                    LOG_WARN("%s pinned offload params alloc failed; falling back to pageable",
+                             get_desc().c_str());
+                }
+            }
+        }
+        if (params_buffer == nullptr) {
+            params_buffer = ggml_backend_alloc_ctx_tensors(params_ctx, params_backend);
+        }
         if (params_buffer == nullptr) {
             LOG_ERROR("%s alloc params backend buffer failed, num_tensors = %i",
                       get_desc().c_str(),
@@ -2884,10 +2914,11 @@ public:
         rebuild_params_tensor_set();
         ggml_backend_buffer_set_usage(params_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         size_t params_buffer_size = ggml_backend_buffer_get_size(params_buffer);
-        LOG_DEBUG("%s params backend buffer size = % 6.2f MB(%s) (%i tensors)",
+        LOG_DEBUG("%s params backend buffer size = % 6.2f MB(%s%s) (%i tensors)",
                   get_desc().c_str(),
                   params_buffer_size / (1024.f * 1024.f),
                   ggml_backend_is_cpu(params_backend) ? "RAM" : "VRAM",
+                  use_pinned_offload ? ", pinned" : "",
                   num_tensors);
         return true;
     }

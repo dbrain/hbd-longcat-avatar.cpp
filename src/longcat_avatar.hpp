@@ -1670,11 +1670,15 @@ namespace LONGCAT_AVATAR {
             // 8% sampling-wall win); stacked with the lap-27.1 fused-modulate to ship
             // ~+9% combined. DEFAULT ON. Opt out via LONGCAT_NO_COND_CACHE=1.
             //
-            // HARD-requires the resident path: on offload (--offload-to-cpu /
-            // --max-vram), the segmented graph-cut's bind_segment_cached_inputs
-            // misbinds the persistent cross-compute() leaves and PSNR collapses to
-            // ~12 dB (recurring class — same as the lap-20 view-output liveness
-            // bug). Auto-disabled there; proper fix is parked as a future lap.
+            // Works on BOTH the resident AND --offload-to-cpu paths since lap-27
+            // P0 (commit f0b4bcc): the cpy writes are tagged into the block's
+            // post_self_attn subcut group so the graph-cut planner attaches them
+            // as additional outputs of an existing segment, and the persistent K/V
+            // tensors are registered via register_persistent_tensor so the
+            // segmented executor's reset_segment_runtime_tensors leaves their
+            // buffer/data pointers intact between segments. Without those two
+            // pieces in place the offload path's bind_segment_cached_inputs would
+            // see zero-initialized leaves and PSNR collapse to ~12 dB.
             //
             // Requires flash-attn: cache stores F16(k*kv_scale) and kv_scale=1/256
             // is what keeps v F16-safe; the non-flash path (kv_scale=1) would
