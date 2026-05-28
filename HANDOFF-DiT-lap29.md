@@ -1,10 +1,11 @@
 # LongCat-Avatar.cpp — DiT PERF HANDOFF (lap-29, the levers that are STILL left)
 
-*Written end of lap-28 (2026-05-28). Lap-28 shipped THREE bit-exact perf wins
-(cumulative −1.73% wall vs lap-27 baseline) + landed a BSA mask prototype that
-proved sparse attention via ggml's stock flash kernel is a wall-time dead end
-(needs a custom sparse-flash kernel). Read this doc first; it supersedes
-HANDOFF-DiT-lap28.md (kept for archaeology).*
+*Written end of lap-28 (2026-05-28). Lap-28 shipped FOUR bit-exact perf wins
+(cumulative **−2.43% wall, 159.03s → 155.16s** @ 480/25f/--steps 8 RESIDENT vs
+lap-27 baseline) + landed a BSA mask prototype that proved sparse attention via
+ggml's stock flash kernel is a wall-time dead end (needs a custom sparse-flash
+kernel) AND owner eye-tested BSA radius={1,2} = not acceptable quality.
+Read this doc first; it supersedes HANDOFF-DiT-lap28.md (kept for archaeology).*
 
 ---
 
@@ -65,18 +66,20 @@ once.
 | `9663680` | `kobbler-lap28.2-kv-prescaled-f16-2026-05-28` | F16-prescaled cond-cache K/V consume (skip F16→F32→F16 round-trip); + ggml-cuda concat extended to F16 | 157.38s → 157.19s (mean of 2 runs) = **−0.12%** (within noise; infra positive) |
 | `ecb4985` | `kobbler-lap28.3-gate-add-fusion-2026-05-28` | new ggml-cuda `mul_add_bcast` kernel — fused MUL+ADD across RESHAPE views for gate_add | 157.19s → 156.28s = **−0.58%** |
 | `b3ca5a3` | `kobbler-lap28.4-bsa-mask-prototype-2026-05-28` | BSA mask infrastructure (env-gated `LONGCAT_BSA=1`); built but stock ggml flash applies mask post-QK so it's a wall regression (156.28s → 165.21s = **+5.7%**), kept as prototype for the custom kernel | (regression, env-default-off) |
+| `4d07d11` | `kobbler-lap28.5-scale-cast-fusion-2026-05-28` | new ggml-cuda `scale_cast` kernel — fused SCALE→CPY(F32→F16) for kv_scale prescale (~672 fired pairs/render at avatar shape, ~306 MB bandwidth saved per pair) | 156.28s → 155.16s = **−0.72%** |
 
-**Stacked cumulative @ 480/25f/--steps 8 resident:** 159.03s → **156.28s** = **−1.73%** (lap-28.1 + .2 + .3, all bit-exact PSNR 99.00).
+**Stacked cumulative @ 480/25f/--steps 8 resident:** 159.03s → **155.16s** = **−2.43%** (lap-28.1 + .2 + .3 + .5, all bit-exact PSNR 99.00; lap-28.4 BSA prototype is env-default-off and excluded from cumulative).
 
-The 156.28s number is the "current shipped" baseline for lap-29 deltas. PSNR 99.00 vs lap-27 baseline maintained throughout (`build/lap28_lap27baseline.webm` is the same-conditions reference).
+The 155.16s number is the "current shipped" baseline for lap-29 deltas. Current shipped HEAD is `4d07d11`, clip is `build/lap28_scale_cast.webm`. PSNR 99.00 vs lap-27 baseline maintained throughout (`build/lap28_lap27baseline.webm` is the same-conditions reference).
 
 **Production-quality clips in `build/`** (don't confuse with `_*.webm` smoke/debug clips):
 - `lap28_lap27baseline.webm` — same-conditions lap-27 reference (159.03s, **the A/B reference**)
 - `lap28_audio_fuse.webm` — lap-28.1 output (157.38s, bit-exact 99 vs baseline)
 - `lap28_kvprescaled.webm`, `lap28_kvprescaled_run2.webm` — lap-28.2 (157.12s, 157.26s)
-- `lap28_gateadd.webm` — **lap-28.3 (current shipped HEAD, 156.28s, bit-exact 99)**
+- `lap28_gateadd.webm` — lap-28.3 (156.28s, bit-exact 99)
 - `lap28_bsa_f16.webm` — lap-28.4 BSA radius=1 (165.21s, NOT acceptable quality per owner)
-- `lap28_bsa_r2.webm` — lap-28.4 BSA radius=2 (165.04s, quality TBD)
+- `lap28_bsa_r2.webm` — lap-28.4 BSA radius=2 (165.04s, BETTER but NOT prod-acceptable per owner)
+- `lap28_scale_cast.webm` — **lap-28.5 (current shipped HEAD, 155.16s, bit-exact 99)**
 
 ---
 
@@ -96,10 +99,20 @@ Wall measurement (radius=1, cube [4,6], cond-frame anchor): **156.28s →
 165.21s, +5.7% REGRESSION**. The regression comes from the mask layer-add
 overhead, not from any compute savings.
 
-QUALITY measurement (owner eye-test of `lap28_bsa_f16.webm`): unacceptable.
-At radius=1 the scene visibly warps "like fluid motion applied to the whole
-scene" (a coffee cup in the background moves like liquid). Radius=2 rendered
-(`lap28_bsa_r2.webm`) but not yet eye-tested.
+QUALITY measurement (owner eye-test): both radius=1 and radius=2 are NOT
+acceptable for production. Radius=1 (`lap28_bsa_f16.webm`) visibly warps "like
+fluid motion applied to the whole scene" (a coffee cup in the background
+moves like liquid). Radius=2 (`lap28_bsa_r2.webm`) is "better but not 'go
+live with this to save 10%' acceptable — maybe usable per-request configurable."
+Owner: "if it was insanely better performance and per-request configurable
+- maybe usable - but definitely not a default."
+
+Root-cause hypothesis: the avatar's DiT distill wasn't trained with sparse
+attention. Any sparsity removes context the model expects, causing global
+coherence drift on frames 2-6 (which lose anchors as we move away from frame 0).
+The fix is either (a) MUCH more permissive sparsity (radius=3+, multi-frame
+anchors) — but that shrinks the speedup to ~5%, OR (b) finetune the model on
+the sparsity pattern.
 
 **To realize BSA as a wall lever, write a custom sparse-flash kernel** that
 iterates only over allowed K tiles per Q cube. The lap-28.4 mask infrastructure
