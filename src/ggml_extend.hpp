@@ -1806,6 +1806,30 @@ protected:
     std::vector<std::pair<ggml_tensor*, ggml_tensor*>> partial_offload_pairs;
     size_t max_graph_vram_bytes = 0;
 
+    // LongCat lap-32.2: H2D-compute pipelining for the offload path. Allocate
+    // segment N+1's partial param buffer + queue its cudaMemcpyAsync on a
+    // SECONDARY CUDA backend (own stream) while segment N's compute runs on the
+    // runtime backend's stream. event_wait between the two streams keeps the
+    // ordering correct. Lazily initialized in compute_with_graph_cuts when
+    // LONGCAT_OFFLOAD_PIPELINING=1 fires.
+    ggml_backend_t copy_backend_                 = nullptr;
+    ggml_backend_event_t partial_prefetch_event_ = nullptr;
+    // The "prefetched" state holds segment N+1's allocations + H2D-in-flight.
+    // When segment N+1's turn comes, the runtime backend waits on the event,
+    // then swaps the tensors using these pairs.
+    struct partial_offload_state {
+        ggml_context* ctx                = nullptr;
+        ggml_backend_buffer_t buf        = nullptr;
+        std::vector<std::pair<ggml_tensor*, ggml_tensor*>> pairs;
+        bool event_recorded              = false;
+    };
+    partial_offload_state prefetched_state_;
+    bool current_offload_swapped_ = false;  // whether prev partial_offload_pairs are in swapped state
+    // When set, execute_graph skips its internal offload_partial_params / offload_all_params
+    // call — the pipelining driver in compute_with_graph_cuts has already arranged the
+    // partial param state via commit_prefetched_state.
+    bool skip_internal_offload_   = false;
+
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 
     std::vector<float> one_vec = {1.f};
@@ -2277,6 +2301,163 @@ protected:
         return true;
     }
 
+    // LongCat lap-32.2: lazily initialize the secondary CUDA backend used for
+    // async H2D on a stream separate from the runtime compute stream. Returns
+    // false if the runtime backend isn't CUDA (pipelining only applies there).
+    bool ensure_pipelining_backend() {
+        if (copy_backend_ != nullptr) return true;
+        // Only meaningful when runtime backend is CUDA and params backend is CPU
+        // (the offload-mode invariant). For other configs pipelining is a no-op.
+        if (ggml_backend_is_cpu(runtime_backend) || !ggml_backend_is_cpu(params_backend)) {
+            return false;
+        }
+        // Create a second CUDA backend instance on the same device. This gives
+        // us a distinct cudaStream_t that the GPU scheduler can run concurrently
+        // with the runtime backend's stream (subject to the copy engine /
+        // compute capability separation Ampere natively supports).
+        ggml_backend_dev_t dev = ggml_backend_get_device(runtime_backend);
+        if (dev == nullptr) return false;
+        copy_backend_ = ggml_backend_dev_init(dev, nullptr);
+        if (copy_backend_ == nullptr) return false;
+        partial_prefetch_event_ = ggml_backend_event_new(dev);
+        if (partial_prefetch_event_ == nullptr) {
+            ggml_backend_free(copy_backend_);
+            copy_backend_ = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    void free_pipelining_backend() {
+        if (partial_prefetch_event_ != nullptr) {
+            ggml_backend_event_free(partial_prefetch_event_);
+            partial_prefetch_event_ = nullptr;
+        }
+        if (copy_backend_ != nullptr) {
+            ggml_backend_free(copy_backend_);
+            copy_backend_ = nullptr;
+        }
+    }
+
+    // Look up the host-resident CPU data pointer for a tensor, accounting for
+    // any prior swap. If the tensor was swapped into partial_offload_pairs
+    // (segment N's swap), its real CPU data is at the offload_tensor->data
+    // field (the duplicate that took over the original CPU buffer pointer).
+    // Otherwise the tensor itself still points at the CPU buffer.
+    const void* lookup_host_data(ggml_tensor* tensor) const {
+        if (current_offload_swapped_) {
+            for (const auto& pair : partial_offload_pairs) {
+                if (pair.first == tensor) {
+                    return pair.second->data;
+                }
+            }
+        }
+        return tensor->data;
+    }
+
+    // Allocate segment N+1's partial param buffer and queue cudaMemcpyAsync
+    // for each tensor on the copy backend's stream. The runtime backend will
+    // wait on partial_prefetch_event_ before consuming these tensors (in the
+    // subsequent swap_in step). NO tensor pointer swap happens here.
+    bool kick_off_prefetch(const std::vector<ggml_tensor*>& tensors) {
+        // Clean up any prior prefetched state that wasn't consumed (shouldn't
+        // happen with well-formed compute_with_graph_cuts driving, but be safe).
+        if (prefetched_state_.buf != nullptr) {
+            ggml_backend_buffer_free(prefetched_state_.buf);
+            prefetched_state_.buf = nullptr;
+        }
+        if (prefetched_state_.ctx != nullptr) {
+            ggml_free(prefetched_state_.ctx);
+            prefetched_state_.ctx = nullptr;
+        }
+        prefetched_state_.pairs.clear();
+        prefetched_state_.event_recorded = false;
+
+        std::vector<ggml_tensor*> unique_tensors;
+        std::unordered_set<ggml_tensor*> seen;
+        unique_tensors.reserve(tensors.size());
+        seen.reserve(tensors.size());
+        for (ggml_tensor* t : tensors) {
+            if (t != nullptr && seen.insert(t).second) {
+                unique_tensors.push_back(t);
+            }
+        }
+        if (unique_tensors.empty()) return true;
+
+        ggml_init_params p;
+        p.mem_size   = std::max<size_t>(1, unique_tensors.size()) * ggml_tensor_overhead();
+        p.mem_buffer = nullptr;
+        p.no_alloc   = true;
+        prefetched_state_.ctx = ggml_init(p);
+        if (prefetched_state_.ctx == nullptr) return false;
+
+        prefetched_state_.pairs.reserve(unique_tensors.size());
+        for (ggml_tensor* tensor : unique_tensors) {
+            ggml_tensor* offload_tensor = ggml_dup_tensor(prefetched_state_.ctx, tensor);
+            ggml_set_name(offload_tensor, tensor->name);
+            prefetched_state_.pairs.push_back({tensor, offload_tensor});
+        }
+        prefetched_state_.buf = ggml_backend_alloc_ctx_tensors(prefetched_state_.ctx, runtime_backend);
+        if (prefetched_state_.buf == nullptr) {
+            ggml_free(prefetched_state_.ctx);
+            prefetched_state_.ctx = nullptr;
+            prefetched_state_.pairs.clear();
+            return false;
+        }
+        ggml_backend_buffer_set_usage(prefetched_state_.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // Queue async H2D for each tensor on the copy backend's stream.
+        // Source = the tensor's "real" CPU data (may be in the prior swap pair).
+        for (auto& pair : prefetched_state_.pairs) {
+            const void* host_src = lookup_host_data(pair.first);
+            const size_t nbytes  = ggml_nbytes(pair.first);
+            ggml_backend_tensor_set_async(copy_backend_, pair.second, host_src, 0, nbytes);
+        }
+        ggml_backend_event_record(partial_prefetch_event_, copy_backend_);
+        prefetched_state_.event_recorded = true;
+        return true;
+    }
+
+    // Consume the prefetched state: make the runtime stream wait on the H2D
+    // event, then swap tensor pointers so subsequent compute uses the
+    // prefetched VRAM buffer. Replaces the current partial_offload_pairs.
+    bool commit_prefetched_state() {
+        if (prefetched_state_.buf == nullptr) {
+            return true;  // nothing to commit (no prefetch was kicked off)
+        }
+        if (prefetched_state_.event_recorded) {
+            ggml_backend_event_wait(runtime_backend, partial_prefetch_event_);
+        }
+        // Note: the prior partial_offload_pairs should already be restored
+        // (un-swapped) before this is called. If not, the swap below would
+        // overwrite the original tensor->data with the VRAM_B address, losing
+        // the CPU pointer that was stashed in the old offload_tensor.
+        GGML_ASSERT(!current_offload_swapped_);
+
+        for (auto& pair : prefetched_state_.pairs) {
+            ggml_tensor* tensor         = pair.first;
+            ggml_tensor* offload_tensor = pair.second;
+            std::swap(tensor->buffer, offload_tensor->buffer);
+            std::swap(tensor->data, offload_tensor->data);
+            std::swap(tensor->extra, offload_tensor->extra);
+        }
+        // Transfer ownership: this prefetched state becomes the current state.
+        partial_offload_pairs        = std::move(prefetched_state_.pairs);
+        if (partial_runtime_params_buffer != nullptr) {
+            ggml_backend_buffer_free(partial_runtime_params_buffer);
+        }
+        if (partial_offload_ctx != nullptr) {
+            ggml_free(partial_offload_ctx);
+        }
+        partial_runtime_params_buffer = prefetched_state_.buf;
+        partial_offload_ctx           = prefetched_state_.ctx;
+        prefetched_state_.buf         = nullptr;
+        prefetched_state_.ctx         = nullptr;
+        prefetched_state_.event_recorded = false;
+        current_offload_swapped_      = true;
+        return true;
+    }
+
     bool offload_partial_params(const std::vector<ggml_tensor*>& tensors) {
         restore_partial_params();
         if (params_backend == runtime_backend) {
@@ -2343,6 +2524,7 @@ protected:
             std::swap(tensor->data, offload_tensor->data);
             std::swap(tensor->extra, offload_tensor->extra);
         }
+        current_offload_swapped_ = true;
 
         size_t params_buffer_size = ggml_backend_buffer_get_size(partial_runtime_params_buffer);
         LOG_DEBUG("%s offload partial params (%6.2f MB, %zu tensors) to runtime backend (%s)",
@@ -2391,6 +2573,7 @@ protected:
                 ggml_free(partial_offload_ctx);
                 partial_offload_ctx = nullptr;
             }
+            current_offload_swapped_ = false;
             return;
         }
 
@@ -2416,6 +2599,7 @@ protected:
             ggml_free(partial_offload_ctx);
             partial_offload_ctx = nullptr;
         }
+        current_offload_swapped_ = false;
     }
 
     bool should_use_graph_cut_segmented_compute(const GraphCutPlan& plan) {
@@ -2579,15 +2763,17 @@ protected:
         int64_t t_execute_begin              = ggml_time_ms();
         const bool use_partial_param_offload = !runtime_param_tensors.empty();
         int64_t t_offload_begin              = ggml_time_ms();
-        if (use_partial_param_offload) {
-            if (!offload_partial_params(runtime_param_tensors)) {
-                LOG_ERROR("%s offload partial params to runtime backend failed", get_desc().c_str());
-                return std::nullopt;
-            }
-        } else {
-            if (!offload_all_params()) {
-                LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
-                return std::nullopt;
+        if (!skip_internal_offload_) {
+            if (use_partial_param_offload) {
+                if (!offload_partial_params(runtime_param_tensors)) {
+                    LOG_ERROR("%s offload partial params to runtime backend failed", get_desc().c_str());
+                    return std::nullopt;
+                }
+            } else {
+                if (!offload_all_params()) {
+                    LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
+                    return std::nullopt;
+                }
             }
         }
         int64_t t_offload_end = ggml_time_ms();
@@ -2791,12 +2977,57 @@ protected:
         free_cache_ctx_and_buffer();
 
         reset_offload_profile();
+
+        // LongCat lap-32.2: H2D-compute pipelining. When LONGCAT_OFFLOAD_PIPELINING=1
+        // AND the secondary CUDA backend init succeeds, we prefetch segment N+1's
+        // partial param H2D onto a separate CUDA stream WHILE segment N's compute
+        // runs on the runtime stream. The runtime stream waits on the prefetch event
+        // before the swap-in, so correctness is preserved.
+        static const bool pipelining_enabled_env = []{
+            const char* s = getenv("LONGCAT_OFFLOAD_PIPELINING");
+            return s && s[0] == '1';
+        }();
+        const bool pipelining_active = pipelining_enabled_env &&
+                                       plan.segments.size() > 1 &&
+                                       ensure_pipelining_backend();
+
+        // Bootstrap: if pipelining is on, kick off segment 0's H2D async BEFORE entering
+        // the loop. The loop's first iter will commit it via event_wait + swap.
+        if (pipelining_active) {
+            auto seg0_tensors = sd::ggml_graph_cut::runtime_param_tensors(gf, plan.segments[0], get_desc().c_str());
+            kick_off_prefetch(seg0_tensors);
+        }
+
         int64_t t_segloop_begin = ggml_time_ms();
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
             int64_t t_segment_begin = ggml_time_ms();
             const auto& segment     = plan.segments[seg_idx];
             auto future_cut_names   = sd::ggml_graph_cut::collect_future_input_names(gf, plan, seg_idx);
+
+            // LongCat lap-32.2: per-iter pipelining handoff. If pipelining is on,
+            // (a) restore the previous segment's swap (already done compute-wise
+            // since execute_graph syncs), (b) commit the current segment's
+            // prefetched_state_ (event_wait + swap), (c) kick off next segment's
+            // prefetch on the copy stream. execute_graph then runs with
+            // skip_internal_offload_ so it doesn't redo the H2D.
+            if (pipelining_active) {
+                // Restore any prior segment's swap state before swapping in the
+                // current segment's prefetched tensors. First segment has no
+                // prior to restore.
+                if (current_offload_swapped_) {
+                    restore_partial_params();
+                }
+                commit_prefetched_state();
+                // Prefetch the NEXT segment's params asynchronously on the copy
+                // backend's stream so its H2D overlaps with this segment's compute.
+                if (seg_idx + 1 < plan.segments.size()) {
+                    auto next_tensors = sd::ggml_graph_cut::runtime_param_tensors(
+                        gf, plan.segments[seg_idx + 1], get_desc().c_str());
+                    kick_off_prefetch(next_tensors);
+                }
+                skip_internal_offload_ = true;
+            }
             LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s",
                       get_desc().c_str(),
                       seg_idx + 1,
@@ -2840,6 +3071,16 @@ protected:
                 return std::nullopt;
             }
             output = std::move(segment_output);
+            if (pipelining_active) {
+                skip_internal_offload_ = false;
+            }
+        }
+
+        // LongCat lap-32.2: post-loop cleanup of the pipelining state. The last
+        // segment's swap is still active; restore it so the params are back on
+        // CPU as the rest of the runner expects.
+        if (pipelining_active && current_offload_swapped_) {
+            restore_partial_params();
         }
 
         backend_tensor_data_map.clear();
@@ -2878,6 +3119,7 @@ public:
         free_params_ctx();
         free_compute_ctx();
         free_cache_ctx_and_buffer();
+        free_pipelining_backend();
     }
 
     virtual GGMLRunnerContext get_context() {
