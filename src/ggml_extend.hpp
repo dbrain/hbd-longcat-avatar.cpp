@@ -1694,6 +1694,13 @@ struct GGMLRunnerContext {
     // cond-token compute. Default off ⇒ byte-identical.
     int sampler_step                                                 = -1;
     bool cond_kv_cache                                               = false;
+    // Direct persistent cond-K/V buffers (lap-26). Owned by the runner (allocated like
+    // params, so the compute gallocr treats them as pre-allocated leaves — the graph-cut
+    // cache mechanism does NOT yield a valid resident leaf). self_attn writes them at
+    // step 1 (ggml_cpy → cache_writes, expanded by build_graph) and reads them at step>1.
+    std::vector<ggml_tensor*>* condkv_k    = nullptr;  // per-block cached cond K (F16, prescaled)
+    std::vector<ggml_tensor*>* condkv_v    = nullptr;  // per-block cached cond V
+    std::vector<ggml_tensor*>* cache_writes = nullptr; // ggml_cpy nodes to expand into the graph
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;

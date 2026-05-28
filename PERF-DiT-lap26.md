@@ -172,6 +172,91 @@ Watch: RoPE position offset for noise (must match the full-graph positions), con
 n_per_frame divisibility, and the audio/text cross-attn cond-zeroing (already cond-aware — noise-only graph
 just drops the cond rows it used to zero).
 
+### VERIFY BLOCKER (lap-26): cache buffer OOM — F32 too big
+8-step A/B: baseline OK (137.77s). Flag-on **OOM** at `copy_cache_tensors_to_cache_buffer` (ggml_extend
+.hpp:2006) allocating **2.45 GB** — the cond K/V are post-RoPE **F32**: k_cond [128,1560,32] + v_cond
+[128,32,1560] = 6.39M elts ×2 ×48 blocks ×4B ≈ 2.45 GB, on top of 8.5 GB resident weights on a 12 GB card.
+Consume logic did NOT crash (no assert/garbage) — pure footprint. Fix options (next tick):
+- **(A, preferred) F16 PRE-SCALED cache + direct flash in consume.** Cache `F16(k_cond*kv_scale)` /
+  `F16(v_cond*kv_scale)` (kv_scale=1/256 — required so v's ~1e6 magnitude doesn't overflow F16) → 1.23 GB.
+  Consume: `F16(k_noise*kv_scale)`/`F16(v_noise*kv_scale)`, concat F16, then call `ggml_flash_attn_ext`
+  DIRECTLY (mirror `ggml_ext_attention_ext`'s build_kqv: softmax scale = (1/√d)/kv_scale, out *= 1/kv_scale).
+  CANNOT reuse the wrapper with pre-scaled k/v — its kv_scale both scales k/v AND folds into the softmax
+  scale + output rescale, so injecting pre-scaled k/v double-applies. Bit-exact because the wrapper casts
+  to the same F16 internally anyway; the /256 is an exact F16 exponent shift (mantissa preserved).
+- **(B, simpler/robust) cache cond_x (block input) F32** = [4096,1560]×48 ≈ 1.23 GB, bit-exact, reuses
+  the unchanged attention path. Cost: consume recomputes cond qkv+RoPE (1560 tok, ~14% of qkv — erodes
+  the qkv portion of the win, but FFN/proj/attn-output savings remain, the bigger chunks).
+- (C) cache_buffer on CPU backend + per-step upload — likely too slow / not how the mechanism binds.
+Lean (A) for full win + bit-exact; (B) if (A)'s direct-flash replication proves fiddly to verify.
+
+### VRAM wall — the deeper blocker (lap-26, root cause)
+F16 prescaled cache (1.23 GB) STILL OOMs, now at the **compute buffer** (4.18 GB) at step 1, not the
+cache. Root cause = the capture/persist mechanism marks cond K/V as graph **outputs** (`set_output`),
+which the allocator CANNOT recycle. So step 1 must hold simultaneously: full-step compute transients
+(~2.5-3 GB, dominated by the FFN `[11008×10920]` SwiGLU triple) + 1.23 GB non-recyclable cond-K/V
+outputs + (at copy time) the 1.23 GB cache buffer — on top of 8.5 GB resident weights. Peak ~13.9 GB
+≫ 11.9 GB card. (The F16 prescale's `scale→cast` even adds F32 intermediates, making the compute
+buffer worse, not better.) This is why "work already being done" OOMs: the *store* forces the cond
+state to be RESIDENT (all 48 blocks at once) where the dense path kept it TRANSIENT (one block,
+recycled). It's a recompute→store trade and the 8.5 GB weights leave too little room for the store.
+
+**Proper fix (next): direct-to-persistent-buffer write + FFN tiling.**
+- Avoid the `set_output` double-residency: pre-allocate a persistent buffer (own ggml_context +
+  `ggml_backend_alloc_ctx_tensors`, 96 named F16 tensors [d_head,n_cond,heads] / [d_head,heads,n_cond,N],
+  ~1.23 GB) ONCE at step 1; in-graph `ggml_cpy` the (prescaled-F16) cond K/V directly into those
+  persistent tensors. They're not compute-buffer outputs → the cond K/V stay transient/recyclable; only
+  the 1.23 GB persistent buffer is added. Consume references those persistent tensors directly (no
+  load_cache_tensor / no capture path).
+- Force FFN token-tiling whenever the cache is active (bit-exact, per-token) to shrink the step compute
+  buffer. Then step-1 peak ≈ 8.5 (weights) + ~1.5 (tiled compute) + 1.23 (persistent cache) ≈ 11.2 GB —
+  fits with ~0.7 GB headroom. Consume steps (noise-only 9360 tok, tiled) fit similarly.
+- Fallback if still too tight: --offload-to-cpu (frees weight VRAM) but adds per-block weight streaming
+  that likely eats the 12% — measure before committing to that path.
+The capture/`cache_tensor` mechanism is wrong for 48×2 large per-block tensors (built for a few graph-cut
+boundaries); the direct persistent buffer is the right tool. Lever is still a real ~12% bit-exact win
+in COMPUTE; the fight is purely fitting the 1.23 GB store on a 12 GB card w/ 8.5 GB weights.
+
+### ROOT CAUSE FOUND (lap-26): cache mechanism wrong for resident path
+Bisected at 320×448 (fits, so correctness-comparable): cache-on PSNR **12 dB** (garbage) and F16 mode
+**segfaults (exit 139)**. Tap dumps (`b0_xm`/`b0_xs` via `ctx->capture_tensor`): block-0 modulate INPUT
+matches (max 0), self-attn OUTPUT diverges **30×**. Decisive test `LONGCAT_COND_NOCAT` (noise-only,
+NO cond concat) runs **clean (exit 0)** → the noise-only STRUCTURE (forward slicing of x/t_emb/pe/audio,
+rope on sliced pe, attention, ffn) is SOUND. The bug is purely the **cached-cond concat**: the runner's
+`persist_cache_tensor`/`load_cache_tensor` (graph-cut/offload cache) does NOT yield a valid resident-graph
+leaf — the offload path rebinds buffers via `bind_segment_cached_inputs`; the resident path references the
+`cache_ctx` tensor raw and it reads garbage / faults. F32 bisect also wrong → not the F16 round-trip.
+
+**FIX (compact direct persistent buffer, ~45 LoC):**
+- `GGMLRunnerContext`: add `std::vector<ggml_tensor*>* condkv_k/condkv_v` + `std::vector<ggml_tensor*>* cache_writes`.
+- Runner: members `ggml_context* condkv_ctx; ggml_backend_buffer_t condkv_buf; vector<ggml_tensor*> condkv_k/v; int64_t condkv_ncond`;
+  `ensure_condkv(d_head,n_cond,heads,N,n_layers)` — lazily ggml_new F16 tensors in own ctx +
+  `ggml_backend_alloc_ctx_tensors(runtime_backend)` (allocated like params → gallocr respects as leaf).
+- build_graph: `ensure_condkv(...)` when cache active; set ctx ptrs; after `build_forward_expand(gf,out)`,
+  loop `build_forward_expand(gf, w)` for each collected cache_write.
+- self_attn step1: `auto w = ggml_cpy(prescaled_f16_kcond, (*ctx->condkv_k)[block_idx]); ctx->cache_writes->push_back(w);` (+v).
+- self_attn step>1: use `(*ctx->condkv_k)[block_idx]` directly (cast F32, unscale ×256, concat). No load_cache_tensor.
+- This kills the double-residency (cond k/v written straight to persistent buf, not set_output) AND fixes the
+  segfault (proper leaf). Then re-verify PSNR99 @320×448, then FFN-tile for 480 VRAM fit. Diag toggles
+  (LONGCAT_COND_CACHE_F32 / _NOCAT, b0_x* taps) can be removed after.
+
+## ⚠️ OFFLOAD IS BUGGERED (lap-26 finding — FIX IN A FUTURE LAP)
+`--offload-to-cpu` + the cond-K/V cache = **PSNR 12 dB** (garbage), vs 99 dB bit-exact on the resident
+path. This is the **recurring offload/gallocr PSNR-ruining bug** (same class as the lap-20 ggml-alloc
+view-output liveness bug — "why does this keep happening"). The offload SEGMENTED graph-cut path
+(`bind_segment_cached_inputs`) does not correctly bind cross-`compute()` persistent leaves: my direct
+condkv buffer (and likely any persistent tensor referenced as a resident-style leaf) gets clobbered /
+mis-bound when each block becomes a segment. Symptom: massive PSNR loss, not a crash.
+- **For now:** cond-cache is RESIDENT-ONLY (gated; offload disables it implicitly — actually it does NOT,
+  so the prod gate must also exclude offload, OR offload must be fixed). TODO: make `cond_kv_cache` also
+  require `!offload` until the offload path is fixed.
+- **Future lap:** audit the graph-cut segmented path's handling of persistent/cross-graph leaves
+  (bind_segment_cached_inputs + the cache_buffer realloc-per-compute) — this bug recurs every time
+  something persistent meets offload. The resident path is clean; offload is the liability.
+- Also: offload VRAM peak measured ~3.8 GB but that was a sampling trough (offload streams per-segment;
+  true peak likely ~8 GB). Offload step overhead measured ~12% here (uncharacterized recently — owner
+  has avoided offload by design). Not the path to optimize around.
+
 ### Build status (lap-26, in progress)
 - DONE + built green: plumbing (`DiffusionParams.step`→`runner.cur_step`→`GGMLRunnerContext.sampler_step`
   + `cond_kv_cache`, env `LONGCAT_COND_CACHE`) and the PERSIST half — `self_attn` 2-way split persists

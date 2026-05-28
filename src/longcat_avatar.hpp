@@ -271,7 +271,25 @@ namespace LONGCAT_AVATAR {
             auto k_rope = Rope::apply_rope(ctx->ggml_ctx, k, pe, true, ctx->allow_fused_rope);  // [d_head, n_token, num_heads*N]
 
             ggml_tensor* out;
-            if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {
+            if (ctx->cond_kv_cache && ctx->sampler_step > 1 && block_idx >= 0) {
+                // ======= COND-FRAME K/V CACHE CONSUME (lap-26, ai2v) =======
+                // step>0: x is the NOISE tokens only (forward() sliced off the cond
+                // frame). The cond frame's post-RoPE K/V are step-invariant, persisted
+                // at step 0; reattach them so the noise queries see the exact same full
+                // K/V as the dense path — concat order [cond | noise] matches the
+                // original full-length token layout, and the cond K were RoPE'd at
+                // their absolute positions [0,n_cond) at step 0, so this is bit-exact.
+                GGML_ASSERT(ctx->condkv_k != nullptr && block_idx < (int)ctx->condkv_k->size() && "cond-kv cache missing");
+                ggml_tensor* k_cond = (*ctx->condkv_k)[block_idx];
+                ggml_tensor* v_cond = (*ctx->condkv_v)[block_idx];
+                // Undo the persist-time scale: F32(F16(k*kv_scale)) / kv_scale, so the wrapper's
+                // own kv_scale+F16 cast reproduces the exact F16(k/256) the dense path uses.
+                k_cond = ggml_ext_scale(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, k_cond, GGML_TYPE_F32), 1.0f / kv_scale);
+                v_cond = ggml_ext_scale(ctx->ggml_ctx, ggml_cast(ctx->ggml_ctx, v_cond, GGML_TYPE_F32), 1.0f / kv_scale);                ggml_tensor* k_full = ggml_concat(ctx->ggml_ctx, k_cond, k_rope, 1);  // [d_head, n_cond+n_noise, heads]
+                ggml_tensor* v_full = ggml_concat(ctx->ggml_ctx, v_cond, v, 2);       // [d_head, heads, n_cond+n_noise, N]
+                out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_rope, k_full, v_full,
+                                             num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);
+            } else if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {
                 // ======= VIDEO-CONTINUATION 3-WAY SPLIT (generate_avc) =======
                 // Layout: [ref(num_ref_latents) | cond_tail | noise]. The leading
                 // n_cond_tokens span = (num_ref + num_cond_tail) frames. This mirrors
@@ -363,14 +381,22 @@ namespace LONGCAT_AVATAR {
                                            v->nb[1], v->nb[2], v->nb[3], 0);
                 q_cond      = ggml_cont(ctx->ggml_ctx, q_cond);
                 k_cond      = ggml_cont(ctx->ggml_ctx, k_cond);
-                v_cond      = ggml_cont(ctx->ggml_ctx, v_cond);
-                // Cond-frame K/V cache (lap-26): the cond frame's input (init_latent) and
+                v_cond      = ggml_cont(ctx->ggml_ctx, v_cond);                // Cond-frame K/V cache (lap-26): the cond frame's input (init_latent) and
                 // timestep (0) are step-invariant, so post-RoPE k_cond / v_cond are bit-
                 // identical every step. Persist them at step 0; steps>0 reuse them and skip
                 // the cond compute (consume path — WIP). Default off ⇒ no graph change.
-                if (ctx->cond_kv_cache && ctx->sampler_step <= 0 && block_idx >= 0) {
-                    ctx->persist_cache_tensor("longcat.condkv.b" + std::to_string(block_idx) + ".k", k_cond);
-                    ctx->persist_cache_tensor("longcat.condkv.b" + std::to_string(block_idx) + ".v", v_cond);
+                if (ctx->cond_kv_cache && ctx->sampler_step <= 1 && block_idx >= 0 && ctx->condkv_k &&
+                    block_idx < (int)ctx->condkv_k->size()) {
+                    // Store F16(k_cond*kv_scale) / F16(v_cond*kv_scale) DIRECTLY into the
+                    // persistent buffer (ggml_cpy, expanded by build_graph). Prescale halves
+                    // the footprint AND keeps v F16-overflow-safe. Bit-exact on consume: the
+                    // wrapper feeds F16(k/256) to flash; /256 is an exact F16 exponent shift,
+                    // so F16(k*kv_scale) round-trips to that identical value.
+                    auto kc = ggml_cast(ctx->ggml_ctx, ggml_ext_scale(ctx->ggml_ctx, k_cond, kv_scale), GGML_TYPE_F16);
+                    auto vc = ggml_cast(ctx->ggml_ctx, ggml_ext_scale(ctx->ggml_ctx, v_cond, kv_scale), GGML_TYPE_F16);
+                    auto wk = ggml_cpy(ctx->ggml_ctx, kc, (*ctx->condkv_k)[block_idx]);
+                    auto wv = ggml_cpy(ctx->ggml_ctx, vc, (*ctx->condkv_v)[block_idx]);
+                    if (ctx->cache_writes) { ctx->cache_writes->push_back(wk); ctx->cache_writes->push_back(wv); }
                 }
                 auto x_cond = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_cond, k_cond, v_cond,
                                                      num_heads, nullptr, true, fa, kv_scale, /*flash_skip_kv_pad=*/true);  // [N, n_cond, C]
@@ -564,8 +590,7 @@ namespace LONGCAT_AVATAR {
 
             // self-attn with modulation
             auto x_m = modulate(ctx, mod_norm_attn, x, ms[0], ms[1], T);
-            auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens, T, block_idx);
-            x        = gate_add(ctx, x, x_s, ms[2], T);
+            auto x_s = self_attn(ctx, x_m, pe, n_cond_tokens, T, block_idx);            x        = gate_add(ctx, x, x_s, ms[2], T);
             subcut(x, "post_self_attn");
 
             // text cross-attn (ungated). With a num_cond_latents split the cond-frame
@@ -1010,6 +1035,36 @@ namespace LONGCAT_AVATAR {
             t_emb = ggml_reshape_3d(ctx->ggml_ctx, t_emb, t_emb->ne[0], T, 1);
             tap("tap_t_embed", t_emb);
 
+            // Cond-frame K/V cache CONSUME (lap-26): at step>0 the cond frame's forward is
+            // step-invariant and was cached at step 0, so process ONLY the noise tokens
+            // here. Slice x / t_emb / pe / audio / T down to the noise frames; each block's
+            // self_attn reattaches the cached cond K/V (consume branch). The cond output
+            // rows are zero-padded back after final_layer (the sampler overwrites the cond
+            // latent region with init_latent regardless, so exactness there is free).
+            const bool cond_consume = ctx->cond_kv_cache && ctx->sampler_step > 1 &&
+                                      n_cond_tokens > 0 && n_cond_tokens < x->ne[1] && n_per_frame > 0;
+            int64_t consume_n_cond_tokens = 0;
+            ggml_tensor* t_emb_full = t_emb;  // un-sliced t_emb + T for the final_layer (run on full tokens)
+            int64_t T_full          = T;
+            if (cond_consume) {
+                int64_t n_cond_fr     = n_cond_tokens / n_per_frame;
+                consume_n_cond_tokens = n_cond_tokens;
+                x = ggml_cont(ctx->ggml_ctx, ggml_view_3d(ctx->ggml_ctx, x, x->ne[0], x->ne[1] - n_cond_tokens, x->ne[2],
+                                                          x->nb[1], x->nb[2], x->nb[1] * n_cond_tokens));
+                t_emb = ggml_cont(ctx->ggml_ctx, ggml_view_3d(ctx->ggml_ctx, t_emb, t_emb->ne[0], T - n_cond_fr, t_emb->ne[2],
+                                                             t_emb->nb[1], t_emb->nb[2], t_emb->nb[1] * n_cond_fr));
+                if (pe != nullptr) {
+                    pe = ggml_cont(ctx->ggml_ctx, ggml_view_4d(ctx->ggml_ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->ne[3] - n_cond_tokens,
+                                                              pe->nb[1], pe->nb[2], pe->nb[3], pe->nb[3] * n_cond_tokens));
+                }
+                if (audio != nullptr) {
+                    audio = ggml_cont(ctx->ggml_ctx, ggml_view_3d(ctx->ggml_ctx, audio, audio->ne[0], audio->ne[1], audio->ne[2] - n_cond_fr,
+                                                                 audio->nb[1], audio->nb[2], audio->nb[2] * n_cond_fr));
+                }
+                T             = T - n_cond_fr;
+                n_cond_tokens = 0;  // blocks now see noise-only; self_attn consume branch supplies cond K/V
+            }
+
             // y_embedder: Linear -> GELU(tanh) -> Linear
             context = y_proj_0->forward(ctx, context);
             context = ggml_ext_gelu(ctx->ggml_ctx, context, true);
@@ -1052,6 +1107,12 @@ namespace LONGCAT_AVATAR {
                     // auto: target ~10k tokens/tile (matches the 25f single-shot extent
                     // that already fits comfortably).
                     ffn_tiles = (n_token_total + 9999) / 10000;
+                } else if (ctx->cond_kv_cache && n_token_total > 2000) {
+                    // The cond-K/V cache adds a ~1.23 GB persistent buffer; tile the FFN
+                    // (bit-exact, per-token) to shrink the step compute buffer enough to fit
+                    // it beside the 8.5 GB resident weights at 480p. tile=2 is the lightest
+                    // that fits (tile=1 OOMs); measured fastest of {2,3,4} at 480/8-step.
+                    ffn_tiles = 2;
                 }
                 // attn query-tiling is OPT-IN only (LONGCAT_ATTN_TILES): the
                 // concat-accumulated output buffer grows per tile and gallocr can't
@@ -1081,7 +1142,17 @@ namespace LONGCAT_AVATAR {
                 }
             }
 
-            x = final_layer->forward(ctx, x, t_emb, T);  // [N, thw, num_patch*out_channels]
+            if (cond_consume) {
+                // Pad cond (zeros) BEFORE final_layer so it runs on the FULL token set: the
+                // final output Linear is F16→cuBLAS (M-dependent FP, unlike the blocks' per-row
+                // Q4_K MMQ), so running it on the noise-only 9360 rows drifted ~5e-5 from the
+                // dense 10920-row path and compounded over steps. Matching M makes the noise
+                // rows bit-exact; the cond rows (zero input) are garbage but the sampler
+                // overwrites the cond latent with init_latent. Use the un-sliced t_emb/T.
+                auto zeros = ggml_ext_zeros(ctx->ggml_ctx, x->ne[0], consume_n_cond_tokens, x->ne[2], 1);
+                x          = ggml_concat(ctx->ggml_ctx, zeros, x, 1);  // [N, full_n_token, C]
+            }
+            x = final_layer->forward(ctx, x, cond_consume ? t_emb_full : t_emb, cond_consume ? T_full : T);  // [N, thw, num_patch*out_channels]
             tap("tap_final_layer", x);
             x = unpatchify(ctx->ggml_ctx, x, t_len, h_len, w_len);  // [N*C, T, H, W]
             tap("tap_output", x);
@@ -1108,6 +1179,40 @@ namespace LONGCAT_AVATAR {
         // forward is step-invariant, so step>0 can reuse step-0's per-block cond K/V.
         // -1 = unknown (cache disabled). Gated behind LONGCAT_COND_CACHE (default off).
         int cur_step = -1;
+        // Direct persistent cond-K/V cache (lap-26). Allocated once (lazily) in its own
+        // ctx+buffer on the runtime backend, so the per-step compute gallocr sees these as
+        // pre-allocated leaves (like params). Sidesteps the graph-cut cache mechanism that
+        // segfaults / returns garbage as a resident-graph leaf. Stores F16(k*kv_scale) /
+        // F16(v*kv_scale): the prescale halves the footprint AND keeps v F16-overflow-safe.
+        ggml_context*  condkv_ctx              = nullptr;
+        ggml_backend_buffer_t condkv_buf       = nullptr;
+        std::vector<ggml_tensor*> condkv_k_vec;  // [n_layers] each [d_head, n_cond, heads]
+        std::vector<ggml_tensor*> condkv_v_vec;  // [n_layers] each [d_head, heads, n_cond, N]
+        std::vector<ggml_tensor*> condkv_writes; // ggml_cpy nodes for the current graph
+        int64_t condkv_ncond                   = -1;
+
+        void free_condkv_cache() {
+            if (condkv_buf) { ggml_backend_buffer_free(condkv_buf); condkv_buf = nullptr; }
+            if (condkv_ctx) { ggml_free(condkv_ctx); condkv_ctx = nullptr; }
+            condkv_k_vec.clear(); condkv_v_vec.clear(); condkv_ncond = -1;
+        }
+
+        // (Re)allocate the persistent cond-K/V tensors. No-op if already sized for n_cond.
+        void ensure_condkv_cache(int64_t d_head, int64_t n_cond, int64_t heads, int64_t Nb, int n_layers) {
+            if (condkv_buf != nullptr && condkv_ncond == n_cond) return;
+            free_condkv_cache();
+            ggml_init_params p = { ggml_tensor_overhead() * (size_t)(2 * n_layers + 8), nullptr, /*no_alloc=*/true };
+            condkv_ctx = ggml_init(p);
+            condkv_k_vec.resize(n_layers); condkv_v_vec.resize(n_layers);
+            for (int i = 0; i < n_layers; ++i) {
+                condkv_k_vec[i] = ggml_new_tensor_3d(condkv_ctx, GGML_TYPE_F16, d_head, n_cond, heads);
+                condkv_v_vec[i] = ggml_new_tensor_4d(condkv_ctx, GGML_TYPE_F16, d_head, heads, n_cond, Nb);
+                ggml_set_name(condkv_k_vec[i], ("condkv.k." + std::to_string(i)).c_str());
+                ggml_set_name(condkv_v_vec[i], ("condkv.v." + std::to_string(i)).c_str());
+            }
+            condkv_buf  = ggml_backend_alloc_ctx_tensors(condkv_ctx, runtime_backend);
+            condkv_ncond = n_cond;
+        }
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
         float audio_mouth_scale = 1.0f;
@@ -1222,7 +1327,22 @@ namespace LONGCAT_AVATAR {
             // reuse (step>0) the step-invariant cond-frame K/V. Default off → no-op.
             static const bool cond_cache_env = []{ const char* s = getenv("LONGCAT_COND_CACHE"); return s && s[0] == '1'; }();
             runner_ctx.sampler_step = cur_step;
-            runner_ctx.cond_kv_cache = cond_cache_env && (num_cond_latents > 0) && (num_ref_latents == 0);
+            // Requires flash-attn: the cond K/V cache stores F16(k*kv_scale) and kv_scale<1
+            // (=1/256) is what keeps v F16-safe; the non-flash path (kv_scale=1) would overflow.
+            runner_ctx.cond_kv_cache = cond_cache_env && (num_cond_latents > 0) && (num_ref_latents == 0) && runner_ctx.flash_attn_enabled;
+            condkv_writes.clear();
+            if (runner_ctx.cond_kv_cache) {
+                int64_t t_len_c = x->ne[2];
+                int64_t h_len_c = x->ne[1] / std::get<1>(avatar_params.patch_size);
+                int64_t w_len_c = x->ne[0] / std::get<2>(avatar_params.patch_size);
+                int64_t npf_c   = h_len_c * w_len_c;
+                int64_t ncond_c = std::min<int64_t>(num_cond_latents, t_len_c) * npf_c;
+                int64_t d_head_c = avatar_params.hidden_size / avatar_params.num_heads;
+                ensure_condkv_cache(d_head_c, ncond_c, avatar_params.num_heads, 1, (int)avatar_params.num_layers);
+                runner_ctx.condkv_k     = &condkv_k_vec;
+                runner_ctx.condkv_v     = &condkv_v_vec;
+                runner_ctx.cache_writes = &condkv_writes;
+            }
 
             // Audio path: run AudioProjModel on the host-windowed inputs to produce
             // audio_hidden_states [768, 32, N_t], threaded into every block's audio
@@ -1296,6 +1416,13 @@ namespace LONGCAT_AVATAR {
             // frames denoise in the wrong direction → latent std blows up to ~3x → noise.
             out = ggml_scale(runner_ctx.ggml_ctx, out, -1.0f);
 
+            // Cond-K/V cache writes (lap-26): ggml_cpy nodes storing the step-invariant cond
+            // K/V into the persistent buffer at step 1. Expand them FIRST (they're off the main
+            // output path) so that `out` is expanded LAST and remains the final graph node —
+            // the runner reads the output as ggml_graph_node(gf, -1).
+            for (ggml_tensor* w : condkv_writes) {
+                ggml_build_forward_expand(gf, w);
+            }
             ggml_build_forward_expand(gf, out);
             return gf;
         }
