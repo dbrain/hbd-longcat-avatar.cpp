@@ -1811,8 +1811,25 @@ namespace LONGCAT_AVATAR {
             }
             const bool is_resident_path  = (params_backend == runtime_backend);
             const bool would_oom_in_bsa  = is_resident_path && bsa_enabled_for_xattn;
+            // LongCat continuation OOM fix (regression from lap-32.3 flipping the xattn
+            // text cache default-ON). A continuation segment (ref-anchor present) is
+            // inherently larger than an equivalent single clip: it prepends an extra
+            // ref-anchor latent frame (T = base + num_ref) and runs the 3-way
+            // ref/cond/noise self-attn split — both enlarge the compute buffer (resident
+            // path) and the graph-cut cross-segment cache_buffer (offload path). The
+            // 384 MiB persistent xattn-text K/V cache is the straw that pushes seg>=1
+            // over 12 GiB on BOTH paths at 480p (verified: 25f 2-seg OOMs resident at
+            // the seg-2 compute-buffer reserve AND offload at the graph-cut cache_buffer;
+            // disabling it lets seg-2 fit on both — matching the lap-21 sweet-spot
+            // numbers from before the cache was default-on). The cond-K/V cache is
+            // already auto-off for continuation (it requires num_ref_latents==0).
+            // Single-clip (num_ref_latents==0) keeps the cache → zero perf change on the
+            // hot path / bench. Mirrors the would_oom_in_bsa auto-disable above; the
+            // explicit LONGCAT_XATTN_TEXT_CACHE=1 override still forces it on (footgun).
+            const bool is_continuation_segment = (num_ref_latents > 0 && n_cond_tokens > 0);
+            const bool would_oom = would_oom_in_bsa || is_continuation_segment;
             const bool xattn_text_cache_active = !xattn_text_cache_explicit_off &&
-                                                 (xattn_text_cache_explicit_on || !would_oom_in_bsa) &&
+                                                 (xattn_text_cache_explicit_on || !would_oom) &&
                                                  runner_ctx.flash_attn_enabled &&
                                                  context != nullptr;
             if (xattn_text_cache_active) {
