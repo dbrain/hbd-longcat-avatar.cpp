@@ -15,8 +15,10 @@
 // is the encoded video container (webm/avi/webp depending on output_format).
 //
 // Thread-safety: caller must hold the sd_ctx mutex for the duration of the
-// call. Internally sd_ctx_keep_diffusion_model_resident is flipped to true
-// for chained renders so the DiT survives across segments.
+// call. DiT residency is the CALLER's responsibility: set
+// sd_ctx_keep_diffusion_model_resident() before invoking this (the server
+// derives it from the per-request `offload` flag; the cli pins it for chains).
+// This helper no longer forces residency on — doing so defeated `offload`.
 
 #pragma once
 
