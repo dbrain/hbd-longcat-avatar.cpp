@@ -1,5 +1,6 @@
 #include "util.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <codecvt>
@@ -341,6 +342,13 @@ int32_t sd_get_num_physical_cores() {
 static sd_progress_cb_t sd_progress_cb = nullptr;
 void* sd_progress_cb_data              = nullptr;
 
+// Process-global cooperative-cancel flag. Set from any thread (server disconnect
+// watchdog → worker reader thread → sd_request_cancel); read on the compute thread
+// between sampler steps / segments. Relaxed ordering is fine — we only need eventual
+// visibility within a step or two. One render at a time per worker, so a single flag
+// is correct.
+static std::atomic<bool> sd_cancel_requested{false};
+
 static sd_preview_cb_t sd_preview_cb = nullptr;
 static void* sd_preview_cb_data      = nullptr;
 preview_t sd_preview_mode            = PREVIEW_NONE;
@@ -612,6 +620,15 @@ void sd_set_log_callback(sd_log_cb_t cb, void* data) {
 void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;
     sd_progress_cb_data = data;
+}
+void sd_request_cancel(void) {
+    sd_cancel_requested.store(true, std::memory_order_relaxed);
+}
+void sd_clear_cancel(void) {
+    sd_cancel_requested.store(false, std::memory_order_relaxed);
+}
+bool sd_is_cancel_requested(void) {
+    return sd_cancel_requested.load(std::memory_order_relaxed);
 }
 void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, bool denoised, bool noisy, void* data) {
     sd_preview_cb       = cb;

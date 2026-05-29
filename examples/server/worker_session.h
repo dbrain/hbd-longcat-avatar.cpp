@@ -51,6 +51,13 @@ public:
                         const std::vector<uint8_t>& image,
                         const std::vector<uint8_t>& audio);
 
+    // Send CANCEL_REQ to the worker for the currently in-flight render.
+    // Idempotent: no-op if no render is in flight (current_render_req_id_==0).
+    // Safe to call from another thread WHILE render() holds io_mutex_ in its
+    // blocking recv — uses a separate send_mutex_ so it can't deadlock. Does NOT
+    // SIGKILL the worker; the worker bails cooperatively and stays warm.
+    void cancel_in_flight();
+
 private:
     void kill_worker_locked();
 
@@ -60,8 +67,14 @@ private:
     int                      fd_          = -1;
     bool                     loaded_      = false;
     mutable std::mutex       io_mutex_;
+    // Held only while a frame is written to fd_. Distinct from io_mutex_ so a
+    // cancel can be sent while io_mutex_ is held by the render's blocking recv.
+    mutable std::mutex       send_mutex_;
     std::string              last_error_;
     std::atomic<uint32_t>    next_req_id_{1};
+    // Published by render() AFTER the RENDER_REQ send, cleared on every return
+    // path via RAII. Read by cancel_in_flight(). 0 ⇒ no render in flight.
+    std::atomic<uint32_t>    current_render_req_id_{0};
 };
 
 // Child-side dispatch loop. Called from main() when --worker <fd> is on the

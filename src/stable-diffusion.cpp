@@ -153,6 +153,19 @@ public:
     bool avatar_text_cond_cached = false;
     SDCondition avatar_cached_cond;
     SDCondition avatar_cached_uncond;
+    // Prompt the avatar text cache was computed for. On a warm worker the umT5
+    // weights were freed (free_params_immediately), so a prompt change must RELOAD
+    // umT5 and recompute — a stale cache would silently ignore the new prompt.
+    std::string avatar_cached_prompt;
+    std::string avatar_cached_negative_prompt;
+    // Standalone umT5 reload support (Conditioner has no load_from_file): a ModelLoader
+    // copy + the TE tensor subset captured at init, mirroring the deferred-DiT loader.
+    // Lets reload_cond_stage_model() re-alloc the params buffer and refill it after the
+    // TE was freed, without retaining sd_ctx_params.
+    std::shared_ptr<ModelLoader> te_reload_loader;
+    std::map<std::string, ggml_tensor*> te_reload_tensors;
+    std::set<std::string> te_reload_ignore_tensors;
+    bool te_reload_use_mmap = false;
 
     bool circular_x = false;
     bool circular_y = false;
@@ -1069,6 +1082,29 @@ public:
             }
         }
 
+        // Capture umT5 reload state: the TE is freed after each text encode
+        // (free_params_immediately), but a prompt change on a warm resident worker
+        // must recompute the conditioning, which requires reloading umT5. Keep a
+        // loader copy + the TE tensor subset so reload_cond_stage_model() can
+        // re-alloc + refill the params buffer on demand. This is needed REGARDLESS of
+        // whether the TE lives on GPU or CPU (--clip-on-cpu): the deferred-DiT block
+        // above only engages for umT5-on-GPU, but the free-then-reload-on-prompt-change
+        // requirement is independent of placement. Gate only on avatar + freed-weights +
+        // no-mmap (mmap'd weights are never freed, so no reload is needed).
+        if (sd_version_is_longcat_avatar(version) && cond_stage_model &&
+            free_params_immediately && !sd_ctx_params->enable_mmap) {
+            for (const auto& [key, tensor] : tensors) {
+                if (starts_with(key, "text_encoders.t5xxl.transformer")) {
+                    te_reload_tensors[key] = tensor;
+                }
+            }
+            if (!te_reload_tensors.empty()) {
+                te_reload_ignore_tensors = ignore_tensors;
+                te_reload_use_mmap       = sd_ctx_params->enable_mmap;
+                te_reload_loader         = std::make_shared<ModelLoader>(model_loader);
+            }
+        }
+
         if (diffusion_model && !dit_load_deferred) {
             diffusion_model->alloc_params_buffer();
         }
@@ -1340,6 +1376,37 @@ public:
             return false;
         }
         LOG_INFO("avatar: deferred DiT weight load completed, taking %.2fs",
+                 (ggml_time_ms() - t0) * 1.0f / 1000);
+        return true;
+    }
+
+    // Reload the umT5 text-encoder params after they were freed
+    // (free_params_immediately). Conditioner has no load_from_file, so this mirrors
+    // the deferred-DiT loader: re-alloc the params buffer (against the surviving
+    // params_ctx tensors) and refill it from the captured ModelLoader. No-op (returns
+    // true) if the TE is still resident or no reload state was captured.
+    bool reload_cond_stage_model() {
+        if (!cond_stage_model) {
+            return false;
+        }
+        if (cond_stage_model->get_params_buffer_size() != 0) {
+            return true;  // still resident, nothing to reload
+        }
+        if (!te_reload_loader || te_reload_tensors.empty()) {
+            LOG_ERROR("avatar: umT5 reload requested but no reload state captured");
+            return false;
+        }
+        int64_t t0 = ggml_time_ms();
+        cond_stage_model->alloc_params_buffer();
+        bool ok = te_reload_loader->load_tensors(te_reload_tensors,
+                                                 te_reload_ignore_tensors,
+                                                 n_threads,
+                                                 te_reload_use_mmap);
+        if (!ok) {
+            LOG_ERROR("avatar: umT5 reload failed");
+            return false;
+        }
+        LOG_INFO("avatar: umT5 reloaded for prompt change, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
@@ -2078,6 +2145,14 @@ public:
         SamplePreviewContext preview = prepare_sample_preview_context();
 
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
+            // Cooperative cancel: client disconnected mid-render. Bail before launching
+            // this step's DiT compute. An empty pred makes sample_k_diffusion yield an
+            // empty latent, which the caller treats as failure and frees the compute
+            // buffers (weights stay resident — NOT unload).
+            if (sd_is_cancel_requested()) {
+                LOG_INFO("render cancelled (client disconnect) at sampler step %d/%zu", step, (size_t)steps);
+                return {};
+            }
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
             }
@@ -5145,16 +5220,31 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     // Chained avatar segments reuse the cached text conditioning (the umT5 weights
     // were freed after segment 0). The avatar leaves c_concat/c_vector empty, so the
     // cached cond/uncond carry the full text conditioning.
-    bool use_text_cache = sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
-                          sd_ctx->sd->keep_diffusion_model_resident &&
-                          sd_ctx->sd->avatar_text_cond_cached;
+    // Prompt-keyed avatar text cache. Valid only when the prompt AND negative prompt
+    // match what it was computed for. On a warm resident worker the umT5 weights were
+    // freed (free_params_immediately), so a prompt change forces a reload + recompute;
+    // an identical prompt (the common boilerplate case) reuses the cache with no reload
+    // and no recompute.
+    bool avatar_resident = sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+                           sd_ctx->sd->keep_diffusion_model_resident;
+    bool prompt_matches  = sd_ctx->sd->avatar_text_cond_cached &&
+                           sd_ctx->sd->avatar_cached_prompt == request.prompt &&
+                           sd_ctx->sd->avatar_cached_negative_prompt == request.negative_prompt;
+    bool use_text_cache  = avatar_resident && prompt_matches;
     if (use_text_cache) {
-        LOG_INFO("avatar: reusing cached text conditioning (chained segment)");
+        LOG_INFO("avatar: reusing cached text conditioning (prompt unchanged)");
         embeds.cond = sd_ctx->sd->avatar_cached_cond;
         if (request.use_uncond) {
             embeds.uncond = sd_ctx->sd->avatar_cached_uncond;
         }
     } else {
+        if (avatar_resident && sd_ctx->sd->avatar_text_cond_cached) {
+            LOG_INFO("avatar: prompt changed, reloading umT5 to recompute conditioning");
+        }
+        // umT5 may have been freed after the previous encode; reload before use.
+        if (!sd_ctx->sd->reload_cond_stage_model()) {
+            LOG_ERROR("avatar: umT5 reload failed; text conditioning unavailable");
+        }
         embeds.cond          = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                    condition_params);
         if (request.use_uncond) {
@@ -5162,11 +5252,13 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
             embeds.uncond         = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                         condition_params);
         }
-        // Stash for subsequent chained segments before the TE is freed.
-        if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && sd_ctx->sd->keep_diffusion_model_resident) {
-            sd_ctx->sd->avatar_cached_cond     = embeds.cond;
-            sd_ctx->sd->avatar_cached_uncond   = embeds.uncond;
-            sd_ctx->sd->avatar_text_cond_cached = true;
+        // Stash for subsequent renders before the TE is freed, keyed by prompt.
+        if (avatar_resident) {
+            sd_ctx->sd->avatar_cached_cond            = embeds.cond;
+            sd_ctx->sd->avatar_cached_uncond          = embeds.uncond;
+            sd_ctx->sd->avatar_cached_prompt          = request.prompt;
+            sd_ctx->sd->avatar_cached_negative_prompt = request.negative_prompt;
+            sd_ctx->sd->avatar_text_cond_cached       = true;
         }
     }
     embeds.cond.c_concat     = latents.concat_latent;

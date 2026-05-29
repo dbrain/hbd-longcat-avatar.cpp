@@ -3237,10 +3237,35 @@ public:
     }
 
     void free_params_buffer() {
+        // If the params are currently swapped onto the runtime backend (offload), bring
+        // them back first so params_buffer (and the params_ctx tensors that reference it)
+        // are the ones we free, and offload_ctx is left clean.
+        restore_partial_params();
+        restore_all_params();
         if (params_buffer != nullptr) {
             ggml_backend_buffer_free(params_buffer);
             params_buffer = nullptr;
         }
+        // ggml_backend_buffer_free releases the backing memory but does NOT clear the
+        // tensors' data/buffer pointers — they are left dangling. A later
+        // alloc_params_buffer() inspects t->data: if it's still non-NULL it concludes the
+        // tensor is already allocated and SKIPS allocation (see ggml-alloc.c
+        // "already allocated" + the all_have_data fast-path in alloc_params_buffer),
+        // leaving the tensor pointing at freed memory. That's exactly the umT5
+        // free-then-reload crash: load_tensors writes into / compute reads from the freed
+        // buffer (segfault in dequantize_row_q8_0). Null the pointers here so the params
+        // buffer can be cleanly re-allocated on a later reload. params_ctx itself (the
+        // tensor structs) survives, so captured tensor pointers stay valid.
+        if (params_ctx != nullptr) {
+            for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+                if (t->view_src == nullptr) {
+                    t->data   = nullptr;
+                    t->buffer = nullptr;
+                    t->extra  = nullptr;
+                }
+            }
+        }
+        params_tensor_set_.clear();
     }
 
     size_t get_params_buffer_size() {

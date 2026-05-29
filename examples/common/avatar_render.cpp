@@ -161,6 +161,14 @@ bool render_avatar_to_video_bytes(sd_ctx_t* sd_ctx,
         std::vector<sd_image_t> stitched;
 
         for (int seg = 0; seg < n_segments; ++seg) {
+            // Cooperative cancel between segments (client disconnect). Free the
+            // frames we own so far and bail; the worker stays warm.
+            if (sd_is_cancel_requested()) {
+                error_message = "render cancelled (client disconnect)";
+                for (auto& f : cond_tail_frames) free(f.data);
+                for (auto& im : stitched) free(im.data);
+                return false;
+            }
             if (seg > 0 && use_ref_anchor && ref_anchor_ready) {
                 vid_gen_params.cont_ref_latent       = ref_anchor_latent.data();
                 vid_gen_params.cont_ref_img_index    = gen_params.cont_ref_img_index;

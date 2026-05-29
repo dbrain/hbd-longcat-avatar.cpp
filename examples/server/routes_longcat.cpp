@@ -14,6 +14,7 @@
 #include <mutex>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/log.h"
@@ -280,12 +281,43 @@ static void handle_generate(const httplib::Request& req,
         return;
     }
 
+    // Disconnect watchdog. render() blocks on the worker round-trip; if the client
+    // goes away mid-render we poll req.is_connection_closed (httplib wires this per
+    // request against the socket) every ~200 ms and ask the worker to cancel
+    // cooperatively. The worker bails ASAP and stays warm — this is NOT /unload.
+    std::atomic<bool> wd_stop{false};
+    std::atomic<bool> client_gone{false};
+    std::thread watchdog([&]() {
+        while (!wd_stop.load(std::memory_order_relaxed)) {
+            if (req.is_connection_closed && req.is_connection_closed()) {
+                client_gone.store(true, std::memory_order_relaxed);
+                LOG_INFO("generate: client disconnected -> cancel in-flight render");
+                ctx.worker->cancel_in_flight();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+    struct WatchdogJoinGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~WatchdogJoinGuard() { stop.store(true, std::memory_order_relaxed); if (t.joinable()) t.join(); }
+    } watchdog_join{wd_stop, watchdog};
+
     auto t0 = std::chrono::steady_clock::now();
     longcat_avatar::RenderResult rr = ctx.worker->render(body.dump(), image_bytes, audio_bytes);
     auto t1 = std::chrono::steady_clock::now();
     double wall_sec = std::chrono::duration<double>(t1 - t0).count();
 
     if (!rr.ok) {
+        // Cancelled by client disconnect: nothing to send (client is gone), but
+        // return a distinct status for logs/proxies. 499 = client closed request.
+        if (client_gone.load(std::memory_order_relaxed)) {
+            res.status = 499;
+            res.set_content(R"json({"error":"render cancelled (client disconnected)"})json",
+                            "application/json");
+            return;
+        }
         res.status = 500;
         res.set_content(json({{"error", rr.error.empty() ? "render failed" : rr.error}}).dump(),
                         "application/json");

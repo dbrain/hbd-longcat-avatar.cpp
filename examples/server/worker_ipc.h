@@ -35,6 +35,13 @@ enum class WorkerFrame : uint32_t {
     LOAD_RESP   = 0x11,  // W->P  {"ok": bool, "error": str}
     RENDER_REQ  = 0x20,  // P->W  packed render payload (json+image+audio)
     RENDER_RESP = 0x21,  // W->P  packed render response (json+video)
+    // CANCEL_REQ: parent asks the worker to abort the in-flight render. Empty
+    // payload; hdr.req_id = the target render's req_id. The worker's reader thread
+    // matches req_id against the active render and flips the cooperative cancel flag
+    // (sd_request_cancel). A mismatch / 0 is a no-op so a stale cancel can't abort the
+    // next render. The worker still emits RENDER_RESP(ok=false) so the parent's
+    // blocking recv unblocks and the worker stays warm. NOT SIGKILL (that's /unload).
+    CANCEL_REQ  = 0x30,  // P->W  empty payload; hdr.req_id = target render id
     PING        = 0x40,
     PONG        = 0x41,
     SHUTDOWN    = 0xFF,

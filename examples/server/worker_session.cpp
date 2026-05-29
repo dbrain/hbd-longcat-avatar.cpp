@@ -4,9 +4,11 @@
 
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -116,6 +118,27 @@ bool WorkerSession::ensure_loaded() {
     return true;
 }
 
+void WorkerSession::cancel_in_flight() {
+    uint32_t req_id = current_render_req_id_.load(std::memory_order_acquire);
+    if (req_id == 0) {
+        return;  // no render in flight
+    }
+    int fd = fd_;
+    if (fd < 0) {
+        return;  // worker already gone
+    }
+    // Deliberately NOT io_mutex_ — the render we're cancelling holds it inside its
+    // blocking recv_frame.
+    std::lock_guard<std::mutex> slk(send_mutex_);
+    IpcError e = send_frame(fd, WorkerFrame::CANCEL_REQ, req_id, nullptr, 0);
+    if (e != IpcError::OK) {
+        fprintf(stderr, "worker-session: CANCEL_REQ send failed (req_id=%u): %s\n",
+                req_id, ipc_error_str(e));
+        return;
+    }
+    fprintf(stderr, "worker-session: CANCEL_REQ sent (req_id=%u)\n", req_id);
+}
+
 RenderResult WorkerSession::render(const std::string& gen_json,
                                    const std::vector<uint8_t>& image,
                                    const std::vector<uint8_t>& audio) {
@@ -128,17 +151,27 @@ RenderResult WorkerSession::render(const std::string& gen_json,
     uint32_t req_id = next_req_id_.fetch_add(1);
 
     auto payload = pack_render_request(gen_json, image, audio);
-    auto err     = send_frame(fd_, WorkerFrame::RENDER_REQ, req_id, payload);
-    if (err != IpcError::OK) {
-        result.error = std::string("RENDER_REQ send failed: ") + ipc_error_str(err);
-        kill_worker_locked();
-        last_error_ = result.error;
-        return result;
+    {
+        std::lock_guard<std::mutex> slk(send_mutex_);
+        auto err = send_frame(fd_, WorkerFrame::RENDER_REQ, req_id, payload);
+        if (err != IpcError::OK) {
+            result.error = std::string("RENDER_REQ send failed: ") + ipc_error_str(err);
+            kill_worker_locked();
+            last_error_ = result.error;
+            return result;
+        }
     }
+    // Publish req_id AFTER the send so a cancel racing in before the worker has even
+    // seen RENDER_REQ is a harmless no-op. Clear on every return path via RAII.
+    current_render_req_id_.store(req_id, std::memory_order_release);
+    struct CurrentRenderGuard {
+        std::atomic<uint32_t>& cur;
+        ~CurrentRenderGuard() { cur.store(0, std::memory_order_release); }
+    } current_render_guard{current_render_req_id_};
 
     FrameHeader hdr{};
     std::vector<uint8_t> resp_payload;
-    err = recv_frame(fd_, &hdr, &resp_payload);
+    auto err = recv_frame(fd_, &hdr, &resp_payload);
     if (err != IpcError::OK || hdr.type != (uint32_t)WorkerFrame::RENDER_RESP) {
         result.error = std::string("RENDER_RESP recv failed: ") + ipc_error_str(err);
         kill_worker_locked();
@@ -212,7 +245,14 @@ int run_worker_loop(int fd, int argc, const char** argv) {
         return 2;
     }
 
-    sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false, false, false);
+    // free_params_immediately=TRUE: frees the umT5 text encoder (~5.7 GB host RAM)
+    // right after the one-shot text encode. On the avatar vid_gen path this is the
+    // ONLY weight it frees — the DiT (stable-diffusion.cpp:5872), VAE (5251) and
+    // whisper (5604) frees are all gated on !keep_diffusion_model_resident, and the
+    // worker sets keep_resident=true below, so those stay warm across renders/segments.
+    // Matches the CLI (main.cpp passes true). umT5 is dead after its encode (chained
+    // segments reuse the cached text conditioning), so holding it was pure waste.
+    sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false, true, false);
     SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
     if (!sd_ctx) {
         std::fprintf(stderr, "worker: new_sd_ctx failed\n");
@@ -238,17 +278,83 @@ int run_worker_loop(int fd, int argc, const char** argv) {
 
     fprintf(stderr, "worker: ready (pid=%d)\n", (int)getpid());
 
+    // Reader thread demultiplexes the socket so CANCEL_REQ is observed WHILE a render
+    // runs on the main thread. CANCEL_REQ is handled inline by the reader (flips the
+    // cooperative cancel flag); every other frame is queued for the main thread.
+    struct WorkerCtrl {
+        std::deque<std::pair<FrameHeader, std::vector<uint8_t>>> work_queue;
+        std::mutex              queue_mutex;
+        std::condition_variable queue_cv;
+        std::atomic<bool>       reader_done{false};
+        int                     reader_exit_code = 0;
+        // Published by the main thread BEFORE a render begins, cleared AFTER. The
+        // reader matches CANCEL_REQ.req_id against this; mismatch/0 ⇒ drop.
+        std::atomic<uint32_t>   active_render_req_id{0};
+    };
+    WorkerCtrl ctrl;
+
+    std::thread reader_thread([fd, &ctrl]() {
+        for (;;) {
+            FrameHeader hdr{};
+            std::vector<uint8_t> payload;
+            IpcError e = recv_frame(fd, &hdr, &payload);
+            if (e == IpcError::EofClean) {
+                ctrl.reader_done.store(true);
+                ctrl.queue_cv.notify_all();
+                return;
+            }
+            if (e != IpcError::OK) {
+                fprintf(stderr, "worker-reader: recv_frame failed: %s\n", ipc_error_str(e));
+                ctrl.reader_exit_code = 1;
+                ctrl.reader_done.store(true);
+                ctrl.queue_cv.notify_all();
+                return;
+            }
+            WorkerFrame ft = static_cast<WorkerFrame>(hdr.type);
+            if (ft == WorkerFrame::CANCEL_REQ) {
+                uint32_t active = ctrl.active_render_req_id.load(std::memory_order_acquire);
+                if (active != 0 && active == hdr.req_id) {
+                    sd_request_cancel();
+                    fprintf(stderr, "worker-reader: CANCEL_REQ req_id=%u accepted\n", hdr.req_id);
+                } else {
+                    fprintf(stderr, "worker-reader: CANCEL_REQ req_id=%u dropped (active=%u)\n",
+                            hdr.req_id, active);
+                }
+                continue;
+            }
+            if (ft == WorkerFrame::SHUTDOWN) {
+                std::lock_guard<std::mutex> lk(ctrl.queue_mutex);
+                ctrl.work_queue.emplace_back(hdr, std::move(payload));
+                ctrl.reader_done.store(true);
+                ctrl.queue_cv.notify_all();
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(ctrl.queue_mutex);
+                ctrl.work_queue.emplace_back(hdr, std::move(payload));
+            }
+            ctrl.queue_cv.notify_all();
+        }
+    });
+    struct ReaderJoinGuard {
+        std::thread& t;
+        ~ReaderJoinGuard() { if (t.joinable()) t.join(); }
+    } reader_join{reader_thread};
+
     for (;;) {
         FrameHeader hdr{};
         std::vector<uint8_t> payload;
-        auto err = recv_frame(fd, &hdr, &payload);
-        if (err == IpcError::EofClean) {
-            fprintf(stderr, "worker: parent closed cleanly, exiting\n");
-            return 0;
-        }
-        if (err != IpcError::OK) {
-            fprintf(stderr, "worker: recv_frame failed: %s\n", ipc_error_str(err));
-            return 1;
+        {
+            std::unique_lock<std::mutex> lk(ctrl.queue_mutex);
+            ctrl.queue_cv.wait(lk, [&] {
+                return !ctrl.work_queue.empty() || ctrl.reader_done.load();
+            });
+            if (ctrl.work_queue.empty()) {
+                return ctrl.reader_exit_code;  // reader done, nothing left
+            }
+            hdr     = ctrl.work_queue.front().first;
+            payload = std::move(ctrl.work_queue.front().second);
+            ctrl.work_queue.pop_front();
         }
         switch (static_cast<WorkerFrame>(hdr.type)) {
             case WorkerFrame::LOAD_REQ: {
@@ -311,6 +417,16 @@ int run_worker_loop(int fd, int argc, const char** argv) {
                 std::string err_msg;
                 auto t0 = std::chrono::steady_clock::now();
                 bool ok = false;
+                // Cancel coordination: clear any stale cancel from a prior render BEFORE
+                // publishing this render's req_id, so a CANCEL_REQ arriving after the
+                // store is guaranteed to see the cleared flag (release/acquire with the
+                // reader's load). RAII unpublish on every exit.
+                sd_clear_cancel();
+                ctrl.active_render_req_id.store(hdr.req_id, std::memory_order_release);
+                struct RenderActiveGuard {
+                    std::atomic<uint32_t>& active;
+                    ~RenderActiveGuard() { active.store(0, std::memory_order_release); }
+                } render_active_guard{ctrl.active_render_req_id};
                 {
                     std::lock_guard<std::mutex> lock(sd_ctx_mutex);
                     ok = render_avatar_to_video_bytes(sd_ctx.get(),
