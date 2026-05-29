@@ -5,6 +5,7 @@
 #include "model.h"
 #include "rope.hpp"
 #include "ggml-cuda.h"  // ggml_cuda_set_longcat_fa_bsa_bitmap (lap-31.2)
+#include "diffusion_model.hpp"  // DiffusionModelRunner + LongCatAvatarDiffusionExtra (sd.cpp #1569)
 
 // LongCat-Video-Avatar 1.5 DiT port (mirrors src/wan.hpp).
 //
@@ -1919,5 +1920,131 @@ namespace LONGCAT_AVATAR {
     };
 
 }  // namespace LONGCAT_AVATAR
+
+// Diffusion-model wrapper (was in diffusion_model.hpp pre-#1569; moved here to match
+// upstream sd.cpp's per-model-header layout). Subclasses DiffusionModelRunner.
+struct LongCatAvatarModel : public DiffusionModelRunner {
+    LONGCAT_AVATAR::LongCatAvatarRunner avatar;
+    // Video-continuation (generate_avc) reference-anchor params, set per-render by the
+    // generate_video path before sampling. num_ref_latents>0 selects the 3-way self-attn
+    // split + ref-positioned PE in the runner; 0 = ai2v / single-clip (UNCHANGED).
+    int cont_num_ref_latents  = 0;
+    int cont_ref_img_index    = 10;
+    int cont_mask_frame_range = 3;
+    // LongCat lap-32.4: per-request BSA knob. Set per generate_video call from
+    // sd_vid_gen_params_t.bsa_*; the runner consults these in build_graph each
+    // render (env LONGCAT_BSA* override for back-compat with the bench script).
+    // Defaults match sd_vid_gen_params_init: r=1+self_frame preset, off by default.
+    bool bsa_enabled    = false;
+    int  bsa_radius     = 1;
+    bool bsa_self_frame = true;
+    bool bsa_bookend    = false;
+    int  bsa_cube_h     = 4;
+    int  bsa_cube_w     = 6;
+
+    LongCatAvatarModel(ggml_backend_t backend,
+                       ggml_backend_t params_backend,
+                       const String2TensorStorage& tensor_storage_map = {},
+                       const std::string prefix                       = "model.diffusion_model",
+                       SDVersion version                              = VERSION_LONGCAT_AVATAR)
+        : DiffusionModelRunner(backend, params_backend, prefix), avatar(backend, params_backend, tensor_storage_map, prefix, version) {
+    }
+
+    std::string get_desc() override {
+        return avatar.get_desc();
+    }
+
+    void alloc_params_buffer() override {
+        avatar.alloc_params_buffer();
+    }
+
+    void free_params_buffer() override {
+        avatar.free_params_buffer();
+    }
+
+    void free_compute_buffer() override {
+        avatar.free_compute_buffer();
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
+        avatar.get_param_tensors(tensors, prefix);
+    }
+
+    size_t get_params_buffer_size() override {
+        return avatar.get_params_buffer_size();
+    }
+
+    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        avatar.set_weight_adapter(adapter);
+    }
+
+    int64_t get_adm_in_channels() override {
+        return 768;
+    }
+
+    void set_flash_attention_enabled(bool enabled) {
+        avatar.set_flash_attention_enabled(enabled);
+    }
+
+    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        avatar.set_max_graph_vram_bytes(max_vram_bytes);
+    }
+
+    void set_circular_axes(bool circular_x, bool circular_y) override {
+        avatar.set_circular_axes(circular_x, circular_y);
+    }
+
+    sd::Tensor<float> compute(int n_threads,
+                              const DiffusionParams& diffusion_params) override {
+        GGML_ASSERT(diffusion_params.x != nullptr);
+        GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        // Derive num_cond_latents (ai2v ref-image frames) from the per-frame
+        // timesteps: the pipeline forces the cond frame(s) to timestep 0 while the
+        // generated frames carry the current step's t (>0). Counting leading-zero
+        // frames recovers num_cond_latents without extra plumbing.
+        int num_cond_latents     = 0;
+        const auto& ts           = *diffusion_params.timesteps;
+        const float* ts_data     = ts.data();
+        int64_t n_ts             = ts.numel();
+        if (n_ts > 1 && ts_data != nullptr) {
+            for (int64_t i = 0; i < n_ts; ++i) {
+                if (ts_data[i] == 0.0f) {
+                    num_cond_latents++;
+                } else {
+                    break;
+                }
+            }
+            // only treat as a cond split if SOME frames are non-zero (real video)
+            if (num_cond_latents == n_ts) {
+                num_cond_latents = 0;
+            }
+        }
+        avatar.num_cond_latents = num_cond_latents;
+        // Thread the continuation ref-anchor params onto the runner. Only engage the
+        // 3-way split when there IS a cond split (num_cond_latents>0); otherwise the
+        // ai2v / single-clip path must stay on the 2-way / plain-PE route.
+        avatar.num_ref_latents  = (num_cond_latents > 0) ? cont_num_ref_latents : 0;
+        avatar.ref_img_index    = cont_ref_img_index;
+        avatar.mask_frame_range = cont_mask_frame_range;
+        int lc_step = -1;
+        if (const auto* lc_extra = std::get_if<LongCatAvatarDiffusionExtra>(&diffusion_params.extra)) {
+            lc_step = lc_extra->step;
+        }
+        avatar.cur_step         = lc_step;  // cond-frame K/V cache (lap-26)
+        // LongCat lap-32.4: thread per-request BSA params to the runner. env
+        // LONGCAT_BSA* still override these inside build_graph for back-compat.
+        avatar.bsa_enabled    = bsa_enabled;
+        avatar.bsa_radius     = bsa_radius;
+        avatar.bsa_self_frame = bsa_self_frame;
+        avatar.bsa_bookend    = bsa_bookend;
+        avatar.bsa_cube_h     = bsa_cube_h;
+        avatar.bsa_cube_w     = bsa_cube_w;
+        return avatar.compute(n_threads,
+                              *diffusion_params.x,
+                              *diffusion_params.timesteps,
+                              tensor_or_empty(diffusion_params.context));
+    }
+};
+
 
 #endif  // __LONGCAT_AVATAR_HPP__
