@@ -144,9 +144,7 @@ bool render_avatar_to_video_bytes(sd_ctx_t* sd_ctx,
         LOG_INFO("continuation: %d segments, overlap %d video frames = %d cond latents (%d decoded), %d new frames/seg",
                  n_segments, cond_vframes, num_cond_latents, cond_decoded_v, new_per_seg);
 
-        // NOTE: residency is the caller's call now (server sets it per-request
-        // from `offload`; the cli pins it before invoking us). Don't force it
-        // on here — that defeated `offload` for chains and pinned ~10.5 GB.
+        sd_ctx_keep_diffusion_model_resident(sd_ctx, true);
 
         std::vector<float> stitched_audio;
         uint32_t audio_sr = 0;

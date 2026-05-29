@@ -227,11 +227,8 @@ int run_worker_loop(int fd, int argc, const char** argv) {
     }
     std::mutex sd_ctx_mutex;
 
-    // DiT residency is decided PER RENDER from the request's `offload` flag
-    // (see RENDER_REQ below): offload=false keeps the DiT resident across
-    // renders (warm-weights fast path, ~10.5 GB); offload=true lets
-    // --offload-to-cpu stream weights per layer so peak drops to ~5.7 GB,
-    // leaving VRAM for the light GPU peers. Don't pin it unconditionally here.
+    // Resident DiT across renders is what gives us the warm-weights win.
+    sd_ctx_keep_diffusion_model_resident(sd_ctx.get(), true);
 
     // Tmp dir for materialising image+audio per render. /tmp survives
     // across renders; we just overwrite per request.
@@ -308,34 +305,6 @@ int run_worker_loop(int fd, int argc, const char** argv) {
                 try { req_extra = json::parse(gen_json); } catch (...) {}
                 std::string output_format = req_extra.value("output_format", std::string("webm"));
                 int output_quality        = req_extra.value("output_compression", 90);
-
-                // Per-request DiT residency from `offload`. Residency is the
-                // offload-vs-resident switch in this build: resident=true loads
-                // the DiT onto the GPU (params_backend == runtime_backend →
-                // graph-cut segmented compute disabled → ~10.8 GB monolithic
-                // path); resident=false leaves the DiT on CPU so --offload-to-cpu
-                // streams it via graph-cut and the peak drops to ~5.7 GB at 53f
-                // — leaving room for the light GPU peers (TTS/STT/vision).
-                //
-                // Applies to chains too: each segment is its own 53f render at
-                // the same per-segment VRAM (the 13-frame overlap doesn't raise
-                // it), and the lap-20 ggml-alloc fix made segmented/offload
-                // coherent at all frame counts. With --clip-on-cpu the
-                // per-segment text re-encode just runs on CPU.
-                //
-                // offload=true (prod default) → resident=false → ~5.7 GB.
-                // offload=false → resident=true → ~10.8 GB, warm-weights fast.
-                // "auto"/any non-"false" string means on.
-                bool offload = true;
-                if (req_extra.contains("offload")) {
-                    const auto& o = req_extra["offload"];
-                    if (o.is_boolean()) {
-                        offload = o.get<bool>();
-                    } else if (o.is_string()) {
-                        offload = o.get<std::string>() != "false";
-                    }
-                }
-                sd_ctx_keep_diffusion_model_resident(sd_ctx.get(), !offload);
 
                 std::vector<uint8_t> video_bytes;
                 int segments_rendered = 0;
