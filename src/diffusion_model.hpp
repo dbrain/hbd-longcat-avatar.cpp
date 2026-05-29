@@ -112,6 +112,15 @@ public:
     virtual void set_circular_axes(bool /*cx*/, bool /*cy*/) {}
     virtual void set_max_graph_vram_bytes(size_t /*max_vram_bytes*/) {}
     virtual void set_flash_attention_enabled(bool /*enabled*/) {}
+
+    // GGMLRunner param/adapter methods are non-virtual; make them virtual here so a
+    // wrapper model (e.g. LongCatAvatarModel) can delegate to a nested runner. Default
+    // forwards to GGMLRunner (correct for models whose params live in their own ctx).
+    virtual bool   alloc_params_buffer()      { return GGMLRunner::alloc_params_buffer(); }
+    virtual void   free_params_buffer()       { GGMLRunner::free_params_buffer(); }
+    virtual void   free_compute_buffer()      { GGMLRunner::free_compute_buffer(); }
+    virtual size_t get_params_buffer_size()   { return GGMLRunner::get_params_buffer_size(); }
+    virtual void   set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) { GGMLRunner::set_weight_adapter(adapter); }
 };
 
 #endif

@@ -1954,8 +1954,8 @@ struct LongCatAvatarModel : public DiffusionModelRunner {
         return avatar.get_desc();
     }
 
-    void alloc_params_buffer() override {
-        avatar.alloc_params_buffer();
+    bool alloc_params_buffer() override {
+        return avatar.alloc_params_buffer();
     }
 
     void free_params_buffer() override {
@@ -1978,7 +1978,7 @@ struct LongCatAvatarModel : public DiffusionModelRunner {
         avatar.set_weight_adapter(adapter);
     }
 
-    int64_t get_adm_in_channels() override {
+    int64_t get_adm_in_channels() {  // not a base method; plain helper (not virtual-dispatched)
         return 768;
     }
 
