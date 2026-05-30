@@ -4,7 +4,8 @@ FLUX.2-Klein image gen on RTX 3060, heavy-bucket beside prod LLM. Lap-based perf
 Per-lap detail in `PERF-lapNN-*.md` (terse). Project memory: `project_flux2_cpp`.
 
 ## run it
-- build: `~/dev/kobbler/docker/flux2-dev/iter.sh build`  (sd-cli + flux2-server, sm_86)
+- build: `~/dev/kobbler/docker/flux2-dev/iter.sh build`  (sd-cli + sd-server, sm_86)
+- NOTE: the server CMake target is the shared-fork-generic `sd-server` (was `flux2-server`); the built binary still serves the flux2 sdcpp async API.
 - serve: `iter.sh serve` → resident server :8095 (klein-base + Q4 enc + offload + fa)
 - gallery: `cd tools && python3 gallery_server.py` → :8096 (gen UI, Cancel, PSNR-vs-golden, civ presets)
 - driver: `tools/flux_client.py` (submit/poll/cancel + VRAM + stage timings); bench `~/dev/bench/adapters/flux2.py`
