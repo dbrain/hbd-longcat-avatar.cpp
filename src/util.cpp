@@ -10,6 +10,7 @@
 #include <locale>
 #include <regex>
 #include <sstream>
+#include <atomic>
 #include <string>
 #include <thread>
 #include <unordered_set>

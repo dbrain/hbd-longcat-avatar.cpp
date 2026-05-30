@@ -118,6 +118,10 @@ public:
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors)           = 0;
     virtual size_t get_params_buffer_size()                                                = 0;
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes) {}
+    // flux2 lap-11 Lever A: keep the text-encoder params resident across the two
+    // CFG encodes (cond + uncond) so the 2nd encode doesn't re-upload them.
+    // Default no-op; only the offload-capable LLMEmbedder honours it.
+    virtual void set_keep_params_resident(bool keep) {}
     virtual void set_flash_attention_enabled(bool enabled) = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
     virtual std::tuple<SDCondition, std::vector<bool>> get_learned_condition_with_trigger(int n_threads,
@@ -1735,6 +1739,10 @@ struct LLMEmbedder : public Conditioner {
         llm->set_max_graph_vram_bytes(max_vram_bytes);
     }
 
+    void set_keep_params_resident(bool keep) override {
+        llm->set_keep_params_resident(keep);
+    }
+
     void set_flash_attention_enabled(bool enabled) override {
         llm->set_flash_attention_enabled(enabled);
     }
@@ -2079,6 +2087,14 @@ struct LLMEmbedder : public Conditioner {
         } else if (version == VERSION_FLUX2_KLEIN) {
             prompt_template_encode_start_idx = 0;
             min_length                       = 512;
+            // flux2 experiment: the text is padded to 512 tokens which all feed the
+            // DiT joint attention (L_k = 1024 img + 512 txt = 1536). For short prompts
+            // most are padding. Override to trim the text sequence; PSNR-gate vs the
+            // 512-padded golden to check it's quality-equivalent.
+            if (const char* e = getenv("FLUX2_TEXT_MINLEN")) {
+                int v = atoi(e);
+                if (v > 0) min_length = (size_t) v;
+            }
             out_layers                       = {9, 18, 27};
 
             prompt = "<|im_start|>user\n";

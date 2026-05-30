@@ -1440,10 +1440,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (can_use_flash_attn) {
             kqv = build_kqv(q, k, v, mask);
             if (!ggml_backend_supports_op(backend, kqv)) {
+                LOG_DEBUG("FA2DBG: supports_op=FALSE L_q=%ld L_k=%ld n_head=%ld d_head=%ld N=%ld kv_pad=%d mask=%s",
+                          (long)L_q, (long)L_k, (long)n_head, (long)d_head, (long)N, kv_pad,
+                          mask ? "yes" : "null");
                 kqv = nullptr;
             } else {
+                LOG_DEBUG("FA2DBG: flash ENGAGED L_q=%ld L_k=%ld d_head=%ld", (long)L_q, (long)L_k, (long)d_head);
                 kqv = ggml_view_3d(ctx, kqv, d_head, n_head, L_q, kqv->nb[1], kqv->nb[2], 0);
             }
+        } else {
+            LOG_DEBUG("FA2DBG: can_use_flash_attn=FALSE (mask->ne[3]!=1?)");
         }
     }
 
@@ -1829,6 +1835,17 @@ protected:
     // call — the pipelining driver in compute_with_graph_cuts has already arranged the
     // partial param state via commit_prefetched_state.
     bool skip_internal_offload_   = false;
+
+    // flux2 lap-11 Lever A: when set, free_compute_buffer() frees the compute
+    // allocr (activations) but DOES NOT restore_all_params() — the offloaded
+    // params stay resident on the runtime backend across consecutive compute()
+    // calls. Used to share one resident qwen across the CFG cond+uncond encodes
+    // (avoids re-uploading 4302 MB for the 2nd pass). VRAM peak is unchanged
+    // (same params already resident; activations still freed between calls).
+    // The caller MUST call set_keep_params_resident(false) afterward, which
+    // restores params back to the params backend (freeing runtime VRAM) before
+    // the next consumer (e.g. the UNet) loads.
+    bool keep_params_resident_    = false;
 
     std::shared_ptr<WeightAdapter> weight_adapter = nullptr;
 
@@ -3286,7 +3303,20 @@ public:
             compute_allocr = nullptr;
         }
         restore_partial_params();
-        restore_all_params();
+        if (!keep_params_resident_) {
+            restore_all_params();
+        }
+    }
+
+    // flux2 lap-11 Lever A. Toggle whether free_compute_buffer() keeps offloaded
+    // params resident on the runtime backend. Clearing it (false) immediately
+    // restores params to the params backend (freeing the runtime VRAM), matching
+    // the default end-of-compute behaviour.
+    void set_keep_params_resident(bool keep) {
+        keep_params_resident_ = keep;
+        if (!keep) {
+            restore_all_params();
+        }
     }
 
     // do copy after alloc graph
@@ -3590,7 +3620,12 @@ public:
 };
 
 __STATIC_INLINE__ bool support_get_rows(ggml_type wtype) {
-    std::set<ggml_type> allow_types = {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0};
+    // Q4_K added (flux2 lap-3): the CUDA get_rows kernel handles Q4_K (getrows.cu),
+    // so a Q4_K embedding (e.g. Qwen3-8B-Q4_K_M token_embd, 151936x4096) can stay
+    // quantized + mmappable instead of being force-converted to F32 — that F32 blob
+    // was 2374 MB of non-reclaimable pinned host RAM. get_rows uses the same
+    // dequantize_q4_K, so looked-up rows are bit-identical to the old F32 path.
+    std::set<ggml_type> allow_types = {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K};
     if (allow_types.find(wtype) != allow_types.end()) {
         return true;
     }

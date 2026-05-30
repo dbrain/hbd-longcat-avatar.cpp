@@ -1073,8 +1073,20 @@ namespace LLM {
                 intermediate_outputs.push_back(x);
             }
 
+            // Early-stop: when we only need a fixed set of hidden states (not the
+            // post-final-norm output and not all states), the deepest layer whose
+            // output is consumed is max(out_layers). Layers beyond it feed only the
+            // final norm — which is unused here — so skipping them is bit-exact.
+            int stop_layers = static_cast<int>(num_layers);
+            if (!return_all_hidden_states && !out_layers.empty()) {
+                int max_out = *out_layers.rbegin();  // std::set is sorted ascending
+                if (max_out <= static_cast<int>(num_layers)) {
+                    stop_layers = max_out;  // out_layers are 1-indexed (i+1); run layers [0, max_out)
+                }
+            }
+
             sd::ggml_graph_cut::mark_graph_cut(x, "llm.text.prelude", "x");
-            for (int i = 0; i < num_layers; i++) {
+            for (int i = 0; i < stop_layers; i++) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["layers." + std::to_string(i)]);
 
                 x = block->forward(ctx, x, input_pos, attention_mask, sliding_attention_mask);

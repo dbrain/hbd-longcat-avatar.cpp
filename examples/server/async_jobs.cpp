@@ -298,6 +298,10 @@ void async_job_worker(ServerRuntime& runtime) {
             job             = it->second;
             job->status     = AsyncJobStatus::Generating;
             job->started_at = unix_timestamp_now();
+            // Publish the active job + clear any stale cancel so a cancel aimed at
+            // an already-finished job cannot abort this fresh render.
+            manager.generating_job_id = job->id;
+            sd_clear_cancel();
         }
 
         std::vector<std::string> output_images;
@@ -330,6 +334,7 @@ void async_job_worker(ServerRuntime& runtime) {
             }
 
             job->completed_at = unix_timestamp_now();
+            manager.generating_job_id.clear();
             if (ok) {
                 job->status                 = AsyncJobStatus::Completed;
                 job->result_images_b64      = std::move(output_images);
@@ -339,6 +344,16 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->result_fps             = output_fps;
                 job->error_code.clear();
                 job->error_message.clear();
+            } else if (sd_is_cancel_requested()) {
+                // Cooperative cancel: the render bailed by request, not a fault.
+                job->status        = AsyncJobStatus::Cancelled;
+                job->error_code    = "cancelled";
+                job->error_message = "job cancelled by client";
+                job->result_images_b64.clear();
+                job->result_media_b64.clear();
+                job->result_media_mime_type.clear();
+                job->result_frame_count = 0;
+                job->result_fps         = 0;
             } else {
                 job->status        = AsyncJobStatus::Failed;
                 job->error_code    = "generation_failed";

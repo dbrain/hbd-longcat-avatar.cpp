@@ -178,7 +178,7 @@ static json make_img_gen_features_json() {
         {"hires", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
     };
 }
 
@@ -192,7 +192,7 @@ static json make_vid_gen_features_json() {
         {"vae_tiling", true},
         {"cache", true},
         {"cancel_queued", true},
-        {"cancel_generating", false},
+        {"cancel_generating", true},
     };
 }
 
@@ -301,7 +301,7 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     json top_level_output_formats = json::array();
     json top_level_features       = {
               {"cancel_queued", true},
-              {"cancel_generating", false},
+              {"cancel_generating", true},
     };
     std::string current_mode = "";
     if (supports_img) {
@@ -584,8 +584,16 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+            if (manager.generating_job_id == job.id) {
+                // Cooperative in-flight cancel: flag the render loop, which bails at
+                // its next step and the worker flips this job to "cancelled".
+                sd_request_cancel();
+                res.status = 202;
+                res.set_content(make_async_job_json(manager, job).dump(), "application/json");
+            } else {
+                res.status = 409;
+                res.set_content(R"({"error":"job is generating but is not the active render"})", "application/json");
+            }
             return;
         }
 

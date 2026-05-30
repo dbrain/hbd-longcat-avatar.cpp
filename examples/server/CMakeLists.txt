@@ -1,4 +1,4 @@
-set(TARGET longcat-avatar-server)
+set(TARGET flux2-server)
 
 option(SD_SERVER_BUILD_FRONTEND "Build server frontend with pnpm" ON)
 

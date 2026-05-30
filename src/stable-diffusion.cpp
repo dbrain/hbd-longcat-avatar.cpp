@@ -4284,6 +4284,19 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     auto id_cond                     = sd_ctx->sd->get_pmid_conditon(request->pm_params, condition_params);
     int64_t prepare_start_ms         = ggml_time_ms();
     condition_params.zero_out_masked = false;
+
+    // flux2 lap-11 Lever A: CFG does two consecutive text encodes (cond below,
+    // uncond just after). With --offload-to-cpu the text-encoder params get
+    // restored to CPU after the cond encode and fully re-uploaded for the uncond
+    // encode (~0.6s redundant H2D). Keep them resident across both encodes; the
+    // params are already paid for by the first encode and stay the same size, so
+    // VRAM peak is unchanged. They are restored to CPU below (before the UNet
+    // loads) by set_keep_params_resident(false) / free_params_buffer().
+    const bool keep_te_resident_across_cfg = (request->use_uncond || request->use_high_noise_uncond);
+    if (keep_te_resident_across_cfg) {
+        sd_ctx->sd->cond_stage_model->set_keep_params_resident(true);
+    }
+
     auto cond                        = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                            condition_params);
     if (cond.c_concat.empty()) {
@@ -4305,6 +4318,12 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         if (uncond.c_concat.empty()) {
             uncond.c_concat = latents->uncond_concat_latent;  // TODO: optimize
         }
+    }
+
+    // flux2 lap-11 Lever A: both CFG encodes done — restore text-encoder params
+    // back to the params backend (frees runtime VRAM) before the UNet loads.
+    if (keep_te_resident_across_cfg) {
+        sd_ctx->sd->cond_stage_model->set_keep_params_resident(false);
     }
 
     int64_t t1 = ggml_time_ms();
@@ -4585,6 +4604,17 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
 
     std::vector<sd::Tensor<float>> final_latents;
     int64_t denoise_start = ggml_time_ms();
+    // flux2 lap-11 Lever C: for a multi-seed batch the UNet weights are re-uploaded
+    // for every seed (each sample() ends by restoring params to CPU). Nothing else
+    // touches VRAM between seeds (the text encoder is already freed; the VAE runs
+    // after this loop), so keep the UNet resident across the seeds — saves one
+    // ~0.8s 5.6GB H2D per extra seed. VRAM peak is unchanged (one UNet, activations
+    // still freed between seeds). Cleared below before the UNet is freed / the VAE
+    // loads. No-op for batch_count==1 (single-gen path untouched).
+    const bool keep_unet_resident = request.batch_count > 1;
+    if (keep_unet_resident) {
+        sd_ctx->sd->diffusion_model->set_keep_params_resident(true);
+    }
     for (int b = 0; b < request.batch_count; b++) {
         int64_t sampling_start = ggml_time_ms();
         int64_t cur_seed       = request.seed + b;
@@ -4631,10 +4661,19 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                   b + 1,
                   request.batch_count,
                   (sampling_end - sampling_start) * 1.0f / 1000);
+        if (keep_unet_resident) {
+            sd_ctx->sd->diffusion_model->set_keep_params_resident(false);
+        }
         if (sd_ctx->sd->free_params_immediately) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         return nullptr;
+    }
+    // flux2 lap-11 Lever C: all seeds done — drop the keep-resident hold, which
+    // restores the UNet params off the runtime backend (frees VRAM) before the
+    // free below / the VAE decode loads.
+    if (keep_unet_resident) {
+        sd_ctx->sd->diffusion_model->set_keep_params_resident(false);
     }
     if (sd_ctx->sd->free_params_immediately && !request.hires.enabled) {
         sd_ctx->sd->diffusion_model->free_params_buffer();

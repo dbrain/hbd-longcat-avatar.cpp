@@ -108,10 +108,15 @@ public:
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                    const std::string& prefix) = 0;
 
-    // longcat-avatar additions: avatar overrides these; other models inherit no-ops.
+    // longcat-avatar additions. set_circular_axes / set_max_graph_vram_bytes are
+    // avatar-only (default no-op). set_flash_attention_enabled MUST forward to the
+    // GGMLRunner base by default — FluxRunner et al. don't override it, and a no-op
+    // here silently name-hides GGMLRunner::set_flash_attention_enabled, leaving
+    // flash_attn_enabled=false → the DiT attention falls back to unfused
+    // softmax (flux2 lap-1). Wrappers with nested runners (avatar, hidream) still override.
     virtual void set_circular_axes(bool /*cx*/, bool /*cy*/) {}
     virtual void set_max_graph_vram_bytes(size_t /*max_vram_bytes*/) {}
-    virtual void set_flash_attention_enabled(bool /*enabled*/) {}
+    virtual void set_flash_attention_enabled(bool enabled) { GGMLRunner::set_flash_attention_enabled(enabled); }
 
     // GGMLRunner param/adapter methods are non-virtual; make them virtual here so a
     // wrapper model (e.g. LongCatAvatarModel) can delegate to a nested runner. Default
