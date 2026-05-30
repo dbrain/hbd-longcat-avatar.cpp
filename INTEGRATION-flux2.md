@@ -41,16 +41,16 @@ The dev harness (`docker/flux2-dev/iter.sh serve`, in the kobbler repo) already 
 mmap is just the `--mmap` flag on the avatar entrypoint (file-backed reclaimable weights vs locked RSS).
 The Q4_K-embd whitelist + FA fix are already merged here and don't touch avatar output. Bench it.
 
-## Held-back: shared ggml changes (NOT applied — see patches/)
-`patches/ggml-flux2-lap8-modulate-fusion-and-lap7-mmq-scaffolding.patch` holds two ggml-side changes,
-kept OUT of the build because `ggml/` is shared `dbrain/ggml` (all 6 GPU projects) and the gitlink stays
-at `048cba4d` to match master:
+## ggml changes — LANDED in dbrain/ggml (gitlink bumped)
+The `ggml/` submodule gitlink is bumped from `048cba4d` to **`bea6ca1c`** (pushed to `dbrain/ggml` master,
+a clean fast-forward; the other 5 GPU projects still pin `048cba4d` and are unaffected until they bump):
 - **lap-8 modulate shift-fusion** — folds flux AdaLN `x*scale+shift` into the longcat gate_add kernel.
-  Bit-exact (−0.7% dit). Worth landing in dbrain/ggml.
+  Bit-exact (`__fadd_rn`); fires only on the `[d0,1,d2,Nb]` shift pattern, so existing gate_add callers
+  (avatar gated-residual) are unaffected. −0.7% dit.
 - **lap-7 MMQ occupancy scaffolding** — `GGML_MMQ_X_CAP` env + `MMQ_EXPERIMENT_MIN_BLOCKS`/`MMQ_Y_OVERRIDE`
   defines, all **default-off / upstream**. Dead-end experiments (kept for reproducibility, see PERF-lap7).
-To enable: apply the patch in `ggml/`, commit+push to `dbrain/ggml`, bump the gitlink. The build is
-bit-exact WITHOUT it, so it's optional.
+Validated bit-exact with the fusion live (md5 `6c0a783425ea`). A `git submodule update` after pulling
+this branch checks out `bea6ca1c`.
 
 ## Facts for the UI / next integrator (measured; full detail in PERF-lap10 + project memory)
 - **Multi-seed:** `batch_count` (= `batch` in flux_client / gallery) renders seeds = seed, seed+1, …
