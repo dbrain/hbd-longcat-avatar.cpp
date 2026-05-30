@@ -1,4 +1,4 @@
-set(TARGET flux2-server)
+set(TARGET sd-server)
 
 option(SD_SERVER_BUILD_FRONTEND "Build server frontend with pnpm" ON)
 
