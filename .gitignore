@@ -19,3 +19,7 @@ preview.png
 .convert-tmp/
 __pycache__/
 *.pyc
+# flux2 dev artifacts (not for the shared repo)
+gallery/
+profiles/
+/tmp_*
