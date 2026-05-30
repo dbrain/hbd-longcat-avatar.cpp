@@ -209,6 +209,17 @@ int main(int argc, const char** argv) {
     std::vector<UpscalerEntry> upscaler_cache;
     std::mutex                 upscaler_mutex;
     AsyncJobManager async_job_manager;
+
+    // FLUX.2-Klein dual-DiT swap state. The BASE DiT was loaded by new_sd_ctx()
+    // above (from --diffusion-model); the EDIT DiT path (--diffusion-model-edit)
+    // is swapped in per request on the async worker thread.
+    ModelSwapState model_swap;
+    model_swap.base_path      = ctx_params.diffusion_model_path;
+    model_swap.edit_path      = svr_params.diffusion_model_edit_path;
+    model_swap.loaded_variant = "base";
+    model_swap.loaded.store(true);
+    model_swap.draining.store(false);
+
     ServerRuntime runtime = {
         sd_ctx.get(),
         &sd_ctx_mutex,
@@ -220,6 +231,7 @@ int main(int argc, const char** argv) {
         &upscaler_cache,
         &upscaler_mutex,
         &async_job_manager,
+        &model_swap,
     };
 
     std::thread async_worker(async_job_worker, std::ref(runtime));
@@ -236,6 +248,15 @@ int main(int argc, const char** argv) {
         if (req.method == "OPTIONS") {
             res.status = 204;
             return httplib::Server::HandlerResponse::Handled;
+        }
+        // Body-less POSTs (e.g. /v1/admin/drain with no body) would otherwise block
+        // on httplib's read-without-length until the keep-alive timeout. Inject
+        // Content-Length: 0 so the body read returns immediately (same workaround
+        // as routes_longcat.cpp).
+        if ((req.method == "POST" || req.method == "PUT" || req.method == "PATCH") &&
+            !req.has_header("Content-Length") &&
+            req.get_header_value("Transfer-Encoding") != "chunked") {
+            const_cast<httplib::Request&>(req).set_header("Content-Length", "0");
         }
         return httplib::Server::HandlerResponse::Unhandled;
     });
@@ -254,6 +275,7 @@ int main(int argc, const char** argv) {
     register_openai_api_endpoints(svr, runtime);
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
+    register_sdcpp_admin_endpoints(svr, runtime);
 
     LOG_INFO("listening on: http://%s:%d (in-process)\n",
              svr_params.listen_ip.c_str(), svr_params.listen_port);

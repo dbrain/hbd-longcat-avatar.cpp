@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -21,6 +22,10 @@ struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
     std::string serve_html_path;
+    // FLUX.2-Klein edit-variant DiT path. The BASE DiT comes from the context
+    // params (--diffusion-model); this is the EDIT DiT (--diffusion-model-edit),
+    // swapped in per request. Empty = single-model (back-compat) mode.
+    std::string diffusion_model_edit_path;
     bool normal_exit = false;
     bool verbose     = false;
     bool color       = false;
@@ -45,6 +50,19 @@ struct UpscalerEntry {
     int scale = 4;
 };
 
+// Tracks which FLUX.2-Klein DiT variant is currently resident on the GPU, plus the
+// admin drain/unload state for the external GPU gate. Mutated only on the serial
+// async worker thread (swaps) + the HTTP threads (atomics), so no extra locking is
+// needed beyond the existing sd_ctx_mutex around generation.
+struct ModelSwapState {
+    std::string base_path;   // --diffusion-model
+    std::string edit_path;   // --diffusion-model-edit (empty = single-model mode)
+    // "base" | "edit"; the variant whose weights are resident in sd_ctx right now.
+    std::string loaded_variant = "base";
+    std::atomic<bool> loaded{true};       // false after /v1/admin/unload freed VRAM
+    std::atomic<bool> draining{false};    // true after /v1/admin/drain
+};
+
 struct ServerRuntime {
     sd_ctx_t* sd_ctx;
     std::mutex* sd_ctx_mutex;
@@ -56,12 +74,17 @@ struct ServerRuntime {
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
+    ModelSwapState* model_swap;
 };
 
 struct ImgGenJobRequest {
     SDGenerationParams gen_params;
     std::string output_format = "png";
     int output_compression    = 100;
+    // Requested DiT variant ("base" | "edit"), parsed from the optional top-level
+    // "model" field of the img_gen body. Empty = caller did not specify, so the
+    // worker renders with whatever variant is currently loaded (no forced swap).
+    std::string model_variant;
 
     sd_img_gen_params_t to_sd_img_gen_params_t() {
         return gen_params.to_sd_img_gen_params_t();

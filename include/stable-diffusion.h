@@ -515,6 +515,22 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 // later segments don't render against freed GPU memory.
 SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep);
 
+// Hot-swap the diffusion (DiT) model weights in place from a different gguf,
+// reusing the existing backend + the resident VAE/text-encoder. Intended for the
+// FLUX.2-Klein base<->edit swap: both variants share the same DiT architecture +
+// tensor names, only the ~5.6 GB of weights differ, so the runner object/param
+// graph is reused and only its param buffer is freed + refilled. Returns false on
+// load failure (and leaves the DiT params buffer freed — caller should treat the
+// ctx as unusable for img_gen until a successful swap/reload). The caller MUST
+// guarantee no render is in flight (call from the serial async worker thread).
+SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path);
+
+// Free the diffusion (DiT) model's VRAM (compute + param buffers) without touching
+// the resident VAE / text encoder. Used by the server's /v1/admin/unload so an
+// external GPU gate can reclaim the card; the next render must reload the DiT via
+// sd_ctx_swap_diffusion_model() first. Caller MUST ensure no render is in flight.
+SD_API void sd_ctx_free_diffusion_model(sd_ctx_t* sd_ctx);
+
 // LongCat-Avatar continuation chaining (drift sink): VAE-encode a stack of decoded
 // RGB frames back to a DIFFUSION latent, matching the space of generate_video_ex's
 // final_latent_out / the cont_latent consumed by the next segment. This is the

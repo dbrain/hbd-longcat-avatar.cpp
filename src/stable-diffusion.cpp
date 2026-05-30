@@ -167,6 +167,15 @@ public:
     std::set<std::string> te_reload_ignore_tensors;
     bool te_reload_use_mmap = false;
 
+    // Dual-DiT (base/edit) hot-swap state. The flags mirror the boot mmap
+    // config (sd_ctx_params isn't retained); the store holds the mmap of the
+    // CURRENTLY-SWAPPED DiT so its file-backed pages stay alive. Reassigned on
+    // each swap (drops the prior swapped DiT's mapping). The boot variant's DiT
+    // mapping lives in `mmap_tensor_store` and is left mapped (reclaimable).
+    bool dit_swap_enable_mmap   = false;
+    bool dit_swap_writable_mmap = false;
+    std::vector<MmapTensorStore> dit_swap_mmap_store;
+
     bool circular_x = false;
     bool circular_y = false;
 
@@ -479,6 +488,12 @@ public:
             }
             enable_mmap_tensors = true;
         }
+        // Capture the mmap flags so swap_diffusion_model() (which has no
+        // sd_ctx_params) can re-map a swapped DiT the same way as the boot load
+        // — keeping the swapped weights in reclaimable file-backed page cache
+        // instead of anon RAM (preserves the --mmap host-RAM win across swaps).
+        dit_swap_enable_mmap   = enable_mmap_tensors;
+        dit_swap_writable_mmap = needs_writable_mmap;
 
         // split definition to avoid msvc choking on the extra parameter handling
         auto module_can_mmap = [&](SDBackendModule module) {
@@ -1407,6 +1422,90 @@ public:
             return false;
         }
         LOG_INFO("avatar: umT5 reloaded for prompt change, taking %.2fs",
+                 (ggml_time_ms() - t0) * 1.0f / 1000);
+        return true;
+    }
+
+    // Hot-swap the diffusion model (DiT) weights in place from a different gguf,
+    // reusing the existing backend, the resident VAE + text encoder, and the
+    // already-built DiffusionModelRunner object/param-tensor graph. This is the
+    // FLUX.2-Klein base<->edit swap path: both variants share the exact same DiT
+    // architecture + tensor names ("model.diffusion_model.*"), only the weights
+    // differ (~5.6 GB). We therefore do NOT rebuild the runner; we just free its
+    // param buffer (VRAM) and refill it from the new file — the same free-then-
+    // reload mechanism reload_cond_stage_model() uses for umT5, which is why the
+    // dangling-pointer fix in GGMLRunner::free_params_buffer() is load-bearing here.
+    //
+    // Must be called with no render in flight (serial async worker thread).
+    bool swap_diffusion_model(const std::string& new_diffusion_model_path) {
+        if (!diffusion_model) {
+            LOG_ERROR("swap_diffusion_model: no diffusion model loaded");
+            return false;
+        }
+        if (new_diffusion_model_path.empty()) {
+            LOG_ERROR("swap_diffusion_model: empty path");
+            return false;
+        }
+
+        int64_t t0 = ggml_time_ms();
+
+        // 1. Free the current DiT compute + params buffers (releases VRAM and any
+        //    anon params backing). free_params_buffer() nulls the tensor
+        //    data/buffer pointers so the re-alloc below doesn't trip the
+        //    "already allocated" fast-path. For an mmap'd DiT the weight data
+        //    lives in a MmapTensorStore (the boot variant in `mmap_tensor_store`,
+        //    a prior swap in `dit_swap_mmap_store`), not the params buffer.
+        diffusion_model->free_compute_buffer();
+        diffusion_model->free_params_buffer();
+
+        // 2. Open the new gguf with the same prefix the runner's tensor keys use.
+        ModelLoader swap_loader;
+        if (!swap_loader.init_from_file(new_diffusion_model_path, "model.diffusion_model.")) {
+            LOG_ERROR("swap_diffusion_model: init loader from '%s' failed", new_diffusion_model_path.c_str());
+            return false;
+        }
+
+        // 3. Collect the runner's param tensors (keys are "model.diffusion_model.*").
+        std::map<std::string, ggml_tensor*> dit_tensors;
+        diffusion_model->get_param_tensors(dit_tensors);
+        if (dit_tensors.empty()) {
+            LOG_ERROR("swap_diffusion_model: runner exposed no param tensors");
+            return false;
+        }
+
+        // 4. Mirror the boot load ORDER so the swapped DiT has the SAME RAM
+        //    characteristics as the boot one: when mmap is on, map the new file
+        //    first (points the tensors at reclaimable file-backed pages — this is
+        //    what preserves the --mmap host-RAM win across swaps; without it the
+        //    swapped DiT would sit in ~5.6 GB of non-reclaimable anon RAM), THEN
+        //    alloc the params buffer for any non-mappable remainder, THEN load
+        //    that remainder. Drop the prior swap's mapping first so we never hold
+        //    two swapped DiTs mapped at once. mmap_tensors skips any tensor whose
+        //    dtype/shape differs from the runner graph (built from the boot
+        //    gguf); load_tensors(use_mmap=true) then fills exactly those, so a
+        //    base/edit recipe mismatch degrades to a partial anon load rather
+        //    than silent garbage.
+        dit_swap_mmap_store.clear();
+        if (dit_swap_enable_mmap) {
+            dit_swap_mmap_store =
+                swap_loader.mmap_tensors(dit_tensors, /*ignore_tensors=*/{}, dit_swap_writable_mmap);
+        }
+        if (!diffusion_model->alloc_params_buffer()) {
+            LOG_ERROR("swap_diffusion_model: alloc params buffer failed");
+            return false;
+        }
+        bool ok = swap_loader.load_tensors(dit_tensors,
+                                           /*ignore_tensors=*/{},
+                                           n_threads,
+                                           /*use_mmap=*/dit_swap_enable_mmap);
+        if (!ok) {
+            LOG_ERROR("swap_diffusion_model: load tensors from '%s' failed", new_diffusion_model_path.c_str());
+            return false;
+        }
+
+        LOG_INFO("swap_diffusion_model: loaded DiT from '%s' (mmap=%d), taking %.2fs",
+                 new_diffusion_model_path.c_str(),
+                 (int)dit_swap_enable_mmap,
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
@@ -6131,6 +6230,33 @@ SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep) {
     if (sd_ctx != nullptr && sd_ctx->sd != nullptr) {
         sd_ctx->sd->keep_diffusion_model_resident = keep;
     }
+}
+
+SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || diffusion_model_path == nullptr) {
+        return false;
+    }
+    // Hot-swap the DiT weights in place (e.g. FLUX.2-Klein base<->edit). The VAE +
+    // text encoder stay resident; only the diffusion model's param buffer is freed
+    // and refilled from the new gguf. Caller MUST ensure no render is in flight.
+    return sd_ctx->sd->swap_diffusion_model(diffusion_model_path);
+}
+
+SD_API void sd_ctx_free_diffusion_model(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || !sd_ctx->sd->diffusion_model) {
+        return;
+    }
+    // Free the DiT compute + param buffers (releases its VRAM) without touching the
+    // resident VAE/text-encoder. Used by /v1/admin/unload so the external GPU gate
+    // can reclaim the card for the LLM/avatar. The next render must reload the DiT
+    // via sd_ctx_swap_diffusion_model() first. free_params_buffer() nulls the tensor
+    // data/buffer pointers so a later alloc+reload is clean.
+    sd_ctx->sd->diffusion_model->free_compute_buffer();
+    sd_ctx->sd->diffusion_model->free_params_buffer();
+    // Also drop any swapped-DiT mmap so its file-backed pages are released (the
+    // boot variant's mapping in mmap_tensor_store is left alone; a reload
+    // re-maps via sd_ctx_swap_diffusion_model()).
+    sd_ctx->sd->dit_swap_mmap_store.clear();
 }
 
 SD_API float* sd_ctx_encode_video_frames(sd_ctx_t* sd_ctx,

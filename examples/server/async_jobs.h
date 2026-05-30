@@ -76,4 +76,14 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          int& output_frame_count,
                          int& output_fps,
                          std::string& error_message);
+// Ensure the DiT variant required by `target_variant` ("base"|"edit") is resident
+// in sd_ctx, swapping (or reloading after an admin unload) if necessary. An empty
+// target_variant means "use whatever is loaded" — but if the model was unloaded by
+// admin, the currently-tracked variant is reloaded so the render has weights. Runs
+// on the serial async worker thread (holds sd_ctx_mutex internally). Returns false
+// and fills error_message on swap/reload failure.
+bool ensure_variant_loaded(ServerRuntime& runtime,
+                           const std::string& target_variant,
+                           std::string& error_message);
+
 void async_job_worker(ServerRuntime& runtime);

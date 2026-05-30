@@ -269,6 +269,57 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     return true;
 }
 
+bool ensure_variant_loaded(ServerRuntime& runtime,
+                           const std::string& target_variant,
+                           std::string& error_message) {
+    ModelSwapState* swap = runtime.model_swap;
+    if (swap == nullptr) {
+        return true;  // dual-DiT not wired (should not happen in-process)
+    }
+
+    // Resolve the variant we actually need resident. An explicit request wins;
+    // otherwise keep the currently-loaded variant (no forced swap — preserves
+    // single-model byte-identical behaviour when no "model" field is sent).
+    std::string want = target_variant.empty() ? swap->loaded_variant : target_variant;
+    if (want.empty()) {
+        want = "base";
+    }
+
+    const bool unloaded     = !swap->loaded.load();
+    const bool variant_diff = (want != swap->loaded_variant);
+
+    // Fast path: requested variant already resident and nothing was unloaded.
+    if (!unloaded && !variant_diff) {
+        return true;
+    }
+
+    // Resolve the gguf path for the wanted variant.
+    std::string path = (want == "edit") ? swap->edit_path : swap->base_path;
+    if (path.empty()) {
+        error_message = "no diffusion model path for variant '" + want + "'";
+        return false;
+    }
+
+    // Swap is serialized with rendering via sd_ctx_mutex (worker is single-threaded,
+    // but admin/unload may also touch the DiT under this lock).
+    std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
+
+    if (variant_diff || unloaded) {
+        LOG_INFO("img_gen: swapping DiT variant %s -> %s (unloaded=%d)",
+                 swap->loaded_variant.c_str(), want.c_str(), (int)unloaded);
+        if (!sd_ctx_swap_diffusion_model(runtime.sd_ctx, path.c_str())) {
+            error_message = "failed to load diffusion model variant '" + want + "'";
+            // On failure the DiT params buffer is freed → mark unloaded so the next
+            // attempt forces a fresh reload rather than assuming it's resident.
+            swap->loaded.store(false);
+            return false;
+        }
+        swap->loaded_variant = want;
+        swap->loaded.store(true);
+    }
+    return true;
+}
+
 void async_job_worker(ServerRuntime& runtime) {
     AsyncJobManager& manager = *runtime.async_job_manager;
 
@@ -313,7 +364,12 @@ void async_job_worker(ServerRuntime& runtime) {
         bool ok = false;
 
         if (job->kind == AsyncJobKind::ImgGen) {
-            ok = execute_img_gen_job(runtime, *job, output_images, error_message);
+            // FLUX.2-Klein dual-DiT: ensure the requested variant (or the tracked
+            // one, after an admin unload) is resident before rendering. The swap is
+            // serial on this worker thread, so it never races a live render.
+            if (ensure_variant_loaded(runtime, job->img_gen.model_variant, error_message)) {
+                ok = execute_img_gen_job(runtime, *job, output_images, error_message);
+            }
         } else if (job->kind == AsyncJobKind::VidGen) {
             ok = execute_vid_gen_job(runtime,
                                      *job,

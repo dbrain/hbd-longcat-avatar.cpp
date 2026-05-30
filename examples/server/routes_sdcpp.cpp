@@ -342,6 +342,29 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     result["features_by_mode"]       = features_by_mode;
     result["loras"]                  = available_loras;
     result["upscalers"]              = available_upscalers;
+
+    // FLUX.2-Klein dual-DiT variants. "base" is always present; "edit" appears only
+    // when --diffusion-model-edit was given. `loaded` reflects which DiT is resident
+    // right now. default_steps/default_cfg are informational (koblem has its own).
+    json variants = json::array();
+    if (runtime.model_swap != nullptr) {
+        const std::string loaded_variant = runtime.model_swap->loaded_variant;
+        variants.push_back({
+            {"name", "base"},
+            {"loaded", loaded_variant == "base"},
+            {"default_steps", 8},
+            {"default_cfg", 5.0},
+        });
+        if (!runtime.model_swap->edit_path.empty()) {
+            variants.push_back({
+                {"name", "edit"},
+                {"loaded", loaded_variant == "edit"},
+                {"default_steps", 4},
+                {"default_cfg", 1.0},
+            });
+        }
+    }
+    result["variants"] = variants;
     return result;
 }
 
@@ -364,6 +387,24 @@ static bool parse_img_gen_request(const json& body,
     if (!assign_output_options(request, output_format, output_compression, true, error_message)) {
         return false;
     }
+
+    // FLUX.2-Klein dual-DiT: optional top-level "model":"base"|"edit". When absent,
+    // model_variant stays empty and the worker renders with whatever DiT is loaded
+    // (no forced swap) — keeps single-model behaviour byte-identical. "edit" is only
+    // honoured when --diffusion-model-edit was provided at startup.
+    if (body.contains("model") && body["model"].is_string()) {
+        std::string variant = body["model"].get<std::string>();
+        if (variant != "base" && variant != "edit") {
+            error_message = "invalid model variant, must be \"base\" or \"edit\"";
+            return false;
+        }
+        if (variant == "edit" && runtime.svr_params->diffusion_model_edit_path.empty()) {
+            error_message = "edit model not available (server started without --diffusion-model-edit)";
+            return false;
+        }
+        request.model_variant = variant;
+    }
+
     // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
     if (!request.gen_params.resolve_and_validate(IMG_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid generation parameters";
@@ -417,6 +458,13 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             if (!runtime_supports_generation_mode(*runtime, IMG_GEN)) {
                 res.status = 400;
                 res.set_content(json({{"error", unsupported_generation_mode_error(IMG_GEN)}}).dump(), "application/json");
+                return;
+            }
+            // Draining: stop accepting new jobs so the external GPU gate can reclaim
+            // the card once in-flight work finishes.
+            if (runtime->model_swap && runtime->model_swap->draining.load()) {
+                res.status = 503;
+                res.set_content(R"({"error":"service draining — not accepting new jobs"})", "application/json");
                 return;
             }
 
@@ -600,4 +648,118 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.status = 200;
         res.set_content(make_async_job_json(manager, job).dump(), "application/json");
     });
+}
+
+// ─── /health + /v1/admin/{drain,unload,load} ─────────────────────────────────
+// Mirrors routes_longcat.cpp's admin surface so the external kob-gpu-gate can
+// drain + reclaim the GPU. drain = stop accepting new jobs, let in-flight finish.
+// unload(force) = cancel the active render (reuse the sdcpp job-cancel path) and
+// free the DiT VRAM. load = clear draining (and reload the DiT on next render).
+
+static int sdcpp_in_flight(ServerRuntime& rt) {
+    AsyncJobManager& manager = *rt.async_job_manager;
+    std::lock_guard<std::mutex> lock(manager.mutex);
+    return manager.generating_job_id.empty() ? 0 : 1;
+}
+
+static void sdcpp_handle_health(ServerRuntime& rt, httplib::Response& res) {
+    ModelSwapState* swap = rt.model_swap;
+    const int in_flight  = sdcpp_in_flight(rt);
+    json h               = {
+        {"status",       "ok"},
+        {"busy",         in_flight > 0},
+        {"draining",     swap ? swap->draining.load() : false},
+        {"loaded",       swap ? swap->loaded.load() : true},
+        {"loaded_model", swap ? swap->loaded_variant : std::string("base")},
+        {"in_flight",    in_flight},
+    };
+    res.set_content(h.dump(), "application/json");
+}
+
+static void sdcpp_handle_drain(ServerRuntime& rt, httplib::Response& res) {
+    if (rt.model_swap) {
+        rt.model_swap->draining.store(true);
+    }
+    const int in_flight = sdcpp_in_flight(rt);
+    res.set_content(json({
+                            {"status",    "draining"},
+                            {"busy",      in_flight > 0},
+                            {"in_flight", in_flight},
+                        }).dump(),
+                    "application/json");
+}
+
+static void sdcpp_handle_unload(ServerRuntime& rt, const httplib::Request& req, httplib::Response& res) {
+    bool force = false;
+    if (!req.body.empty()) {
+        try {
+            json b = json::parse(req.body);
+            force  = b.value("force", false);
+        } catch (...) {}
+    }
+
+    ModelSwapState* swap = rt.model_swap;
+    const bool was_loaded = swap ? swap->loaded.load() : true;
+    const int in_flight   = sdcpp_in_flight(rt);
+
+    if (in_flight > 0 && !force) {
+        res.status = 200;
+        res.set_content(json({{"status", "busy (pass force=true to cancel + unload)"}}).dump(),
+                        "application/json");
+        return;
+    }
+
+    // Cancel the active render cooperatively (same flag the job-cancel route uses).
+    // The worker bails at its next step and releases sd_ctx_mutex.
+    if (in_flight > 0) {
+        sd_request_cancel();
+    }
+    // Acquiring sd_ctx_mutex blocks until any in-flight render has bailed, so the
+    // DiT free below never races a live generate_image.
+    {
+        std::lock_guard<std::mutex> lock(*rt.sd_ctx_mutex);
+        sd_ctx_free_diffusion_model(rt.sd_ctx);
+    }
+    if (swap) {
+        swap->loaded.store(false);  // next render forces a reload of loaded_variant
+    }
+    res.set_content(json({
+                            {"status",   was_loaded ? "unloaded" : "idle"},
+                            {"unloaded", was_loaded},
+                        }).dump(),
+                    "application/json");
+}
+
+static void sdcpp_handle_load(ServerRuntime& rt, httplib::Response& res) {
+    if (rt.model_swap) {
+        rt.model_swap->draining.store(false);
+    }
+    // We do NOT eagerly reload the DiT here — the next img_gen job reloads the
+    // tracked variant via ensure_variant_loaded(). Report current state.
+    res.set_content(json({
+                            {"status", "ok"},
+                            {"loaded", rt.model_swap ? rt.model_swap->loaded.load() : true},
+                        }).dump(),
+                    "application/json");
+}
+
+void register_sdcpp_admin_endpoints(httplib::Server& svr, ServerRuntime& rt) {
+    ServerRuntime* runtime = &rt;
+
+    svr.Get("/health", [runtime](const httplib::Request&, httplib::Response& res) {
+        sdcpp_handle_health(*runtime, res);
+    });
+    svr.Post("/v1/admin/drain", [runtime](const httplib::Request&, httplib::Response& res) {
+        sdcpp_handle_drain(*runtime, res);
+    });
+    svr.Post("/v1/admin/unload", [runtime](const httplib::Request& req, httplib::Response& res) {
+        sdcpp_handle_unload(*runtime, req, res);
+    });
+    svr.Post("/v1/admin/load", [runtime](const httplib::Request&, httplib::Response& res) {
+        sdcpp_handle_load(*runtime, res);
+    });
+    // NOTE: the body-less-POST Content-Length:0 workaround for the admin POSTs is
+    // applied in main.cpp's shared pre-routing handler (httplib allows only one
+    // pre-routing handler, so we must not install another here or we'd clobber the
+    // CORS handler).
 }
