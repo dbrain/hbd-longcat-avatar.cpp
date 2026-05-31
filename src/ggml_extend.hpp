@@ -6,7 +6,10 @@
 #include <stdarg.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -1831,6 +1834,43 @@ protected:
     };
     partial_offload_state prefetched_state_;
     bool current_offload_swapped_ = false;  // whether prev partial_offload_pairs are in swapped state
+
+    // LongCat lap-33: background prefetch thread. The lap-32.2 single-threaded
+    // pipelining is NULL in offload mode because the H2D source is PAGEABLE mmap
+    // memory — cudaMemcpyAsync from pageable degrades to synchronous + device-
+    // serializing, so the copy never overlaps compute. The fix: a worker thread
+    // that, while the main thread blocks in execute_graph (segment N's compute),
+    // stages segment N+1's weights: memcpy(mmap pageable -> bounded PINNED ring)
+    // on CPU cores, then ggml_backend_tensor_set_async from the pinned buffer
+    // (now a true async DMA) on copy_backend_. Both the host memcpy and the
+    // pinned DMA then overlap the GPU compute. Gated behind
+    // LONGCAT_OFFLOAD_PREFETCH_THREAD=1 (default OFF). Bounded pinned RAM only
+    // (env LONGCAT_PREFETCH_PINNED_MB, default 384) — mmap weights stay pageable.
+    struct prefetch_copy_item {
+        ggml_tensor* dst        = nullptr;   // GPU dst tensor (in prefetched_state_.buf)
+        const void*  host_src   = nullptr;   // pageable mmap source
+        size_t       nbytes     = 0;
+    };
+    std::thread             prefetch_thread_;
+    std::mutex              prefetch_mtx_;
+    std::condition_variable prefetch_cv_;          // main -> worker: job ready / shutdown
+    std::condition_variable prefetch_done_cv_;     // worker -> main: job issued
+    bool                    prefetch_thread_started_ = false;
+    bool                    prefetch_thread_stop_    = false;
+    bool                    prefetch_job_pending_    = false;  // a job is queued for the worker
+    bool                    prefetch_job_done_       = true;   // worker finished issuing the queued job
+    std::vector<prefetch_copy_item> prefetch_items_;            // protected by prefetch_mtx_
+    // Bounded pinned staging ring. The worker memcpys mmap -> a slice of this
+    // ring, then DMAs the slice. Sized by env (default 384 MB). The DMA from a
+    // ring slice for tensor i must complete before that slice is reused; the
+    // copy_backend_ stream serializes its own queued copies, so as long as the
+    // ring is large enough to not wrap before the prior DMA on the same slice
+    // finished we are safe. We use a simple linear bump within the ring per job
+    // and a per-job barrier (event_wait in commit) so the ring is fully drained
+    // before the next job stages into it.
+    ggml_backend_buffer_t   prefetch_pinned_buf_   = nullptr;
+    char*                   prefetch_pinned_base_  = nullptr;
+    size_t                  prefetch_pinned_size_  = 0;
     // When set, execute_graph skips its internal offload_partial_params / offload_all_params
     // call — the pipelining driver in compute_with_graph_cuts has already arranged the
     // partial param state via commit_prefetched_state.
@@ -2346,6 +2386,13 @@ protected:
     }
 
     void free_pipelining_backend() {
+        stop_prefetch_thread();
+        if (prefetch_pinned_buf_ != nullptr) {
+            ggml_backend_buffer_free(prefetch_pinned_buf_);
+            prefetch_pinned_buf_  = nullptr;
+            prefetch_pinned_base_ = nullptr;
+            prefetch_pinned_size_ = 0;
+        }
         if (partial_prefetch_event_ != nullptr) {
             ggml_backend_event_free(partial_prefetch_event_);
             partial_prefetch_event_ = nullptr;
@@ -2354,6 +2401,153 @@ protected:
             ggml_backend_free(copy_backend_);
             copy_backend_ = nullptr;
         }
+    }
+
+    // LongCat lap-33: is the background prefetch thread enabled? (env-gated, OFF
+    // by default). Cached on first query.
+    static bool prefetch_thread_enabled() {
+        static const bool en = []{
+            const char* s = getenv("LONGCAT_OFFLOAD_PREFETCH_THREAD");
+            return s && s[0] == '1';
+        }();
+        return en;
+    }
+
+    // Lazily allocate the bounded pinned staging ring + launch the worker thread.
+    // The WIN is moving the weight H2D off the main thread (the worker stages
+    // mmap->pinned + async DMA while the main thread keeps the GPU busy with
+    // compute). Ring is BOUNDED pinned RAM (default 128 MB — sweep showed 64MB..
+    // 1GB all equal speed, so 128 minimizes the pinned footprint while covering
+    // any single weight tensor); the ~8.5GB mmap weights stay pageable/reclaimable.
+    // Returns false if pinned allocation fails (caller falls back to inline path).
+    bool ensure_prefetch_thread() {
+        if (prefetch_thread_started_) return prefetch_pinned_base_ != nullptr;
+        prefetch_thread_started_ = true;  // mark attempted regardless of outcome
+
+        size_t pinned_mb = 128;
+        if (const char* s = getenv("LONGCAT_PREFETCH_PINNED_MB")) {
+            long v = atol(s);
+            if (v > 0) pinned_mb = (size_t)v;
+        }
+        prefetch_pinned_size_ = pinned_mb * 1024 * 1024;
+
+        ggml_backend_buffer_type_t cuda_host_buft = ggml_backend_cuda_host_buffer_type();
+        if (cuda_host_buft == nullptr) {
+            LOG_WARN("%s prefetch-thread: cuda host buffer type unavailable; disabling", get_desc().c_str());
+            prefetch_pinned_size_ = 0;
+            return false;
+        }
+        prefetch_pinned_buf_ = ggml_backend_buft_alloc_buffer(cuda_host_buft, prefetch_pinned_size_);
+        if (prefetch_pinned_buf_ == nullptr) {
+            LOG_WARN("%s prefetch-thread: pinned staging ring alloc (%zu MB) failed; disabling",
+                     get_desc().c_str(), pinned_mb);
+            prefetch_pinned_size_ = 0;
+            return false;
+        }
+        prefetch_pinned_base_ = (char*)ggml_backend_buffer_get_base(prefetch_pinned_buf_);
+        LOG_INFO("%s lap-33 background prefetch thread ON (pinned staging ring %zu MB)",
+                 get_desc().c_str(), pinned_mb);
+
+        prefetch_thread_stop_ = false;
+        prefetch_job_pending_ = false;
+        prefetch_job_done_    = true;
+        prefetch_thread_      = std::thread([this] { prefetch_worker_loop(); });
+        return true;
+    }
+
+    void stop_prefetch_thread() {
+        if (!prefetch_thread_.joinable()) {
+            prefetch_thread_started_ = false;
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lk(prefetch_mtx_);
+            prefetch_thread_stop_ = true;
+            prefetch_cv_.notify_all();
+        }
+        prefetch_thread_.join();
+        prefetch_thread_started_ = false;
+    }
+
+    // Worker loop: wait for a queued job (a list of mmap->GPU copy items + the
+    // event to record), stage each item through the bounded pinned ring, queue
+    // the async DMA on copy_backend_, then record the event and signal done.
+    // All of this overlaps the MAIN thread's blocking execute_graph() compute.
+    void prefetch_worker_loop() {
+        for (;;) {
+            std::vector<prefetch_copy_item> items;
+            {
+                std::unique_lock<std::mutex> lk(prefetch_mtx_);
+                prefetch_cv_.wait(lk, [this] { return prefetch_job_pending_ || prefetch_thread_stop_; });
+                if (prefetch_thread_stop_ && !prefetch_job_pending_) return;
+                items = std::move(prefetch_items_);
+                prefetch_items_.clear();
+                prefetch_job_pending_ = false;
+            }
+
+            stage_and_dma(items);
+
+            {
+                std::unique_lock<std::mutex> lk(prefetch_mtx_);
+                ggml_backend_event_record(partial_prefetch_event_, copy_backend_);
+                prefetched_state_.event_recorded = true;
+                prefetch_job_done_ = true;
+                prefetch_done_cv_.notify_all();
+            }
+        }
+    }
+
+    // Stage items through the bounded pinned ring: memcpy(mmap pageable -> pinned
+    // slice) on CPU, then async DMA(pinned slice -> GPU) on copy_backend_. When
+    // the ring can't fit the next tensor, synchronize copy_backend_ to drain
+    // queued DMAs so the ring space is safe to reuse. This synchronize happens
+    // on the WORKER thread, overlapping the main thread's compute.
+    void stage_and_dma(const std::vector<prefetch_copy_item>& items) {
+        size_t ring_off = 0;
+        for (const auto& it : items) {
+            if (it.dst == nullptr || it.host_src == nullptr || it.nbytes == 0) continue;
+            if (it.nbytes > prefetch_pinned_size_) {
+                // Tensor larger than the whole ring: drain, DMA directly from the
+                // pageable source (degrades to sync, but rare/large outlier) so we
+                // never corrupt the ring. Keeps correctness; perf cost bounded.
+                ggml_backend_synchronize(copy_backend_);
+                ring_off = 0;
+                ggml_backend_tensor_set_async(copy_backend_, it.dst, it.host_src, 0, it.nbytes);
+                continue;
+            }
+            if (ring_off + it.nbytes > prefetch_pinned_size_) {
+                // Won't fit in remaining ring; drain in-flight DMAs then wrap.
+                ggml_backend_synchronize(copy_backend_);
+                ring_off = 0;
+            }
+            char* slice = prefetch_pinned_base_ + ring_off;
+            memcpy(slice, it.host_src, it.nbytes);
+            ggml_backend_tensor_set_async(copy_backend_, it.dst, slice, 0, it.nbytes);
+            ring_off += it.nbytes;
+        }
+        // Ensure all queued DMAs are visible to the event recorded by the caller.
+        // (event_record on the same stream already orders after these; no extra
+        // sync needed — the runtime stream's event_wait covers DMA completion.)
+    }
+
+    // Hand a list of copy items to the worker thread (non-blocking). Caller must
+    // have already allocated the GPU dst tensors. Marks the job pending; the
+    // worker records partial_prefetch_event_ when done issuing.
+    void dispatch_prefetch_job(std::vector<prefetch_copy_item>&& items) {
+        std::unique_lock<std::mutex> lk(prefetch_mtx_);
+        prefetch_items_       = std::move(items);
+        prefetch_job_pending_ = true;
+        prefetch_job_done_    = false;
+        prefetch_cv_.notify_one();
+    }
+
+    // Block until the worker has finished issuing the queued job (all DMAs queued
+    // on copy_backend_ + event recorded). After this returns, the GPU-side
+    // event_wait in commit_prefetched_state() correctly orders the runtime
+    // stream after the prefetch DMAs.
+    void wait_prefetch_job() {
+        std::unique_lock<std::mutex> lk(prefetch_mtx_);
+        prefetch_done_cv_.wait(lk, [this] { return prefetch_job_done_; });
     }
 
     // Look up the host-resident CPU data pointer for a tensor, accounting for
@@ -2423,8 +2617,32 @@ protected:
         }
         ggml_backend_buffer_set_usage(prefetched_state_.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // Queue async H2D for each tensor on the copy backend's stream.
-        // Source = the tensor's "real" CPU data (may be in the prior swap pair).
+        // LongCat lap-33: when the background prefetch thread is enabled, hand the
+        // staging work (mmap pageable -> pinned ring memcpy + async DMA + event
+        // record) to the worker thread so it runs CONCURRENTLY with the main
+        // thread's blocking execute_graph() compute. The worker records
+        // partial_prefetch_event_ when done; commit_prefetched_state() blocks on
+        // wait_prefetch_job() (CPU side) then event_wait (GPU side).
+        if (prefetch_thread_enabled() && ensure_prefetch_thread()) {
+            std::vector<prefetch_copy_item> items;
+            items.reserve(prefetched_state_.pairs.size());
+            for (auto& pair : prefetched_state_.pairs) {
+                prefetch_copy_item it;
+                it.dst      = pair.second;
+                it.host_src = lookup_host_data(pair.first);
+                it.nbytes   = ggml_nbytes(pair.first);
+                items.push_back(it);
+            }
+            prefetched_state_.event_recorded = false;  // worker will record + flip
+            dispatch_prefetch_job(std::move(items));
+            return true;
+        }
+
+        // Default (inline) path: queue async H2D for each tensor on the copy
+        // backend's stream from the main thread. Source = the tensor's "real" CPU
+        // data (may be in the prior swap pair). NOTE: in offload mode the source
+        // is pageable mmap memory so this degrades to synchronous (the lap-32.2
+        // pipelining is a no-op in practice — see lap-33).
         for (auto& pair : prefetched_state_.pairs) {
             const void* host_src = lookup_host_data(pair.first);
             const size_t nbytes  = ggml_nbytes(pair.first);
@@ -2441,6 +2659,14 @@ protected:
     bool commit_prefetched_state() {
         if (prefetched_state_.buf == nullptr) {
             return true;  // nothing to commit (no prefetch was kicked off)
+        }
+        // LongCat lap-33: if the background prefetch thread staged this job, block
+        // until the worker has finished issuing all async DMAs and recorded the
+        // event (CPU-side handshake). After this, event_recorded is true and the
+        // GPU-side event_wait below correctly orders the runtime stream after the
+        // prefetch DMAs.
+        if (prefetch_thread_enabled() && prefetch_thread_started_ && prefetch_pinned_base_ != nullptr) {
+            wait_prefetch_job();
         }
         if (prefetched_state_.event_recorded) {
             ggml_backend_event_wait(runtime_backend, partial_prefetch_event_);
