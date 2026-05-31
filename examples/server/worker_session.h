@@ -26,6 +26,15 @@ struct RenderResult {
     double render_sec       = 0.0;
 };
 
+// Result of a FLUX.2 image render driven through the worker child.
+struct ImageRenderResult {
+    bool ok = false;
+    std::string error;
+    std::string output_format = "png";
+    std::vector<std::string> images;  // base64-encoded image bytes, one per batch
+    double render_sec = 0.0;
+};
+
 class WorkerSession {
 public:
     explicit WorkerSession(const char* argv0, std::vector<std::string> extra_argv = {});
@@ -50,6 +59,12 @@ public:
     RenderResult render(const std::string& gen_json,
                         const std::vector<uint8_t>& image,
                         const std::vector<uint8_t>& audio);
+
+    // Drive a FLUX.2 image render through the worker. `request_json` is the raw
+    // /sdcpp/v1/img_gen body (the init/edit image rides inside as base64). The
+    // child re-parses it and runs the in-process compute. Same io_mutex_ +
+    // current_render_req_id_ machinery as render(), so cancel_in_flight() works.
+    ImageRenderResult render_image(const std::string& request_json);
 
     // Send CANCEL_REQ to the worker for the currently in-flight render.
     // Idempotent: no-op if no render is in flight (current_render_req_id_==0).

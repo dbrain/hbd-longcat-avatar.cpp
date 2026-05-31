@@ -37,6 +37,9 @@ struct AsyncGenerationJob {
     int64_t completed_at  = 0;
     ImgGenJobRequest img_gen;
     VidGenJobRequest vid_gen;
+    // Raw /sdcpp/v1/img_gen body, kept so the worker-isolation path can forward
+    // it verbatim to the CUDA child (which re-parses + renders). Empty in-process.
+    std::string img_gen_request_json;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;

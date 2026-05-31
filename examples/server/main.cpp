@@ -182,6 +182,55 @@ int main(int argc, const char** argv) {
         svr.set_write_timeout(60 * 30, 0);
         svr.set_idle_interval(60, 0);
 
+        // FLUX.2 image-gen isolation: the SAME worker-subprocess shape as the
+        // avatar path, but the parent serves the sdcpp async-job IMAGE API and
+        // routes each render to the CUDA child (which runs the dual-DiT swap +
+        // generate). /v1/admin/unload SIGKILLs the child → true-0 VRAM (drops the
+        // ~500 MiB resident context, not just the DiT weights). Gated on a
+        // dedicated env so the avatar isolation path stays byte-identical.
+        if (env_truthy("SD_IMAGE_ISOLATION")) {
+            LOG_INFO("worker-isolation: FLUX.2 image mode (sdcpp routes, CUDA-free parent)\n");
+
+            std::mutex                 sd_ctx_mutex;  // unused in parent (compute is in the child)
+            std::vector<LoraEntry>     lora_cache;
+            std::mutex                 lora_mutex;
+            std::vector<UpscalerEntry> upscaler_cache;
+            std::mutex                 upscaler_mutex;
+            AsyncJobManager            async_job_manager;
+            ModelSwapState             model_swap;
+            model_swap.base_path      = ctx_params.diffusion_model_path;
+            model_swap.edit_path      = svr_params.diffusion_model_edit_path;
+            model_swap.loaded_variant = "base";
+            model_swap.loaded.store(true);
+            model_swap.draining.store(false);
+
+            ServerRuntime runtime = {
+                nullptr,            &sd_ctx_mutex,    &svr_params,
+                &ctx_params,        &default_gen_params,
+                &lora_cache,        &lora_mutex,      &upscaler_cache,
+                &upscaler_mutex,    &async_job_manager, &model_swap,
+            };
+            runtime.worker = ctx.worker.get();
+
+            std::thread async_worker(async_job_worker, std::ref(runtime));
+
+            register_sdcpp_api_endpoints(svr, runtime);
+            register_sdcpp_admin_endpoints(svr, runtime);
+
+            LOG_INFO("listening on: http://%s:%d (worker-isolation, FLUX.2 image)\n",
+                     svr_params.listen_ip.c_str(), svr_params.listen_port);
+            svr.listen(svr_params.listen_ip, svr_params.listen_port);
+
+            {
+                std::lock_guard<std::mutex> lock(async_job_manager.mutex);
+                async_job_manager.stop = true;
+            }
+            async_job_manager.cv.notify_all();
+            async_worker.join();
+            ctx.worker->shutdown();
+            return 0;
+        }
+
         register_longcat_endpoints(svr, ctx);
 
         LOG_INFO("listening on: http://%s:%d (worker-isolation, lazy worker spawn)\n",

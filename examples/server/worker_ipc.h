@@ -35,6 +35,13 @@ enum class WorkerFrame : uint32_t {
     LOAD_RESP   = 0x11,  // W->P  {"ok": bool, "error": str}
     RENDER_REQ  = 0x20,  // P->W  packed render payload (json+image+audio)
     RENDER_RESP = 0x21,  // W->P  packed render response (json+video)
+    // FLUX.2 image gen (worker-isolated flux2-server). Payload is the RAW
+    // /sdcpp/v1/img_gen request JSON (the edit/init image rides inside it as
+    // base64, so no separate blob). The child re-parses it and runs the same
+    // parse_img_gen_request + ensure_variant_loaded + execute_img_gen_job as
+    // the in-process path. RESP payload is {ok,error,output_format,images:[b64]}.
+    IMG_GEN_REQ  = 0x22,  // P->W  raw img_gen request JSON
+    IMG_GEN_RESP = 0x23,  // W->P  {ok,error,output_format,images:[b64,...]}
     // CANCEL_REQ: parent asks the worker to abort the in-flight render. Empty
     // payload; hdr.req_id = the target render's req_id. The worker's reader thread
     // matches req_id against the active render and flips the cooperative cancel flag

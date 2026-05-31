@@ -8,6 +8,7 @@
 #include "common/log.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+#include "worker_session.h"
 
 const char* async_job_kind_name(AsyncJobKind kind) {
     switch (kind) {
@@ -364,12 +365,34 @@ void async_job_worker(ServerRuntime& runtime) {
         bool ok = false;
 
         if (job->kind == AsyncJobKind::ImgGen) {
-            // FLUX.2-Klein dual-DiT: ensure the requested variant (or the tracked
-            // one, after an admin unload) is resident before rendering. The swap is
-            // serial on this worker thread, so it never races a live render.
-            if (ensure_variant_loaded(runtime, job->img_gen.model_variant, error_message)) {
+            if (runtime.worker) {
+                // Worker isolation: render in the CUDA-owning child over IPC. The
+                // child re-parses the raw request and runs the SAME
+                // parse_img_gen_request + ensure_variant_loaded + execute_img_gen_job.
+                longcat_avatar::ImageRenderResult r = runtime.worker->render_image(job->img_gen_request_json);
+                ok            = r.ok;
+                error_message = r.error;
+                if (ok) {
+                    output_images = std::move(r.images);
+                    // Keep the parent's model_swap roughly in sync for
+                    // /capabilities + /health (the child owns the real swap state).
+                    if (runtime.model_swap) {
+                        runtime.model_swap->loaded.store(true);
+                        if (!job->img_gen.model_variant.empty()) {
+                            runtime.model_swap->loaded_variant = job->img_gen.model_variant;
+                        }
+                    }
+                }
+            } else if (ensure_variant_loaded(runtime, job->img_gen.model_variant, error_message)) {
+                // FLUX.2-Klein dual-DiT: ensure the requested variant (or the tracked
+                // one, after an admin unload) is resident before rendering. The swap is
+                // serial on this worker thread, so it never races a live render.
                 ok = execute_img_gen_job(runtime, *job, output_images, error_message);
             }
+        } else if (job->kind == AsyncJobKind::VidGen && runtime.worker) {
+            // Image-isolation parent has no sd_ctx; video gen is the avatar
+            // server's job, not flux2's. koblem never sends vid_gen here.
+            error_message = "vid_gen not supported under flux2 image isolation";
         } else if (job->kind == AsyncJobKind::VidGen) {
             ok = execute_vid_gen_job(runtime,
                                      *job,

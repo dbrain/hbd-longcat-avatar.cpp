@@ -167,6 +167,12 @@ std::string video_mime_type(const std::string& output_format) {
 }
 
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode) {
+    // Worker-isolation parent: sd_ctx lives in the child, so we can't query it
+    // here. The flux2 image child supports IMG_GEN (not VID_GEN); report that
+    // statically rather than dereferencing the null parent sd_ctx.
+    if (runtime.worker != nullptr) {
+        return mode == IMG_GEN;
+    }
     if (mode == VID_GEN) {
         return sd_ctx_supports_video_generation(runtime.sd_ctx);
     }

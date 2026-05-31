@@ -17,6 +17,7 @@ using json = nlohmann::json;
 struct ArgOptions;
 struct SDContextParams;
 struct AsyncJobManager;
+namespace longcat_avatar { class WorkerSession; }
 
 struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
@@ -75,6 +76,11 @@ struct ServerRuntime {
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
     ModelSwapState* model_swap;
+    // Worker-isolation (flux2 image mode): when non-null, the GPU compute runs in
+    // a forked CUDA-owning child and `sd_ctx` is null in this (parent) runtime.
+    // The async worker routes img_gen jobs through worker->render_image(), and
+    // /v1/admin/unload SIGKILLs the child. Null = legacy in-process (sd_ctx set).
+    longcat_avatar::WorkerSession* worker = nullptr;
 };
 
 struct ImgGenJobRequest {

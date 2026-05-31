@@ -28,6 +28,8 @@
 #include "common/avatar_render.h"
 #include "stable-diffusion.h"
 #include "runtime.h"
+#include "routes.h"
+#include "async_jobs.h"
 #include "worker_ipc.h"
 
 namespace fs = std::filesystem;
@@ -199,6 +201,59 @@ RenderResult WorkerSession::render(const std::string& gen_json,
     return result;
 }
 
+ImageRenderResult WorkerSession::render_image(const std::string& request_json) {
+    ImageRenderResult result;
+    if (!ensure_loaded()) {
+        result.error = last_error_;
+        return result;
+    }
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    uint32_t req_id = next_req_id_.fetch_add(1);
+
+    {
+        std::lock_guard<std::mutex> slk(send_mutex_);
+        auto err = send_frame(fd_, WorkerFrame::IMG_GEN_REQ, req_id, request_json);
+        if (err != IpcError::OK) {
+            result.error = std::string("IMG_GEN_REQ send failed: ") + ipc_error_str(err);
+            kill_worker_locked();
+            last_error_ = result.error;
+            return result;
+        }
+    }
+    // Publish AFTER the send so a cancel racing in early is a harmless no-op.
+    current_render_req_id_.store(req_id, std::memory_order_release);
+    struct CurrentRenderGuard {
+        std::atomic<uint32_t>& cur;
+        ~CurrentRenderGuard() { cur.store(0, std::memory_order_release); }
+    } current_render_guard{current_render_req_id_};
+
+    FrameHeader hdr{};
+    std::vector<uint8_t> resp_payload;
+    auto err = recv_frame(fd_, &hdr, &resp_payload);
+    if (err != IpcError::OK || hdr.type != (uint32_t)WorkerFrame::IMG_GEN_RESP) {
+        result.error = std::string("IMG_GEN_RESP recv failed: ") + ipc_error_str(err);
+        kill_worker_locked();
+        last_error_ = result.error;
+        return result;
+    }
+    try {
+        json m = json::parse(std::string(resp_payload.begin(), resp_payload.end()));
+        result.ok            = m.value("ok", false);
+        result.error         = m.value("error", "");
+        result.output_format = m.value("output_format", std::string("png"));
+        result.render_sec    = m.value("render_sec", 0.0);
+        if (m.contains("images") && m["images"].is_array()) {
+            for (const auto& im : m["images"]) {
+                if (im.is_string()) result.images.push_back(im.get<std::string>());
+            }
+        }
+    } catch (const std::exception& e) {
+        result.ok = false;
+        result.error = std::string("IMG_GEN_RESP meta parse: ") + e.what();
+    }
+    return result;
+}
+
 // ─── child-side dispatch loop ────────────────────────────────────────────────
 
 // Forward decl from main.cpp — the child re-parses CLI args the same way the
@@ -275,6 +330,27 @@ int run_worker_loop(int fd, int argc, const char** argv) {
     fs::path tmp_dir = fs::temp_directory_path() / "longcat-avatar-worker";
     std::error_code ec;
     fs::create_directories(tmp_dir, ec);
+
+    // FLUX.2 image-isolation mode reuses the in-process compute (parse_img_gen_request
+    // + ensure_variant_loaded + execute_img_gen_job) via a child-local ServerRuntime.
+    // Built unconditionally — it's cheap, and the avatar path simply never sends
+    // IMG_GEN_REQ. The DiT swap state lives HERE (the real sd_ctx is in this child).
+    std::vector<LoraEntry>     lora_cache;
+    std::mutex                 lora_mutex;
+    std::vector<UpscalerEntry> upscaler_cache;
+    std::mutex                 upscaler_mutex;
+    ModelSwapState             model_swap;
+    model_swap.base_path      = ctx_params.diffusion_model_path;
+    model_swap.edit_path      = svr_params.diffusion_model_edit_path;
+    model_swap.loaded_variant = "base";
+    model_swap.loaded.store(true);
+    model_swap.draining.store(false);
+    ServerRuntime child_runtime = {
+        sd_ctx.get(),       &sd_ctx_mutex,    &svr_params,
+        &ctx_params,        &default_gen_params,
+        &lora_cache,        &lora_mutex,      &upscaler_cache,
+        &upscaler_mutex,    nullptr /*async_job_manager*/, &model_swap,
+    };
 
     fprintf(stderr, "worker: ready (pid=%d)\n", (int)getpid());
 
@@ -452,6 +528,57 @@ int run_worker_loop(int fd, int argc, const char** argv) {
                 auto serr = send_frame(fd, WorkerFrame::RENDER_RESP, hdr.req_id, resp);
                 if (serr != IpcError::OK) {
                     fprintf(stderr, "worker: RENDER_RESP send failed: %s\n",
+                            ipc_error_str(serr));
+                    return 1;
+                }
+                break;
+            }
+            case WorkerFrame::IMG_GEN_REQ: {
+                // FLUX.2 image render. Payload is the raw /sdcpp/v1/img_gen body;
+                // re-parse + render with the same code the in-process server runs.
+                std::string request_json(payload.begin(), payload.end());
+                bool ok = false;
+                std::string err_msg;
+                std::string out_fmt = "png";
+                std::vector<std::string> images;
+                auto t0 = std::chrono::steady_clock::now();
+                // Cancel coordination — mirrors RENDER_REQ so /sdcpp job-cancel and
+                // force /v1/admin/unload reach this render via the reader thread.
+                sd_clear_cancel();
+                ctrl.active_render_req_id.store(hdr.req_id, std::memory_order_release);
+                struct ImgActiveGuard {
+                    std::atomic<uint32_t>& active;
+                    ~ImgActiveGuard() { active.store(0, std::memory_order_release); }
+                } img_active_guard{ctrl.active_render_req_id};
+                try {
+                    json body = json::parse(request_json);
+                    ImgGenJobRequest request;
+                    if (!parse_img_gen_request(body, child_runtime, request, err_msg)) {
+                        // err_msg already set by the parser.
+                    } else {
+                        out_fmt = request.output_format;
+                        AsyncGenerationJob ijob;
+                        ijob.kind    = AsyncJobKind::ImgGen;
+                        ijob.img_gen = std::move(request);
+                        if (ensure_variant_loaded(child_runtime, ijob.img_gen.model_variant, err_msg)) {
+                            ok = execute_img_gen_job(child_runtime, ijob, images, err_msg);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    err_msg = std::string("img_gen worker exception: ") + e.what();
+                }
+                double render_sec = std::chrono::duration<double>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                json meta = {
+                    {"ok", ok},
+                    {"error", err_msg},
+                    {"output_format", out_fmt},
+                    {"render_sec", render_sec},
+                    {"images", images},
+                };
+                auto serr = send_frame(fd, WorkerFrame::IMG_GEN_RESP, hdr.req_id, meta.dump());
+                if (serr != IpcError::OK) {
+                    fprintf(stderr, "worker: IMG_GEN_RESP send failed: %s\n",
                             ipc_error_str(serr));
                     return 1;
                 }

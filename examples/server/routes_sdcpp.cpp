@@ -6,6 +6,7 @@
 
 #include "async_jobs.h"
 #include "common/common.h"
+#include "worker_session.h"
 
 namespace fs = std::filesystem;
 
@@ -368,10 +369,10 @@ static json make_capabilities_json(ServerRuntime& runtime) {
     return result;
 }
 
-static bool parse_img_gen_request(const json& body,
-                                  ServerRuntime& runtime,
-                                  ImgGenJobRequest& request,
-                                  std::string& error_message) {
+bool parse_img_gen_request(const json& body,
+                           ServerRuntime& runtime,
+                           ImgGenJobRequest& request,
+                           std::string& error_message) {
     request.gen_params = *runtime.default_gen_params;
 
     refresh_lora_cache(runtime);
@@ -483,6 +484,11 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->status                             = AsyncJobStatus::Queued;
             job->created_at                         = unix_timestamp_now();
             job->img_gen                            = std::move(request);
+            // Worker-isolation: forward the raw body to the CUDA child verbatim
+            // (it re-parses + renders). Harmless/unused on the in-process path.
+            if (runtime->worker) {
+                job->img_gen_request_json = req.body;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(manager.mutex);
@@ -634,8 +640,15 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         if (job.status == AsyncJobStatus::Generating) {
             if (manager.generating_job_id == job.id) {
                 // Cooperative in-flight cancel: flag the render loop, which bails at
-                // its next step and the worker flips this job to "cancelled".
-                sd_request_cancel();
+                // its next step and the worker flips this job to "cancelled". Under
+                // worker isolation the render runs in the child, so route the cancel
+                // there (it trips sd_request_cancel inside the child); otherwise flag
+                // the in-process render directly.
+                if (runtime->worker) {
+                    runtime->worker->cancel_in_flight();
+                } else {
+                    sd_request_cancel();
+                }
                 res.status = 202;
                 res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             } else {
@@ -709,8 +722,30 @@ static void sdcpp_handle_unload(ServerRuntime& rt, const httplib::Request& req, 
         return;
     }
 
-    // Cancel the active render cooperatively (same flag the job-cancel route uses).
-    // The worker bails at its next step and releases sd_ctx_mutex.
+    if (rt.worker) {
+        // Worker isolation: SIGKILL the CUDA child → ALL VRAM reclaimed (primary
+        // context + cuBLAS workspace + cubin cache) — true-0, not just the DiT
+        // weights. Cancel the in-flight render first so the child bails and
+        // releases the render's io_mutex_ before shutdown() takes it; the blocked
+        // render_image() then unblocks and the job is marked failed. The next
+        // img_gen re-forks the child cold.
+        if (in_flight > 0) {
+            rt.worker->cancel_in_flight();
+        }
+        rt.worker->shutdown();
+        if (swap) {
+            swap->loaded.store(false);
+        }
+        res.set_content(json({
+                                {"status",   was_loaded ? "unloaded" : "idle"},
+                                {"unloaded", was_loaded},
+                            }).dump(),
+                        "application/json");
+        return;
+    }
+
+    // In-process: cancel the active render cooperatively (same flag the job-cancel
+    // route uses). The worker bails at its next step and releases sd_ctx_mutex.
     if (in_flight > 0) {
         sd_request_cancel();
     }
