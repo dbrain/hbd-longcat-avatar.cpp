@@ -1835,17 +1835,19 @@ protected:
     partial_offload_state prefetched_state_;
     bool current_offload_swapped_ = false;  // whether prev partial_offload_pairs are in swapped state
 
-    // LongCat lap-33: background prefetch thread. The lap-32.2 single-threaded
+    // LongCat lap-33/34: background prefetch thread. The lap-32.2 single-threaded
     // pipelining is NULL in offload mode because the H2D source is PAGEABLE mmap
     // memory — cudaMemcpyAsync from pageable degrades to synchronous + device-
-    // serializing, so the copy never overlaps compute. The fix: a worker thread
-    // that, while the main thread blocks in execute_graph (segment N's compute),
-    // stages segment N+1's weights: memcpy(mmap pageable -> bounded PINNED ring)
-    // on CPU cores, then ggml_backend_tensor_set_async from the pinned buffer
-    // (now a true async DMA) on copy_backend_. Both the host memcpy and the
-    // pinned DMA then overlap the GPU compute. Gated behind
-    // LONGCAT_OFFLOAD_PREFETCH_THREAD=1 (default OFF). Bounded pinned RAM only
-    // (env LONGCAT_PREFETCH_PINNED_MB, default 384) — mmap weights stay pageable.
+    // serializing, so the copy never overlaps compute when issued on the main
+    // thread. The fix: a worker thread that, while the main thread blocks in
+    // execute_graph (segment N's compute), DMAs segment N+1's weights directly
+    // from the pageable mmap source on copy_backend_. A pageable cudaMemcpyAsync
+    // blocks ITS CALLING THREAD (the worker), not the GPU compute stream, so on
+    // the worker it overlaps the main thread's compute — that thread move IS the
+    // whole win. (lap-34 removed the pinned staging ring: a 1MB ring forced the
+    // direct-pageable fallback and matched the 128MB ring exactly, proving the
+    // ring bought nothing. ZERO pinned RAM now; mmap weights stay pageable.)
+    // Gated behind LONGCAT_OFFLOAD_PREFETCH_THREAD=1 (default OFF).
     struct prefetch_copy_item {
         ggml_tensor* dst        = nullptr;   // GPU dst tensor (in prefetched_state_.buf)
         const void*  host_src   = nullptr;   // pageable mmap source
@@ -1860,17 +1862,21 @@ protected:
     bool                    prefetch_job_pending_    = false;  // a job is queued for the worker
     bool                    prefetch_job_done_       = true;   // worker finished issuing the queued job
     std::vector<prefetch_copy_item> prefetch_items_;            // protected by prefetch_mtx_
-    // Bounded pinned staging ring. The worker memcpys mmap -> a slice of this
-    // ring, then DMAs the slice. Sized by env (default 384 MB). The DMA from a
-    // ring slice for tensor i must complete before that slice is reused; the
-    // copy_backend_ stream serializes its own queued copies, so as long as the
-    // ring is large enough to not wrap before the prior DMA on the same slice
-    // finished we are safe. We use a simple linear bump within the ring per job
-    // and a per-job barrier (event_wait in commit) so the ring is fully drained
-    // before the next job stages into it.
-    ggml_backend_buffer_t   prefetch_pinned_buf_   = nullptr;
-    char*                   prefetch_pinned_base_  = nullptr;
-    size_t                  prefetch_pinned_size_  = 0;
+
+    // LongCat lap-34 Task 2: GPU weight-buffer pool. After lap-34 killed the
+    // pinned ring, the residual offload tax is the per-segment GPU buffer churn:
+    // kick_off_prefetch did a fresh cudaMalloc (via alloc_ctx_tensors) for the
+    // next segment's weights and restore/commit did a cudaFree of the prior one.
+    // cudaMalloc/cudaFree are SYNCHRONOUS + device-draining and ran on the MAIN
+    // thread (the alloc must precede the worker DMA so it can't overlap) = ~520ms/
+    // step. The segments repeat with the SAME sizes every sampling step, so we
+    // pool freed buffers keyed by byte-size and reuse them round-robin: steady
+    // state does ZERO cudaMalloc/cudaFree. Only active when the prefetch thread is
+    // enabled (the inline/OFF path keeps its original malloc/free, bit-exact).
+    // Tensors are re-placed into a pooled buffer with ggml_tallocr (offset reset
+    // to 0); identical shapes/order each step => identical layout. Torn down in
+    // free_pipelining_backend() via free_prefetch_buffer_pool().
+    std::vector<ggml_backend_buffer_t> prefetch_buf_pool_;
     // When set, execute_graph skips its internal offload_partial_params / offload_all_params
     // call — the pipelining driver in compute_with_graph_cuts has already arranged the
     // partial param state via commit_prefetched_state.
@@ -2387,12 +2393,7 @@ protected:
 
     void free_pipelining_backend() {
         stop_prefetch_thread();
-        if (prefetch_pinned_buf_ != nullptr) {
-            ggml_backend_buffer_free(prefetch_pinned_buf_);
-            prefetch_pinned_buf_  = nullptr;
-            prefetch_pinned_base_ = nullptr;
-            prefetch_pinned_size_ = 0;
-        }
+        free_prefetch_buffer_pool();
         if (partial_prefetch_event_ != nullptr) {
             ggml_backend_event_free(partial_prefetch_event_);
             partial_prefetch_event_ = nullptr;
@@ -2413,46 +2414,118 @@ protected:
         return en;
     }
 
-    // Lazily allocate the bounded pinned staging ring + launch the worker thread.
-    // The WIN is moving the weight H2D off the main thread (the worker stages
-    // mmap->pinned + async DMA while the main thread keeps the GPU busy with
-    // compute). Ring is BOUNDED pinned RAM (default 128 MB — sweep showed 64MB..
-    // 1GB all equal speed, so 128 minimizes the pinned footprint while covering
-    // any single weight tensor); the ~8.5GB mmap weights stay pageable/reclaimable.
-    // Returns false if pinned allocation fails (caller falls back to inline path).
+    // Lazily launch the worker thread. The WIN is moving the weight H2D off the
+    // main thread: the worker DMAs the next segment's weights DIRECTLY from the
+    // pageable mmap source while the main thread keeps the GPU busy with compute.
+    // A pageable cudaMemcpyAsync blocks its calling thread (the worker), not the
+    // GPU compute stream, so on the worker it overlaps. ZERO pinned RAM (lap-34);
+    // the ~8.5GB mmap weights stay pageable/reclaimable. Always succeeds once the
+    // copy backend is up.
     bool ensure_prefetch_thread() {
-        if (prefetch_thread_started_) return prefetch_pinned_base_ != nullptr;
+        if (prefetch_thread_started_) return prefetch_thread_.joinable();
         prefetch_thread_started_ = true;  // mark attempted regardless of outcome
 
-        size_t pinned_mb = 128;
-        if (const char* s = getenv("LONGCAT_PREFETCH_PINNED_MB")) {
-            long v = atol(s);
-            if (v > 0) pinned_mb = (size_t)v;
-        }
-        prefetch_pinned_size_ = pinned_mb * 1024 * 1024;
-
-        ggml_backend_buffer_type_t cuda_host_buft = ggml_backend_cuda_host_buffer_type();
-        if (cuda_host_buft == nullptr) {
-            LOG_WARN("%s prefetch-thread: cuda host buffer type unavailable; disabling", get_desc().c_str());
-            prefetch_pinned_size_ = 0;
-            return false;
-        }
-        prefetch_pinned_buf_ = ggml_backend_buft_alloc_buffer(cuda_host_buft, prefetch_pinned_size_);
-        if (prefetch_pinned_buf_ == nullptr) {
-            LOG_WARN("%s prefetch-thread: pinned staging ring alloc (%zu MB) failed; disabling",
-                     get_desc().c_str(), pinned_mb);
-            prefetch_pinned_size_ = 0;
-            return false;
-        }
-        prefetch_pinned_base_ = (char*)ggml_backend_buffer_get_base(prefetch_pinned_buf_);
-        LOG_INFO("%s lap-33 background prefetch thread ON (pinned staging ring %zu MB)",
-                 get_desc().c_str(), pinned_mb);
+        LOG_INFO("%s lap-34 background prefetch thread ON (direct pageable DMA, 0 pinned RAM)",
+                 get_desc().c_str());
 
         prefetch_thread_stop_ = false;
         prefetch_job_pending_ = false;
         prefetch_job_done_    = true;
         prefetch_thread_      = std::thread([this] { prefetch_worker_loop(); });
         return true;
+    }
+
+    // lap-34 Task 2: allocate the tensors in `ctx` into a runtime-backend buffer,
+    // reusing a pooled buffer of the right size if one is available (no cudaMalloc
+    // in steady state). Returns the buffer (caller owns it until returning it to
+    // the pool via pool_return_partial_buffer). Falls back to a fresh
+    // alloc_ctx_tensors if pooling is off or the pool is empty for that size.
+    // The double-buffered pipeline keeps at most 2 partial-param buffers live at
+    // once (segment N's committed buffer + segment N+1's prefetched buffer). To
+    // do ZERO cudaMalloc/cudaFree in steady state while NOT keeping every distinct
+    // segment size resident (that would re-resident the whole DiT and OOM the
+    // compute buffer), we reuse the SMALLEST pooled buffer that is >= the needed
+    // size — one buffer big enough for the largest segment then serves the small
+    // ones too — and cap the pool so it never holds more than the working set.
+    static constexpr size_t kPrefetchPoolCap = 2;
+
+    static bool prefetch_pool_enabled() {
+        static const bool en = []{
+            if (!prefetch_thread_enabled()) return false;
+            const char* s = getenv("LONGCAT_NO_PREFETCH_POOL");
+            return !(s && s[0] == '1');  // pool ON by default when prefetch thread on
+        }();
+        return en;
+    }
+
+    ggml_backend_buffer_t pool_alloc_ctx_tensors(ggml_context* ctx) {
+        if (!prefetch_pool_enabled()) {
+            return ggml_backend_alloc_ctx_tensors(ctx, runtime_backend);
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(runtime_backend);
+        const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+        if (needed == 0) {
+            // Nothing to allocate (all tensors zero-sized/pre-allocated).
+            return ggml_backend_alloc_ctx_tensors(ctx, runtime_backend);
+        }
+        // Best-fit: smallest pooled buffer with size >= needed.
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < prefetch_buf_pool_.size(); ++i) {
+            const size_t sz = ggml_backend_buffer_get_size(prefetch_buf_pool_[i]);
+            if (sz >= needed && (best == SIZE_MAX ||
+                sz < ggml_backend_buffer_get_size(prefetch_buf_pool_[best]))) {
+                best = i;
+            }
+        }
+        if (best != SIZE_MAX) {
+            ggml_backend_buffer_t buf = prefetch_buf_pool_[best];
+            prefetch_buf_pool_.erase(prefetch_buf_pool_.begin() + best);
+            ggml_tallocr talloc = ggml_tallocr_new(buf);
+            for (ggml_tensor* t = ggml_get_first_tensor(ctx); t != nullptr;
+                 t = ggml_get_next_tensor(ctx, t)) {
+                if (t->data != nullptr || t->view_src != nullptr) continue;
+                if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+                    // Shouldn't happen (size >= needed); fall back cleanly.
+                    ggml_backend_buffer_free(buf);
+                    return ggml_backend_alloc_ctx_tensors(ctx, runtime_backend);
+                }
+            }
+            return buf;
+        }
+        return ggml_backend_alloc_ctx_tensors(ctx, runtime_backend);
+    }
+
+    // lap-34 Task 2: return a partial-param buffer to the pool for reuse instead
+    // of cudaFree'ing it. When pooling is off, just free it (original behaviour).
+    // Keep the pool bounded to the working set: if over cap, evict (free) the
+    // SMALLEST buffer (least likely to satisfy a future best-fit alloc) so the
+    // pool converges on the few largest sizes the pipeline actually reuses, and
+    // never re-residents the full DiT.
+    void pool_return_partial_buffer(ggml_backend_buffer_t buf) {
+        if (buf == nullptr) return;
+        if (!prefetch_pool_enabled()) {
+            ggml_backend_buffer_free(buf);
+            return;
+        }
+        prefetch_buf_pool_.push_back(buf);
+        while (prefetch_buf_pool_.size() > kPrefetchPoolCap) {
+            size_t smallest = 0;
+            for (size_t i = 1; i < prefetch_buf_pool_.size(); ++i) {
+                if (ggml_backend_buffer_get_size(prefetch_buf_pool_[i]) <
+                    ggml_backend_buffer_get_size(prefetch_buf_pool_[smallest])) {
+                    smallest = i;
+                }
+            }
+            ggml_backend_buffer_free(prefetch_buf_pool_[smallest]);
+            prefetch_buf_pool_.erase(prefetch_buf_pool_.begin() + smallest);
+        }
+    }
+
+    void free_prefetch_buffer_pool() {
+        for (ggml_backend_buffer_t buf : prefetch_buf_pool_) {
+            if (buf != nullptr) ggml_backend_buffer_free(buf);
+        }
+        prefetch_buf_pool_.clear();
     }
 
     void stop_prefetch_thread() {
@@ -2497,37 +2570,25 @@ protected:
         }
     }
 
-    // Stage items through the bounded pinned ring: memcpy(mmap pageable -> pinned
-    // slice) on CPU, then async DMA(pinned slice -> GPU) on copy_backend_. When
-    // the ring can't fit the next tensor, synchronize copy_backend_ to drain
-    // queued DMAs so the ring space is safe to reuse. This synchronize happens
-    // on the WORKER thread, overlapping the main thread's compute.
+    // DMA each item DIRECTLY from its pageable mmap source on copy_backend_, on
+    // the WORKER thread (overlapping the main thread's compute). ZERO pinned RAM.
+    //
+    // The synchronize BEFORE each set_async is load-bearing, not a perf knob: a
+    // pageable cudaMemcpyAsync is internally split into chunks staged through a
+    // small driver-owned pinned bounce buffer, and the call only returns once the
+    // whole transfer has been pushed through that finite buffer. Queuing many of
+    // these back-to-back WITHOUT draining lets the driver's bounce staging and
+    // the copy_backend_ stream get into an inconsistent state (a naive no-sync
+    // version crashed the container mid-render). Draining per item — exactly what
+    // the old ring's fallback path did and which benched identical to the ring —
+    // keeps the driver's bounce buffer empty before the next pageable copy starts.
+    // It all runs on the worker, so the main thread's GPU compute still overlaps.
     void stage_and_dma(const std::vector<prefetch_copy_item>& items) {
-        size_t ring_off = 0;
         for (const auto& it : items) {
             if (it.dst == nullptr || it.host_src == nullptr || it.nbytes == 0) continue;
-            if (it.nbytes > prefetch_pinned_size_) {
-                // Tensor larger than the whole ring: drain, DMA directly from the
-                // pageable source (degrades to sync, but rare/large outlier) so we
-                // never corrupt the ring. Keeps correctness; perf cost bounded.
-                ggml_backend_synchronize(copy_backend_);
-                ring_off = 0;
-                ggml_backend_tensor_set_async(copy_backend_, it.dst, it.host_src, 0, it.nbytes);
-                continue;
-            }
-            if (ring_off + it.nbytes > prefetch_pinned_size_) {
-                // Won't fit in remaining ring; drain in-flight DMAs then wrap.
-                ggml_backend_synchronize(copy_backend_);
-                ring_off = 0;
-            }
-            char* slice = prefetch_pinned_base_ + ring_off;
-            memcpy(slice, it.host_src, it.nbytes);
-            ggml_backend_tensor_set_async(copy_backend_, it.dst, slice, 0, it.nbytes);
-            ring_off += it.nbytes;
+            ggml_backend_synchronize(copy_backend_);
+            ggml_backend_tensor_set_async(copy_backend_, it.dst, it.host_src, 0, it.nbytes);
         }
-        // Ensure all queued DMAs are visible to the event recorded by the caller.
-        // (event_record on the same stream already orders after these; no extra
-        // sync needed — the runtime stream's event_wait covers DMA completion.)
     }
 
     // Hand a list of copy items to the worker thread (non-blocking). Caller must
@@ -2574,7 +2635,7 @@ protected:
         // Clean up any prior prefetched state that wasn't consumed (shouldn't
         // happen with well-formed compute_with_graph_cuts driving, but be safe).
         if (prefetched_state_.buf != nullptr) {
-            ggml_backend_buffer_free(prefetched_state_.buf);
+            pool_return_partial_buffer(prefetched_state_.buf);
             prefetched_state_.buf = nullptr;
         }
         if (prefetched_state_.ctx != nullptr) {
@@ -2608,7 +2669,7 @@ protected:
             ggml_set_name(offload_tensor, tensor->name);
             prefetched_state_.pairs.push_back({tensor, offload_tensor});
         }
-        prefetched_state_.buf = ggml_backend_alloc_ctx_tensors(prefetched_state_.ctx, runtime_backend);
+        prefetched_state_.buf = pool_alloc_ctx_tensors(prefetched_state_.ctx);
         if (prefetched_state_.buf == nullptr) {
             ggml_free(prefetched_state_.ctx);
             prefetched_state_.ctx = nullptr;
@@ -2665,7 +2726,7 @@ protected:
         // event (CPU-side handshake). After this, event_recorded is true and the
         // GPU-side event_wait below correctly orders the runtime stream after the
         // prefetch DMAs.
-        if (prefetch_thread_enabled() && prefetch_thread_started_ && prefetch_pinned_base_ != nullptr) {
+        if (prefetch_thread_enabled() && prefetch_thread_started_ && prefetch_thread_.joinable()) {
             wait_prefetch_job();
         }
         if (prefetched_state_.event_recorded) {
@@ -2687,7 +2748,7 @@ protected:
         // Transfer ownership: this prefetched state becomes the current state.
         partial_offload_pairs        = std::move(prefetched_state_.pairs);
         if (partial_runtime_params_buffer != nullptr) {
-            ggml_backend_buffer_free(partial_runtime_params_buffer);
+            pool_return_partial_buffer(partial_runtime_params_buffer);
         }
         if (partial_offload_ctx != nullptr) {
             ggml_free(partial_offload_ctx);
@@ -2746,7 +2807,7 @@ protected:
             partial_offload_pairs.push_back({tensor, offload_tensor});
         }
 
-        partial_runtime_params_buffer = ggml_backend_alloc_ctx_tensors(partial_offload_ctx, runtime_backend);
+        partial_runtime_params_buffer = pool_alloc_ctx_tensors(partial_offload_ctx);
         if (partial_runtime_params_buffer == nullptr) {
             LOG_ERROR("%s alloc partial runtime params backend buffer failed, num_tensors = %zu",
                       get_desc().c_str(),
@@ -2809,7 +2870,7 @@ protected:
     void restore_partial_params() {
         if (partial_offload_pairs.empty()) {
             if (partial_runtime_params_buffer != nullptr) {
-                ggml_backend_buffer_free(partial_runtime_params_buffer);
+                pool_return_partial_buffer(partial_runtime_params_buffer);
                 partial_runtime_params_buffer = nullptr;
             }
             if (partial_offload_ctx != nullptr) {
@@ -2833,7 +2894,7 @@ protected:
         }
 
         if (partial_runtime_params_buffer != nullptr) {
-            ggml_backend_buffer_free(partial_runtime_params_buffer);
+            pool_return_partial_buffer(partial_runtime_params_buffer);
             partial_runtime_params_buffer = nullptr;
         }
         partial_offload_pairs.clear();
