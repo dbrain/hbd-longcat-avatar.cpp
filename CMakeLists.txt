@@ -196,6 +196,33 @@ if(SD_WEBM)
                 INTERFACE_INCLUDE_DIRECTORIES "${WEBM_INCLUDE_DIR}")
         endif()
     endif()
+
+    # Opus audio for WebM. Browsers only decode Vorbis/Opus in a WebM container,
+    # so a raw-PCM track plays silent — encode Opus when libopus is available.
+    set(SD_OPUS_FOUND FALSE)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(Opus IMPORTED_TARGET GLOBAL opus)
+    endif()
+    if(Opus_FOUND)
+        add_library(opus ALIAS PkgConfig::Opus)
+        set(SD_OPUS_FOUND TRUE)
+    else()
+        find_path(OPUS_INCLUDE_DIR NAMES opus/opus.h)
+        find_library(OPUS_LIBRARY NAMES opus)
+        if(OPUS_INCLUDE_DIR AND OPUS_LIBRARY)
+            add_library(opus UNKNOWN IMPORTED GLOBAL)
+            set_target_properties(opus PROPERTIES
+                IMPORTED_LOCATION "${OPUS_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${OPUS_INCLUDE_DIR}")
+            set(SD_OPUS_FOUND TRUE)
+        endif()
+    endif()
+    if(SD_OPUS_FOUND)
+        message(STATUS "Opus found: WebM audio will be Opus-encoded")
+    else()
+        message(WARNING "Opus not found: WebM audio falls back to raw PCM (silent in browsers)")
+    endif()
 endif()
 
 set(SD_LIB stable-diffusion)

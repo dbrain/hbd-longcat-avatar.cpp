@@ -101,6 +101,10 @@ endif()
 if(SD_WEBM)
     target_compile_definitions(${TARGET} PRIVATE SD_USE_WEBM)
     target_link_libraries(${TARGET} PRIVATE webm)
+    if(SD_OPUS_FOUND)
+        target_compile_definitions(${TARGET} PRIVATE SD_USE_OPUS)
+        target_link_libraries(${TARGET} PRIVATE opus)
+    endif()
 endif()
 
 # due to httplib; it contains a pragma for MSVC, but other things need explicit flags
