@@ -259,9 +259,28 @@ void refresh_lora_cache(ServerRuntime& rt) {
     std::vector<LoraEntry> new_cache;
 
     fs::path lora_dir = rt.ctx_params->lora_model_dir;
-    if (fs::exists(lora_dir) && fs::is_directory(lora_dir)) {
-        for (auto& entry : fs::recursive_directory_iterator(lora_dir, fs::directory_options::skip_permission_denied)) {
-            if (!entry.is_regular_file()) {
+    // "." (and "") is the unconfigured default (see common.h). Recursively
+    // walking the process CWD — which for the prod server is the container
+    // root "/" — is never intended: it descends into pseudo-filesystems like
+    // /proc, where stat()'ing entries (e.g. /proc/1/map_files/*) throws EPERM
+    // that skip_permission_denied does NOT cover (it only suppresses errors
+    // opening a directory, not the stat() inside is_regular_file()), and it
+    // would otherwise mis-list every .gguf/.safetensors on the FS — including
+    // the resident DiT weights under /models — as a "lora". Require an
+    // explicit dir.
+    const std::string lora_dir_str = lora_dir.string();
+    const bool unconfigured        = lora_dir_str.empty() || lora_dir_str == ".";
+    if (!unconfigured && fs::exists(lora_dir) && fs::is_directory(lora_dir)) {
+        // Use the error_code iterator overloads so a stray permission error on
+        // any single entry skips that entry instead of aborting the whole
+        // refresh (defense in depth beside the unconfigured-dir guard above).
+        std::error_code ec;
+        fs::recursive_directory_iterator it(lora_dir, fs::directory_options::skip_permission_denied, ec);
+        const fs::recursive_directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            const fs::directory_entry& entry = *it;
+            std::error_code fec;
+            if (!entry.is_regular_file(fec) || fec) {
                 continue;
             }
             const fs::path& p = entry.path();
