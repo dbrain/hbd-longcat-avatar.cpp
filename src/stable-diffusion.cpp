@@ -4428,7 +4428,20 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
-    if (sd_ctx->sd->free_params_immediately) {
+    // Only free the text encoder when this is a one-shot context (CLI). On a warm
+    // RESIDENT worker (worker isolation / image API) keep_diffusion_model_resident is
+    // set and every /generate re-encodes a fresh prompt, so the TE must survive across
+    // requests. The image path has no TE reload mechanism (unlike the avatar video path
+    // at get_learned_condition_for_video, which captures reload state + calls
+    // reload_cond_stage_model()), so freeing it here would leave the conditioner's param
+    // tensors with NULL buffers — free_params_buffer() nulls t->data/buffer even for the
+    // mmap fast-path (params_buffer==nullptr) — and the NEXT encode aborts in
+    // ggml_backend_tensor_copy (GGML_ASSERT(buffer)). Mirror the !keep_diffusion_model_resident
+    // guard the VAE/DiT frees already use (decode_first_stage / sample). Under
+    // --offload-to-cpu the TE params live on the CPU params backend (the per-compute GPU
+    // copy is freed by free_compute_buffer), so keeping them resident costs no VRAM; under
+    // --mmap they are reclaimable file-backed pages.
+    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
 
