@@ -4472,7 +4472,7 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
         sd::Tensor<float> image = sd_ctx->sd->decode_first_stage(final_latents[i]);
         if (image.empty()) {
             LOG_ERROR("decode_first_stage failed for latent %" PRId64, i + 1);
-            if (sd_ctx->sd->free_params_immediately) {
+            if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
                 sd_ctx->sd->first_stage_model->free_params_buffer();
             }
             return nullptr;
@@ -4484,7 +4484,9 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
 
     int64_t t4 = ggml_time_ms();
     LOG_INFO("decode_first_stage completed, taking %.2fs", (t4 - t0) * 1.0f / 1000);
-    if (sd_ctx->sd->free_params_immediately) {
+    // !keep_diffusion_model_resident: the VAE, like the DiT/TE, must survive across
+    // /generate calls on a warm resident worker (no reload path on the image side).
+    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
         sd_ctx->sd->first_stage_model->free_params_buffer();
     }
 
@@ -4776,7 +4778,11 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         if (keep_unet_resident) {
             sd_ctx->sd->diffusion_model->set_keep_params_resident(false);
         }
-        if (sd_ctx->sd->free_params_immediately) {
+        // !keep_diffusion_model_resident: never free the DiT on a warm resident
+        // worker (image API / isolation) — it has no reload path and the next
+        // request would abort with NULL-buffer params. See the TE free in
+        // prepare_image_generation_embeds for the full rationale.
+        if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         return nullptr;
@@ -4787,7 +4793,7 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     if (keep_unet_resident) {
         sd_ctx->sd->diffusion_model->set_keep_params_resident(false);
     }
-    if (sd_ctx->sd->free_params_immediately && !request.hires.enabled) {
+    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident && !request.hires.enabled) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
     int64_t denoise_end = ggml_time_ms();
@@ -4812,7 +4818,7 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                 sd_ctx->sd->offload_params_to_cpu,
                                                 sd_ctx->sd->n_threads)) {
                 LOG_ERROR("load hires model upscaler failed");
-                if (sd_ctx->sd->free_params_immediately) {
+                if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
                     sd_ctx->sd->diffusion_model->free_params_buffer();
                 }
                 return nullptr;
@@ -4846,7 +4852,7 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                               request,
                                                               hires_upscaler.get());
             if (upscaled.empty()) {
-                if (sd_ctx->sd->free_params_immediately) {
+                if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
                     sd_ctx->sd->diffusion_model->free_params_buffer();
                 }
                 return nullptr;
@@ -4905,12 +4911,12 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                       b + 1,
                       (int)final_latents.size(),
                       (hires_sample_end - hires_sample_start) * 1.0f / 1000);
-            if (sd_ctx->sd->free_params_immediately) {
+            if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
                 sd_ctx->sd->diffusion_model->free_params_buffer();
             }
             return nullptr;
         }
-        if (sd_ctx->sd->free_params_immediately) {
+        if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         int64_t hires_denoise_end = ggml_time_ms();
