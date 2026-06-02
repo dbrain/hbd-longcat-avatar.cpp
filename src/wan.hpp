@@ -1470,9 +1470,19 @@ namespace WAN {
             auto vv = ggml_reshape_4d(ctx->ggml_ctx,
                                       ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v_all, 0, 2, 1, 3)),
                                       head_dim, num_heads, L_k, 1);  // [d_head, n_head, L_k, 1]
+            // Flash-attention over the [prev ++ cur ++ cond] cache. With FA OFF the
+            // L_blk x L_k scores tensor is materialized — at 480x832 (L_blk~4680,
+            // L_k grows to ~9k) that is several GB and is THE causal compute-buffer
+            // peak (measured 5.5 GB), which blocks keeping the Q4_K weights resident
+            // on the 12 GB card. FA streams the scores so the buffer drops to a few
+            // hundred MB. No causal mask: each block attends ALL cached keys (full
+            // attention over the rolling cache), so mask=nullptr is correct. The
+            // wrapper pads L_k->256 internally. Gated by the runner's flash flag so
+            // S2V_NO_FLASH=1 still selects the exact (FA-off) path for A/B.
             auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend,
                                                q_roped, k_all, vv, num_heads, nullptr,
-                                               /*skip_reshape=*/true, /*flash_attn=*/false);  // [1, L_blk, dim]
+                                               /*skip_reshape=*/true,
+                                               /*flash_attn=*/ctx->flash_attn_enabled);  // [1, L_blk, dim]
             attn = o_proj->forward(ctx, attn);
             return attn;
         }
