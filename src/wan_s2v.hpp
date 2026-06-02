@@ -523,9 +523,13 @@ namespace WAN_S2V {
             // build padded residual [1, L, dim] (zeros for ref tail) then add.
             int64_t L = xc->ne[1];
             if (L > L_noisy) {
-                auto zeros = ggml_new_tensor_3d(ctx->ggml_ctx, out->type, dim, L - L_noisy, 1);
-                zeros = ggml_scale(ctx->ggml_ctx, zeros, 0.0f);
-                out   = ggml_concat(ctx->ggml_ctx, out, zeros, 1);  // [1, L, dim]
+                // NB: must be a TRUE zero fill. The old `ggml_scale(ggml_new_tensor, 0)`
+                // multiplied an *uninitialized* compute-buffer tensor by 0 — on a reused
+                // graph buffer that scratch can hold Inf/NaN from a prior op, and
+                // 0*Inf = NaN, poisoning the whole sequence from the 2nd forward on.
+                auto zeros = ggml_ext_zeros(ctx->ggml_ctx, dim, L - L_noisy, 1, 1);
+                zeros      = ggml_reshape_3d(ctx->ggml_ctx, zeros, dim, L - L_noisy, 1);
+                out        = ggml_concat(ctx->ggml_ctx, out, zeros, 1);  // [1, L, dim]
             }
             xc = ggml_add(ctx->ggml_ctx, xc, out);
             return xc;

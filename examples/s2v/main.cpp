@@ -373,6 +373,20 @@ int main(int argc, char** argv) {
         auto am  = sd::Tensor<float>::from_vector(std::get<2>(tw));
         context  = t5->model.compute(n_threads, ids, am);  // [text_dim=4096, n_tok, 1]
         dump_stats("context (umT5)", context);
+        // model_s2v.py pads the text context to text_len=512 with zeros BEFORE the
+        // text_embedding MLP (the DiT does NOT pad internally). Without this the
+        // cross-attn sees only the few real tokens — weak/incorrect text conditioning.
+        {
+            int64_t tok = context.shape()[1];
+            const int64_t TEXT_LEN = 512;
+            if (tok < TEXT_LEN) {
+                sd::Tensor<float> ctx_pad({context.shape()[0], TEXT_LEN, context.shape()[2]});
+                std::fill(ctx_pad.data(), ctx_pad.data() + ctx_pad.numel(), 0.0f);
+                sd::ops::slice_assign(&ctx_pad, 1, 0, tok, context);
+                context = std::move(ctx_pad);
+                dump_stats("context (padded 512)", context);
+            }
+        }
     } else {
         context = sd::Tensor<float>({4096, 512, 1});
         printf("WARN: no --umt5/--context, context = zeros\n");
