@@ -106,7 +106,20 @@ bool convert(const char* input_path,
     auto backend    = ggml_backend_cpu_init();
     size_t mem_size = 1 * 1024 * 1024;  // for padding
     mem_size += model_loader.get_tensor_storage_map().size() * ggml_tensor_overhead();
-    mem_size += model_loader.get_params_mem_size(backend, type);
+    // Size the output ggml context with the per-tensor type rules applied — otherwise
+    // a rule that bumps a tensor BACK UP from the default (e.g. q4_K -> f16) makes the
+    // real allocation exceed the default-type estimate and ggml_new_tensor asserts.
+    {
+        size_t rules_mem = 0;
+        for (auto& [name, ts] : model_loader.get_tensor_storage_map()) {
+            ggml_type out_t = get_export_tensor_type(model_loader, ts, type, type_rules);
+            TensorStorage tmp = ts;
+            tmp.type          = out_t;
+            rules_mem += tmp.nbytes() + ggml_tensor_overhead();
+        }
+        mem_size += rules_mem;
+    }
+    mem_size += model_loader.get_params_mem_size(backend, type);  // headroom
     LOG_INFO("model tensors mem size: %.2fMB", mem_size / 1024.f / 1024.f);
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
 

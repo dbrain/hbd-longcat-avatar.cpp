@@ -487,10 +487,18 @@ namespace WAV2VEC2 {
 
             int64_t h4 = p.out_dim / 4;
 
+            bool dbg = getenv("S2V_CAE_DEBUG") != nullptr;
+            auto D = [&](const char* tag, ggml_tensor* t) {
+                if (dbg) fprintf(stderr, "[CAE] %-14s ne=[%lld,%lld,%lld,%lld] nb0=%zu cont=%d\n", tag,
+                                 (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                                 t->nb[0], ggml_is_contiguous(t));
+            };
             // ---- local branch ----
             // conv1_local: [F, in_dim, 1] -> [F, h4*num_token, 1]
             auto xt = to_time(x_cf);
+            D("x_cf->time", xt);
             xt = conv1_local->forward(ctx, xt);  // [F, h4*num_token, 1]
+            D("conv1_local", xt);
             int64_t Fl = xt->ne[0];
             // rearrange 'b (n c) t -> (b n) t c': split channel into [num_token, h4],
             // treat num_token as batch. ggml layout: xt is [F, num_token*h4, 1]; we want
@@ -518,9 +526,12 @@ namespace WAV2VEC2 {
             int64_t F3 = xc3->ne[1];
             auto pad_b = ggml_reshape_3d(ctx->ggml_ctx, pad, p.out_dim, 1, 1);
             pad_b      = ggml_repeat_4d(ctx->ggml_ctx, pad_b, p.out_dim, F3, 1, 1);  // [out_dim, F3, 1]
+            D("xc3(local)", xc3);
             auto x_local = ggml_concat(ctx->ggml_ctx, xc3, pad_b, 2);                // [out_dim, F3, num_token+1]
+            D("x_local.cat", x_local);
             // reorder to [out_dim, num_token+1, F3] (per-frame token grouping)
             x_local = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x_local, 0, 2, 1, 3));
+            D("x_local.perm", x_local);
 
             if (!p.need_global) {
                 return {nullptr, x_local};
@@ -555,9 +566,13 @@ namespace WAV2VEC2 {
         CausalAudioEncoderParams p;
 
         void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+            // PyTorch `weights` is [1, num_layers, 1, 1] -> ggml ne [1, 1, num_layers, 1].
+            // Declare it with that exact ne so the loader's per-dim shape check passes;
+            // we flatten to [num_layers] in forward(). Force F32 (the loader converts
+            // the gguf's F16 storage on load) — it feeds a broadcast ggml_mul against
+            // F32 features, and ggml binary ops require matching src1 dtype.
             (void)tensor_storage_map;
-            // weights [1, num_layers, 1, 1] -> ggml 1d of num_layers
-            params["weights"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, p.num_layers);
+            params["weights"] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, 1, p.num_layers);
         }
 
     public:
@@ -572,14 +587,21 @@ namespace WAV2VEC2 {
         // [B, num_layers, dim, video_length]; here per-frame channels-first.)
         // Returns {x_global, x_local} from the MotionEncoder.
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx, ggml_tensor* features) {
-            ggml_tensor* w = params["weights"];  // [num_layers]
+            ggml_tensor* w = params["weights"];  // ggml ne [1, 1, num_layers]
+            w              = ggml_reshape_1d(ctx->ggml_ctx, w, p.num_layers);  // [num_layers]
             // weights = SiLU(weights); weights_sum = sum; weighted = sum_l(feat_l * w_l)/sum.
             auto ws = ggml_silu(ctx->ggml_ctx, w);                    // [num_layers]
             // weighted sum over layer dim (dim2). Broadcast ws over [in_dim, F, num_layers].
             auto ws_b = ggml_reshape_3d(ctx->ggml_ctx, ws, 1, 1, p.num_layers);
+            if (getenv("S2V_CAE_DEBUG"))
+                fprintf(stderr, "[CAE] feats ne=[%lld,%lld,%lld] cont=%d ; ws_b ne=[%lld,%lld,%lld] cont=%d\n",
+                        (long long)features->ne[0], (long long)features->ne[1], (long long)features->ne[2], ggml_is_contiguous(features),
+                        (long long)ws_b->ne[0], (long long)ws_b->ne[1], (long long)ws_b->ne[2], ggml_is_contiguous(ws_b));
             auto wf   = ggml_mul(ctx->ggml_ctx, features, ws_b);      // [in_dim, F, num_layers]
-            // sum over dim2 -> [in_dim, F, 1].  ggml_sum_rows sums dim0, so permute.
-            auto wf_p = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, wf, 2, 0, 1, 3));  // [num_layers, in_dim, F]
+            // sum over the layer dim -> [in_dim, F].  ggml_sum_rows sums ne[0], so
+            // permute the layer axis (src ne2) into ne[0]: in_dim(ne0)->pos1,
+            // F(ne1)->pos2, num_layers(ne2)->pos0  ==> ggml_permute(.,1,2,0,3).
+            auto wf_p = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, wf, 1, 2, 0, 3));  // [num_layers, in_dim, F]
             auto summed = ggml_sum_rows(ctx->ggml_ctx, wf_p);        // [1, in_dim, F]
             // divide by sum(ws)
             auto ws_sum = ggml_sum_rows(ctx->ggml_ctx, ggml_reshape_2d(ctx->ggml_ctx, ws, p.num_layers, 1));  // [1,1]
@@ -611,20 +633,29 @@ namespace WAV2VEC2 {
             enc.get_param_tensors(tensors, prefix);
         }
 
-        ggml_cgraph* build_graph(const sd::Tensor<float>& feats) {
+        ggml_cgraph* build_graph(const sd::Tensor<float>& feats, bool want_global) {
             ggml_cgraph* gf  = new_graph_custom(GGML_DEFAULT_GRAPH_SIZE * 4);
             ggml_tensor* f   = make_input(feats);
             auto runner_ctx  = get_context();
             auto out = enc.forward(&runner_ctx, f);
-            // output both; build on x_local (and x_global if present)
-            ggml_build_forward_expand(gf, out.second);
-            if (out.first) ggml_build_forward_expand(gf, out.first);
+            // The runner extracts the graph's FINAL node. Expand exactly the one we
+            // want last so it is the designated output:
+            //   x_local  [dim, n_tok=5, F]  -> per-frame injector context
+            //   x_global [dim, 1, F]        -> AdaLN temb (enable_adain)
+            ggml_tensor* outp = (want_global && out.first) ? out.first : out.second;
+            ggml_build_forward_expand(gf, outp);
             return gf;
         }
 
-        // For M1 structural verification we compute only x_local (the per-frame tokens).
+        // x_local: per-frame audio tokens [dim, 5, F].
         sd::Tensor<float> compute(int n_threads, const sd::Tensor<float>& feats) {
-            auto get_graph = [&]() -> ggml_cgraph* { return build_graph(feats); };
+            auto get_graph = [&]() -> ggml_cgraph* { return build_graph(feats, /*want_global=*/false); };
+            return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, false));
+        }
+
+        // x_global: per-frame global embedding [dim, 1, F] (AdaLN temb). need_global.
+        sd::Tensor<float> compute_global(int n_threads, const sd::Tensor<float>& feats) {
+            auto get_graph = [&]() -> ggml_cgraph* { return build_graph(feats, /*want_global=*/true); };
             return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, false));
         }
     };

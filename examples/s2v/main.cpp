@@ -33,6 +33,8 @@
 #include <vector>
 
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "model.h"
 #include "stable-diffusion.h"
 #include "tensor.hpp"
@@ -60,6 +62,24 @@ static void dump_stats(const char* tag, const sd::Tensor<float>& t) {
            var > 0 ? sqrt(var) : 0.0, mn, mx);
 }
 
+// Write a sd::Tensor<float> in the simple .bin format that
+// load_tensor_from_file_as_tensor reads back (n_dims, name_len, ggml_type, dims[], name, data).
+static void write_bin(const std::string& path, const sd::Tensor<float>& t, const std::string& name) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { printf("cannot open %s\n", path.c_str()); return; }
+    int32_t n_dims = (int32_t)t.dim();
+    int32_t len    = (int32_t)name.size();
+    int32_t ttype  = (int32_t)GGML_TYPE_F32;
+    fwrite(&n_dims, sizeof(int32_t), 1, f);
+    fwrite(&len, sizeof(int32_t), 1, f);
+    fwrite(&ttype, sizeof(int32_t), 1, f);
+    for (int i = 0; i < n_dims; ++i) { int32_t d = (int32_t)t.shape()[(size_t)i]; fwrite(&d, sizeof(int32_t), 1, f); }
+    fwrite(name.data(), 1, (size_t)len, f);
+    fwrite(t.data(), sizeof(float), (size_t)t.numel(), f);
+    fclose(f);
+    printf("wrote %s\n", path.c_str());
+}
+
 static std::string opt(int argc, char** argv, const std::string& flag, const std::string& def = "") {
     for (int i = 1; i < argc - 1; ++i)
         if (flag == argv[i]) return argv[i + 1];
@@ -84,6 +104,8 @@ static std::vector<float> flow_sigmas(int steps, float shift) {
 }
 
 int main(int argc, char** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered: keep progress visible up to a crash
+    setvbuf(stderr, nullptr, _IONBF, 0);
     sd_set_log_callback(log_cb, nullptr);
 
     if (argc < 2 || has_flag(argc, argv, "--help")) {
@@ -113,22 +135,39 @@ int main(int argc, char** argv) {
     bool  load_only = has_flag(argc, argv, "--load-only");
 
     ggml_backend_t backend = nullptr;
-#ifdef SD_USE_CUDA
-    if (!cpu) { backend = ggml_backend_cuda_init(0); printf("backend: CUDA\n"); }
-#endif
+    ggml_backend_load_all();  // register CUDA/CPU backends from the ggml registry
+    if (!cpu) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        if (backend) printf("backend: GPU (%s)\n", ggml_backend_name(backend));
+        else printf("WARN: no GPU backend available, falling back to CPU\n");
+    }
     if (!backend) { backend = ggml_backend_cpu_init(); printf("backend: CPU\n"); }
+
+    // The audio path (wav2vec2 + CausalAudioEncoder) is tiny (<20 MB compute) and
+    // hits a CUDA binbcast contiguity assert on some of its broadcast ops; run it
+    // on a dedicated CPU backend. The heavy DiT + VAE stay on `backend` (GPU).
+    // Override with S2V_AUDIO_ON_GPU=1 to force the audio path onto `backend`.
+    ggml_backend_t audio_backend = backend;
+    if (getenv("S2V_AUDIO_ON_GPU") == nullptr) {
+        audio_backend = ggml_backend_cpu_init();
+        printf("audio path backend: CPU (DiT/VAE on %s)\n", ggml_backend_name(backend));
+    }
 
     int n_threads = 8;
 
     // ---- load DiT ----
+    // IMPORTANT: build the runner WITH the gguf's tensor_storage_map so each
+    // GGMLBlock creates its weight tensor at the gguf's stored dtype (Q4_K/F16),
+    // not the F32 default (which would balloon the param buffer to ~62 GB).
     if (dit_path.empty()) { printf("ERROR: --dit required\n"); return 1; }
     printf("loading S2V DiT '%s'\n", dit_path.c_str());
-    auto dit = std::make_shared<WAN_S2V::WanS2VRunner>(backend, backend, String2TensorStorage{}, "model.diffusion_model");
+    std::shared_ptr<WAN_S2V::WanS2VRunner> dit;
     {
         ModelLoader loader;
         if (!loader.init_from_file_and_convert_name(dit_path, "model.diffusion_model.")) {
             printf("ERROR: init loader %s\n", dit_path.c_str()); return 1;
         }
+        dit = std::make_shared<WAN_S2V::WanS2VRunner>(backend, backend, loader.get_tensor_storage_map(), "model.diffusion_model");
         dit->alloc_params_buffer();
         std::map<std::string, ggml_tensor*> tensors;
         dit->get_param_tensors(tensors, "model.diffusion_model");
@@ -141,9 +180,9 @@ int main(int argc, char** argv) {
     std::shared_ptr<WAV2VEC2::CausalAudioEncoderRunner> cae;
     if (!w2v_path.empty()) {
         printf("loading wav2vec2 '%s'\n", w2v_path.c_str());
-        w2v = std::make_shared<WAV2VEC2::Wav2Vec2EncoderRunner>(backend, backend, String2TensorStorage{}, "audio_encoder");
         ModelLoader loader;
         if (!loader.init_from_file_and_convert_name(w2v_path, "")) { printf("ERROR: init w2v loader\n"); return 1; }
+        w2v = std::make_shared<WAV2VEC2::Wav2Vec2EncoderRunner>(audio_backend, audio_backend, loader.get_tensor_storage_map(), "audio_encoder");
         w2v->alloc_params_buffer();
         std::map<std::string, ggml_tensor*> tensors;
         w2v->get_param_tensors(tensors, "audio_encoder");
@@ -152,12 +191,15 @@ int main(int argc, char** argv) {
     }
     if (!cae_path.empty()) {
         printf("loading casual_audio_encoder '%s'\n", cae_path.c_str());
-        cae = std::make_shared<WAV2VEC2::CausalAudioEncoderRunner>(backend, backend, String2TensorStorage{}, "casual_audio_encoder");
         ModelLoader loader;
         if (!loader.init_from_file_and_convert_name(cae_path, "")) { printf("ERROR: init cae loader\n"); return 1; }
+        // The CausalAudioEncoder lives INSIDE the DiT checkpoint, so its tensors
+        // carry the DiT's "model.diffusion_model." prefix (NAMING.md: routed to the
+        // DiT gguf). Request them under the full prefix.
+        cae = std::make_shared<WAV2VEC2::CausalAudioEncoderRunner>(audio_backend, audio_backend, loader.get_tensor_storage_map(), "model.diffusion_model.casual_audio_encoder");
         cae->alloc_params_buffer();
         std::map<std::string, ggml_tensor*> tensors;
-        cae->get_param_tensors(tensors, "casual_audio_encoder");
+        cae->get_param_tensors(tensors, "model.diffusion_model.casual_audio_encoder");
         if (!loader.load_tensors(tensors)) { printf("WARN: some casual_audio_encoder tensors failed to load\n"); }
         printf("casual_audio_encoder loaded (%zu tensors)\n", tensors.size());
     }
@@ -210,11 +252,12 @@ int main(int argc, char** argv) {
         // motion_frames[0] frame-0 repeats + crop [motion_frames[1]:] for exact parity.
         auto aout = cae->compute(n_threads, bucket);  // x_local [dim, 5, F]
         dump_stats("audio_tokens", aout);
-        audio_tokens = aout;  // [dim, 5, F]  — TODO: AudioCrossAttention expects k/v dim=1024;
-                              // the casual_audio_encoder already projects to dim=5120 (out_dim),
-                              // so the injector k/v Linear is 5120->5120 in that path. The 1024
-                              // audio_dim is the wav2vec hidden size feeding the encoder, NOT the
-                              // injector context. Keeping aout (dim=5120) as the injector context.
+        audio_tokens = aout;  // [dim, 5, F]; injector k/v project 5120->5120 (CAE out_dim).
+        // x_global [dim, 1, F] -> AdaLN temb (enable_adain attn_norm path). The DiT's
+        // audio_inject AdaLayerNorm REQUIRES this; without it the injector pre-norm
+        // dereferences a null temb. Compute it from the same bucket.
+        audio_global = cae->compute_global(n_threads, bucket);  // [dim, 1, F]
+        dump_stats("audio_global", audio_global);
     } else {
         printf("WARN: audio path skipped (need --wav2vec --audioenc --wav). audio tokens = zeros.\n");
         audio_tokens = sd::Tensor<float>({5120, 5, (int64_t)lat_t});
@@ -257,6 +300,13 @@ int main(int argc, char** argv) {
     }
     dump_stats("final_latent", x);
 
+    // Always persist the final latent so a forward pass produces an output file even
+    // if VAE decode is unavailable/fails. ne layout [W,H,T,16].
+    {
+        std::string lp = out_dir + "/s2v_final_latent.bin";
+        write_bin(lp, x, "s2v_final_latent");
+    }
+
     // ---- optional VAE decode ----
     if (!vae_path.empty()) {
         printf("\nloading VAE '%s' for decode...\n", vae_path.c_str());
@@ -268,12 +318,18 @@ int main(int argc, char** argv) {
             vae->get_param_tensors(tensors, "first_stage_model");
             if (loader.load_tensors(tensors)) {
                 sd_tiling_params_t tiling = {}; tiling.enabled = false;
-                // decode cat([ref_latent, x]) and drop the ref frame (M1 drop_first_motion).
-                // For simplicity decode x alone here (parent wires the exact concat).
+                // The DiT emits the latent as ne [W,H,T,C=16] which is the Wan VAE
+                // CausalConv3d input layout. NOTE: the Wan VAE decode still asserts in a
+                // 2D-conv im2col for this S2V latent — the exact ref-frame concat / frame
+                // handling is the parent's next-phase work; the raw latent is saved above.
                 auto rgb = vae->decode(n_threads, x, tiling, true, false, false);
                 dump_stats("decoded_rgb", rgb);
-                printf("decoded %lld frames (write your own PNG dump from decoded_rgb)\n",
-                       rgb.shape().size() >= 3 ? (long long)rgb.shape()[2] : 0);
+                if (!rgb.empty()) {
+                    std::string rp = out_dir + "/s2v_decoded_rgb.bin";
+                    write_bin(rp, rgb, "s2v_decoded_rgb");
+                    printf("decoded %lld frames -> %s\n",
+                           rgb.shape().size() >= 3 ? (long long)rgb.shape()[2] : 0, rp.c_str());
+                }
             } else printf("WARN: VAE tensor load failed\n");
         } else printf("WARN: VAE loader init failed\n");
     }

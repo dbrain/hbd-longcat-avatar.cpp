@@ -402,9 +402,15 @@ namespace WAN_S2V {
 
             // trainable_cond_mask: 0 for noisy, 1 for ref. ids built host-side.
             {
-                auto ids = ggml_reshape_2d(ctx->ggml_ctx, cond_mask_ids, L, 1);  // [L,1] int32
-                auto mask_emb = cond_mask->forward(ctx, ids);  // [1, L, dim]
-                xc = ggml_add(ctx->ggml_ctx, xc, mask_emb);
+                if (getenv("S2V_DIT_DEBUG"))
+                    fprintf(stderr, "[DiT] cond_mask_ids type=%d (I32=%d) ne=[%lld,%lld] L=%lld\n",
+                            (int)cond_mask_ids->type, (int)GGML_TYPE_I32,
+                            (long long)cond_mask_ids->ne[0], (long long)cond_mask_ids->ne[1], (long long)L);
+                if (getenv("S2V_SKIP_CONDMASK") == nullptr) {
+                    auto ids = ggml_reshape_2d(ctx->ggml_ctx, cond_mask_ids, L, 1);  // [L,1] int32
+                    auto mask_emb = cond_mask->forward(ctx, ids);  // [1, L, dim]
+                    xc = ggml_add(ctx->ggml_ctx, xc, mask_emb);
+                }
             }
 
             // time embedding (noisy t). e: [N, dim].
@@ -439,14 +445,29 @@ namespace WAN_S2V {
 
             int64_t num_frames = t_len;  // latent frames (audio per-frame count)
 
+            bool dbg = getenv("S2V_DIT_DEBUG") != nullptr;
+            auto DD = [&](const char* tag, ggml_tensor* t) {
+                if (dbg) fprintf(stderr, "[DiT] %-16s ne=[%lld,%lld,%lld,%lld]\n", tag,
+                                 (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+            };
+            if (dbg) fprintf(stderr, "[DiT] t_len=%lld h_len=%lld w_len=%lld L_noisy=%lld L_ref=%lld L=%lld seg=%lld\n",
+                             (long long)t_len, (long long)h_len, (long long)w_len, (long long)L_noisy, (long long)L_ref, (long long)L, (long long)seg);
+            DD("xc(pre-blocks)", xc);
+            DD("e0_2", e0_2);
+            DD("pe", pe);
+            DD("context", context);
+            DD("audio_tokens", audio_tokens);
+
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanS2VAttentionBlock>(blocks["blocks." + std::to_string(i)]);
                 xc = block->forward_s2v(ctx, xc, e0_2, pe, context, seg);
+                if (i == 0) DD("xc(after blk0)", xc);
 
                 auto it = inject_id.find(i);
-                if (it != inject_id.end() && audio_tokens != nullptr) {
+                if (it != inject_id.end() && audio_tokens != nullptr && getenv("S2V_SKIP_INJECT") == nullptr) {
                     xc = audio_inject(ctx, xc, it->second, L_noisy, num_frames, h_len, w_len,
                                       audio_tokens, audio_global);
+                    if (i == 0) DD("xc(after inj0)", xc);
                 }
             }
 
@@ -544,6 +565,11 @@ namespace WAN_S2V {
         WanS2VParams params;
         WanS2V dit;
         std::vector<float> pe_vec;
+        // make_input() stores the host data POINTER and copies later (after get_graph
+        // returns). These backing tensors MUST outlive the lambda, so keep them as
+        // members (like pe_vec) — locals would dangle and feed garbage to the graph.
+        sd::Tensor<int32_t> mask_t_hold;
+        sd::Tensor<float> zero_ts_hold;
         std::string desc = "Wan2.2-S2V-14B";
 
         WanS2VRunner(ggml_backend_t backend,
@@ -602,9 +628,9 @@ namespace WAN_S2V {
                 ggml_tensor* gcond = cond_states.empty() ? nullptr : make_input(cond_states);
                 ggml_tensor* gag  = audio_global.empty() ? nullptr : make_input(audio_global);
 
-                // ref-slot t=0.
-                auto zero_ts = sd::Tensor<float>::from_vector(std::vector<float>{0.0f});
-                ggml_tensor* gts0 = params.zero_timestep ? make_input(zero_ts) : nullptr;
+                // ref-slot t=0.  (member-held: see mask_t_hold note above)
+                zero_ts_hold = sd::Tensor<float>::from_vector(std::vector<float>{0.0f});
+                ggml_tensor* gts0 = params.zero_timestep ? make_input(zero_ts_hold) : nullptr;
 
                 // dims of the patchified grid (for PE + mask).
                 int T = (int)x.shape()[2], H = (int)x.shape()[1], W = (int)x.shape()[0];
@@ -614,11 +640,11 @@ namespace WAN_S2V {
                 int L_ref   = 1 * h_len * w_len;  // ref is 1 latent frame
                 int L = L_noisy + L_ref;
 
-                // cond-mask ids: 0 for noisy, 1 for ref.
+                // cond-mask ids: 0 for noisy, 1 for ref.  (member-held — see note above)
                 std::vector<int32_t> mask_ids(L, 0);
                 for (int i = L_noisy; i < L; i++) mask_ids[i] = 1;
-                auto mask_t = sd::Tensor<int32_t>::from_vector(mask_ids);
-                ggml_tensor* gmask = make_input(mask_t);
+                mask_t_hold = sd::Tensor<int32_t>::from_vector(mask_ids);
+                ggml_tensor* gmask = make_input(mask_t_hold);
 
                 // RoPE.
                 pe_vec = build_pe(T, H, W);
