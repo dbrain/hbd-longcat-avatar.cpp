@@ -320,8 +320,13 @@ namespace WAN_S2V {
             int slot = 0;
             for (int layer : params.audio_inject_layers) {
                 inject_id[layer] = slot;
+                // AudioInjector_WAN.injector = AudioCrossAttention(dim=self.dim, ...): the
+                // injector is a WanCrossAttention whose k/v project from dim (5120), NOT
+                // audio_dim. The audio context (merged_audio_emb) is already CausalAudio-
+                // Encoder out_dim==dim==5120. (audio_dim=1024 is the wav2vec hidden size
+                // FEEDING the encoder, not the injector context.)
                 blocks["audio_injector.injector." + std::to_string(slot)] =
-                    std::shared_ptr<GGMLBlock>(new AudioCrossAttention(params.dim, params.audio_dim, params.num_heads, true, params.eps));
+                    std::shared_ptr<GGMLBlock>(new AudioCrossAttention(params.dim, params.dim, params.num_heads, true, params.eps));
                 if (params.enable_adain) {
                     blocks["audio_injector.injector_adain_layers." + std::to_string(slot)] =
                         std::shared_ptr<GGMLBlock>(new AdaLayerNorm(params.dim, params.eps));

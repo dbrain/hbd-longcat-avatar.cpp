@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
     int lat_h = height / 8;
     int lat_w = width / 8;
     printf("latent target: [%d, %d, %d, 16]  (frames=%d %dx%d, steps=%d cfg=%.2f)\n",
-           lat_w, lat_h, lat_t, frames, height, width, steps);
+           lat_w, lat_h, lat_t, frames, height, width, steps, cfg);
 
     // ---- reference latent + text context ----
     sd::Tensor<float> ref_latent, context;
