@@ -1,5 +1,54 @@
 # LiveAvatar (Wan2.2-S2V-14B) → sd.cpp/ggml — PORT HANDOFF
 
+## MAX-PERF campaign (2026-06-03) — FA win + KV root-cause
+
+Goal: beat longcat (~104 s/clip @ 480x832) at the FAIR 480x832, causal path. All measured
+at 480x832, 1 step, frames=21 (2 causal blocks, nfb=3), DiT-only (NOVAE), boy.jpg+speechA.
+GPU = RTX 3060 12 GB; host = 31 GB RAM, weights on a ROTATIONAL HDD (`/mnt/hdd`).
+
+LANDED + COMMITTED: **flash-attention in the causal KV-cache self-attn** (`src/wan.hpp`
+`WanSelfAttention::forward_kv_cache`, commit 7fa1140). Was hardcoded `flash_attn=false` →
+materialized the L_blk x L_k scores (5.5 GB, THE causal compute-buffer peak). Now uses the
+runner flash flag, mask=nullptr (full attention over the rolling cache). Effect:
+- compute buffer 5.5 GB → ~3.8 GB; offload plan 21 segments → 4 (@9.5 GB budget) / 7 (@6.0).
+- S2V_NO_FLASH=1 keeps the exact FA-off path for A/B.
+
+MEASURED (block-0 = prefill + 1 block-forward, 1 step; pure GPU compute ~8.6 s):
+| config                         | budget | peak VRAM | block-0 wall | segments |
+|--------------------------------|--------|-----------|--------------|----------|
+| baseline (FA off, offload 6.5) | 6.5    | 8896 MiB  | 1748 s (!)   | 21       |
+| SOLO (S2V_NO_OFFLOAD, FA off)  | n/a    | OOM       | —            | monolith |
+| SOLO (S2V_NO_OFFLOAD, FA on)   | n/a    | OOM @prefill (needs 2.6 GB on top of 8.8 GB resident) | monolith |
+| offload+FA (near-SOLO)         | 9.5    | 10710 MiB | 16.3 s       | 4        |
+| offload+FA (COEXIST)           | 6.0    | 8118 MiB  | 16.3 s       | 7        |
+(baseline 1748 s = HDD-mmap + swap thrash, NOT GPU — see below. block-0 warm wall is ~16 s.)
+
+ROOT CAUSE of the remaining bottleneck (fully proven, NOT compute):
+1. Offload DiT weights are loaded **pinned (RAM, unswappable) 8.8 GB**, NOT mmap. Good.
+2. The rolling causal KV cache is held **HOST-side F32** (`cache_k/cache_v` in wan_s2v.hpp),
+   read back per block + re-uploaded next block. At 480x832 it is ~12.8 GB F32 at 2 blocks.
+3. Starting at block ≥1 the growing F32 host cache + readback transients push the 31 GB host
+   into SWAP → the pinned-bounce H2D + cudaMalloc staging stall: a single segment jumped to
+   `alloc=73 s copy_in=167 s` (compute stayed 1.6 s). THIS is the 21-55 s/segment "copy_in"
+   the brief saw. Block-0 (cache empty) is clean at ~16 s; block-1 explodes.
+
+VERDICT vs longcat at 480x832: block-0 compute is ~8.6 s (prefill+1 forward), warm wall 16 s.
+At 1 step that is competitive, but the host-KV swap pathology makes any ≥2-block clip blow up.
+NOT a GPU-compute loss — a host-memory architecture problem.
+
+NEXT (highest leverage, scoped, NOT yet done — risk = needs slow multi-block render validation):
+- **Resident KV** (Lever 1): keep cond K/V + rolling K/V as GPU-resident persistent tensors
+  (mirror LongCatAvatarRunner `condkv_buf` / `register_persistent_tensor`, longcat_avatar.hpp
+  ~1303-1556) instead of the host F32 round-trip. Kills the swap villain entirely. Pair with
+  **F16 KV** (halves footprint + PCIe). cond K/V is block-invariant (already prefilled once,
+  read 40/40 OK). Sizing: F16 KV for a full clip ~6.4 GB → with 8.8 GB resident weights it
+  will NOT all fit on 12 GB, so the practical target is offload@high-budget + resident KV
+  (weights mostly resident, KV resident, no host churn). The persistent+offload combo was
+  flagged buggy for longcat's cond-cache (ggml-alloc view-chain) — validate carefully or do
+  it in the no-offload path on short clips first.
+- Then kernel laps on the FA self-attn (occupancy / mmq tile) — only after H2D/swap is gone.
+
+
 Goal: port **LiveAvatar** (Quark-Vision) — an audio-driven talking-head model = stock
 **Wan-AI/Wan2.2-S2V-14B** + a rank-128 DMD-distill **LoRA** (`liveavatar.safetensors`) — into this
 fork (a `leejet/stable-diffusion.cpp` fork that already runs LongCat-Video-Avatar). Target Q4_K on a
