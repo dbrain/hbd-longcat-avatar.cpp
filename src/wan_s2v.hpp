@@ -1102,8 +1102,9 @@ namespace WAN_S2V {
                 // + the final result get computed per segment). mark_graph_cut RENAMES
                 // them to the cut name; read back by that name in the hook.
                 for (int i = 0; i < nL; i++) {
-                    ggml_tensor* k1 = ggml_cont(rctx.ggml_ctx, cond_kc[i]);
-                    ggml_tensor* v1 = ggml_cont(rctx.ggml_ctx, cond_vc[i]);
+                    // Lever 1: cond cache F16 too (block-invariant, fed every block).
+                    ggml_tensor* k1 = ggml_cast(rctx.ggml_ctx, cond_kc[i], GGML_TYPE_F16);
+                    ggml_tensor* v1 = ggml_cast(rctx.ggml_ctx, cond_vc[i], GGML_TYPE_F16);
                     ggml_set_output(k1); ggml_set_output(v1);
                     ggml_build_forward_expand(gf, k1);
                     ggml_build_forward_expand(gf, v1);
@@ -1126,12 +1127,12 @@ namespace WAN_S2V {
             cond_v_cache.assign(nL, {});
             std::vector<bool> gk(nL, false), gv(nL, false);
             auto read_named = [&](ggml_cgraph* sg, const std::string& name,
-                                  sd::Tensor<float>& dst) -> bool {
+                                  sd::Tensor<ggml_fp16_t>& dst) -> bool {
                 int nn = ggml_graph_n_nodes(sg);
                 for (int n = 0; n < nn; n++) {
                     ggml_tensor* t = ggml_graph_node(sg, n);
                     if (t && strcmp(t->name, name.c_str()) == 0 && t->buffer != nullptr) {
-                        dst = sd::Tensor<float>({(int64_t)d_head, (int64_t)L_ref, (int64_t)n_head});
+                        dst = sd::Tensor<ggml_fp16_t>({(int64_t)d_head, (int64_t)L_ref, (int64_t)n_head});
                         ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
                         return true;
                     }
@@ -1173,14 +1174,21 @@ namespace WAN_S2V {
             return Rope::embed_nd(ids, 1, static_cast<float>(params.causal_theta), params.axes_dim);
         }
 
-        // Persistent host-side rolling KV cache (per layer), F32, ne [d_head, L, n_head].
-        std::vector<sd::Tensor<float>> cache_k, cache_v;
+        // Persistent host-side rolling KV cache (per layer), ne [d_head, L, n_head].
+        // F16 (Lever 1): the rolling cache is the dominant host-memory consumer at
+        // 480x832 (~15 GB F32 at 2 blocks pushed the 31 GB host into swap -> the
+        // alloc/copy_in stalls). F16 halves it (host RAM + PCIe), keeping the host out
+        // of swap. The in-graph self-attn math stays F32: the F16 inputs are cast back
+        // to F32 before the concat (F16->F32 lossless), and the freshly-computed K/V are
+        // cast F32->F16 only at the readback boundary (the same precision the reference
+        // pipeline holds its kv_cache in: param_dtype/bf16).
+        std::vector<sd::Tensor<ggml_fp16_t>> cache_k, cache_v;
         // Lever A: cond (ref/sink) K/V is block-INVARIANT (it only depends on the ref
         // latent + prompt, not on the block index). The reference prefills it ONCE
         // and reuses it; we did a full 40-block ref forward inside EVERY block's graph
         // (redundant compute + ~doubled the compute buffer). Cache it host-side after
         // block 0 and feed it back as graph inputs for blocks 1..N (no ref forward).
-        std::vector<sd::Tensor<float>> cond_k_cache, cond_v_cache;
+        std::vector<sd::Tensor<ggml_fp16_t>> cond_k_cache, cond_v_cache;
         // input holders (must outlive the graph lambda).
         std::vector<float> blk_pe_hold, cond_pe_hold;
         sd::Tensor<int32_t> blk_mask_hold;
@@ -1306,8 +1314,10 @@ namespace WAN_S2V {
                 // per segment). They land in their block's segment, terminal (not future
                 // inputs) so they stay materialized at hook time. read back by cut name.
                 for (int i = 0; i < nL; i++) {
-                    ggml_tensor* nk1 = ggml_cont(rctx.ggml_ctx, new_kc[i]);
-                    ggml_tensor* nv1 = ggml_cont(rctx.ggml_ctx, new_vc[i]);
+                    // Lever 1: store the rolling cache F16 (halves host RAM + PCIe ->
+                    // keeps the 31 GB host out of swap). Cast at the readback boundary.
+                    ggml_tensor* nk1 = ggml_cast(rctx.ggml_ctx, new_kc[i], GGML_TYPE_F16);
+                    ggml_tensor* nv1 = ggml_cast(rctx.ggml_ctx, new_vc[i], GGML_TYPE_F16);
                     ggml_set_output(nk1);
                     ggml_set_output(nv1);
                     ggml_build_forward_expand(gf, nk1);
@@ -1321,15 +1331,16 @@ namespace WAN_S2V {
             };
 
             // K/V layout from forward_kv_cache: [d_head, L, n_head], concat along dim 1.
-            std::vector<sd::Tensor<float>> nk(nL), nv(nL);
+            // F16 host cache (Lever 1): the cut outputs were cast to F16 in-graph.
+            std::vector<sd::Tensor<ggml_fp16_t>> nk(nL), nv(nL);
             std::vector<bool> got_k(nL, false), got_v(nL, false);
             auto read_named = [&](ggml_cgraph* sg, const std::string& name,
-                                  sd::Tensor<float>& dst, int64_t L) -> bool {
+                                  sd::Tensor<ggml_fp16_t>& dst, int64_t L) -> bool {
                 int nn = ggml_graph_n_nodes(sg);
                 for (int n = 0; n < nn; n++) {
                     ggml_tensor* t = ggml_graph_node(sg, n);
                     if (t && strcmp(t->name, name.c_str()) == 0 && t->buffer != nullptr) {
-                        dst = sd::Tensor<float>({(int64_t)d_head, L, (int64_t)n_head});
+                        dst = sd::Tensor<ggml_fp16_t>({(int64_t)d_head, L, (int64_t)n_head});
                         ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
                         return true;
                     }
@@ -1366,6 +1377,37 @@ namespace WAN_S2V {
                 for (int i = 0; i < nL; i++) {
                     cache_k[i] = sd::ops::concat(cache_k[i], nk[i], 1);
                     cache_v[i] = sd::ops::concat(cache_v[i], nv[i], 1);
+                }
+            }
+            // Lever 2 (windowed causal attention). The reference holds the WHOLE clip's
+            // K/V on GPU (5xH800, 80 GB each) and only RINGS (overwrites oldest) once it
+            // wraps past kv_cache_size across clips. On a 12 GB card an unbounded rolling
+            // cache is the structural killer: even F16 it grows ~0.78 MB/token/clip and
+            // the per-block host round-trip (make_input upload + concat) drives the 31 GB
+            // host into swap from ~3 blocks on (measured: 36 s of GPU compute but a 708 s
+            // wall, 95 % host-side swap churn). S2V_KV_WINDOW_BLOCKS caps the rolling
+            // cache to the last W blocks (a sliding window) -> O(1) host memory + upload
+            // per block, swap-free, clip-length-independent. Talking-head lip-sync needs
+            // only local temporal context, so a short window is the bounded fix that
+            // matches the reference's own long-clip ring behaviour.
+            //   default = 1 (last block + cond): the only swap-free point measured on this
+            //     12 GB / 31 GB host with the 8.8 GB pinned-offload weights — W=2 already
+            //     re-entered swap (706 s vs 72 s @ W=1) because the host can't hold >1
+            //     block of prev-cache + readback double-buffer + weights at once. 3-block
+            //     480x832 renders are coherent at W=1 (boundaries clean, lip-sync intact).
+            //   0 = unbounded (legacy; whole-clip lookback — needs the resident-GPU-KV
+            //     refactor, or a bigger-RAM host, to be swap-free past 2 blocks).
+            //   override via S2V_KV_WINDOW_BLOCKS (e.g. >1 on a larger-RAM host).
+            int window_blocks = 1;
+            if (const char* wb = getenv("S2V_KV_WINDOW_BLOCKS")) window_blocks = atoi(wb);
+            if (window_blocks > 0) {
+                int64_t window_tokens = (int64_t)window_blocks * (int64_t)L_blk;
+                for (int i = 0; i < nL; i++) {
+                    int64_t cur = cache_k[i].shape()[1];
+                    if (cur > window_tokens) {
+                        cache_k[i] = sd::ops::slice(cache_k[i], 1, cur - window_tokens, cur);
+                        cache_v[i] = sd::ops::slice(cache_v[i], 1, cur - window_tokens, cur);
+                    }
                 }
             }
             return vel;

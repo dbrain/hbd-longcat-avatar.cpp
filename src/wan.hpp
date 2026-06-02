@@ -1457,13 +1457,21 @@ namespace WAN {
 
             ggml_tensor* k_all = k_roped;
             ggml_tensor* v_all = v_flat;
+            // Lever 1 (S2V): the host rolling/cond caches are F16. Cast back to F32
+            // (lossless) before concat so the in-graph attention math is unchanged.
+            // ggml_concat requires matching dtypes; k_roped/v_flat are F32.
+            auto to_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
+                return (t != nullptr && t->type != GGML_TYPE_F32)
+                           ? ggml_cast(ctx->ggml_ctx, t, GGML_TYPE_F32)
+                           : t;
+            };
             if (prev_kc != nullptr) {
-                k_all = ggml_concat(ctx->ggml_ctx, prev_kc, k_all, 1);
-                v_all = ggml_concat(ctx->ggml_ctx, prev_vc, v_all, 1);
+                k_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_kc), k_all, 1);
+                v_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_vc), v_all, 1);
             }
             if (cond_kc != nullptr) {
-                k_all = ggml_concat(ctx->ggml_ctx, k_all, cond_kc, 1);
-                v_all = ggml_concat(ctx->ggml_ctx, v_all, cond_vc, 1);
+                k_all = ggml_concat(ctx->ggml_ctx, k_all, to_f32(cond_kc), 1);
+                v_all = ggml_concat(ctx->ggml_ctx, v_all, to_f32(cond_vc), 1);
             }
             int64_t L_k = k_all->ne[1];
 
