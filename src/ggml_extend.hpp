@@ -1859,6 +1859,12 @@ protected:
     std::map<std::string, ggml_tensor*> cache_tensor_map;  // name -> tensor
     std::vector<std::pair<ggml_tensor*, std::string>> debug_tensors;
     const std::string final_result_name = "ggml_runner_final_result_tensor";
+    // Optional per-segment readback hook: called inside execute_graph after compute
+    // + sync but BEFORE the segment compute buffer is freed, so the caller can copy
+    // segment-local outputs (e.g. the causal KV cache's per-block K/V) to host. The
+    // arg is the just-computed (segment) graph. Used by wan_s2v's causal block path
+    // to read each block's K/V without materializing all 40 layers simultaneously.
+    std::function<void(ggml_cgraph*)> segment_readback_hook_ = nullptr;
 
     bool flash_attn_enabled    = false;
     bool conv2d_direct_enabled = false;
@@ -2941,6 +2947,12 @@ protected:
                     }
                 }
             }
+        }
+
+        // Per-segment readback: the compute buffer is still alive here. Lets the
+        // caller copy this segment's local outputs to host before they're freed.
+        if (segment_readback_hook_) {
+            segment_readback_hook_(gf);
         }
 
         int64_t t_cache_begin = ggml_time_ms();

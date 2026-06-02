@@ -630,6 +630,21 @@ namespace WAN_S2V {
             DD("context", context);
             DD("audio_tokens", audio_tokens);
 
+            // Graph-cut: mark the cross-block-persistent inputs as a prelude group and
+            // the residual after every block as a cut "neck". Lets the segmented compute
+            // path stream the CPU-resident Q4_K weights in block-by-block (peak weights-
+            // on-GPU = one block's, not all 40). Inert unless params_backend != runtime
+            // backend + max-vram set. (mirrors longcat_avatar.hpp.)
+            const bool do_cut = getenv("S2V_NO_GRAPH_CUT") == nullptr;
+            if (do_cut) {
+                sd::ggml_graph_cut::mark_graph_cut(xc, "s2v.prelude", "x");
+                sd::ggml_graph_cut::mark_graph_cut(e0_2, "s2v.prelude", "e0");
+                sd::ggml_graph_cut::mark_graph_cut(context, "s2v.prelude", "ctx");
+                if (pe) sd::ggml_graph_cut::mark_graph_cut(pe, "s2v.prelude", "pe");
+                if (audio_tokens) sd::ggml_graph_cut::mark_graph_cut(audio_tokens, "s2v.prelude", "at");
+                if (audio_global) sd::ggml_graph_cut::mark_graph_cut(audio_global, "s2v.prelude", "ag");
+            }
+
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanS2VAttentionBlock>(blocks["blocks." + std::to_string(i)]);
                 xc = block->forward_s2v(ctx, xc, e0_2, pe, context, seg);
@@ -640,6 +655,9 @@ namespace WAN_S2V {
                     xc = audio_inject(ctx, xc, it->second, L_noisy, num_frames, h_len, w_len,
                                       audio_tokens, audio_global);
                     if (i == 0) DD("xc(after inj0)", xc);
+                }
+                if (do_cut) {
+                    sd::ggml_graph_cut::mark_graph_cut(xc, "s2v.blocks." + std::to_string(i) + ".out", "x");
                 }
             }
 
@@ -738,12 +756,21 @@ namespace WAN_S2V {
             kc_out.resize(params.num_layers);
             vc_out.resize(params.num_layers);
             ggml_tensor* x = ref;
+            const bool do_cut = getenv("S2V_NO_GRAPH_CUT") == nullptr;
+            if (do_cut) {
+                sd::ggml_graph_cut::mark_graph_cut(x, "s2v.cond.prelude", "x");
+                sd::ggml_graph_cut::mark_graph_cut(e_cond, "s2v.cond.prelude", "e");
+                sd::ggml_graph_cut::mark_graph_cut(ctx_emb, "s2v.cond.prelude", "ctx");
+                if (pe_cond) sd::ggml_graph_cut::mark_graph_cut(pe_cond, "s2v.cond.prelude", "pe");
+            }
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanS2VAttentionBlock>(blocks["blocks." + std::to_string(i)]);
                 ggml_tensor* kc; ggml_tensor* vc;
                 x = block->forward_cond_prefill(ctx, x, e_cond, pe_cond, ctx_emb, kc, vc);
                 kc_out[i] = kc;
                 vc_out[i] = vc;
+                // residual cut so the sink-forward segments block-by-block.
+                if (do_cut) sd::ggml_graph_cut::mark_graph_cut(x, "s2v.cond.blocks." + std::to_string(i), "x");
             }
         }
 
@@ -800,6 +827,20 @@ namespace WAN_S2V {
             auto e0_2 = build_e0_per_frame(ctx, ts, ts0, e_head);  // [dim,6,2,nfb]
             context   = embed_text(ctx, context);
 
+            // Graph-cut prelude: mark the cross-block-persistent inputs so the
+            // segmented compute path streams the CPU-resident Q4_K weights in
+            // block-by-block instead of allocating all 40 blocks' weights at once.
+            // (Marks are inert unless params_backend != runtime_backend + max-vram set.)
+            const bool do_cut = getenv("S2V_NO_GRAPH_CUT") == nullptr;
+            if (do_cut) {
+                sd::ggml_graph_cut::mark_graph_cut(xc, "s2v.prelude", "x");
+                sd::ggml_graph_cut::mark_graph_cut(e0_2, "s2v.prelude", "e0");
+                sd::ggml_graph_cut::mark_graph_cut(context, "s2v.prelude", "ctx");
+                if (pe_block) sd::ggml_graph_cut::mark_graph_cut(pe_block, "s2v.prelude", "pe");
+                if (audio_tokens) sd::ggml_graph_cut::mark_graph_cut(audio_tokens, "s2v.prelude", "at");
+                if (audio_global) sd::ggml_graph_cut::mark_graph_cut(audio_global, "s2v.prelude", "ag");
+            }
+
             new_kc.assign(params.num_layers, nullptr);
             new_vc.assign(params.num_layers, nullptr);
             for (int i = 0; i < params.num_layers; i++) {
@@ -817,6 +858,14 @@ namespace WAN_S2V {
                 auto it = inject_id.find(i);
                 if (it != inject_id.end() && audio_tokens != nullptr && getenv("S2V_SKIP_INJECT") == nullptr) {
                     xc = audio_inject(ctx, xc, it->second, L_blk, nfb, h_len, w_len, audio_tokens, audio_global);
+                }
+                // Mark the residual after each block as a cut "neck". The planner
+                // segments the 40-block forward around these so peak weights-on-GPU
+                // is ~one block's, not all 40. The new_kc/new_vc branch off here and
+                // are referenced only at the final concat — graph-cut caches them
+                // across segments (they are small per block).
+                if (do_cut) {
+                    sd::ggml_graph_cut::mark_graph_cut(xc, "s2v.blocks." + std::to_string(i) + ".out", "x");
                 }
             }
 
@@ -1015,6 +1064,95 @@ namespace WAN_S2V {
         // -------------------------------------------------------------------
         // CAUSAL blockwise streaming.
         // -------------------------------------------------------------------
+        sd::Tensor<float> cond_pf_ref_hold;  // input holder for prefill_cond_host
+
+        // Run the cond/sink prefill (ref forward at t=0 through all 40 blocks) in its
+        // OWN segmented graph and store the per-layer cond K/V to host (block-invariant;
+        // reused by every causal block). Mirrors compute_causal_block's per-segment
+        // readback. Separating it from the block graph is what makes BOTH segmentable.
+        void prefill_cond_host(int n_threads, const sd::Tensor<float>& ref_latent,
+                               const sd::Tensor<float>& context, int H, int W) {
+            int nL = params.num_layers;
+            int ph = std::get<1>(params.patch_size), pw = std::get<2>(params.patch_size);
+            int h_len = (H + ph / 2) / ph, w_len = (W + pw / 2) / pw;
+            int L_ref = h_len * w_len;
+            int d_head = (int)(params.dim / params.num_heads);
+            int n_head = (int)params.num_heads;
+
+            auto get_graph = [&]() -> ggml_cgraph* {
+                ggml_cgraph* gf = new_graph_custom(WAN::WAN_GRAPH_SIZE);
+                ggml_tensor* gref = make_input(ref_latent);
+                ggml_tensor* gctx = make_input(context);
+                cond_mask1_hold = sd::Tensor<int32_t>::from_vector(std::vector<int32_t>(L_ref, 1));
+                ggml_tensor* gmask1 = make_input(cond_mask1_hold);
+                cond_ts0_hold = sd::Tensor<float>::from_vector(std::vector<float>{0.0f});
+                ggml_tensor* gts0c = make_input(cond_ts0_hold);
+
+                cond_pe_hold = build_pe_cond(H, W);
+                int cnd_pos = (int)(cond_pe_hold.size() / params.axes_dim_sum / 2);
+                auto pe_cond = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, params.axes_dim_sum / 2, cnd_pos);
+                set_backend_tensor_data(pe_cond, cond_pe_hold.data());
+
+                auto rctx = get_context();
+                std::vector<ggml_tensor*> cond_kc, cond_vc;
+                dit.prefill_cond(&rctx, gref, pe_cond, gts0c, gctx, gmask1, cond_kc, cond_vc);
+                // emit each layer's cond K/V as a cut-marked output in that layer's
+                // sink-block group, so it materializes + reads back per-segment small.
+                // cond K/V must be cut tensors to be segment outputs (only cut tensors
+                // + the final result get computed per segment). mark_graph_cut RENAMES
+                // them to the cut name; read back by that name in the hook.
+                for (int i = 0; i < nL; i++) {
+                    ggml_tensor* k1 = ggml_cont(rctx.ggml_ctx, cond_kc[i]);
+                    ggml_tensor* v1 = ggml_cont(rctx.ggml_ctx, cond_vc[i]);
+                    ggml_set_output(k1); ggml_set_output(v1);
+                    ggml_build_forward_expand(gf, k1);
+                    ggml_build_forward_expand(gf, v1);
+                    sd::ggml_graph_cut::mark_graph_cut(k1, "s2v.cond.blocks." + std::to_string(i), "ck");
+                    sd::ggml_graph_cut::mark_graph_cut(v1, "s2v.cond.blocks." + std::to_string(i), "cv");
+                }
+                // Dummy final node so NONE of the cond K/V is the graph's last node
+                // (the last node is renamed to ggml_runner_final_result_tensor, which
+                // would make that layer's cut unfindable by name -> a missing layer).
+                ggml_tensor* sentinel = ggml_scale(rctx.ggml_ctx, gts0c, 0.0f);
+                ggml_set_output(sentinel);
+                ggml_build_forward_expand(gf, sentinel);
+                return gf;
+            };
+            auto cut_name = [](const std::string& g, const std::string& o) {
+                return sd::ggml_graph_cut::make_graph_cut_name(g, o);
+            };
+
+            cond_k_cache.assign(nL, {});
+            cond_v_cache.assign(nL, {});
+            std::vector<bool> gk(nL, false), gv(nL, false);
+            auto read_named = [&](ggml_cgraph* sg, const std::string& name,
+                                  sd::Tensor<float>& dst) -> bool {
+                int nn = ggml_graph_n_nodes(sg);
+                for (int n = 0; n < nn; n++) {
+                    ggml_tensor* t = ggml_graph_node(sg, n);
+                    if (t && strcmp(t->name, name.c_str()) == 0 && t->buffer != nullptr) {
+                        dst = sd::Tensor<float>({(int64_t)d_head, (int64_t)L_ref, (int64_t)n_head});
+                        ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+                        return true;
+                    }
+                }
+                return false;
+            };
+            segment_readback_hook_ = [&](ggml_cgraph* sg) {
+                for (int i = 0; i < nL; i++) {
+                    std::string g = "s2v.cond.blocks." + std::to_string(i);
+                    if (!gk[i]) gk[i] = read_named(sg, cut_name(g, "ck"), cond_k_cache[i]);
+                    if (!gv[i]) gv[i] = read_named(sg, cut_name(g, "cv"), cond_v_cache[i]);
+                }
+            };
+            // no_return = true: we only want the side-effect K/V readback, not a final
+            // tensor (the last node is a cond V output, irrelevant as a return).
+            GGMLRunner::compute<float>(get_graph, n_threads, true, true);
+            segment_readback_hook_ = nullptr;
+            int nread = 0; for (int i = 0; i < nL; i++) if (gk[i] && gv[i]) nread++;
+            printf("prefill_cond_host: read %d/%d cond K/V layers to host\n", nread, nL);
+        }
+
         // Build a RoPE table for `t` latent frames whose temporal grid starts at
         // `t_offset` (the block's global frame index). 45000-theta for causal.
         std::vector<float> pe_block_vec, pe_cond_vec;
@@ -1037,6 +1175,12 @@ namespace WAN_S2V {
 
         // Persistent host-side rolling KV cache (per layer), F32, ne [d_head, L, n_head].
         std::vector<sd::Tensor<float>> cache_k, cache_v;
+        // Lever A: cond (ref/sink) K/V is block-INVARIANT (it only depends on the ref
+        // latent + prompt, not on the block index). The reference prefills it ONCE
+        // and reuses it; we did a full 40-block ref forward inside EVERY block's graph
+        // (redundant compute + ~doubled the compute buffer). Cache it host-side after
+        // block 0 and feed it back as graph inputs for blocks 1..N (no ref forward).
+        std::vector<sd::Tensor<float>> cond_k_cache, cond_v_cache;
         // input holders (must outlive the graph lambda).
         std::vector<float> blk_pe_hold, cond_pe_hold;
         sd::Tensor<int32_t> blk_mask_hold;
@@ -1044,7 +1188,10 @@ namespace WAN_S2V {
         sd::Tensor<int32_t> cond_mask1_hold;
         sd::Tensor<float> cond_ts0_hold;
 
-        void causal_reset_cache() { cache_k.clear(); cache_v.clear(); }
+        void causal_reset_cache() {
+            cache_k.clear(); cache_v.clear();
+            cond_k_cache.clear(); cond_v_cache.clear();
+        }
 
         // Run ONE causal block forward. Reads the rolling cache (cache_k/cache_v),
         // appends this block's K/V to it, and returns the velocity for the block's
@@ -1068,10 +1215,22 @@ namespace WAN_S2V {
             int nL = params.num_layers;
 
             bool have_prev = !cache_k.empty();
+            // Velocity is the SOLE graph output so the standard segmented compute<>()
+            // path (graph-cut + CPU-weight offload + prefetch pipelining) applies. The
+            // DiT is too big to keep resident on a 12 GB card (Q4_K ~9.4 GB) AND fit
+            // the causal compute buffer, so the weights MUST live on CPU and stream in
+            // segment-by-segment. The per-block K/V are cut-marked outputs read to host
+            // per-segment (so GPU holds only a couple K/V at a time, not all 80).
+            int d_head = (int)(params.dim / params.num_heads);
+            int n_head = (int)params.num_heads;
+            int L_ref  = h_len * w_len;
+            (void)L_ref;
 
-            // outputs read back after compute.
-            ggml_tensor* g_out = nullptr;
-            std::vector<ggml_tensor*> g_newk(nL, nullptr), g_newv(nL, nullptr);
+            // cond/sink K/V (block-invariant) is prefilled once in its own segmented
+            // graph before the first block (when the cache is empty + cond enabled).
+            if (cond_k_cache.empty() && getenv("S2V_SKIP_COND") == nullptr) {
+                prefill_cond_host(n_threads, ref_latent, context, H, W);
+            }
 
             auto get_graph = [&]() -> ggml_cgraph* {
                 ggml_cgraph* gf = new_graph_custom(WAN::WAN_GRAPH_SIZE);
@@ -1105,17 +1264,20 @@ namespace WAN_S2V {
 
                 auto rctx = get_context();
 
-                // cond (ref) K/V prefill — the LiveAvatar SINK forward: ref propagates
-                // through all blocks at t=0, capturing each block's modulated self-attn
-                // cond K/V. (cheap: 1 ref frame; fresh each block.)
+                // cond (ref) K/V is the LiveAvatar SINK: ref propagated through all
+                // blocks at t=0. It is block-INVARIANT, so it is computed ONCE in a
+                // SEPARATE segmented graph (prefill_cond_host, called before the block
+                // loop) and ALWAYS fed here from the host cache. Running it inline in the
+                // block graph forced a monolithic non-segmentable sink-forward (OOM) and
+                // poisoned the noisy output (NaN). (void) pe_cond — unused here now.
+                (void)pe_cond;
                 std::vector<ggml_tensor*> cond_kc, cond_vc;
-                if (getenv("S2V_SKIP_COND") == nullptr) {
-                    int L_ref = h_len * w_len;  // ref is 1 latent frame
-                    cond_mask1_hold = sd::Tensor<int32_t>::from_vector(std::vector<int32_t>(L_ref, 1));
-                    ggml_tensor* gmask1 = make_input(cond_mask1_hold);
-                    cond_ts0_hold = sd::Tensor<float>::from_vector(std::vector<float>{0.0f});
-                    ggml_tensor* gts0c = make_input(cond_ts0_hold);
-                    dit.prefill_cond(&rctx, gref, pe_cond, gts0c, gctx, gmask1, cond_kc, cond_vc);
+                if (getenv("S2V_SKIP_COND") == nullptr && !cond_k_cache.empty()) {
+                    cond_kc.resize(nL); cond_vc.resize(nL);
+                    for (int i = 0; i < nL; i++) {
+                        cond_kc[i] = make_input(cond_k_cache[i]);
+                        cond_vc[i] = make_input(cond_v_cache[i]);
+                    }
                 }
 
                 // prev rolling cache as inputs.
@@ -1129,49 +1291,74 @@ namespace WAN_S2V {
                 }
 
                 std::vector<ggml_tensor*> new_kc, new_vc;
-                g_out = dit.forward_causal_block(&rctx, gx, gcond_block, gts, gts0, gctx,
+                ggml_tensor* vel = dit.forward_causal_block(&rctx, gx, gcond_block, gts, gts0, gctx,
                                                  pe_block, gmask, gat, gag,
                                                  prev_kc, prev_vc, cond_kc, cond_vc,
                                                  new_kc, new_vc);
-                ggml_set_output(g_out);
-                ggml_build_forward_expand(gf, g_out);
-                // Output ONLY this block's NEW K/V (small, fixed nfb). The rolling
-                // cache is grown HOST-side (concat below) to keep the compute buffer
-                // from ballooning with 40 full-history K/V graph outputs.
+
+                // Velocity is the SOLE final output -> the 40-block forward segments
+                // cleanly (~one block's compute buffer per segment). The per-block K/V
+                // are NOT concatenated into the output (that forced a monolithic final
+                // segment holding all 80 tensors = OOM). Each block's K/V is a cut-marked
+                // output of its OWN block segment, read to host by the per-segment
+                // readback hook (peak K/V on GPU = a couple tensors, not 80).
+                // K/V must be cut tensors (only cut tensors + final result get computed
+                // per segment). They land in their block's segment, terminal (not future
+                // inputs) so they stay materialized at hook time. read back by cut name.
                 for (int i = 0; i < nL; i++) {
-                    ggml_tensor* nk = ggml_cont(rctx.ggml_ctx, new_kc[i]);
-                    ggml_tensor* nv = ggml_cont(rctx.ggml_ctx, new_vc[i]);
-                    ggml_set_output(nk);
-                    ggml_set_output(nv);
-                    ggml_build_forward_expand(gf, nk);
-                    ggml_build_forward_expand(gf, nv);
-                    g_newk[i] = nk;
-                    g_newv[i] = nv;
+                    ggml_tensor* nk1 = ggml_cont(rctx.ggml_ctx, new_kc[i]);
+                    ggml_tensor* nv1 = ggml_cont(rctx.ggml_ctx, new_vc[i]);
+                    ggml_set_output(nk1);
+                    ggml_set_output(nv1);
+                    ggml_build_forward_expand(gf, nk1);
+                    ggml_build_forward_expand(gf, nv1);
+                    sd::ggml_graph_cut::mark_graph_cut(nk1, "s2v.blocks." + std::to_string(i) + ".out", "nk");
+                    sd::ggml_graph_cut::mark_graph_cut(nv1, "s2v.blocks." + std::to_string(i) + ".out", "nv");
                 }
+                ggml_set_output(vel);
+                ggml_build_forward_expand(gf, vel);
                 return gf;
             };
 
-            // Low-level compute: build, alloc, run, read all outputs.
-            ggml_cgraph* gf = nullptr;
-            if (!prepare_compute_graph(get_graph, &gf)) return {};
-            if (!alloc_compute_buffer(gf)) return {};
-            if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) return {};
-            copy_data_to_backend_tensor(gf, true);
-            if (ggml_backend_is_cpu(runtime_backend)) ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
-            offload_all_params();
-            if (ggml_backend_graph_compute(runtime_backend, gf) != GGML_STATUS_SUCCESS) return {};
-            ggml_backend_synchronize(runtime_backend);
-
-            auto read_tensor = [&](ggml_tensor* t) -> sd::Tensor<float> {
-                std::vector<int64_t> shp = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
-                sd::Tensor<float> out(shp);
-                ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
-                return out;
-            };
-            sd::Tensor<float> vel = read_tensor(g_out);
-            // grow the rolling cache HOST-side: append this block's new K/V (ne[1]=L).
+            // K/V layout from forward_kv_cache: [d_head, L, n_head], concat along dim 1.
             std::vector<sd::Tensor<float>> nk(nL), nv(nL);
-            for (int i = 0; i < nL; i++) { nk[i] = read_tensor(g_newk[i]); nv[i] = read_tensor(g_newv[i]); }
+            std::vector<bool> got_k(nL, false), got_v(nL, false);
+            auto read_named = [&](ggml_cgraph* sg, const std::string& name,
+                                  sd::Tensor<float>& dst, int64_t L) -> bool {
+                int nn = ggml_graph_n_nodes(sg);
+                for (int n = 0; n < nn; n++) {
+                    ggml_tensor* t = ggml_graph_node(sg, n);
+                    if (t && strcmp(t->name, name.c_str()) == 0 && t->buffer != nullptr) {
+                        dst = sd::Tensor<float>({(int64_t)d_head, L, (int64_t)n_head});
+                        ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+                        return true;
+                    }
+                }
+                return false;
+            };
+            // Per-segment readback: as each block's segment finishes, copy its K/V to
+            // host (compute buffer still alive). This keeps GPU K/V to a couple tensors.
+            auto cut_name = [](const std::string& g, const std::string& o) {
+                return sd::ggml_graph_cut::make_graph_cut_name(g, o);
+            };
+            segment_readback_hook_ = [&](ggml_cgraph* sg) {
+                for (int i = 0; i < nL; i++) {
+                    std::string g = "s2v.blocks." + std::to_string(i) + ".out";
+                    if (!got_k[i]) got_k[i] = read_named(sg, cut_name(g, "nk"), nk[i], L_blk);
+                    if (!got_v[i]) got_v[i] = read_named(sg, cut_name(g, "nv"), nv[i], L_blk);
+                }
+            };
+
+            // Route through the standard segmented compute<>() path: graph-cut splits
+            // the 40-block forward into VRAM-bounded segments, streaming the CPU-resident
+            // Q4_K weights in per segment (+prefetch pipelining). Single F32 output (vel).
+            auto vel_opt = GGMLRunner::compute<float>(get_graph, n_threads, true, false);
+            segment_readback_hook_ = nullptr;
+            if (!vel_opt.has_value() || vel_opt->empty()) return {};
+            sd::Tensor<float> vel = std::move(*vel_opt);
+            vel.reshape_({(int64_t)W, (int64_t)H, (int64_t)nfb, 16});
+
+            // grow the rolling cache HOST-side.
             if (!have_prev) {
                 cache_k = std::move(nk);
                 cache_v = std::move(nv);
@@ -1181,10 +1368,6 @@ namespace WAN_S2V {
                     cache_v[i] = sd::ops::concat(cache_v[i], nv[i], 1);
                 }
             }
-            restore_all_params();
-            free_compute_buffer();
-            free_compute_ctx();
-            backend_tensor_data_map.clear();
             return vel;
         }
     };

@@ -254,6 +254,25 @@ int main(int argc, char** argv) {
 
     int n_threads = 8;
 
+    // ---- DiT params backend: CPU-offload (lever 2) ----
+    // The Q4_K DiT is ~9.4 GB; keeping it GPU-resident leaves no room for the
+    // ~3 GB causal compute buffer on a 12 GB card (and busts the 7.5 GB budget).
+    // Put the weights on a CPU backend so the graph-cut segmented compute streams
+    // them in segment-by-segment (peak = largest segment's weights, not all 40
+    // blocks). Default ON; S2V_NO_OFFLOAD=1 keeps weights resident (old path).
+    ggml_backend_t dit_params_backend = backend;
+    bool dit_offload = !cpu && getenv("S2V_NO_OFFLOAD") == nullptr;
+    if (dit_offload) {
+        dit_params_backend = ggml_backend_cpu_init();
+        printf("DiT weights: CPU-offload (graph-cut segmented compute on %s)\n", ggml_backend_name(backend));
+    }
+    // VRAM budget that triggers graph-cut. The planner sizes each segment to this,
+    // but the H2D prefetch-pipelining stages the NEXT segment's weights concurrently,
+    // so the live peak runs ~0.7-1 GB over budget. Default 6.5 GiB keeps the measured
+    // peak under the 7.5 GB target; override with S2V_MAX_VRAM_GIB.
+    float max_vram_gib = 6.5f;
+    if (const char* mv = getenv("S2V_MAX_VRAM_GIB")) max_vram_gib = atof(mv);
+
     // ---- load DiT ----
     if (dit_path.empty()) { printf("ERROR: --dit required\n"); return 1; }
     printf("loading S2V DiT '%s'\n", dit_path.c_str());
@@ -263,7 +282,7 @@ int main(int argc, char** argv) {
         if (!loader.init_from_file_and_convert_name(dit_path, "model.diffusion_model.")) {
             printf("ERROR: init loader %s\n", dit_path.c_str()); return 1;
         }
-        dit = std::make_shared<WAN_S2V::WanS2VRunner>(backend, backend, loader.get_tensor_storage_map(), "model.diffusion_model");
+        dit = std::make_shared<WAN_S2V::WanS2VRunner>(backend, dit_params_backend, loader.get_tensor_storage_map(), "model.diffusion_model");
         dit->alloc_params_buffer();
         std::map<std::string, ggml_tensor*> tensors;
         dit->get_param_tensors(tensors, "model.diffusion_model");
@@ -272,6 +291,11 @@ int main(int argc, char** argv) {
         // heads; without FA the materialized scores tensor needs ~28 GB. FA keeps
         // the DiT compute buffer to a few GB. (L_k=13312 % 256 == 0, head_dim=128.)
         dit->set_flash_attention_enabled(getenv("S2V_NO_FLASH") == nullptr);
+        if (dit_offload) {
+            size_t budget = (size_t)(max_vram_gib * 1024.0 * 1024.0 * 1024.0);
+            dit->set_max_graph_vram_bytes(budget);
+            printf("S2V DiT graph-cut VRAM budget = %.2f GiB\n", max_vram_gib);
+        }
         printf("S2V DiT loaded (%zu tensors), flash_attn=%d\n", tensors.size(),
                getenv("S2V_NO_FLASH") == nullptr);
     }
@@ -686,12 +710,17 @@ int main(int argc, char** argv) {
         // Spatial+temporal VAE tiling: the full-frame single-shot decode compute
         // buffer is ~13 GB (too big for a 12 GB card even with the DiT freed). Tiling
         // decodes in spatial tiles (default 32-latent) with temporal chunking.
+        // rel_size 0.5 (2 tiles/dim) leaves a ~5 GB decode buffer at 480x832, which
+        // (transiently) pushes peak over the 7.5 GB budget. Default to 0.34 (~3 tiles
+        // /dim) to shave the decode buffer; S2V_VAE_TILE_REL overrides.
+        float vae_tile_rel = 0.34f;
+        if (const char* tr = getenv("S2V_VAE_TILE_REL")) vae_tile_rel = atof(tr);
         sd_tiling_params_t dec_tiling = {};
         dec_tiling.enabled         = getenv("S2V_NO_VAE_TILE") == nullptr;
         dec_tiling.temporal_tiling = true;
         dec_tiling.target_overlap  = 0.25f;
-        dec_tiling.rel_size_x      = 0.5f;  // ~2 tiles across each spatial dim
-        dec_tiling.rel_size_y      = 0.5f;
+        dec_tiling.rel_size_x      = vae_tile_rel;
+        dec_tiling.rel_size_y      = vae_tile_rel;
         vae->set_temporal_tiling_enabled(true);
         auto rgb = vae->decode(n_threads, dec_diff, dec_tiling, /*decode_video=*/true, false, false);
         dump_stats("decoded_rgb (all)", rgb);
