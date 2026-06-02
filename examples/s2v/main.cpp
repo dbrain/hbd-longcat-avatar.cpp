@@ -222,6 +222,9 @@ int main(int argc, char** argv) {
     bool  load_only = has_flag(argc, argv, "--load-only");
     // --distilled = DMD-LoRA 4-step euler schedule (shift defaults to 3, cfg forced to 1).
     bool  distilled = has_flag(argc, argv, "--distilled");
+    // --causal = LiveAvatar blockwise causal streaming (KV-cache, per-block audio).
+    bool  causal = has_flag(argc, argv, "--causal");
+    int   nfb    = atoi(opt(argc, argv, "--nfb", "3").c_str());  // latent frames per causal block
     if (distilled) {
         if (!has_flag(argc, argv, "--shift")) shift = 3.0f;  // diffusers FlowMatchEuler default
         cfg = 1.0f;                                          // DMD distilled = guide_scale 0 -> single fwd/step
@@ -329,7 +332,16 @@ int main(int argc, char** argv) {
     // scales to [-1,1] and returns the diffusion-space latent (mean/std normalized),
     // matching speech2video.py's self.vae.encode(ref_pixel*2-1).
     sd::Tensor<float> ref_latent;
-    sd_tiling_params_t tiling = {}; tiling.enabled = false;
+    // Spatial VAE tiling for the single-frame ref encode: at larger resolutions
+    // (e.g. 480x832) the full-frame encode compute buffer (~2.9 GB) OOMs the 12 GB
+    // card alongside the resident DiT. Single frame -> no temporal tiling needed.
+    // Gated by the same S2V_NO_VAE_TILE env as the decode path.
+    sd_tiling_params_t tiling = {};
+    tiling.enabled         = getenv("S2V_NO_VAE_TILE") == nullptr;
+    tiling.temporal_tiling = false;
+    tiling.target_overlap  = 0.25f;
+    tiling.rel_size_x      = 0.5f;
+    tiling.rel_size_y      = 0.5f;
     if (!ref_path.empty()) {
         ref_latent = sd::load_tensor_from_file_as_tensor<float>(ref_path);
         dump_stats("ref_latent(.bin)", ref_latent);
@@ -492,7 +504,7 @@ int main(int argc, char** argv) {
         audio_global = sd::Tensor<float>({5120, 1, (int64_t)lat_t});
     }
 
-    // ---- M1 flow-match sampler ----
+    // ---- sampler ----
     std::mt19937 rng(1234);
     std::normal_distribution<float> nd(0.f, 1.f);
     sd::Tensor<float> x({(int64_t)lat_w, (int64_t)lat_h, (int64_t)lat_t, 16});
@@ -501,54 +513,133 @@ int main(int argc, char** argv) {
     sd::Tensor<float> cond_states;  // M1: empty (zeros) -> cond_encoder contributes +0.
     auto sigmas = distilled ? distilled_sigmas(steps, shift) : flow_sigmas(steps, shift);
 
-    printf("\n=== %s sampling (%d steps, shift=%.2f cfg=%.2f) ===\n",
-           distilled ? "DISTILLED euler (DMD-LoRA)" : "flow-match", steps, shift, cfg);
-    {
-        char sbuf[256]; int off = 0;
-        off += snprintf(sbuf + off, sizeof(sbuf) - off, "sigmas:");
-        for (size_t i = 0; i < sigmas.size() && off < (int)sizeof(sbuf) - 12; ++i)
-            off += snprintf(sbuf + off, sizeof(sbuf) - off, " %.5f", sigmas[i]);
-        printf("%s\n", sbuf);
-    }
-    int64_t t_sample0 = ggml_time_ms();
-    for (int i = 0; i < steps; ++i) {
-        float sigma_t = sigmas[i], sigma_next = sigmas[i + 1];
-        sd::Tensor<float> ts = sd::Tensor<float>::from_vector(std::vector<float>{sigma_t * 1000.f});
+    // ==================================================================
+    // CAUSAL blockwise streaming sampler (LiveAvatar). Denoise the clip
+    // block-by-block (nfb latent frames each), carrying a per-layer KV cache
+    // across blocks; per block slices its OWN audio (lip-sync fix).
+    // ==================================================================
+    if (causal) {
+        int n_blocks = (lat_t + nfb - 1) / nfb;
+        printf("\n=== CAUSAL streaming (%d blocks x %d frames, %d steps/blk, shift=%.2f) ===\n",
+               n_blocks, nfb, steps, shift);
+        dit->causal_reset_cache();
+        int64_t t_c0 = ggml_time_ms();
+        int blocks_done = 0;
+        for (int b = 0; b < n_blocks; ++b) {
+            int f0 = b * nfb;
+            int fn = std::min(nfb, lat_t - f0);
+            int t_off = f0;  // global latent-frame index of this block
 
-        auto v_cond = dit->compute(n_threads, x, ref_latent, cond_states, ts, context, audio_tokens, audio_global);
-        if (v_cond.empty()) { printf("ERROR: DiT forward returned empty at step %d\n", i); return 1; }
+            // slice the block's noisy latent frames [W,H,fn,16] (ne[2]=frames).
+            auto xb = sd::ops::narrow(x, 2, f0, fn);
 
-        sd::Tensor<float> v = v_cond;
-        if (cfg > 1.0f) {
-            sd::Tensor<float> audio_zero = audio_tokens;
-            for (int64_t k = 0; k < audio_zero.numel(); ++k) audio_zero.data()[k] = 0.f;
-            auto v_uncond = dit->compute(n_threads, x, ref_latent, cond_states, ts, context, audio_zero, audio_global);
-            if (!v_uncond.empty())
-                for (int64_t k = 0; k < v.numel(); ++k)
-                    v.data()[k] = v_uncond.data()[k] + cfg * (v_cond.data()[k] - v_uncond.data()[k]);
+            // per-block audio slice: frames [f0, f0+fn) (the lip-sync fix).
+            sd::Tensor<float> at_b, ag_b;
+            if (!audio_tokens.empty()) {
+                int64_t af = audio_tokens.shape()[2];
+                int as = std::min<int64_t>(f0, af - 1);
+                int al = std::min<int64_t>(fn, af - as);
+                at_b = sd::ops::narrow(audio_tokens, 2, as, al);
+                ag_b = sd::ops::narrow(audio_global, 2, as, al);
+                // pad to fn frames if short (repeat last).
+                if (at_b.shape()[2] < fn) {
+                    sd::Tensor<float> a2({at_b.shape()[0], at_b.shape()[1], (int64_t)fn});
+                    sd::Tensor<float> g2({ag_b.shape()[0], ag_b.shape()[1], (int64_t)fn});
+                    for (int f = 0; f < fn; ++f) {
+                        int64_t src = std::min<int64_t>(f, at_b.shape()[2] - 1);
+                        sd::ops::slice_assign(&a2, 2, f, f + 1, sd::ops::narrow(at_b, 2, src, 1));
+                        sd::ops::slice_assign(&g2, 2, f, f + 1, sd::ops::narrow(ag_b, 2, src, 1));
+                    }
+                    at_b = std::move(a2); ag_b = std::move(g2);
+                }
+            }
+
+            // denoise this block over the step schedule (KV cache reused at step 0,
+            // grows from prior blocks). NOTE: the cache is appended at EVERY compute,
+            // so we reset to the pre-block cache size between steps by recomputing —
+            // here we keep it simple: the cache append on the LAST step is what feeds
+            // the next block. To avoid double-appending across steps, snapshot the
+            // cache before the block and restore it before each step.
+            auto cache_k_snap = dit->cache_k;
+            auto cache_v_snap = dit->cache_v;
+            for (int i = 0; i < steps; ++i) {
+                dit->cache_k = cache_k_snap;
+                dit->cache_v = cache_v_snap;
+                float sigma_t = sigmas[i], sigma_next = sigmas[i + 1];
+                auto v = dit->compute_causal_block(n_threads, t_off, xb, cond_states, ref_latent,
+                                                   sigma_t * 1000.f, context, at_b, ag_b);
+                if (v.empty()) { printf("ERROR: causal block %d step %d empty\n", b, i); return 1; }
+                float dt = sigma_next - sigma_t;
+                for (int64_t k = 0; k < xb.numel(); ++k) xb.data()[k] += v.data()[k] * dt;
+            }
+            // the cache now reflects this block (last step's append). keep it for next block.
+            // write the denoised block frames back into x.
+            sd::ops::slice_assign(&x, 2, f0, f0 + fn, xb);
+            blocks_done++;
+            char tag[48]; snprintf(tag, sizeof(tag), "x@block%d(f%d..%d)", b, f0, f0 + fn);
+            dump_stats(tag, xb);
+        }
+        int64_t t_c1 = ggml_time_ms();
+        printf("causal: %d blocks rendered in %.1fs\n", blocks_done, (t_c1 - t_c0) / 1000.0);
+        dump_stats("final_latent", x);
+        {
+            std::string lp = out_dir + "/s2v_final_latent.bin";
+            write_bin(lp, x, "s2v_final_latent");
+        }
+        dit->free_params_buffer();
+        dit->free_compute_buffer();
+        printf("freed DiT before VAE decode\n");
+    } else {
+        // ---- M1 non-causal flow-match sampler ----
+        printf("\n=== %s sampling (%d steps, shift=%.2f cfg=%.2f) ===\n",
+               distilled ? "DISTILLED euler (DMD-LoRA)" : "flow-match", steps, shift, cfg);
+        {
+            char sbuf[256]; int off = 0;
+            off += snprintf(sbuf + off, sizeof(sbuf) - off, "sigmas:");
+            for (size_t i = 0; i < sigmas.size() && off < (int)sizeof(sbuf) - 12; ++i)
+                off += snprintf(sbuf + off, sizeof(sbuf) - off, " %.5f", sigmas[i]);
+            printf("%s\n", sbuf);
+        }
+        int64_t t_sample0 = ggml_time_ms();
+        for (int i = 0; i < steps; ++i) {
+            float sigma_t = sigmas[i], sigma_next = sigmas[i + 1];
+            sd::Tensor<float> ts = sd::Tensor<float>::from_vector(std::vector<float>{sigma_t * 1000.f});
+
+            auto v_cond = dit->compute(n_threads, x, ref_latent, cond_states, ts, context, audio_tokens, audio_global);
+            if (v_cond.empty()) { printf("ERROR: DiT forward returned empty at step %d\n", i); return 1; }
+
+            sd::Tensor<float> v = v_cond;
+            if (cfg > 1.0f) {
+                sd::Tensor<float> audio_zero = audio_tokens;
+                for (int64_t k = 0; k < audio_zero.numel(); ++k) audio_zero.data()[k] = 0.f;
+                auto v_uncond = dit->compute(n_threads, x, ref_latent, cond_states, ts, context, audio_zero, audio_global);
+                if (!v_uncond.empty())
+                    for (int64_t k = 0; k < v.numel(); ++k)
+                        v.data()[k] = v_uncond.data()[k] + cfg * (v_cond.data()[k] - v_uncond.data()[k]);
+            }
+
+            float dt = sigma_next - sigma_t;
+            for (int64_t k = 0; k < x.numel(); ++k) x.data()[k] += v.data()[k] * dt;
+
+            if (i == 0 || i == steps - 1) { char tag[32]; snprintf(tag, sizeof(tag), "x@step%d", i); dump_stats(tag, x); }
+        }
+        int64_t t_sample1 = ggml_time_ms();
+        dump_stats("final_latent", x);
+        printf("sampling: %.1fs total, %.2fs/step (cfg=%.1f -> %d fwd/step)\n",
+               (t_sample1 - t_sample0) / 1000.0, (t_sample1 - t_sample0) / 1000.0 / steps,
+               cfg, cfg > 1.0f ? 2 : 1);
+
+        {
+            std::string lp = out_dir + "/s2v_final_latent.bin";
+            write_bin(lp, x, "s2v_final_latent");
         }
 
-        float dt = sigma_next - sigma_t;
-        for (int64_t k = 0; k < x.numel(); ++k) x.data()[k] += v.data()[k] * dt;
-
-        if (i == 0 || i == steps - 1) { char tag[32]; snprintf(tag, sizeof(tag), "x@step%d", i); dump_stats(tag, x); }
+        // Free the DiT (~9.7 GB VRAM) before VAE decode — the decode compute buffer
+        // needs several GB and won't coexist with the resident DiT on a 12 GB card.
+        dit->free_params_buffer();
+        dit->free_compute_buffer();
+        printf("freed DiT params/compute buffers before VAE decode\n");
     }
-    int64_t t_sample1 = ggml_time_ms();
-    dump_stats("final_latent", x);
-    printf("sampling: %.1fs total, %.2fs/step (cfg=%.1f -> %d fwd/step)\n",
-           (t_sample1 - t_sample0) / 1000.0, (t_sample1 - t_sample0) / 1000.0 / steps,
-           cfg, cfg > 1.0f ? 2 : 1);
-
-    {
-        std::string lp = out_dir + "/s2v_final_latent.bin";
-        write_bin(lp, x, "s2v_final_latent");
-    }
-
-    // Free the DiT (~9.7 GB VRAM) before VAE decode — the decode compute buffer
-    // needs several GB and won't coexist with the resident DiT on a 12 GB card.
-    dit->free_params_buffer();
-    dit->free_compute_buffer();
-    printf("freed DiT params/compute buffers before VAE decode\n");
 
     // ---- VAE decode -> frames -> PNG + mp4 ----
     if (vae) {

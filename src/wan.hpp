@@ -1415,6 +1415,81 @@ namespace WAN {
             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
             return x;
         }
+
+        // Causal KV-cache self-attention (LiveAvatar streaming). Projects x's tokens,
+        // RoPE-applies q/k with `pe` (this block's grid), then attends over the
+        // concatenated [prev ++ cur ++ cond] keys/values. Exports the current block's
+        // RoPE'd K and raw V (both [d_head, L, n_head]) via new_kc/new_vc so the caller
+        // can persist them in a host rolling cache. prev_*/cond_* may be null.
+        ggml_tensor* forward_kv_cache(GGMLRunnerContext* ctx,
+                                      ggml_tensor* x,        // [1, L_blk, dim]
+                                      ggml_tensor* pe,       // RoPE for L_blk tokens
+                                      ggml_tensor* prev_kc,  // [d_head, L_prev, n_head] or null
+                                      ggml_tensor* prev_vc,
+                                      ggml_tensor* cond_kc,  // [d_head, L_cond, n_head] or null
+                                      ggml_tensor* cond_vc,
+                                      ggml_tensor*& new_kc,
+                                      ggml_tensor*& new_vc) {
+            int64_t L_blk = x->ne[1];
+            auto q_proj = std::dynamic_pointer_cast<Linear>(blocks["q"]);
+            auto k_proj = std::dynamic_pointer_cast<Linear>(blocks["k"]);
+            auto v_proj = std::dynamic_pointer_cast<Linear>(blocks["v"]);
+            auto o_proj = std::dynamic_pointer_cast<Linear>(blocks["o"]);
+            auto norm_q = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_q"]);
+            auto norm_k = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_k"]);
+
+            auto q = norm_q->forward(ctx, q_proj->forward(ctx, x));
+            auto k = norm_k->forward(ctx, k_proj->forward(ctx, x));
+            auto v = v_proj->forward(ctx, x);
+            q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, L_blk, 1);
+            k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L_blk, 1);
+            v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L_blk, 1);
+
+            auto q_roped = Rope::apply_rope(ctx->ggml_ctx, q, pe, true, ctx->allow_fused_rope);  // [d_head, L_blk, n_head]
+            auto k_roped = Rope::apply_rope(ctx->ggml_ctx, k, pe, true, ctx->allow_fused_rope);  // [d_head, L_blk, n_head]
+            auto v_flat  = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));  // [d_head, L_blk, n_head]
+
+            new_kc = k_roped;
+            new_vc = v_flat;
+
+            ggml_tensor* k_all = k_roped;
+            ggml_tensor* v_all = v_flat;
+            if (prev_kc != nullptr) {
+                k_all = ggml_concat(ctx->ggml_ctx, prev_kc, k_all, 1);
+                v_all = ggml_concat(ctx->ggml_ctx, prev_vc, v_all, 1);
+            }
+            if (cond_kc != nullptr) {
+                k_all = ggml_concat(ctx->ggml_ctx, k_all, cond_kc, 1);
+                v_all = ggml_concat(ctx->ggml_ctx, v_all, cond_vc, 1);
+            }
+            int64_t L_k = k_all->ne[1];
+
+            auto vv = ggml_reshape_4d(ctx->ggml_ctx,
+                                      ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v_all, 0, 2, 1, 3)),
+                                      head_dim, num_heads, L_k, 1);  // [d_head, n_head, L_k, 1]
+            auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend,
+                                               q_roped, k_all, vv, num_heads, nullptr,
+                                               /*skip_reshape=*/true, /*flash_attn=*/false);  // [1, L_blk, dim]
+            attn = o_proj->forward(ctx, attn);
+            return attn;
+        }
+
+        // Cond-prefill: just compute (and export) RoPE'd K + raw V for the ref/cond
+        // tokens x [1, L_cond, dim] using cond RoPE `pe_cond`. No attention output is
+        // consumed (the sink only fills the cond cache).
+        void prefill_cond_kv(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe_cond,
+                             ggml_tensor*& kc, ggml_tensor*& vc) {
+            int64_t L = x->ne[1];
+            auto k_proj = std::dynamic_pointer_cast<Linear>(blocks["k"]);
+            auto v_proj = std::dynamic_pointer_cast<Linear>(blocks["v"]);
+            auto norm_k = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_k"]);
+            auto k = norm_k->forward(ctx, k_proj->forward(ctx, x));
+            auto v = v_proj->forward(ctx, x);
+            k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L, 1);
+            v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L, 1);
+            kc = Rope::apply_rope(ctx->ggml_ctx, k, pe_cond, true, ctx->allow_fused_rope);  // [d_head, L, n_head]
+            vc = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));      // [d_head, L, n_head]
+        }
     };
 
     class WanCrossAttention : public WanSelfAttention {

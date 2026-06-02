@@ -73,6 +73,9 @@ namespace WAN_S2V {
         std::vector<int> audio_inject_layers = {0, 4, 8, 12, 16, 20, 24, 27, 30, 33, 36, 39};
         bool zero_timestep       = true;
         int ref_t_offset         = 30;  // ref latent temporal anchor grid pos
+        // Causal streaming (LiveAvatar): 45000-theta RoPE, 3 latent frames per block.
+        int causal_theta         = 45000;
+        int num_frames_per_block = 3;
     };
 
     // ----------------------------------------------------------------------
@@ -187,6 +190,101 @@ namespace WAN_S2V {
 
             return x;
         }
+
+        // ------------------------------------------------------------------
+        // CAUSAL block forward (LiveAvatar streaming). Mirrors
+        // CausalWanS2VAttentionBlock.forward + CausalWanS2VSelfAttention.forward
+        // (causal_model_s2v.py). Processes ONE block of `nfb` latent frames whose
+        // spatial tokens are x [1, L_blk, dim] (L_blk = nfb*hw). The self-attn
+        // attends over [prev_cache_kv ++ this_block_kv ++ cond_kv] where:
+        //   - prev_kc/prev_vc : ALREADY-RoPE'd K and raw V from earlier blocks
+        //     (host-persisted rolling cache), or nullptr for the first block.
+        //   - cond_kc/cond_vc : cond (ref/motion) K (RoPE'd w/ pe_cond) and raw V,
+        //     persisted from the sink prefill, or nullptr.
+        // pe_block: RoPE table for THIS block's L_blk tokens (45000-theta, temporal
+        //           offset = global frame index of the block).
+        // The per-frame modulation `e_pf` is [dim, 6, 2, nfb] (one e0 per latent
+        // frame); seg=L_blk (all tokens are noisy in the inference path).
+        // OUT params new_kc / new_vc receive this block's RoPE'd K and raw V so the
+        // runner can append them to the host cache after the compute.
+        ggml_tensor* forward_causal(GGMLRunnerContext* ctx,
+                                    ggml_tensor* x,        // [1, L_blk, dim]
+                                    ggml_tensor* e_pf,     // [dim, 6, 2, nfb] per-frame modulation
+                                    ggml_tensor* pe_block, // RoPE for L_blk tokens
+                                    ggml_tensor* context,  // text [1, ctx, dim]
+                                    int64_t nfb,           // frames in this block
+                                    int64_t hw,            // spatial tokens per frame
+                                    ggml_tensor* prev_kc,  // [d_head, n_head, L_prev] or null
+                                    ggml_tensor* prev_vc,  // [d_head, n_head, L_prev] or null
+                                    ggml_tensor* cond_kc,  // [d_head, n_head, L_cond] or null
+                                    ggml_tensor* cond_vc,  // [d_head, n_head, L_cond] or null
+                                    ggml_tensor*& new_kc,  // OUT: this block RoPE'd K
+                                    ggml_tensor*& new_vc)  // OUT: this block raw V
+        {
+            int64_t dim     = x->ne[0];
+            int64_t L_blk   = x->ne[1];
+            auto self_attn  = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+            auto norm3      = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm3"]);
+            auto cross_attn = std::dynamic_pointer_cast<WAN::WanCrossAttention>(blocks["cross_attn"]);
+            auto norm2      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm2"]);
+            auto ffn_0      = std::dynamic_pointer_cast<Linear>(blocks["ffn.0"]);
+            auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
+
+            auto modulation = params["modulation"];  // [dim, 6, 1]
+            auto mod4 = ggml_reshape_4d(ctx->ggml_ctx, modulation, dim, 6, 1, 1);
+            auto e    = ggml_add(ctx->ggml_ctx, e_pf, mod4);  // [dim, 6, 2, nfb]
+            auto es   = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);  // 6 x [dim,1,2,nfb]
+
+            // Per-frame modulate: each of the nfb latent frames (hw tokens each) uses
+            // its own slot-0 (noisy@t) scale/shift. Build a [dim, L_blk] broadcast by
+            // taking slot0 of e_chunk [dim,1,2,nfb] -> [dim,nfb] -> repeat_interleave hw.
+            auto pf_slot0 = [&](ggml_tensor* ec) -> ggml_tensor* {
+                // ec [dim,1,2,nfb]; slot 0 over dim2 -> [dim,1,1,nfb] -> [dim,nfb]
+                auto v = ggml_view_4d(ctx->ggml_ctx, ec, dim, 1, 1, nfb,
+                                      ec->nb[1], ec->nb[2], ec->nb[3], 0);
+                v = ggml_reshape_2d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, v), dim, nfb);  // [dim,nfb]
+                // repeat each frame's vec hw times -> [dim, hw, nfb] -> [dim, L_blk]
+                v = ggml_reshape_3d(ctx->ggml_ctx, v, dim, 1, nfb);
+                auto rep = ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, dim, hw, nfb);
+                v = ggml_repeat(ctx->ggml_ctx, v, rep);  // [dim, hw, nfb]
+                v = ggml_reshape_3d(ctx->ggml_ctx, v, dim, L_blk, 1);  // [1, L_blk, dim]
+                return v;
+            };
+            ggml_tensor* m_shift1 = pf_slot0(es[0]);
+            ggml_tensor* m_scale1 = pf_slot0(es[1]);
+            ggml_tensor* m_gate1  = pf_slot0(es[2]);
+            ggml_tensor* m_shift2 = pf_slot0(es[3]);
+            ggml_tensor* m_scale2 = pf_slot0(es[4]);
+            ggml_tensor* m_gate2  = pf_slot0(es[5]);
+
+            // --- self attention (causal, with KV cache) ---
+            auto y = norm1->forward(ctx, x);
+            y = ggml_add(ctx->ggml_ctx, y, ggml_mul(ctx->ggml_ctx, y, m_scale1));
+            y = ggml_add(ctx->ggml_ctx, y, m_shift1);
+
+            auto attn = self_attn->forward_kv_cache(ctx, y, pe_block,
+                                                    prev_kc, prev_vc, cond_kc, cond_vc,
+                                                    new_kc, new_vc);
+            attn = ggml_mul(ctx->ggml_ctx, attn, m_gate1);
+            x    = ggml_add(ctx->ggml_ctx, x, attn);
+
+            // cross-attention (text)
+            x = ggml_add(ctx->ggml_ctx, x, cross_attn->forward(ctx, norm3->forward(ctx, x), context, 0));
+
+            // ffn (per-frame modulate)
+            y = norm2->forward(ctx, x);
+            y = ggml_add(ctx->ggml_ctx, y, ggml_mul(ctx->ggml_ctx, y, m_scale2));
+            y = ggml_add(ctx->ggml_ctx, y, m_shift2);
+            y = ffn_0->forward(ctx, y);
+            y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
+            y = ffn_2->forward(ctx, y);
+            y = ggml_mul(ctx->ggml_ctx, y, m_gate2);
+            x = ggml_add(ctx->ggml_ctx, x, y);
+            return x;
+        }
+
+        std::shared_ptr<GGMLBlock> get_self_attn() { return blocks["self_attn"]; }
     };
 
     // ----------------------------------------------------------------------
@@ -484,6 +582,149 @@ namespace WAN_S2V {
             return out;
         }
 
+        // -------------------------------------------------------------------
+        // CAUSAL DiT — shared front-end (time/text/per-frame e0).
+        // -------------------------------------------------------------------
+        // Build the per-frame e0 modulation [dim, 6, 2, nfb]: slot0 = e0(t) per frame,
+        // slot1 = e0(t=0) (zero_timestep). `ts` carries one timestep per frame.
+        ggml_tensor* build_e0_per_frame(GGMLRunnerContext* ctx, ggml_tensor* ts, ggml_tensor* ts0, ggml_tensor*& e_head) {
+            auto time_embedding_0  = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.0"]);
+            auto time_embedding_2  = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.2"]);
+            auto time_projection_1 = std::dynamic_pointer_cast<Linear>(blocks["time_projection.1"]);
+            int64_t dim = params.dim;
+            auto time_emb = [&](ggml_tensor* t) -> ggml_tensor* {
+                auto te = ggml_ext_timestep_embedding(ctx->ggml_ctx, t, params.freq_dim);
+                te = time_embedding_0->forward(ctx, te);
+                te = ggml_silu_inplace(ctx->ggml_ctx, te);
+                te = time_embedding_2->forward(ctx, te);  // [F, dim]
+                return te;
+            };
+            auto proj = [&](ggml_tensor* te) -> ggml_tensor* {
+                auto p = ggml_silu(ctx->ggml_ctx, te);
+                p = time_projection_1->forward(ctx, p);
+                return ggml_reshape_4d(ctx->ggml_ctx, p, dim, 6, 1, p->ne[1]);  // [dim,6,1,F]
+            };
+            auto te    = time_emb(ts);   // [F, dim]
+            e_head     = te;             // Head uses per-frame e (first frame slot in practice)
+            auto e0    = proj(te);       // [dim,6,1,F]
+            ggml_tensor* e0_ref = ts0 != nullptr ? proj(time_emb(ts0)) : e0;
+            // broadcast zero-slot to F frames if ts0 was a single entry.
+            if (e0_ref->ne[3] == 1 && e0->ne[3] > 1) {
+                auto rep = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F32, dim, 6, 1, e0->ne[3]);
+                e0_ref = ggml_repeat(ctx->ggml_ctx, e0_ref, rep);
+            }
+            return ggml_concat(ctx->ggml_ctx, e0, e0_ref, 2);  // [dim,6,2,F]
+        }
+
+        ggml_tensor* embed_text(GGMLRunnerContext* ctx, ggml_tensor* context) {
+            auto t0 = std::dynamic_pointer_cast<Linear>(blocks["text_embedding.0"]);
+            auto t2 = std::dynamic_pointer_cast<Linear>(blocks["text_embedding.2"]);
+            context = t0->forward(ctx, context);
+            context = ggml_ext_gelu(ctx->ggml_ctx, context);
+            context = t2->forward(ctx, context);
+            return context;
+        }
+
+        // Prefill cond (ref) K/V for ALL layers from the ref latent. Exports per-layer
+        // RoPE'd K and raw V into kc_out/vc_out (each [d_head, L_ref, n_head]).
+        void prefill_cond(GGMLRunnerContext* ctx, ggml_tensor* ref_latent, ggml_tensor* pe_cond,
+                          std::vector<ggml_tensor*>& kc_out, std::vector<ggml_tensor*>& vc_out) {
+            auto patch_embedding = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding"]);
+            int64_t rt, rh, rw;
+            auto ref = patch_flatten(ctx, patch_embedding, ref_latent, rt, rh, rw);  // [1, L_ref, dim]
+            kc_out.resize(params.num_layers);
+            vc_out.resize(params.num_layers);
+            for (int i = 0; i < params.num_layers; i++) {
+                auto block = std::dynamic_pointer_cast<WanS2VAttentionBlock>(blocks["blocks." + std::to_string(i)]);
+                auto sa = std::dynamic_pointer_cast<WanSelfAttention>(block->get_self_attn());
+                ggml_tensor* kc;
+                ggml_tensor* vc;
+                sa->prefill_cond_kv(ctx, ref, pe_cond, kc, vc);
+                kc_out[i] = kc;
+                vc_out[i] = vc;
+            }
+        }
+
+        // One causal streaming block forward. Processes `nfb` latent frames.
+        //   x_block:   [in_dim, nfb, H, W] noisy latent for this block.
+        //   cond_block:[cond_dim, nfb, H, W] pose cond or nullptr.
+        //   pe_block:  RoPE for nfb*hw tokens at this block's temporal offset.
+        //   ts:        [nfb] timesteps (one per frame).
+        //   prev_kc/prev_vc/cond_kc/cond_vc: per-layer caches (null entries OK).
+        //   audio_tokens:[audio_dim, 5, nfb]; audio_global:[dim,1,nfb].
+        // Returns velocity [out_dim, nfb, H, W]; exports per-layer new K/V to append.
+        ggml_tensor* forward_causal_block(GGMLRunnerContext* ctx,
+                                          ggml_tensor* x_block,
+                                          ggml_tensor* cond_block,
+                                          ggml_tensor* ts,
+                                          ggml_tensor* ts0,
+                                          ggml_tensor* context,
+                                          ggml_tensor* pe_block,
+                                          ggml_tensor* mask_ids,  // [L_blk] int32 all-zero (noisy)
+                                          ggml_tensor* audio_tokens,
+                                          ggml_tensor* audio_global,
+                                          const std::vector<ggml_tensor*>& prev_kc,
+                                          const std::vector<ggml_tensor*>& prev_vc,
+                                          const std::vector<ggml_tensor*>& cond_kc,
+                                          const std::vector<ggml_tensor*>& cond_vc,
+                                          std::vector<ggml_tensor*>& new_kc,
+                                          std::vector<ggml_tensor*>& new_vc) {
+            auto patch_embedding = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding"]);
+            auto cond_encoder    = std::dynamic_pointer_cast<Conv3d>(blocks["cond_encoder"]);
+            auto head            = std::dynamic_pointer_cast<Head>(blocks["head"]);
+            auto cond_mask       = std::dynamic_pointer_cast<Embedding>(blocks["trainable_cond_mask"]);
+            int64_t dim = params.dim;
+
+            int64_t t_len, h_len, w_len;
+            auto xc = patch_flatten(ctx, patch_embedding, x_block, t_len, h_len, w_len);  // [1, L_blk, dim]
+            if (cond_block != nullptr) {
+                int64_t ct, ch, cw;
+                auto cond = patch_flatten(ctx, cond_encoder, cond_block, ct, ch, cw);
+                xc = ggml_add(ctx->ggml_ctx, xc, cond);
+            }
+            int64_t nfb = t_len;
+            int64_t hw  = h_len * w_len;
+            int64_t L_blk = xc->ne[1];
+
+            // mask_input = 0 for all noisy tokens (causal inference path); ids are a
+            // host-provided all-zero I32 tensor of length L_blk.
+            {
+                auto ids = ggml_reshape_2d(ctx->ggml_ctx, mask_ids, L_blk, 1);
+                auto mask_emb = cond_mask->forward(ctx, ids);  // [1, L_blk, dim]
+                xc = ggml_add(ctx->ggml_ctx, xc, mask_emb);
+            }
+
+            ggml_tensor* e_head;
+            auto e0_2 = build_e0_per_frame(ctx, ts, ts0, e_head);  // [dim,6,2,nfb]
+            context   = embed_text(ctx, context);
+
+            new_kc.assign(params.num_layers, nullptr);
+            new_vc.assign(params.num_layers, nullptr);
+            for (int i = 0; i < params.num_layers; i++) {
+                auto block = std::dynamic_pointer_cast<WanS2VAttentionBlock>(blocks["blocks." + std::to_string(i)]);
+                ggml_tensor* nkc;
+                ggml_tensor* nvc;
+                xc = block->forward_causal(ctx, xc, e0_2, pe_block, context, nfb, hw,
+                                           prev_kc.empty() ? nullptr : prev_kc[i],
+                                           prev_vc.empty() ? nullptr : prev_vc[i],
+                                           cond_kc.empty() ? nullptr : cond_kc[i],
+                                           cond_vc.empty() ? nullptr : cond_vc[i],
+                                           nkc, nvc);
+                new_kc[i] = nkc;
+                new_vc[i] = nvc;
+                auto it = inject_id.find(i);
+                if (it != inject_id.end() && audio_tokens != nullptr && getenv("S2V_SKIP_INJECT") == nullptr) {
+                    xc = audio_inject(ctx, xc, it->second, L_blk, nfb, h_len, w_len, audio_tokens, audio_global);
+                }
+            }
+
+            // Head uses per-frame e; use frame-0 timestep embedding (all frames share t in a block).
+            auto e_head0 = ggml_cont(ctx->ggml_ctx, ggml_view_2d(ctx->ggml_ctx, e_head, dim, 1, e_head->nb[1], 0));
+            auto out = head->forward(ctx, xc, e_head0);  // [1, L_blk, pt*ph*pw*out_dim]
+            out = unpatchify(ctx->ggml_ctx, out, t_len, h_len, w_len);
+            return out;
+        }
+
         // after_transformer_block audio injection for one inject layer.
         //   xc: [1, L_noisy+L_ref, dim]; we operate on the first L_noisy tokens.
         //   The noisy tokens are [num_frames, h_len*w_len] spatial; each frame's
@@ -667,6 +908,171 @@ namespace WAN_S2V {
                 return gf;
             };
             return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, false));
+        }
+
+        // -------------------------------------------------------------------
+        // CAUSAL blockwise streaming.
+        // -------------------------------------------------------------------
+        // Build a RoPE table for `t` latent frames whose temporal grid starts at
+        // `t_offset` (the block's global frame index). 45000-theta for causal.
+        std::vector<float> pe_block_vec, pe_cond_vec;
+        std::vector<float> build_pe_frames(int t, int h, int w, int t_offset) {
+            int pt = std::get<0>(params.patch_size);
+            int ph = std::get<1>(params.patch_size);
+            int pw = std::get<2>(params.patch_size);
+            // t is PIXEL frames; gen_vid_ids divides by pt internally (t_len = t/pt).
+            auto ids = Rope::gen_vid_ids(t, h, w, pt, ph, pw, 1, t_offset, 0, 0);
+            return Rope::embed_nd(ids, 1, static_cast<float>(params.causal_theta), params.axes_dim);
+        }
+        // cond (ref) RoPE: single frame at grid pos ref_t_offset.
+        std::vector<float> build_pe_cond(int h, int w) {
+            int pt = std::get<0>(params.patch_size);
+            int ph = std::get<1>(params.patch_size);
+            int pw = std::get<2>(params.patch_size);
+            auto ids = Rope::gen_vid_ids(pt, h, w, pt, ph, pw, 1, params.ref_t_offset, 0, 0);
+            return Rope::embed_nd(ids, 1, static_cast<float>(params.causal_theta), params.axes_dim);
+        }
+
+        // Persistent host-side rolling KV cache (per layer), F32, ne [d_head, L, n_head].
+        std::vector<sd::Tensor<float>> cache_k, cache_v;
+        // input holders (must outlive the graph lambda).
+        std::vector<float> blk_pe_hold, cond_pe_hold;
+        sd::Tensor<int32_t> blk_mask_hold;
+        sd::Tensor<float> blk_ts_hold, blk_ts0_hold;
+
+        void causal_reset_cache() { cache_k.clear(); cache_v.clear(); }
+
+        // Run ONE causal block forward. Reads the rolling cache (cache_k/cache_v),
+        // appends this block's K/V to it, and returns the velocity for the block's
+        // nfb frames. block_t_offset = global latent-frame index of this block.
+        //   x_block:[W,H,nfb,16]  cond_block:[W,H,nfb,16] or empty  ref_latent:[W,H,1,16]
+        //   ts: scalar timestep (broadcast to nfb)  context:[text_dim,512,1]
+        //   audio_tokens:[audio_dim,5,nfb]  audio_global:[dim,1,nfb]
+        sd::Tensor<float> compute_causal_block(int n_threads,
+                                               int block_t_offset,
+                                               const sd::Tensor<float>& x_block,
+                                               const sd::Tensor<float>& cond_block,
+                                               const sd::Tensor<float>& ref_latent,
+                                               float timestep,
+                                               const sd::Tensor<float>& context,
+                                               const sd::Tensor<float>& audio_tokens,
+                                               const sd::Tensor<float>& audio_global) {
+            int T = (int)x_block.shape()[2], H = (int)x_block.shape()[1], W = (int)x_block.shape()[0];
+            int pt = std::get<0>(params.patch_size), ph = std::get<1>(params.patch_size), pw = std::get<2>(params.patch_size);
+            int nfb = (T + pt / 2) / pt, h_len = (H + ph / 2) / ph, w_len = (W + pw / 2) / pw;
+            int L_blk = nfb * h_len * w_len;
+            int nL = params.num_layers;
+
+            bool have_prev = !cache_k.empty();
+
+            // outputs read back after compute.
+            ggml_tensor* g_out = nullptr;
+            std::vector<ggml_tensor*> g_newk(nL, nullptr), g_newv(nL, nullptr);
+
+            auto get_graph = [&]() -> ggml_cgraph* {
+                ggml_cgraph* gf = new_graph_custom(WAN::WAN_GRAPH_SIZE);
+
+                ggml_tensor* gx    = make_input(x_block);
+                ggml_tensor* gref  = make_input(ref_latent);
+                ggml_tensor* gctx  = make_input(context);
+                ggml_tensor* gat   = make_input(audio_tokens);
+                ggml_tensor* gcond_block = cond_block.empty() ? nullptr : make_input(cond_block);
+                ggml_tensor* gag   = audio_global.empty() ? nullptr : make_input(audio_global);
+
+                // per-frame timesteps (all == timestep) and zero-slot.
+                blk_ts_hold  = sd::Tensor<float>::from_vector(std::vector<float>(nfb, timestep));
+                blk_ts0_hold = sd::Tensor<float>::from_vector(std::vector<float>(nfb, 0.0f));
+                ggml_tensor* gts  = make_input(blk_ts_hold);
+                ggml_tensor* gts0 = params.zero_timestep ? make_input(blk_ts0_hold) : nullptr;
+
+                // all-zero mask ids (noisy).
+                blk_mask_hold = sd::Tensor<int32_t>::from_vector(std::vector<int32_t>(L_blk, 0));
+                ggml_tensor* gmask = make_input(blk_mask_hold);
+
+                // RoPE tables.
+                blk_pe_hold  = build_pe_frames(T, H, W, block_t_offset);
+                cond_pe_hold = build_pe_cond(H, W);
+                int blk_pos = (int)(blk_pe_hold.size() / params.axes_dim_sum / 2);
+                int cnd_pos = (int)(cond_pe_hold.size() / params.axes_dim_sum / 2);
+                auto pe_block = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, params.axes_dim_sum / 2, blk_pos);
+                set_backend_tensor_data(pe_block, blk_pe_hold.data());
+                auto pe_cond = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, params.axes_dim_sum / 2, cnd_pos);
+                set_backend_tensor_data(pe_cond, cond_pe_hold.data());
+
+                auto rctx = get_context();
+
+                // cond (ref) K/V prefill — fresh each block (cheap: 1 frame).
+                std::vector<ggml_tensor*> cond_kc, cond_vc;
+                dit.prefill_cond(&rctx, gref, pe_cond, cond_kc, cond_vc);
+
+                // prev rolling cache as inputs.
+                std::vector<ggml_tensor*> prev_kc, prev_vc;
+                if (have_prev) {
+                    prev_kc.resize(nL); prev_vc.resize(nL);
+                    for (int i = 0; i < nL; i++) {
+                        prev_kc[i] = make_input(cache_k[i]);
+                        prev_vc[i] = make_input(cache_v[i]);
+                    }
+                }
+
+                std::vector<ggml_tensor*> new_kc, new_vc;
+                g_out = dit.forward_causal_block(&rctx, gx, gcond_block, gts, gts0, gctx,
+                                                 pe_block, gmask, gat, gag,
+                                                 prev_kc, prev_vc, cond_kc, cond_vc,
+                                                 new_kc, new_vc);
+                ggml_set_output(g_out);
+                ggml_build_forward_expand(gf, g_out);
+                // Output ONLY this block's NEW K/V (small, fixed nfb). The rolling
+                // cache is grown HOST-side (concat below) to keep the compute buffer
+                // from ballooning with 40 full-history K/V graph outputs.
+                for (int i = 0; i < nL; i++) {
+                    ggml_tensor* nk = ggml_cont(rctx.ggml_ctx, new_kc[i]);
+                    ggml_tensor* nv = ggml_cont(rctx.ggml_ctx, new_vc[i]);
+                    ggml_set_output(nk);
+                    ggml_set_output(nv);
+                    ggml_build_forward_expand(gf, nk);
+                    ggml_build_forward_expand(gf, nv);
+                    g_newk[i] = nk;
+                    g_newv[i] = nv;
+                }
+                return gf;
+            };
+
+            // Low-level compute: build, alloc, run, read all outputs.
+            ggml_cgraph* gf = nullptr;
+            if (!prepare_compute_graph(get_graph, &gf)) return {};
+            if (!alloc_compute_buffer(gf)) return {};
+            if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) return {};
+            copy_data_to_backend_tensor(gf, true);
+            if (ggml_backend_is_cpu(runtime_backend)) ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+            offload_all_params();
+            if (ggml_backend_graph_compute(runtime_backend, gf) != GGML_STATUS_SUCCESS) return {};
+            ggml_backend_synchronize(runtime_backend);
+
+            auto read_tensor = [&](ggml_tensor* t) -> sd::Tensor<float> {
+                std::vector<int64_t> shp = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
+                sd::Tensor<float> out(shp);
+                ggml_backend_tensor_get(t, out.data(), 0, ggml_nbytes(t));
+                return out;
+            };
+            sd::Tensor<float> vel = read_tensor(g_out);
+            // grow the rolling cache HOST-side: append this block's new K/V (ne[1]=L).
+            std::vector<sd::Tensor<float>> nk(nL), nv(nL);
+            for (int i = 0; i < nL; i++) { nk[i] = read_tensor(g_newk[i]); nv[i] = read_tensor(g_newv[i]); }
+            if (!have_prev) {
+                cache_k = std::move(nk);
+                cache_v = std::move(nv);
+            } else {
+                for (int i = 0; i < nL; i++) {
+                    cache_k[i] = sd::ops::concat(cache_k[i], nk[i], 1);
+                    cache_v[i] = sd::ops::concat(cache_v[i], nv[i], 1);
+                }
+            }
+            restore_all_params();
+            free_compute_buffer();
+            free_compute_ctx();
+            backend_tensor_data_map.clear();
+            return vel;
         }
     };
 
