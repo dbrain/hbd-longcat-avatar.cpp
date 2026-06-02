@@ -14,7 +14,10 @@
 namespace WAN {
 
     constexpr int CACHE_T        = 2;
-    constexpr int WAN_GRAPH_SIZE = 10240;
+    // 20480: the S2V causal block graph holds the noisy block forward + the cond/sink
+    // prefill (a FULL ref forward through all 40 blocks: norm1+mod+self-attn+cross+ffn)
+    // + 40 layers of K/V graph outputs. That overflows the old 10240 node budget.
+    constexpr int WAN_GRAPH_SIZE = 20480;
 
     class CausalConv3d : public GGMLBlock {
     protected:

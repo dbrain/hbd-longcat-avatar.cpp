@@ -284,6 +284,76 @@ namespace WAN_S2V {
             return x;
         }
 
+        // ------------------------------------------------------------------
+        // COND/SINK prefill (LiveAvatar prepare_kv_cache, sink_flag): propagate the
+        // ref tokens x [1, L_ref, dim] through THIS block exactly as the model does
+        // for the cond cache, and export this block's self-attn cond K (RoPE'd at the
+        // cond grid) and raw V. The ref uses the ZERO-timestep modulation `e_cond`
+        // ([dim,6,1,1]) — i.e. the slot-1 (ref) e0. The cross-attn + ffn update x so
+        // the NEXT layer's cond k/v are computed from the propagated ref hidden state.
+        // This is the missing piece: the cond K/V must come from norm1(ref)*(1+scale)+
+        // shift (modulated), NOT the raw patchified ref. (matches model_s2v.py
+        // CausalWanS2VSelfAttention prefill-cond branch which caches q/k *after* the
+        // block's norm1+modulation.)
+        ggml_tensor* forward_cond_prefill(GGMLRunnerContext* ctx,
+                                          ggml_tensor* x,        // [1, L_ref, dim] ref hidden
+                                          ggml_tensor* e_cond,   // [dim,6,1,1] zero-t modulation (pre-mod-add)
+                                          ggml_tensor* pe_cond,  // RoPE for the cond grid
+                                          ggml_tensor* context,  // text [1, ctx, dim]
+                                          ggml_tensor*& cond_kc, // OUT: cond K (RoPE'd)
+                                          ggml_tensor*& cond_vc) // OUT: cond raw V
+        {
+            int64_t dim     = x->ne[0];
+            auto self_attn  = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+            auto norm3      = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm3"]);
+            auto cross_attn = std::dynamic_pointer_cast<WAN::WanCrossAttention>(blocks["cross_attn"]);
+            auto norm2      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm2"]);
+            auto ffn_0      = std::dynamic_pointer_cast<Linear>(blocks["ffn.0"]);
+            auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
+
+            auto modulation = params["modulation"];  // [dim, 6, 1]
+            auto mod4 = ggml_reshape_4d(ctx->ggml_ctx, modulation, dim, 6, 1, 1);
+            auto e    = ggml_add(ctx->ggml_ctx, e_cond, mod4);  // [dim,6,1,1]
+            auto es   = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);  // 6 x [dim,1,1,1]
+            // each es[k] is [dim,1,1,1] -> broadcast [dim,1,1] over all ref tokens.
+            auto mvec = [&](ggml_tensor* ec) -> ggml_tensor* {
+                return ggml_reshape_3d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, ec), dim, 1, 1);
+            };
+            ggml_tensor* sh1 = mvec(es[0]), *sc1 = mvec(es[1]), *gt1 = mvec(es[2]);
+            ggml_tensor* sh2 = mvec(es[3]), *sc2 = mvec(es[4]), *gt2 = mvec(es[5]);
+
+            // self-attn: modulate then export RoPE'd K + raw V (no prev/no cond keys —
+            // the cond attends only itself here, but we DISCARD the attn output for x
+            // since the velocity isn't consumed; we still run it to mirror the ref's
+            // residual update so downstream layers see the right hidden state).
+            auto y = norm1->forward(ctx, x);
+            y = ggml_add(ctx->ggml_ctx, y, ggml_mul(ctx->ggml_ctx, y, sc1));
+            y = ggml_add(ctx->ggml_ctx, y, sh1);
+            ggml_tensor* nkc; ggml_tensor* nvc;
+            auto attn = self_attn->forward_kv_cache(ctx, y, pe_cond,
+                                                    nullptr, nullptr, nullptr, nullptr,
+                                                    nkc, nvc);
+            cond_kc = nkc;  // RoPE'd cond K
+            cond_vc = nvc;  // raw cond V
+            attn = ggml_mul(ctx->ggml_ctx, attn, gt1);
+            x    = ggml_add(ctx->ggml_ctx, x, attn);
+
+            // cross-attn (text)
+            x = ggml_add(ctx->ggml_ctx, x, cross_attn->forward(ctx, norm3->forward(ctx, x), context, 0));
+
+            // ffn
+            y = norm2->forward(ctx, x);
+            y = ggml_add(ctx->ggml_ctx, y, ggml_mul(ctx->ggml_ctx, y, sc2));
+            y = ggml_add(ctx->ggml_ctx, y, sh2);
+            y = ffn_0->forward(ctx, y);
+            y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
+            y = ffn_2->forward(ctx, y);
+            y = ggml_mul(ctx->ggml_ctx, y, gt2);
+            x = ggml_add(ctx->ggml_ctx, x, y);
+            return x;
+        }
+
         std::shared_ptr<GGMLBlock> get_self_attn() { return blocks["self_attn"]; }
     };
 
@@ -625,21 +695,53 @@ namespace WAN_S2V {
             return context;
         }
 
-        // Prefill cond (ref) K/V for ALL layers from the ref latent. Exports per-layer
-        // RoPE'd K and raw V into kc_out/vc_out (each [d_head, L_ref, n_head]).
+        // Prefill cond (ref) K/V for ALL layers from the ref latent — the LiveAvatar
+        // SINK forward (prepare_kv_cache). The ref tokens are patch-embedded, get the
+        // trainable_cond_mask (id=1), and PROPAGATE through every block at the ZERO
+        // timestep (sink t=0). Each block's self-attn cond K (RoPE'd @ cond grid) + raw
+        // V are captured; the ref hidden state is updated by the full block so the next
+        // layer's cond k/v see the propagated state. Exports per-layer kc/vc.
+        //   ts0_cond: [1] zero timestep tensor (for the sink modulation e0).
+        //   context:  text [1, ctx, dim] (already umT5, pre-embed_text).
+        //   cond_mask_id1: [L_ref] int32 all-ones (ref mask id).
         void prefill_cond(GGMLRunnerContext* ctx, ggml_tensor* ref_latent, ggml_tensor* pe_cond,
+                          ggml_tensor* ts0_cond, ggml_tensor* context, ggml_tensor* cond_mask_id1,
                           std::vector<ggml_tensor*>& kc_out, std::vector<ggml_tensor*>& vc_out) {
             auto patch_embedding = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding"]);
+            auto cond_mask       = std::dynamic_pointer_cast<Embedding>(blocks["trainable_cond_mask"]);
+            int64_t dim = params.dim;
             int64_t rt, rh, rw;
             auto ref = patch_flatten(ctx, patch_embedding, ref_latent, rt, rh, rw);  // [1, L_ref, dim]
+            int64_t L_ref = ref->ne[1];
+
+            // trainable_cond_mask id=1 for the ref tokens.
+            {
+                auto ids = ggml_reshape_2d(ctx->ggml_ctx, cond_mask_id1, L_ref, 1);
+                auto me  = cond_mask->forward(ctx, ids);  // [1, L_ref, dim]
+                ref = ggml_add(ctx->ggml_ctx, ref, me);
+            }
+
+            // zero-timestep e0 for the sink: [dim,6,1,1].
+            auto time_embedding_0  = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.0"]);
+            auto time_embedding_2  = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.2"]);
+            auto time_projection_1 = std::dynamic_pointer_cast<Linear>(blocks["time_projection.1"]);
+            auto te = ggml_ext_timestep_embedding(ctx->ggml_ctx, ts0_cond, params.freq_dim);
+            te = time_embedding_0->forward(ctx, te);
+            te = ggml_silu_inplace(ctx->ggml_ctx, te);
+            te = time_embedding_2->forward(ctx, te);  // [dim,1]
+            auto e_cond = ggml_silu(ctx->ggml_ctx, te);
+            e_cond = time_projection_1->forward(ctx, e_cond);
+            e_cond = ggml_reshape_4d(ctx->ggml_ctx, e_cond, dim, 6, 1, 1);  // [dim,6,1,1]
+
+            auto ctx_emb = embed_text(ctx, context);  // umT5 -> dim
+
             kc_out.resize(params.num_layers);
             vc_out.resize(params.num_layers);
+            ggml_tensor* x = ref;
             for (int i = 0; i < params.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanS2VAttentionBlock>(blocks["blocks." + std::to_string(i)]);
-                auto sa = std::dynamic_pointer_cast<WanSelfAttention>(block->get_self_attn());
-                ggml_tensor* kc;
-                ggml_tensor* vc;
-                sa->prefill_cond_kv(ctx, ref, pe_cond, kc, vc);
+                ggml_tensor* kc; ggml_tensor* vc;
+                x = block->forward_cond_prefill(ctx, x, e_cond, pe_cond, ctx_emb, kc, vc);
                 kc_out[i] = kc;
                 vc_out[i] = vc;
             }
@@ -939,6 +1041,8 @@ namespace WAN_S2V {
         std::vector<float> blk_pe_hold, cond_pe_hold;
         sd::Tensor<int32_t> blk_mask_hold;
         sd::Tensor<float> blk_ts_hold, blk_ts0_hold;
+        sd::Tensor<int32_t> cond_mask1_hold;
+        sd::Tensor<float> cond_ts0_hold;
 
         void causal_reset_cache() { cache_k.clear(); cache_v.clear(); }
 
@@ -1001,9 +1105,18 @@ namespace WAN_S2V {
 
                 auto rctx = get_context();
 
-                // cond (ref) K/V prefill — fresh each block (cheap: 1 frame).
+                // cond (ref) K/V prefill — the LiveAvatar SINK forward: ref propagates
+                // through all blocks at t=0, capturing each block's modulated self-attn
+                // cond K/V. (cheap: 1 ref frame; fresh each block.)
                 std::vector<ggml_tensor*> cond_kc, cond_vc;
-                dit.prefill_cond(&rctx, gref, pe_cond, cond_kc, cond_vc);
+                if (getenv("S2V_SKIP_COND") == nullptr) {
+                    int L_ref = h_len * w_len;  // ref is 1 latent frame
+                    cond_mask1_hold = sd::Tensor<int32_t>::from_vector(std::vector<int32_t>(L_ref, 1));
+                    ggml_tensor* gmask1 = make_input(cond_mask1_hold);
+                    cond_ts0_hold = sd::Tensor<float>::from_vector(std::vector<float>{0.0f});
+                    ggml_tensor* gts0c = make_input(cond_ts0_hold);
+                    dit.prefill_cond(&rctx, gref, pe_cond, gts0c, gctx, gmask1, cond_kc, cond_vc);
+                }
 
                 // prev rolling cache as inputs.
                 std::vector<ggml_tensor*> prev_kc, prev_vc;

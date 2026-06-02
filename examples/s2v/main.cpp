@@ -436,6 +436,11 @@ int main(int argc, char** argv) {
     if (w2v && cae && !wav_path.empty()) {
         std::vector<float> wav;
         if (!LONGCAT_AUDIO::load_wav_16k_mono(wav_path, wav)) { printf("ERROR: load wav\n"); return 1; }
+        {
+            double s=0,s2=0; for (float v : wav) { s+=v; s2+=(double)v*v; }
+            printf("loaded wav '%s': n=%zu mean=%.5f rms=%.5f\n", wav_path.c_str(),
+                   wav.size(), wav.empty()?0:s/wav.size(), wav.empty()?0:sqrt(s2/wav.size()));
+        }
         auto wav_n = WAV2VEC2::normalize_waveform(wav);
         sd::Tensor<float> wav_t({(int64_t)wav_n.size(), 1, 1});
         memcpy(wav_t.data(), wav_n.data(), wav_n.size() * sizeof(float));
@@ -505,10 +510,25 @@ int main(int argc, char** argv) {
     }
 
     // ---- sampler ----
-    std::mt19937 rng(1234);
+    unsigned seed_val = 1234;
+    if (const char* se = getenv("S2V_SEED")) seed_val = (unsigned)atoi(se);
+    std::mt19937 rng(seed_val);
     std::normal_distribution<float> nd(0.f, 1.f);
     sd::Tensor<float> x({(int64_t)lat_w, (int64_t)lat_h, (int64_t)lat_t, 16});
     for (int64_t i = 0; i < x.numel(); ++i) x.data()[i] = nd(rng);
+
+    // DIAGNOSTIC: --load-latent <bin> replaces the sampler with a saved latent and
+    // jumps straight to VAE decode (proves whether corruption is in latent or decode).
+    std::string load_lat = opt(argc, argv, "--load-latent");
+    if (!load_lat.empty()) {
+        x = sd::load_tensor_from_file_as_tensor<float>(load_lat);
+        printf("loaded latent from %s shape=[%lld,%lld,%lld,%lld] -> skipping sampler\n",
+               load_lat.c_str(), (long long)x.shape()[0], (long long)x.shape()[1],
+               (long long)x.shape()[2], (long long)x.shape()[3]);
+        steps = 0;
+        causal = false;
+        frames = (int)((x.shape()[2]) * 4);  // approx for the decode tail-trim
+    }
 
     sd::Tensor<float> cond_states;  // M1: empty (zeros) -> cond_encoder contributes +0.
     auto sigmas = distilled ? distilled_sigmas(steps, shift) : flow_sigmas(steps, shift);
@@ -520,6 +540,7 @@ int main(int argc, char** argv) {
     // ==================================================================
     if (causal) {
         int n_blocks = (lat_t + nfb - 1) / nfb;
+        if (const char* mb = getenv("S2V_MAX_BLOCKS")) n_blocks = std::min(n_blocks, atoi(mb));
         printf("\n=== CAUSAL streaming (%d blocks x %d frames, %d steps/blk, shift=%.2f) ===\n",
                n_blocks, nfb, steps, shift);
         dit->causal_reset_cache();
@@ -571,6 +592,12 @@ int main(int argc, char** argv) {
                 if (v.empty()) { printf("ERROR: causal block %d step %d empty\n", b, i); return 1; }
                 float dt = sigma_next - sigma_t;
                 for (int64_t k = 0; k < xb.numel(); ++k) xb.data()[k] += v.data()[k] * dt;
+                if (getenv("S2V_STEP_DBG")) {
+                    double vs=0, xs=0; for (int64_t k=0;k<v.numel();++k) vs+=v.data()[k]*v.data()[k];
+                    for (int64_t k=0;k<xb.numel();++k) xs+=xb.data()[k]*xb.data()[k];
+                    printf("  [blk %d step %d] sigma=%.4f->%.4f v_rms=%.4f xb_rms=%.4f\n",
+                           b, i, sigma_t, sigma_next, sqrt(vs/v.numel()), sqrt(xs/xb.numel()));
+                }
             }
             // the cache now reflects this block (last step's append). keep it for next block.
             // write the denoised block frames back into x.
