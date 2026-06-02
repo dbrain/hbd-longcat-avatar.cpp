@@ -1,5 +1,77 @@
 # LiveAvatar (Wan2.2-S2V-14B) → sd.cpp/ggml — PORT HANDOFF
 
+## ⭐ PROJECT PAUSE — STATUS & NEXT STEPS (2026-06-03)
+
+**One-liner:** LiveAvatar (= stock Wan-AI/Wan2.2-S2V-14B + rank-128 DMD-distill LoRA) is ported to this
+sd.cpp/ggml fork and **functionally complete** on a single RTX 3060: it renders a coherent, lip-synced,
+audio-driven talking head from a reference image + audio, in Q4_K, with causal blockwise streaming for
+long clips. **Paused here as a clean functional milestone.** Remaining work is pure perf-lap territory.
+
+### What WORKS (all committed on branch `wan-s2v-port`, fork `dbrain/hbd-longcat-avatar.cpp`)
+- **M1** — stock Wan2.2-S2V-14B, non-causal, 40-step CFG: coherent talking face. (correctness gate)
+- **M2** — LiveAvatar DMD LoRA merged (scale 0.5 = alpha64/rank128), 4-step distilled (diffusers
+  FlowMatchEuler shift=3 schedule, `--distilled`): same quality, ~20× fewer forwards.
+- **Causal streaming** (`--causal`) — per-block KV-cache + sink-prefill + per-block audio + blockwise
+  flow-match loop. Multi-block clips render **swap-free, coherent across block boundaries, lip-syncing**.
+- Audio is ALIVE (different audio → different mouth, localized to face).
+
+### Numbers (480×832 = THE fair-comparison res; 512² is cheating, never quote it as a win)
+- Full **4-step distilled + VAE clip @ 480×832, 3 blocks (30 frames) = ~178 s**, peak ~9.9 GB, swap-free.
+- vs **longcat ~104 s/clip** → currently **~1.5–1.7× SLOWER for a real full render. NOT beaten yet.**
+- GPU compute is competitive (~24 s solo / 1-step / 3 blocks); the gap = 4 forwards + ~15–20 s/clip
+  host-loop offload overhead + VAE. Per-block wall is FLAT (no blow-up) → long clips scale LINEARLY.
+- VRAM operating points (3-block, 1-step, W=1, swap-free): SOLO 9.5 GiB budget → 10422 MiB / ~24 s;
+  default 6.5 → 9634 MiB / 51 s; COEXIST ≤7.5 GB (4.0 GiB budget) → **6106 MiB** / 121 s.
+
+### Key bugs fixed along the way (don't re-investigate)
+1. Patchify/RoPE was NOT the scramble — it was a **NaN from uninitialized `ggml_new_tensor_3d` scratch
+   `0*garbage` in the audio-inject zero-pad** (clean 1st forward, NaN on buffer reuse). Fixed w/ true zero.
+2. **umT5 context not padded to text_len=512** → text cross-attn saw ~7 tokens. Fixed in CLI.
+3. **Dead audio in M2** → root cause was the causal **cond/sink K/V fed UN-modulated** (missing the
+   norm1 + zero-t modulate + cross-attn + ffn the reference sink applies) → poisoned self-attn → the
+   checkerboard. Fixed by propagating the ref through a full block forward (commit 8a363b5).
+4. **Host-KV swap thrash** (the multi-block blocker) → rolling causal KV cache was host-side F32, grew to
+   ~12.8 GB at 2 blocks, swapped the 31 GB host from block≥1 (alloc 73s/copy 167s while compute 1.6s).
+   Fixed w/ **F16 KV + windowed attention** (`S2V_KV_WINDOW_BLOCKS`, default W=1) (commit 1f29a2b).
+5. TWO harness bugs that faked early results: `iter.sh` didn't forward `S2V_*` envs into the --rm
+   container (isolation toggles silently ran defaults); the wrapper hard-coded `--wav` (A/B reused the
+   same audio). Both fixed in kobbler `docker/longcat-avatar-dev/iter.sh` (UNCOMMITTED dev-tooling).
+
+### OPEN — next perf laps (in priority order)
+1. **Resident windowed KV on GPU + sweep W** — THE make-or-break lap. W=1 is the only swap-free point on
+   this host but is the weakest for long-range coherence (likely identity drift on long clips). Making the
+   windowed KV GPU-resident (mirror `LongCatAvatarRunner` `condkv_buf`/`register_persistent_tensor`,
+   `src/longcat_avatar.hpp` ~1303-1556) kills the ~15–20 s/clip host-loop tax AND makes W>1 affordable.
+   Risk: persistent+offload hit a ggml-alloc view-chain bug for longcat — validate carefully. This lap
+   answers BOTH the speed wall and the W=1 quality risk at once.
+2. **Kernel laps** (FA occupancy / `__launch_bounds__`, MMQ tile `mmq_x`) — only after H2D/swap is gone.
+3. **FramePack motioner** — cross-clip memory for true infinite length (currently single-clip;
+   `frame_packer.*` weights are in the gguf, path is `drop_motion`). Needed for minutes-long content.
+4. **Torch-oracle PSNR validation** — render quality is eyeball-verified, not numerically checked.
+
+### Realistic perf-wall guess (honest)
+- **Short clips (2–4 s):** ~parity with longcat (0.8–1.2×). Causal overhead eats the 4-step advantage.
+- **Long clips (minutes — the actual vtuber use case):** windowed causal is O(length) w/ small constant
+  vs longcat's growing per-clip denoise → **plausibly 1.5–3× faster, growing with length** — IF a small W
+  (2–4 blocks) holds identity. The min-quality W is the single unknown that decides "slightly better" vs
+  "make it cry." The decisive experiment: resident windowed KV → sweep W → measure a 30 s clip vs longcat.
+- Hard floor: same 14B on the same 3060 — wins come from fewer steps + linear scaling + killing the
+  host/offload tax, NOT from cheaper matmuls.
+
+### Where things live
+- Code: branch `wan-s2v-port` (fork `dbrain/hbd-longcat-avatar.cpp`). New: `src/wan_s2v.hpp`,
+  `src/wav2vec2.hpp`, `examples/s2v/` (`--causal`/`--distilled`/`S2V_*` env knobs); reuses `src/wan.hpp`.
+- GGUFs (NOT in repo): `/mnt/hdd/live-avatar/gguf/` — `wan-s2v-14b-dit-dmd-q4_k.gguf` (9.4 GB, LoRA-merged),
+  `wan-s2v-14b-dit-q4_k.gguf` (stock M1), `wav2vec2-xlsr53-f16.gguf`, `NAMING.md`. Reuse `models/longcat-
+  umt5-xxl-q8_0.gguf` + `models/longcat-wan-vae-f16.gguf`.
+- Convert scripts: `/mnt/hdd/live-avatar/convert/` (`convert_wan_s2v_dit.py`, `..._lora.py`, `convert_wav2vec2.py`).
+- Reference source: `/mnt/hdd/live-avatar/ref/{Wan2.2,LiveAvatar}/`. Outputs/gallery:
+  `/mnt/hdd/live-avatar/out/`; LAN gallery `python3 /mnt/hdd/live-avatar/serve_out.py` → http://10.0.0.208:8200.
+- Build + run: `kobbler/docker/longcat-avatar-dev/iter.sh build` / `... s2v -- <args>` (the s2v run-case +
+  `S2V_*` env passthrough are UNCOMMITTED in kobbler — commit alongside if you productionize).
+
+---
+
 ## MAX-PERF campaign (2026-06-03) — FA win + KV root-cause
 
 Goal: beat longcat (~104 s/clip @ 480x832) at the FAIR 480x832, causal path. All measured
