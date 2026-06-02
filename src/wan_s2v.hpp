@@ -238,7 +238,11 @@ namespace WAN_S2V {
             auto q = norm_q->forward(ctx, q_proj->forward(ctx, x));
             auto k = norm_k->forward(ctx, k_proj->forward(ctx, context));
             auto v = v_proj->forward(ctx, context);
-            x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, nullptr, false, ctx->flash_attn_enabled);
+            // NB: this cross-attn is BATCHED over the F latent frames (q ne[2]=F as the
+            // batch dim). The flash-attn wrapper's output view assumes N==1 and would
+            // assert on the reshape for N>1 — and the attention here is tiny (L_q=h*w,
+            // L_k=5 audio tokens), so use the non-flash dense path unconditionally.
+            x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, nullptr, false, /*flash_attn=*/false);
             x = o_proj->forward(ctx, x);
             return x;
         }
