@@ -136,6 +136,26 @@ static std::vector<float> flow_sigmas(int steps, float shift) {
     return s;
 }
 
+// Distilled (DMD-LoRA) schedule — EXACT replica of diffusers
+// FlowMatchEulerDiscreteScheduler.set_timesteps(num_steps) with shift=3, as used
+// by LiveAvatar's euler solver (causal_s2v_pipeline.py:921 -> FlowMatchEulerDiscreteScheduler(shift=3)).
+//   sigma_max=1.0, sigma_min=0.003/1.002; pre-shift sigmas = linspace(sigma_max,sigma_min,N);
+//   post-shift sigma' = shift*s/(1+(shift-1)*s); final boundary sigma = 0.
+// For N=4, shift=3 this gives [1.0, 0.85769, 0.60215, 0.00893, 0.0] (verified vs diffusers 0.37.1).
+static std::vector<float> distilled_sigmas(int steps, float shift) {
+    const float sigma_max = 1.0f;
+    const float sigma_min = 0.003f / 1.002f;  // 0.0029940...
+    std::vector<float> s(steps + 1);
+    for (int i = 0; i < steps; ++i) {
+        float sigma = (steps == 1)
+                          ? sigma_max
+                          : sigma_max + (sigma_min - sigma_max) * (float)i / (float)(steps - 1);
+        s[i] = shift * sigma / (1.0f + (shift - 1.0f) * sigma);
+    }
+    s[steps] = 0.0f;  // final boundary
+    return s;
+}
+
 // Load image -> RGB[0,1], short-side resize then center-crop to WxH, as ggml ne
 // [W,H,1,3] (channel-planar, ne[0] fastest = x). Mirrors speech2video.py's
 // Resize(min(H,W)) + CenterCrop((H,W)) + ToTensor (channels-first, [0,1]).
@@ -175,6 +195,7 @@ int main(int argc, char** argv) {
         printf("          --ref-image <png> --prompt \"<text>\" --wav <audio.wav>\n");
         printf("          [--out <dir>] [--frames N] [--height H] [--width W]\n");
         printf("          [--steps S] [--cfg G] [--shift F] [--fps R] [--cpu] [--load-only]\n");
+        printf("          [--distilled]  (DMD-LoRA 4-step euler schedule; sets shift=3, cfg=1)\n");
         return 1;
     }
 
@@ -199,6 +220,12 @@ int main(int argc, char** argv) {
     int   fps    = atoi(opt(argc, argv, "--fps", "16").c_str());
     bool  cpu    = has_flag(argc, argv, "--cpu");
     bool  load_only = has_flag(argc, argv, "--load-only");
+    // --distilled = DMD-LoRA 4-step euler schedule (shift defaults to 3, cfg forced to 1).
+    bool  distilled = has_flag(argc, argv, "--distilled");
+    if (distilled) {
+        if (!has_flag(argc, argv, "--shift")) shift = 3.0f;  // diffusers FlowMatchEuler default
+        cfg = 1.0f;                                          // DMD distilled = guide_scale 0 -> single fwd/step
+    }
 
     // S2V motion-frame constants (configs/wan_s2v_14B.py: motion_frames=73).
     const int MOTION_FRAMES     = 73;
@@ -472,9 +499,17 @@ int main(int argc, char** argv) {
     for (int64_t i = 0; i < x.numel(); ++i) x.data()[i] = nd(rng);
 
     sd::Tensor<float> cond_states;  // M1: empty (zeros) -> cond_encoder contributes +0.
-    auto sigmas = flow_sigmas(steps, shift);
+    auto sigmas = distilled ? distilled_sigmas(steps, shift) : flow_sigmas(steps, shift);
 
-    printf("\n=== flow-match sampling (%d steps) ===\n", steps);
+    printf("\n=== %s sampling (%d steps, shift=%.2f cfg=%.2f) ===\n",
+           distilled ? "DISTILLED euler (DMD-LoRA)" : "flow-match", steps, shift, cfg);
+    {
+        char sbuf[256]; int off = 0;
+        off += snprintf(sbuf + off, sizeof(sbuf) - off, "sigmas:");
+        for (size_t i = 0; i < sigmas.size() && off < (int)sizeof(sbuf) - 12; ++i)
+            off += snprintf(sbuf + off, sizeof(sbuf) - off, " %.5f", sigmas[i]);
+        printf("%s\n", sbuf);
+    }
     int64_t t_sample0 = ggml_time_ms();
     for (int i = 0; i < steps; ++i) {
         float sigma_t = sigmas[i], sigma_next = sigmas[i + 1];
