@@ -78,6 +78,7 @@ const char* model_version_to_str[] = {
     "Lens",
     "Longcat-Image",
     "Longcat-Video-Avatar",
+    "Wan 2.2 S2V (LiveAvatar)",
 };
 
 const char* sampling_methods_str[] = {
