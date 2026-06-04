@@ -416,6 +416,14 @@ struct RenderOpts {
     std::string spk_emb;
     std::string spk_pos_str;
     float timbre_cfg      = 0.0f;
+    // Clip continuation (Task 3). --video-anchor: a prior segment's tail video latent
+    // [W_lat,H_lat,N,48] (diffusion convention) — its N frames are pinned as clean
+    // anchors (frames 0..N-1, timestep 0). --audio-anchor: prior tail audio latent
+    // [128,K] — first K audio tokens pinned clean. Both chain DIRECTLY from a prior
+    // render's dumped latents (NAVA_DUMP_LATENT / NAVA_DUMP_AUDIO_LATENT); no VAE
+    // re-encode needed. --image still gives the single-frame i2v anchor (N=1).
+    std::string video_anchor;
+    std::string audio_anchor;
 };
 
 // FlowMatchScheduler (Euler), distilled from NAVA scheduler/flow_match.py.
@@ -532,6 +540,8 @@ static int run_render(int argc, char** argv) {
         else if (a == "--spk-emb") o.spk_emb = next("");
         else if (a == "--spk-pos") o.spk_pos_str = next("");
         else if (a == "--timbre-cfg") o.timbre_cfg = atof(next("0.0").c_str());
+        else if (a == "--video-anchor") o.video_anchor = next("");
+        else if (a == "--audio-anchor") o.audio_anchor = next("");
         else if (a == "--cuda") o.cuda = true;
         else { printf("unknown render arg: %s\n", a.c_str()); return 1; }
     }
@@ -586,9 +596,22 @@ static int run_render(int argc, char** argv) {
     // tools/nava_prep_image.py so we avoid linking stb here). VAE-encode it (decode_only
     // =false) BEFORE the 12.6GB DiT loads (VRAM: VAE alone fits, then freed). The anchor
     // is spliced at frame 0 and pinned each step via the per-token clean-anchor timestep.
-    sd::Tensor<float> anchor_latent;          // [W_lat, H_lat, 1, 48], diffusion convention
-    const bool i2v = !o.image.empty();
-    if (i2v) {
+    // Clean-anchor video latent [W_lat,H_lat,N,48] (diffusion convention): N tail frames
+    // of a prior segment (--video-anchor) OR a single i2v image (--image, N=1).
+    sd::Tensor<float> vid_anchor;
+    int n_anchor_v = 0;
+    if (!o.video_anchor.empty()) {
+        if (!path_exists(o.video_anchor)) { printf("ERROR: --video-anchor %s not found\n", o.video_anchor.c_str()); return 1; }
+        vid_anchor = sd::load_tensor_from_file_as_tensor<float>(o.video_anchor);
+        if (vid_anchor.dim() < 4 || vid_anchor.shape()[0] != (int64_t)W_lat
+            || vid_anchor.shape()[1] != (int64_t)H_lat || vid_anchor.shape()[3] != 48) {
+            printf("ERROR: --video-anchor ne %s != [%d,%d,N,48]\n",
+                   sd::tensor_shape_to_string(vid_anchor.shape()).c_str(), W_lat, H_lat);
+            return 1;
+        }
+        n_anchor_v = (int)vid_anchor.shape()[2];
+        printf("CONTINUATION: video anchor %s -> %d clean frame(s)\n", o.video_anchor.c_str(), n_anchor_v);
+    } else if (!o.image.empty()) {
         if (!path_exists(o.image)) { printf("ERROR: --image %s not found\n", o.image.c_str()); return 1; }
         auto img_rgb = sd::load_tensor_from_file_as_tensor<float>(o.image);
         printf("I2V: loaded image %s shape=%s\n", o.image.c_str(),
@@ -611,11 +634,29 @@ static int run_render(int argc, char** argv) {
         printf("I2V: encoded mu shape=%s\n", sd::tensor_shape_to_string(mu.shape()).c_str());
         sd::Tensor<float> mu5 = mu;
         mu5.reshape_({(int64_t)W_lat, (int64_t)H_lat, 1, 48, 1});
-        anchor_latent = encvae->vae_to_diffusion_latents(mu5);
-        anchor_latent.reshape_({(int64_t)W_lat, (int64_t)H_lat, 1, 48});
+        vid_anchor = encvae->vae_to_diffusion_latents(mu5);
+        vid_anchor.reshape_({(int64_t)W_lat, (int64_t)H_lat, 1, 48});
+        n_anchor_v = 1;
         encvae.reset();  // free VAE before the DiT loads
-        dump_stats("I2V anchor latent (diffusion)", anchor_latent);
+        dump_stats("I2V anchor latent (diffusion)", vid_anchor);
     }
+    // Clean-anchor audio latent [128,K]: first K audio tokens pinned to a prior segment's
+    // tail audio latent (--audio-anchor). Chains directly from a dumped audio latent.
+    sd::Tensor<float> aud_anchor;
+    int n_anchor_a = 0;
+    if (!o.audio_anchor.empty()) {
+        if (!path_exists(o.audio_anchor)) { printf("ERROR: --audio-anchor %s not found\n", o.audio_anchor.c_str()); return 1; }
+        aud_anchor = sd::load_tensor_from_file_as_tensor<float>(o.audio_anchor);
+        if (aud_anchor.shape()[0] != 128) {
+            printf("ERROR: --audio-anchor ne %s != [128,K]\n", sd::tensor_shape_to_string(aud_anchor.shape()).c_str());
+            return 1;
+        }
+        n_anchor_a = (int)aud_anchor.shape()[1];
+        if (n_anchor_a >= audio_len) n_anchor_a = audio_len - 1;  // keep >=1 token to denoise
+        printf("CONTINUATION: audio anchor %s -> %d clean token(s) (of %d)\n",
+               o.audio_anchor.c_str(), n_anchor_a, audio_len);
+    }
+    const bool i2v = (n_anchor_v > 0) || (n_anchor_a > 0);  // any clean-anchor => per-token timestep
 
     // ----- load DiT -----
     ModelLoader loader;
@@ -738,15 +779,25 @@ static int run_render(int argc, char** argv) {
     // and frame 0's latent is re-pinned to the image after every Euler step.
     const int h_grid_i      = H_lat / 2, w_grid_i = W_lat / 2;
     const int64_t L_vid_i   = (int64_t)f_len * h_grid_i * w_grid_i;
-    const int64_t n_clean_i = (int64_t)h_grid_i * w_grid_i;   // frame-0 spatial tokens
+    const int64_t n_clean_i = (int64_t)n_anchor_v * h_grid_i * w_grid_i;  // clean VIDEO tokens (N frames)
+    // Pin the N clean video frames + K clean audio tokens to their anchor latents. Called
+    // at init and after every video/audio step so the clean anchors stay exact through the
+    // trajectory (their per-token timestep=0 already drives velocity ~0).
     auto splice_anchor = [&]() {
-        if (!i2v) return;
-        const int64_t W = W_lat, H = H_lat, F = f_len;  // latent ne [W,H,F,48]
-        for (int64_t c = 0; c < 48; ++c)
-            for (int64_t y = 0; y < H; ++y)
-                for (int64_t x = 0; x < W; ++x)
-                    latent.data()[x + W * (y + H * (0 + F * c))] =
-                        anchor_latent.data()[x + W * (y + H * c)];
+        if (n_anchor_v > 0) {
+            const int64_t W = W_lat, H = H_lat, F = f_len;  // latent ne [W,H,F,48]; anchor [W,H,N,48]
+            for (int64_t f = 0; f < n_anchor_v; ++f)
+                for (int64_t c = 0; c < 48; ++c)
+                    for (int64_t y = 0; y < H; ++y)
+                        for (int64_t x = 0; x < W; ++x)
+                            latent.data()[x + W * (y + H * (f + F * c))] =
+                                vid_anchor.data()[x + W * (y + H * (f + (int64_t)n_anchor_v * c))];
+        }
+        if (n_anchor_a > 0) {  // audio_latent ne [128,audio_len]; aud_anchor [128,K]
+            for (int64_t k = 0; k < n_anchor_a; ++k)
+                for (int64_t c = 0; c < 128; ++c)
+                    audio_latent.data()[k * 128 + c] = aud_anchor.data()[k * 128 + c];
+        }
     };
     splice_anchor();
 
@@ -821,9 +872,13 @@ static int run_render(int argc, char** argv) {
         // T2V: scalar timestep (uniform-t, broadcast). Validated vs PyTorch (blocks 100-120 dB).
         sd::Tensor<float> ts;
         if (i2v) {
+            // per-token clean-anchor timestep: first n_clean_i video tokens (N frames) and
+            // first n_anchor_a audio tokens carry t=0; everything else carries tval.
             const int64_t L_total = L_vid_i + audio_len;
             ts = sd::Tensor<float>({L_total});
-            for (int64_t i = 0; i < L_total; ++i) ts.data()[i] = (i < n_clean_i) ? 0.0f : tval;
+            for (int64_t i = 0; i < L_vid_i; ++i) ts.data()[i] = (i < n_clean_i) ? 0.0f : tval;
+            for (int64_t j = 0; j < audio_len; ++j)
+                ts.data()[L_vid_i + j] = (j < (int64_t)n_anchor_a) ? 0.0f : tval;
         } else {
             ts = sd::Tensor<float>({1});
             ts.data()[0] = tval;
@@ -971,6 +1026,7 @@ static int run_render(int argc, char** argv) {
                     audio_latent.data()[i] += va_cfg.data()[i] * dsig_audio;
                 }
             }
+            splice_anchor();  // re-pin clean audio (and video) anchors after the audio step
             if (dump_traj) {
                 char fn[80];
                 snprintf(fn, sizeof(fn), "/aud_step_%02d.bin", step);
