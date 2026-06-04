@@ -63,6 +63,7 @@
 #include "vae.hpp"
 #include "wan.hpp"
 #include "ltx_audio_vae.h"
+#include "t5.hpp"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -75,6 +76,49 @@ static void log_cb(enum sd_log_level_t level, const char* text, void* /*data*/) 
 static bool path_exists(const std::string& p) {
     struct stat st;
     return stat(p.c_str(), &st) == 0;
+}
+
+// Match python's HuggingfaceTokenizer text preprocessing (nava_src .../tokenizers.py):
+// the umT5 sentencepiece normalizer applies NFKC, mapping full-width forms to ASCII
+// (U+FF01..U+FF5E -> cp-0xFEE0, U+3000 -> space). The cpp t5 unigram tokenizer does NOT
+// apply that charsmap, so full-width CJK punctuation ('，' U+FF0C, '：' U+FF1A, ...)
+// mis-tokenizes (id 356/619 instead of 275/283), corrupting the whole umT5 context via
+// bidirectional attention. Also apply whitespace_clean (collapse \s+ -> ' ', strip).
+static std::string nava_normalize_text(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    auto emit = [&](uint32_t cp) {
+        if (cp < 0x80) out.push_back((char)cp);
+        else if (cp < 0x800) { out.push_back((char)(0xC0 | (cp >> 6))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+        else if (cp < 0x10000) { out.push_back((char)(0xE0 | (cp >> 12))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+        else { out.push_back((char)(0xF0 | (cp >> 18))); out.push_back((char)(0x80 | ((cp >> 12) & 0x3F))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+    };
+    size_t i = 0, n = in.size();
+    while (i < n) {
+        unsigned char c = (unsigned char)in[i];
+        uint32_t cp; int len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c >> 5) == 0x6) { cp = c & 0x1F; len = 2; }
+        else if ((c >> 4) == 0xE) { cp = c & 0x0F; len = 3; }
+        else if ((c >> 3) == 0x1E) { cp = c & 0x07; len = 4; }
+        else { cp = c; len = 1; }
+        for (int k = 1; k < len && i + k < n; ++k) cp = (cp << 6) | ((unsigned char)in[i + k] & 0x3F);
+        i += len;
+        if (cp >= 0xFF01 && cp <= 0xFF5E) cp -= 0xFEE0;  // full-width forms -> ASCII (NFKC)
+        else if (cp == 0x3000) cp = 0x20;                // ideographic space -> space
+        emit(cp);
+    }
+    // whitespace_clean: collapse whitespace runs to a single space, then strip.
+    std::string ws;
+    ws.reserve(out.size());
+    bool prev_sp = false;
+    for (char ch : out) {
+        bool sp = (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v');
+        if (sp) { if (!prev_sp) ws.push_back(' '); prev_sp = true; }
+        else { ws.push_back(ch); prev_sp = false; }
+    }
+    size_t a = ws.find_first_not_of(' '), b = ws.find_last_not_of(' ');
+    return (a == std::string::npos) ? std::string() : ws.substr(a, b - a + 1);
 }
 
 static void mkdirs(const std::string& p) {
@@ -187,9 +231,12 @@ static int run_single_forward(int argc, char** argv) {
     // per-token-timestep path can be validated against the PyTorch first_frame_is_clean
     // reference (~/dev/NAVA/nava_dump_i2v_ref.py).
     if (getenv("NAVA_I2V")) {
-        const int h_grid = H / 2, w_grid = W / 2;
-        const int64_t L_vid = (int64_t)F * h_grid * w_grid;       // 128
-        const int64_t L_aud = audio.shape()[1];                   // 8
+        // derive the grid from the LOADED video tensor [W,H,F,48], not the smoke
+        // fallback consts, so the per-token t is correct at any resolution.
+        const int Wv = (int)video.shape()[0], Hv = (int)video.shape()[1], Fv = (int)video.shape()[2];
+        const int h_grid = Hv / 2, w_grid = Wv / 2;
+        const int64_t L_vid = (int64_t)Fv * h_grid * w_grid;
+        const int64_t L_aud = audio.shape()[1];
         const int64_t L_total = L_vid + L_aud;
         const int64_t n_clean = (int64_t)h_grid * w_grid;         // first-frame spatial tokens
         const float tval = timestep.data()[0];
@@ -241,6 +288,12 @@ static int run_single_forward(int argc, char** argv) {
     printf("NAVA backbone loaded\n");
 
     int n_threads = 8;
+    // NAVA_MASK_MODALITY=1: run the separate intra-modal attention path (align_3d_cfg
+    // masking_modality forward) so it can be diffed vs the PyTorch mmask reference.
+    if (getenv("NAVA_MASK_MODALITY")) {
+        runner->mask_modality = true;
+        printf("NAVA_MASK_MODALITY: separate intra-modal self-attention\n");
+    }
     int64_t t0 = ggml_time_ms();
     auto vel_video = runner->compute(n_threads, video, audio, context, timestep);
     int64_t t1 = ggml_time_ms();
@@ -251,7 +304,9 @@ static int run_single_forward(int argc, char** argv) {
     // The video velocity MUST be bit-identical between them — any diff is a
     // render-only bug (slicing/stride in the joint path).
     {
-        auto vv = runner->compute_va(n_threads, video, audio, context, timestep).first;
+        // pass the same mask_modality the compute() above used, else this compares
+        // masked-compute() vs unmasked-compute_va() (compute_va resets the flag).
+        auto vv = runner->compute_va(n_threads, video, audio, context, timestep, runner->mask_modality).first;
         dump_stats("compute()    vel_video", vel_video);
         dump_stats("compute_va() vv        ", vv);
         if (!vv.empty() && vv.numel() == vel_video.numel()) {
@@ -348,6 +403,8 @@ struct RenderOpts {
     int fps               = 24;
     uint64_t seed         = 42;
     float cfg             = 3.0f;
+    float cfg_align       = 3.0f;   // video_align_guidance_scale (align_3d_cfg)
+    float cfg_align_audio = 2.0f;   // audio_align_guidance_scale (align_3d_cfg)
     float shift           = 5.0f;
     bool cuda             = false;
     std::string image;         // I2V: input image; frame-0 clean-latent anchor (empty => T2V)
@@ -454,6 +511,8 @@ static int run_render(int argc, char** argv) {
         else if (a == "--seed") o.seed = (uint64_t)strtoull(next("42").c_str(), nullptr, 10);
         else if (a == "--image") o.image = next("");
         else if (a == "--cfg") o.cfg = atof(next("3.0").c_str());
+        else if (a == "--cfg-align") o.cfg_align = atof(next("3.0").c_str());
+        else if (a == "--cfg-align-audio") o.cfg_align_audio = atof(next("2.0").c_str());
         else if (a == "--shift") o.shift = atof(next("5.0").c_str());
         else if (a == "--out-name") o.out_name = next("");
         else if (a == "--runs-dir") o.runs_dir = next("");
@@ -483,7 +542,9 @@ static int run_render(int argc, char** argv) {
     // joint attention. Size it to the video duration (audio_tokens_per_sec=25,
     // video_fps=24 per nava_run.yaml), min 8, so the joint forward sees a
     // plausible audio stream even though we render silent.
-    const int audio_len = std::max(8, (int)std::lround(((f_len - 1) * 4 + 1) / 24.0 * 25.0));
+    // PyTorch uses ceil (t2v.py:417: math.ceil(video_duration * audio_tokens_per_sec)),
+    // NOT round — match it so the joint audio sequence length is identical.
+    const int audio_len = std::max(8, (int)std::ceil(((f_len - 1) * 4 + 1) / 24.0 * 25.0));
 
     printf("=== NAVA render (SILENT) ===\n");
     printf("prompt: %s\n", o.prompt.c_str());
@@ -655,20 +716,34 @@ static int run_render(int argc, char** argv) {
     // to an audio stream at the matching noise level (a frozen / degenerate audio
     // stream poisons the joint attention and the video never coheres).
     const float cfg_audio = 2.0f;  // nava_run.yaml audio_guidance_scale
+    // align_3d_cfg (nava_640.yaml): a 3rd "masking_modality" forward (separate
+    // intra-modal attention) adds an alignment guidance term to BOTH streams. This
+    // is what locks audio content to the video on hard prompts — its omission was
+    // the audio->noise divergence. Default ON to match python; NAVA_NO_ALIGN_CFG=1
+    // reverts to the old 2-way CFG for A/B.
+    const float cfg_video_align = o.cfg_align;        // video_align_guidance_scale
+    const float cfg_audio_align = o.cfg_align_audio;  // audio_align_guidance_scale
+    const bool  align_cfg       = getenv("NAVA_NO_ALIGN_CFG") == nullptr;
     FlowMatchSched sched;
     sched.set_timesteps(o.steps, o.shift);
-    // Optional UniPC multistep solver (validated vs PyTorch FlowUniPCMultistepScheduler).
-    // Higher-order corrector tames the big low-sigma Euler steps that otherwise amplify
-    // the per-forward error into a runaway std explosion. Separate history per stream.
-    const bool use_unipc = getenv("NAVA_UNIPC") != nullptr;
+    // UniPC multistep solver (validated vs PyTorch FlowUniPCMultistepScheduler) is the
+    // DEFAULT: it matches python prod (nava_run.yaml scheduler_unipc=true). Its higher-order
+    // corrector tames the big low-sigma Euler steps that otherwise leave residual noise/"fuzz"
+    // at low step counts (and can run the std away). Opt out with NAVA_EULER=1 (plain Euler).
+    const bool use_unipc = getenv("NAVA_EULER") == nullptr;
+    // Per-stream sampler: the AUDIO stream can use a DIFFERENT solver than video.
+    // UniPC's higher-order corrector cleans up the VIDEO fuzz, but on the audio stream
+    // it can run aud_std away (-> the voice diverges to noise on hard prompts). Set
+    // NAVA_AUDIO_EULER=1 to keep video on UniPC but denoise audio with plain Euler.
+    const bool use_unipc_audio = use_unipc && getenv("NAVA_AUDIO_EULER") == nullptr;
     UniPCSched usched_v, usched_a;
     if (use_unipc) {
         usched_v.set_timesteps(o.steps, o.shift);
         usched_a.set_timesteps(o.steps, o.shift);
-        printf("sampler: UniPC (multistep, order<=2)\n");
-    } else {
-        printf("sampler: Euler flow-match\n");
     }
+    printf("sampler: video=%s  audio=%s\n",
+           use_unipc ? "UniPC" : "Euler",
+           use_unipc_audio ? "UniPC" : "Euler");
 
     // Optional per-step trajectory dump for cpp-vs-PyTorch sampler faithfulness probe.
     const char* dump_traj = getenv("NAVA_DUMP_TRAJ");
@@ -701,24 +776,47 @@ static int run_render(int argc, char** argv) {
             printf("ERROR: DiT forward returned empty at step %d\n", step);
             return 1;
         }
-        // Separate AUDIO uncond forward (PyTorch uses a distinct audio neg-prompt).
-        // The audio velocity from THIS forward replaces va_uncond for the audio CFG.
+        // AUDIO uncond context. PyTorch's MMDiT merges to a SINGLE shared context for
+        // both streams: when spk_embed is None (our case — spk is stubbed), the merge
+        // picks context_VID, so the audio stream's uncond uses the VIDEO negative and
+        // the audio negative is DISCARDED (model_mm.py:1644, uncond pass spk=None at
+        // pipeline_nava.py:491). So by default we reuse va_uncond (video-neg joint pass)
+        // for audio — matching python — and SKIP the separate audio-neg forward.
+        // NAVA_SEPARATE_AUDIO_NEG=1 restores the old behaviour (correct only once a real
+        // speaker embed is wired, where the merge would pick context_audio).
+        static const bool separate_audio_neg =
+            have_audio_neg && getenv("NAVA_SEPARATE_AUDIO_NEG") != nullptr;
         sd::Tensor<float> va_audio_uncond;
-        if (have_audio_neg) {
+        if (separate_audio_neg) {
             auto [vv_audio_unc, va_audio_unc] =
                 runner->compute_va(n_threads, latent, audio_latent, ctx_audio_neg, ts);
             (void)vv_audio_unc;
             va_audio_uncond = std::move(va_audio_unc);
         }
         const sd::Tensor<float>& va_uncond_for_audio =
-            have_audio_neg ? va_audio_uncond : va_uncond;
+            separate_audio_neg ? va_audio_uncond : va_uncond;
         float dsig = sched.sigma_next(step) - sched.sigmas[step];
 
+        // align_3d_cfg: 3rd forward with masking_modality=true (separate intra-modal
+        // attention, same POSITIVE context) -> alignment guidance anchor for both streams.
+        sd::Tensor<float> vv_mmask, va_mmask;
+        if (align_cfg) {
+            std::tie(vv_mmask, va_mmask) =
+                runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/true);
+        }
+
         // --- video: CFG combine (patched) -> unpatchify -> Euler step ---
+        // align on : eps = ec + g*(ec-eu) + ga*(ec-emmask)   (cond base, 3-term)
+        // align off: eps = eu + g*(ec-eu)                     (legacy 2-term)
         sd::Tensor<float> v_p(vv_cond.shape());
         for (int64_t i = 0; i < v_p.numel(); ++i) {
             float vc = vv_cond.data()[i], vu = vv_uncond.data()[i];
-            v_p.data()[i] = vu + o.cfg * (vc - vu);
+            if (align_cfg && !vv_mmask.empty()) {
+                float vm      = vv_mmask.data()[i];
+                v_p.data()[i] = vc + o.cfg * (vc - vu) + cfg_video_align * (vc - vm);
+            } else {
+                v_p.data()[i] = vu + o.cfg * (vc - vu);
+            }
         }
         auto v = unpatchify_video(v_p, f_len, h_grid, w_grid);
         if (dump_traj) {
@@ -748,14 +846,31 @@ static int run_render(int argc, char** argv) {
             sd::Tensor<float> va_cfg(audio_latent.shape());
             for (int64_t i = 0; i < audio_latent.numel(); ++i) {
                 float ac = va_cond.data()[i], au = va_uncond_for_audio.data()[i];
-                va_cfg.data()[i] = au + cfg_audio * (ac - au);
+                if (align_cfg && !va_mmask.empty() && va_mmask.numel() == audio_latent.numel()) {
+                    float am         = va_mmask.data()[i];
+                    va_cfg.data()[i] = ac + cfg_audio * (ac - au) + cfg_audio_align * (ac - am);
+                } else {
+                    va_cfg.data()[i] = au + cfg_audio * (ac - au);
+                }
             }
-            if (use_unipc) {
+            if (dump_traj) {
+                char fn[80];
+                snprintf(fn, sizeof(fn), "/va_cfg_%02d.bin", step);
+                write_bin(std::string(dump_traj) + fn, va_cfg, "va_cfg");
+                snprintf(fn, sizeof(fn), "/va_cond_%02d.bin", step);
+                write_bin(std::string(dump_traj) + fn, va_cond, "va_cond");
+            }
+            if (use_unipc_audio) {
                 audio_latent = usched_a.step(va_cfg, audio_latent);
             } else {
                 for (int64_t i = 0; i < audio_latent.numel(); ++i) {
                     audio_latent.data()[i] += va_cfg.data()[i] * dsig;
                 }
+            }
+            if (dump_traj) {
+                char fn[80];
+                snprintf(fn, sizeof(fn), "/aud_step_%02d.bin", step);
+                write_bin(std::string(dump_traj) + fn, audio_latent, "aud_step");
             }
         }
         double asm_ = 0, asq = 0; int64_t an = audio_latent.numel();
@@ -1050,6 +1165,112 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::string(argv[1]) == "unipc-test") {
         return run_unipc_test(argc, argv);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "encode-prompt") {
+        // nava encode-prompt <umt5_gguf> <prompt.txt> <out.bin>  — encode a text prompt
+        // through umT5-xxl (GPU) into a NAVA context bin [4096,512] (zero-padded), matching
+        // dump_three_ctx.py. Makes the cpp nava pipeline self-sufficient (text -> context).
+        if (argc < 5) {
+            printf("usage: %s encode-prompt <umt5_gguf> <prompt.txt> <out.bin>\n", argv[0]);
+            return 1;
+        }
+        std::string gguf = argv[2], pf = argv[3], out = argv[4];
+        std::string text;
+        {
+            FILE* f = fopen(pf.c_str(), "rb");
+            if (!f) { printf("cannot open prompt file %s\n", pf.c_str()); return 1; }
+            fseek(f, 0, SEEK_END);
+            long n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (n > 0) { text.resize((size_t)n); size_t r = fread(&text[0], 1, (size_t)n, f); text.resize(r); }
+            fclose(f);
+            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+        }
+        // NAVA data-loader caption transform (nava_src/data/t2v.py:391, the
+        // use_speech_special_token=false path that nava_640.yaml/prod selects):
+        //   text = text.replace("<S>", "<S><extra_id_2>")
+        // i.e. insert the umT5 sentinel <extra_id_2> (id 256297) right after each
+        // speech-start marker. The pipeline ALWAYS does this before the umT5 encode;
+        // omitting it shifts every token from the spoken line onward and the
+        // bidirectional umT5 context diverges there (cos ~0.35 past the marker),
+        // which the joint DiT faithfully turns into GARBLED SPEECH while the video
+        // (barely dependent on those tokens) looks fine. <E> stays literal, matching
+        // use_speech_special_token=false. The cpp unigram tokenizer already maps
+        // <extra_id_2> -> 256297, so only this textual insertion is needed.
+        // The TRAILING SPACE is load-bearing: HF/sentencepiece re-adds the metaspace
+        // (▁) to the word AFTER a special token, so "<extra_id_2>We" tokenizes as
+        // [<extra_id_2>, ▁We]. The cpp unigram tokenizer does NOT add ▁ after a
+        // special token, so without the space "We" tokenizes as bare 7440 instead of
+        // ▁We=1136 — one wrong token right at the start of the spoken line, which
+        // ripples through the bidirectional context. The inserted space makes the cpp
+        // tokenizer emit ▁We, matching HF exactly (0 token diffs). whitespace_clean
+        // (in nava_normalize_text below) preserves the single space.
+        {
+            const std::string from = "<S>", to = "<S><extra_id_2> ";
+            for (size_t p = 0; (p = text.find(from, p)) != std::string::npos; p += to.size())
+                text.replace(p, from.size(), to);
+        }
+        // NFKC full-width normalization + whitespace_clean, to match python's tokenizer
+        // (the cpp t5 unigram tokenizer skips the sentencepiece NFKC charsmap).
+        text = nava_normalize_text(text);
+        ggml_backend_t backend = nullptr;
+#ifdef GGML_USE_CUDA
+        backend = ggml_backend_cuda_init(0);
+#endif
+        if (!backend) backend = ggml_backend_cpu_init();
+        ModelLoader ml;
+        if (!ml.init_from_file_and_convert_name(gguf)) { printf("umt5 load fail: %s\n", gguf.c_str()); return 1; }
+        auto& tsm           = ml.get_tensor_storage_map();
+        const char* T5PREFIX = "text_encoders.t5xxl.transformer";
+        auto t5   = std::make_shared<T5Embedder>(backend, backend, tsm, T5PREFIX, /*is_umt5=*/true);
+        t5->alloc_params_buffer();
+        std::map<std::string, ggml_tensor*> tensors;
+        t5->get_param_tensors(tensors, T5PREFIX);
+        if (!ml.load_tensors(tensors)) { printf("umt5 tensors load fail\n"); return 1; }
+        printf("umt5 loaded; prompt is %zu bytes\n", text.size());
+        // No token padding (max_length=0, padding=false) -> raw token length, then we
+        // zero-pad the OUTPUT to 512, exactly like dump_three_ctx.py.
+        auto tw          = t5->tokenize(text, 0, false);
+        auto& tokens     = std::get<0>(tw);
+        auto& masks      = std::get<2>(tw);
+        if (const char* tp = getenv("NAVA_DUMP_TOKENS")) {
+            FILE* tf = fopen(tp, "w");
+            if (tf) { for (auto id : tokens) fprintf(tf, "%d\n", (int)id); fclose(tf);
+                      printf("dumped %zu token ids -> %s\n", tokens.size(), tp); }
+        }
+        // NAVA caps umT5 at text_len=512 (model_loading_utils.py): truncate the INPUT
+        // to 512 so the encoder doesn't attend past it. (Truncating only the OUTPUT
+        // would let the kept embeddings see the dropped tail -> not faithful to python.)
+        const size_t kMaxTok = 512;
+        if (tokens.size() > kMaxTok) {
+            // Match python (HF tokenizer seq_len=512 truncation): keep the first 511
+            // content tokens and KEEP the EOS at position 511 — do NOT keep 512 content
+            // and drop EOS. umT5 is a bidirectional encoder, so a missing/!=EOS terminator
+            // shifts EVERY token's embedding (context cos ~0.57 vs ~0.99 otherwise).
+            int eos = tokens.back();  // umT5 EOS (id 1) at the natural sequence end
+            printf("tokens=%zu -> truncating to %zu (511 content + EOS %d, NAVA umT5 text_len cap)\n",
+                   tokens.size(), kMaxTok, eos);
+            tokens.resize(kMaxTok - 1);
+            tokens.push_back(eos);
+            masks.assign(kMaxTok, 0.0f);  // tokenize already mapped valid->0.0 / pad->-HUGE (t5.hpp:509)
+        }
+        printf("tokens=%zu\n", tokens.size());
+        auto input_ids = sd::Tensor<int32_t>::from_vector(tokens);
+        auto attn_mask = sd::Tensor<float>::from_vector(masks);
+        auto emb       = t5->model.compute(8, input_ids, attn_mask);  // ne [4096, L]
+        if (emb.empty()) { printf("umt5 encode returned empty\n"); return 1; }
+        int64_t C  = emb.shape()[0];
+        int64_t L  = emb.shape().size() > 1 ? emb.shape()[1] : 1;
+        int64_t Lc = std::min<int64_t>(L, 512);
+        sd::Tensor<float> ctx({C, 512});
+        std::fill(ctx.data(), ctx.data() + ctx.numel(), 0.0f);
+        for (int64_t tok = 0; tok < Lc; ++tok)
+            for (int64_t c = 0; c < C; ++c)
+                ctx.data()[c + C * tok] = emb.data()[c + C * tok];
+        write_bin(out, ctx, "context");
+        dump_stats("umt5 context", ctx);
+        printf("encoded -> %s  ne=[%lld,512]  (token L=%lld)\n", out.c_str(), (long long)C, (long long)L);
+        return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "ltx-audio-test") {
         // nava ltx-audio-test <gguf> <latent.bin> [out_wave.bin]  — load the audio VAE gguf

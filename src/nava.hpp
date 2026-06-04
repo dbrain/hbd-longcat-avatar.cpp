@@ -342,7 +342,8 @@ namespace NAVA {
                              ggml_tensor* e_vid,    // [dim, 6, N]
                              ggml_tensor* e_audio,  // [dim, 6, N]
                              ggml_tensor* pe,
-                             ggml_tensor* context) {
+                             ggml_tensor* context,
+                             bool joint_attn = true) {  // false = masking_modality (intra-modal only)
             int64_t L_total = x->ne[1];
             int64_t L_aud   = L_total - L_vid;
 
@@ -371,16 +372,26 @@ namespace NAVA {
             ggml_tensor *qv, *kv, *vv, *qa, *ka, *va;
             std::tie(qv, kv, vv) = self_attn->qkv_suffix(ctx, xv_n, "");
             std::tie(qa, ka, va) = self_attn->qkv_suffix(ctx, xa_n, "_audio");
-            // concat over the token dim (ne dim 2): [head_dim, n_head, L, N]
-            auto q = ggml_concat(ctx->ggml_ctx, qv, qa, 2);
-            auto k = ggml_concat(ctx->ggml_ctx, kv, ka, 2);
-            auto v = ggml_concat(ctx->ggml_ctx, vv, va, 2);
-
-            // joint rope + attention over the whole sequence (B=1 unpadded -> no mask)
-            auto attn = Rope::attention(ctx, q, k, v, pe, nullptr, 1.0f, true, ctx->flash_attn_enabled);  // [dim, L_total, N]
-
-            auto attn_v = ggml_ext_slice(ctx->ggml_ctx, attn, 1, 0, L_vid);
-            auto attn_a = ggml_ext_slice(ctx->ggml_ctx, attn, 1, L_vid, L_total);
+            ggml_tensor *attn_v, *attn_a;
+            if (joint_attn) {
+                // concat over the token dim (ne dim 2): [head_dim, n_head, L, N]
+                auto q = ggml_concat(ctx->ggml_ctx, qv, qa, 2);
+                auto k = ggml_concat(ctx->ggml_ctx, kv, ka, 2);
+                auto v = ggml_concat(ctx->ggml_ctx, vv, va, 2);
+                // joint rope + attention over the whole sequence (B=1 unpadded -> no mask)
+                auto attn = Rope::attention(ctx, q, k, v, pe, nullptr, 1.0f, true, ctx->flash_attn_enabled);  // [dim, L_total, N]
+                attn_v = ggml_ext_slice(ctx->ggml_ctx, attn, 1, 0, L_vid);
+                attn_a = ggml_ext_slice(ctx->ggml_ctx, attn, 1, L_vid, L_total);
+            } else {
+                // masking_modality (align_3d_cfg): SEPARATE intra-modal self-attention —
+                // video tokens attend only to video, audio only to audio (no cross-modal).
+                // The joint pe (ne[3]==L_total) is the per-token concat of video++audio
+                // freqs, so slice it per stream to match each sub-sequence.
+                auto pe_v   = ggml_ext_slice(ctx->ggml_ctx, pe, 3, 0, L_vid);
+                auto pe_a   = ggml_ext_slice(ctx->ggml_ctx, pe, 3, L_vid, L_total);
+                attn_v      = Rope::attention(ctx, qv, kv, vv, pe_v, nullptr, 1.0f, true, ctx->flash_attn_enabled);
+                attn_a      = Rope::attention(ctx, qa, ka, va, pe_a, nullptr, 1.0f, true, ctx->flash_attn_enabled);
+            }
             auto yv     = self_attn->out_suffix(ctx, attn_v, "");
             auto ya_sa  = self_attn->out_suffix(ctx, attn_a, "_audio");
             // gated residual
@@ -438,7 +449,9 @@ namespace NAVA {
                              ggml_tensor* x,    // [dim, L_total, N]
                              ggml_tensor* e,    // [dim, 6, N]  (cat of e_vid,e_audio per token; see runner)
                              ggml_tensor* pe,
-                             ggml_tensor* context) {
+                             ggml_tensor* context,
+                             int64_t L_vid    = -1,      // for masking_modality split (default: joint, unused)
+                             bool joint_attn  = true) {  // false = masking_modality (intra-modal only)
             int64_t L = x->ne[1];
             int64_t N = x->ne[2];
 
@@ -462,7 +475,24 @@ namespace NAVA {
             y      = mod_add(ctx->ggml_ctx, ggml_add(ctx->ggml_ctx, y, mod_mul(ctx->ggml_ctx, y, es[1])), es[0]);
             ggml_tensor *q, *k, *v;
             std::tie(q, k, v) = self_attn->qkv(ctx, y);
-            auto attn         = Rope::attention(ctx, q, k, v, pe, nullptr, 1.0f, true, ctx->flash_attn_enabled);
+            ggml_tensor* attn;
+            if (joint_attn) {
+                attn = Rope::attention(ctx, q, k, v, pe, nullptr, 1.0f, true, ctx->flash_attn_enabled);
+            } else {
+                // masking_modality: split q/k/v at L_vid (token axis ne[2]) + slice pe (ne[3])
+                // -> separate intra-modal attention, then re-concat over the token dim.
+                auto qv   = ggml_ext_slice(ctx->ggml_ctx, q, 2, 0, L_vid);
+                auto kv   = ggml_ext_slice(ctx->ggml_ctx, k, 2, 0, L_vid);
+                auto vv   = ggml_ext_slice(ctx->ggml_ctx, v, 2, 0, L_vid);
+                auto qa   = ggml_ext_slice(ctx->ggml_ctx, q, 2, L_vid, L);
+                auto ka   = ggml_ext_slice(ctx->ggml_ctx, k, 2, L_vid, L);
+                auto va   = ggml_ext_slice(ctx->ggml_ctx, v, 2, L_vid, L);
+                auto pe_v = ggml_ext_slice(ctx->ggml_ctx, pe, 3, 0, L_vid);
+                auto pe_a = ggml_ext_slice(ctx->ggml_ctx, pe, 3, L_vid, L);
+                auto av   = Rope::attention(ctx, qv, kv, vv, pe_v, nullptr, 1.0f, true, ctx->flash_attn_enabled);
+                auto aa   = Rope::attention(ctx, qa, ka, va, pe_a, nullptr, 1.0f, true, ctx->flash_attn_enabled);
+                attn      = ggml_concat(ctx->ggml_ctx, av, aa, 1);  // [dim, L_total, N]
+            }
             attn              = self_attn->out(ctx, attn);
             x                 = ggml_add(ctx->ggml_ctx, x, mod_mul(ctx->ggml_ctx, attn, es[2]));
 
@@ -691,6 +721,9 @@ namespace NAVA {
         // when set, build_graph emits ONE output = concat(vel_video, pad(vel_audio,192))
         // so compute_va() can recover BOTH stream velocities for joint denoising.
         bool return_joint = false;
+        // when set, the self-attention runs SEPARATE intra-modal (video-only / audio-only)
+        // instead of joint cross-modal — the align_3d_cfg "masking_modality" forward pass.
+        bool mask_modality = false;
 
         NavaRunner(ggml_backend_t backend,
                    ggml_backend_t params_backend,
@@ -781,7 +814,7 @@ namespace NAVA {
             for (int i = 0; i < nava_params.num_double; ++i) {
                 auto blk = std::dynamic_pointer_cast<DoubleBlock>(
                     nava.get_block("double_blocks." + std::to_string(i)));
-                x = blk->forward(&rc, x, L_vid, e_vid, e_audio, pe, context_e);
+                x = blk->forward(&rc, x, L_vid, e_vid, e_audio, pe, context_e, !mask_modality);
                 rc.capture_tensor("double_blocks." + std::to_string(i), x);
             }
 
@@ -790,7 +823,7 @@ namespace NAVA {
             for (int i = 0; i < nava_params.num_single; ++i) {
                 auto blk = std::dynamic_pointer_cast<SingleBlock>(
                     nava.get_block("single_blocks." + std::to_string(i)));
-                x = blk->forward(&rc, x, e_single, pe, context_e);
+                x = blk->forward(&rc, x, e_single, pe, context_e, L_vid, !mask_modality);
                 rc.capture_tensor("single_blocks." + std::to_string(i), x);
             }
 
@@ -871,13 +904,16 @@ namespace NAVA {
                    const sd::Tensor<float>& video,
                    const sd::Tensor<float>& audio,
                    const sd::Tensor<float>& context,
-                   const sd::Tensor<float>& timestep) {
-            return_joint = true;
+                   const sd::Tensor<float>& timestep,
+                   bool mask_modality_arg = false) {
+            return_joint  = true;
+            mask_modality = mask_modality_arg;
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(video, audio, context, timestep);
             };
             auto r       = GGMLRunner::compute<float>(get_graph, n_threads, false);
-            return_joint = false;
+            return_joint  = false;
+            mask_modality = false;
             sd::Tensor<float> joint = r.value_or(sd::Tensor<float>());  // [192, L_total]
             if (joint.empty()) {
                 return {sd::Tensor<float>(), sd::Tensor<float>()};
