@@ -170,3 +170,80 @@ cd /home/dbrain/dev/longcat-avatar.cpp
 - ggufs in `models/`: nava-dit-{q8_0,f16}.gguf, longcat-umt5-xxl-q8_0.gguf,
   wan2.2-vae-48ch-f16.gguf, nava-ltx-audio-vae-f16.gguf
 - python full render harness: `/mnt/hdd/nava/run_nava.sh` (fp8, fits 12GB, ~14 min).
+
+---
+## Reference clips already on the ear server (http://10.0.0.208:8099)
+Files live in `/mnt/hdd/nava/audio_demo/` (direct URL = http://10.0.0.208:8099/<file>).
+The page `index.html` is hand-edited; add a row when you add a clip. MOST RELEVANT for
+the decode task are 10 vs 11 (same latent, cpp vs python decode) and GTA (python @896).
+
+| # | file | what it is |
+|---|------|-----------|
+| 10 | 10_cpp_CORRECT_ctx_extra_id2.wav | **cpp decode**, peter seed42, fixed context. Speech correct, timbre "clippy/warble". |
+| 11 | 11_pythonVAE_decode_of_FIXED_cpp_latent.wav | **python decode of the SAME seed42 cpp latent**. 10-vs-11 isolates the DECODE (the task). |
+| 16 | 16_python_from_cpp42noise.wav | python full pipeline fed cpp's seed42 INIT NOISE (injection test). |
+| 14 | 14_cpp_seed123_GOOD.wav | cpp seed123 (richer formants). |
+| 15 | 15_cpp_seed7.wav | cpp seed7 (owner: "ok"). |
+| 12 | 12_cpp_audioEULER.wav | cpp seed42, audio on Euler (vs UniPC) — same deficit. |
+| 13 | 13_cpp_NOalign.wav | cpp seed42, align CFG off — worse. |
+| 8 | 8_cpp_fresh_verified_ctx.wav | cpp seed42 BEFORE the sentinel fix (garbled "betruer/what h-"). |
+| 9 | 9_pythonVAE_decode_of_cpp_latent.wav | python decode of the BUGGY-context cpp latent. |
+| GT | GT_python_full_render.wav | python full render, but **384×384** (resolution differs — weak ref). |
+| GTA | GTA_python_noclone_sameres.wav | python full render **896×448** (cmp_A) — the proper same-res quality TARGET. |
+| 1-7 | 1_*..7_* | older prev-agent A/Bs (decode-cross, context-swap); lower trust. |
+
+Video clips (http://10.0.0.208:8097, dir `/mnt/hdd/nava/cpp-runs/<name>/clip.webm`):
+`cpp_peter_fixedctx_v2` (seed42 fixed), `cpp_peter_seed7`/`cpp_peter_seed123`,
+`cmp_A_python_noclone` (python @896 reference, h264+aac).
+
+## Running PYTHON (reference render + decode oracle)
+- venv: `/mnt/hdd/nava/.venv/bin/python`. Run from `cd /home/dbrain/dev/NAVA`.
+- **Decode oracle** (python decode of a cpp audio latent .bin → 16k wav.bin):
+  ```
+  /mnt/hdd/nava/.venv/bin/python /home/dbrain/dev/NAVA/nava_audio_vae_decode_ref.py \
+     <latent.bin> <out_wave.bin>          # 16 kHz, NO BWE; ne [n_samples, 2]
+  ```
+- **Full python render** (fp8, FITS the 12 GB GPU, ~14 min; the quality ground truth):
+  ```
+  NAME=py_ref DATA_FILE=/mnt/hdd/nava/peter_noclone.jsonl \
+  W=896 H=448 FRAMES=13 STEPS=10 DUR=2.0 \
+  CFG=/mnt/hdd/nava/nava_640.yaml GENFLAGS="--is_i2v" \
+  bash /mnt/hdd/nava/run_nava.sh
+  # output mp4 -> /mnt/hdd/nava/runs/$NAME/*.mp4 and /mnt/hdd/nava/clips/$NAME.mp4
+  ```
+  (uses NAVA_fp8.safetensors; peak ~10 GB VRAM, ~26 GB RAM. ~14 min, mostly model load.)
+- **Init-noise injection** (prove faithfulness: feed cpp's dumped init noise to python).
+  pipeline_nava.py `sample()` has an env hook (left in place, no-op unless set):
+  ```
+  NAVA_INJECT_INIT=1 \
+  NAVA_INJECT_AUDIO=/mnt/hdd/nava/cpp_traj/aud_noise.bin \
+  NAVA_INJECT_VIDEO=/mnt/hdd/nava/cpp_traj/vid_noise.bin \
+  NAME=py_inject ... bash /mnt/hdd/nava/run_nava.sh
+  ```
+  (cpp dumps aud_noise/vid_noise via `NAVA_DUMP_TRAJ=<dir>` on a render. Layout
+  conversion is handled in the hook: aud ne[128,T]→[T,128]; vid ne[W,H,F,C]→
+  reshape(C,F,H,W).transpose(1,2,3,0).reshape(F*H*W,C).)
+- The model arch config (NAVA_6B.json, temporal_rope_scaling_factor 0.24, audio_in_dim
+  128) is the JOINT WanAVModel; audio rope = rope_params(1024, 44, scaling=0.24), 22
+  rotated complex pairs (cpp matches). `audio_tiny.json` (0.19676) is the DEAD fusion
+  path — NOT used; don't follow it.
+
+## LOW-MEMORY / OOM SURVIVAL (this box bites; read before launching jobs)
+- GPU = ONE 12 GB 3060, used SERIALLY. RAM = 31 GB total.
+- **NEVER run two model loads concurrently.** The classic crash: a python bf16 model
+  (~12 GB RAM) + a cpp f16 forward (~12 GB RAM) at once → RAM OOM (the box dies/swaps).
+  Run python and cpp jobs ONE AT A TIME. Check with `free -g` (want >12 G avail before
+  a second load) and `nvidia-smi`.
+- The DiT on GPU: f16 (~12.5 GB) does NOT fit the 12 GB card — use **q8** for renders.
+  f16 is CPU-only (the forward-diff oracle). bf16 python backbone OOMs the GPU on build;
+  the fp8 `run_nava.sh` path is the one that fits.
+- After `pkill`-ing a GPU job, **sleep 2-3 s before the next** GPU launch or it fails on
+  a VRAM-release race (CUDA init error / instant exit-1). Verify `nvidia-smi` shows the
+  memory freed first.
+- The bf16 reference dumps load F32→bf16 weights on CPU which takes **~466 s** (≈8 min)
+  with NO output — it LOOKS hung but isn't; wait it out (or watch RSS climb).
+- Backgrounding gotcha: `nohup cmd &` inside a one-shot shell can get **killed when the
+  shell returns**. Prefer a job runner that detaches properly, `nohup cmd & disown`, or
+  keep the launching process alive until the child writes its first output.
+- Don't leave orphan cpp forwards from killed loops — they keep ~12 GB RAM. `pgrep -af
+  "build-nava/bin/nava|inference_nava.py|nava_dump"` and kill stragglers by PID.
