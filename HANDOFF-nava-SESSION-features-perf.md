@@ -93,12 +93,23 @@ All numbers @ 896x448 / 13 frames / 10 steps, RTX 3060, peter i2v. VRAM = sample
 | q8 + FA | 9069 | 179s | 87s | 56s | 30s | 0.996 |
 | q4_K + FA | 9069* | 179s | 89s | 56s | 30s | **0.754 (BAD)** |
 | q4_K(audio-q8) + FA | 9071* | 180s | 89s | 56s | 30s | 0.783 (still bad) |
+| **q4_K + FA + tile16** | **6173 MiB** | 176s | 89s | 46s | 30s | 0.754* (ear-OK) |
 | **q6_K + FA + tile16** | **7579 MiB** | **176s** | 95s | 46s | 30s | **0.991 (held)** |
 
 \* once weights shrink, the VAE decode (8.8GB) becomes the ceiling — see tile fix.
 
-WINNING CONFIG = **q6_K DiT + flash-attention (default) + `NAVA_VAE_TILE=16`**:
-peak **7579 MiB (7.40 GiB, under 7.5)**, audio cos 0.991 / video 0.988 vs q8, wall −24%.
+WINNING CONFIG = **q4_K or q6_K DiT + flash-attention (default) + `NAVA_VAE_TILE=16`**:
+- q6_K: peak **7579 MiB (7.40 GiB)**, audio latent cos 0.991 — the conservative pick.
+- q4_K: peak **6173 MiB (6.0 GiB)** — 1.4GB lighter; latent cos 0.754 BUT that metric
+  OVERSTATES the perceptual gap (the audio-VAE decode is phase/detail-tolerant: q4_K-vs-q8
+  decoded-waveform sample corr ≈ 0 from phase, yet spectral centroid 1354 vs 1424 Hz and
+  RMS 0.31 vs 0.25 are close). Owner ear-tested q4_K = OK → q4_K is viable for the budget,
+  freeing headroom for higher res / longer clips. Ear rows 28 (q6_K) vs 29 (q4_K) to A/B.
+- Latent cosine is a POOR perceptual proxy for the audio stream — judge audio by ear.
+
+CONTINUATION note: N>1 video anchors go out-of-distribution (model only ever saw 1 clean
+frame in training) → artifacts (floating mouth). **Use N=1** (= i2v from the last generated
+frame); see eye `chain_seg1_n1` / `chain_CONCAT_n1` (stable) vs `chain_seg1_n3k13` (whacky).
 
 Levers, measured (don't re-derive):
 - **Flash attention** (commit 6b710af, default ON): the joint self-attn (~5k tokens,
