@@ -26,6 +26,12 @@ if(SD_WEBM)
     if(SD_OPUS_FOUND)
         target_compile_definitions(${TARGET} PRIVATE SD_USE_OPUS)
         target_link_libraries(${TARGET} PRIVATE opus)
+        # media_io.cpp includes <opus/opus.h>; a cross sysroot toolchain doesn't search
+        # the host /usr/include and CMake strips it as "implicit", so pass the opus parent
+        # dir as a raw compile option (mirrors examples/nava).
+        if(Opus_INCLUDEDIR)
+            target_compile_options(${TARGET} PRIVATE "-I${Opus_INCLUDEDIR}")
+        endif()
     endif()
 endif()
 target_compile_features(${TARGET} PUBLIC c_std_11 cxx_std_17)

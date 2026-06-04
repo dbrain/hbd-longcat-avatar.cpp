@@ -1106,11 +1106,17 @@ static int run_render(int argc, char** argv) {
     // The Wan2.2 16x VAE decode buffer is spatial-bound (~7GB at 24x24 latent on the
     // 3060). Tile spatially at the proven-fit 24x24 latent size so full-bucket
     // (832x480 -> 52x30 latent) fits 12GB. Single-tile no-op when <= 24x24.
-    tiling.enabled        = (W_lat > 24 || H_lat > 24);
+    // The 7.7GB decode compute buffer scales ~quadratically with the tile size. 24x24
+    // peaks ~8.8GB (over the 7.5GB budget); smaller tiles cut it (16x16 ~ (16/24)^2 =
+    // 0.44x). NAVA_VAE_TILE overrides the latent tile edge (default 24).
+    int vae_tile = 24;
+    if (const char* vt = getenv("NAVA_VAE_TILE")) { int t = atoi(vt); if (t >= 8 && t <= 64) vae_tile = t; }
+    tiling.enabled        = (W_lat > vae_tile || H_lat > vae_tile);
     tiling.temporal_tiling = false;  // wan VAE is causal-conv3d => temporal already streamed
-    tiling.tile_size_x    = 24;
-    tiling.tile_size_y    = 24;
+    tiling.tile_size_x    = vae_tile;
+    tiling.tile_size_y    = vae_tile;
     tiling.target_overlap = 0.25f;
+    printf("VAE tiling: %dx%d latent (enabled=%d)\n", vae_tile, vae_tile, (int)tiling.enabled);
     int64_t dec_t0 = ggml_time_ms();
     // WanVAERunner expects a 5D video latent [W,H,T,C,1] (get_latents_mean_std
     // reads channel at ne dim 3 for 5D; a 4D tensor is treated as an IMAGE
