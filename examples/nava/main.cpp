@@ -747,16 +747,36 @@ static int run_render(int argc, char** argv) {
 
     // Optional per-step trajectory dump for cpp-vs-PyTorch sampler faithfulness probe.
     const char* dump_traj = getenv("NAVA_DUMP_TRAJ");
+    const char* dump_audio_traj = getenv("NAVA_DUMP_AUDIO_TRAJ");
     if (dump_traj) {
         std::string d = dump_traj;
+        mkdirs(d);
         write_bin(d + "/vid_noise.bin", latent, "vid_noise");
         write_bin(d + "/aud_noise.bin", audio_latent, "aud_noise");
         printf("NAVA_DUMP_TRAJ active -> %s\n", d.c_str());
     }
+    if (dump_audio_traj) {
+        std::string d = dump_audio_traj;
+        mkdirs(d);
+        write_bin(d + "/aud_noise.bin", audio_latent, "aud_noise");
+        printf("NAVA_DUMP_AUDIO_TRAJ active -> %s\n", d.c_str());
+    }
 
     int64_t sample_t0 = ggml_time_ms();
     for (int step = 0; step < o.steps; ++step) {
-        const float tval = use_unipc ? usched_v.timesteps[step] : sched.timesteps[step];
+        // Python's FlowUniPCMultistepScheduler exposes int64 timesteps, but the
+        // existing C++ trajectory is measurably closer with the float sigma*1000
+        // value. Keep float timesteps by default; NAVA_UNIPC_INT_TIMESTEP=1
+        // enables the strict Python-source probe path.
+        const float sampler_t = use_unipc ? usched_v.timesteps[step] : sched.timesteps[step];
+        const float sampler_sigma = use_unipc ? usched_v.sigmas[step] : sched.sigmas[step];
+        const bool audio_uses_unipc_schedule = use_unipc_audio || use_unipc;
+        const float audio_sigma = audio_uses_unipc_schedule ? usched_a.sigmas[step] : sched.sigmas[step];
+        const float audio_sigma_next = audio_uses_unipc_schedule ? usched_a.sigmas[step + 1]
+                                                                 : sched.sigma_next(step);
+        const bool use_int_timestep = use_unipc && getenv("NAVA_UNIPC_INT_TIMESTEP") != nullptr;
+        const float tval = use_int_timestep ? static_cast<float>(static_cast<int64_t>(sampler_t))
+                                            : sampler_t;
         // I2V: per-token clean-anchor timestep (frame-0 video tokens = 0, rest = t).
         // T2V: scalar timestep (uniform-t, broadcast). Validated vs PyTorch (blocks 100-120 dB).
         sd::Tensor<float> ts;
@@ -795,7 +815,9 @@ static int run_render(int argc, char** argv) {
         }
         const sd::Tensor<float>& va_uncond_for_audio =
             separate_audio_neg ? va_audio_uncond : va_uncond;
-        float dsig = sched.sigma_next(step) - sched.sigmas[step];
+        const float dsig_video = use_unipc ? usched_v.sigmas[step + 1] - usched_v.sigmas[step]
+                                           : sched.sigma_next(step) - sched.sigmas[step];
+        const float dsig_audio = audio_sigma_next - audio_sigma;
 
         // align_3d_cfg: 3rd forward with masking_modality=true (separate intra-modal
         // attention, same POSITIVE context) -> alignment guidance anchor for both streams.
@@ -803,6 +825,18 @@ static int run_render(int argc, char** argv) {
         if (align_cfg) {
             std::tie(vv_mmask, va_mmask) =
                 runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/true);
+        }
+        if (dump_audio_traj) {
+            char fn[96];
+            const std::string d = dump_audio_traj;
+            snprintf(fn, sizeof(fn), "/va_cond_%02d.bin", step);
+            write_bin(d + fn, va_cond, "va_cond");
+            snprintf(fn, sizeof(fn), "/va_uncond_%02d.bin", step);
+            write_bin(d + fn, va_uncond_for_audio, "va_uncond");
+            if (!va_mmask.empty()) {
+                snprintf(fn, sizeof(fn), "/va_mmask_%02d.bin", step);
+                write_bin(d + fn, va_mmask, "va_mmask");
+            }
         }
 
         // --- video: CFG combine (patched) -> unpatchify -> Euler step ---
@@ -832,7 +866,7 @@ static int run_render(int argc, char** argv) {
             latent = usched_v.step(v, latent);  // x0-predict + multistep corrector
         } else {
             for (int64_t i = 0; i < latent.numel(); ++i) {
-                latent.data()[i] += v.data()[i] * dsig;
+                latent.data()[i] += v.data()[i] * dsig_video;
             }
         }
         // I2V: re-pin frame 0 to the clean image latent (the per-token t=0 makes its
@@ -860,17 +894,28 @@ static int run_render(int argc, char** argv) {
                 snprintf(fn, sizeof(fn), "/va_cond_%02d.bin", step);
                 write_bin(std::string(dump_traj) + fn, va_cond, "va_cond");
             }
+            if (dump_audio_traj) {
+                char fn[96];
+                const std::string d = dump_audio_traj;
+                snprintf(fn, sizeof(fn), "/va_cfg_%02d.bin", step);
+                write_bin(d + fn, va_cfg, "va_cfg");
+            }
             if (use_unipc_audio) {
                 audio_latent = usched_a.step(va_cfg, audio_latent);
             } else {
                 for (int64_t i = 0; i < audio_latent.numel(); ++i) {
-                    audio_latent.data()[i] += va_cfg.data()[i] * dsig;
+                    audio_latent.data()[i] += va_cfg.data()[i] * dsig_audio;
                 }
             }
             if (dump_traj) {
                 char fn[80];
                 snprintf(fn, sizeof(fn), "/aud_step_%02d.bin", step);
                 write_bin(std::string(dump_traj) + fn, audio_latent, "aud_step");
+            }
+            if (dump_audio_traj) {
+                char fn[96];
+                snprintf(fn, sizeof(fn), "/aud_step_%02d.bin", step);
+                write_bin(std::string(dump_audio_traj) + fn, audio_latent, "aud_step");
             }
         }
         double asm_ = 0, asq = 0; int64_t an = audio_latent.numel();
@@ -881,8 +926,8 @@ static int run_render(int argc, char** argv) {
         double sm = 0, sq = 0; int64_t nn = latent.numel();
         for (int64_t i = 0; i < nn; ++i) { double vv = latent.data()[i]; sm += vv; sq += vv * vv; }
         double lmean = sm / (double)nn, lstd = sqrt(sq / (double)nn - lmean * lmean);
-        printf("  step %2d/%d  t=%.2f sigma=%.4f dsig=%+.4f  latent mean=%+.3f std=%.3f  aud_std=%.3f\n",
-               step + 1, o.steps, sched.timesteps[step], sched.sigmas[step], dsig, lmean, lstd, astd);
+        printf("  step %2d/%d  t=%.2f model_t=%.2f sigma=%.4f dsig_v=%+.4f dsig_a=%+.4f  latent mean=%+.3f std=%.3f  aud_std=%.3f\n",
+               step + 1, o.steps, sampler_t, tval, sampler_sigma, dsig_video, dsig_audio, lmean, lstd, astd);
 
         if (dump_traj) {
             char fn[64];

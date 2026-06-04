@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -1153,14 +1154,69 @@ struct OpusEncodedPacket {
     std::vector<uint8_t> data;
 };
 
+static std::vector<float> resample_interleaved_hann_sinc(const float* src,
+                                                         uint64_t src_n,
+                                                         uint32_t src_ch,
+                                                         uint32_t dst_ch,
+                                                         uint32_t src_sr,
+                                                         uint32_t dst_sr) {
+    if (src == nullptr || src_n == 0 || src_ch == 0 || dst_ch == 0 || src_sr == 0 || dst_sr == 0) {
+        return {};
+    }
+
+    const uint64_t dst_n = static_cast<uint64_t>(
+        std::ceil(static_cast<double>(dst_sr) * static_cast<double>(src_n) / static_cast<double>(src_sr)));
+    std::vector<float> dst(static_cast<size_t>(dst_n * dst_ch), 0.0f);
+
+    int orig = static_cast<int>(src_sr);
+    int neo  = static_cast<int>(dst_sr);
+    int gcd  = std::gcd(orig, neo);
+    orig /= gcd;
+    neo /= gcd;
+
+    constexpr int lowpass_filter_width = 6;
+    constexpr double rolloff           = 0.99;
+    constexpr double pi                = 3.14159265358979323846;
+    const double base_freq             = static_cast<double>(std::min(orig, neo)) * rolloff;
+    const int width                    = static_cast<int>(std::ceil(lowpass_filter_width * static_cast<double>(orig) / base_freq));
+    const double scale                 = base_freq / static_cast<double>(orig);
+
+    for (uint64_t i = 0; i < dst_n; ++i) {
+        const double center = static_cast<double>(i) * static_cast<double>(src_sr) / static_cast<double>(dst_sr);
+        const int64_t left  = static_cast<int64_t>(std::floor(center)) - width - 1;
+        const int64_t right = static_cast<int64_t>(std::floor(center)) + width + 1;
+        for (uint32_t c = 0; c < dst_ch; ++c) {
+            double acc = 0.0;
+            for (int64_t j = left; j <= right; ++j) {
+                if (j < 0 || j >= static_cast<int64_t>(src_n)) {
+                    continue;
+                }
+                double t = (static_cast<double>(j) / static_cast<double>(orig) -
+                            static_cast<double>(i) / static_cast<double>(neo)) *
+                           base_freq;
+                t = std::clamp(t, -static_cast<double>(lowpass_filter_width), static_cast<double>(lowpass_filter_width));
+                double window = std::cos(t * pi / static_cast<double>(lowpass_filter_width) / 2.0);
+                window *= window;
+                double t_pi = t * pi;
+                double sinc = t_pi == 0.0 ? 1.0 : std::sin(t_pi) / t_pi;
+                const uint32_t src_c = src_ch == 1 ? 0 : std::min<uint32_t>(c, src_ch - 1);
+                acc += static_cast<double>(src[static_cast<size_t>(j * src_ch + src_c)]) * sinc * window * scale;
+            }
+            dst[static_cast<size_t>(i * dst_ch + c)] = static_cast<float>(acc);
+        }
+    }
+    return dst;
+}
+
 // Encode audio as Opus for WebM muxing. WebM browsers (Chrome/Firefox) only
 // decode Vorbis/Opus — a raw-PCM (A_PCM/INT/LIT) track is muxed fine but plays
-// SILENT in a <video> element. We downmix to mono, linear-resample to 48 kHz
-// (Opus' native rate) and emit 20 ms packets plus the OpusHead CodecPrivate.
+// SILENT in a <video> element. Preserve mono/stereo, resample to 48 kHz
+// (Opus' native rate), and emit 20 ms packets plus the OpusHead CodecPrivate.
 static bool encode_audio_to_opus(const sd_audio_t* audio,
                                  std::vector<OpusEncodedPacket>& packets,
                                  std::vector<uint8_t>& opus_head,
-                                 uint64_t& codec_delay_ns) {
+                                 uint64_t& codec_delay_ns,
+                                 uint32_t& opus_channels) {
     if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 ||
         audio->channels == 0 || audio->sample_rate == 0) {
         return false;
@@ -1169,60 +1225,54 @@ static bool encode_audio_to_opus(const sd_audio_t* audio,
     const uint32_t src_sr = audio->sample_rate;
     const uint32_t src_ch = audio->channels;
     const uint64_t src_n  = audio->sample_count;
-
-    // Downmix to mono.
-    std::vector<float> mono(src_n);
-    for (uint64_t i = 0; i < src_n; ++i) {
-        float acc = 0.0f;
-        for (uint32_t c = 0; c < src_ch; ++c) {
-            acc += audio->data[i * src_ch + c];
-        }
-        mono[i] = acc / static_cast<float>(src_ch);
-    }
-
-    // Linear-resample to 48 kHz (Opus encodes/decodes natively at 48 kHz).
     const uint32_t dst_sr = 48000;
+    const uint32_t dst_ch = src_ch == 1 ? 1 : 2;
+    opus_channels         = dst_ch;
+
     std::vector<float> res;
     if (src_sr == dst_sr) {
-        res = std::move(mono);
-    } else {
-        const double ratio   = static_cast<double>(dst_sr) / static_cast<double>(src_sr);
-        const uint64_t dst_n = static_cast<uint64_t>(std::llround(static_cast<double>(src_n) * ratio));
-        res.resize(dst_n);
-        for (uint64_t i = 0; i < dst_n; ++i) {
-            const double src_pos = static_cast<double>(i) / ratio;
-            const uint64_t i0    = static_cast<uint64_t>(src_pos);
-            const uint64_t i1    = std::min<uint64_t>(i0 + 1, src_n - 1);
-            const double frac    = src_pos - static_cast<double>(i0);
-            res[i]               = static_cast<float>(mono[i0] * (1.0 - frac) + mono[i1] * frac);
+        res.resize(static_cast<size_t>(src_n * dst_ch));
+        for (uint64_t i = 0; i < src_n; ++i) {
+            for (uint32_t c = 0; c < dst_ch; ++c) {
+                const uint32_t src_c = src_ch == 1 ? 0 : std::min<uint32_t>(c, src_ch - 1);
+                res[static_cast<size_t>(i * dst_ch + c)] = audio->data[static_cast<size_t>(i * src_ch + src_c)];
+            }
         }
+    } else {
+        res = resample_interleaved_hann_sinc(audio->data, src_n, src_ch, dst_ch, src_sr, dst_sr);
+    }
+    if (res.empty()) {
+        return false;
     }
 
     int err          = 0;
-    OpusEncoder* enc = opus_encoder_create(static_cast<opus_int32>(dst_sr), 1, OPUS_APPLICATION_AUDIO, &err);
+    OpusEncoder* enc = opus_encoder_create(static_cast<opus_int32>(dst_sr), static_cast<int>(dst_ch), OPUS_APPLICATION_AUDIO, &err);
     if (enc == nullptr || err != OPUS_OK) {
         if (enc != nullptr) {
             opus_encoder_destroy(enc);
         }
         return false;
     }
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(64000));
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(dst_ch == 2 ? 128000 : 96000));
 
     opus_int32 lookahead = 0;  // encoder pre-skip, in 48 kHz samples
     opus_encoder_ctl(enc, OPUS_GET_LOOKAHEAD(&lookahead));
 
     const int frame_size              = static_cast<int>(dst_sr) / 50;  // 20 ms = 960 samples @ 48 kHz
     const uint64_t frame_dur_ns       = 20000000ULL;
-    std::vector<int16_t> pcm(frame_size);
+    std::vector<int16_t> pcm(static_cast<size_t>(frame_size * dst_ch));
     std::vector<uint8_t> out(4000);
     uint64_t ts_ns = 0;
+    const uint64_t dst_n = static_cast<uint64_t>(res.size() / dst_ch);
 
-    for (uint64_t off = 0; off < res.size(); off += static_cast<uint64_t>(frame_size)) {
+    for (uint64_t off = 0; off < dst_n; off += static_cast<uint64_t>(frame_size)) {
         for (int k = 0; k < frame_size; ++k) {
             const uint64_t idx = off + static_cast<uint64_t>(k);
-            float s            = idx < res.size() ? res[idx] : 0.0f;
-            s                  = std::clamp(s, -1.0f, 1.0f);
-            pcm[k]             = static_cast<int16_t>(std::lrint(s * 32767.0f));
+            for (uint32_t c = 0; c < dst_ch; ++c) {
+                float s = idx < dst_n ? res[static_cast<size_t>(idx * dst_ch + c)] : 0.0f;
+                s       = std::clamp(s, -1.0f, 1.0f);
+                pcm[static_cast<size_t>(k * dst_ch + c)] = static_cast<int16_t>(std::lrint(s * 32767.0f));
+            }
         }
         const opus_int32 n = opus_encode(enc, pcm.data(), frame_size, out.data(), static_cast<opus_int32>(out.size()));
         if (n < 0) {
@@ -1241,7 +1291,7 @@ static bool encode_audio_to_opus(const sd_audio_t* audio,
     static const char magic[] = {'O', 'p', 'u', 's', 'H', 'e', 'a', 'd'};
     opus_head.assign(magic, magic + sizeof(magic));
     opus_head.push_back(1);                                            // version
-    opus_head.push_back(1);                                            // channel count
+    opus_head.push_back(static_cast<uint8_t>(dst_ch));                 // channel count
     opus_head.push_back(static_cast<uint8_t>(pre_skip & 0xff));        // pre-skip lo
     opus_head.push_back(static_cast<uint8_t>((pre_skip >> 8) & 0xff)); // pre-skip hi
     const uint32_t in_sr = dst_sr;                                     // input sample rate (informational)
@@ -1313,7 +1363,8 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         std::vector<OpusEncodedPacket> opus_packets;
         std::vector<uint8_t> opus_head;
         uint64_t opus_codec_delay_ns = 0;
-        use_opus = audio != nullptr && encode_audio_to_opus(audio, opus_packets, opus_head, opus_codec_delay_ns);
+        uint32_t opus_channels       = 0;
+        use_opus = audio != nullptr && encode_audio_to_opus(audio, opus_packets, opus_head, opus_codec_delay_ns, opus_channels);
 #endif
 
         std::vector<uint8_t> audio_pcm;
@@ -1323,7 +1374,7 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
 
 #ifdef SD_USE_OPUS
         if (use_opus) {
-            audio_track_number = segment.AddAudioTrack(48000, 1, 0);
+            audio_track_number = segment.AddAudioTrack(48000, static_cast<int32_t>(opus_channels), 0);
             if (audio_track_number == 0) {
                 fprintf(stderr, "Error: Failed to add audio track.\n");
                 return -1;
@@ -1336,7 +1387,7 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
             audio_track->set_codec_id("A_OPUS");
             audio_track->SetCodecPrivate(opus_head.data(), opus_head.size());
             audio_track->set_sample_rate(48000.0);
-            audio_track->set_channels(1);
+            audio_track->set_channels(opus_channels);
             audio_track->set_codec_delay(opus_codec_delay_ns);
             audio_track->set_seek_pre_roll(80000000ULL);  // 80 ms, per the WebM Opus guidelines
         } else

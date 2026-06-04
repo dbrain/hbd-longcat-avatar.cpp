@@ -2,6 +2,7 @@
 #define __SD_LTX_AUDIO_VAE_H__
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -52,10 +53,7 @@ namespace LTXV {
         }
 
         int output_sample_rate() const {
-            if (has_bwe) {
-                return bwe_output_sample_rate;
-            }
-            return base_output_sample_rate();
+            return sample_rate;
         }
 
         static LTXAudioVAEConfig detect_from_weights(const String2TensorStorage& tensor_storage_map) {
@@ -151,7 +149,8 @@ namespace LTXV {
             }
             config.base_resblock_kernel_sizes.resize(3);
 
-            config.has_bwe = tensor_storage_map.find("vocoder.bwe_generator.conv_pre.weight") != tensor_storage_map.end();
+            config.has_bwe = tensor_storage_map.find("vocoder.bwe_generator.conv_pre.weight") != tensor_storage_map.end() &&
+                             std::getenv("NAVA_AUDIO_DISABLE_BWE") == nullptr;
             if (config.has_bwe) {
                 config.bwe_input_sample_rate        = 16000;
                 config.bwe_output_sample_rate       = 48000;
@@ -242,6 +241,33 @@ namespace LTXV {
             window *= window;
             double sinc                    = t == 0.0 ? 1.0 : std::sin(kPi * t) / (kPi * t);
             filter[static_cast<size_t>(i)] = static_cast<float>(sinc * window * rolloff / ratio);
+        }
+        return filter;
+    }
+
+    static std::vector<float> build_torchaudio_hann_resample_filter(int orig_freq, int new_freq) {
+        int gcd = std::gcd(orig_freq, new_freq);
+        orig_freq /= gcd;
+        new_freq /= gcd;
+
+        constexpr int lowpass_filter_width = 6;
+        constexpr double rolloff           = 0.99;
+        constexpr double kPi               = 3.14159265358979323846;
+        double base_freq                   = static_cast<double>(std::min(orig_freq, new_freq)) * rolloff;
+        int width                          = static_cast<int>(std::ceil(lowpass_filter_width * static_cast<double>(orig_freq) / base_freq));
+        int kernel_size                    = 2 * width + orig_freq;
+        std::vector<float> filter(static_cast<size_t>(kernel_size), 0.0f);
+
+        for (int i = 0; i < kernel_size; ++i) {
+            double idx = static_cast<double>(i - width) / static_cast<double>(orig_freq);
+            double t   = idx * base_freq;
+            t          = std::clamp(t, -static_cast<double>(lowpass_filter_width), static_cast<double>(lowpass_filter_width));
+            double window = std::cos(t * kPi / static_cast<double>(lowpass_filter_width) / 2.0);
+            window *= window;
+            double t_pi = t * kPi;
+            double sinc = t_pi == 0.0 ? 1.0 : std::sin(t_pi) / t_pi;
+            double scale = base_freq / static_cast<double>(orig_freq);
+            filter[static_cast<size_t>(i)] = static_cast<float>(sinc * window * scale);
         }
         return filter;
     }
@@ -409,6 +435,38 @@ namespace LTXV {
         }
         GGML_ASSERT(waveform->ne[0] > target_samples);
         return ggml_ext_slice(ctx, waveform, 0, 0, target_samples);
+    }
+
+    static ggml_tensor* downsample_waveform_torchaudio_hann(GGMLRunnerContext* runner_ctx,
+                                                            ggml_tensor* waveform,
+                                                            ggml_tensor* filter,
+                                                            int orig_freq,
+                                                            int new_freq) {
+        auto ctx = runner_ctx->ggml_ctx;
+        GGML_ASSERT(ctx != nullptr);
+        GGML_ASSERT(waveform != nullptr);
+        GGML_ASSERT(filter != nullptr);
+        GGML_ASSERT(waveform->ne[3] == 1);
+
+        int gcd = std::gcd(orig_freq, new_freq);
+        orig_freq /= gcd;
+        new_freq /= gcd;
+        const int lowpass_filter_width = 6;
+        const double rolloff           = 0.99;
+        double base_freq               = static_cast<double>(std::min(orig_freq, new_freq)) * rolloff;
+        int width                      = static_cast<int>(std::ceil(lowpass_filter_width * static_cast<double>(orig_freq) / base_freq));
+        GGML_ASSERT(filter->ne[0] == 2 * width + orig_freq);
+
+        int64_t length   = waveform->ne[0];
+        int64_t channels = waveform->ne[1];
+        int64_t batch    = waveform->ne[2];
+        int64_t target_length = (static_cast<int64_t>(new_freq) * length + orig_freq - 1) / orig_freq;
+
+        auto x = ggml_reshape_3d(ctx, waveform, length, channels * batch, 1);
+        x      = ggml_pad_ext(ctx, x, width, width + orig_freq, 0, 0, 0, 0, 0, 0);
+        x      = depthwise_conv1d(runner_ctx, x, filter, orig_freq, 0);
+        x      = crop_waveform_samples(ctx, x, target_length);
+        return ggml_reshape_3d(ctx, x, target_length, channels, batch);
     }
 
     struct PixelNorm2D : public UnaryBlock {
@@ -932,7 +990,8 @@ namespace LTXV {
 
         ggml_tensor* decode(GGMLRunnerContext* ctx,
                             ggml_tensor* latent,
-                            ggml_tensor* bwe_skip_filter) {
+                            ggml_tensor* bwe_skip_filter,
+                            ggml_tensor* bwe_downsample_filter) {
             int target_time = static_cast<int>(latent->ne[1]) * config.latent_downsample_factor() -
                               (config.latent_downsample_factor() - 1);
             int target_freq = config.mel_bins;
@@ -941,8 +1000,14 @@ namespace LTXV {
             auto mean     = params["audio_vae.per_channel_statistics.mean-of-means"];
             auto stddev   = params["audio_vae.per_channel_statistics.std-of-means"];
             auto mel      = decoder->forward(ctx, latent, mean, stddev, target_time, target_freq);
+            if (std::getenv("NAVA_AUDIO_DUMP_TAPS") != nullptr) {
+                ctx->capture_tensor("audio_decoder_mel", mel);
+            }
             auto vocoder  = std::dynamic_pointer_cast<Vocoder>(blocks["vocoder.vocoder"]);
             auto waveform = vocoder->forward(ctx, mel);
+            if (std::getenv("NAVA_AUDIO_DUMP_TAPS") != nullptr) {
+                ctx->capture_tensor("audio_vocoder_waveform", waveform);
+            }
 
             if (config.has_bwe) {
                 GGML_ASSERT(bwe_skip_filter != nullptr);
@@ -980,8 +1045,17 @@ namespace LTXV {
                                        -1.0f,
                                        1.0f);
                 waveform  = crop_waveform_samples(ctx->ggml_ctx, waveform, out_time);
+                if (config.bwe_output_sample_rate != config.sample_rate) {
+                    GGML_ASSERT(bwe_downsample_filter != nullptr);
+                    waveform = downsample_waveform_torchaudio_hann(ctx,
+                                                                   waveform,
+                                                                   bwe_downsample_filter,
+                                                                   config.bwe_output_sample_rate,
+                                                                   config.sample_rate);
+                }
             }
 
+            waveform = ggml_clamp(ctx->ggml_ctx, waveform, -0.99f, 0.99f);
             return waveform;
         }
     };
@@ -990,6 +1064,7 @@ namespace LTXV {
         LTXAudioVAEConfig config;
         LTXAudioVAE model;
         sd::Tensor<float> bwe_skip_filter_tensor;
+        sd::Tensor<float> bwe_downsample_filter_tensor;
 
         LTXAudioVAERunner(ggml_backend_t backend,
                           ggml_backend_t params_backend,
@@ -1002,6 +1077,10 @@ namespace LTXV {
             if (config.has_bwe) {
                 const int bwe_ratio    = config.bwe_output_sample_rate / config.bwe_input_sample_rate;
                 bwe_skip_filter_tensor = sd::Tensor<float>::from_vector(build_hann_resample_filter(bwe_ratio));
+                if (config.bwe_output_sample_rate != config.sample_rate) {
+                    bwe_downsample_filter_tensor = sd::Tensor<float>::from_vector(
+                        build_torchaudio_hann_resample_filter(config.bwe_output_sample_rate, config.sample_rate));
+                }
             }
         }
 
@@ -1023,9 +1102,10 @@ namespace LTXV {
             auto get_graph = [&]() -> ggml_cgraph* {
                 auto latent                  = make_input(latent_tensor);
                 ggml_tensor* bwe_skip_filter = config.has_bwe ? make_input(bwe_skip_filter_tensor) : nullptr;
+                ggml_tensor* bwe_downsample_filter = config.has_bwe && !bwe_downsample_filter_tensor.empty() ? make_input(bwe_downsample_filter_tensor) : nullptr;
                 ggml_cgraph* gf              = new_graph_custom(655360);
                 auto runner_ctx              = GGMLRunner::get_context();
-                auto waveform                = model.decode(&runner_ctx, latent, bwe_skip_filter);
+                auto waveform                = model.decode(&runner_ctx, latent, bwe_skip_filter, bwe_downsample_filter);
                 ggml_build_forward_expand(gf, waveform);
                 return gf;
             };

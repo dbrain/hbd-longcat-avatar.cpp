@@ -12,6 +12,7 @@ with open(inp, "rb") as f:
     name = f.read(int(name_len))
     data = np.fromfile(f, np.float32)
 x = np.reshape(data, dims, order="F")        # ne order -> [n_samples, n_channels]
+x = np.squeeze(x)
 if x.ndim == 1:
     x = x[:, None]
 n_samp, n_ch = x.shape

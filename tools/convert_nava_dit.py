@@ -40,6 +40,28 @@ def _bf16_to_f32(u16: np.ndarray) -> np.ndarray:
     return (u16.astype(np.uint32) << 16).view(np.float32)
 
 
+def _f8_e4m3_to_f32(u8: np.ndarray) -> np.ndarray:
+    """Decode torch/safetensors F8_E4M3 bytes to f32.
+
+    NAVA_fp8.safetensors stores FP8Linear weights as float8_e4m3fn plus a
+    per-output-channel BF16 scale. This mirrors the C++ loader's e4m3 decode;
+    0x7f/0xff are NaN sentinels and should not appear in trained weights.
+    """
+    v = u8.astype(np.uint32)
+    sign = np.where((v & 0x80) != 0, -1.0, 1.0).astype(np.float32)
+    exp = ((v & 0x78) >> 3).astype(np.int32)
+    mant = (v & 0x07).astype(np.float32)
+
+    out = np.zeros(v.shape, dtype=np.float32)
+    sub = (exp == 0) & (mant != 0)
+    norm = exp != 0
+
+    out[sub] = sign[sub] * np.ldexp(mant[sub] / 8.0, -6)
+    out[norm] = sign[norm] * np.ldexp(1.0 + mant[norm] / 8.0, exp[norm] - 7)
+    out[(v == 0x7f) | (v == 0xff)] = np.nan
+    return out
+
+
 class Safetensors:
     """Lazy reader over one safetensors file (header parse + mmap)."""
 
@@ -62,6 +84,8 @@ class Safetensors:
         buf = self.mm[self.data_start + a: self.data_start + b]
         if dt == "BF16":
             arr = _bf16_to_f32(np.frombuffer(buf, dtype=np.uint16))
+        elif dt == "F8_E4M3":
+            arr = _f8_e4m3_to_f32(np.frombuffer(buf, dtype=np.uint8))
         else:
             arr = np.frombuffer(buf, dtype=_ST_DT[dt])
         return arr.reshape(e["shape"])
@@ -106,6 +130,14 @@ def main():
 
     names = [n for n in names if keep(n)]
 
+    # Python's FP8Linear stores a matrix as `<name>.weight` (F8_E4M3) plus
+    # `<name>.weight_scale` (BF16, one scale per output row), and applies:
+    #   dequant_weight = fp8_weight.to(dtype) * weight_scale[:, None]
+    # Fold that scale into the matrix before writing GGUF so the existing C++
+    # Linear path sees the same effective weights.
+    weight_scales = {n[:-len("_scale")]: n for n in names if n.endswith(".weight_scale")}
+    names = [n for n in names if not n.endswith(".weight_scale")]
+
     writer = gguf.GGUFWriter(args.out, arch="nava", use_temp_file=True)
     writer.add_description("NAVA 6.3B joint audio-video MMDiT (F32 -> gguf)")
 
@@ -128,6 +160,12 @@ def main():
 
     for name in sorted(names):
         arr = st.get(name)
+        scale_name = weight_scales.get(name)
+        if scale_name is not None:
+            scale = st.get(scale_name).astype(np.float32)
+            assert arr.ndim == 2, f"{name}: fp8 weight with scale is not 2-D: {arr.shape}"
+            assert scale.shape == (arr.shape[0],), f"{name}: scale {scale.shape} vs weight {arr.shape}"
+            arr = arr.astype(np.float32) * scale[:, None]
         # squeeze the singleton temporal dim of the video Conv3d patch embed
         # [3072,48,1,2,2] -> [3072,48,2,2] (ggml is max-4D).
         if name.endswith("patch_embedding.weight") and arr.ndim == 5:
