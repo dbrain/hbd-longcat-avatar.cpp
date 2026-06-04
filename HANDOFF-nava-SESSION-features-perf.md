@@ -67,10 +67,24 @@ The audio-VAE ENCODER is only needed to drive from an EXTERNAL waveform ("shared
   AUDIO tail-anchor runs but is rough (concat env_CV 0.42, aud_std elevated) — crude
   tail-token pinning is not the right tool for speech continuity; the proper "shared audio
   across segments" wants the LTX encoder (§4).
-- NOTE on N>1: python's `first_frame_is_clean` only ever marks ONE frame clean (model_mm.py
-  `_first_images_seq_len` = a single frame's H'W'); N>1 anchors are genuinely UNTESTED in the
-  trained model. N=3 ran fine numerically; eyeball chain_seg1 motion to judge if N>1 helps or
-  hurts. N=1 (= i2v from the last generated frame) is the safe baseline.
+- **CORRECTION (proven 2026-06-05): the `--video-anchor` RAW-LATENT splice is WRONG at frame 0.**
+  The Wan2.2 VAE is causal-temporal: latent frame 0 is an "I-frame" (encodes 1 pixel frame,
+  std~0.5) and frames 1+ are "P-frames" (4 pixel frames each, std~0.9) — confirmed in seg0's
+  own latent (frame0 std 0.495 vs frames1-12 std ~0.9). `nava_chain_tail.py` takes a P-frame
+  (the prior clip's last latent frame, std 0.9) and drops it into seg1's I-frame slot →
+  the causal decode smears the background into gibberish. longcat-avatar's PROD chaining
+  (`examples/common/avatar_render.cpp:198-223`) RE-ENCODES the decoded tail pixel frames
+  ("drift sink"); its raw-latent passthrough (`LONGCAT_CONT_RAW_LATENT`) is the legacy
+  "drifts off the manifold" mode = exactly this bug.
+  **CORRECT continuation = re-encode the last decoded PIXEL frame(s) through the VAE** (the
+  i2v `--image` path: encode → vae_to_diffusion_latents → frame-0 anchor at std~0.5).
+  PROVEN: extracting seg0's last frame → `--image` gives anchor std 0.50054 and a clean
+  render (eye `chain_seg1_reenc` / `chain_CONCAT_reenc`, vs the broken `chain_seg1_n1`).
+  - N=1 works TODAY via `--image <extracted-last-frame>` (no code change).
+  - For N>1 motion continuity: re-encode the last N pixel frames as a block (the VAE makes a
+    valid I+P latent sequence — `sd_ctx_encode_video_frames` pattern); needs a small tool /
+    in-binary path. The raw-latent `--video-anchor` should be removed or restricted to
+    already-VAE-re-encoded latents. python's clean n1 did exactly this (i2v from last frame).
 
 ### Chaining workflow
 ```
