@@ -671,6 +671,14 @@ static int run_render(int argc, char** argv) {
         }
     }
     auto runner = std::make_shared<NAVA::NavaRunner>(backend, backend, tsm, "backbone");
+    // Flash attention: fuses the joint self-attn (L_total ~5k tokens, head_dim 128) so the
+    // O(L^2) scores tensor is never materialized -> big activation-VRAM + speed win on the
+    // DiT phase. head_dim 128 is FA-friendly. Default ON; NAVA_NO_FLASH=1 reverts to the
+    // unfused path (the numerically-validated reference). Prec is F32 inside FA.
+    if (getenv("NAVA_NO_FLASH") == nullptr) {
+        runner->set_flash_attention_enabled(true);
+        printf("flash attention: ON\n");
+    }
     runner->alloc_params_buffer();
     {
         std::map<std::string, ggml_tensor*> tensors;
