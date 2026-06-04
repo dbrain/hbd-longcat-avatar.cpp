@@ -611,9 +611,17 @@ namespace NAVA {
             blocks["head"]       = std::shared_ptr<GGMLBlock>(new NavaHead(p.dim, p.video_dim * std::get<1>(p.patch_size) * std::get<2>(p.patch_size), p.eps));
             blocks["head_audio"] = std::shared_ptr<GGMLBlock>(new NavaHead(p.dim, p.audio_dim, p.eps));
 
-            // speaker_embedding (SpkToken) is STUBBED for this first-draft harness
-            // (HANDOFF allows it). Its weights are present in the gguf but unused;
-            // we do NOT splice spk into context. See report TODO.
+            // speaker_embedding (SpkToken) — voice clone. model_mm.py SpkToken:
+            //   net = Sequential(LayerNorm(192), Linear(192,dim), SiLU, Linear(dim,dim))
+            //   out_norm = LayerNorm(dim); null_token [1,dim] (only used for the all-zero
+            //   "fake" embedding, which we never splice — we splice REAL embeddings only).
+            // The projected [dim] token replaces the <extra_id_2> position in the
+            // text-embedded context (post text_embedding), feeding the audio stream's
+            // shared context (model_mm.py:1515-1527,1644).
+            blocks["speaker_embedding.net.0"]    = std::shared_ptr<GGMLBlock>(new LayerNorm(192));
+            blocks["speaker_embedding.net.1"]    = std::shared_ptr<GGMLBlock>(new Linear(192, p.dim));
+            blocks["speaker_embedding.net.3"]    = std::shared_ptr<GGMLBlock>(new Linear(p.dim, p.dim));
+            blocks["speaker_embedding.out_norm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(p.dim));
         }
 
         const NavaParams& cfg() const { return params_; }
@@ -704,6 +712,29 @@ namespace NAVA {
             context = t2->forward(ctx, context);
             return context;  // [dim, 512, N]
         }
+
+        // Voice clone: project a speaker embedding [192,1] through SpkToken and splice
+        // the resulting [dim,1] token into the (already text_embedded) context [dim,512,1]
+        // at each spk position. We only call this with a REAL (nonzero) embedding, so the
+        // null_token gating in model_mm.py SpkToken.forward is unneeded here.
+        ggml_tensor* splice_spk(GGMLRunnerContext* ctx, ggml_tensor* context_e,
+                                ggml_tensor* spk_emb, const std::vector<int>& spk_pos) {
+            auto ln0   = std::dynamic_pointer_cast<LayerNorm>(blocks["speaker_embedding.net.0"]);
+            auto l1    = std::dynamic_pointer_cast<Linear>(blocks["speaker_embedding.net.1"]);
+            auto l3    = std::dynamic_pointer_cast<Linear>(blocks["speaker_embedding.net.3"]);
+            auto onorm = std::dynamic_pointer_cast<LayerNorm>(blocks["speaker_embedding.out_norm"]);
+            auto h = ln0->forward(ctx, spk_emb);   // [192,1]
+            h      = l1->forward(ctx, h);          // [dim,1]
+            h      = ggml_silu(ctx->ggml_ctx, h);
+            h      = l3->forward(ctx, h);          // [dim,1]
+            h      = onorm->forward(ctx, h);       // [dim,1] -- the spk token
+            for (int p : spk_pos) {
+                if (p < 0 || p >= (int)context_e->ne[1]) continue;
+                context_e = ggml_set_2d(ctx->ggml_ctx, context_e, h, context_e->nb[1],
+                                        (size_t)p * context_e->nb[1]);
+            }
+            return context_e;
+        }
     };
 
     // ---------------------------------------------------------------------
@@ -724,6 +755,11 @@ namespace NAVA {
         // when set, the self-attention runs SEPARATE intra-modal (video-only / audio-only)
         // instead of joint cross-modal — the align_3d_cfg "masking_modality" forward pass.
         bool mask_modality = false;
+        // voice clone: when apply_spk, splice the projected speaker embedding (spk_emb_host
+        // [192,1]) into the text-embedded context at spk_pos_v before the blocks.
+        bool apply_spk = false;
+        sd::Tensor<float> spk_emb_host;
+        std::vector<int> spk_pos_v;
 
         NavaRunner(ggml_backend_t backend,
                    ggml_backend_t params_backend,
@@ -808,6 +844,10 @@ namespace NAVA {
             }
 
             auto context_e = nava.embed_text(&rc, ctx_t);    // [dim, 512, 1]
+            if (apply_spk && !spk_emb_host.empty() && !spk_pos_v.empty()) {
+                ggml_tensor* spk_in = make_input(spk_emb_host);  // [192,1]
+                context_e = nava.splice_spk(&rc, context_e, spk_in, spk_pos_v);
+            }
             rc.capture_tensor("context_embedded", context_e);
 
             // --- double blocks ---
@@ -905,15 +945,22 @@ namespace NAVA {
                    const sd::Tensor<float>& audio,
                    const sd::Tensor<float>& context,
                    const sd::Tensor<float>& timestep,
-                   bool mask_modality_arg = false) {
+                   bool mask_modality_arg = false,
+                   bool apply_spk_arg = false,
+                   const sd::Tensor<float>* spk_emb_arg = nullptr,
+                   const std::vector<int>* spk_pos_arg = nullptr) {
             return_joint  = true;
             mask_modality = mask_modality_arg;
+            apply_spk     = apply_spk_arg && spk_emb_arg && !spk_emb_arg->empty()
+                            && spk_pos_arg && !spk_pos_arg->empty();
+            if (apply_spk) { spk_emb_host = *spk_emb_arg; spk_pos_v = *spk_pos_arg; }
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(video, audio, context, timestep);
             };
             auto r       = GGMLRunner::compute<float>(get_graph, n_threads, false);
             return_joint  = false;
             mask_modality = false;
+            apply_spk     = false;
             sd::Tensor<float> joint = r.value_or(sd::Tensor<float>());  // [192, L_total]
             if (joint.empty()) {
                 return {sd::Tensor<float>(), sd::Tensor<float>()};

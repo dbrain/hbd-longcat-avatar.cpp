@@ -408,6 +408,14 @@ struct RenderOpts {
     float shift           = 5.0f;
     bool cuda             = false;
     std::string image;         // I2V: input image; frame-0 clean-latent anchor (empty => T2V)
+    // Voice clone (Task 2). --spk-emb: a [192] f32 .bin (ReDimNet speaker embedding,
+    // precomputed offline). --spk-pos: comma-sep token indices for the <extra_id_2>
+    // splice; if empty, auto-loaded from "<context>.spkpos" (written by encode-prompt).
+    // --timbre-cfg: timbre_align_guidance_scale (>0 enables the 4th timbre-uncond audio
+    // forward, model_mm.py/pipeline_nava.py; 0 = off). Clone active iff spk-emb + spk-pos.
+    std::string spk_emb;
+    std::string spk_pos_str;
+    float timbre_cfg      = 0.0f;
 };
 
 // FlowMatchScheduler (Euler), distilled from NAVA scheduler/flow_match.py.
@@ -521,6 +529,9 @@ static int run_render(int argc, char** argv) {
         else if (a == "--no-audio") o.audio_vae = "";
         else if (a == "--gguf") o.gguf = next("");
         else if (a == "--label") o.label = next("");
+        else if (a == "--spk-emb") o.spk_emb = next("");
+        else if (a == "--spk-pos") o.spk_pos_str = next("");
+        else if (a == "--timbre-cfg") o.timbre_cfg = atof(next("0.0").c_str());
         else if (a == "--cuda") o.cuda = true;
         else { printf("unknown render arg: %s\n", a.c_str()); return 1; }
     }
@@ -676,6 +687,35 @@ static int run_render(int argc, char** argv) {
         printf("NOTE: no --audio-neg-context => audio uncond reuses the VIDEO neg context.\n");
     }
 
+    // ----- Voice clone: load the speaker embedding + splice positions -----
+    // spk_emb_host is the ReDimNet [192] embedding (precomputed offline). spk_pos_v are
+    // the <extra_id_2> token indices in the 512-len context (from --spk-pos or the
+    // "<context>.spkpos" sidecar written by encode-prompt). Clone is active iff BOTH set.
+    sd::Tensor<float> spk_emb_host;
+    std::vector<int> spk_pos_v;
+    if (!o.spk_emb.empty()) {
+        if (!path_exists(o.spk_emb)) { printf("ERROR: --spk-emb %s not found\n", o.spk_emb.c_str()); return 1; }
+        spk_emb_host = sd::load_tensor_from_file_as_tensor<float>(o.spk_emb);
+        spk_emb_host.reshape_({192, 1});
+        std::string poss = o.spk_pos_str;
+        if (poss.empty()) {  // fall back to the encode-prompt sidecar
+            std::string sp = o.context + ".spkpos";
+            FILE* sf = fopen(sp.c_str(), "r");
+            if (sf) { char ln[32]; while (fgets(ln, sizeof(ln), sf)) { int v = atoi(ln); if (ln[0]>='0'&&ln[0]<='9') spk_pos_v.push_back(v); } fclose(sf);
+                      printf("spk_pos: loaded %zu position(s) from %s\n", spk_pos_v.size(), sp.c_str()); }
+        } else {
+            size_t p = 0; while (p < poss.size()) { size_t c = poss.find(',', p); spk_pos_v.push_back(atoi(poss.substr(p, c==std::string::npos?c:c-p).c_str())); if (c==std::string::npos) break; p = c+1; }
+        }
+        if (spk_pos_v.empty()) { printf("WARNING: --spk-emb given but no spk_pos resolved => clone DISABLED.\n"); }
+    }
+    const bool clone = !spk_emb_host.empty() && !spk_pos_v.empty();
+    const bool effective_timbre = clone && o.timbre_cfg > 0.0f;
+    if (clone) {
+        printf("VOICE CLONE: spk_emb=%s, spk_pos=[", o.spk_emb.c_str());
+        for (size_t i = 0; i < spk_pos_v.size(); ++i) printf("%s%d", i?",":"", spk_pos_v[i]);
+        printf("], timbre_cfg=%.2f%s\n", o.timbre_cfg, effective_timbre ? " (active)" : "");
+    }
+
     // ----- seeded noise in VAE-latent space [W_lat, H_lat, F, 48] -----
     PhiloxRNG rng(o.seed);
     sd::Tensor<float> latent({(int64_t)W_lat, (int64_t)H_lat, (int64_t)f_len, 48});
@@ -790,7 +830,11 @@ static int run_render(int argc, char** argv) {
         }
 
         // cond + uncond JOINT forwards -> both stream velocities each.
-        auto [vv_cond,   va_cond]   = runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts);
+        // COND: when cloning, splice the projected speaker embedding into the shared
+        // (spk-selected, model_mm.py:1644) context. UNCOND is always spk=None (the python
+        // uncond pass passes spk_embs=None -> context_vid(neg) for both streams).
+        auto [vv_cond,   va_cond]   = runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts,
+                                                         /*mask_modality=*/false, /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
         auto [vv_uncond, va_uncond] = runner->compute_va(n_threads, latent, audio_latent, ctx_neg, ts);
         if (vv_cond.empty() || vv_uncond.empty()) {
             printf("ERROR: DiT forward returned empty at step %d\n", step);
@@ -824,7 +868,19 @@ static int run_render(int argc, char** argv) {
         sd::Tensor<float> vv_mmask, va_mmask;
         if (align_cfg) {
             std::tie(vv_mmask, va_mmask) =
-                runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/true);
+                runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/true,
+                                   /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
+        }
+        // timbre CFG: a 4th AUDIO forward with spk=None on the POSITIVE context
+        // (pipeline_nava.py eps_timbre_uncond). The term g_timbre*(cond - timbre_uncond)
+        // amplifies the speaker's contribution. Audio-only (video timbre term is commented
+        // out in python). Only its audio velocity is used.
+        sd::Tensor<float> va_timbre;
+        if (effective_timbre) {
+            sd::Tensor<float> vv_tmp;
+            std::tie(vv_tmp, va_timbre) =
+                runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/false);
+            (void)vv_tmp;
         }
         if (dump_audio_traj) {
             char fn[96];
@@ -880,12 +936,20 @@ static int run_render(int argc, char** argv) {
             sd::Tensor<float> va_cfg(audio_latent.shape());
             for (int64_t i = 0; i < audio_latent.numel(); ++i) {
                 float ac = va_cond.data()[i], au = va_uncond_for_audio.data()[i];
+                float eps;
                 if (align_cfg && !va_mmask.empty() && va_mmask.numel() == audio_latent.numel()) {
-                    float am         = va_mmask.data()[i];
-                    va_cfg.data()[i] = ac + cfg_audio * (ac - au) + cfg_audio_align * (ac - am);
+                    float am = va_mmask.data()[i];
+                    eps = ac + cfg_audio * (ac - au) + cfg_audio_align * (ac - am);  // cond-base 3-term
+                } else if (effective_timbre) {
+                    eps = ac + cfg_audio * (ac - au);                                // cond-base 2-term (timbre, no align)
                 } else {
-                    va_cfg.data()[i] = au + cfg_audio * (ac - au);
+                    eps = au + cfg_audio * (ac - au);                                // legacy uncond-base 2-term
                 }
+                // timbre term (audio only): + g_timbre*(cond - timbre_uncond)
+                if (effective_timbre && !va_timbre.empty() && va_timbre.numel() == audio_latent.numel()) {
+                    eps += o.timbre_cfg * (ac - va_timbre.data()[i]);
+                }
+                va_cfg.data()[i] = eps;
             }
             if (dump_traj) {
                 char fn[80];
@@ -1300,6 +1364,20 @@ int main(int argc, char** argv) {
             masks.assign(kMaxTok, 0.0f);  // tokenize already mapped valid->0.0 / pad->-HUGE (t5.hpp:509)
         }
         printf("tokens=%zu\n", tokens.size());
+        // Voice clone: record the spk-token (<extra_id_2>=256297) position(s) in the FINAL
+        // token sequence to a sidecar <out>.spkpos, so `render --spk-emb` can splice the
+        // projected speaker embedding there (model_mm.py spk_pos). 0 lines => no spk token.
+        {
+            std::string sp = out + ".spkpos";
+            FILE* sf = fopen(sp.c_str(), "w");
+            if (sf) {
+                int n_spk = 0;
+                for (size_t i = 0; i < tokens.size(); ++i)
+                    if (tokens[i] == 256297) { fprintf(sf, "%zu\n", i); ++n_spk; }
+                fclose(sf);
+                printf("spk_pos: %d <extra_id_2> token(s) -> %s\n", n_spk, sp.c_str());
+            }
+        }
         auto input_ids = sd::Tensor<int32_t>::from_vector(tokens);
         auto attn_mask = sd::Tensor<float>::from_vector(masks);
         auto emb       = t5->model.compute(8, input_ids, attn_mask);  // ne [4096, L]
