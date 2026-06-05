@@ -554,6 +554,21 @@ struct RenderOpts {
     // re-encode needed. --image still gives the single-frame i2v anchor (N=1).
     std::string video_anchor;
     std::string audio_anchor;
+    // Continuation seam softener (Track 1, SDEdit warm-start). --warm-latent: a prior
+    // segment's dumped diffusion video latent [W_lat,H_lat,Kf,48] (from NAVA_DUMP_LATENT).
+    // Its LAST frame (a velocity-carrying P-frame, std~0.88 — NOT a reset I-frame) is
+    // broadcast across all f_len frames as the clean x0; the video latent is init'd
+    // (1-sigma)*x0 + sigma*noise and the VIDEO stream denoises from the schedule step
+    // whose sigma <= --warm-strength. AUDIO keeps the full schedule (Track 1 leaves the
+    // per-segment speech path untouched). 0 = disabled.
+    std::string warm_latent;
+    float warm_strength   = 0.0f;
+    int   warm_overlap    = 4;     // # leading frames seeded from the prior tail SEQUENCE
+    // SYNC mode (Track 1+2): when set, the AUDIO stream is also warm-started from the prior
+    // segment's tail audio latent [128,audio_len] at the SAME sigma_held and both streams
+    // denoise the truncated schedule together — no freeze, no video/audio noise-level
+    // desync (which corrupts the joint audio), and speech flows across the seam.
+    std::string warm_audio;
 };
 
 // FlowMatchScheduler (Euler), distilled from NAVA scheduler/flow_match.py.
@@ -791,6 +806,10 @@ static int run_render(int argc, char** argv) {
         else if (a == "--timbre-cfg") o.timbre_cfg = atof(next("0.0").c_str());
         else if (a == "--video-anchor") o.video_anchor = next("");
         else if (a == "--audio-anchor") o.audio_anchor = next("");
+        else if (a == "--warm-latent") o.warm_latent = next("");
+        else if (a == "--warm-strength") o.warm_strength = atof(next("0.0").c_str());
+        else if (a == "--warm-overlap") o.warm_overlap = atoi(next("4").c_str());
+        else if (a == "--warm-audio") o.warm_audio = next("");
         else if (a == "--cuda") o.cuda = true;
         else { printf("unknown render arg: %s\n", a.c_str()); return 1; }
     }
@@ -1188,6 +1207,102 @@ static int run_render(int argc, char** argv) {
            use_unipc ? "UniPC" : "Euler",
            use_unipc_audio ? "UniPC" : "Euler");
 
+    // ----- WARM-START (SDEdit) video init — continuation seam softener (Track 1) -----
+    // Pinning a clean I-frame anchor (--image) resets the leading frame to std~0.5,
+    // wiping the motion velocity the full-sequence encode held (std~0.88) → a hard cut.
+    // Instead we seed the WHOLE video latent from the prior segment's velocity-carrying
+    // tail latent and denoise the video stream from a partial sigma (img2img/strength).
+    // The continuity-vs-LIVENESS tension (measured by eye): uniformly warm-starting EVERY
+    // frame from the prior latent kills the model's free micro-motion (blinks, cheeks) →
+    // "dead-eyed" + jitter. M=1 stays alive because its post-anchor frames denoise from PURE
+    // NOISE (full freedom). GRADED fix: warm ONLY the OVERLAP region (first O video frames /
+    // Na audio tokens) to carry the prior MOTION across the seam, and leave the BODY frames as
+    // pure noise on the full schedule (free → lively). The overlap is SOFT-ANCHORED: held at
+    // sigma_held (a partial-noise SDEdit level, repinned each step) until the schedule's sigma
+    // descends to it (video_start_step), then released to denoise with the body. The model
+    // propagates the overlap motion into the free body via its own temporal attention. Both
+    // streams share sigma_held so the joint attention never desyncs (no broken audio). The
+    // overlap frames reproduce the prior tail, so they're dropped in the concat → seam flows.
+    int   video_start_step = 0;     // step at which the soft-anchored overlap releases
+    bool  warm_active      = false;
+    float sigma_held       = 0.0f;
+    int   warm_ov_v        = 0;     // # soft-anchored video overlap frames
+    int   warm_ov_a        = 0;     // # soft-anchored audio overlap tokens
+    std::vector<float> warm_pin_v;  // saved warm-init for the overlap video frames (repin)
+    std::vector<float> warm_pin_a;  // saved warm-init for the overlap audio tokens (repin)
+    if (!o.warm_latent.empty() && o.warm_strength > 0.0f) {
+        if (!path_exists(o.warm_latent)) { printf("ERROR: --warm-latent %s not found\n", o.warm_latent.c_str()); return 1; }
+        auto wl = sd::load_tensor_from_file_as_tensor<float>(o.warm_latent);  // [W,H,Kf,48] diffusion latent
+        if (wl.dim() < 4 || wl.shape()[0] != (int64_t)W_lat || wl.shape()[1] != (int64_t)H_lat
+            || wl.shape()[3] != 48) {
+            printf("ERROR: --warm-latent ne %s != [%d,%d,Kf,48]\n",
+                   sd::tensor_shape_to_string(wl.shape()).c_str(), W_lat, H_lat);
+            return 1;
+        }
+        const int64_t Kf = wl.shape()[2];
+        // start step = first schedule step whose sigma <= the requested strength.
+        const std::vector<float>& sig = use_unipc ? usched_v.sigmas : sched.sigmas;
+        int ss = 0;
+        while (ss < o.steps && sig[(size_t)ss] > o.warm_strength) ss++;
+        if (ss >= o.steps) ss = o.steps - 1;  // leave >=1 release step
+        video_start_step = ss;
+        sigma_held       = sig[(size_t)ss];
+        int O = o.warm_overlap;
+        if (O < 1) O = 1;
+        if (O > (int)Kf) O = (int)Kf;
+        if (O > f_len) O = f_len;
+        warm_ov_v = O;
+        const int64_t WH = (int64_t)W_lat * H_lat;
+        warm_pin_v.resize((size_t)O * 48 * WH);
+        // Seed overlap frames [0,O) from the prior tail SEQUENCE [Kf-O, Kf) (carries the real
+        // frame-to-frame velocity); body frames [O, f_len) are LEFT as pure noise (free).
+        for (int64_t c = 0; c < 48; ++c)
+            for (int64_t f = 0; f < O; ++f)
+                for (int64_t p = 0; p < WH; ++p) {
+                    const float   x0  = wl.data()[p + WH * ((Kf - (int64_t)O + f) + Kf * c)];
+                    const int64_t di  = p + WH * (f + (int64_t)f_len * c);
+                    const float   val = (1.0f - sigma_held) * x0 + sigma_held * latent.data()[di];
+                    latent.data()[di] = val;
+                    warm_pin_v[((size_t)f * 48 + c) * WH + p] = val;
+                }
+        warm_active = true;
+        printf("WARM-START (graded): strength=%.3f start_step=%d/%d sigma_held=%.4f overlap=%d/%d Kf=%lld (body=free noise)\n",
+               o.warm_strength, video_start_step, o.steps, sigma_held, O, f_len, (long long)Kf);
+        dump_stats("warm-start video init", latent);
+    }
+    // Audio overlap: warm the first Na audio tokens from the prior tail audio latent at the
+    // SAME sigma_held (continuity), soft-anchored like the video overlap; the rest is free
+    // noise → new speech stays lively. Na ~ the video overlap in TIME (25 audio tok/s).
+    if (warm_active && !o.warm_audio.empty()) {
+        if (!path_exists(o.warm_audio)) { printf("ERROR: --warm-audio %s not found\n", o.warm_audio.c_str()); return 1; }
+        auto wa = sd::load_tensor_from_file_as_tensor<float>(o.warm_audio);  // [128, Ka]
+        if (wa.shape()[0] != 128) {
+            printf("ERROR: --warm-audio ne %s != [128,Ka]\n", sd::tensor_shape_to_string(wa.shape()).c_str());
+            return 1;
+        }
+        const int64_t Ka = wa.shape()[1];
+        int Na = (int)llround((double)warm_ov_v * (double)audio_len / (double)f_len);
+        if (Na < 1) Na = 1;
+        if (Na > audio_len) Na = audio_len;
+        warm_ov_a = Na;
+        warm_pin_a.resize((size_t)Na * 128);
+        for (int64_t t = 0; t < Na; ++t) {
+            const int64_t st = (t < Ka) ? t : (Ka - 1);  // align to prior tail; clamp at its end
+            for (int64_t c = 0; c < 128; ++c) {
+                const float a0  = wa.data()[st * 128 + c];
+                const float val = (1.0f - sigma_held) * a0 + sigma_held * audio_latent.data()[t * 128 + c];
+                audio_latent.data()[t * 128 + c] = val;
+                warm_pin_a[(size_t)t * 128 + c]  = val;
+            }
+        }
+        printf("WARM-START AUDIO (graded): overlap=%d/%d tokens, Ka=%lld (rest=free noise)\n",
+               Na, audio_len, (long long)Ka);
+        dump_stats("warm-start audio init", audio_latent);
+    }
+    // Per-token timestep needed whenever tokens sit at different noise levels: i2v clean
+    // anchors (t=0) OR the soft-anchored warm overlap (held at sigma_held until release).
+    const bool per_token_ts = i2v || warm_active;
+
     // Optional per-step trajectory dump for cpp-vs-PyTorch sampler faithfulness probe.
     const char* dump_traj = getenv("NAVA_DUMP_TRAJ");
     const char* dump_audio_traj = getenv("NAVA_DUMP_AUDIO_TRAJ");
@@ -1249,17 +1364,29 @@ static int run_render(int argc, char** argv) {
         const bool use_int_timestep = use_unipc && getenv("NAVA_UNIPC_INT_TIMESTEP") != nullptr;
         const float tval = use_int_timestep ? static_cast<float>(static_cast<int64_t>(sampler_t))
                                             : sampler_t;
-        // I2V: per-token clean-anchor timestep (frame-0 video tokens = 0, rest = t).
-        // T2V: scalar timestep (uniform-t, broadcast). Validated vs PyTorch (blocks 100-120 dB).
+        // Graded warm-start: the soft-anchored overlap (first warm_ov_v video frames /
+        // warm_ov_a audio tokens) is HELD at sigma_held until the schedule sigma descends to
+        // it (step < video_start_step) → those tokens carry the held timestep; everything else
+        // (clean anchors = 0, free body = live tval) carries its own level.
+        const float held_t      = sigma_held * 1000.0f;
+        const bool  ov_held     = warm_active && (step < video_start_step);
+        const int64_t tpf       = (int64_t)h_grid_i * w_grid_i;  // video tokens per frame
+        // I2V / warm-start: per-token timestep. T2V: scalar timestep (uniform-t).
+        // Validated vs PyTorch (blocks 100-120 dB).
         sd::Tensor<float> ts;
-        if (i2v) {
-            // per-token clean-anchor timestep: first n_clean_i video tokens (N frames) and
-            // first n_anchor_a audio tokens carry t=0; everything else carries tval.
+        if (per_token_ts) {
             const int64_t L_total = L_vid_i + audio_len;
             ts = sd::Tensor<float>({L_total});
-            for (int64_t i = 0; i < L_vid_i; ++i) ts.data()[i] = (i < n_clean_i) ? 0.0f : tval;
+            for (int64_t i = 0; i < L_vid_i; ++i) {
+                const int64_t f = (tpf > 0) ? (i / tpf) : 0;
+                ts.data()[i] = (i < n_clean_i)                         ? 0.0f      // clean anchor
+                             : (ov_held && f < warm_ov_v)             ? held_t    // soft-anchored overlap
+                                                                       : tval;     // free body
+            }
             for (int64_t j = 0; j < audio_len; ++j)
-                ts.data()[L_vid_i + j] = (j < (int64_t)n_anchor_a) ? 0.0f : tval;
+                ts.data()[L_vid_i + j] = (j < (int64_t)n_anchor_a)        ? 0.0f
+                                       : (ov_held && j < warm_ov_a)       ? held_t
+                                                                          : tval;
         } else {
             ts = sd::Tensor<float>({1});
             ts.data()[0] = tval;
@@ -1456,6 +1583,9 @@ static int run_render(int argc, char** argv) {
             snprintf(fn, sizeof(fn), "/vel_vid_uncond_%02d.bin", step);
             write_bin(std::string(dump_traj) + fn, vv_uncond, "vel_vid_uncond");
         }
+        // Body + overlap denoise every step (full schedule). The soft-anchored overlap is
+        // repinned below while still held, so its UniPC update here is discarded each early
+        // step — same mechanism as the i2v clean-anchor repin.
         if (use_unipc) {
             latent = usched_v.step(v, latent);  // x0-predict + multistep corrector
         } else {
@@ -1465,6 +1595,16 @@ static int run_render(int argc, char** argv) {
         }
         if (repin_after_step) {
             splice_anchor_into(&latent, &audio_latent);
+        }
+        // Graded warm-start: re-pin the soft-anchored video overlap to its held warm-init
+        // until release (keeps frames [0,warm_ov_v) at sigma_held while the body denoises).
+        if (warm_active && ov_held && warm_ov_v > 0) {
+            const int64_t WH = (int64_t)W_lat * H_lat;
+            for (int64_t f = 0; f < warm_ov_v; ++f)
+                for (int64_t c = 0; c < 48; ++c)
+                    for (int64_t p = 0; p < WH; ++p)
+                        latent.data()[p + WH * (f + (int64_t)f_len * c)] =
+                            warm_pin_v[((size_t)f * 48 + c) * WH + p];
         }
 
         // --- audio: CFG combine -> Euler step (same schedule/shift -> same dsig) ---
@@ -1511,6 +1651,13 @@ static int run_render(int argc, char** argv) {
             }
             if (repin_after_step) {
                 splice_anchor_into(&latent, &audio_latent);
+            }
+            // Graded warm-start: re-pin the soft-anchored audio overlap to its held warm-init
+            // until release (continuity handoff) while the rest of the speech denoises free.
+            if (warm_active && ov_held && warm_ov_a > 0) {
+                for (int64_t t = 0; t < warm_ov_a; ++t)
+                    for (int64_t c = 0; c < 128; ++c)
+                        audio_latent.data()[t * 128 + c] = warm_pin_a[(size_t)t * 128 + c];
             }
             if (dump_traj) {
                 char fn[80];
