@@ -5,6 +5,12 @@ clone, perf) and build/run mechanics. This doc is ONLY about chaining clips so m
 speech continue across segments. Branch `nava-port`. 1× RTX 3060, serial GPU. cpp builds
 on-server. Eye :8097 / ear :8099.
 
+## LOCKED CONFIG (use for ALL ongoing continuation work)
+**q6_K DiT + flash attention (default ON) + `NAVA_VAE_TILE=16` + i2v encode tiling OFF
+(already default).** Peak ~7.6 GB, ~176s per ~2s clip, audio cos 0.991 vs q8. If VRAM ever
+gets tight, reduce `--frames` (weights are fixed at 5.5 GB; activation + decode buffer scale
+with frame count) — don't drop quant. `--gguf models/nava-dit-q6_k.gguf`.
+
 ## TL;DR state
 - **N=1 continuation WORKS today** (proven). Re-encode the prior clip's last decoded PIXEL
   frame as an i2v `--image` → render the next segment. Eye: `chain_seg1_reenc` /
