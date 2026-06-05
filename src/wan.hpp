@@ -1211,6 +1211,28 @@ namespace WAN {
 
             ggml_build_forward_expand(gf, out);
 
+            if (std::getenv("NAVA_VAE_OP_HIST") != nullptr) {
+                std::map<int, int> hist;
+                std::map<int, int64_t> work;
+                int nconcat   = 0;
+                int n_nodes   = ggml_graph_n_nodes(gf);
+                for (int ni = 0; ni < n_nodes; ni++) {
+                    ggml_tensor* n = ggml_graph_node(gf, ni);
+                    hist[(int)n->op]++;
+                    work[(int)n->op] += ggml_nelements(n);
+                    if (n->op == GGML_OP_CONCAT && nconcat < 8) {
+                        printf("  CONCAT[%d] dim=%d ne=[%lld,%lld,%lld,%lld]\n", nconcat,
+                               n->op_params[0], (long long)n->ne[0], (long long)n->ne[1],
+                               (long long)n->ne[2], (long long)n->ne[3]);
+                        nconcat++;
+                    }
+                }
+                printf("=== VAE graph op histogram (n_nodes=%d) ===\n", n_nodes);
+                for (auto& kv : hist)
+                    printf("  %-22s count=%7d  out_elems=%lld\n", ggml_op_name((ggml_op)kv.first),
+                           kv.second, (long long)work[kv.first]);
+            }
+
             return gf;
         }
 
