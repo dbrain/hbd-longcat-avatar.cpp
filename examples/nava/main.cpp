@@ -1338,6 +1338,31 @@ static int run_render(int argc, char** argv) {
            sd::tensor_shape_to_string(rgb.shape()).c_str());
     dump_stats("decoded rgb [0,1]", rgb);
 
+    // ----- continuation: dump the tail decoded frames LOSSLESSLY -----
+    // NAVA_DUMP_TAIL=<dir> writes the last K decoded pixel frames (K=NAVA_TAIL_K, default 9
+    // -> M=3 anchor) as lossless PNGs straight from the `rgb` tensor (NOT the VP9 webm). The
+    // webm round-trip injects compression artifacts that COMPOUND through every chained
+    // re-encode (sharpness/noise explodes seg-over-seg); chaining from these lossless frames
+    // keeps the drift-sink clean. Feed them to `nava encode-video` -> `render --video-anchor`.
+    if (const char* td = getenv("NAVA_DUMP_TAIL")) {
+        int tail_k = 9;
+        if (const char* tk = getenv("NAVA_TAIL_K")) { int v = atoi(tk); if (v >= 1) tail_k = v; }
+        int64_t Tp = rgb.shape()[2];
+        if (tail_k > (int)Tp) tail_k = (int)Tp;
+        std::string dir = td;
+        mkdirs(dir);
+        for (int j = 0; j < tail_k; ++j) {
+            int64_t fi = Tp - tail_k + j;  // oldest-first temporal order
+            sd_image_t im = tensor_to_sd_image(rgb, (int)fi);
+            char fn[64];
+            snprintf(fn, sizeof(fn), "/f%03d.png", j + 1);
+            write_image_to_file(dir + fn, im.data, (int)im.width, (int)im.height, (int)im.channel, "", 100);
+            free(im.data);
+        }
+        printf("NAVA_DUMP_TAIL: wrote last %d decoded frames (lossless PNG) -> %s/f001..f%03d.png\n",
+               tail_k, dir.c_str(), tail_k);
+    }
+
     // ----- audio: decode the co-denoised audio latent -> waveform (LTX audio VAE) -----
     // audio_latent (ggml ne [128, audio_len]) carries the joint-denoised audio stream.
     // The LTX audio VAE applies its own per_channel_statistics renorm INSIDE decode and
@@ -1666,6 +1691,138 @@ int main(int argc, char** argv) {
         write_bin(out, ctx, "context");
         dump_stats("umt5 context", ctx);
         printf("encoded -> %s  ne=[%lld,512]  (token L=%lld)\n", out.c_str(), (long long)C, (long long)L);
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "encode-video") {
+        // nava encode-video --vae <gguf> --width W --height H --out <out.bin> [--cuda] f0 f1 ...
+        //
+        // Re-encode K decoded PIXEL frames (in temporal order, oldest->newest) through the
+        // Wan2.2 16x VAE into a diffusion-latent ANCHOR block ggml ne [W_lat,H_lat,M,48]
+        // (M = 1 + (K-1)/4; the VAE encodes frame 0 alone as a causal I-frame std~0.5 and
+        // each following 4-frame chunk as a P-frame std~0.9 — a valid temporal sequence).
+        // This is the CORRECT clip-continuation primitive: feed the output to
+        //   nava render --video-anchor <out.bin>
+        // to pin those M frames as clean motion anchors for the next segment. The legacy
+        // raw-latent --video-anchor (slicing a prior render's P-frame into the I-frame slot)
+        // is WRONG and smears the decode (see HANDOFF-nava-CONTINUATION-NEXT.md).
+        //
+        // K=1 (single frame) reproduces the `render --image` i2v anchor BIT-FOR-BIT (same VAE,
+        // same full-frame encode, same vae_to_diffusion_latents) — a numeric parity gate.
+        std::string vae = "models/wan2.2-vae-48ch-f16.gguf", out;
+        int W = 0, H = 0;
+        bool want_cuda = false;
+        std::vector<std::string> frame_files;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--vae") { if (i + 1 < argc) vae = argv[++i]; }
+            else if (a == "--width") { if (i + 1 < argc) W = atoi(argv[++i]); }
+            else if (a == "--height") { if (i + 1 < argc) H = atoi(argv[++i]); }
+            else if (a == "--out") { if (i + 1 < argc) out = argv[++i]; }
+            else if (a == "--cuda") { want_cuda = true; }
+            else frame_files.push_back(a);
+        }
+        if (W <= 0 || H <= 0 || out.empty() || frame_files.empty()) {
+            printf("usage: %s encode-video --vae <gguf> --width W --height H --out <out.bin> [--cuda] f0.png f1.png ...\n",
+                   argv[0]);
+            printf("  W,H are PIXEL dims (multiples of 16). K frames -> M = 1+(K-1)/4 latent anchor frames.\n");
+            return 1;
+        }
+        const int K = (int)frame_files.size();
+        const int W_lat = W / 16, H_lat = H / 16;
+        const int M = 1 + (K - 1) / 4;
+        if (W % 16 != 0 || H % 16 != 0) { printf("ERROR: W,H must be multiples of 16 (got %dx%d)\n", W, H); return 1; }
+        if (((K - 1) % 4) != 0)
+            printf("WARN: K=%d is not 1+4*m; the final P-chunk is partial (<4 frames). M=%d. "
+                   "For clean chunking use K in {1,5,9,13,...}.\n", K, M);
+        printf("=== NAVA encode-video: %d pixel frame(s) -> [%d,%d,%d,48] diffusion anchor (vae=%s) ===\n",
+               K, W_lat, H_lat, M, vae.c_str());
+
+        ggml_backend_t backend = nullptr;
+        if (want_cuda) {
+#ifdef GGML_USE_CUDA
+            backend = ggml_backend_cuda_init(0);
+            printf("backend: CUDA\n");
+#endif
+        }
+        if (!backend) { backend = ggml_backend_cpu_init(); printf("backend: CPU\n"); }
+        const int n_threads = 8;
+
+        // Load + Python-parity resize/center-crop each frame, stack into ggml ne [W,H,K,3].
+        // Per-frame data idx = x + W*(y + H*(0 + 1*c)); stacked idx = x + W*(y + H*(f + K*c)).
+        sd::Tensor<float> frames({(int64_t)W, (int64_t)H, (int64_t)K, 3});
+        for (int f = 0; f < K; ++f) {
+            sd::Tensor<float> img;
+            if (looks_like_image_file(frame_files[(size_t)f])) {
+                if (!load_image_resize_center_crop(frame_files[(size_t)f], W, H, img)) return 1;
+            } else {
+                img = sd::load_tensor_from_file_as_tensor<float>(frame_files[(size_t)f]);
+                printf("loaded preprocessed RGB bin %s shape=%s\n", frame_files[(size_t)f].c_str(),
+                       sd::tensor_shape_to_string(img.shape()).c_str());
+            }
+            if (img.shape()[0] != (int64_t)W || img.shape()[1] != (int64_t)H) {
+                printf("ERROR: frame %d ne %s != [%d,%d,1,3]\n", f,
+                       sd::tensor_shape_to_string(img.shape()).c_str(), W, H);
+                return 1;
+            }
+            for (int64_t c = 0; c < 3; ++c)
+                for (int64_t y = 0; y < H; ++y)
+                    for (int64_t x = 0; x < W; ++x)
+                        frames.data()[x + W * (y + H * (f + (int64_t)K * c))] =
+                            img.data()[x + W * (y + H * (0 + 1 * c))];
+        }
+        // Explicit 5D video tensor [W,H,K,3,1] (temporal at ne2) — symmetric to the decode
+        // path's latent5 [W,H,T,48,1]; dim==5 means _compute does NOT unsqueeze (the 4D
+        // single-image path relies on the unsqueeze batch->temporal convention).
+        frames.reshape_({(int64_t)W, (int64_t)H, (int64_t)K, 3, 1});
+
+        auto encvae = std::make_shared<WAN::WanVAERunner>(
+            backend, backend, String2TensorStorage{}, "", /*decode_only=*/false, VERSION_WAN2_2_TI2V);
+        {
+            ModelLoader vl;
+            if (!vl.init_from_file_and_convert_name(vae, "vae.")) { printf("VAE loader fail: %s\n", vae.c_str()); return 1; }
+            encvae->alloc_params_buffer();
+            std::map<std::string, ggml_tensor*> vt;
+            encvae->get_param_tensors(vt, "first_stage_model");
+            if (!vl.load_tensors(vt)) { printf("VAE tensors load fail\n"); return 1; }
+        }
+        sd_tiling_params_t et = {};
+        // Full-frame encode (Python-parity) — same as render --image. Tiling seams perturb
+        // the anchor latent (~14%); a single block is encoded in isolation so VRAM is fine.
+        et.enabled = (W_lat > 24 || H_lat > 24) && (getenv("NAVA_VAE_ENCODE_TILE") != nullptr);
+        et.temporal_tiling = false; et.tile_size_x = 24; et.tile_size_y = 24; et.target_overlap = 0.25f;
+        printf("VAE encode tiling=%s\n", et.enabled ? "ON (24x24/0.25)" : "OFF (full-frame)");
+        auto mu = encvae->encode(n_threads, frames, et, /*circular_x=*/true, /*circular_y=*/false);
+        if (mu.empty()) { printf("ERROR: VAE encode failed\n"); return 1; }
+        printf("encoded mu shape=%s (expect [%d,%d,%d,48] or trailing-singleton variant)\n",
+               sd::tensor_shape_to_string(mu.shape()).c_str(), W_lat, H_lat, M);
+        // Normalize to a clean 4D [W_lat,H_lat,M,48] regardless of trailing singletons.
+        if (mu.numel() != (int64_t)W_lat * H_lat * M * 48) {
+            printf("ERROR: mu numel %lld != %lld — layout mismatch (K=%d -> M=%d?)\n",
+                   (long long)mu.numel(), (long long)((int64_t)W_lat * H_lat * M * 48), K, M);
+            return 1;
+        }
+        // vae_to_diffusion_latents reads channels at ne dim 3 for a 5D tensor -> [W,H,M,48,1].
+        sd::Tensor<float> mu5 = mu;
+        mu5.reshape_({(int64_t)W_lat, (int64_t)H_lat, (int64_t)M, 48, 1});
+        auto anchor = encvae->vae_to_diffusion_latents(mu5);
+        anchor.reshape_({(int64_t)W_lat, (int64_t)H_lat, (int64_t)M, 48});
+        encvae.reset();
+        dump_stats("video anchor (diffusion)", anchor);
+        // Per-frame std diagnostic: frame 0 should be I-frame (~0.5), frames 1+ P-frames (~0.9).
+        for (int f = 0; f < M; ++f) {
+            double s = 0, sq = 0; int64_t cnt = 0;
+            for (int64_t c = 0; c < 48; ++c)
+                for (int64_t y = 0; y < H_lat; ++y)
+                    for (int64_t x = 0; x < W_lat; ++x) {
+                        double v = anchor.data()[x + W_lat * (y + H_lat * (f + (int64_t)M * c))];
+                        s += v; sq += v * v; ++cnt;
+                    }
+            double m = s / (double)cnt, sd_ = sqrt(sq / (double)cnt - m * m);
+            printf("  anchor frame %d: mean=%+.4f std=%.4f%s\n", f, m, sd_,
+                   f == 0 ? "  (I-frame, expect ~0.5)" : "  (P-frame, expect ~0.9)");
+        }
+        write_bin(out, anchor, "vid_anchor");
+        printf("=== encode-video done -> %s  ne=[%d,%d,%d,48] ===\n", out.c_str(), W_lat, H_lat, M);
         return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "ltx-audio-test") {
