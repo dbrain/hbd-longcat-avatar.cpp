@@ -1035,6 +1035,25 @@ static int run_render(int argc, char** argv) {
         printf("NAVA_DUMP_AUDIO_TRAJ active -> %s\n", d.c_str());
     }
 
+    // ---- NAVA step cache (TeaCache/EasyCache-style velocity reuse) ----
+    // The cond velocity is extremely stable step-to-step (measured: cos>0.999 in the
+    // mid-trajectory). On a "stable" step we SKIP all 3 DiT forwards and reuse the last
+    // computed velocities. Skip is predicted from the relative latent change times the
+    // learned input->output transformation rate (EasyCache), accumulated until it crosses
+    // NAVA_CACHE_THRESH. Active only in [start,end] fraction of the schedule. Disabled by
+    // default (thresh 0); the timbre 4th-forward path disables it. Tunables:
+    //   NAVA_CACHE_THRESH (e.g. 0.15) NAVA_CACHE_START (0.2) NAVA_CACHE_END (0.95)
+    const float cache_thresh = getenv("NAVA_CACHE_THRESH") ? atof(getenv("NAVA_CACHE_THRESH")) : 0.0f;
+    const float cache_start  = getenv("NAVA_CACHE_START") ? atof(getenv("NAVA_CACHE_START")) : 0.20f;
+    const float cache_end    = getenv("NAVA_CACHE_END") ? atof(getenv("NAVA_CACHE_END")) : 0.95f;
+    const bool  cache_on     = cache_thresh > 0.0f && !effective_timbre &&
+                               getenv("NAVA_SEPARATE_AUDIO_NEG") == nullptr;
+    sd::Tensor<float> c_vv_cond, c_va_cond, c_vv_uncond, c_va_uncond, c_vv_mmask, c_va_mmask;
+    std::vector<float> cache_prev_latent, cache_prev_vvcond;
+    float cache_rate = 0.0f, cache_accum = 0.0f;
+    bool cache_have = false, cache_have_rate = false;
+    int  cache_skipped = 0;
+
     int64_t sample_t0 = ggml_time_ms();
     for (int step = 0; step < o.steps; ++step) {
         // Python's FlowUniPCMultistepScheduler exposes int64 timesteps, but the
@@ -1081,28 +1100,49 @@ static int run_render(int argc, char** argv) {
             audio_in  = &audio_model;
         }
 
+        // ---- step-cache skip decision (EasyCache: predict from latent change x rate) ----
+        bool did_skip = false;
+        if (cache_on && cache_have && cache_have_rate &&
+            (int64_t) cache_prev_latent.size() == latent.numel()) {
+            const float progress = (float) step / (float) o.steps;
+            if (progress >= cache_start && progress <= cache_end) {
+                double dch = 0.0, nrm = 0.0;
+                const float* ld = latent.data();
+                for (int64_t i = 0; i < latent.numel(); ++i) { dch += std::fabs(ld[i] - cache_prev_latent[i]); nrm += std::fabs(ld[i]); }
+                const float rel = nrm > 0.0 ? (float) (dch / nrm) : 0.0f;
+                cache_accum += cache_rate * rel;
+                if (cache_accum < cache_thresh) did_skip = true; else cache_accum = 0.0f;
+            }
+        }
+
         // cond + uncond JOINT forwards -> both stream velocities each.
         // COND: when cloning, splice the projected speaker embedding into the shared
         // (spk-selected, model_mm.py:1644) context. UNCOND is always spk=None (the python
         // uncond pass passes spk_embs=None -> context_vid(neg) for both streams).
-        auto [vv_cond,   va_cond]   = runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts,
-                                                         /*mask_modality=*/false, /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
-        if (vv_cond.empty()) {
-            printf("ERROR: DiT forward returned empty at step %d\n", step);
-            return 1;
-        }
-        if (step == 0 && getenv("NAVA_STOP_AFTER_STEP0_COND") != nullptr) {
-            if (dump_audio_traj) {
-                const std::string d = dump_audio_traj;
-                write_bin(d + "/va_cond_00.bin", va_cond, "va_cond");
+        sd::Tensor<float> vv_cond, va_cond, vv_uncond, va_uncond;
+        if (did_skip) {
+            vv_cond = c_vv_cond; va_cond = c_va_cond; vv_uncond = c_vv_uncond; va_uncond = c_va_uncond;
+            cache_skipped++;
+        } else {
+            std::tie(vv_cond, va_cond) = runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts,
+                                                            /*mask_modality=*/false, /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
+            if (vv_cond.empty()) {
+                printf("ERROR: DiT forward returned empty at step %d\n", step);
+                return 1;
             }
-            printf("NAVA_STOP_AFTER_STEP0_COND active -> stopped after first conditional DiT forward\n");
-            return 0;
-        }
-        auto [vv_uncond, va_uncond] = runner->compute_va(n_threads, *latent_in, *audio_in, ctx_neg, ts);
-        if (vv_uncond.empty()) {
-            printf("ERROR: DiT forward returned empty at step %d\n", step);
-            return 1;
+            if (step == 0 && getenv("NAVA_STOP_AFTER_STEP0_COND") != nullptr) {
+                if (dump_audio_traj) {
+                    const std::string d = dump_audio_traj;
+                    write_bin(d + "/va_cond_00.bin", va_cond, "va_cond");
+                }
+                printf("NAVA_STOP_AFTER_STEP0_COND active -> stopped after first conditional DiT forward\n");
+                return 0;
+            }
+            std::tie(vv_uncond, va_uncond) = runner->compute_va(n_threads, *latent_in, *audio_in, ctx_neg, ts);
+            if (vv_uncond.empty()) {
+                printf("ERROR: DiT forward returned empty at step %d\n", step);
+                return 1;
+            }
         }
         // AUDIO uncond context. PyTorch's MMDiT merges to a SINGLE shared context for
         // both streams: when spk_embed is None (our case — spk is stubbed), the merge
@@ -1131,9 +1171,35 @@ static int run_render(int argc, char** argv) {
         // attention, same POSITIVE context) -> alignment guidance anchor for both streams.
         sd::Tensor<float> vv_mmask, va_mmask;
         if (align_cfg) {
-            std::tie(vv_mmask, va_mmask) =
-                runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts, /*mask_modality=*/true,
-                                   /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
+            if (did_skip) {
+                vv_mmask = c_vv_mmask; va_mmask = c_va_mmask;
+            } else {
+                std::tie(vv_mmask, va_mmask) =
+                    runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts, /*mask_modality=*/true,
+                                       /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
+            }
+        }
+
+        // ---- update step cache (computed steps only) + learn the transformation rate ----
+        if (cache_on && !did_skip) {
+            if (cache_have && !cache_prev_vvcond.empty() &&
+                (int64_t) cache_prev_vvcond.size() == vv_cond.numel() &&
+                (int64_t) cache_prev_latent.size() == latent.numel()) {
+                double vch = 0, vnrm = 0; const float* vd = vv_cond.data();
+                for (int64_t i = 0; i < vv_cond.numel(); ++i) { vch += std::fabs(vd[i] - cache_prev_vvcond[i]); vnrm += std::fabs(vd[i]); }
+                double lch = 0, lnrm = 0; const float* ld = latent.data();
+                for (int64_t i = 0; i < latent.numel(); ++i) { lch += std::fabs(ld[i] - cache_prev_latent[i]); lnrm += std::fabs(ld[i]); }
+                const float vrel = vnrm > 0 ? (float) (vch / vnrm) : 0.0f;
+                const float lrel = lnrm > 0 ? (float) (lch / lnrm) : 0.0f;
+                if (lrel > 1e-9f) { cache_rate = vrel / lrel; cache_have_rate = true; }
+            }
+            c_vv_cond = vv_cond; c_va_cond = va_cond;
+            c_vv_uncond = vv_uncond; c_va_uncond = va_uncond;
+            c_vv_mmask = vv_mmask; c_va_mmask = va_mmask;
+            cache_have = true;
+            cache_prev_vvcond.assign(vv_cond.data(), vv_cond.data() + vv_cond.numel());
+            cache_prev_latent.assign(latent.data(), latent.data() + latent.numel());
+            cache_accum = 0.0f;
         }
         // timbre CFG: a 4th AUDIO forward with spk=None on the POSITIVE context
         // (pipeline_nava.py eps_timbre_uncond). The term g_timbre*(cond - timbre_uncond)
@@ -1268,6 +1334,10 @@ static int run_render(int argc, char** argv) {
     }
     int64_t sample_t1 = ggml_time_ms();
     float sample_s = (sample_t1 - sample_t0) / 1000.0f;
+    if (cache_on) {
+        printf("step-cache: skipped %d/%d steps (reused all 3 forwards) thresh=%.3f rate=%.3f\n",
+               cache_skipped, o.steps, cache_thresh, cache_rate);
+    }
     dump_stats("final latent", latent);
 
     // Optional: dump the final video latent [W_lat,H_lat,F,48] so it can be decoded

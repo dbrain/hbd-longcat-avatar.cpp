@@ -898,6 +898,36 @@ namespace NAVA {
                 auto joint     = ggml_concat(compute_ctx, vel_v, vel_a_pad, 1);  // [192, L_total, 1]
                 ggml_set_output(joint);
                 ggml_build_forward_expand(gf, joint);
+                if (std::getenv("NAVA_DIT_VRAM_HIST") != nullptr) {
+                    int nn = ggml_graph_n_nodes(gf);
+                    // top tensors by size + op histogram (probe what fills the compute buffer)
+                    std::vector<std::pair<int64_t, ggml_tensor*>> sz;
+                    std::map<int, int64_t> opbytes;
+                    int64_t total = 0;
+                    for (int i = 0; i < nn; i++) {
+                        ggml_tensor* n = ggml_graph_node(gf, i);
+                        int64_t b = (int64_t) ggml_nbytes(n);
+                        sz.push_back({b, n});
+                        opbytes[(int) n->op] += b;
+                        total += b;
+                    }
+                    std::sort(sz.begin(), sz.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                    printf("=== NAVA DiT graph: %d nodes, sum-of-node-bytes %.1f MB (gallocr packs this into the compute buffer) ===\n",
+                           nn, total / 1e6);
+                    printf("  TOP 35 tensors by size:\n");
+                    for (int i = 0; i < 35 && i < (int) sz.size(); i++) {
+                        ggml_tensor* n = sz[i].second;
+                        printf("   %7.1f MB  %-14s [%lld,%lld,%lld,%lld]\n", sz[i].first / 1e6,
+                               ggml_op_name(n->op), (long long) n->ne[0], (long long) n->ne[1],
+                               (long long) n->ne[2], (long long) n->ne[3]);
+                    }
+                    printf("  bytes by op:\n");
+                    std::vector<std::pair<int64_t, int>> ob;
+                    for (auto& kv : opbytes) ob.push_back({kv.second, kv.first});
+                    std::sort(ob.begin(), ob.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                    for (int i = 0; i < 10 && i < (int) ob.size(); i++)
+                        printf("   %7.1f MB  %s\n", ob[i].first / 1e6, ggml_op_name((ggml_op) ob[i].second));
+                }
                 return gf;
             }
 
