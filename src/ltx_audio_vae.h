@@ -636,9 +636,28 @@ namespace LTXV {
         void init_params(ggml_context* ctx,
                          const String2TensorStorage& tensor_storage_map = {},
                          const std::string prefix                       = "") override {
+            // Weight type drives the CUDA dispatch: F16 weights route to the fast
+            // smem-tiled wmma conv_transpose_1d kernel; F32 falls back to the naive
+            // triple-loop kernel (~27s of the audio VAE in profiling — the single
+            // biggest sink in the whole pipeline). The GGUF stores these 11 HiFiGAN
+            // `ups.N` upsamplers as F32, so we FORCE F16 here (loader down-casts on
+            // load) to put the upsample cascade on the tensor-core path.
+            // NAVA_CT1D_F32=1 restores the legacy full-F32 path (A/B / quality fallback).
             SD_UNUSED(tensor_storage_map);
-            SD_UNUSED(prefix);
-            params["weight"] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kernel_size, out_channels, in_channels, 1);
+            // Precision/speed gating:
+            //   NAVA_CT1D_F32=1          -> all upsamplers F32 (legacy naive kernel).
+            //   NAVA_CT1D_F16_BWE_ONLY=1 -> F16 only for the BWE generator (perceptually
+            //                               masked high-freq extension; holds the 3x5.6s
+            //                               kernels), base vocoder stays full F32.
+            //   default                  -> all F16 (fast wmma everywhere).
+            ggml_type wtype = GGML_TYPE_F16;
+            if (std::getenv("NAVA_CT1D_F32") != nullptr) {
+                wtype = GGML_TYPE_F32;
+            } else if (std::getenv("NAVA_CT1D_F16_BWE_ONLY") != nullptr &&
+                       prefix.find("bwe") == std::string::npos) {
+                wtype = GGML_TYPE_F32;  // base vocoder full precision
+            }
+            params["weight"] = ggml_new_tensor_4d(ctx, wtype, kernel_size, out_channels, in_channels, 1);
             if (bias) {
                 params["bias"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_channels);
             }

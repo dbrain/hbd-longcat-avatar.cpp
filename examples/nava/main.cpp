@@ -1408,6 +1408,9 @@ static int run_render(int argc, char** argv) {
                            (a_t1 - a_t0) / 1000.0f, sd::tensor_shape_to_string(ws).c_str(),
                            (long long)n_samp, (long long)n_ch, avae->config.output_sample_rate());
                     dump_stats("audio waveform", wav);
+                    if (const char* wp = getenv("NAVA_DUMP_WAV")) {
+                        write_bin(wp, wav, "audio_waveform");  // planar [n_samp, n_ch] f32
+                    }
                     // ggml is planar (ne0=n_samples fastest): data[c*n_samp + i].
                     // sd_audio_t wants interleaved: data[i*n_ch + c].
                     audio_interleaved.resize((size_t)(n_samp * n_ch));
