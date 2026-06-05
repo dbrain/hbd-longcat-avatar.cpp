@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -29,6 +30,7 @@ namespace LTXV {
         std::vector<int> base_resblock_kernel_sizes                = {3, 7, 11};
         std::vector<std::vector<int>> base_resblock_dilation_sizes = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
         bool has_bwe                                               = false;
+        bool has_encoder                                           = false;  // encoder tensors present (encode gguf)
         int bwe_input_sample_rate                                  = 16000;
         int bwe_output_sample_rate                                 = 48000;
         int bwe_hop_length                                         = 80;
@@ -163,6 +165,9 @@ namespace LTXV {
                 config.bwe_resblock_kernel_sizes    = {3, 7, 11};
                 config.bwe_resblock_dilation_sizes  = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
             }
+
+            config.has_encoder = tensor_storage_map.find("audio_vae.encoder.conv_in.conv.weight") != tensor_storage_map.end() &&
+                                 tensor_storage_map.find("audio_vae.encoder.mel_stft.forward_basis") != tensor_storage_map.end();
 
             if (config.audio_channels != 2 || config.latent_channels != 8 || config.mel_bins != 64) {
                 return config;
@@ -524,6 +529,30 @@ namespace LTXV {
             x         = ggml_upscale(ctx->ggml_ctx, x, 2, GGML_SCALE_MODE_NEAREST);
             x         = conv->forward(ctx, x);
             return ggml_ext_slice(ctx->ggml_ctx, x, 1, 1, x->ne[1]);
+        }
+    };
+
+    // ENCODER strided downsample (mirrors python audio_vae/downsample.py `Downsample`
+    // with causality_axis=HEIGHT). A plain stride-2 k3 Conv2d preceded by an asymmetric
+    // pad. torch HEIGHT pad tuple (left,right,top,bottom)=(0,1,2,0): width(freq) gets
+    // (0,1), height(time) gets (2,0) = causal-top. In ggml ne (ne0=W=freq, ne1=H=time)
+    // that is ne0:(0,1), ne1:(2,0).
+    struct AudioDownsample2D : public GGMLBlock {
+        explicit AudioDownsample2D(int64_t channels) {
+            blocks["conv"] = std::make_shared<Conv2d>(channels,
+                                                      channels,
+                                                      std::pair<int, int>{3, 3},
+                                                      std::pair<int, int>{2, 2},
+                                                      std::pair<int, int>{0, 0},
+                                                      std::pair<int, int>{1, 1},
+                                                      true);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto conv = std::dynamic_pointer_cast<Conv2d>(blocks["conv"]);
+            // ne0 (freq): left 0, right 1 ; ne1 (time): left 2 (past), right 0.
+            x = ggml_ext_pad_ext(ctx->ggml_ctx, x, 0, 1, 2, 0, 0, 0, 0, 0);
+            return conv->forward(ctx, x);
         }
     };
 
@@ -977,6 +1006,172 @@ namespace LTXV {
         }
     };
 
+    // ENCODER mel front-end. Unlike the decode-side compute_log_mel_spectrogram
+    // (conv1d-based, LEFT-pad filter_len-hop), this takes a HOST-pre-framed window
+    // matrix `frames` ne [n_fft, T_mel, channels] (overlapping hop-strided windows of
+    // the reflect-padded waveform; reflect = torchaudio center=True). The STFT is a
+    // single F32 ggml_mul_mat with the windowed-DFT `forward_basis` — NO ggml_conv_1d,
+    // so it runs identically on CPU (conv1d asserts an F16 kernel; mul_mat keeps F32
+    // precision, which the log-mel needs for lip-sync). forward_basis/mel_basis are
+    // baked into the gguf by the converter. Output ggml ne [mel_bins, T_mel, channels].
+    static ggml_tensor* compute_encoder_log_mel(GGMLRunnerContext* runner_ctx,
+                                                ggml_tensor* frames,
+                                                ggml_tensor* forward_basis,
+                                                ggml_tensor* mel_basis) {
+        auto ctx = runner_ctx->ggml_ctx;
+        GGML_ASSERT(ctx != nullptr);
+        GGML_ASSERT(frames != nullptr && forward_basis != nullptr && mel_basis != nullptr);
+        GGML_ASSERT(frames->type == GGML_TYPE_F32);
+        GGML_ASSERT(forward_basis->type == GGML_TYPE_F32);
+        GGML_ASSERT(mel_basis->type == GGML_TYPE_F32);
+        GGML_ASSERT(forward_basis->ne[1] == 1);
+
+        const int64_t filter_len    = forward_basis->ne[0];   // n_fft
+        const int64_t stft_channels = forward_basis->ne[2];   // 2*n_freqs
+        const int64_t n_freqs       = stft_channels / 2;
+        const int64_t n_mels        = mel_basis->ne[1];
+        const int64_t frame_count   = frames->ne[1];
+        const int64_t channels      = frames->ne[2];
+
+        GGML_ASSERT(stft_channels % 2 == 0);
+        GGML_ASSERT(mel_basis->ne[0] == n_freqs);
+        GGML_ASSERT(frames->ne[0] == filter_len);
+
+        auto basis2d = ggml_reshape_2d(ctx, forward_basis, filter_len, stft_channels);  // [n_fft, 2*n_freqs]
+        // mul_mat(A[n_fft,2*n_freqs], B[n_fft, T_mel*ch]) -> [2*n_freqs, T_mel*ch]
+        auto fr2d    = ggml_reshape_2d(ctx, frames, filter_len, frame_count * channels);
+        auto stft    = ggml_mul_mat(ctx, basis2d, fr2d);  // [2*n_freqs, T_mel*ch]
+
+        auto real      = ggml_ext_slice(ctx, stft, 0, 0, n_freqs);
+        auto imag      = ggml_ext_slice(ctx, stft, 0, n_freqs, stft_channels);
+        auto magnitude = ggml_sqrt(ctx,
+                                   ggml_add(ctx,
+                                            ggml_sqr(ctx, real),
+                                            ggml_sqr(ctx, imag)));  // [n_freqs, T_mel*ch]
+
+        auto mel = ggml_mul_mat(ctx, mel_basis, magnitude);  // mel_basis[n_freqs,n_mels] -> [n_mels, T_mel*ch]
+        mel      = ggml_log(ctx, ggml_clamp(ctx, mel, 1e-5f, std::numeric_limits<float>::max()));
+
+        return ggml_reshape_4d(ctx, mel, n_mels, frame_count, channels, 1);
+    }
+
+    // ENCODER. Mirrors python AudioEncoder (audio_vae/audio_vae.py): conv_in,
+    // 3 down levels (2 ResnetBlocks each; levels 0,1 followed by a strided downsample;
+    // level 2 has none), mid block_1/block_2 (NO attention — checkpoint has
+    // mid_block_add_attention=false), PixelNorm + SiLU, conv_out -> 2*z_channels,
+    // chunk(2)[0] = means, patchify "b c t f -> b t (c f)", per-channel normalize,
+    // then [B,128,T]. causality_axis=HEIGHT (checkpoint ddconfig) -> reuse
+    // HeightCausalConv2D / AudioResnetBlock2D exactly as the decode side.
+    struct AudioEncoder : public GGMLBlock {
+        LTXAudioVAEConfig config;
+        int in_channels  = 2;
+        int z_channels   = 8;
+        int num_res_blocks = 2;
+
+        explicit AudioEncoder(const LTXAudioVAEConfig& config)
+            : config(config),
+              in_channels(config.audio_channels),
+              z_channels(config.latent_channels),
+              num_res_blocks(config.decoder_num_res_blocks) {
+            const auto& mult = config.decoder_channel_multipliers;  // {1,2,4}
+            int num_levels   = static_cast<int>(mult.size());
+
+            blocks["conv_in"] = std::make_shared<HeightCausalConv2D>(in_channels, config.decoder_channels, std::pair<int, int>{3, 3});
+
+            int block_in       = config.decoder_channels;            // running channels (in)
+            int in_ch_first     = config.decoder_channels;           // ch * in_ch_mult[level]
+            for (int level = 0; level < num_levels; ++level) {
+                int block_out  = config.decoder_channels * mult[level];
+                int level_in   = (level == 0) ? config.decoder_channels : config.decoder_channels * mult[level - 1];
+                (void)in_ch_first;
+                int cur_in = level_in;
+                for (int b = 0; b < num_res_blocks; ++b) {
+                    blocks["down." + std::to_string(level) + ".block." + std::to_string(b)] =
+                        std::make_shared<AudioResnetBlock2D>(cur_in, block_out);
+                    cur_in = block_out;
+                }
+                if (level != num_levels - 1) {
+                    blocks["down." + std::to_string(level) + ".downsample"] =
+                        std::make_shared<AudioDownsample2D>(block_out);
+                }
+                block_in = block_out;
+            }
+
+            blocks["mid.block_1"] = std::make_shared<AudioResnetBlock2D>(block_in, block_in);
+            blocks["mid.block_2"] = std::make_shared<AudioResnetBlock2D>(block_in, block_in);
+
+            blocks["norm_out"] = std::make_shared<PixelNorm2D>();
+            blocks["conv_out"] = std::make_shared<HeightCausalConv2D>(block_in, 2 * z_channels, std::pair<int, int>{3, 3});
+        }
+
+        // mel: ggml ne [mel_bins(=F=64), T_mel, channels(=2), batch]. We map this to the
+        // python encoder's [B, C=2, T, F=64] convention. The convs operate on (ne0=F,
+        // ne1=T, ne2=channel, ne3=batch) — channel is the conv input-channel axis, exactly
+        // like the decode path treats its latent. So no permute needed: ne2=channel.
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* mel,
+                             ggml_tensor* mean,
+                             ggml_tensor* stddev) {
+            auto conv_in  = std::dynamic_pointer_cast<HeightCausalConv2D>(blocks["conv_in"]);
+            auto norm_out = std::dynamic_pointer_cast<PixelNorm2D>(blocks["norm_out"]);
+            auto conv_out = std::dynamic_pointer_cast<HeightCausalConv2D>(blocks["conv_out"]);
+            const auto& mult = config.decoder_channel_multipliers;
+            int num_levels   = static_cast<int>(mult.size());
+
+            auto h = conv_in->forward(ctx, mel);
+            if (std::getenv("NAVA_ENC_RETURN_CONVIN") != nullptr) {
+                return ggml_cont(ctx->ggml_ctx, h);  // [F=64, T=161, ch=128, B]
+            }
+
+            for (int level = 0; level < num_levels; ++level) {
+                for (int b = 0; b < num_res_blocks; ++b) {
+                    auto block = std::dynamic_pointer_cast<AudioResnetBlock2D>(blocks["down." + std::to_string(level) + ".block." + std::to_string(b)]);
+                    h          = block->forward(ctx, h);
+                }
+                if (level != num_levels - 1) {
+                    auto ds = std::dynamic_pointer_cast<AudioDownsample2D>(blocks["down." + std::to_string(level) + ".downsample"]);
+                    h       = ds->forward(ctx, h);
+                }
+                if (const char* lv = std::getenv("NAVA_ENC_RETURN_LEVEL")) {
+                    if (atoi(lv) == level) return ggml_cont(ctx->ggml_ctx, h);
+                }
+            }
+
+            auto mid_1 = std::dynamic_pointer_cast<AudioResnetBlock2D>(blocks["mid.block_1"]);
+            auto mid_2 = std::dynamic_pointer_cast<AudioResnetBlock2D>(blocks["mid.block_2"]);
+            h          = mid_1->forward(ctx, h);
+            h          = mid_2->forward(ctx, h);
+
+            h = norm_out->forward(ctx, h);
+            h = ggml_silu_inplace(ctx->ggml_ctx, h);
+            h = conv_out->forward(ctx, h);  // ne [F=16, T/4, 2*z=16, B]
+
+            // chunk(2, dim=channels)[0] -> first z_channels (means). channels = ne2.
+            auto chunks = ggml_ext_chunk(ctx->ggml_ctx, h, 2, 2);  // split ne2 (16 -> 8 + 8)
+            auto means  = chunks[0];                               // ne [F=16, T/4, z=8, B]
+
+            // patchify "b c t f -> b t (c f)" : c (channel) OUTER, f (freq) INNER ->
+            // 128-feature index = c*16 + f. In ggml we want ne0 = (f fastest, c slower).
+            // means is [F, T, C, B]; permute to [F, C, T, B] (swap ne1,ne2) then merge
+            // ne0(F)+ne1(C) -> 128 with f fastest, c next.
+            auto p = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, means, 0, 2, 1, 3));  // [F, C, T, B]
+            int64_t F    = p->ne[0];
+            int64_t Cz   = p->ne[1];
+            int64_t Tlat = p->ne[2];
+            int64_t B    = p->ne[3];
+            auto patched = ggml_reshape_3d(ctx->ggml_ctx, p, F * Cz, Tlat, B);  // [128, T, B]
+
+            // per-channel normalize: (x - mean)/std over the 128 feature axis (ne0).
+            mean   = ggml_reshape_4d(ctx->ggml_ctx, mean, mean->ne[0], 1, 1, 1);
+            stddev = ggml_reshape_4d(ctx->ggml_ctx, stddev, stddev->ne[0], 1, 1, 1);
+            auto normed = ggml_div(ctx->ggml_ctx, ggml_sub(ctx->ggml_ctx, patched, mean), stddev);
+
+            // wrapped_encode does patchify(latent).transpose(1,2) -> [B,128,T]. Our tensor
+            // is already [128, T, B] (ne0=128 fastest, ne1=T) which IS that ne layout.
+            return normed;
+        }
+    };
+
     struct LTXAudioVAE : public GGMLBlock {
         LTXAudioVAEConfig config;
 
@@ -986,6 +1181,9 @@ namespace LTXV {
             blocks["vocoder.vocoder"]   = std::make_shared<Vocoder>(config);
             if (config.has_bwe) {
                 blocks["vocoder.bwe_generator"] = std::make_shared<Vocoder>(config, true, false);
+            }
+            if (config.has_encoder) {
+                blocks["audio_vae.encoder"] = std::make_shared<AudioEncoder>(config);
             }
         }
 
@@ -1004,6 +1202,15 @@ namespace LTXV {
                     ggml_new_tensor_3d(ctx, GGML_TYPE_F32, config.bwe_n_fft, 1, (config.bwe_n_fft / 2 + 1) * 2);
                 params["vocoder.mel_stft.stft_fn.inverse_basis"] =
                     ggml_new_tensor_3d(ctx, GGML_TYPE_F32, config.bwe_n_fft, 1, (config.bwe_n_fft / 2 + 1) * 2);
+            }
+            if (config.has_encoder) {
+                // Encoder mel front-end basis (baked by tools/convert_ltx_audio_vae.py):
+                //   mel_basis      [n_fft/2+1, mel_bins]  slaney filterbank
+                //   forward_basis  [n_fft, 1, (n_fft/2+1)*2]  windowed DFT (Hann folded in)
+                params["audio_vae.encoder.mel_stft.mel_basis"] =
+                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, config.n_fft / 2 + 1, config.mel_bins);
+                params["audio_vae.encoder.mel_stft.forward_basis"] =
+                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, config.n_fft, 1, (config.n_fft / 2 + 1) * 2);
             }
         }
 
@@ -1077,6 +1284,29 @@ namespace LTXV {
             waveform = ggml_clamp(ctx->ggml_ctx, waveform, -0.99f, 0.99f);
             return waveform;
         }
+
+        // ENCODE: `frames` is the HOST-pre-framed window matrix ne [n_fft, T_mel,
+        // channels=2] (hop-strided overlapping windows of the reflect-padded 16k
+        // waveform). Returns audio latent ne [128, T/4].
+        ggml_tensor* encode(GGMLRunnerContext* ctx, ggml_tensor* frames) {
+            GGML_ASSERT(config.has_encoder);
+            auto encoder    = std::dynamic_pointer_cast<AudioEncoder>(blocks["audio_vae.encoder"]);
+            auto fwd_basis  = params["audio_vae.encoder.mel_stft.forward_basis"];
+            auto mel_basis  = params["audio_vae.encoder.mel_stft.mel_basis"];
+            auto mean       = params["audio_vae.per_channel_statistics.mean-of-means"];
+            auto stddev     = params["audio_vae.per_channel_statistics.std-of-means"];
+            GGML_ASSERT(encoder != nullptr && fwd_basis != nullptr && mel_basis != nullptr);
+
+            auto mel = compute_encoder_log_mel(ctx, frames, fwd_basis, mel_basis);
+            if (std::getenv("NAVA_AUDIO_DUMP_TAPS") != nullptr) {
+                ctx->capture_tensor("audio_encoder_mel", mel);
+            }
+            if (std::getenv("NAVA_ENC_RETURN_MEL") != nullptr) {
+                // debug: return the log-mel as [mel_bins, T_mel, channels] for parity checks.
+                return ggml_cont(ctx->ggml_ctx, mel);
+            }
+            return encoder->forward(ctx, mel, mean, stddev);
+        }
     };
 
     struct LTXAudioVAERunner : public GGMLRunner {
@@ -1131,6 +1361,71 @@ namespace LTXV {
             auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), 4);
             int64_t t1  = ggml_time_ms();
             LOG_INFO("ltx audio vae decode completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+            return result;
+        }
+
+        // ENCODE entry. `waveform` is a host tensor ne [samples, channels] @ 16 kHz
+        // (channels 1 or 2; mono is duplicated to 2). Returns audio latent ne [128, T/4].
+        // Reflect padding (n_fft/2 each side, torchaudio center=True) is applied HOST-side
+        // here for exact parity (ggml has no native reflect pad).
+        sd::Tensor<float> encode(int n_threads, const sd::Tensor<float>& waveform) {
+            GGML_ASSERT(config.has_encoder);
+            GGML_ASSERT(waveform.dim() == 2);
+            const int64_t samples  = waveform.shape()[0];
+            const int64_t in_ch    = waveform.shape()[1];
+            const int64_t out_ch   = config.audio_channels;  // 2
+            const int pad          = config.n_fft / 2;
+            GGML_ASSERT(samples > pad);  // reflect needs at least pad+1 samples
+
+            const int64_t n_fft  = config.n_fft;
+            const int64_t hop    = config.mel_hop_length;
+            const int64_t padded = samples + 2 * pad;
+            // reflect-padded per-channel waveform (torchaudio center=True).
+            std::vector<std::vector<float>> chan(out_ch, std::vector<float>(padded));
+            const float* src = waveform.data();
+            for (int64_t c = 0; c < out_ch; ++c) {
+                const int64_t sc = (in_ch == 1) ? 0 : c;            // mono -> dup
+                const float* col = src + sc * samples;              // ne1-strided source col
+                float* w         = chan[c].data();
+                for (int64_t i = 0; i < pad; ++i) w[i] = col[pad - i];                 // left reflect (excl. edge)
+                for (int64_t i = 0; i < samples; ++i) w[pad + i] = col[i];
+                for (int64_t i = 0; i < pad; ++i) w[pad + samples + i] = col[samples - 2 - i];  // right reflect
+            }
+
+            // host frame matrix ne [n_fft, T_mel, channels]: overlapping hop-strided
+            // windows (Hann is folded into forward_basis, so no window applied here).
+            const int64_t T_mel = (padded < n_fft) ? 0 : 1 + (padded - n_fft) / hop;
+            GGML_ASSERT(T_mel > 0);
+            sd::Tensor<float> frames({n_fft, T_mel, out_ch});
+            float* fd = frames.data();
+            for (int64_t c = 0; c < out_ch; ++c) {
+                const float* w = chan[c].data();
+                for (int64_t t = 0; t < T_mel; ++t) {
+                    float* dstf = fd + (c * T_mel + t) * n_fft;  // ne0(k) fastest, ne1(t), ne2(c)
+                    std::memcpy(dstf, w + t * hop, (size_t)n_fft * sizeof(float));
+                }
+            }
+
+            // Optional direct-conv path (NAVA_ENC_CONV2D_DIRECT=1). Measured to give
+            // bit-identical results to the default im2col path on CPU for this encoder,
+            // so default stays im2col (the standard conv route shared with the decoder).
+            const bool prev_direct = conv2d_direct_enabled;
+            if (std::getenv("NAVA_ENC_CONV2D_DIRECT") != nullptr) {
+                set_conv2d_direct_enabled(true);
+            }
+            int64_t t0     = ggml_time_ms();
+            auto get_graph = [&]() -> ggml_cgraph* {
+                auto fr         = make_input(frames);
+                ggml_cgraph* gf = new_graph_custom(655360);
+                auto runner_ctx = GGMLRunner::get_context();
+                auto latent     = model.encode(&runner_ctx, fr);
+                ggml_build_forward_expand(gf, latent);
+                return gf;
+            };
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), 2);
+            set_conv2d_direct_enabled(prev_direct);
+            int64_t t1  = ggml_time_ms();
+            LOG_INFO("ltx audio vae encode completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
             return result;
         }
 
