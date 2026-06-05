@@ -23,3 +23,8 @@ __pycache__/
 gallery/
 profiles/
 /tmp_*
+
+# nsys/ncu binary traces (large; keep markdown writeups)
+bench/results/*.nsys-rep
+bench/results/*.sqlite
+bench/results/*.ncu-rep
