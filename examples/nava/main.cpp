@@ -1048,10 +1048,20 @@ static int run_render(int argc, char** argv) {
     const float cache_end    = getenv("NAVA_CACHE_END") ? atof(getenv("NAVA_CACHE_END")) : 0.95f;
     const bool  cache_on     = cache_thresh > 0.0f && !effective_timbre &&
                                getenv("NAVA_SEPARATE_AUDIO_NEG") == nullptr;
+    // AUDIO-AWARE veto (NAVA_CACHE_AUDIO_AWARE=1): the base EasyCache skip predictor is
+    // VIDEO-only (latent + vv_cond), so it skips steps that are stable for video but NOT
+    // for the faster-moving audio stream → reuses a stale audio velocity → audio refinement
+    // loss (the 25-step audio regresses toward 10-step "off tone"). With this on, a SECOND
+    // accumulator tracks the audio stream (audio_latent + va_cond) and a step is skipped
+    // only when BOTH streams are predicted stable — audio instability vetoes the skip.
+    const bool  cache_audio_aware = getenv("NAVA_CACHE_AUDIO_AWARE") != nullptr;
     sd::Tensor<float> c_vv_cond, c_va_cond, c_vv_uncond, c_va_uncond, c_vv_mmask, c_va_mmask;
     std::vector<float> cache_prev_latent, cache_prev_vvcond;
+    std::vector<float> cache_prev_alatent, cache_prev_vacond;  // audio-aware
     float cache_rate = 0.0f, cache_accum = 0.0f;
+    float cache_rate_a = 0.0f, cache_accum_a = 0.0f;           // audio-aware
     bool cache_have = false, cache_have_rate = false;
+    bool cache_have_rate_a = false;                            // audio-aware
     int  cache_skipped = 0;
 
     int64_t sample_t0 = ggml_time_ms();
@@ -1111,7 +1121,20 @@ static int run_render(int argc, char** argv) {
                 for (int64_t i = 0; i < latent.numel(); ++i) { dch += std::fabs(ld[i] - cache_prev_latent[i]); nrm += std::fabs(ld[i]); }
                 const float rel = nrm > 0.0 ? (float) (dch / nrm) : 0.0f;
                 cache_accum += cache_rate * rel;
-                if (cache_accum < cache_thresh) did_skip = true; else cache_accum = 0.0f;
+                bool vid_stable = cache_accum < cache_thresh;
+                // audio-aware: a second accumulator on the audio stream must ALSO be stable
+                bool aud_stable = true;
+                if (cache_audio_aware && cache_have_rate_a &&
+                    (int64_t) cache_prev_alatent.size() == audio_latent.numel()) {
+                    double ach = 0.0, anrm = 0.0;
+                    const float* ad = audio_latent.data();
+                    for (int64_t i = 0; i < audio_latent.numel(); ++i) { ach += std::fabs(ad[i] - cache_prev_alatent[i]); anrm += std::fabs(ad[i]); }
+                    const float arel = anrm > 0.0 ? (float) (ach / anrm) : 0.0f;
+                    cache_accum_a += cache_rate_a * arel;
+                    aud_stable = cache_accum_a < cache_thresh;
+                }
+                if (vid_stable && aud_stable) did_skip = true;
+                else { cache_accum = 0.0f; cache_accum_a = 0.0f; }
             }
         }
 
@@ -1193,13 +1216,28 @@ static int run_render(int argc, char** argv) {
                 const float lrel = lnrm > 0 ? (float) (lch / lnrm) : 0.0f;
                 if (lrel > 1e-9f) { cache_rate = vrel / lrel; cache_have_rate = true; }
             }
+            // audio-aware: learn the audio transformation rate (va_cond change / audio_latent change)
+            if (cache_audio_aware && cache_have && !cache_prev_vacond.empty() &&
+                (int64_t) cache_prev_vacond.size() == va_cond.numel() &&
+                (int64_t) cache_prev_alatent.size() == audio_latent.numel()) {
+                double ach = 0, anrm = 0; const float* ad = va_cond.data();
+                for (int64_t i = 0; i < va_cond.numel(); ++i) { ach += std::fabs(ad[i] - cache_prev_vacond[i]); anrm += std::fabs(ad[i]); }
+                double alch = 0, alnrm = 0; const float* al = audio_latent.data();
+                for (int64_t i = 0; i < audio_latent.numel(); ++i) { alch += std::fabs(al[i] - cache_prev_alatent[i]); alnrm += std::fabs(al[i]); }
+                const float arel  = anrm > 0 ? (float) (ach / anrm) : 0.0f;
+                const float alrel = alnrm > 0 ? (float) (alch / alnrm) : 0.0f;
+                if (alrel > 1e-9f) { cache_rate_a = arel / alrel; cache_have_rate_a = true; }
+            }
             c_vv_cond = vv_cond; c_va_cond = va_cond;
             c_vv_uncond = vv_uncond; c_va_uncond = va_uncond;
             c_vv_mmask = vv_mmask; c_va_mmask = va_mmask;
             cache_have = true;
             cache_prev_vvcond.assign(vv_cond.data(), vv_cond.data() + vv_cond.numel());
             cache_prev_latent.assign(latent.data(), latent.data() + latent.numel());
+            cache_prev_vacond.assign(va_cond.data(), va_cond.data() + va_cond.numel());
+            cache_prev_alatent.assign(audio_latent.data(), audio_latent.data() + audio_latent.numel());
             cache_accum = 0.0f;
+            cache_accum_a = 0.0f;
         }
         // timbre CFG: a 4th AUDIO forward with spk=None on the POSITIVE context
         // (pipeline_nava.py eps_timbre_uncond). The term g_timbre*(cond - timbre_uncond)
@@ -1335,8 +1373,9 @@ static int run_render(int argc, char** argv) {
     int64_t sample_t1 = ggml_time_ms();
     float sample_s = (sample_t1 - sample_t0) / 1000.0f;
     if (cache_on) {
-        printf("step-cache: skipped %d/%d steps (reused all 3 forwards) thresh=%.3f rate=%.3f\n",
-               cache_skipped, o.steps, cache_thresh, cache_rate);
+        printf("step-cache: skipped %d/%d steps (reused all 3 forwards) thresh=%.3f rate=%.3f%s rate_a=%.3f\n",
+               cache_skipped, o.steps, cache_thresh, cache_rate,
+               cache_audio_aware ? " [AUDIO-AWARE]" : "", cache_rate_a);
     }
     dump_stats("final latent", latent);
 
