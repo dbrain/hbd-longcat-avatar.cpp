@@ -76,7 +76,55 @@ import tempfile
 import time
 
 
+# Encoder packing is opt-in via --with-encoder (adds the 44 encoder tensors +
+# the 2 baked mel-front-end keys, for the C++ audio-VAE *encode* path). The
+# default still skips the encoder (decode-only gguf, unchanged behaviour).
 SKIP_PREFIX = "audio_vae.encoder"  # decode-only: encoder not needed
+
+# Mel front-end params (sample_rate=16k, n_fft=1024, hop=160, n_mels=64, fmax=8000),
+# matching torchaudio MelSpectrogram(center=True, power=1.0, mel_scale/norm="slaney",
+# window=hann periodic). Baked under the encoder's own prefix; the C++ encoder loads
+# them and does reflect-pad (n_fft/2 both sides) on the host before a windowed-DFT conv1d.
+ENC_MEL_KEY_BASIS = "audio_vae.encoder.mel_stft.forward_basis"
+ENC_MEL_KEY_FB    = "audio_vae.encoder.mel_stft.mel_basis"
+N_FFT   = 1024
+HOP     = 160
+N_MELS  = 64
+SR      = 16000
+FMIN    = 0.0
+FMAX    = 8000.0
+
+
+def build_mel_front_end():
+    """Return {forward_basis, mel_basis} as float32 numpy arrays in the ggml layout
+    the C++ `compute_encoder_log_mel` expects:
+      forward_basis  [2*n_freqs, 1, n_fft]   (conv1d weight: out=2*n_freqs, in=1, k=n_fft)
+      mel_basis      [n_freqs, n_mels]
+    """
+    import numpy as np
+    import torch
+    import torchaudio
+
+    n_freqs = N_FFT // 2 + 1
+    win = torch.hann_window(N_FFT, periodic=True).numpy()  # MelSpectrogram default window
+    k = np.arange(n_freqs)[:, None]
+    t = np.arange(N_FFT)[None, :]
+    ang = 2.0 * np.pi * k * t / N_FFT
+    real = np.cos(ang) * win[None, :]    # [n_freqs, n_fft]
+    imag = -np.sin(ang) * win[None, :]   # DFT sign convention (-i)
+    fb = np.concatenate([real, imag], axis=0)         # [2*n_freqs, n_fft]
+    forward_basis = fb[:, None, :].astype(np.float32)  # [2*n_freqs, 1, n_fft]
+
+    fb_freq_mel = torchaudio.functional.melscale_fbanks(
+        n_freqs=n_freqs, f_min=FMIN, f_max=FMAX, n_mels=N_MELS,
+        sample_rate=SR, norm="slaney", mel_scale="slaney",
+    ).numpy().astype(np.float32)  # [n_freqs, n_mels]
+    # C++ compute_*_log_mel expects ggml ne [n_freqs, n_mels], i.e. numpy shape
+    # [n_mels, n_freqs] (gguf reverses dims on store). So transpose before packing.
+    mel_basis = np.ascontiguousarray(fb_freq_mel.T)  # [n_mels, n_freqs]
+
+    return {ENC_MEL_KEY_BASIS: forward_basis, ENC_MEL_KEY_FB: mel_basis}
+
 
 # Names (or suffixes) that must stay F32 regardless of ndim.
 F32_MEL_STFT_PREFIX = "vocoder.mel_stft."
@@ -101,11 +149,14 @@ def want_f32(name: str, ndim: int) -> bool:
     return False
 
 
-def step1_dump_npz(src: str, npz_path: str) -> int:
+def step1_dump_npz(src: str, npz_path: str, with_encoder: bool = False) -> int:
     """Read safetensors with the NAVA venv (torch) -> typed .npz of fp16/fp32 arrays.
 
     Source is bf16; safetensors' `np` framework can't decode bf16, so we read
     via the `pt` (torch) framework and upcast bf16 -> fp32 in torch first.
+
+    with_encoder=True also packs the 44 `audio_vae.encoder.*` tensors (verbatim
+    names; conv weights F16, biases F32) plus the 2 baked mel-front-end keys.
     """
     import numpy as np
     import torch
@@ -116,7 +167,7 @@ def step1_dump_npz(src: str, npz_path: str) -> int:
     with safe_open(src, framework="pt") as f:
         keys = sorted(f.keys())
         for name in keys:
-            if name.startswith(SKIP_PREFIX):
+            if name.startswith(SKIP_PREFIX) and not with_encoder:
                 continue
             t = f.get_tensor(name)  # torch tensor (bf16)
             # Upcast to fp32 in torch (numpy has no bf16); handles bf16/f16/f32.
@@ -129,6 +180,12 @@ def step1_dump_npz(src: str, npz_path: str) -> int:
             arr = np.ascontiguousarray(arr, dtype=target)
             arrays[name] = arr
             n += 1
+
+    if with_encoder:
+        for key, arr in build_mel_front_end().items():
+            arrays[key] = np.ascontiguousarray(arr, dtype=np.float32)
+            n += 1
+
     np.savez(npz_path, **arrays)
     return n
 
@@ -167,6 +224,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--npz", default=None, help="intermediate npz path (default: temp)")
     ap.add_argument(
+        "--with-encoder",
+        action="store_true",
+        help="also pack the 44 audio_vae.encoder.* tensors + baked mel front-end "
+             "(for the C++ audio-VAE encode path). Default: decode-only.",
+    )
+    ap.add_argument(
         "--_pack_only",
         action="store_true",
         help="internal: only run the gguf-pack step (used by the uv re-exec)",
@@ -194,8 +257,9 @@ def main():
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     t0 = time.time()
-    n1 = step1_dump_npz(args.src, npz_path)
-    print(f"step1: dumped {n1} tensors -> {npz_path}  ({time.time() - t0:.1f}s)")
+    n1 = step1_dump_npz(args.src, npz_path, with_encoder=args.with_encoder)
+    print(f"step1: dumped {n1} tensors -> {npz_path}  "
+          f"({'with' if args.with_encoder else 'no'} encoder)  ({time.time() - t0:.1f}s)")
 
     # Step 2: pack.
     if have_gguf:

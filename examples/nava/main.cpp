@@ -67,6 +67,16 @@
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
+#else
+// CPU-only build shim: ggml_extend.hpp references ggml_backend_cuda_host_buffer_type
+// unconditionally (lap-32 pinned offload params). On a pure-CPU build that pinned
+// path is never taken (it requires a non-CPU runtime backend), but the symbol must
+// still resolve at link time. This stub returns null so the alloc falls back to the
+// pageable path. (Only present when GGML_USE_CUDA is undefined; never built into the
+// supported CUDA service binary.)
+extern "C" ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void) {
+    return nullptr;
+}
 #endif
 
 static void log_cb(enum sd_log_level_t level, const char* text, void* /*data*/) {
@@ -293,6 +303,78 @@ static void write_bin(const std::string& path, const sd::Tensor<float>& t, const
     fwrite(t.data(), sizeof(float), (size_t)t.numel(), f);
     fclose(f);
     printf("wrote %s\n", path.c_str());
+}
+
+// Minimal RIFF/WAVE reader for the `audio-encode` subcommand. Supports PCM16,
+// PCM32, IEEE-float32, and WAVE_FORMAT_EXTENSIBLE wrapping those. Returns an
+// sd::Tensor<float> ne [samples, channels] (ne0=samples fastest, ne1=channels)
+// = the planar layout the LTX audio encoder expects. The model needs 16 kHz; we
+// require it (ffmpeg -ar 16000 produces it) rather than resample in-binary.
+static bool read_wav_16k(const std::string& path, sd::Tensor<float>& out, uint32_t& sample_rate) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { printf("audio-encode: cannot open wav %s\n", path.c_str()); return false; }
+    auto rd_u32 = [&](uint32_t& v) { return fread(&v, 4, 1, f) == 1; };
+    auto rd_u16 = [&](uint16_t& v) { return fread(&v, 2, 1, f) == 1; };
+    char tag[4];
+    uint32_t riff_size = 0;
+    if (fread(tag, 1, 4, f) != 4 || memcmp(tag, "RIFF", 4) != 0) { fclose(f); printf("audio-encode: not RIFF\n"); return false; }
+    if (!rd_u32(riff_size) || fread(tag, 1, 4, f) != 4 || memcmp(tag, "WAVE", 4) != 0) { fclose(f); printf("audio-encode: not WAVE\n"); return false; }
+
+    uint16_t fmt = 0, channels = 0, bits = 0;
+    uint32_t srate = 0;
+    bool have_fmt = false, have_data = false;
+    std::vector<uint8_t> data;
+    while (fread(tag, 1, 4, f) == 4) {
+        uint32_t chunk_size = 0;
+        if (!rd_u32(chunk_size)) break;
+        if (memcmp(tag, "fmt ", 4) == 0) {
+            uint16_t block_align = 0;
+            uint32_t byte_rate = 0;
+            rd_u16(fmt); rd_u16(channels); rd_u32(srate); rd_u32(byte_rate); rd_u16(block_align); rd_u16(bits);
+            long consumed = 16;
+            if (fmt == 0xFFFE && chunk_size >= 40) {  // EXTENSIBLE: read the real subformat tag
+                uint16_t ext_size = 0, valid_bits = 0; uint32_t chmask = 0; uint16_t subfmt = 0;
+                rd_u16(ext_size); rd_u16(valid_bits); rd_u32(chmask); rd_u16(subfmt);
+                fmt = subfmt; consumed += 10;
+            }
+            if ((long)chunk_size > consumed) fseek(f, chunk_size - consumed, SEEK_CUR);
+            have_fmt = true;
+        } else if (memcmp(tag, "data", 4) == 0) {
+            data.resize(chunk_size);
+            if (fread(data.data(), 1, chunk_size, f) != chunk_size) { fclose(f); printf("audio-encode: short data\n"); return false; }
+            have_data = true;
+        } else {
+            fseek(f, chunk_size + (chunk_size & 1), SEEK_CUR);  // skip (pad to even)
+        }
+    }
+    fclose(f);
+    if (!have_fmt || !have_data) { printf("audio-encode: missing fmt/data chunk\n"); return false; }
+    sample_rate = srate;
+
+    const int64_t bytes_per_sample = bits / 8;
+    if (bytes_per_sample == 0 || channels == 0) { printf("audio-encode: bad fmt\n"); return false; }
+    const int64_t total = (int64_t)data.size() / bytes_per_sample;
+    const int64_t frames = total / channels;
+
+    // de-interleave -> planar ne [frames, channels]
+    out = sd::Tensor<float>({frames, (int64_t)channels});
+    float* dst = out.data();
+    const uint8_t* p = data.data();
+    auto sample_at = [&](int64_t idx) -> float {
+        const uint8_t* s = p + idx * bytes_per_sample;
+        if (fmt == 3 && bits == 32) { float v; memcpy(&v, s, 4); return v; }                 // IEEE float
+        if (fmt == 1 && bits == 16) { int16_t v; memcpy(&v, s, 2); return v / 32768.0f; }     // PCM16
+        if (fmt == 1 && bits == 32) { int32_t v; memcpy(&v, s, 4); return v / 2147483648.0f; }// PCM32
+        if (fmt == 1 && bits == 24) {                                                          // PCM24
+            int32_t v = (s[0] | (s[1] << 8) | (s[2] << 16)); if (v & 0x800000) v |= ~0xFFFFFF;
+            return v / 8388608.0f;
+        }
+        return 0.0f;
+    };
+    for (int64_t i = 0; i < frames; ++i)
+        for (int64_t c = 0; c < channels; ++c)
+            dst[c * frames + i] = sample_at(i * channels + c);  // ne1(c)-strided, ne0(i)-fast
+    return true;
 }
 
 // deterministic dummy fill (small magnitudes, sin-based so it's reproducible)
@@ -2079,6 +2161,54 @@ int main(int argc, char** argv) {
         printf("=== encode-video done -> %s  ne=[%d,%d,%d,48] ===\n", out.c_str(), W_lat, H_lat, M);
         return 0;
     }
+    if (argc >= 2 && std::string(argv[1]) == "audio-encode") {
+        // nava audio-encode <audio_vae_gguf> <in.wav> <out_latent.bin> [--cuda]
+        //   wav (16 kHz, mono/stereo) -> log-mel -> LTX audio encoder -> latent ne [128, ceil(T_mel/4)].
+        //   CPU by default (encoder is tiny ~350MB); --cuda available for the service build.
+        if (argc < 5) { printf("usage: %s audio-encode <audio_vae_gguf> <in.wav> <out_latent.bin> [--cuda]\n", argv[0]); return 1; }
+        bool use_cuda = false;
+        for (int i = 5; i < argc; ++i) if (std::string(argv[i]) == "--cuda") use_cuda = true;
+
+        sd::Tensor<float> wave;
+        uint32_t sr = 0;
+        if (!read_wav_16k(argv[3], wave, sr)) return 1;
+        if (sr != 16000) {
+            printf("audio-encode: wav is %u Hz; require 16000 Hz (run: ffmpeg -i in -ar 16000 -ac 1 out.wav)\n", sr);
+            return 1;
+        }
+        printf("audio-encode: wav '%s' sr=%u ne=[%lld,%lld] dur=%.4fs\n",
+               argv[3], sr, (long long)wave.shape()[0], (long long)wave.shape()[1],
+               (double)wave.shape()[0] / sr);
+
+        ggml_backend_t backend = nullptr;
+#ifdef GGML_USE_CUDA
+        if (use_cuda) backend = ggml_backend_cuda_init(0);
+#else
+        (void)use_cuda;
+#endif
+        if (!backend) backend = ggml_backend_cpu_init();
+        ModelLoader ml;
+        if (!ml.init_from_file(argv[2])) { printf("audio-encode: vae load fail\n"); return 1; }
+        auto& tsm = ml.get_tensor_storage_map();
+        auto avae = std::make_shared<LTXV::LTXAudioVAERunner>(backend, backend, tsm, "");
+        if (!avae->config.has_encoder) {
+            printf("audio-encode: gguf has NO encoder tensors. Repack with: "
+                   "tools/convert_ltx_audio_vae.py --with-encoder\n");
+            return 1;
+        }
+        avae->alloc_params_buffer();
+        std::map<std::string, ggml_tensor*> at;
+        avae->get_param_tensors(at, "");
+        if (!ml.load_tensors(at)) { printf("audio-encode: vae tensors fail\n"); return 1; }
+        printf("audio-encode: vae loaded (%zu params); encoder ready\n", at.size());
+
+        auto latent = avae->encode(8, wave);
+        if (latent.empty()) { printf("audio-encode: ERROR empty latent\n"); return 1; }
+        dump_stats("audio_latent", latent);
+        printf("audio-encode: latent ne=%s\n", sd::tensor_shape_to_string(latent.shape()).c_str());
+        write_bin(argv[4], latent, "audio_latent");
+        return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "ltx-audio-test") {
         // nava ltx-audio-test <gguf> <latent.bin> [out_wave.bin]  — load the audio VAE gguf
         // into the in-tree LTXV decoder + decode on CUDA (CPU hits an F16 assert), dump waveform.
@@ -2112,6 +2242,7 @@ int main(int argc, char** argv) {
         printf("  %s render --context ctx.bin [opts]        # phase-2 render from precomputed ctx\n", argv[0]);
         printf("  %s encode-prompt <umt5> <p.txt> <out.bin> # text -> umT5 cond context bin\n", argv[0]);
         printf("  %s encode-prompts <umt5> <prefix> p0 p1.. # batch encode (1x umT5 load for a chain)\n", argv[0]);
+        printf("  %s audio-encode <avae> <in.wav> <out.bin> # wav(16k) -> LTX audio latent [128,T/4]\n", argv[0]);
         printf("  %s unipc-test [<ref_dir>]                 # UniPC scheduler numeric validation\n", argv[0]);
         return 1;
     }
