@@ -55,7 +55,7 @@
 #include "tensor_ggml.hpp"
 #include "util.h"
 
-#include "common/media_io.h"
+#include "common/media_io.h"  // load_image_from_file (stb_image decode)
 
 #include "nava.hpp"
 #include "rng_philox.hpp"
@@ -76,6 +76,129 @@ static void log_cb(enum sd_log_level_t level, const char* text, void* /*data*/) 
 static bool path_exists(const std::string& p) {
     struct stat st;
     return stat(p.c_str(), &st) == 0;
+}
+
+static bool ends_with_ci(const std::string& s, const std::string& suf) {
+    if (s.size() < suf.size()) return false;
+    for (size_t i = 0; i < suf.size(); ++i)
+        if (std::tolower((unsigned char)s[s.size() - suf.size() + i]) != suf[i]) return false;
+    return true;
+}
+
+// True for real encoded-image inputs (vs a preprocessed raw RGB .bin / latent .bin).
+static bool looks_like_image_file(const std::string& p) {
+    return ends_with_ci(p, ".png") || ends_with_ci(p, ".jpg") || ends_with_ci(p, ".jpeg")
+        || ends_with_ci(p, ".bmp") || ends_with_ci(p, ".webp") || ends_with_ci(p, ".tga");
+}
+
+// PIL-compatible separable Lanczos-3 resize for interleaved RGB8. Python NAVA resizes
+// with PIL Image.LANCZOS; stb_image_resize has no Lanczos and the closest cubic
+// (CATMULLROM) measurably diverges through the chaotic DiT (darker audio). This mirrors
+// PIL's ImagingResampleInner: precompute normalized coeffs per output pixel
+// (support = 3*max(scale,1)), horizontal pass -> uint8 temp, then vertical pass -> uint8.
+static double nava_sinc(double x) {
+    if (x == 0.0) return 1.0;
+    x *= M_PI;
+    return std::sin(x) / x;
+}
+static double nava_lanczos(double x) {
+    return (-3.0 < x && x < 3.0) ? nava_sinc(x) * nava_sinc(x / 3.0) : 0.0;
+}
+// One-dimension coefficient table (PIL precompute_coeffs).
+static void nava_lanczos_coeffs(int in_size, int out_size,
+                                std::vector<int>& bounds,       // 2*out_size: [xmin,k]
+                                std::vector<double>& kk,        // out_size*ksize
+                                int& ksize) {
+    double scale       = (double)in_size / (double)out_size;
+    double filterscale = scale < 1.0 ? 1.0 : scale;
+    double support     = 3.0 * filterscale;  // Lanczos a=3
+    ksize = (int)std::ceil(support) * 2 + 1;
+    bounds.assign((size_t)out_size * 2, 0);
+    kk.assign((size_t)out_size * ksize, 0.0);
+    for (int xx = 0; xx < out_size; ++xx) {
+        double center = (xx + 0.5) * scale;
+        double ww = 0.0, ss = 1.0 / filterscale;
+        int xmin = (int)(center - support + 0.5); if (xmin < 0) xmin = 0;
+        int xmax = (int)(center + support + 0.5); if (xmax > in_size) xmax = in_size;
+        xmax -= xmin;
+        double* k = &kk[(size_t)xx * ksize];
+        int x = 0;
+        for (; x < xmax; ++x) { double w = nava_lanczos((x + xmin - center + 0.5) * ss); k[x] = w; ww += w; }
+        for (x = 0; x < xmax; ++x) if (ww != 0.0) k[x] /= ww;
+        bounds[xx * 2 + 0] = xmin;
+        bounds[xx * 2 + 1] = xmax;
+    }
+}
+static inline uint8_t nava_clip8(double v) {
+    if (v <= 0.0) return 0;
+    if (v >= 255.0) return 255;
+    return (uint8_t)(v + 0.5);
+}
+static void nava_lanczos_resize_rgb8(const uint8_t* src, int sw, int sh,
+                                     std::vector<uint8_t>& dst, int dw, int dh) {
+    std::vector<int> hb, vb; std::vector<double> hk, vk; int hks = 0, vks = 0;
+    nava_lanczos_coeffs(sw, dw, hb, hk, hks);
+    nava_lanczos_coeffs(sh, dh, vb, vk, vks);
+    // Horizontal pass: src [sh,sw,3] -> temp [sh,dw,3].
+    std::vector<uint8_t> temp((size_t)sh * dw * 3);
+    for (int y = 0; y < sh; ++y)
+        for (int xx = 0; xx < dw; ++xx) {
+            int xmin = hb[xx * 2], xmax = hb[xx * 2 + 1];
+            const double* k = &hk[(size_t)xx * hks];
+            for (int c = 0; c < 3; ++c) {
+                double acc = 0.0;
+                for (int i = 0; i < xmax; ++i) acc += src[((size_t)y * sw + (xmin + i)) * 3 + c] * k[i];
+                temp[((size_t)y * dw + xx) * 3 + c] = nava_clip8(acc);
+            }
+        }
+    // Vertical pass: temp [sh,dw,3] -> dst [dh,dw,3].
+    dst.assign((size_t)dh * dw * 3, 0);
+    for (int yy = 0; yy < dh; ++yy) {
+        int ymin = vb[yy * 2], ymax = vb[yy * 2 + 1];
+        const double* k = &vk[(size_t)yy * vks];
+        for (int xx = 0; xx < dw; ++xx)
+            for (int c = 0; c < 3; ++c) {
+                double acc = 0.0;
+                for (int i = 0; i < ymax; ++i) acc += temp[((size_t)(ymin + i) * dw + xx) * 3 + c] * k[i];
+                dst[((size_t)yy * dw + xx) * 3 + c] = nava_clip8(acc);
+            }
+    }
+}
+
+// Load an encoded image and reproduce Python NAVA's I2V first-frame preprocessing
+// (nava_src/vae/local_video_vae.py:_resize_center_crop): aspect-PRESERVING resize so
+// the image fills the (W,H) target, then a center crop, then x/255 -> [0,1]. The
+// result is a ggml ne [W,H,1,3] tensor ready for the WAN VAE encoder — identical in
+// layout to tools/nava_prep_image.py, but handled in-port so callers pass a real
+// image instead of a pre-baked bin. Resampling is PIL-LANCZOS-parity
+// (nava_lanczos_resize_rgb8) to match Python bit-for-bit-ish; framing/FOV is exact.
+static bool load_image_resize_center_crop(const std::string& path, int W, int H,
+                                          sd::Tensor<float>& out) {
+    int sw = 0, sh = 0;
+    uint8_t* src = load_image_from_file(path.c_str(), sw, sh, /*expected_w=*/0, /*expected_h=*/0, 3);
+    if (!src) { printf("ERROR: failed to decode image %s\n", path.c_str()); return false; }
+    // Python: scale = max(W/sw, H/sh); resize to (round(sw*scale), round(sh*scale)).
+    double scale = std::max((double)W / (double)sw, (double)H / (double)sh);
+    int rw = (int)std::lround(sw * scale);
+    int rh = (int)std::lround(sh * scale);
+    if (rw < W) rw = W;
+    if (rh < H) rh = H;
+    std::vector<uint8_t> resized;
+    nava_lanczos_resize_rgb8(src, sw, sh, resized, rw, rh);  // PIL Image.LANCZOS parity
+    free(src);
+    // Center crop (rw,rh) -> (W,H).
+    int left = (rw - W) / 2, top = (rh - H) / 2;
+    // ggml ne [W,H,1,3]: c slowest, then y, x fastest (== prep script's [C,1,H,W] C-order).
+    std::vector<float> data((size_t)3 * H * W);
+    for (int c = 0; c < 3; ++c)
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                data[((size_t)c * H + y) * W + x] =
+                    resized[(((size_t)(top + y) * rw) + (left + x)) * 3 + c] / 255.0f;
+    out = sd::Tensor<float>({(int64_t)W, (int64_t)H, 1, 3}, std::move(data));
+    printf("I2V: decoded %s %dx%d -> resize %dx%d -> center-crop %dx%d (Python-parity)\n",
+           path.c_str(), sw, sh, rw, rh, W, H);
+    return true;
 }
 
 // Match python's HuggingfaceTokenizer text preprocessing (nava_src .../tokenizers.py):
@@ -592,9 +715,12 @@ static int run_render(int argc, char** argv) {
     int64_t wall_t0 = ggml_time_ms();
 
     // ----- I2V: encode the input image -> frame-0 clean-latent anchor -----
-    // --image is a PREPROCESSED RGB bin (ggml ne [W,H,1,3], values [0,1] — produced by
-    // tools/nava_prep_image.py so we avoid linking stb here). VAE-encode it (decode_only
-    // =false) BEFORE the 12.6GB DiT loads (VRAM: VAE alone fits, then freed). The anchor
+    // --image accepts a real encoded image (.png/.jpg/...): decoded + Python-parity
+    // resize/center-crop/normalize in-port via load_image_resize_center_crop (matches
+    // nava_src/vae/local_video_vae.py:_resize_center_crop). A pre-baked RGB bin (ggml ne
+    // [W,H,1,3], [0,1] from tools/nava_prep_image.py) is still accepted for back-compat.
+    // VAE-encode it (decode_only=false) BEFORE the 12.6GB DiT loads (VRAM: VAE alone fits,
+    // then freed). The anchor
     // is spliced at frame 0 and pinned each step via the per-token clean-anchor timestep.
     // Clean-anchor video latent [W_lat,H_lat,N,48] (diffusion convention): N tail frames
     // of a prior segment (--video-anchor) OR a single i2v image (--image, N=1).
@@ -613,9 +739,16 @@ static int run_render(int argc, char** argv) {
         printf("CONTINUATION: video anchor %s -> %d clean frame(s)\n", o.video_anchor.c_str(), n_anchor_v);
     } else if (!o.image.empty()) {
         if (!path_exists(o.image)) { printf("ERROR: --image %s not found\n", o.image.c_str()); return 1; }
-        auto img_rgb = sd::load_tensor_from_file_as_tensor<float>(o.image);
-        printf("I2V: loaded image %s shape=%s\n", o.image.c_str(),
-               sd::tensor_shape_to_string(img_rgb.shape()).c_str());
+        sd::Tensor<float> img_rgb;
+        if (looks_like_image_file(o.image)) {
+            // Real image file: decode + Python-parity resize/center-crop/normalize in-port.
+            if (!load_image_resize_center_crop(o.image, W_lat * 16, H_lat * 16, img_rgb)) return 1;
+        } else {
+            // Legacy: pre-baked RGB bin (ggml ne [W,H,1,3], [0,1]) from tools/nava_prep_image.py.
+            img_rgb = sd::load_tensor_from_file_as_tensor<float>(o.image);
+            printf("I2V: loaded preprocessed RGB bin %s shape=%s\n", o.image.c_str(),
+                   sd::tensor_shape_to_string(img_rgb.shape()).c_str());
+        }
         auto encvae = std::make_shared<WAN::WanVAERunner>(
             backend, backend, String2TensorStorage{}, "", /*decode_only=*/false, VERSION_WAN2_2_TI2V);
         {
@@ -627,8 +760,16 @@ static int run_render(int argc, char** argv) {
             if (!vl.load_tensors(vt)) { printf("I2V VAE tensors fail\n"); return 1; }
         }
         sd_tiling_params_t et = {};
-        et.enabled = (W_lat > 24 || H_lat > 24);
+        // Python encodes the I2V first frame in ONE full-frame VAE forward. C++ used to
+        // tile (24x24 latent tiles, 0.25 overlap), and the SEAM BLENDING perturbed the
+        // frame-0 anchor latent by ~14% (reldiff 0.137 -> 0.005 vs Python when off),
+        // which propagated into the audio via cross-modal attention. Full-frame is the
+        // default now: it's a SINGLE frame encoded in isolation before the DiT loads
+        // (VAE freed right after), so peak ~2.6GB << the DiT sampling peak (~8.9GB) — no
+        // real VRAM cost. NAVA_VAE_ENCODE_TILE=1 forces tiling back for huge inputs.
+        et.enabled = (W_lat > 24 || H_lat > 24) && (getenv("NAVA_VAE_ENCODE_TILE") != nullptr);
         et.temporal_tiling = false; et.tile_size_x = 24; et.tile_size_y = 24; et.target_overlap = 0.25f;
+        printf("I2V: VAE encode tiling=%s\n", et.enabled ? "ON (24x24/0.25)" : "OFF (full-frame, Python-parity)");
         auto mu = encvae->encode(n_threads, img_rgb, et, /*encode_video=*/true, false);
         if (mu.empty()) { printf("ERROR: I2V VAE encode failed\n"); return 1; }
         printf("I2V: encoded mu shape=%s\n", sd::tensor_shape_to_string(mu.shape()).c_str());
@@ -639,6 +780,10 @@ static int run_render(int argc, char** argv) {
         n_anchor_v = 1;
         encvae.reset();  // free VAE before the DiT loads
         dump_stats("I2V anchor latent (diffusion)", vid_anchor);
+        if (const char* ap = getenv("NAVA_DUMP_ANCHOR")) {
+            write_bin(ap, vid_anchor, "vid_anchor");  // [W_lat,H_lat,1,48] diffusion latent
+            printf("NAVA_DUMP_ANCHOR: wrote frame-0 anchor -> %s\n", ap);
+        }
     }
     // Clean-anchor audio latent [128,K]: first K audio tokens pinned to a prior segment's
     // tail audio latent (--audio-anchor). Chains directly from a dumped audio latent.
@@ -781,6 +926,30 @@ static int run_render(int argc, char** argv) {
         auto r = rng.randn((uint32_t)audio_latent.numel());
         for (int64_t i = 0; i < audio_latent.numel(); ++i) audio_latent.data()[i] = r[(size_t)i];
     }
+    bool injected_video_init = false;
+    if (const char* p = getenv("NAVA_INJECT_VIDEO")) {
+        auto inj = sd::load_tensor_from_file_as_tensor<float>(p);
+        if (inj.shape() != latent.shape()) {
+            printf("ERROR: NAVA_INJECT_VIDEO ne %s != latent %s\n",
+                   sd::tensor_shape_to_string(inj.shape()).c_str(),
+                   sd::tensor_shape_to_string(latent.shape()).c_str());
+            return 1;
+        }
+        latent = std::move(inj);
+        injected_video_init = true;
+        printf("NAVA_INJECT_VIDEO: sampler video init <- %s\n", p);
+    }
+    if (const char* p = getenv("NAVA_INJECT_AUDIO")) {
+        auto inj = sd::load_tensor_from_file_as_tensor<float>(p);
+        if (inj.shape() != audio_latent.shape()) {
+            printf("ERROR: NAVA_INJECT_AUDIO ne %s != audio_latent %s\n",
+                   sd::tensor_shape_to_string(inj.shape()).c_str(),
+                   sd::tensor_shape_to_string(audio_latent.shape()).c_str());
+            return 1;
+        }
+        audio_latent = std::move(inj);
+        printf("NAVA_INJECT_AUDIO: sampler audio init <- %s\n", p);
+    }
 
     // I2V: token bookkeeping + splice the clean anchor into frame 0. The first
     // h_grid*w_grid VIDEO tokens (frame 0) carry timestep 0 every step (clean anchor)
@@ -788,26 +957,31 @@ static int run_render(int argc, char** argv) {
     const int h_grid_i      = H_lat / 2, w_grid_i = W_lat / 2;
     const int64_t L_vid_i   = (int64_t)f_len * h_grid_i * w_grid_i;
     const int64_t n_clean_i = (int64_t)n_anchor_v * h_grid_i * w_grid_i;  // clean VIDEO tokens (N frames)
-    // Pin the N clean video frames + K clean audio tokens to their anchor latents. Called
-    // at init and after every video/audio step so the clean anchors stay exact through the
-    // trajectory (their per-token timestep=0 already drives velocity ~0).
-    auto splice_anchor = [&]() {
-        if (n_anchor_v > 0) {
+    // Pin clean anchors into a tensor. Python's predict_eps() does this as a
+    // per-forward input substitution for I2V: the model sees frame 0 clean, but
+    // latents_vision itself is not overwritten after scheduler.step().
+    auto splice_anchor_into = [&](sd::Tensor<float>* vlat, sd::Tensor<float>* alat) {
+        if (vlat && n_anchor_v > 0) {
             const int64_t W = W_lat, H = H_lat, F = f_len;  // latent ne [W,H,F,48]; anchor [W,H,N,48]
             for (int64_t f = 0; f < n_anchor_v; ++f)
                 for (int64_t c = 0; c < 48; ++c)
                     for (int64_t y = 0; y < H; ++y)
                         for (int64_t x = 0; x < W; ++x)
-                            latent.data()[x + W * (y + H * (f + F * c))] =
+                            vlat->data()[x + W * (y + H * (f + F * c))] =
                                 vid_anchor.data()[x + W * (y + H * (f + (int64_t)n_anchor_v * c))];
         }
-        if (n_anchor_a > 0) {  // audio_latent ne [128,audio_len]; aud_anchor [128,K]
+        if (alat && n_anchor_a > 0) {  // audio_latent ne [128,audio_len]; aud_anchor [128,K]
             for (int64_t k = 0; k < n_anchor_a; ++k)
                 for (int64_t c = 0; c < 128; ++c)
-                    audio_latent.data()[k * 128 + c] = aud_anchor.data()[k * 128 + c];
+                    alat->data()[k * 128 + c] = aud_anchor.data()[k * 128 + c];
         }
     };
-    splice_anchor();
+    const bool model_input_anchor = getenv("NAVA_MODEL_INPUT_ANCHOR") != nullptr;
+    // Default generation keeps the historical C++ behavior: the clean anchor is
+    // part of sampler state and is re-pinned after each update. The Python-style
+    // per-forward substitution diagnostic is available with NAVA_MODEL_INPUT_ANCHOR=1.
+    splice_anchor_into((model_input_anchor && injected_video_init) ? nullptr : &latent, &audio_latent);
+    const bool repin_after_step = !model_input_anchor || getenv("NAVA_REPIN_AFTER_STEP") != nullptr;
 
     // ----- Euler flow-match sampling (JOINT video+audio denoise) -----
     // NAVA is a joint AV MMDiT: every block self-attends over [video ++ audio].
@@ -892,14 +1066,41 @@ static int run_render(int argc, char** argv) {
             ts.data()[0] = tval;
         }
 
+        // Optional diagnostic: Python predict_eps() substitutes the I2V first
+        // frame into the model input each forward, while scheduler.step() still
+        // receives the evolving latents_vision sample.
+        sd::Tensor<float> latent_model;
+        sd::Tensor<float> audio_model;
+        const sd::Tensor<float>* latent_in = &latent;
+        const sd::Tensor<float>* audio_in  = &audio_latent;
+        if (i2v && model_input_anchor) {
+            latent_model = latent;
+            audio_model  = audio_latent;
+            splice_anchor_into(&latent_model, &audio_model);
+            latent_in = &latent_model;
+            audio_in  = &audio_model;
+        }
+
         // cond + uncond JOINT forwards -> both stream velocities each.
         // COND: when cloning, splice the projected speaker embedding into the shared
         // (spk-selected, model_mm.py:1644) context. UNCOND is always spk=None (the python
         // uncond pass passes spk_embs=None -> context_vid(neg) for both streams).
-        auto [vv_cond,   va_cond]   = runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts,
+        auto [vv_cond,   va_cond]   = runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts,
                                                          /*mask_modality=*/false, /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
-        auto [vv_uncond, va_uncond] = runner->compute_va(n_threads, latent, audio_latent, ctx_neg, ts);
-        if (vv_cond.empty() || vv_uncond.empty()) {
+        if (vv_cond.empty()) {
+            printf("ERROR: DiT forward returned empty at step %d\n", step);
+            return 1;
+        }
+        if (step == 0 && getenv("NAVA_STOP_AFTER_STEP0_COND") != nullptr) {
+            if (dump_audio_traj) {
+                const std::string d = dump_audio_traj;
+                write_bin(d + "/va_cond_00.bin", va_cond, "va_cond");
+            }
+            printf("NAVA_STOP_AFTER_STEP0_COND active -> stopped after first conditional DiT forward\n");
+            return 0;
+        }
+        auto [vv_uncond, va_uncond] = runner->compute_va(n_threads, *latent_in, *audio_in, ctx_neg, ts);
+        if (vv_uncond.empty()) {
             printf("ERROR: DiT forward returned empty at step %d\n", step);
             return 1;
         }
@@ -916,7 +1117,7 @@ static int run_render(int argc, char** argv) {
         sd::Tensor<float> va_audio_uncond;
         if (separate_audio_neg) {
             auto [vv_audio_unc, va_audio_unc] =
-                runner->compute_va(n_threads, latent, audio_latent, ctx_audio_neg, ts);
+                runner->compute_va(n_threads, *latent_in, *audio_in, ctx_audio_neg, ts);
             (void)vv_audio_unc;
             va_audio_uncond = std::move(va_audio_unc);
         }
@@ -931,7 +1132,7 @@ static int run_render(int argc, char** argv) {
         sd::Tensor<float> vv_mmask, va_mmask;
         if (align_cfg) {
             std::tie(vv_mmask, va_mmask) =
-                runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/true,
+                runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts, /*mask_modality=*/true,
                                    /*apply_spk=*/clone, &spk_emb_host, &spk_pos_v);
         }
         // timbre CFG: a 4th AUDIO forward with spk=None on the POSITIVE context
@@ -942,7 +1143,7 @@ static int run_render(int argc, char** argv) {
         if (effective_timbre) {
             sd::Tensor<float> vv_tmp;
             std::tie(vv_tmp, va_timbre) =
-                runner->compute_va(n_threads, latent, audio_latent, ctx_pos, ts, /*mask_modality=*/false);
+                runner->compute_va(n_threads, *latent_in, *audio_in, ctx_pos, ts, /*mask_modality=*/false);
             (void)vv_tmp;
         }
         if (dump_audio_traj) {
@@ -988,9 +1189,9 @@ static int run_render(int argc, char** argv) {
                 latent.data()[i] += v.data()[i] * dsig_video;
             }
         }
-        // I2V: re-pin frame 0 to the clean image latent (the per-token t=0 makes its
-        // velocity ~0, but re-splicing keeps the anchor exact through the trajectory).
-        splice_anchor();
+        if (repin_after_step) {
+            splice_anchor_into(&latent, &audio_latent);
+        }
 
         // --- audio: CFG combine -> Euler step (same schedule/shift -> same dsig) ---
         static const bool freeze_audio = getenv("NAVA_FREEZE_AUDIO") != nullptr;
@@ -1034,7 +1235,9 @@ static int run_render(int argc, char** argv) {
                     audio_latent.data()[i] += va_cfg.data()[i] * dsig_audio;
                 }
             }
-            splice_anchor();  // re-pin clean audio (and video) anchors after the audio step
+            if (repin_after_step) {
+                splice_anchor_into(&latent, &audio_latent);
+            }
             if (dump_traj) {
                 char fn[80];
                 snprintf(fn, sizeof(fn), "/aud_step_%02d.bin", step);
