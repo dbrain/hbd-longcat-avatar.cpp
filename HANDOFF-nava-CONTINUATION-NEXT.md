@@ -100,10 +100,11 @@ NAVA_VAE_TILE=16 nava render --cuda --gguf models/nava-dit-q6_k.gguf \
   --image /mnt/hdd/nava/peter_896x448.bin --vae models/wan2.2-vae-48ch-f16.gguf \
   --audio-vae models/nava-ltx-audio-vae-f16.gguf --steps 10 --frames 13 \
   --width 896 --height 448 --seed 42 --out-name chain_seg0
-# N=1 continuation (CORRECT, proven): re-encode seg0's last decoded frame
+# N=1 continuation (CORRECT, proven): re-encode seg0's last decoded frame.
+# As of 3b5710b, --image takes a REAL image directly (Python-parity resize+center-crop
+# +Lanczos-3 in-port); no prep script needed. (Output is already 896x448 -> crop is a no-op.)
 ffmpeg -sseof -0.1 -i cpp-runs/chain_seg0/clip.webm -update 1 -frames:v 1 last.png
-python tools/nava_prep_image.py last.png 896 448 last.bin
-nava render ... --image last.bin --seed 123 --out-name chain_seg1_reenc   # clean
+nava render ... --image last.png --seed 123 --out-name chain_seg1_reenc   # clean
 ```
 Eye :8097 — `chain_seg1_reenc`/`chain_CONCAT_reenc` (correct) vs `chain_seg1_n1`,
 `chain_seg1_n3k13` (broken raw-latent). Ear :8099 — row 27 (chain audio).
