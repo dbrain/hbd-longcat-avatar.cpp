@@ -98,6 +98,31 @@ ranks seams but **cannot distinguish "natural settle" from "dead-eyed" from "con
 those are eye calls (motion magnitude alone is ambiguous; confetti reads as high motion). Use
 it as a pre-filter, not a judge.
 
+## Motion test bench + continuity-test VALIDITY (critical — read before any render eval)
+**A prompt-driven motion clip CANNOT validate velocity continuity.** If the motion is described
+in the text, every continuation segment gets that same text and the model RE-GENERATES the
+motion regardless of whether it read the prior frames' velocity. (This also means earlier seam
+tests that reused the "man talking" prompt every segment were partly prompt-faked.) So:
+
+- **Valid continuity protocol (owner-confirmed):** establish the motion — ideally an *unexpected*
+  motion — in **seg0's prompt ONLY**, then give the continuation a **NEUTRAL prompt that does
+  NOT mention the moving subject/direction**. The model's default (neutral prompt + appearance
+  anchor) is the *natural* motion; so if the continuation keeps doing the *unexpected* thing,
+  that signal can ONLY have come from the prior frames → true velocity continuity. If it reverts
+  to the default, the motion reset. Example: seg0 = "a car reversing / rear-facing but moving
+  toward camera", seg1 = "a car on a desert highway" (no direction) → does it keep reversing?
+
+- **Verified motion benches** (NAVA renders these; q5_k 896×448, prompts in
+  `/mnt/hdd/nava/warm_exp/motion/*.txt`, clips `cpp-runs/MOTION_*`):
+  - `car3p_rev` — **best**: 3rd-person car on a desert highway with strong translational motion
+    (approaches/grows across the clip). Position+size are trackable and NOT fully pinned by text.
+  - `highway_fwd` — 1st-person ground-cam road push (the NAVA demo prompt, verbatim).
+  - `headturn` — strong head rotation (profile→back→profile); the owner's named failure case.
+  - `orbit` — an element does orbit the head (followed); but it's prompt-defined so weak as a
+    *continuity* test (re-faked each segment). Avatar talking-head = WORST bench (near-static).
+  Use `tools/nava_motion_anchor.py` for extrapolated anchors. Judge by EYE on :8097 — the metric
+  can't tell continued-motion from reset (both read as motion).
+
 ## What's LEFT — honest assessment
 1. **DiT continuation pathway via LoRA (the real fix).** Add an input the weights learn to read
    as "prior motion state" — prior-segment tail latents as extra attention KV, or a small
