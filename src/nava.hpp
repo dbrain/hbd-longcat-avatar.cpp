@@ -152,6 +152,60 @@ namespace NAVA {
     }
 
     // ---------------------------------------------------------------------
+    // Modulation 2-timestep collapse (bit-exact VRAM/speed win).
+    //
+    // The per-token I2V timestep has only TWO unique values: 0 for the clean
+    // anchor prefix and `tval` for the rest. So AdaLN modulation is computed on a
+    // COMPACT e [dim,6,2] (col0 = anchor t=0, col1 = tval) instead of the full
+    // [dim,6,L_total]. After chunk6's add+chunk+permute each modulation chunk is a
+    // compact [dim,2,1]; these helpers expand it per-token to [dim,L,1] with pure
+    // copies (repeat/concat — no arithmetic), so the downstream op graph and bits
+    // are byte-identical to the old per-token path.
+
+    // Single-anchor 2-segment expand: first n_anchor tokens take col0 (anchor),
+    // the remaining L-n_anchor take col1 (tval). c: compact [dim,2,1].
+    static ggml_tensor* expand_mod_chunk(ggml_context* ctx, ggml_tensor* c,
+                                         int64_t n_anchor, int64_t L) {
+        int64_t dim = c->ne[0];
+        GGML_ASSERT(c->ne[1] == 2);
+        auto col0 = ggml_cont(ctx, ggml_view_3d(ctx, c, dim, 1, 1, c->nb[1], c->nb[2], 0));
+        auto col1 = ggml_cont(ctx, ggml_view_3d(ctx, c, dim, 1, 1, c->nb[1], c->nb[2], c->nb[1]));
+        if (n_anchor <= 0) {
+            return ggml_repeat_4d(ctx, col1, dim, L, 1, 1);
+        }
+        if (n_anchor >= L) {
+            return ggml_repeat_4d(ctx, col0, dim, L, 1, 1);
+        }
+        auto a = ggml_repeat_4d(ctx, col0, dim, n_anchor, 1, 1);
+        auto r = ggml_repeat_4d(ctx, col1, dim, L - n_anchor, 1, 1);
+        return ggml_concat(ctx, a, r, 1);  // [dim, L, 1]
+    }
+
+    // SingleBlock 4-segment expand over concat[video++audio]: video has its own
+    // clean anchor (n_clean_i of L_vid), audio its own (n_anchor_a of L_aud), and
+    // they are INDEPENDENT. c: compact [dim,2,1].
+    static ggml_tensor* expand_mod_chunk_single(ggml_context* ctx, ggml_tensor* c,
+                                                int64_t n_clean_i, int64_t L_vid,
+                                                int64_t n_anchor_a, int64_t L_aud) {
+        int64_t dim = c->ne[0];
+        GGML_ASSERT(c->ne[1] == 2);
+        auto col0 = ggml_cont(ctx, ggml_view_3d(ctx, c, dim, 1, 1, c->nb[1], c->nb[2], 0));
+        auto col1 = ggml_cont(ctx, ggml_view_3d(ctx, c, dim, 1, 1, c->nb[1], c->nb[2], c->nb[1]));
+        ggml_tensor* out = nullptr;
+        auto append = [&](ggml_tensor* col, int64_t n) {
+            if (n <= 0) return;
+            auto seg = ggml_repeat_4d(ctx, col, dim, n, 1, 1);
+            out = out ? ggml_concat(ctx, out, seg, 1) : seg;
+        };
+        append(col0, n_clean_i);             // video anchor prefix
+        append(col1, L_vid - n_clean_i);     // video body
+        append(col0, n_anchor_a);            // audio anchor prefix
+        append(col1, L_aud - n_anchor_a);    // audio body
+        GGML_ASSERT(out != nullptr && out->ne[1] == L_vid + L_aud);
+        return out;  // [dim, L_total, 1]
+    }
+
+    // ---------------------------------------------------------------------
     // One self/cross attention "side" (q/k/v/o + qk RMSNorm). Mirrors
     // WanSelfAttention but exposed so the joint double-block can drive video and
     // audio sides separately and concat in the middle.
@@ -321,17 +375,23 @@ namespace NAVA {
         }
 
         // returns 6 modulation chunks for the given e (ev or ea).
-        // e: [dim, 6, N] (matches modulation param [dim,6,1]); after add -> chunk 6
-        // over dim==1 -> each [dim, 1, N].
-        std::vector<ggml_tensor*> chunk6(GGMLRunnerContext* ctx, ggml_tensor* e, const std::string& which) {
-            auto modparam = params[which];                          // [dim, 6, 1]
-            e             = ggml_add(ctx->ggml_ctx, e, modparam);   // [dim, 6, L]  (L=1 text / L_stream I2V; modparam broadcasts over L)
-            auto chunks   = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1); // 6 x [dim, 1, L]
-            // Lay each chunk as [dim, L, 1] so the modulation applies PER-TOKEN against
-            // x [dim, L, 1]. When L==1 (text-mode / uniform-t) this is a no-op shape that
-            // broadcasts over the token axis exactly like before — text-mode is unchanged.
+        // e: [dim, 6, Ne] — Ne==1 text-mode (uniform-t) / Ne==2 compact I2V
+        // (col0=anchor t=0, col1=tval). modparam [dim,6,1] broadcasts over Ne.
+        // n_anchor/L_stream drive the per-token expansion in the I2V (Ne==2) case.
+        std::vector<ggml_tensor*> chunk6(GGMLRunnerContext* ctx, ggml_tensor* e, const std::string& which,
+                                         int64_t n_anchor, int64_t L_stream) {
+            auto modparam      = params[which];                          // [dim, 6, 1]
+            e                  = ggml_add(ctx->ggml_ctx, e, modparam);   // [dim, 6, Ne]
+            const bool compact = e->ne[2] == 2;                          // compact I2V (2-col) path; >2 = full per-token (debug)
+            auto chunks        = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1); // 6 x [dim, 1, Ne]
+            // Lay each chunk as [dim, Ne, 1]; then in I2V expand to per-token [dim, L_stream, 1].
+            // When Ne==1 (text-mode / uniform-t) this is a no-op shape that broadcasts over
+            // the token axis exactly like before — text-mode is unchanged.
             for (auto& c : chunks) {
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 0, 2, 1, 3));
+                if (compact) {
+                    c = expand_mod_chunk(ctx->ggml_ctx, c, n_anchor, L_stream);  // [dim, L_stream, 1]
+                }
             }
             return chunks;
         }
@@ -339,10 +399,12 @@ namespace NAVA {
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,        // [dim, L_total, N]
                              int64_t L_vid,
-                             ggml_tensor* e_vid,    // [dim, 6, N]
-                             ggml_tensor* e_audio,  // [dim, 6, N]
+                             ggml_tensor* e_vid,    // [dim, 6, Ne] (Ne=1 text / 2 compact I2V)
+                             ggml_tensor* e_audio,  // [dim, 6, Ne]
                              ggml_tensor* pe,
                              ggml_tensor* context,
+                             int64_t n_clean_i  = 0,    // video clean-anchor count (I2V)
+                             int64_t n_anchor_a = 0,    // audio clean-anchor count (I2V)
                              bool joint_attn = true) {  // false = masking_modality (intra-modal only)
             int64_t L_total = x->ne[1];
             int64_t L_aud   = L_total - L_vid;
@@ -353,8 +415,8 @@ namespace NAVA {
             auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
             auto norm3      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm3"]);
 
-            auto ev = chunk6(ctx, e_vid, "modulation.modulation");
-            auto ea = chunk6(ctx, e_audio, "modulation_audio.modulation");
+            auto ev = chunk6(ctx, e_vid, "modulation.modulation", n_clean_i, L_vid);
+            auto ea = chunk6(ctx, e_audio, "modulation_audio.modulation", n_anchor_a, L_aud);
 
             // split streams
             auto xv = ggml_ext_slice(ctx->ggml_ctx, x, 1, 0, L_vid);        // [dim, L_vid, N]
@@ -447,10 +509,12 @@ namespace NAVA {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,    // [dim, L_total, N]
-                             ggml_tensor* e,    // [dim, 6, N]  (cat of e_vid,e_audio per token; see runner)
+                             ggml_tensor* e,    // [dim, 6, Ne] (Ne=1 text / 2 compact I2V)
                              ggml_tensor* pe,
                              ggml_tensor* context,
-                             int64_t L_vid    = -1,      // for masking_modality split (default: joint, unused)
+                             int64_t L_vid    = -1,      // video token count (masking split + I2V expand)
+                             int64_t n_clean_i  = 0,     // video clean-anchor count (I2V)
+                             int64_t n_anchor_a = 0,     // audio clean-anchor count (I2V)
                              bool joint_attn  = true) {  // false = masking_modality (intra-modal only)
             int64_t L = x->ne[1];
             int64_t N = x->ne[2];
@@ -461,13 +525,18 @@ namespace NAVA {
             auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
             auto norm3      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm3"]);
 
-            auto modparam = params["modulation.modulation"];
-            e             = ggml_add(ctx->ggml_ctx, e, modparam);  // [dim,6,Lt] (Lt=1 text / L_total I2V)
-            auto es       = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);// 6 x [dim,1,Lt]
-            // -> [dim, Lt, 1] so modulation applies per-token against x [dim, L_total, 1]
-            // (no-op broadcast when Lt==1; text-mode unchanged).
+            auto modparam      = params["modulation.modulation"];
+            e                  = ggml_add(ctx->ggml_ctx, e, modparam);  // [dim,6,Ne] (Ne=1 text / 2 compact I2V)
+            const bool compact = e->ne[2] == 2;                         // compact I2V (2-col) path; >2 = full per-token (debug)
+            auto es            = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);// 6 x [dim,1,Ne]
+            // -> [dim, Ne, 1]; then in I2V expand to per-token [dim, L_total, 1] over the
+            // concat[video++audio] sequence (video + audio carry INDEPENDENT clean anchors).
+            // (no-op broadcast when Ne==1; text-mode unchanged.)
             for (auto& c : es) {
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 0, 2, 1, 3));
+                if (compact) {
+                    c = expand_mod_chunk_single(ctx->ggml_ctx, c, n_clean_i, L_vid, n_anchor_a, L - L_vid);
+                }
             }
 
             // self-attn (joint pe over the whole sequence)
@@ -534,23 +603,27 @@ namespace NAVA {
             blocks["head"] = std::shared_ptr<GGMLBlock>(new Linear(dim, out_dim));
         }
 
-        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* e_time) {
-            // x: [dim, L, N]; e_time: [dim, N]. We use a single shared time vector
-            // per stream for this first-draft harness (B=1, N=1). The modulation is
-            // broadcast over the L tokens.
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* e_time,
+                             int64_t n_anchor = 0) {
+            // x: [dim, L, N]; e_time: [dim, Ne]. The modulation is broadcast over the L tokens.
             auto head     = std::dynamic_pointer_cast<Linear>(blocks["head"]);
             auto modparam = params["modulation"];  // [dim,2,1]
 
-            // e_time: [dim, Lt] — Lt==1 (text/uniform-t, broadcast over tokens) or
-            // Lt==L (per-token I2V clean anchor). Build per-token shift/scale [dim,Lt,1].
-            int64_t Lt = e_time->ne[1];
-            auto e     = ggml_reshape_3d(ctx->ggml_ctx, e_time, dim, 1, Lt);  // [dim,1,Lt]
-            e          = ggml_repeat_4d(ctx->ggml_ctx, e, dim, 2, Lt, 1);     // [dim,2,Lt]
-            e          = ggml_add(ctx->ggml_ctx, e, modparam);                // [dim,2,Lt] (modparam [dim,2,1] broadcasts over Lt)
-            auto es    = ggml_ext_chunk(ctx->ggml_ctx, e, 2, 1);              // 2 x [dim,1,Lt]
-            // -> [dim, Lt, 1] so modulation applies per-token (broadcasts when Lt==1).
+            // e_time: [dim, Ne] — Ne==1 (text/uniform-t, broadcast over tokens) or
+            // Ne==2 (compact I2V clean anchor: col0=t0, col1=tval). Build shift/scale.
+            int64_t Ne = e_time->ne[1];
+            auto e     = ggml_reshape_3d(ctx->ggml_ctx, e_time, dim, 1, Ne);  // [dim,1,Ne]
+            e          = ggml_repeat_4d(ctx->ggml_ctx, e, dim, 2, Ne, 1);     // [dim,2,Ne]
+            e          = ggml_add(ctx->ggml_ctx, e, modparam);                // [dim,2,Ne] (modparam [dim,2,1] broadcasts over Ne)
+            auto es    = ggml_ext_chunk(ctx->ggml_ctx, e, 2, 1);              // 2 x [dim,1,Ne]
+            // -> [dim, Ne, 1] so modulation applies per-token (broadcasts when Ne==1).
             auto shift = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, es[0], 0, 2, 1, 3));
             auto scale = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, es[1], 0, 2, 1, 3));
+            if (Ne == 2) {  // compact I2V: expand the 2 columns to per-token [dim, L, 1]
+                int64_t L = x->ne[1];
+                shift = expand_mod_chunk(ctx->ggml_ctx, shift, n_anchor, L);
+                scale = expand_mod_chunk(ctx->ggml_ctx, scale, n_anchor, L);
+            }
 
             x = ggml_ext_layer_norm(ctx->ggml_ctx, x, nullptr, nullptr, eps);
             x = mod_add(ctx->ggml_ctx, ggml_add(ctx->ggml_ctx, x, mod_mul(ctx->ggml_ctx, x, scale)), shift);
@@ -744,6 +817,7 @@ namespace NAVA {
         NavaParams nava_params;
         Nava nava;
         std::vector<float> pe_vec;
+        sd::Tensor<float> t2_host;  // compact {0, tval} timestep (modulation 2-timestep collapse); must outlive compute
         std::string prefix;
 
         // grid sizes for the current forward (set by build_graph)
@@ -787,7 +861,7 @@ namespace NAVA {
             ggml_tensor* vid = make_input(video);
             ggml_tensor* aud = make_input(audio);
             ggml_tensor* ctx_t = make_input(context);
-            ggml_tensor* t   = make_input(timestep);
+            // timestep input is built compact below (after L_vid/audio_len are known).
 
             auto rc = get_context();
             // RENDER (joint) path: skip the validation-only debug-tensor taps. Their
@@ -821,26 +895,73 @@ namespace NAVA {
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, nava_params.head_dim / 2, L_total);
             set_backend_tensor_data(pe, pe_vec.data());
 
+            // --- modulation 2-timestep collapse ---
+            // The per-token I2V timestep has only 2 unique values: 0 (clean anchor) and
+            // tval (rest). Feed time_embed a COMPACT {0, tval} so the AdaLN modulation
+            // tensors stay [dim,6,2] instead of [dim,6,L_total]; the blocks expand the 2
+            // columns back per-token with pure copies (bit-exact). Recover the per-stream
+            // anchor counts host-side from the timestep we were handed.
+            int64_t n_clean_i = 0, n_anchor_a = 0;
+            int64_t dbg_anchor_idx = 0, dbg_tval_idx = 0;
+            const bool per_token = (timestep.numel() > 1);
+            ggml_tensor* t = nullptr;
+            if (per_token) {
+                GGML_ASSERT(timestep.numel() == L_total);
+                const float* td = timestep.data();
+                float tval = 0.0f;
+                for (int64_t i = 0; i < L_total; ++i) {
+                    if (td[i] != 0.0f) { tval = td[i]; break; }
+                }
+                while (n_clean_i < L_vid && td[n_clean_i] == 0.0f) ++n_clean_i;
+                while (n_anchor_a < audio_len && td[L_vid + n_anchor_a] == 0.0f) ++n_anchor_a;
+                // host-side indices of an anchor (t==0) and a tval token, for the
+                // NAVA_MOD_FROM_FULL debug mode (slice the compact 2-col table out of the
+                // full-width matmul output to test expansion logic vs matmul-width rounding).
+                for (int64_t i = 0; i < L_total; ++i) { if (td[i] == 0.0f) { dbg_anchor_idx = i; break; } }
+                for (int64_t i = 0; i < L_total; ++i) { if (td[i] != 0.0f) { dbg_tval_idx = i; break; } }
+                t2_host = sd::Tensor<float>({2});
+                t2_host.data()[0] = 0.0f;     // col0 = anchor (t=0)
+                t2_host.data()[1] = tval;     // col1 = tval
+                t = make_input(t2_host);
+            } else {
+                t = make_input(timestep);
+            }
+
             // --- prepare ---
             auto x_vid   = nava.patchify_video(&rc, vid);    // [dim, L_vid, 1]
             auto x_aud   = nava.patchify_audio(&rc, aud);    // [dim, L_audio, 1]
             auto x       = ggml_concat(compute_ctx, x_vid, x_aud, 1);  // [dim, L_total, 1]
 
-            auto [e0, e_time] = nava.time_embed(&rc, t);     // e0 [dim,6,Lt]; e_time [dim,Lt]
-            // Lt==1: uniform-t (text-mode) — e_vid==e_audio==e0, heads share e_time (broadcast).
-            // Lt==L_total: per-token I2V clean anchor — slice the modulation per stream so
-            // each token's timestep (frame-0 video tokens = 0) drives its own AdaLN/head.
-            const bool per_token  = (e0->ne[2] > 1);
+            auto [e0, e_time] = nava.time_embed(&rc, t);     // e0 [dim,6,Ne]; e_time [dim,Ne]
+            // Ne==1: uniform-t (text-mode) — all streams share e0/e_time (broadcast).
+            // Ne==2: compact I2V clean anchor (col0=t0, col1=tval). The blocks/heads
+            // expand the 2 columns to per-token [dim,*,1] using the anchor counts above.
+            // No per-stream slicing here anymore — that's the whole VRAM win.
             ggml_tensor* e_vid    = e0;
             ggml_tensor* e_audio  = e0;
             ggml_tensor* e_single = e0;
             ggml_tensor* e_head_v = e_time;
             ggml_tensor* e_head_a = e_time;
-            if (per_token) {
-                e_vid    = ggml_ext_slice(compute_ctx, e0, 2, 0, L_vid);
-                e_audio  = ggml_ext_slice(compute_ctx, e0, 2, L_vid, L_total);
-                e_head_v = ggml_ext_slice(compute_ctx, e_time, 1, 0, L_vid);
-                e_head_a = ggml_ext_slice(compute_ctx, e_time, 1, L_vid, L_total);
+
+            // BIT-EXACT mode (NAVA_MOD_FROM_FULL=1): reproduce the OLD prod path's modulation
+            // EXACTLY. The compact default runs the quantized time_projection matmul at width
+            // 2 → ggml-cuda picks the MMVQ kernel (F32 activations), which is MORE accurate
+            // than the old full-width MMQ path (int8-quantized activations) — i.e. the compact
+            // latent moves TOWARD the PyTorch reference, not a bug. When exact reproduction of
+            // the old C++ baseline is required, this mode runs the matmul at full width and
+            // slices out the 2 unique columns (bit-identical, proven), at the cost of
+            // materializing the full table transiently. Same downstream expansion either way.
+            if (per_token && std::getenv("NAVA_MOD_FROM_FULL") != nullptr) {
+                ggml_tensor* tf = make_input(timestep);
+                auto [e0f, e_timef] = nava.time_embed(&rc, tf);  // full-width matmul (old prod)
+                auto a6 = ggml_ext_slice(compute_ctx, e0f, 2, dbg_anchor_idx, dbg_anchor_idx + 1);
+                auto v6 = ggml_ext_slice(compute_ctx, e0f, 2, dbg_tval_idx, dbg_tval_idx + 1);
+                e0 = ggml_concat(compute_ctx, a6, v6, 2);        // [dim,6,2] compact, from full
+                auto a1 = ggml_ext_slice(compute_ctx, e_timef, 1, dbg_anchor_idx, dbg_anchor_idx + 1);
+                auto v1 = ggml_ext_slice(compute_ctx, e_timef, 1, dbg_tval_idx, dbg_tval_idx + 1);
+                e_time = ggml_concat(compute_ctx, a1, v1, 1);    // [dim,2] compact, from full
+                e_vid = e_audio = e_single = e0;
+                e_head_v = e_head_a = e_time;
             }
 
             auto context_e = nava.embed_text(&rc, ctx_t);    // [dim, 512, 1]
@@ -854,7 +975,7 @@ namespace NAVA {
             for (int i = 0; i < nava_params.num_double; ++i) {
                 auto blk = std::dynamic_pointer_cast<DoubleBlock>(
                     nava.get_block("double_blocks." + std::to_string(i)));
-                x = blk->forward(&rc, x, L_vid, e_vid, e_audio, pe, context_e, !mask_modality);
+                x = blk->forward(&rc, x, L_vid, e_vid, e_audio, pe, context_e, n_clean_i, n_anchor_a, !mask_modality);
                 rc.capture_tensor("double_blocks." + std::to_string(i), x);
             }
 
@@ -863,7 +984,7 @@ namespace NAVA {
             for (int i = 0; i < nava_params.num_single; ++i) {
                 auto blk = std::dynamic_pointer_cast<SingleBlock>(
                     nava.get_block("single_blocks." + std::to_string(i)));
-                x = blk->forward(&rc, x, e_single, pe, context_e, L_vid, !mask_modality);
+                x = blk->forward(&rc, x, e_single, pe, context_e, L_vid, n_clean_i, n_anchor_a, !mask_modality);
                 rc.capture_tensor("single_blocks." + std::to_string(i), x);
             }
 
@@ -874,8 +995,8 @@ namespace NAVA {
             auto x_v = ggml_ext_slice(compute_ctx, x, 1, 0, L_vid);
             auto x_a = ggml_ext_slice(compute_ctx, x, 1, L_vid, L_total);
 
-            auto vel_v = head->forward(&rc, x_v, e_head_v);      // [48*ph*pw, L_vid, 1]
-            auto vel_a = head_audio->forward(&rc, x_a, e_head_a);// [128, L_audio, 1]
+            auto vel_v = head->forward(&rc, x_v, e_head_v, n_clean_i);       // [48*ph*pw, L_vid, 1]
+            auto vel_a = head_audio->forward(&rc, x_a, e_head_a, n_anchor_a);// [128, L_audio, 1]
 
             rc.capture_tensor("velocity_video_patched", vel_v);
             rc.capture_tensor("velocity_audio", vel_a);
