@@ -516,6 +516,13 @@ struct RenderOpts {
     std::string neg_context;   // VIDEO uncond context; empty => zeros_like(context)
     std::string audio_neg_context;  // AUDIO uncond context; empty => falls back to neg_context
     std::string prompt    = "(informational only — context comes from --context)";
+    // Inline text-encode (Task: umT5 in-process). --umt5 <gguf> turns on the
+    // inline path: the prompt (from --prompt or --prompt-file) is encoded through
+    // umT5 here, umT5 is freed, THEN the DiT loads — no precomputed --context bin
+    // and no shell-out to `encode-prompt`. spk-pos is resolved from the inline
+    // encode (no .spkpos sidecar needed).
+    std::string umt5;
+    std::string prompt_file;
     std::string label;
     std::string out_name;
     std::string runs_dir  = "/mnt/hdd/nava/cpp-runs";
@@ -630,6 +637,123 @@ static std::string now_stamp() {
     return buf;
 }
 
+// ---------------------------------------------------------------------------
+// umT5 text-context encode — shared by `encode-prompt`, the inline `render
+// --umt5`/`--prompt` path, and `encode-prompts` (batch). Factoring this keeps
+// the three paths byte-identical: the load-bearing tokenizer transform
+// (<S> -> <S><extra_id_2> , NFKC normalize, 512-cap with EOS-at-511) lives in
+// ONE place. See the encode-prompt subcommand below for the full rationale of
+// each step.
+// ---------------------------------------------------------------------------
+
+// mmap capability for the umT5 load. Default OFF, opt-in via NAVA_UMT5_MMAP=1.
+// MEASURED A/B (peter_prompt, warm page cache, CUDA backend): mmap is a WASH on
+// load time (2.14s on vs 2.27s off) and RAISES host RSS 1.4GB -> 7.3GB, because
+// the whole 6GB gguf maps resident while the weights are simultaneously copied
+// to the GPU params buffer (the encode is transient — umT5 is freed before the
+// DiT loads, so nothing is reused). The prod sd-server/longcat mmap RAM win is
+// for LONG-LIVED CPU-resident weights; it does not transfer to this transient
+// GPU encode. Kept as opt-in so a future CPU-backend / pinned-cache use can flip
+// it on, and values are bit-identical either way (proven by cmp).
+static bool nava_umt5_use_mmap() { return getenv("NAVA_UMT5_MMAP") != nullptr; }
+
+static const char* kNavaT5Prefix = "text_encoders.t5xxl.transformer";
+
+// Load umT5-xxl into a RESIDENT T5Embedder on `backend`. Caller owns the
+// returned embedder and MUST reset() it to free the ~6GB params buffer before
+// the DiT loads (umT5 + DiT do not co-reside on a 12GB card). The ModelLoader
+// is local: the plain load_tensors path COPIES file data into the alloc'd
+// params buffer, so the mmap can be released as soon as load returns.
+static std::shared_ptr<T5Embedder> nava_load_umt5(const std::string& gguf,
+                                                  ggml_backend_t backend,
+                                                  bool use_mmap,
+                                                  double* load_secs = nullptr) {
+    int64_t t0 = ggml_time_ms();
+    ModelLoader ml;
+    if (!ml.init_from_file_and_convert_name(gguf)) {
+        printf("umt5 load fail: %s\n", gguf.c_str());
+        return nullptr;
+    }
+    auto& tsm = ml.get_tensor_storage_map();
+    auto t5   = std::make_shared<T5Embedder>(backend, backend, tsm, kNavaT5Prefix, /*is_umt5=*/true);
+    t5->alloc_params_buffer();
+    std::map<std::string, ggml_tensor*> tensors;
+    t5->get_param_tensors(tensors, kNavaT5Prefix);
+    if (!ml.load_tensors(tensors, {}, /*n_threads=*/0, /*use_mmap=*/use_mmap)) {
+        printf("umt5 tensors load fail\n");
+        return nullptr;
+    }
+    if (load_secs) *load_secs = (ggml_time_ms() - t0) / 1000.0;
+    return t5;
+}
+
+// Encode ONE raw prompt through a resident umT5 into a NAVA cond context
+// [4096,512] (zero-padded). If spk_pos_out != null, fills it with the
+// <extra_id_2>(=256297) token positions for voice-clone splicing. Returns an
+// empty tensor on encode failure. This is the EXACT logic of the original
+// encode-prompt subcommand — keep them identical.
+static sd::Tensor<float> nava_encode_prompt_ctx(const std::shared_ptr<T5Embedder>& t5,
+                                                const std::string& raw_prompt,
+                                                std::vector<int>* spk_pos_out) {
+    // NAVA data-loader caption transform (t2v.py, use_speech_special_token=false):
+    // insert <extra_id_2> after each <S>; the TRAILING SPACE is load-bearing so
+    // the unigram tokenizer emits the metaspace on the following word (matches HF).
+    std::string text = raw_prompt;
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+    {
+        const std::string from = "<S>", to = "<S><extra_id_2> ";
+        for (size_t p = 0; (p = text.find(from, p)) != std::string::npos; p += to.size())
+            text.replace(p, from.size(), to);
+    }
+    text = nava_normalize_text(text);
+    auto tw      = t5->tokenize(text, 0, false);
+    auto& tokens = std::get<0>(tw);
+    auto& masks  = std::get<2>(tw);
+    if (const char* tp = getenv("NAVA_DUMP_TOKENS")) {
+        FILE* tf = fopen(tp, "w");
+        if (tf) { for (auto id : tokens) fprintf(tf, "%d\n", (int)id); fclose(tf);
+                  printf("dumped %zu token ids -> %s\n", tokens.size(), tp); }
+    }
+    const size_t kMaxTok = 512;
+    if (tokens.size() > kMaxTok) {
+        int eos = tokens.back();  // keep 511 content + EOS at 511 (bidirectional encoder)
+        tokens.resize(kMaxTok - 1);
+        tokens.push_back(eos);
+        masks.assign(kMaxTok, 0.0f);
+    }
+    if (spk_pos_out) {
+        spk_pos_out->clear();
+        for (size_t i = 0; i < tokens.size(); ++i)
+            if (tokens[i] == 256297) spk_pos_out->push_back((int)i);
+    }
+    auto input_ids = sd::Tensor<int32_t>::from_vector(tokens);
+    auto attn_mask = sd::Tensor<float>::from_vector(masks);
+    auto emb       = t5->model.compute(8, input_ids, attn_mask);  // ne [4096, L]
+    if (emb.empty()) return sd::Tensor<float>();
+    int64_t C  = emb.shape()[0];
+    int64_t L  = emb.shape().size() > 1 ? emb.shape()[1] : 1;
+    int64_t Lc = std::min<int64_t>(L, 512);
+    sd::Tensor<float> ctx({C, 512});
+    std::fill(ctx.data(), ctx.data() + ctx.numel(), 0.0f);
+    for (int64_t tok = 0; tok < Lc; ++tok)
+        for (int64_t c = 0; c < C; ++c)
+            ctx.data()[c + C * tok] = emb.data()[c + C * tok];
+    return ctx;
+}
+
+// Read a whole file into a string (prompt text). Returns false if unreadable.
+static bool nava_read_file(const std::string& path, std::string& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    out.clear();
+    if (n > 0) { out.resize((size_t)n); size_t r = fread(&out[0], 1, (size_t)n, f); out.resize(r); }
+    fclose(f);
+    return true;
+}
+
 static int run_render(int argc, char** argv) {
     RenderOpts o;
     for (int i = 2; i < argc; ++i) {
@@ -639,6 +763,8 @@ static int run_render(int argc, char** argv) {
             return def;
         };
         if (a == "--prompt") o.prompt = next("");
+        else if (a == "--prompt-file") o.prompt_file = next("");
+        else if (a == "--umt5") o.umt5 = next("");
         else if (a == "--context") o.context = next("");
         else if (a == "--neg-context") o.neg_context = next("");
         else if (a == "--audio-neg-context") o.audio_neg_context = next("");
@@ -713,6 +839,43 @@ static int run_render(int argc, char** argv) {
 
     int n_threads = 8;
     int64_t wall_t0 = ggml_time_ms();
+
+    // ----- INLINE umT5 text-encode (--umt5) — encode THEN free, before DiT -----
+    // Makes a multi-segment render self-sufficient (raw text -> clip) with no
+    // precomputed --context bin and no per-segment shell-out. umT5 (~6.4GB) is
+    // resident only for the encode and freed here, so it never co-resides with
+    // the ~7GB DiT. The image VAE (below) and DiT load after, strictly
+    // sequential. Bit-identical to `nava encode-prompt` (shared helper).
+    sd::Tensor<float> inline_ctx;
+    std::vector<int>  inline_spk_pos;
+    bool have_inline_ctx = false;
+    if (!o.umt5.empty()) {
+        std::string ptext;
+        if (!o.prompt_file.empty()) {
+            if (!nava_read_file(o.prompt_file, ptext)) {
+                printf("ERROR: --prompt-file %s unreadable\n", o.prompt_file.c_str());
+                return 1;
+            }
+        } else {
+            ptext = o.prompt;
+        }
+        const bool mmap = nava_umt5_use_mmap();
+        double load_s = 0;
+        auto t5 = nava_load_umt5(o.umt5, backend, mmap, &load_s);
+        if (!t5) return 1;
+        int64_t e0 = ggml_time_ms();
+        inline_ctx = nava_encode_prompt_ctx(t5, ptext, &inline_spk_pos);
+        double enc_s = (ggml_time_ms() - e0) / 1000.0;
+        t5.reset();  // FREE umT5 (~6.4GB) BEFORE the DiT loads
+        if (inline_ctx.numel() == 0) { printf("ERROR: inline umT5 encode returned empty\n"); return 1; }
+        have_inline_ctx = true;
+        printf("INLINE umT5: load %.2fs + encode %.2fs (mmap=%s) -> cond ctx [4096,512], %zu spk pos\n",
+               load_s, enc_s, mmap ? "on" : "off", inline_spk_pos.size());
+        if (const char* dp = getenv("NAVA_DUMP_INLINE_CTX")) {
+            write_bin(dp, inline_ctx, "context");
+            printf("NAVA_DUMP_INLINE_CTX: wrote inline cond ctx -> %s\n", dp);
+        }
+    }
 
     // ----- I2V: encode the input image -> frame-0 clean-latent anchor -----
     // --image accepts a real encoded image (.png/.jpg/...): decoded + Python-parity
@@ -848,7 +1011,11 @@ static int run_render(int argc, char** argv) {
     // real-neg CFG guidance was biased, driving the std runaway. (ctx_neg below was
     // already loaded correctly via load_tensor_from_file_as_tensor.)
     sd::Tensor<float> ctx_pos;
-    if (!o.context.empty()) {
+    if (have_inline_ctx) {
+        ctx_pos = std::move(inline_ctx);
+        printf("cond context from INLINE umT5 encode (ne0=%lld)\n",
+               (long long)ctx_pos.shape()[0]);
+    } else if (!o.context.empty()) {
         if (!path_exists(o.context)) {
             printf("ERROR: --context %s not found\n", o.context.c_str());
             return 1;
@@ -892,7 +1059,10 @@ static int run_render(int argc, char** argv) {
         spk_emb_host = sd::load_tensor_from_file_as_tensor<float>(o.spk_emb);
         spk_emb_host.reshape_({192, 1});
         std::string poss = o.spk_pos_str;
-        if (poss.empty()) {  // fall back to the encode-prompt sidecar
+        if (poss.empty() && have_inline_ctx) {  // inline encode resolved spk pos in-process
+            spk_pos_v = inline_spk_pos;
+            printf("spk_pos: %zu position(s) from inline umT5 encode\n", spk_pos_v.size());
+        } else if (poss.empty()) {  // fall back to the encode-prompt sidecar
             std::string sp = o.context + ".spkpos";
             FILE* sf = fopen(sp.c_str(), "r");
             if (sf) { char ln[32]; while (fgets(ln, sizeof(ln), sf)) { int v = atoi(ln); if (ln[0]>='0'&&ln[0]<='9') spk_pos_v.push_back(v); } fclose(sf);
@@ -1695,114 +1865,86 @@ int main(int argc, char** argv) {
         }
         std::string gguf = argv[2], pf = argv[3], out = argv[4];
         std::string text;
-        {
-            FILE* f = fopen(pf.c_str(), "rb");
-            if (!f) { printf("cannot open prompt file %s\n", pf.c_str()); return 1; }
-            fseek(f, 0, SEEK_END);
-            long n = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            if (n > 0) { text.resize((size_t)n); size_t r = fread(&text[0], 1, (size_t)n, f); text.resize(r); }
-            fclose(f);
-            while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
-        }
-        // NAVA data-loader caption transform (nava_src/data/t2v.py:391, the
-        // use_speech_special_token=false path that nava_640.yaml/prod selects):
-        //   text = text.replace("<S>", "<S><extra_id_2>")
-        // i.e. insert the umT5 sentinel <extra_id_2> (id 256297) right after each
-        // speech-start marker. The pipeline ALWAYS does this before the umT5 encode;
-        // omitting it shifts every token from the spoken line onward and the
-        // bidirectional umT5 context diverges there (cos ~0.35 past the marker),
-        // which the joint DiT faithfully turns into GARBLED SPEECH while the video
-        // (barely dependent on those tokens) looks fine. <E> stays literal, matching
-        // use_speech_special_token=false. The cpp unigram tokenizer already maps
-        // <extra_id_2> -> 256297, so only this textual insertion is needed.
-        // The TRAILING SPACE is load-bearing: HF/sentencepiece re-adds the metaspace
-        // (▁) to the word AFTER a special token, so "<extra_id_2>We" tokenizes as
-        // [<extra_id_2>, ▁We]. The cpp unigram tokenizer does NOT add ▁ after a
-        // special token, so without the space "We" tokenizes as bare 7440 instead of
-        // ▁We=1136 — one wrong token right at the start of the spoken line, which
-        // ripples through the bidirectional context. The inserted space makes the cpp
-        // tokenizer emit ▁We, matching HF exactly (0 token diffs). whitespace_clean
-        // (in nava_normalize_text below) preserves the single space.
-        {
-            const std::string from = "<S>", to = "<S><extra_id_2> ";
-            for (size_t p = 0; (p = text.find(from, p)) != std::string::npos; p += to.size())
-                text.replace(p, from.size(), to);
-        }
-        // NFKC full-width normalization + whitespace_clean, to match python's tokenizer
-        // (the cpp t5 unigram tokenizer skips the sentencepiece NFKC charsmap).
-        text = nava_normalize_text(text);
+        if (!nava_read_file(pf, text)) { printf("cannot open prompt file %s\n", pf.c_str()); return 1; }
         ggml_backend_t backend = nullptr;
 #ifdef GGML_USE_CUDA
         backend = ggml_backend_cuda_init(0);
 #endif
         if (!backend) backend = ggml_backend_cpu_init();
-        ModelLoader ml;
-        if (!ml.init_from_file_and_convert_name(gguf)) { printf("umt5 load fail: %s\n", gguf.c_str()); return 1; }
-        auto& tsm           = ml.get_tensor_storage_map();
-        const char* T5PREFIX = "text_encoders.t5xxl.transformer";
-        auto t5   = std::make_shared<T5Embedder>(backend, backend, tsm, T5PREFIX, /*is_umt5=*/true);
-        t5->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        t5->get_param_tensors(tensors, T5PREFIX);
-        if (!ml.load_tensors(tensors)) { printf("umt5 tensors load fail\n"); return 1; }
-        printf("umt5 loaded; prompt is %zu bytes\n", text.size());
-        // No token padding (max_length=0, padding=false) -> raw token length, then we
-        // zero-pad the OUTPUT to 512, exactly like dump_three_ctx.py.
-        auto tw          = t5->tokenize(text, 0, false);
-        auto& tokens     = std::get<0>(tw);
-        auto& masks      = std::get<2>(tw);
-        if (const char* tp = getenv("NAVA_DUMP_TOKENS")) {
-            FILE* tf = fopen(tp, "w");
-            if (tf) { for (auto id : tokens) fprintf(tf, "%d\n", (int)id); fclose(tf);
-                      printf("dumped %zu token ids -> %s\n", tokens.size(), tp); }
-        }
-        // NAVA caps umT5 at text_len=512 (model_loading_utils.py): truncate the INPUT
-        // to 512 so the encoder doesn't attend past it. (Truncating only the OUTPUT
-        // would let the kept embeddings see the dropped tail -> not faithful to python.)
-        const size_t kMaxTok = 512;
-        if (tokens.size() > kMaxTok) {
-            // Match python (HF tokenizer seq_len=512 truncation): keep the first 511
-            // content tokens and KEEP the EOS at position 511 — do NOT keep 512 content
-            // and drop EOS. umT5 is a bidirectional encoder, so a missing/!=EOS terminator
-            // shifts EVERY token's embedding (context cos ~0.57 vs ~0.99 otherwise).
-            int eos = tokens.back();  // umT5 EOS (id 1) at the natural sequence end
-            printf("tokens=%zu -> truncating to %zu (511 content + EOS %d, NAVA umT5 text_len cap)\n",
-                   tokens.size(), kMaxTok, eos);
-            tokens.resize(kMaxTok - 1);
-            tokens.push_back(eos);
-            masks.assign(kMaxTok, 0.0f);  // tokenize already mapped valid->0.0 / pad->-HUGE (t5.hpp:509)
-        }
-        printf("tokens=%zu\n", tokens.size());
-        // Voice clone: record the spk-token (<extra_id_2>=256297) position(s) in the FINAL
-        // token sequence to a sidecar <out>.spkpos, so `render --spk-emb` can splice the
-        // projected speaker embedding there (model_mm.py spk_pos). 0 lines => no spk token.
+        const bool mmap = nava_umt5_use_mmap();
+        double load_s = 0;
+        auto t5 = nava_load_umt5(gguf, backend, mmap, &load_s);
+        if (!t5) return 1;
+        printf("umt5 loaded (%.2fs, mmap=%s); prompt is %zu bytes\n", load_s, mmap ? "on" : "off", text.size());
+        // Shared helper does the load-bearing caption transform (<S> -> <S><extra_id_2> ),
+        // NFKC normalize, 512-cap (511 content + EOS), and spk-pos collection — IDENTICAL
+        // to the inline render path (bit-exactness by construction).
+        std::vector<int> spk_pos;
+        sd::Tensor<float> ctx = nava_encode_prompt_ctx(t5, text, &spk_pos);
+        if (ctx.numel() == 0) { printf("umt5 encode returned empty\n"); return 1; }
+        // Voice clone: record the <extra_id_2>(=256297) position(s) to a sidecar
+        // <out>.spkpos, so `render --spk-emb` can splice the projected speaker embedding.
         {
             std::string sp = out + ".spkpos";
             FILE* sf = fopen(sp.c_str(), "w");
             if (sf) {
-                int n_spk = 0;
-                for (size_t i = 0; i < tokens.size(); ++i)
-                    if (tokens[i] == 256297) { fprintf(sf, "%zu\n", i); ++n_spk; }
+                for (int p : spk_pos) fprintf(sf, "%d\n", p);
                 fclose(sf);
-                printf("spk_pos: %d <extra_id_2> token(s) -> %s\n", n_spk, sp.c_str());
+                printf("spk_pos: %zu <extra_id_2> token(s) -> %s\n", spk_pos.size(), sp.c_str());
             }
         }
-        auto input_ids = sd::Tensor<int32_t>::from_vector(tokens);
-        auto attn_mask = sd::Tensor<float>::from_vector(masks);
-        auto emb       = t5->model.compute(8, input_ids, attn_mask);  // ne [4096, L]
-        if (emb.empty()) { printf("umt5 encode returned empty\n"); return 1; }
-        int64_t C  = emb.shape()[0];
-        int64_t L  = emb.shape().size() > 1 ? emb.shape()[1] : 1;
-        int64_t Lc = std::min<int64_t>(L, 512);
-        sd::Tensor<float> ctx({C, 512});
-        std::fill(ctx.data(), ctx.data() + ctx.numel(), 0.0f);
-        for (int64_t tok = 0; tok < Lc; ++tok)
-            for (int64_t c = 0; c < C; ++c)
-                ctx.data()[c + C * tok] = emb.data()[c + C * tok];
         write_bin(out, ctx, "context");
         dump_stats("umt5 context", ctx);
-        printf("encoded -> %s  ne=[%lld,512]  (token L=%lld)\n", out.c_str(), (long long)C, (long long)L);
+        printf("encoded -> %s  ne=[%lld,512]\n", out.c_str(), (long long)ctx.shape()[0]);
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "encode-prompts") {
+        // nava encode-prompts <umt5_gguf> <out_prefix> <p0.txt> <p1.txt> ...
+        //   Batch text-encode for a multi-segment CHAIN: load umT5 ONCE, encode every
+        //   segment's prompt while it stays resident, then free — so an N-segment chain
+        //   pays 1x umT5 load instead of N. Writes <out_prefix>{i}.bin (+ .spkpos sidecar)
+        //   for each prompt; a chain driver then loops `nava render --context <prefix>{i}.bin`.
+        //   (For a SINGLE self-contained render, prefer `nava render --umt5 ... --prompt`.)
+        if (argc < 5) {
+            printf("usage: %s encode-prompts <umt5_gguf> <out_prefix> <p0.txt> [p1.txt ...]\n", argv[0]);
+            return 1;
+        }
+        std::string gguf = argv[2], prefix = argv[3];
+        std::vector<std::string> pfiles;
+        for (int i = 4; i < argc; ++i) pfiles.push_back(argv[i]);
+        ggml_backend_t backend = nullptr;
+#ifdef GGML_USE_CUDA
+        backend = ggml_backend_cuda_init(0);
+#endif
+        if (!backend) backend = ggml_backend_cpu_init();
+        const bool mmap = nava_umt5_use_mmap();
+        double load_s = 0;
+        int64_t t_all0 = ggml_time_ms();
+        auto t5 = nava_load_umt5(gguf, backend, mmap, &load_s);  // 1x load for the whole batch
+        if (!t5) return 1;
+        printf("umt5 loaded ONCE (%.2fs, mmap=%s) for %zu segment prompt(s)\n",
+               load_s, mmap ? "on" : "off", pfiles.size());
+        for (size_t i = 0; i < pfiles.size(); ++i) {
+            std::string text;
+            if (!nava_read_file(pfiles[i], text)) { printf("cannot open prompt file %s\n", pfiles[i].c_str()); return 1; }
+            std::vector<int> spk_pos;
+            int64_t e0 = ggml_time_ms();
+            sd::Tensor<float> ctx = nava_encode_prompt_ctx(t5, text, &spk_pos);
+            if (ctx.numel() == 0) { printf("umt5 encode returned empty for %s\n", pfiles[i].c_str()); return 1; }
+            double enc_s = (ggml_time_ms() - e0) / 1000.0;
+            std::string out = prefix + std::to_string(i) + ".bin";
+            {
+                std::string sp = out + ".spkpos";
+                FILE* sf = fopen(sp.c_str(), "w");
+                if (sf) { for (int p : spk_pos) fprintf(sf, "%d\n", p); fclose(sf); }
+            }
+            write_bin(out, ctx, "context");
+            printf("  [%zu] %s -> %s  (encode %.2fs, %zu spk pos)\n",
+                   i, pfiles[i].c_str(), out.c_str(), enc_s, spk_pos.size());
+        }
+        t5.reset();  // free umT5 once the whole batch is encoded
+        printf("encode-prompts: %zu prompt(s) in one residency, total %.2fs (load %.2fs)\n",
+               pfiles.size(), (ggml_time_ms() - t_all0) / 1000.0, load_s);
         return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "encode-video") {
@@ -1966,7 +2108,10 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         printf("usage:\n");
         printf("  %s <gguf> [<input_dir>] [<out_dir>]      # phase-1 single forward\n", argv[0]);
-        printf("  %s render --prompt \"...\" [opts]           # phase-2 silent render\n", argv[0]);
+        printf("  %s render --umt5 <gguf> --prompt \"...\"     # phase-2 render, inline text-encode\n", argv[0]);
+        printf("  %s render --context ctx.bin [opts]        # phase-2 render from precomputed ctx\n", argv[0]);
+        printf("  %s encode-prompt <umt5> <p.txt> <out.bin> # text -> umT5 cond context bin\n", argv[0]);
+        printf("  %s encode-prompts <umt5> <prefix> p0 p1.. # batch encode (1x umT5 load for a chain)\n", argv[0]);
         printf("  %s unipc-test [<ref_dir>]                 # UniPC scheduler numeric validation\n", argv[0]);
         return 1;
     }
