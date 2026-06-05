@@ -118,15 +118,120 @@ it as a pre-filter, not a judge.
      can't judge it — see harness caveat above). Effort: days + a training loop, NOT a full
      retrain. **This is the only path to reliable ACTIVE-motion continuity. Open scope decision
      for the owner — training infra does not exist yet and must be built in python.**
-2. **Crafted velocity-encoding anchor (zero-shot long shot).** Feed the existing i2v slot a
-   single frame that *encodes* direction — a motion-smear / optical-flow-extrapolated "next"
-   frame instead of the sharp last frame. Low confidence (blur ≠ velocity vector; model may just
-   sharpen it), but it's ONE render to falsify. Untried.
-3. **Calm-head + audio-drive (shippable TODAY for avatars).** The audio drive already makes
+2. **Streaming / cached VAE encode (best non-LoRA experiment, unimplemented).** This is the
+   strongest code-discovered frozen-model path left. The idea is to stop treating every
+   continuation segment's first encoded frame as a fresh causal-VAE I-frame. Instead, prime the
+   Wan2.2 VAE **encoder** cache with the prior decoded tail, then encode the continuation anchor
+   / first frames in the same causal history. If it works, the new segment's initial latent may
+   carry some "P-frame" temporal state before the DiT sees it.
+
+   Why this is plausible:
+   - NAVA's DiT i2v path receives only one clean frame and no explicit velocity. Python literally
+     substitutes frame 0 in `predict_eps()` (`/home/dbrain/dev/NAVA/nava_src/model_nava.py`,
+     `xt_reshaped[:, :1] = first_frames[i]`) and then keeps denoising `latents_vision` normally
+     in `pipeline_nava.py`. That explains why last-frame chaining preserves pose but loses
+     direction.
+   - The video VAE is causal in time, so its encoder cache is exactly where short-range temporal
+     history exists before the DiT. Full-frame `WanVAE::encode()` currently clears that history at
+     both ends: `src/wan.hpp` `WanVAE::encode()` calls `clear_cache()` before encoding and again
+     before return.
+   - C++ already has reusable **decoder** cache plumbing (`WanVAE::decode_partial()` and
+     `WanVAERunner::build_graph_partial()` cache `feat_idx:*`). That is the pattern to copy for
+     `_enc_feat_map` / `enc_feat_idx:*`.
+
+   Critical caveat: do **not** assume the resulting cached P-latent can be pinned as a clean i2v
+   frame. Previous raw prior P-latent splicing into frame 0 made gibberish, because the DiT's
+   clean i2v slot expects an I-frame-like latent. Treat this as an experiment with two possible
+   uses:
+   - **A. Cached encode as initialization only:** use the cached-encoded tail/next-frame latent to
+     warm-start matching frames at an appropriate global sigma, but keep the clean i2v anchor as
+     the normal last-frame I-latent. This avoids lying to `first_frame_is_clean`.
+   - **B. Cached encode as a weak/noisy overlap:** inject cached latents into an overlap region at
+     the same noise level as the rest of the segment, then let the sampler denoise all tokens on a
+     matched schedule. Do not mix clean / held / live sigmas inside joint attention; lever #6
+     already showed that mismatched per-frame noise levels produce confetti.
+
+   Minimal C++ implementation plan:
+   1. Add `WanVAE::encode_partial(...)` next to `decode_partial(...)` in `src/wan.hpp`. It should
+      accept one encoder chunk, use `_enc_feat_map`, reset `_enc_conv_idx = 0` per chunk, and
+      return the encoded `mu` for that chunk. Mirror the chunking rules from full `encode()`:
+      first chunk is 1 frame, later chunks are 4 frames.
+   2. Add an encoder-cache branch to `WanVAERunner::build_graph_partial()`. Today it only reloads
+      / stores `_feat_map` (`feat_idx:*`) for decoder cache; add parallel reload/store for
+      `_enc_feat_map` (`enc_feat_idx:*`).
+   3. Add a small runner API or env-gated tool path that can encode a sequence in streaming mode:
+      call partial encode for prior tail frames first to fill `_enc_feat_map`, discard or save
+      those outputs, then encode the next segment's anchor/first frames without clearing
+      `_enc_feat_map`.
+   4. **Go/no-go GATE — dump FOUR artifacts, no render needed** (this is the cheap, decisive
+      step; do it BEFORE spending any GPU on a render):
+      a. fresh I-encode of `last.png` (cache cleared — the M=1 baseline anchor);
+      b. cached encode of `last.png` after priming with **1** tail frame;
+      c. cached encode of `last.png` after priming with **2–4** tail frames;
+      d. cached encode of an **extrapolated next-frame** anchor (`linear.png` from
+         `tools/nava_motion_anchor.py`) after priming with the tail.
+      For EACH: record mean/std/min/max, **latent L2 + cosine distance from (a)**, and a
+      **VAE decode preview** (decode the latent back to pixels and eyeball it) — std alone is a
+      first filter, not the whole decision.
+   5. **Decision rule** (std is the first cut; distance + decode preview confirm):
+      - **P-like, std ~0.8–0.9** (≈ prior tail P-frame): this is effectively the raw-P-latent
+        splice — do **NOT** clean-pin it (expect gibberish). → frozen-model continuity is
+        exhausted; **stop and go LoRA**.
+      - **I-like, std ~0.5–0.7**: might be pinnable. Now ask *does it carry direction?* — check
+        L2/cosine vs the fresh I-encode (a): if it's nearly identical to (a) it added nothing;
+        if it differs meaningfully AND the extrapolated-anchor (d) differs from (a) too, the
+        cache is injecting real temporal signal. → **one render justified.**
+      - **Intermediate / ambiguous**: the only genuinely interesting surprise case — escalate to
+        a render only if (d) meaningfully differs from (a).
+      - **If the only viable use is same-sigma warm init** (anchor still must be the fresh
+        I-latent): expect **bridge-at-best**, not the general solution. Still possibly worth it
+        for hard seams, but set expectations.
+   6. ONLY if the gate passes: conservative render test — normal `--image last.png` clean anchor
+      plus the cached latent used as a same-sigma warm init for frame 1 / a small overlap, then
+      compare against `MOTION_CHAIN_last` (score 4.43) with `tools/nava_seam_metrics.py` and by
+      eye. Remember the metric can't judge dead-eye/confetti/natural — eye is the judge.
+
+   Expected failure modes:
+   - If cached P-like latents are clean-pinned, expect the same gibberish/background instability
+     as raw P-latent splice.
+   - If cached latents are held at a different sigma from neighboring frames, expect confetti due
+     to mismatched noise levels in joint audio/video attention.
+   - If it only improves frame 0/1 and then the segment still re-plans motion, it is a bridge, not
+     a solution. That still may be useful for hard seams.
+
+   Test artifacts already available for comparison:
+   - Baseline last-frame chain: `MOTION_CHAIN_last`, score 4.43.
+   - Exact Python-style i2v substitution was tested with `NAVA_MODEL_INPUT_ANCHOR=1` and was much
+     worse (early noise/confetti; score 22.92 with drop 1), so keep the existing C++ default
+     repinned-anchor path for product renders.
+   - Align-guidance-off continuation was tested as `MOTION_CHAIN_last_noalign`, score 7.42, worse
+     than baseline due to a sharpness/detail jump. Do not chase `NAVA_NO_ALIGN_CFG=1` as the main
+     continuity fix.
+3. **Crafted velocity-encoding anchor (zero-shot bridge, now tested).** Feed the existing i2v
+   slot a single frame that *encodes* direction — an extrapolated "next" frame generated from
+   the prior segment's last 2-3 decoded frames. This stays in-distribution for NAVA because the
+   model still receives exactly one clean i2v frame. Tool: `tools/nava_motion_anchor.py`.
+   Tested on 2026-06-06 with `MOTION_seg0` -> `MOTION_seg1_{last,linear,accel,smear}`.
+   Important concat rule: plain `last` is an overlap anchor, so drop seg1 frame 0; extrapolated
+   anchors are intended as the next frame, so **do not drop** seg1 frame 0.
+
+   Result: mechanically works as a **one-frame bridge**. `linear_nodrop` / `accel_nodrop` make
+   the first generated frame after the seam look like a plausible continuation of the prior
+   motion. But the DiT still has no persistent velocity state, so frames 1-2 of the new segment
+   settle into a new independent trajectory; metrics show larger luma/sharpness jumps than the
+   plain M=1 baseline. Review clips:
+   - `MOTION_CHAIN_last` — baseline, drop 1, metric score 4.43.
+   - `MOTION_CHAIN_linear_nodrop` — extrapolated next-frame bridge, score 5.44.
+   - `MOTION_CHAIN_accel_nodrop` — second-order bridge, score 6.56.
+   - `MOTION_CHAIN_smear_nodrop` — damped bridge, score 5.45.
+
+   Honest use: try it when a seam is obviously mid-motion and one bridged frame is more valuable
+   than the slight exposure/detail state change. It is not the general active-motion solution.
+4. **Calm-head + audio-drive (shippable TODAY for avatars).** The audio drive already makes
    mouth+voice continuous across seams (the hardest part). Owner confirmed neutral heads work.
    So: damp head motion (uniform warm or just prompt/seed for stillness) + audio-drive → seams
    nearly invisible for a talking head. Does NOT generalize to active non-face motion.
-4. **Optical-flow interpolation across the seam (post-process).** RIFE/FILM between seg0-last and
+5. **Optical-flow interpolation across the seam (post-process).** RIFE/FILM between seg0-last and
    seg1-first. Smooths POSITION but not the velocity reset → "neutral-only," same limit as warm.
 
 ## Recommendation
@@ -136,3 +241,6 @@ it as a pre-filter, not a judge.
   answer — fine-tune is needed, but it's lightweight (LoRA) and self-supervised. Everything
   short of it (frozen-model noise tricks) is provably capped by the matched-noise-level +
   1-clean-frame constraints documented above.
+- **Best next frozen-model experiment:** implement streaming/cached VAE encode (#2). It is not
+  guaranteed, but it is the only remaining non-training idea grounded in a real motion-carrying
+  state in the current codebase.
