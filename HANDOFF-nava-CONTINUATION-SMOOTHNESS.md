@@ -5,6 +5,10 @@ driven by **one continuous (user-supplied) audio stream** — a general video-co
 mission, not just talking-avatar. Owner's framing: *"if I cut mid-clip, what would I be fed
 to continue? The new segment should start with that."*
 
+> **Setup (repo path, GPU constraints, build/run commands, model & asset paths, review
+> servers, CLI flags, drivers): see `HANDOFF-nava-VIDEO-CONTINUITY-DEEP.md` §"Environment & how
+> to reproduce" — it's self-contained and applies to everything below.**
+
 ## TL;DR
 - **AUDIO DRIVE = SHIPPED + VALIDATED.** External wav → `audio-encode` → per-segment latent
   slices → pinned via `--audio-anchor` → the avatar lip-syncs to it, **continuously across
