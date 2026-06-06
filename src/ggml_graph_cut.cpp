@@ -473,6 +473,61 @@ namespace sd::ggml_graph_cut {
         for (int node_idx : segment.internal_node_indices) {
             ggml_graph_add_node(segment_graph, ggml_graph_node(gf, node_idx));
         }
+
+        // Populate use_counts so the ggml-cuda multi-op fusion matchers (RMS_NORM+MUL[+ADD],
+        // LayerNorm modulate, gate_add mul_add_bcast, same-shape madd — all gated on
+        // ggml_node_get_use_count(cgraph,i)==1) actually fire inside graph-cut segments. A fresh
+        // graph from ggml_new_graph_custom + ggml_graph_add_node has an empty visited_hash_set
+        // (ggml_hash_set_reset), so ggml_node_get_use_count() returns 0 for every node and EVERY
+        // fusion silently disables under --offload-to-cpu (measured: 484/484 NORM rejected
+        // use_count=0, zero fused kernels, ~19% of DiT GPU = standalone norm/elementwise residue).
+        //
+        // Semantics (bit-exact + segment-safe): a node may be fused away (its intermediate elided,
+        // never materialized) ONLY if its sole consumer is the next op IN THIS SAME segment. So we
+        // count uses among segment-internal nodes (mirrors ggml.c ggml_visit_parents_graph, scoped
+        // to the slice) and add +1 for every node that is a segment OUTPUT — a tensor read by a
+        // later segment or returned as the final result is an external use that must stay
+        // materialized. This gives the existing ==1 gate correct counts; we do NOT relax it to <=1
+        // (that would allow unsafe in-place fuse-overwrite of a boundary tensor the next segment reads).
+        {
+            ggml_hash_set* hs = &segment_graph->visited_hash_set;
+            // Pass 1: register every internal node, use_count 0.
+            for (int n = 0; n < segment_graph->n_nodes; ++n) {
+                ggml_tensor* node = segment_graph->nodes[n];
+                size_t pos = ggml_hash_insert(hs, node);
+                if (pos == GGML_HASHSET_ALREADY_EXISTS) {
+                    pos = ggml_hash_find(hs, node);
+                }
+                segment_graph->use_counts[pos] = 0;
+            }
+            // Pass 2: count uses among segment-internal nodes only.
+            for (int n = 0; n < segment_graph->n_nodes; ++n) {
+                ggml_tensor* node = segment_graph->nodes[n];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    ggml_tensor* src = node->src[s];
+                    if (src == nullptr) {
+                        continue;
+                    }
+                    size_t pos = ggml_hash_find(hs, src);
+                    if (pos != GGML_HASHSET_FULL && ggml_bitset_get(hs->used, pos)) {
+                        segment_graph->use_counts[pos]++;
+                    }
+                }
+            }
+            // Pass 3: +1 for every segment-output node (external/boundary consumer) so its
+            // intermediate is never fused away.
+            for (int output_node_index : segment.output_node_indices) {
+                ggml_tensor* output = ggml_graph_node(gf, output_node_index);
+                if (output == nullptr) {
+                    continue;
+                }
+                size_t pos = ggml_hash_find(hs, output);
+                if (pos != GGML_HASHSET_FULL && ggml_bitset_get(hs->used, pos)) {
+                    segment_graph->use_counts[pos]++;
+                }
+            }
+        }
+
         *graph_ctx_out = graph_ctx;
         return segment_graph;
     }
