@@ -1251,7 +1251,10 @@ static int run_render(int argc, char** argv) {
     // Default generation keeps the historical C++ behavior: the clean anchor is
     // part of sampler state and is re-pinned after each update. The Python-style
     // per-forward substitution diagnostic is available with NAVA_MODEL_INPUT_ANCHOR=1.
-    splice_anchor_into((model_input_anchor && injected_video_init) ? nullptr : &latent, &audio_latent);
+    // Python i2v keeps the sampler state as free noise and substitutes the clean
+    // first frame only in predict_eps(). Keep the historical C++ repinned-state
+    // path by default, but make NAVA_MODEL_INPUT_ANCHOR=1 match Python exactly.
+    splice_anchor_into(model_input_anchor ? nullptr : &latent, &audio_latent);
     const bool repin_after_step = !model_input_anchor || getenv("NAVA_REPIN_AFTER_STEP") != nullptr;
 
     // ----- Euler flow-match sampling (JOINT video+audio denoise) -----
@@ -2306,6 +2309,132 @@ int main(int argc, char** argv) {
         }
         write_bin(out, anchor, "vid_anchor");
         printf("=== encode-video done -> %s  ne=[%d,%d,%d,48] ===\n", out.c_str(), W_lat, H_lat, M);
+        return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "encode-stream") {
+        // nava encode-stream --vae <g> --width W --height H --out <out.bin> [--cuda]
+        //                    [--decode-preview <png>] prime0.png ... primeN.png target.png
+        //
+        // STREAMING / CACHED VAE ENCODE (clip-continuity gate). All positional args are
+        // PIXEL frames in temporal order; the LAST is the target to encode, the preceding
+        // ones are the priming tail. The Wan2.2 VAE encoder's causal cache (_enc_feat_map)
+        // is primed with the tail, then the target is encoded as a standalone 1-frame chunk
+        // WITHOUT clearing the cache, so it may carry P-frame temporal state instead of the
+        // history-less I-frame reset that a fresh encode produces. With ONE positional arg
+        // (no priming) this reproduces the M=1 baseline I-encode (== render --image anchor),
+        // a numeric parity gate.
+        std::string vae = "models/wan2.2-vae-48ch-f16.gguf", out, preview;
+        int W = 0, H = 0;
+        bool want_cuda = false;
+        std::vector<std::string> frame_files;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--vae") { if (i + 1 < argc) vae = argv[++i]; }
+            else if (a == "--width") { if (i + 1 < argc) W = atoi(argv[++i]); }
+            else if (a == "--height") { if (i + 1 < argc) H = atoi(argv[++i]); }
+            else if (a == "--out") { if (i + 1 < argc) out = argv[++i]; }
+            else if (a == "--decode-preview") { if (i + 1 < argc) preview = argv[++i]; }
+            else if (a == "--cuda") { want_cuda = true; }
+            else frame_files.push_back(a);
+        }
+        if (W <= 0 || H <= 0 || out.empty() || frame_files.empty()) {
+            printf("usage: %s encode-stream --vae <g> --width W --height H --out <out.bin> [--cuda]\n"
+                   "                        [--decode-preview <png>] prime0.png ... target.png\n", argv[0]);
+            return 1;
+        }
+        if (W % 16 != 0 || H % 16 != 0) { printf("ERROR: W,H must be multiples of 16 (got %dx%d)\n", W, H); return 1; }
+        const int K = (int)frame_files.size();
+        const int W_lat = W / 16, H_lat = H / 16;
+        const int n_prime = K - 1;
+        printf("=== NAVA encode-stream: prime=%d frame(s) + 1 target -> cached [%d,%d,1,48] (vae=%s) ===\n",
+               n_prime, W_lat, H_lat, vae.c_str());
+
+        ggml_backend_t backend = nullptr;
+        if (want_cuda) {
+#ifdef GGML_USE_CUDA
+            backend = ggml_backend_cuda_init(0);
+            printf("backend: CUDA\n");
+#endif
+        }
+        if (!backend) { backend = ggml_backend_cpu_init(); printf("backend: CPU\n"); }
+        const int n_threads = 8;
+
+        sd::Tensor<float> frames({(int64_t)W, (int64_t)H, (int64_t)K, 3});
+        for (int f = 0; f < K; ++f) {
+            sd::Tensor<float> img;
+            if (looks_like_image_file(frame_files[(size_t)f])) {
+                if (!load_image_resize_center_crop(frame_files[(size_t)f], W, H, img)) return 1;
+            } else {
+                img = sd::load_tensor_from_file_as_tensor<float>(frame_files[(size_t)f]);
+            }
+            if (img.shape()[0] != (int64_t)W || img.shape()[1] != (int64_t)H) {
+                printf("ERROR: frame %d ne %s != [%d,%d,1,3]\n", f,
+                       sd::tensor_shape_to_string(img.shape()).c_str(), W, H);
+                return 1;
+            }
+            for (int64_t c = 0; c < 3; ++c)
+                for (int64_t y = 0; y < H; ++y)
+                    for (int64_t x = 0; x < W; ++x)
+                        frames.data()[x + W * (y + H * (f + (int64_t)K * c))] =
+                            img.data()[x + W * (y + H * (0 + 1 * c))];
+        }
+        frames.reshape_({(int64_t)W, (int64_t)H, (int64_t)K, 3, 1});
+
+        auto encvae = std::make_shared<WAN::WanVAERunner>(
+            backend, backend, String2TensorStorage{}, "", /*decode_only=*/false, VERSION_WAN2_2_TI2V);
+        {
+            ModelLoader vl;
+            if (!vl.init_from_file_and_convert_name(vae, "vae.")) { printf("VAE loader fail: %s\n", vae.c_str()); return 1; }
+            encvae->alloc_params_buffer();
+            std::map<std::string, ggml_tensor*> vt;
+            encvae->get_param_tensors(vt, "first_stage_model");
+            if (!vl.load_tensors(vt)) { printf("VAE tensors load fail\n"); return 1; }
+        }
+
+        // NB: encode-video's full-frame path runs with circular OFF (its circular_x arg
+        // only takes effect in the tiled path), so leave the default to stay bit-parity
+        // with the M=1 baseline anchor.
+        auto mu = encvae->encode_streaming(n_threads, frames);
+        if (mu.empty()) { printf("ERROR: streaming encode failed\n"); return 1; }
+        if (mu.numel() != (int64_t)W_lat * H_lat * 48) {
+            printf("ERROR: mu numel %lld != %lld (target should be ONE latent frame)\n",
+                   (long long)mu.numel(), (long long)((int64_t)W_lat * H_lat * 48));
+            return 1;
+        }
+        // diffusion-space anchor (same normalization as encode-video / render --image),
+        // so std is directly comparable to the I~0.5 / P~0.9 bands.
+        sd::Tensor<float> mu5 = mu;
+        mu5.reshape_({(int64_t)W_lat, (int64_t)H_lat, 1, 48, 1});
+        auto anchor = encvae->vae_to_diffusion_latents(mu5);
+        anchor.reshape_({(int64_t)W_lat, (int64_t)H_lat, 1, 48});
+        dump_stats("cached target anchor (diffusion)", anchor);
+        {
+            double s = 0, sq = 0; int64_t cnt = 0;
+            for (int64_t i = 0; i < anchor.numel(); ++i) { double v = anchor.data()[i]; s += v; sq += v * v; ++cnt; }
+            double m = s / cnt, st = sqrt(sq / cnt - m * m);
+            printf("  target latent: mean=%+.4f std=%.4f  (I-frame ~0.5, P-frame ~0.9)\n", m, st);
+        }
+        write_bin(out, anchor, "vid_anchor");
+
+        if (!preview.empty()) {
+            // Decode the single mu latent back to pixels (history-less 1-frame decode) and
+            // save a PNG to eyeball what the cached latent represents.
+            sd_tiling_params_t dt = {};
+            dt.enabled = false;
+            sd::Tensor<float> mu1 = mu;
+            mu1.reshape_({(int64_t)W_lat, (int64_t)H_lat, 1, 48, 1});
+            auto rgb = encvae->decode(n_threads, mu1, dt, /*decode_video=*/true, false, false, true);
+            if (!rgb.empty()) {
+                sd_image_t im = tensor_to_sd_image(rgb, 0);
+                write_image_to_file(preview, im.data, (int)im.width, (int)im.height, (int)im.channel, "", 100);
+                free(im.data);
+                printf("decode preview -> %s\n", preview.c_str());
+            } else {
+                printf("WARN: decode preview failed\n");
+            }
+        }
+        encvae.reset();
+        printf("=== encode-stream done -> %s  ne=[%d,%d,1,48] ===\n", out.c_str(), W_lat, H_lat);
         return 0;
     }
     if (argc >= 2 && std::string(argv[1]) == "audio-encode") {
