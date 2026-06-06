@@ -25,7 +25,7 @@ npz key layouts (torch, C-contiguous => last axis is fastest = ggml ne[0]):
   input_t                [1]             -> ne [1]
 
 Usage:
-  python3 tools/nava_npz_to_bin.py <ref_tensors.npz> <out_dir> [--raw-context]
+  python3 tools/nava_npz_to_bin.py <ref_tensors.npz> <out_dir> [--raw-context] [--i2v-clean-timestep]
 """
 import sys, os, argparse
 import numpy as np
@@ -62,6 +62,8 @@ def main():
     ap.add_argument("outdir")
     ap.add_argument("--raw-context", action="store_true",
                     help="emit raw umT5 [4096,512] context instead of post-embed [3072,512]")
+    ap.add_argument("--i2v-clean-timestep", action="store_true",
+                    help="emit per-token timestep with video frame 0 set to 0 when meta_first_frame_is_clean is true")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     z = np.load(args.npz, allow_pickle=True)
@@ -98,7 +100,19 @@ def main():
 
     # ---- timestep ----
     t = get("input_t").astype(np.float32).reshape(-1)
-    write_bin(os.path.join(args.outdir, "timestep.bin"), t[:1], [1], "timestep")
+    if args.i2v_clean_timestep:
+        first_clean = bool(np.asarray(z.get("meta_first_frame_is_clean", [0.0])).reshape(-1)[0] > 0.5)
+        if not first_clean:
+            raise SystemExit("--i2v-clean-timestep requested but meta_first_frame_is_clean is false/missing")
+        if C != 48:
+            raise SystemExit(f"--i2v-clean-timestep expects video C=48, got {C}")
+        L_vid = F * (H // 2) * (W // 2)
+        frame_tokens = (H // 2) * (W // 2)
+        ts = np.full((L_vid + L,), t[0], dtype=np.float32)
+        ts[:frame_tokens] = 0.0
+        write_bin(os.path.join(args.outdir, "timestep.bin"), ts, [ts.size], "timestep")
+    else:
+        write_bin(os.path.join(args.outdir, "timestep.bin"), t[:1], [1], "timestep")
 
     print("\nDerived grid:")
     print(f"  video ne [W={W}, H={H}, F={F}, C={C}]  -> L_vid = F*(H/2)*(W/2) = "

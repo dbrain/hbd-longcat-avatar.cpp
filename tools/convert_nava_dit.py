@@ -26,7 +26,7 @@ Usage:
     #          -o models/nava-dit-q4_k.gguf --tensor-type-rules "...=q4_k"
     # debug: --max-blocks 1   (tiny gguf, fast round-trip)
 """
-import argparse, json, mmap, os, struct, time
+import argparse, json, mmap, os, re, struct, time
 import numpy as np
 
 _ST_DT = {
@@ -104,6 +104,9 @@ def main():
                          "start with 'backbone.'; default empty keeps them verbatim)")
     ap.add_argument("--dtype", default="f16", choices=["f16", "q8_0", "q4_0", "q5_0"],
                     help="output type for 2D weight matrices (norms/bias/conv stay f16)")
+    ap.add_argument("--f16-regex", action="append", default=[],
+                    help="regex for tensors to keep as F16 even when --dtype quantizes "
+                         "2D matrices; may be passed multiple times")
     ap.add_argument("--max-blocks", type=int, default=-1,
                     help="debug: only convert double/single blocks [0,N); -1 = all")
     args = ap.parse_args()
@@ -114,6 +117,7 @@ def main():
 
     QMAP = {"f16": QT.F16, "q8_0": QT.Q8_0, "q4_0": QT.Q4_0, "q5_0": QT.Q5_0}
     big_qt = QMAP[args.dtype]
+    f16_patterns = [re.compile(p) for p in args.f16_regex]
 
     st = Safetensors(args.src)
     names = list(st.keys())
@@ -149,8 +153,9 @@ def main():
         nonlocal n_q, n_copy, total_params
         total_params += arr.size
         out_name = args.prefix + name
+        force_f16 = any(p.search(name) for p in f16_patterns)
         # 2-D weight matrix, last dim % 32 == 0  ->  block-quant
-        if arr.ndim == 2 and big_qt != QT.F16 and arr.shape[-1] % 32 == 0:
+        if not force_f16 and arr.ndim == 2 and big_qt != QT.F16 and arr.shape[-1] % 32 == 0:
             qd = quants.quantize(np.ascontiguousarray(arr, dtype=np.float32), big_qt)
             writer.add_tensor(out_name, qd, raw_dtype=big_qt)
             n_q += 1
