@@ -61,6 +61,24 @@ protected:
                                   silent);
     }
 
+    // LTX lever #3 (FINDINGS-04): under --offload-to-cpu the tiled video-VAE
+    // re-offloads its full params (e.g. 1385 MB for the LTX video VAE) to the
+    // GPU for EVERY tile (48x on a 720p/97f 4x4+temporal4 render: "offload
+    // params ... 0.11-0.19s" each, 6.88s total). Keeping the params resident
+    // across the tile loop elides the
+    // re-upload. This is VRAM-NEUTRAL at peak: the params are resident DURING
+    // each tile regardless; per-tile re-offload only frees them BETWEEN tiles
+    // (when no compute buffer is live), so peak (params + largest-tile compute
+    // buffer) is unchanged. Env-gated (opt-in, off by default) so other models'
+    // measured baselines are untouched; recommended for the LTX recipe.
+    static bool vae_keep_params_resident_enabled() {
+        static const bool en = [] {
+            const char* s = getenv("LONGCAT_VAE_KEEP_RESIDENT");
+            return s && s[0] == '1';
+        }();
+        return en;
+    }
+
 public:
     VAE(SDVersion version, ggml_backend_t backend, ggml_backend_t params_backend)
         : version(version), GGMLRunner(backend, params_backend) {}
@@ -169,6 +187,13 @@ public:
         sd::Tensor<float> output;
         set_tiling_params(tiling_params);
 
+        // Keep params resident across the tile loop (see helper above). Only
+        // meaningful for the tiled, offloaded path; cleared after the loop.
+        const bool keep_vae_params_resident = tiling_params.enabled && vae_keep_params_resident_enabled();
+        if (keep_vae_params_resident) {
+            set_keep_params_resident(true);
+        }
+
         if (tiling_params.enabled) {
             const int scale_factor = get_scale_factor();
             int64_t W              = input.shape()[0] * scale_factor;
@@ -197,6 +222,12 @@ public:
             output = _compute(n_threads, input, true);
         }
 
+        // Clear before the final free so restore_all_params() actually releases
+        // the resident params back to the params backend (VRAM freed for the
+        // next phase).
+        if (keep_vae_params_resident) {
+            set_keep_params_resident(false);
+        }
         free_compute_buffer();
 
         if (output.empty()) {
