@@ -1119,6 +1119,103 @@ namespace WAN {
             // sd::ggml_graph_cut::mark_graph_cut(out, "wan_vae.decode_partial.final", "out");
             return out;
         }
+
+        // Streaming/cached encode of ONE encoder chunk, mirror of decode_partial.
+        // Unlike encode() (which clear_cache()'s at both ends), this keeps the
+        // causal encoder history in _enc_feat_map so a chunk encoded after priming
+        // chunks carries P-frame temporal state instead of resetting to an I-frame.
+        // x: [b*c, t_chunk, h, w]  (t_chunk = 1 for the first chunk, up to 4 later).
+        // `i` is the chunk index (0 = first / history-less). Returns this chunk's
+        // mu (vae latent). Caller must NOT clear_cache between chunks.
+        ggml_tensor* encode_partial(GGMLRunnerContext* ctx,
+                                    ggml_tensor* x,
+                                    int i,
+                                    int64_t b = 1) {
+            GGML_ASSERT(b == 1);
+            GGML_ASSERT(decode_only == false);
+
+            auto encoder = std::dynamic_pointer_cast<Encoder3d>(blocks["encoder"]);
+            auto conv1   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+
+            if (wan2_2) {
+                x = patchify(ctx->ggml_ctx, x, 2, b);
+            }
+
+            _enc_conv_idx = 0;
+            auto out      = encoder->forward(ctx, x, b, _enc_feat_map, _enc_conv_idx, i);
+            // conv1 here is a {1,1,1} CausalConv3d (pointwise in time) so applying it
+            // per-chunk is identical to applying it on the concatenated sequence in
+            // encode(); the channel-chunk likewise selects mu (first half).
+            out     = conv1->forward(ctx, out);
+            auto mu = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 3)[0];
+            return mu;
+        }
+
+        // In-graph streaming/cached encode (ONE forward graph — no cross-graph cache).
+        // The cross-graph build_graph_partial path is disabled in this codebase (see the
+        // "chunk 1 result is weird" note in WanVAERunner::_compute); carrying _enc_feat_map
+        // across compute() calls corrupts the chunk-1 result. Instead we build all chunks
+        // into a single graph exactly the way encode() does, so the cache is just ordinary
+        // intra-graph data dependencies.
+        // x: [b*c, K, h, w]. The leading K-1 frames are the priming tail (chunk 0 = 1 frame,
+        // then 4-frame chunks); the FINAL frame is encoded as a standalone 1-frame chunk WITH
+        // the primed cache. Returns ONLY the target frame's mu (vae latent [W_lat,H_lat,1,48]).
+        // K==1 -> a plain history-less I-encode (== encode() of a single frame, bit-identical).
+        ggml_tensor* encode_tail(GGMLRunnerContext* ctx,
+                                 ggml_tensor* x,
+                                 int64_t b = 1) {
+            GGML_ASSERT(b == 1);
+            GGML_ASSERT(decode_only == false);
+
+            clear_cache();
+
+            if (wan2_2) {
+                x = patchify(ctx->ggml_ctx, x, 2, b);
+            }
+            auto encoder = std::dynamic_pointer_cast<Encoder3d>(blocks["encoder"]);
+            auto conv1   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+
+            // The encoder only tolerates chunk sizes 1 (chunk 0) and 4 (the regime encode()
+            // ever feeds); a 3-frame chunk crashes Down_ResidualBlock's avg-shortcut add.
+            // Front-pad the priming tail (repeat the oldest frame = a "static-before-clip"
+            // causal assumption, identical in spirit to the history-less I-frame) so that
+            // (n_prime - 1) is divisible by 4, i.e. priming = chunk0(1) + k*chunk(4).
+            int64_t n_prime = x->ne[2] - 1;
+            if (n_prime >= 1) {
+                int64_t padded = n_prime;
+                while ((padded - 1) % 4 != 0) padded++;
+                for (int64_t p = n_prime; p < padded; p++) {
+                    auto first = ggml_ext_slice(ctx->ggml_ctx, x, 2, 0, 1);
+                    x          = ggml_concat(ctx->ggml_ctx, first, x, 2);  // prepend oldest
+                }
+                n_prime = padded;
+            }
+            const int64_t t = x->ne[2];
+            int chunk_i     = 0;
+
+            // priming chunks over frames [0, n_prime): fills _enc_feat_map in-graph.
+            if (n_prime >= 1) {
+                {
+                    _enc_conv_idx = 0;
+                    auto in       = ggml_ext_slice(ctx->ggml_ctx, x, 2, 0, 1);  // chunk 0: 1 frame
+                    encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, chunk_i++);
+                }
+                for (int64_t s = 1; s < n_prime; s += 4) {
+                    _enc_conv_idx = 0;
+                    auto in       = ggml_ext_slice(ctx->ggml_ctx, x, 2, s, std::min<int64_t>(n_prime, s + 4));
+                    encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, chunk_i++);
+                }
+            }
+
+            // target: the final frame as a standalone 1-frame chunk with the primed cache.
+            _enc_conv_idx = 0;
+            auto in       = ggml_ext_slice(ctx->ggml_ctx, x, 2, t - 1, t);
+            auto out      = encoder->forward(ctx, in, b, _enc_feat_map, _enc_conv_idx, chunk_i);
+            out           = conv1->forward(ctx, out);
+            auto mu       = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 3)[0];
+            clear_cache();
+            return mu;
+        }
     };
 
     struct WanVAERunner : public VAE {
@@ -1211,6 +1308,28 @@ namespace WAN {
 
             ggml_build_forward_expand(gf, out);
 
+            if (std::getenv("NAVA_VAE_OP_HIST") != nullptr) {
+                std::map<int, int> hist;
+                std::map<int, int64_t> work;
+                int nconcat   = 0;
+                int n_nodes   = ggml_graph_n_nodes(gf);
+                for (int ni = 0; ni < n_nodes; ni++) {
+                    ggml_tensor* n = ggml_graph_node(gf, ni);
+                    hist[(int)n->op]++;
+                    work[(int)n->op] += ggml_nelements(n);
+                    if (n->op == GGML_OP_CONCAT && nconcat < 8) {
+                        printf("  CONCAT[%d] dim=%d ne=[%lld,%lld,%lld,%lld]\n", nconcat,
+                               n->op_params[0], (long long)n->ne[0], (long long)n->ne[1],
+                               (long long)n->ne[2], (long long)n->ne[3]);
+                        nconcat++;
+                    }
+                }
+                printf("=== VAE graph op histogram (n_nodes=%d) ===\n", n_nodes);
+                for (auto& kv : hist)
+                    printf("  %-22s count=%7d  out_elems=%lld\n", ggml_op_name((ggml_op)kv.first),
+                           kv.second, (long long)work[kv.first]);
+            }
+
             return gf;
         }
 
@@ -1219,21 +1338,25 @@ namespace WAN {
 
             ae.clear_cache();
 
-            for (size_t feat_idx = 0; feat_idx < ae._feat_map.size(); feat_idx++) {
-                auto feat_cache        = get_cache_tensor_by_name("feat_idx:" + std::to_string(feat_idx));
-                ae._feat_map[feat_idx] = feat_cache;
+            // Decoder uses _feat_map ("feat_idx:*"); encoder uses _enc_feat_map
+            // ("enc_feat_idx:*"). Reload whichever applies from the cross-graph cache.
+            std::vector<ggml_tensor*>& fmap = decode_graph ? ae._feat_map : ae._enc_feat_map;
+            const std::string cpfx          = decode_graph ? "feat_idx:" : "enc_feat_idx:";
+            for (size_t feat_idx = 0; feat_idx < fmap.size(); feat_idx++) {
+                fmap[feat_idx] = get_cache_tensor_by_name(cpfx + std::to_string(feat_idx));
             }
 
             ggml_tensor* z = make_input(z_tensor);
 
             auto runner_ctx = get_context();
 
-            ggml_tensor* out = decode_graph ? ae.decode_partial(&runner_ctx, z, i) : ae.encode(&runner_ctx, z);
+            ggml_tensor* out = decode_graph ? ae.decode_partial(&runner_ctx, z, i)
+                                            : ae.encode_partial(&runner_ctx, z, i);
 
-            for (size_t feat_idx = 0; feat_idx < ae._feat_map.size(); feat_idx++) {
-                ggml_tensor* feat_cache = ae._feat_map[feat_idx];
+            for (size_t feat_idx = 0; feat_idx < fmap.size(); feat_idx++) {
+                ggml_tensor* feat_cache = fmap[feat_idx];
                 if (feat_cache != nullptr) {
-                    cache("feat_idx:" + std::to_string(feat_idx), feat_cache);
+                    cache(cpfx + std::to_string(feat_idx), feat_cache);
                     ggml_build_forward_expand(gf, feat_cache);
                 }
             }
@@ -1241,6 +1364,37 @@ namespace WAN {
             ggml_build_forward_expand(gf, out);
 
             return gf;
+        }
+
+        // Streaming/cached encode for clip-continuity experiments. Encodes `frames`
+        // [W,H,K,3,1] chunk-by-chunk through encode_partial, carrying _enc_feat_map
+        // across chunks (the encoder's causal history) rather than clearing it. The
+        // leading K-1 frames are the priming tail (chunk 0 = 1 frame, then 4-frame
+        // chunks, mirroring encode()'s chunking); the FINAL frame is then encoded as
+        // a standalone 1-frame chunk WITH the primed cache. Returns the final frame's
+        // mu (vae latent, ne [W_lat,H_lat,1,48]). With K==1 this degenerates to a
+        // fresh history-less I-encode == the M=1 baseline anchor.
+        sd::Tensor<float> encode_streaming(const int n_threads, const sd::Tensor<float>& frames) {
+            // Single-graph in-graph cache (encode_tail) — NOT the cross-graph
+            // build_graph_partial path, which is disabled/buggy for chunk>=1.
+            // Mirror the encode() wrapper's [0,1] -> [-1,1] input scaling (scale_input),
+            // which encode_streaming bypasses by calling _compute directly.
+            sd::Tensor<float> input = frames;
+            if (scale_input) {
+                scale_tensor_to_minus1_1(&input);
+            }
+            auto get_graph = [&]() -> ggml_cgraph* {
+                ggml_cgraph* gf = new_graph_custom(10240 * input.shape()[2]);
+                ggml_tensor* x  = make_input(input);
+                auto runner_ctx = get_context();
+                ggml_tensor* out = ae.encode_tail(&runner_ctx, x);
+                ggml_build_forward_expand(gf, out);
+                return gf;
+            };
+            auto mu = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true),
+                                                      input.dim());
+            free_compute_buffer();
+            return mu;
         }
 
         sd::Tensor<float> _compute(const int n_threads,
