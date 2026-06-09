@@ -1338,6 +1338,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
     float scale = (1.0f / sqrt((float)d_head));
 
+    // upstream #1453 dropped the in-wrapper kv-pad; the fork keeps it as an opt-out
+    // (flash_skip_kv_pad). Declared here and captured by-ref into build_kqv below; set
+    // to GGML_PAD(L_k,256)-L_k in the flash_attn branch unless the caller opts out.
+    int kv_pad = 0;
+
     ggml_tensor* kqv = nullptr;
 
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
@@ -2387,7 +2392,7 @@ protected:
         if (copy_backend_ != nullptr) return true;
         // Only meaningful when runtime backend is CUDA and params backend is CPU
         // (the offload-mode invariant). For other configs pipelining is a no-op.
-        if (ggml_backend_is_cpu(runtime_backend) || !ggml_backend_is_cpu(params_backend)) {
+        if (sd_backend_is_cpu(runtime_backend) || !sd_backend_is_cpu(params_backend)) {
             return false;
         }
         // Create a second CUDA backend instance on the same device. This gives
@@ -3885,8 +3890,8 @@ public:
         }();
         const bool use_pinned_offload =
             !pinned_offload_params_disabled &&
-            ggml_backend_is_cpu(params_backend) &&
-            !ggml_backend_is_cpu(runtime_backend);
+            sd_backend_is_cpu(params_backend) &&
+            !sd_backend_is_cpu(runtime_backend);
         if (use_pinned_offload) {
             ggml_backend_buffer_type_t cuda_host_buft = ggml_backend_cuda_host_buffer_type();
             if (cuda_host_buft != nullptr) {
@@ -3912,7 +3917,7 @@ public:
         LOG_DEBUG("%s params backend buffer size = % 6.2f MB(%s%s) (%i tensors)",
                   get_desc().c_str(),
                   params_buffer_size / (1024.f * 1024.f),
-                  ggml_backend_is_cpu(params_backend) ? "RAM" : "VRAM",
+                  sd_backend_is_cpu(params_backend) ? "RAM" : "VRAM",
                   use_pinned_offload ? ", pinned" : "",
                   num_tensors);
         return true;

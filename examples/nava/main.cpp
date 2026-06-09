@@ -62,6 +62,7 @@
 #include "unipc.hpp"
 #include "model/vae/vae.hpp"
 #include "model/diffusion/wan.hpp"
+#include "model/vae/wan_vae.hpp"  // WanVAERunner (extracted from wan.hpp upstream #1614)
 #include "model/vae/ltx_audio_vae.hpp"
 #include "model/te/t5.hpp"
 
@@ -457,7 +458,7 @@ static int run_single_forward(int argc, char** argv) {
     dump_stats("input context",  context);
     dump_stats("input timestep", timestep);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = sd_backend_cpu_init();
     printf("backend: CPU\n");
 
     ModelLoader loader;
@@ -934,7 +935,7 @@ static int run_render(int argc, char** argv) {
 #endif
     }
     if (backend == nullptr) {
-        backend = ggml_backend_cpu_init();
+        backend = sd_backend_cpu_init();
         printf("backend: CPU\n");
     }
 
@@ -2102,7 +2103,7 @@ int main(int argc, char** argv) {
 #ifdef GGML_USE_CUDA
         backend = ggml_backend_cuda_init(0);
 #endif
-        if (!backend) backend = ggml_backend_cpu_init();
+        if (!backend) backend = sd_backend_cpu_init();
         const bool mmap = nava_umt5_use_mmap();
         double load_s = 0;
         auto t5 = nava_load_umt5(gguf, backend, mmap, &load_s);
@@ -2148,7 +2149,7 @@ int main(int argc, char** argv) {
 #ifdef GGML_USE_CUDA
         backend = ggml_backend_cuda_init(0);
 #endif
-        if (!backend) backend = ggml_backend_cpu_init();
+        if (!backend) backend = sd_backend_cpu_init();
         const bool mmap = nava_umt5_use_mmap();
         double load_s = 0;
         int64_t t_all0 = ggml_time_ms();
@@ -2230,7 +2231,7 @@ int main(int argc, char** argv) {
             printf("backend: CUDA\n");
 #endif
         }
-        if (!backend) { backend = ggml_backend_cpu_init(); printf("backend: CPU\n"); }
+        if (!backend) { backend = sd_backend_cpu_init(); printf("backend: CPU\n"); }
         const int n_threads = 8;
 
         // Load + Python-parity resize/center-crop each frame, stack into ggml ne [W,H,K,3].
@@ -2356,7 +2357,7 @@ int main(int argc, char** argv) {
             printf("backend: CUDA\n");
 #endif
         }
-        if (!backend) { backend = ggml_backend_cpu_init(); printf("backend: CPU\n"); }
+        if (!backend) { backend = sd_backend_cpu_init(); printf("backend: CPU\n"); }
         const int n_threads = 8;
 
         sd::Tensor<float> frames({(int64_t)W, (int64_t)H, (int64_t)K, 3});
@@ -2462,7 +2463,7 @@ int main(int argc, char** argv) {
 #else
         (void)use_cuda;
 #endif
-        if (!backend) backend = ggml_backend_cpu_init();
+        if (!backend) backend = sd_backend_cpu_init();
         ModelLoader ml;
         if (!ml.init_from_file(argv[2])) { printf("audio-encode: vae load fail\n"); return 1; }
         auto& tsm = ml.get_tensor_storage_map();
@@ -2493,7 +2494,7 @@ int main(int argc, char** argv) {
 #ifdef GGML_USE_CUDA
         backend = ggml_backend_cuda_init(0);
 #endif
-        if (!backend) backend = ggml_backend_cpu_init();
+        if (!backend) backend = sd_backend_cpu_init();
         ModelLoader ml;
         if (!ml.init_from_file(argv[2])) { printf("audio vae load fail\n"); return 1; }
         auto& tsm = ml.get_tensor_storage_map();

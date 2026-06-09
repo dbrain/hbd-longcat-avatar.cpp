@@ -1139,8 +1139,8 @@ public:
         dit_load_deferred = false;
         if (sd_version_is_longcat_avatar(version) && diffusion_model && cond_stage_model &&
             free_params_immediately && !sd_ctx_params->enable_mmap &&
-            !ggml_backend_is_cpu(params_backend_for(SDBackendModule::TE)) &&
-            !ggml_backend_is_cpu(params_backend_for(SDBackendModule::DIFFUSION))) {
+            !sd_backend_is_cpu(params_backend_for(SDBackendModule::TE)) &&
+            !sd_backend_is_cpu(params_backend_for(SDBackendModule::DIFFUSION))) {
             for (auto it = tensors.begin(); it != tensors.end();) {
                 if (starts_with(it->first, "model.diffusion_model.")) {
                     deferred_dit_tensors[it->first] = it->second;
@@ -5893,7 +5893,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // passing --vae-tiling/--vae-tile-size explicitly both still take precedence.
     if (sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
         !sd_ctx->sd->vae_tiling_params.enabled &&
-        !ggml_backend_is_cpu(sd_ctx->sd->backend_for(SDBackendModule::VAE))) {
+        !sd_backend_is_cpu(sd_ctx->sd->backend_for(SDBackendModule::VAE))) {
         sd_ctx->sd->vae_tiling_params.enabled = true;
         // lap-21: VAE decode time is ∝ total tile area (overcompute). The stock
         // 0.5 overlap recomputes ~64% extra; at the avatar's 60x104 latent / 32
