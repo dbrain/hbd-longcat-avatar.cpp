@@ -122,6 +122,34 @@ namespace sd {
         return tensor;
     }
 
+    // Inverse of load_tensor_from_file_as_tensor: same on-disk layout
+    // (int32 n_dims, int32 name_len, int32 ggml_type, n_dims*int32 dims, name,
+    // then raw T data). Used by the LTX latent-reuse harness (LTX_SAVE_LATENTS /
+    // LTX_LOAD_LATENTS) so the VAE-tiling ladder can re-decode cached latents
+    // without re-running the DiT.
+    template <typename T>
+    inline void save_tensor_to_file(const std::string& file_path, const Tensor<T>& tensor, const std::string& name = "latent") {
+        std::ofstream file(file_path, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("failed to open tensor file for write: " + file_path);
+        }
+        int32_t n_dims = static_cast<int32_t>(tensor.dim());
+        int32_t length = static_cast<int32_t>(name.size());
+        int32_t ttype  = static_cast<int32_t>(GGMLTypeTraits<T>::type);
+        file.write(reinterpret_cast<const char*>(&n_dims), sizeof(n_dims));
+        file.write(reinterpret_cast<const char*>(&length), sizeof(length));
+        file.write(reinterpret_cast<const char*>(&ttype), sizeof(ttype));
+        for (int i = 0; i < n_dims; ++i) {
+            int32_t dim = static_cast<int32_t>(tensor.shape()[static_cast<size_t>(i)]);
+            file.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+        }
+        file.write(name.data(), length);
+        file.write(reinterpret_cast<const char*>(tensor.data()), static_cast<std::streamsize>(tensor.numel() * sizeof(T)));
+        if (!file.good()) {
+            throw std::runtime_error("failed to write tensor file: " + file_path);
+        }
+    }
+
 }  // namespace sd
 
 #endif  // __SD_CORE_TENSOR_GGML_HPP__

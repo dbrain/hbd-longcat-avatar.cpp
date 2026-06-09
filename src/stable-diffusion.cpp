@@ -5606,6 +5606,19 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
         LOG_ERROR("no latent video to decode");
         return nullptr;
     }
+    // LTX latent-reuse harness: bank the raw post-sampling latent so the VAE-tiling
+    // quality ladder can re-decode it (LTX_LOAD_LATENTS) without re-running the DiT.
+    if (const char* save_path = getenv("LTX_SAVE_LATENTS"); save_path != nullptr && save_path[0] != '\0') {
+        try {
+            sd::save_tensor_to_file<float>(save_path, final_latent, "ltx_final_latent");
+            LOG_INFO("LTX_SAVE_LATENTS: wrote post-sampling latent (%dx%dx%dx%d) to %s",
+                     (int)final_latent.shape()[0], (int)final_latent.shape()[1],
+                     (int)final_latent.shape()[2], (int)(final_latent.dim() > 3 ? final_latent.shape()[3] : 1),
+                     save_path);
+        } catch (const std::exception& e) {
+            LOG_ERROR("LTX_SAVE_LATENTS failed: %s", e.what());
+        }
+    }
     sd::Tensor<float> video_latent = final_latent;
     if (sd_version_is_ltxav(sd_ctx->sd->version) &&
         video_latent.shape()[3] > sd_ctx->sd->get_latent_channel()) {
@@ -6094,8 +6107,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
 
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
-    int64_t sampling_start         = ggml_time_ms();
-    sd::Tensor<float> final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+    int64_t sampling_start = ggml_time_ms();
+    sd::Tensor<float> final_latent;
+    // LTX latent-reuse harness: skip the (expensive) DiT sampling and load a banked
+    // latent so the VAE-tiling quality ladder re-decodes the SAME latent under
+    // different tiling. The text encode above still runs (~cheap); only sampling is
+    // skipped. Bank one with LTX_SAVE_LATENTS first (see decode_video_outputs).
+    if (const char* load_path = getenv("LTX_LOAD_LATENTS"); load_path != nullptr && load_path[0] != '\0') {
+        try {
+            final_latent = sd::load_tensor_from_file_as_tensor<float>(load_path);
+            LOG_INFO("LTX_LOAD_LATENTS: loaded cached latent (%dx%dx%dx%d) from %s, SKIPPING DiT sampling",
+                     (int)final_latent.shape()[0], (int)final_latent.shape()[1],
+                     (int)final_latent.shape()[2], (int)(final_latent.dim() > 3 ? final_latent.shape()[3] : 1),
+                     load_path);
+        } catch (const std::exception& e) {
+            LOG_ERROR("LTX_LOAD_LATENTS failed (%s); falling back to sampling", e.what());
+        }
+    }
+    if (final_latent.empty()) {
+        final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                                         true,
                                                         x_t,
                                                         std::move(noise),
@@ -6120,6 +6150,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                         static_cast<float>(request.fps),
                                                         request.cache_params,
                                                         latents.video_positions);
+    }
 
     int64_t sampling_end = ggml_time_ms();
     if (final_latent.empty()) {
