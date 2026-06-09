@@ -7,7 +7,7 @@
 #include <fstream>
 #include <vector>
 
-#include "ggml_extend.hpp"
+#include "core/ggml_extend.hpp"
 #include "model.h"
 
 // LongCat-Video-Avatar 1.5 audio pathway.

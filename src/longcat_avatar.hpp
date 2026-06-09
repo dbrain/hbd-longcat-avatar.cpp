@@ -1,11 +1,11 @@
 #ifndef __LONGCAT_AVATAR_HPP__
 #define __LONGCAT_AVATAR_HPP__
 
-#include "ggml_extend.hpp"
+#include "core/ggml_extend.hpp"
 #include "model.h"
-#include "rope.hpp"
+#include "model/common/rope.hpp"
 #include "ggml-cuda.h"  // ggml_cuda_set_longcat_fa_bsa_bitmap (lap-31.2)
-#include "diffusion_model.hpp"  // DiffusionModelRunner + LongCatAvatarDiffusionExtra (sd.cpp #1569)
+#include "model/diffusion/model.hpp"  // DiffusionModelRunner + LongCatAvatarDiffusionExtra (sd.cpp #1569)
 
 // LongCat-Video-Avatar 1.5 DiT port (mirrors src/wan.hpp).
 //

@@ -51,19 +51,19 @@
 #include "ggml.h"
 #include "model.h"
 #include "stable-diffusion.h"
-#include "tensor.hpp"
-#include "tensor_ggml.hpp"
-#include "util.h"
+#include "core/tensor.hpp"
+#include "core/tensor_ggml.hpp"
+#include "core/util.h"
 
 #include "common/media_io.h"  // load_image_from_file (stb_image decode)
 
 #include "nava.hpp"
-#include "rng_philox.hpp"
+#include "core/rng_philox.hpp"
 #include "unipc.hpp"
-#include "vae.hpp"
-#include "wan.hpp"
-#include "ltx_audio_vae.h"
-#include "t5.hpp"
+#include "model/vae/vae.hpp"
+#include "model/diffusion/wan.hpp"
+#include "model/vae/ltx_audio_vae.hpp"
+#include "model/te/t5.hpp"
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"

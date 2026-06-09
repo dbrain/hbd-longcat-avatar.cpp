@@ -20,7 +20,7 @@
 #include <cstddef>
 #include <vector>
 
-#include "tensor.hpp"
+#include "core/tensor.hpp"
 
 struct UniPCSched {
     // public schedule, mirrors FlowMatchSched in main.cpp

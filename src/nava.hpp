@@ -7,8 +7,8 @@
 #include <utility>
 #include <vector>
 
-#include "ggml_extend.hpp"
-#include "rope.hpp"
+#include "core/ggml_extend.hpp"
+#include "model/common/rope.hpp"
 
 // NAVA — 6.3B joint audio-video MMDiT (ernie-research/NAVA) ported into the
 // sd.cpp tree. This is the DiT backbone only (Phase 1 of HANDOFF-nava.md): a

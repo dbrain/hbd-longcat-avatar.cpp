@@ -125,6 +125,12 @@ endif ()
 if (SD_HIPBLAS)
     message("-- Use HIPBLAS as backend stable-diffusion")
     set(GGML_HIP ON)
+    # ggml-hip's device-stub objects must be position-independent, or the
+    # default-PIE sd-cli link fails with `relocation R_X86_64_32 ... cannot be
+    # used when making a PIE object` on distros that default to PIE
+    # (Ubuntu 24.04, Fedora 40+, Debian 12+). The shared-library branch below
+    # already sets this; the static build (the HIP default) did not.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif ()
 
 if(SD_MUSA)
@@ -231,6 +237,21 @@ file(GLOB SD_LIB_SOURCES CONFIGURE_DEPENDS
     "src/*.h"
     "src/*.cpp"
     "src/*.hpp"
+    "src/conditioning/*.h"
+    "src/conditioning/*.cpp"
+    "src/conditioning/*.hpp"
+    "src/core/*.h"
+    "src/core/*.cpp"
+    "src/core/*.hpp"
+    "src/extensions/*.h"
+    "src/extensions/*.cpp"
+    "src/extensions/*.hpp"
+    "src/model/*/*.h"
+    "src/model/*/*.cpp"
+    "src/model/*/*.hpp"
+    "src/runtime/*.h"
+    "src/runtime/*.cpp"
+    "src/runtime/*.hpp"
     "src/model_io/*.h"
     "src/model_io/*.cpp"
     "src/tokenizers/*.h"
@@ -333,6 +354,7 @@ add_subdirectory(thirdparty)
 
 target_link_libraries(${SD_LIB} PUBLIC ggml zip)
 target_include_directories(${SD_LIB} PUBLIC . src include)
+target_include_directories(${SD_LIB} PRIVATE src/core)
 target_include_directories(${SD_LIB} PUBLIC . thirdparty)
 target_compile_features(${SD_LIB} PUBLIC c_std_11 cxx_std_17)
 
