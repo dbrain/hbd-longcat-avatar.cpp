@@ -108,14 +108,17 @@ public:
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                    const std::string& prefix) = 0;
 
-    // longcat-avatar additions. set_circular_axes / set_max_graph_vram_bytes are
-    // avatar-only (default no-op). set_flash_attention_enabled MUST forward to the
-    // GGMLRunner base by default — FluxRunner et al. don't override it, and a no-op
-    // here silently name-hides GGMLRunner::set_flash_attention_enabled, leaving
-    // flash_attn_enabled=false → the DiT attention falls back to unfused
-    // softmax (flux2 lap-1). Wrappers with nested runners (avatar, hidream) still override.
+    // longcat-avatar additions. set_circular_axes is avatar-only (default no-op).
+    // set_max_graph_vram_bytes and set_flash_attention_enabled MUST forward to the
+    // GGMLRunner base by default — FluxRunner / LTXAVRunner et al. don't override them,
+    // and a no-op here silently name-hides the real GGMLRunner setter. For
+    // set_flash_attention_enabled that left flash_attn_enabled=false → unfused softmax
+    // (flux2 lap-1). For set_max_graph_vram_bytes it left max_graph_vram_bytes=0 → the
+    // graph-cut segmentation never engages → --max-vram is silently ignored and the whole
+    // DiT is offloaded to the GPU at once → OOM on the LTX vid_gen path. Wrappers with
+    // nested runners (avatar, hidream) still override to delegate to the inner runner.
     virtual void set_circular_axes(bool /*cx*/, bool /*cy*/) {}
-    virtual void set_max_graph_vram_bytes(size_t /*max_vram_bytes*/) {}
+    virtual void set_max_graph_vram_bytes(size_t max_vram_bytes) { GGMLRunner::set_max_graph_vram_bytes(max_vram_bytes); }
     virtual void set_flash_attention_enabled(bool enabled) { GGMLRunner::set_flash_attention_enabled(enabled); }
 
     // GGMLRunner param/adapter methods are non-virtual; make them virtual here so a
