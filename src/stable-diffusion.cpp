@@ -2687,13 +2687,15 @@ public:
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
         }
         // Free resident diffusion params before VAE allocates its compute buffer.
-        if (stream_layers) {
-            if (diffusion_model) {
-                diffusion_model->release_streaming_residency();
-            }
-            if (high_noise_diffusion_model) {
-                high_noise_diffusion_model->release_streaming_residency();
-            }
+        // Covers BOTH the streaming-layers residency and the LTX cross-step shared-
+        // resident payload (lap-C), which lives on the offload path (stream_layers
+        // off). release_streaming_residency() -> restore_resident_params() is an
+        // idempotent no-op when nothing is resident, so it is safe to call always.
+        if (diffusion_model) {
+            diffusion_model->release_streaming_residency();
+        }
+        if (high_noise_diffusion_model) {
+            high_noise_diffusion_model->release_streaming_residency();
         }
         auto latents = first_stage_model->diffusion_to_vae_latents(x);
         first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);

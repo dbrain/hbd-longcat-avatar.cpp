@@ -1830,6 +1830,14 @@ protected:
     std::unordered_set<ggml_tensor*> resident_param_set;
     uint64_t resident_state_token = 0;
 
+    // LongCat lap-C (FINDINGS-10): cross-step shared-param residency cache. The
+    // shared-resident set + its plan signature are computed once per render and
+    // reused across the (4) sampling steps, so the 3.26 GB payload is offloaded
+    // ONCE instead of once-per-step. cached_shared_resident_sig_ keys the cache on
+    // a cheap plan signature so a plan change (e.g. resolution) re-derives it.
+    std::vector<ggml_tensor*> cached_shared_resident_set_;
+    uint64_t cached_shared_resident_sig_ = 0;
+
     size_t max_graph_vram_bytes           = 0;
     bool stream_layers_enabled            = false;
     size_t observed_max_effective_budget_ = 0;
@@ -2535,6 +2543,34 @@ protected:
             return v < 2 ? 2 : v;
         }();
         return n;
+    }
+
+    // LongCat lap-C: keep the shared-resident payload pinned ACROSS sampling steps
+    // (offload once per render, not once per step). Default ON whenever
+    // shared-resident is active; opt out with LONGCAT_SHARED_RESIDENT_CROSSSTEP=0
+    // (for a clean per-step A/B against FINDINGS-09's baseline).
+    static bool shared_resident_crossstep_enabled() {
+        static const bool en = []{
+            const char* s = getenv("LONGCAT_SHARED_RESIDENT_CROSSSTEP");
+            return !(s != nullptr && s[0] == '0');
+        }();
+        return en;
+    }
+
+    // Cheap signature of a graph-cut plan (segment count + per-segment group name
+    // and param bytes) — used to invalidate the cross-step shared-resident cache
+    // when the plan changes (e.g. a resolution change on a warm resident worker)
+    // WITHOUT re-walking every segment's runtime param tensors each step.
+    uint64_t plan_signature(const GraphCutPlan& plan) const {
+        uint64_t sig = 1469598103934665603ull;  // FNV-1a offset basis
+        auto mix = [&](uint64_t v) { sig = (sig ^ v) * 1099511628211ull; };
+        mix(plan.segments.size());
+        std::hash<std::string> hstr;
+        for (const auto& s : plan.segments) {
+            mix(static_cast<uint64_t>(hstr(s.group_name)));
+            mix(static_cast<uint64_t>(s.input_param_bytes));
+        }
+        return sig;
     }
 
     // Compute the set of param tensors read by >= shared_resident_min_segments()
@@ -3681,11 +3717,42 @@ protected:
         // whole segloop (offload_partial_params / the prefetch then stream only the
         // block-unique remainder). Must be set up BEFORE the pipelining bootstrap so
         // the bootstrap prefetch already excludes the resident set.
-        const bool shared_resident_on = shared_resident_active() && plan.segments.size() > 1;
+        const bool shared_resident_on   = shared_resident_active() && plan.segments.size() > 1;
+        // LongCat lap-C: when cross-step residency is on, the shared payload stays
+        // pinned between sampling steps — offload it only on the first step (or after
+        // a plan change), then reuse it. decode_first_stage()'s release_streaming_
+        // residency() frees it before the VAE phase so it never stacks into VAE VRAM.
+        const bool shared_resident_cross = shared_resident_on && shared_resident_crossstep_enabled();
         if (shared_resident_on) {
-            auto shared = compute_shared_resident_set(gf, plan);
-            if (!shared.empty() && !offload_resident_params(shared)) {
-                LOG_ERROR("%s shared-resident offload failed; falling back to streamed", get_desc().c_str());
+            // Task 2: recompute the shared set only when the plan changes (cached
+            // across steps via a cheap plan signature); the per-segment node walk is
+            // otherwise redundant — the set is identical for every step of a render.
+            uint64_t sig = plan_signature(plan);
+            if (sig != cached_shared_resident_sig_ || cached_shared_resident_set_.empty()) {
+                cached_shared_resident_set_ = compute_shared_resident_set(gf, plan);
+                cached_shared_resident_sig_ = sig;
+            }
+            const std::vector<ggml_tensor*>& shared = cached_shared_resident_set_;
+            // Residency token from the set's (step-stable) tensor pointers — mirrors
+            // compute_streaming_segments so "is my resident set still valid" is a
+            // pointer-XOR compare, not a re-offload.
+            uint64_t token = 0;
+            for (ggml_tensor* t : shared) {
+                token ^= reinterpret_cast<uintptr_t>(t) * 0x9E3779B97F4A7C15ull;
+            }
+            if (token == 0) token = 1;  // never alias the "nothing resident" sentinel
+            const bool already_resident = shared_resident_cross &&
+                                          !resident_param_set.empty() &&
+                                          token == resident_state_token;
+            if (!already_resident) {
+                restore_resident_params();  // clear any stale set (plan changed)
+                if (!shared.empty()) {
+                    if (offload_resident_params(shared)) {
+                        if (shared_resident_cross) resident_state_token = token;
+                    } else {
+                        LOG_ERROR("%s shared-resident offload failed; falling back to streamed", get_desc().c_str());
+                    }
+                }
             }
         }
 
@@ -3808,7 +3875,10 @@ protected:
         // LongCat lap-B: release the shared-resident payload back to host so the DiT
         // params end the segloop fully on CPU, exactly as the rest of the runner
         // (and the next phase) expect.
-        if (shared_resident_on) {
+        // lap-C: in cross-step mode the payload is KEPT resident for the next sampling
+        // step; decode_first_stage()'s release_streaming_residency() frees it before
+        // the VAE phase (so it never stacks into VAE VRAM).
+        if (shared_resident_on && !shared_resident_cross) {
             restore_resident_params();
         }
 
