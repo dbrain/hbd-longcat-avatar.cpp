@@ -548,6 +548,20 @@ public:
                     backend_manager.runtime_backend_supports_host_buffer(module));
         };
 
+        // LongCat: force the DiT params into a real (pinned) host buffer instead
+        // of mmap. Under --offload-to-cpu + CUDA, alloc_params_buffer() then puts
+        // the weights in cudaMallocHost pinned memory, so the per-step weight H2D
+        // is async/batched DMA (~6-12 GB/s) instead of the pageable-mmap sync
+        // bounce path. Measured on Q4 LTX-2.3: the mmap offload was 14.4 s/step
+        // for ~16.4 GB (= ~1.1 GB/s, sync-per-tensor bound). TE + VAE stay mmap'd
+        // (reclaimable file pages), so only the DiT (~16.4 GB) is pinned — fits a
+        // 31 GB host where full --no-mmap (~27.5 GB pinned) does not. Env-gated,
+        // OFF by default: the prod avatar (and every other recipe) is unchanged.
+        static const bool dit_no_mmap = []{
+            const char* s = getenv("LONGCAT_DIT_NO_MMAP");
+            return s && s[0] == '1';
+        }();
+
         auto get_param_tensors_p = [&](auto&& model, bool do_mmap, const char* prefix) {
             std::map<std::string, ggml_tensor*> temp;
             model->get_param_tensors(temp, prefix);
@@ -831,7 +845,7 @@ public:
 
             diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
             diffusion_model->set_stream_layers_enabled(stream_layers);
-            get_param_tensors(diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION));
+            get_param_tensors(diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION) && !dit_no_mmap);
 
             if (sd_version_is_unet_edit(version)) {
                 vae_decode_only = false;
