@@ -1,6 +1,7 @@
 #include "core/ggml_graph_cut.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -661,11 +662,38 @@ namespace sd::ggml_graph_cut {
                                size_t max_graph_vram_bytes,
                                ggml_backend_t backend,
                                const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                               const char* log_desc) {
+                               const char* log_desc,
+                               bool ring_per_block) {
         GGML_ASSERT(backend != nullptr);
         GGML_ASSERT(gf != nullptr);
         int64_t t_budget_begin = ggml_time_ms();
         if (max_graph_vram_bytes == 0 || !base_plan.has_cuts || base_plan.segments.size() <= 1) {
+            return base_plan;
+        }
+
+        // LongCat ltx-offload-ring (Approach A): cap the params carried by each
+        // merged segment so the per-segment prefetched unit stays ~1 transformer
+        // block. The vanilla merge greedily packs ~GBs of params into each segment
+        // to fill --max-vram (which sizes the COMPUTE budget); the background
+        // prefetch thread then holds segment N+1's full params resident next to
+        // segment N → +3.3 GB → blows the 7.5 GB coexistence cap (FINDINGS-04).
+        // Bounding params-per-segment makes "+1 resident segment" a "+1 block"
+        // (tens of MB). Gated by ring_per_block (the caller's model-scoped
+        // ring_active(): only the large DiT, never the encoders) so the avatar and
+        // every other recipe keep their exact merged plans. A cap of 0 (the default
+        // when the ring is on) means "no param merge at all" — the finest, per-block
+        // base granularity.
+        const bool ring_on = ring_per_block;
+        static const size_t ring_param_cap_bytes = []{
+            const char* s = getenv("LONGCAT_RING_SEG_PARAM_MB");
+            if (s == nullptr || s[0] == '\0') return (size_t)0;
+            return (size_t)(std::strtoull(s, nullptr, 10) * 1024ull * 1024ull);
+        }();
+        if (ring_on && ring_param_cap_bytes == 0) {
+            if (log_desc != nullptr) {
+                LOG_INFO("%s graph cut: LONGCAT_OFFLOAD_RING per-block segments (%zu base segments, no param merge)",
+                         log_desc, base_plan.segments.size());
+            }
             return base_plan;
         }
 
@@ -727,6 +755,12 @@ namespace sd::ggml_graph_cut {
                 if (graph_cut_segment_vram_bytes(candidate_segment) > max_graph_vram_bytes) {
                     break;
                 }
+                // ltx-offload-ring: stop merging once the segment's params exceed
+                // the per-segment cap, so the prefetched "+1 unit" stays ~1 block.
+                if (ring_on && ring_param_cap_bytes > 0 &&
+                    candidate_segment.input_param_bytes > ring_param_cap_bytes) {
+                    break;
+                }
 
                 best_end_segment_index = next_end_segment_index;
             }
@@ -767,7 +801,8 @@ namespace sd::ggml_graph_cut {
                       PlanCache* cache,
                       size_t max_graph_vram_bytes,
                       const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                      const char* log_desc) {
+                      const char* log_desc,
+                      bool ring_per_block) {
         GGML_ASSERT(backend != nullptr);
         GGML_ASSERT(gf != nullptr);
         GGML_ASSERT(cache != nullptr);
@@ -799,7 +834,8 @@ namespace sd::ggml_graph_cut {
                                                                                       max_graph_vram_bytes,
                                                                                       backend,
                                                                                       params_tensor_set,
-                                                                                      log_desc);
+                                                                                      log_desc,
+                                                                                      ring_per_block);
                 cache->budgeted_graph_cut_plan                = resolved_plan;
                 cache->budgeted_graph_cut_plan.available      = true;
                 cache->budgeted_graph_cut_plan_max_vram_bytes = max_graph_vram_bytes;

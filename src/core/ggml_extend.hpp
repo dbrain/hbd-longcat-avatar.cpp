@@ -1934,6 +1934,10 @@ protected:
 
     sd::ggml_graph_cut::PlanCache graph_cut_plan_cache_;
     std::unordered_set<const ggml_tensor*> params_tensor_set_;
+    // Total bytes of this runner's params (sum over params_ctx). Used to scope the
+    // ltx-offload-ring lever to the large streamed model (the DiT) so the small
+    // text encoders keep their clean non-prefetch path. Set in rebuild_params_tensor_set().
+    size_t total_params_bytes_ = 0;
 
     // LongCat lap-27: tensors that live in a runner-owned PERSISTENT backend buffer
     // (e.g. LongCatAvatarRunner::condkv_buf — separate from params_buffer and the
@@ -2054,11 +2058,13 @@ protected:
 
     void rebuild_params_tensor_set() {
         params_tensor_set_.clear();
+        total_params_bytes_ = 0;
         if (params_ctx == nullptr) {
             return;
         }
         for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
             params_tensor_set_.insert(t);
+            total_params_bytes_ += ggml_nbytes(t);
         }
     }
 
@@ -2148,11 +2154,23 @@ protected:
         if (!sd_backend_is_cpu(runtime_backend) && getenv("LONGCAT_VRAM_BREAKDOWN") != nullptr) {
             size_t cuda_free = 0, cuda_total = 0;
             ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
-            LOG_INFO("[VRAM] %s reserve: driver_used=%.0f MB  (this compute_buf=%.0f MB, board_free=%.0f/%.0f MB)",
+            // ltx-offload-ring diag: account the param-buffer working set so the
+            // resident floor is attributable (partial=current swapped-in segment,
+            // prefetched=next in flight, pool=recycled buffers, runtime=full-resident).
+            auto bufmb = [](ggml_backend_buffer_t b) {
+                return b != nullptr ? ggml_backend_buffer_get_size(b) / 1048576.0 : 0.0;
+            };
+            double pool_mb = 0.0;
+            for (ggml_backend_buffer_t b : prefetch_buf_pool_) pool_mb += bufmb(b);
+            LOG_INFO("[VRAM] %s reserve: driver_used=%.0f MB  (this compute_buf=%.0f MB, board_free=%.0f/%.0f MB)"
+                     " [params: partial=%.0f prefetched=%.0f pool=%.0f(%zu) runtime=%.0f resident=%.0f]",
                      get_desc().c_str(),
                      (cuda_total - cuda_free) / 1048576.0,
                      compute_buffer_size / 1048576.0,
-                     cuda_free / 1048576.0, cuda_total / 1048576.0);
+                     cuda_free / 1048576.0, cuda_total / 1048576.0,
+                     bufmb(partial_runtime_params_buffer), bufmb(prefetched_state_.buf),
+                     pool_mb, prefetch_buf_pool_.size(),
+                     bufmb(runtime_params_buffer), bufmb(resident_runtime_params_buffer));
         }
         return true;
     }
@@ -2440,14 +2458,135 @@ protected:
         }
     }
 
-    // LongCat lap-33: is the background prefetch thread enabled? (env-gated, OFF
-    // by default). Cached on first query.
-    static bool prefetch_thread_enabled() {
+    // LongCat ltx-offload-ring: master env gate for the sub-7.5 GB per-layer
+    // offload overlap lever (Approach A). When active for a runner it (a) forces
+    // the background prefetch thread on (overlap H2D with compute), (b) keeps the
+    // buffer pool on (no cudaMalloc churn), (c) forces offload pipelining active
+    // in compute_with_graph_cuts even under LONGCAT_NO_OFFLOAD_PIPELINING=1 (the
+    // prod LTX recipe), and (d) drives per-block graph-cut granularity so the
+    // prefetched "+1 segment" is ~1 transformer block. Env-gated OFF by default →
+    // the prod avatar and all other recipes are byte-identical unless enabled.
+    //
+    // MEASURED DEAD-END under the 7.5 GB coexistence cap (FINDINGS-08): the LTX-2.3
+    // DiT's graph-cut segments are dominated by a ~3.3 GB SHARED global-param payload
+    // (adaLN modulation + video_embeddings_connector + embedders) carried in EVERY
+    // segment, so the prefetched "+1 segment" is ~3.6 GB regardless of granularity
+    // (per-block measured 10.1 GB DiT-phase, OOM). The overlap itself WORKS
+    // (offload_H2D 18091→0 ms) — it just can't fit. Kept as gated infra + the
+    // foundation for a possible lap-B (make the shared payload resident + free the
+    // 2.2 GB text-projection, then stream only the 288 MB/block unique weights).
+    static bool offload_ring_env() {
         static const bool en = []{
-            const char* s = getenv("LONGCAT_OFFLOAD_PREFETCH_THREAD");
+            const char* s = getenv("LONGCAT_OFFLOAD_RING");
             return s && s[0] == '1';
         }();
         return en;
+    }
+
+    // The ring is SCOPED to the large streamed model (the LTX DiT, ~16 GB). The
+    // small text encoders (gemma ~4.7 GB, text-projection ~2.2 GB) must keep their
+    // clean non-prefetch path: their per-layer compute is shorter than the H2D so
+    // the prefetch can't hide there anyway, and running them through it leaves
+    // ~3 GB of residue resident into the DiT phase (measured: DiT started at
+    // 8040 MB → OOM). Gate on total param bytes ≥ LONGCAT_RING_MIN_MODEL_GB
+    // (default 8 GB) so only the DiT engages the ring.
+    static size_t ring_min_model_bytes() {
+        static const size_t b = []{
+            const char* s = getenv("LONGCAT_RING_MIN_MODEL_GB");
+            double gb = (s != nullptr && s[0] != '\0') ? atof(s) : 8.0;
+            if (gb <= 0.0) gb = 8.0;
+            return (size_t)(gb * 1024.0 * 1024.0 * 1024.0);
+        }();
+        return b;
+    }
+    bool ring_active() const {
+        return offload_ring_env() && total_params_bytes_ >= ring_min_model_bytes();
+    }
+
+    // LongCat lap-B (FINDINGS-08 follow-up): shared-param residency. The LTX DiT's
+    // graph-cut segments each drag in a ~3.3 GB SHARED global-param payload (adaLN
+    // modulation + video_embeddings_connector + embedders, read by every block).
+    // Under the streamed offload that payload is re-uploaded EVERY segment (24×/step
+    // → ~94 GB H2D/step), and a prefetch can't shrink it. This lever finds the params
+    // read by >=2 segments and pins them RESIDENT on the GPU for the whole segloop:
+    // offload_partial_params already skips resident_param_set, so each segment then
+    // streams only its block-unique weights (~288 MB/block). Slashes redundant H2D
+    // AND drops the per-segment footprint. Scoped to the large model like the ring.
+    // Gate: LONGCAT_SHARED_RESIDENT=1.
+    static bool shared_resident_env() {
+        static const bool en = []{
+            const char* s = getenv("LONGCAT_SHARED_RESIDENT");
+            return s && s[0] == '1';
+        }();
+        return en;
+    }
+    bool shared_resident_active() const {
+        return shared_resident_env() &&
+               total_params_bytes_ >= ring_min_model_bytes() &&
+               params_backend != runtime_backend &&
+               !sd_backend_is_cpu(runtime_backend);
+    }
+    // Min number of segments that must read a param for it to be pinned resident.
+    // Default 2 (any cross-segment-shared param). Tunable for budget headroom.
+    static int shared_resident_min_segments() {
+        static const int n = []{
+            const char* s = getenv("LONGCAT_SHARED_RESIDENT_MIN_SEGS");
+            int v = (s != nullptr && s[0] != '\0') ? atoi(s) : 2;
+            return v < 2 ? 2 : v;
+        }();
+        return n;
+    }
+
+    // Compute the set of param tensors read by >= shared_resident_min_segments()
+    // graph-cut segments (the shared global payload). Logs the total size.
+    std::vector<ggml_tensor*> compute_shared_resident_set(ggml_cgraph* gf,
+                                                          const GraphCutPlan& plan) {
+        std::unordered_map<ggml_tensor*, int> seg_count;
+        for (const auto& segment : plan.segments) {
+            auto tensors = sd::ggml_graph_cut::runtime_param_tensors(gf, segment, get_desc().c_str());
+            std::unordered_set<ggml_tensor*> uniq(tensors.begin(), tensors.end());
+            for (ggml_tensor* t : uniq) {
+                if (t != nullptr) seg_count[t]++;
+            }
+        }
+        const int min_segs = shared_resident_min_segments();
+        std::vector<ggml_tensor*> shared;
+        size_t shared_bytes = 0;
+        for (const auto& kv : seg_count) {
+            if (kv.second >= min_segs) {
+                shared.push_back(kv.first);
+                shared_bytes += ggml_nbytes(kv.first);
+            }
+        }
+        LOG_INFO("%s shared-resident set: %zu params (%.0f MB) read by >=%d of %zu segments",
+                 get_desc().c_str(), shared.size(), shared_bytes / 1048576.0,
+                 min_segs, plan.segments.size());
+        return shared;
+    }
+
+    // Filter a segment's runtime param tensors to drop any that are pinned resident
+    // (so the prefetch/partial offload streams only the non-resident remainder).
+    std::vector<ggml_tensor*> filter_out_resident(const std::vector<ggml_tensor*>& tensors) const {
+        if (resident_param_set.empty()) return tensors;
+        std::vector<ggml_tensor*> out;
+        out.reserve(tensors.size());
+        for (ggml_tensor* t : tensors) {
+            if (t != nullptr && resident_param_set.find(t) == resident_param_set.end()) {
+                out.push_back(t);
+            }
+        }
+        return out;
+    }
+
+    // LongCat lap-33: is the background prefetch thread enabled for THIS runner?
+    // Explicit LONGCAT_OFFLOAD_PREFETCH_THREAD=1 forces it on globally (legacy
+    // manual override); otherwise it follows the model-scoped ring_active().
+    bool prefetch_thread_enabled() const {
+        static const bool explicit_env = []{
+            const char* s = getenv("LONGCAT_OFFLOAD_PREFETCH_THREAD");
+            return s && s[0] == '1';
+        }();
+        return explicit_env || ring_active();
     }
 
     // Lazily launch the worker thread. The WIN is moving the weight H2D off the
@@ -2485,13 +2624,13 @@ protected:
     // ones too — and cap the pool so it never holds more than the working set.
     static constexpr size_t kPrefetchPoolCap = 2;
 
-    static bool prefetch_pool_enabled() {
-        static const bool en = []{
-            if (!prefetch_thread_enabled()) return false;
+    bool prefetch_pool_enabled() const {
+        if (!prefetch_thread_enabled()) return false;
+        static const bool no_pool = []{
             const char* s = getenv("LONGCAT_NO_PREFETCH_POOL");
-            return !(s && s[0] == '1');  // pool ON by default when prefetch thread on
+            return s && s[0] == '1';
         }();
-        return en;
+        return !no_pool;  // pool ON by default when prefetch thread on
     }
 
     ggml_backend_buffer_t pool_alloc_ctx_tensors(ggml_context* ctx) {
@@ -3133,7 +3272,8 @@ protected:
                                                      &graph_cut_plan_cache_,
                                                      planner_budget,
                                                      params_tensor_set_,
-                                                     get_desc().c_str());
+                                                     get_desc().c_str(),
+                                                     ring_active());
         if (stream_layers_enabled) {
             if (budget_increased) {
                 LOG_INFO("%s streaming budget = %.2f MB",
@@ -3537,6 +3677,18 @@ protected:
         std::unordered_map<ggml_tensor*, PersistentExternalBinding> persistent_externals;
         snapshot_persistent_externals(plan, gf, persistent_externals);
 
+        // LongCat lap-B: pin the cross-segment-shared param payload resident for the
+        // whole segloop (offload_partial_params / the prefetch then stream only the
+        // block-unique remainder). Must be set up BEFORE the pipelining bootstrap so
+        // the bootstrap prefetch already excludes the resident set.
+        const bool shared_resident_on = shared_resident_active() && plan.segments.size() > 1;
+        if (shared_resident_on) {
+            auto shared = compute_shared_resident_set(gf, plan);
+            if (!shared.empty() && !offload_resident_params(shared)) {
+                LOG_ERROR("%s shared-resident offload failed; falling back to streamed", get_desc().c_str());
+            }
+        }
+
         // LongCat lap-32.2: H2D-compute pipelining. DEFAULT ON when offload+CUDA
         // and segment count > 1 (measured -2.3s wall stacked on top of lap-32.1
         // pinned; bit-exact, no quality risk). Opt out via env
@@ -3552,14 +3704,19 @@ protected:
             const char* s2 = getenv("LONGCAT_OFFLOAD_PIPELINING");
             return s2 && s2[0] == '0';
         }();
-        const bool pipelining_active = !pipelining_disabled_env &&
+        // ltx-offload-ring forces the prefetch-overlap path active for the DiT (it
+        // IS the lever); the prod LTX recipe otherwise runs with
+        // LONGCAT_NO_OFFLOAD_PIPELINING=1. Scoped to the large model so the encoders
+        // keep their clean path.
+        const bool pipelining_active = (!pipelining_disabled_env || ring_active()) &&
                                        plan.segments.size() > 1 &&
                                        ensure_pipelining_backend();
 
         // Bootstrap: if pipelining is on, kick off segment 0's H2D async BEFORE entering
         // the loop. The loop's first iter will commit it via event_wait + swap.
         if (pipelining_active) {
-            auto seg0_tensors = sd::ggml_graph_cut::runtime_param_tensors(gf, plan.segments[0], get_desc().c_str());
+            auto seg0_tensors = filter_out_resident(
+                sd::ggml_graph_cut::runtime_param_tensors(gf, plan.segments[0], get_desc().c_str()));
             kick_off_prefetch(seg0_tensors);
         }
 
@@ -3587,8 +3744,8 @@ protected:
                 // Prefetch the NEXT segment's params asynchronously on the copy
                 // backend's stream so its H2D overlaps with this segment's compute.
                 if (seg_idx + 1 < plan.segments.size()) {
-                    auto next_tensors = sd::ggml_graph_cut::runtime_param_tensors(
-                        gf, plan.segments[seg_idx + 1], get_desc().c_str());
+                    auto next_tensors = filter_out_resident(sd::ggml_graph_cut::runtime_param_tensors(
+                        gf, plan.segments[seg_idx + 1], get_desc().c_str()));
                     kick_off_prefetch(next_tensors);
                 }
                 skip_internal_offload_ = true;
@@ -3646,6 +3803,13 @@ protected:
         // CPU as the rest of the runner expects.
         if (pipelining_active && current_offload_swapped_) {
             restore_partial_params();
+        }
+
+        // LongCat lap-B: release the shared-resident payload back to host so the DiT
+        // params end the segloop fully on CPU, exactly as the rest of the runner
+        // (and the next phase) expect.
+        if (shared_resident_on) {
+            restore_resident_params();
         }
 
         backend_tensor_data_map.clear();

@@ -102,13 +102,15 @@ namespace sd::ggml_graph_cut {
                                size_t max_graph_vram_bytes,
                                ggml_backend_t backend,
                                const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                               const char* log_desc);
+                               const char* log_desc,
+                               bool ring_per_block = false);
     Plan resolve_plan(ggml_backend_t backend,
                       ggml_cgraph* gf,
                       PlanCache* cache,
                       size_t max_graph_vram_bytes,
                       const std::unordered_set<const ggml_tensor*>& params_tensor_set,
-                      const char* log_desc);
+                      const char* log_desc,
+                      bool ring_per_block = false);
 
     // Mark leading segments resident when they fit after streamed-segment headroom.
     void annotate_residency(Plan& plan, size_t max_graph_vram_bytes);
