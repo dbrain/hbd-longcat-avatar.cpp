@@ -96,6 +96,33 @@ namespace sd::guidance {
             output.pred                              = pred_img_uncond + guidance_scale_ * (pred_cond - pred_img_uncond);
         }
 
+        // --- LTX guidance rescale (Lin et al. 2023, "Common Diffusion Noise Schedules"). ---
+        // Env-gated: LTX_GUIDANCE_RESCALE=phi in (0,1]; default OFF -> byte-identical to the
+        // plain-CFG path above, so avatar/flux/wan are unaffected (they never set the env).
+        // The official LTX-2 multimodal guider applies rescale ~0.5-0.7; the fork's plain CFG
+        // did not, so the non-distilled (dev) model at cfg>1 over-amplifies the (cond-uncond)
+        // delta and the latent std blows up over many steps -> all-NaN (the cfg6/30-step dud).
+        // Rescaling the CFG result's std back toward the conditional's std bounds it and matches
+        // the reference. Only the uncond-present (real CFG) path is rescaled.
+        static const float rescale_phi = []() {
+            const char* e = getenv("LTX_GUIDANCE_RESCALE");
+            return e != nullptr ? static_cast<float>(atof(e)) : 0.0f;
+        }();
+        if (rescale_phi > 0.0f && has_tensor(input.pred_uncond) && output.pred.numel() > 0) {
+            const int64_t n = output.pred.numel();
+            if (pred_cond.numel() == n) {
+                const double mc = static_cast<double>(pred_cond.sum()) / static_cast<double>(n);
+                const double mg = static_cast<double>(output.pred.sum()) / static_cast<double>(n);
+                const double vc = static_cast<double>((pred_cond * pred_cond).sum()) / static_cast<double>(n) - mc * mc;
+                const double vg = static_cast<double>((output.pred * output.pred).sum()) / static_cast<double>(n) - mg * mg;
+                if (vg > 1e-12 && vc > 0.0) {
+                    float factor = static_cast<float>(std::sqrt(vc / vg));
+                    factor       = rescale_phi * factor + (1.0f - rescale_phi);
+                    output.pred *= factor;
+                }
+            }
+        }
+
         return output;
     }
 
