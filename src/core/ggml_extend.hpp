@@ -2139,6 +2139,21 @@ protected:
                   get_desc().c_str(),
                   compute_buffer_size / 1024.0 / 1024.0,
                   sd_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM");
+        // Code-level VRAM breakdown (env LONGCAT_VRAM_BREAKDOWN=1): the compute
+        // buffer is now reserved, so this is THIS phase's VRAM high-water mark.
+        // Log the exact driver-level used VRAM (cudaMemGetInfo) next to the buffer
+        // size — no nvidia-smi sampling/guessing. `driver_used` = everything on the
+        // board (this module's params + compute + every other resident buffer +
+        // CUDA context); `compute_buf` is this graph's activations only.
+        if (!sd_backend_is_cpu(runtime_backend) && getenv("LONGCAT_VRAM_BREAKDOWN") != nullptr) {
+            size_t cuda_free = 0, cuda_total = 0;
+            ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
+            LOG_INFO("[VRAM] %s reserve: driver_used=%.0f MB  (this compute_buf=%.0f MB, board_free=%.0f/%.0f MB)",
+                     get_desc().c_str(),
+                     (cuda_total - cuda_free) / 1048576.0,
+                     compute_buffer_size / 1048576.0,
+                     cuda_free / 1048576.0, cuda_total / 1048576.0);
+        }
         return true;
     }
 
