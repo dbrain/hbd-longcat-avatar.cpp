@@ -106,7 +106,19 @@ bool convert(const char* input_path,
     auto backend    = sd_backend_cpu_init();
     size_t mem_size = 1 * 1024 * 1024;  // for padding
     mem_size += model_loader.get_tensor_storage_map().size() * ggml_tensor_overhead();
-    mem_size += model_loader.get_params_mem_size(backend, type);
+    // Rules-aware context sizing: get_params_mem_size() only knows the base
+    // `type`, so a --tensor-type-rules entry that forces a tensor to a LARGER
+    // type (e.g. keeping patchify_proj/proj_out/adaLN linears at f16 instead of
+    // q4_K) would overflow the context and trip GGML_ASSERT(obj_new) at the tail
+    // of the export. Sum each tensor's ACTUAL export size (rules applied).
+    {
+        size_t align = ggml_backend_get_alignment(backend);
+        for (const auto& kv : model_loader.get_tensor_storage_map()) {
+            TensorStorage ts = kv.second;
+            ts.type          = get_export_tensor_type(model_loader, ts, type, type_rules);
+            mem_size += ts.nbytes() + align;
+        }
+    }
     LOG_INFO("model tensors mem size: %.2fMB", mem_size / 1024.f / 1024.f);
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
 
