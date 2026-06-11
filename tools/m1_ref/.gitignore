@@ -1,0 +1,5 @@
+# exported model weights (6.4 GB, regenerable via export_weights.py from the HF cache)
+weights/
+*.log
+__pycache__/
+*.pyc

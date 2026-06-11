@@ -1,0 +1,12 @@
+# generated test artifacts — large, regenerable (synthetic) or GPU-captured (model)
+golden_ref/
+golden_model/
+golden_stages/
+# compiled test binaries (regenerable; toolchain nvcc / g++)
+sparse_conv_test
+test_subm
+test_subm_cuda
+bench_cublas
+*.log
+dump_pid.txt
+__pycache__/
