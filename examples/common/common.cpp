@@ -864,6 +864,32 @@ ArgOptions SDGenerationParams::get_options() {
          "path to a 16kHz mono wav for LongCat-Avatar audio-driven lip-sync",
          &audio_path},
         {"",
+         "--drive-audio",
+         "path to a 16kHz wav to DRIVE LTX-2.3 lip-sync (needs an --audio-vae with encoder, the -ENC gguf)",
+         &drive_audio_path},
+        {"",
+         "--cont-latent",
+         "LTXAV latent chaining: path to the prior segment's saved video latent "
+         "(from LTXAV_SAVE_VIDEO_LATENT). Conditions this segment on its motion-carrying tail.",
+         &cont_latent_path},
+        {"",
+         "--cont-anchor",
+         "LTXAV appearance anchor (anti-drift): a saved video latent whose frame 0 is the "
+         "original character, pinned each segment so style does not drift over a long chain.",
+         &cont_anchor_path},
+        {"",
+         "--ltx-chain-prompts",
+         "LTXAV in-process chain (--ltx-chain-segments): path to a text file with one prompt per "
+         "line, applied per segment (the 'director' layer — each ~4s beat its own prompt). Fewer "
+         "lines than segments reuses the last; empty/absent reuses -p for every segment.",
+         &ltx_chain_prompts_path},
+        {"",
+         "--ltx-chain-audio-dir",
+         "LTXAV in-process chain: directory of pre-sliced per-segment 16kHz mono wavs named "
+         "aud_<seg>.wav (absolute-timeline slices of one song); each segment lip-syncs to its slice "
+         "via --drive-audio. Empty = no audio (video-only chain). Needs an --audio-vae with encoder.",
+         &ltx_chain_audio_dir},
+        {"",
          "--pm-id-images-dir",
          "path to PHOTOMAKER input id images dir",
          &pm_id_images_dir},
@@ -927,6 +953,17 @@ ArgOptions SDGenerationParams::get_options() {
          "LongCat-Avatar: number of prior-segment tail frames used as conditioning "
          "for the next segment when --segments > 1 (default: 13)",
          &cont_cond_frames},
+        {"",
+         "--cont-latent-frames",
+         "number of tail latent frames from --cont-latent to use as the overlap (default 3)",
+         &cont_latent_take},
+        {"",
+         "--ltx-chain-segments",
+         "LTXAV in-process N-segment chaining: render N video segments in ONE process with the "
+         "DiT kept resident (no per-segment reload). seg0 = i2v from --init-img; each later "
+         "segment continues from the prior segment's latent tail (K = --cont-latent-frames). "
+         "0 = off (default).",
+         &ltx_chain_segments},
         {"",
          "--cont-ref-img-index",
          "LongCat-Avatar: continuation reference-anchor temporal grid position "
@@ -1744,6 +1781,8 @@ bool SDGenerationParams::from_json_str(
     }
     load_if_exists("segments", segments);
     load_if_exists("cont_cond_frames", cont_cond_frames);
+    load_if_exists("cont_latent_frames", cont_latent_take);
+    load_if_exists("ltx_chain_segments", ltx_chain_segments);
     load_if_exists("cont_ref_img_index", cont_ref_img_index);
     load_if_exists("cont_mask_frame_range", cont_mask_frame_range);
     if (j.contains("segment_frames") && j["segment_frames"].is_number_integer()) {
@@ -2399,6 +2438,12 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.fps                       = fps;
     params.vace_strength             = vace_strength;
     params.audio_path                = audio_path.empty() ? nullptr : audio_path.c_str();
+    params.drive_audio_path          = drive_audio_path.empty() ? nullptr : drive_audio_path.c_str();
+    params.cont_latent_path          = cont_latent_path.empty() ? nullptr : cont_latent_path.c_str();
+    params.cont_anchor_path          = cont_anchor_path.empty() ? nullptr : cont_anchor_path.c_str();
+    if (!cont_latent_path.empty()) {
+        params.cont_latent_frames = cont_latent_take;
+    }
     params.vae_tiling_params         = vae_tiling_params;
     params.cache                     = cache_params;
     params.hires.enabled             = hires_enabled;

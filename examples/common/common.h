@@ -204,6 +204,7 @@ struct SDGenerationParams {
     std::vector<std::string> ref_image_paths;
     std::string control_video_path;
     std::string audio_path;  // LongCat-Avatar audio-driven lip-sync (16kHz mono wav)
+    std::string drive_audio_path;  // LTX-2.3 audio-driven lip-sync (16kHz wav, needs encoder -ENC audio-vae)
 
     sd_sample_params_t sample_params;
     sd_sample_params_t high_noise_sample_params;
@@ -225,6 +226,12 @@ struct SDGenerationParams {
     // LongCat-Avatar continuation chaining (multi-segment clips).
     int segments                         = 1;   // >1 -> chain N resident segments
     int cont_cond_frames                 = 13;  // prior-segment tail frames used as conditioning
+    std::string cont_latent_path;               // LTXAV file-based latent continuation: prior seg's saved video latent
+    int cont_latent_take                 = 3;   // how many tail latent frames to use as the motion-carrying overlap
+    int ltx_chain_segments               = 0;   // LTXAV in-process N-segment chaining: >0 -> render N segments, DiT resident
+    std::string ltx_chain_prompts_path;         // LTXAV chain: file with one prompt per line (per-segment "director"); empty -> reuse -p for all
+    std::string ltx_chain_audio_dir;            // LTXAV chain: dir of pre-sliced per-segment 16k wavs (aud_<seg>.wav) for lip-sync drive; empty -> no audio
+    std::string cont_anchor_path;               // LTXAV appearance anchor: latent whose frame0 = original char (anti-drift)
     int cont_ref_img_index               = 10;  // continuation ref-anchor temporal grid position (generate_avc default)
     int cont_mask_frame_range            = 3;   // continuation noise-near-ref attention carve-out half-width
     // LongCat-Avatar mouth-exaggeration knobs (RUNTIME).

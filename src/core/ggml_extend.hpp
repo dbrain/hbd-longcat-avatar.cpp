@@ -1771,6 +1771,12 @@ struct GGMLRunnerContext {
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
+    // LTX modulation token-collapse (VRAM win): when the conditioned LTXAV path feeds the
+    // blocks a COMPACT AdaLN modulation (computed on just the few UNIQUE per-token timestep
+    // values), this I32[L_video] tensor maps each video token back to its unique column so
+    // get_ada_values can gather the compact chunk [dim,1,U] -> per-token [dim,1,L] (bit-exact).
+    // nullptr ⇒ no collapse (per-token modulation computed directly, the old path).
+    ggml_tensor* ltx_video_token_sel       = nullptr;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {

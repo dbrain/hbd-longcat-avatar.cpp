@@ -395,6 +395,13 @@ typedef struct {
     int fps;
     float vace_strength;
     const char* audio_path;  // LongCat-Avatar audio-driven lip-sync (16kHz mono wav)
+    // LTX-2.3 (LTXAV) audio-DRIVEN lip-sync: when set, this 16kHz wav is encoded by the
+    // audio VAE into the joint AV latent's audio slot and held FIXED (denoise-mask 0,
+    // audio-timestep 0) so the model lip-syncs video to THIS audio instead of inventing
+    // its own. Requires an --audio-vae built with the encoder + mel basis (the -ENC gguf
+    // from tools/convert_ltx_audio_vae.py --with-encoder). Distinct from audio_path above,
+    // which is the LongCat-Avatar (NAVA) Whisper path, NOT the LTXAV path.
+    const char* drive_audio_path;
     // LongCat-Avatar continuation chaining: when cont_latent != NULL these are the
     // LAST cont_latent_frames latent frames of the PRIOR segment (the diffusion
     // latents themselves, NOT pixels — avoids a lossy VAE decode/re-encode roundtrip
@@ -407,6 +414,16 @@ typedef struct {
     // the global audio timeline so lip-sync continues across segments.
     const float* cont_latent;
     int cont_latent_frames;
+    // LTXAV LATENT continuation (file-based, CLI-friendly): path to a saved VIDEO latent
+    // (LTXAV_SAVE_VIDEO_LATENT output from the prior segment). When set on the LTXAV path,
+    // the last cont_latent_frames latent frames are placed at the head of the new segment's
+    // init_latent and held fixed (motion-carrying overlap; mask via LTXAV_CONT_OVERLAP_MASK).
+    // Distinct from cont_latent (the avatar's in-process float* tail).
+    const char* cont_latent_path;
+    // LTXAV appearance ANCHOR (anti-drift): path to a saved video latent whose FRAME 0 is the
+    // original character. Pinned at the head of every continuation segment so the rendering
+    // style can't migrate off the source over a long chain (StreamingT2V-style appearance memory).
+    const char* cont_anchor_path;
     int audio_frame_offset;
     // LongCat-Avatar continuation REFERENCE ANCHOR (generate_avc). When cont_ref_latent
     // != NULL it is the ORIGINAL portrait's diffusion latent (1 frame, same ggml-ne

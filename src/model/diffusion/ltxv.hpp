@@ -34,6 +34,25 @@ namespace LTXV {
         return mod;
     }
 
+    // Modulation token-collapse gather (VRAM win; see LTXAVRunner::build_graph). The
+    // per-token AdaLN timestep has only a few UNIQUE values (clean-anchor t=0 vs noise t,
+    // plus any graded-overlap levels), so the blocks compute modulation on a COMPACT
+    // [dim,coeff,U] table instead of the full [dim,coeff,L_token]; this expands one compact
+    // chunk [dim,1,U] back to per-token [dim,1,L] with a pure int32 row-gather (bit-exact —
+    // no arithmetic, just copies the already-computed unique columns into token order).
+    __STATIC_INLINE__ ggml_tensor* gather_mod_tokens(ggml_context* ctx,
+                                                     ggml_tensor* c,     // [dim, 1, U]
+                                                     ggml_tensor* sel) { // I32 [L]
+        if (sel == nullptr) {
+            return c;
+        }
+        int64_t dim = c->ne[0];
+        int64_t U   = c->ne[2];
+        auto a = ggml_reshape_2d(ctx, ggml_cont(ctx, c), dim, U);  // [dim, U]
+        auto g = ggml_get_rows(ctx, a, sel);                       // [dim, L]
+        return ggml_reshape_3d(ctx, g, dim, 1, sel->ne[0]);        // [dim, 1, L]
+    }
+
     __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,
                                             ggml_tensor* x,
                                             ggml_tensor* shift,
@@ -689,6 +708,17 @@ namespace LTXV {
                 k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
             }
 
+            // Protective kv_scale: with flash-attn, K/V are cast to F16. On deep-chain cont latents
+            // at high res (1280x704) a projected/un-normed K or V element can exceed F16's ±65504 →
+            // inf → q·inf = NaN in the (unmasked) self-attn softmax → 100% NaN output (the high-res
+            // chain blow-up). Scaling K/V down by 1/256 before the F16 cast keeps them in range; the
+            // wrapper divides it back out exactly (1/256 is an exact F16 exponent shift). Override
+            // with LTX_ATTN_KV_SCALE=N (N=1 disables → reproduces the NaN).
+            float kv_scale = 1.0f / 256.0f;
+            if (const char* e = std::getenv("LTX_ATTN_KV_SCALE")) {
+                float d = (float)atof(e);
+                if (d > 0.0f) kv_scale = 1.0f / d;
+            }
             auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
                                               ctx->backend,
                                               q,
@@ -697,7 +727,8 @@ namespace LTXV {
                                               heads,
                                               mask,
                                               false,
-                                              ctx->flash_attn_enabled);
+                                              ctx->flash_attn_enabled,
+                                              kv_scale);
 
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
@@ -1097,6 +1128,13 @@ namespace LTXV {
         int64_t v_dim;
         int64_t a_dim;
         bool cross_attention_adaln;
+        // LTX_BLOCK_STOP_AT_SUBOP: when this block is the truncation block (set by
+        // forward_core for the LTX_DIT_STOP_AT_BLOCK block), return vx early after a
+        // chosen video sub-op so the surviving terminal output isolates WHICH op in the
+        // offending block first goes NaN. 0=after self-attn (attn1), 1=after text cross-attn
+        // (attn2), 2=after audio_to_video cross-attn (a2v), 3=after video ffn (== full block).
+        // Unset/-1 = run the whole block. Composes with LTX_DIT_STOP_AT_BLOCK.
+        int stop_at_subop = -1;
 
         void init_params(ggml_context* ctx,
                          const String2TensorStorage& tensor_storage_map = {},
@@ -1149,11 +1187,16 @@ namespace LTXV {
                                                  ggml_tensor* timestep,
                                                  int64_t dim,
                                                  int64_t coeff,
-                                                 int64_t start = 0,
-                                                 int64_t count = -1) {
+                                                 int64_t start           = 0,
+                                                 int64_t count           = -1,
+                                                 ggml_tensor* expand_sel = nullptr) {
             if (count < 0) {
                 count = coeff - start;
             }
+            // `timestep` is [coeff*dim, batch]. When modulation token-collapse is active for
+            // this stream, batch == U (the few unique timestep values) and expand_sel maps
+            // each token back to its column; otherwise batch == n_tokens (per-token, old path)
+            // and expand_sel is null.
             auto t      = ggml_reshape_3d(ctx->ggml_ctx, timestep, dim, coeff, timestep->ne[1]);
             auto s      = ggml_reshape_3d(ctx->ggml_ctx, table, dim, coeff, 1);
             auto e      = ggml_new_tensor_3d(ctx->ggml_ctx, timestep->type, dim, coeff, timestep->ne[1]);
@@ -1161,7 +1204,13 @@ namespace LTXV {
             s           = ggml_repeat(ctx->ggml_ctx, s, e);
             auto out    = ggml_add(ctx->ggml_ctx, s, t);
             auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
-            return std::vector<ggml_tensor*>(chunks.begin() + start, chunks.begin() + start + count);
+            std::vector<ggml_tensor*> sel(chunks.begin() + start, chunks.begin() + start + count);
+            if (expand_sel != nullptr) {
+                for (auto& c : sel) {
+                    c = gather_mod_tokens(ctx->ggml_ctx, c, expand_sel);
+                }
+            }
+            return sel;
         }
 
         ggml_tensor* apply_text_cross_attention(GGMLRunnerContext* ctx,
@@ -1173,9 +1222,10 @@ namespace LTXV {
                                                 ggml_tensor* timestep,
                                                 ggml_tensor* prompt_timestep,
                                                 int64_t dim,
-                                                ggml_tensor* attention_mask) {
+                                                ggml_tensor* attention_mask,
+                                                ggml_tensor* expand_sel = nullptr) {
             if (cross_attention_adaln) {
-                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3);
+                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, expand_sel);
                 auto q           = rms_norm(ctx->ggml_ctx, x);
                 q                = modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
                 auto context_mod = context;
@@ -1226,11 +1276,14 @@ namespace LTXV {
             bool run_a2v = run_ax;
             bool run_v2a = run_ax;
 
-            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6);
+            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
             v_norm      = modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
+            if (stop_at_subop == 0) {
+                return {vx, ax};  // truncate after video self-attn (attn1)
+            }
             auto v_txt  = apply_text_cross_attention(ctx,
                                                      vx,
                                                      v_context,
@@ -1240,8 +1293,12 @@ namespace LTXV {
                                                      v_timestep,
                                                      v_prompt_timestep,
                                                      v_dim,
-                                                     attention_mask);
+                                                     attention_mask,
+                                                     ctx->ltx_video_token_sel);
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
+            if (stop_at_subop == 1) {
+                return {vx, ax};  // truncate after video text cross-attn (attn2)
+            }
 
             if (run_ax) {
                 auto a_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6);
@@ -1276,6 +1333,9 @@ namespace LTXV {
                     auto a2v_gate        = get_ada_values(ctx, a2v_gate_table, v_cross_gate_timestep, v_dim, 1)[0];
                     vx                   = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, a2v_out, a2v_gate));
                 }
+                if (stop_at_subop == 2) {
+                    return {vx, ax};  // truncate after audio_to_video cross-attn (a2v)
+                }
 
                 if (run_v2a) {
                     auto v2a_audio_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 0, 4);
@@ -1296,7 +1356,7 @@ namespace LTXV {
                 ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
             }
 
-            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3);
+            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, ctx->ltx_video_token_sel);
             auto vx_scaled = rms_norm(ctx->ggml_ctx, vx);
             vx_scaled      = modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
             auto v_ff_out  = ff->forward(ctx, vx_scaled);
@@ -1537,12 +1597,19 @@ namespace LTXV {
         std::vector<ggml_tensor*> get_output_scale_shift(GGMLRunnerContext* ctx,
                                                          ggml_tensor* table,
                                                          ggml_tensor* embedded_timestep,
-                                                         int64_t dim) {
+                                                         int64_t dim,
+                                                         ggml_tensor* expand_sel = nullptr) {
             auto temp = ggml_new_tensor_3d(ctx->ggml_ctx, embedded_timestep->type, dim, 2, embedded_timestep->ne[1]);
             auto t    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, embedded_timestep, dim, 1, embedded_timestep->ne[1]), temp);
             auto s    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, table, dim, 2, 1), temp);
             auto out  = ggml_add(ctx->ggml_ctx, s, t);
-            return ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            if (expand_sel != nullptr) {
+                for (auto& c : chunks) {
+                    c = gather_mod_tokens(ctx->ggml_ctx, c, expand_sel);
+                }
+            }
+            return chunks;
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
@@ -1610,7 +1677,15 @@ namespace LTXV {
                 a_prompt_timestep_mod          = audio_prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
             }
 
-            auto av_ca_video_timestep = repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
+            // When modulation token-collapse is active (ctx->ltx_video_token_sel set), `timestep`
+            // is the COMPACT video timestep [U], so the old repeat-to-video-length would size this
+            // to U (wrong). The video-side cross-attn timestep is derived from the (scalar) audio
+            // timestep and is therefore CONSTANT across video tokens — keep it scalar so get_ada_values
+            // broadcasts it (bit-exact to the per-token-constant path), no per-token materialization.
+            const bool mod_collapse   = ctx->ltx_video_token_sel != nullptr;
+            auto av_ca_video_timestep = (mod_collapse && effective_audio_timestep->ne[0] == 1)
+                                            ? effective_audio_timestep
+                                            : repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
             auto av_ca_audio_timestep = effective_audio_timestep;
             auto av_ca_factor         = config.av_ca_timestep_scale_multiplier / config.timestep_scale_multiplier;
             auto av_ca_video_scale_shift_timestep =
@@ -1629,8 +1704,45 @@ namespace LTXV {
             sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.prelude", "vx");
             sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.prelude", "ax");
 
+            // LTX_BLOCK_NAN: capture the modulation tables + patchified inputs BEFORE the blocks, so
+            // if block 0 is already NaN we can tell whether the AdaLN modulation (the #1 collapse
+            // output) / the patchify input is the source vs the first block's ops.
+            if (getenv("LTX_BLOCK_NAN") != nullptr) {
+                auto cap = [&](ggml_tensor* t, const char* nm) {
+                    if (t == nullptr || ggml_nelements(t) == 0) return;
+                    int64_t k = std::min<int64_t>(512, ggml_nelements(t));
+                    ctx->capture_tensor(std::string("pre_") + nm, ggml_view_1d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, t), k, 0));
+                };
+                cap(vx, "vx_in");
+                cap(v_timestep_mod, "v_mod");
+                cap(a_timestep_mod, "a_mod");
+                cap(av_ca_video_scale_shift_timestep, "avca_v");
+                cap(v_prompt_timestep_mod, "v_prompt");
+            }
+            // LTX_DIT_STOP_AT_BLOCK=N: graph-cut-SURVIVING NaN bisection. The per-block
+            // capture_tensor taps above get pruned by the offload graph-cut (mid-DiT nodes
+            // aren't consumed at a segment boundary, so the snapshot node is dropped — only
+            // mark_graph_cut'd / terminal-output tensors survive). To localize the first NaN
+            // block we instead TRUNCATE the network after block N: vx then flows through the
+            // real norm_out/proj_out/unpatchify tail to the actual model output, so it survives
+            // the cut and the existing LTX_NAN_DEBUG step-2 `out` scan reports nan-count for the
+            // network-truncated-at-N. Bisect N: out clean at N=k but NaN at N=k+1 ⇒ block k+1
+            // is the source (then the BSA self-attn / cross-attn / ffn inside it). N<0 / unset
+            // = full network. Tiny cost (just runs fewer blocks). One run per bisection point.
+            static const int dit_stop_at_block = [] {
+                const char* e = getenv("LTX_DIT_STOP_AT_BLOCK");
+                return e != nullptr ? atoi(e) : -1;
+            }();
+            static const int dit_stop_at_subop = [] {
+                const char* e = getenv("LTX_BLOCK_STOP_AT_SUBOP");
+                return e != nullptr ? atoi(e) : -1;
+            }();
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<BasicAVTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
+                // Apply the intra-block sub-op truncation only on the LAST block we run, so
+                // it composes with LTX_DIT_STOP_AT_BLOCK (e.g. STOP_AT_BLOCK=3 SUBOP=0 =
+                // "run blocks 0-2 whole, then block 3 only up to its self-attn").
+                block->stop_at_subop = (dit_stop_at_block >= 0 && i == dit_stop_at_block) ? dit_stop_at_subop : -1;
                 auto out   = block->forward(ctx,
                                             vx,
                                             ax,
@@ -1651,11 +1763,27 @@ namespace LTXV {
                                             a_prompt_timestep_mod);
                 vx         = out.first;
                 ax         = out.second;
+                // LTX_BLOCK_NAN: capture a small slice of each block's vx/ax for the post-compute
+                // nnan readback — pinpoints which transformer block first goes NaN (the NaN is 100%
+                // of elements, so a 512-element slice is enough). Tiny VRAM. One run localizes the op.
+                static const bool block_nan_dbg = (getenv("LTX_BLOCK_NAN") != nullptr);
+                if (block_nan_dbg) {
+                    int64_t tv = std::min<int64_t>(512, ggml_nelements(vx));
+                    ctx->capture_tensor("blk" + std::to_string(i) + "_vx", ggml_view_1d(ctx->ggml_ctx, vx, tv, 0));
+                    if (ax != nullptr && ggml_nelements(ax) > 0) {
+                        int64_t ta = std::min<int64_t>(512, ggml_nelements(ax));
+                        ctx->capture_tensor("blk" + std::to_string(i) + "_ax", ggml_view_1d(ctx->ggml_ctx, ax, ta, 0));
+                    }
+                }
                 sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.transformer_blocks." + std::to_string(i), "vx");
                 sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.transformer_blocks." + std::to_string(i), "ax");
+                if (dit_stop_at_block >= 0 && i >= dit_stop_at_block) {
+                    LOG_INFO("[LTX_DIT_STOP] truncating DiT after block %d (of %lld)", i, (long long)config.num_layers);
+                    break;
+                }
             }
 
-            auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size);
+            auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, ctx->ltx_video_token_sel);
             vx                 = norm_out->forward(ctx, vx);
             vx                 = modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
             vx                 = proj_out->forward(ctx, vx);
@@ -1684,6 +1812,12 @@ namespace LTXV {
         std::vector<float> audio_connector_pe_vec;
         sd::Tensor<float> vx_input_cache;
         sd::Tensor<float> ax_input_cache;
+        // Modulation token-collapse (VRAM win). The conditioned video timestep is per-token
+        // but has only a few UNIQUE values; we feed the blocks the compact unique set and a
+        // per-token selector so get_ada_values gathers each compact chunk back per-token.
+        // These persist as members (the backend reads their data after build_graph returns).
+        sd::Tensor<float> v_timestep_compact_cache;  // [U] unique video timesteps
+        std::vector<int32_t> v_token_sel_vec;        // [L_video] token -> unique-column index
 
         LTXAVRunner(ggml_backend_t backend,
                     ggml_backend_t params_backend,
@@ -1782,7 +1916,57 @@ namespace LTXV {
 
             ggml_tensor* vx         = make_input(vx_input_cache);
             ggml_tensor* ax         = make_optional_input(ax_input_cache);
-            ggml_tensor* timesteps  = make_input(timesteps_tensor);
+
+            // --- Modulation token-collapse (VRAM win; ports avatar 98e8d16 to LTX) ---
+            // The conditioned video timestep is per-token (len = video_token_count) but holds
+            // only a few UNIQUE values (clean-anchor t=0, noise t, plus any graded-overlap
+            // levels). Feed the blocks just those unique values + a per-token selector so each
+            // per-block AdaLN materializes [dim,coeff,U] (U≈2-5) instead of [dim,coeff,L_video]
+            // (~5k) — cuts the conditioned DiT compute buffer by ~2GB. Pure t2v generate
+            // already passes a length-1 timestep (broadcast) and needs nothing. Bit-exactness:
+            // the gather is a pure copy; the only divergence vs the old path is that the compact
+            // adaln matmul runs at width U (may route to a different ggml-cuda kernel for
+            // quantized weights — same effect as avatar 98e8d16, slightly MORE accurate).
+            // Escape hatches: LTX_MOD_COLLAPSE=0 (old per-token path), LTX_MOD_NO_DEDUP=1
+            // (compact==per-token, sel=identity → isolates/validates the gather as bit-exact).
+            ggml_tensor* timesteps         = nullptr;
+            ggml_tensor* v_token_sel_input = nullptr;
+            bool collapse_env              = true;
+            if (const char* e = std::getenv("LTX_MOD_COLLAPSE")) {
+                collapse_env = e[0] != '0';
+            }
+            bool no_dedup = std::getenv("LTX_MOD_NO_DEDUP") != nullptr;
+            int64_t n_ts  = static_cast<int64_t>(timesteps_tensor.numel());
+            if (collapse_env && n_ts > 1) {
+                const float* td = timesteps_tensor.data();
+                std::vector<float> uniq;
+                v_token_sel_vec.resize(static_cast<size_t>(n_ts));
+                for (int64_t i = 0; i < n_ts; ++i) {
+                    float v = td[i];
+                    int idx = -1;
+                    if (!no_dedup) {
+                        for (size_t u = 0; u < uniq.size(); ++u) {
+                            if (uniq[u] == v) {
+                                idx = static_cast<int>(u);
+                                break;
+                            }
+                        }
+                    }
+                    if (idx < 0) {
+                        idx = static_cast<int>(uniq.size());
+                        uniq.push_back(v);
+                    }
+                    v_token_sel_vec[static_cast<size_t>(i)] = idx;
+                }
+                v_timestep_compact_cache = sd::Tensor<float>({static_cast<int64_t>(uniq.size())}, uniq);
+                timesteps                = make_input(v_timestep_compact_cache);
+                v_token_sel_input        = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, n_ts);
+                ggml_set_name(v_token_sel_input, "ltxav_video_token_sel");
+                set_backend_tensor_data(v_token_sel_input, v_token_sel_vec.data());
+                LOG_DEBUG("ltxav modulation collapse: %lld video tokens -> %zu unique timesteps", (long long)n_ts, uniq.size());
+            } else {
+                timesteps = make_input(timesteps_tensor);
+            }
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
             ggml_tensor* context    = make_optional_input(context_tensor);
 
@@ -1909,8 +2093,9 @@ namespace LTXV {
                 set_backend_tensor_data(audio_connector_pe, audio_connector_pe_vec.data());
             }
 
-            auto runner_ctx = get_context();
-            auto out_pair   = model.forward(&runner_ctx,
+            auto runner_ctx                 = get_context();
+            runner_ctx.ltx_video_token_sel  = v_token_sel_input;  // null unless modulation collapse active
+            auto out_pair                   = model.forward(&runner_ctx,
                                             vx,
                                             ax,
                                             timesteps,

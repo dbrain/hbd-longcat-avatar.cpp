@@ -1094,7 +1094,10 @@ public:
             ignore_tensors.insert("tae.encoder");
             ignore_tensors.insert("text_encoders.llm.visual.");
         }
-        if (audio_vae_model) {
+        if (audio_vae_model && !audio_vae_model->config.has_encoder) {
+            // Decode-only audio VAE (no baked mel basis) → skip the unused encoder convs.
+            // When the file DOES carry the encoder + mel_stft basis (the -ENC gguf), the
+            // encoder block IS built and its tensors must load (LTXAV audio-DRIVE path).
             ignore_tensors.insert("audio_vae.encoder");
         }
         if (version == VERSION_OVIS_IMAGE) {
@@ -2232,7 +2235,8 @@ public:
                              int audio_length,
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
-                             const sd::Tensor<float>& video_positions = {}) {
+                             const sd::Tensor<float>& video_positions = {},
+                             bool ltxav_audio_fixed                    = false) {
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
         float cfg_scale     = guidance.txt_cfg;
         float img_cfg_scale = guidance.img_cfg;
@@ -2308,8 +2312,13 @@ public:
             std::vector<float> timesteps_vec      = base_timesteps_vec;
             sd::Tensor<float> audio_timesteps_tensor;
             if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
-                timesteps_vec          = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask);
-                audio_timesteps_tensor = sd::Tensor<float>({static_cast<int64_t>(base_timesteps_vec.size())}, base_timesteps_vec);
+                timesteps_vec = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask);
+                // Driven audio is held fixed (clean): tell the model its audio tokens are
+                // at timestep 0, just like i2v zeroes the fixed frame-0 video timesteps.
+                std::vector<float> audio_ts = ltxav_audio_fixed
+                                                  ? std::vector<float>(base_timesteps_vec.size(), 0.0f)
+                                                  : base_timesteps_vec;
+                audio_timesteps_tensor = sd::Tensor<float>({static_cast<int64_t>(audio_ts.size())}, audio_ts);
             } else {
                 timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask);
             }
@@ -2445,6 +2454,33 @@ public:
             cond_out = run_condition(*positive_condition, c_concat_override);
             if (cond_out.empty()) {
                 return {};
+            }
+
+            // LTX_NAN_DEBUG: per-step health scan of the DiT input (noised_input = cont+noise) and
+            // raw model output (cond_out). Pinpoints WHICH sampler step first overflows and whether
+            // the input was already corrupt (cont-latent issue) vs the forward producing inf/nan
+            // (FA/matmul overflow). Zero cost unless the env is set.
+            if (getenv("LTX_NAN_DEBUG") != nullptr) {
+                auto scan = [&](const sd::Tensor<float>& t, const char* tag) {
+                    const float* d = t.data();
+                    int64_t n      = t.numel();
+                    long nn = 0, ni = 0;
+                    float mx = -1e30f, mn = 1e30f;
+                    for (int64_t i = 0; i < n; ++i) {
+                        float v = d[i];
+                        if (std::isnan(v)) {
+                            nn++;
+                        } else if (std::isinf(v)) {
+                            ni++;
+                        } else {
+                            if (v > mx) mx = v;
+                            if (v < mn) mn = v;
+                        }
+                    }
+                    LOG_INFO("[LTX_NAN] step=%d %s nan=%ld inf=%ld range=%.3f..%.3f", step, tag, nn, ni, mn, mx);
+                };
+                scan(noised_input, "in ");
+                scan(cond_out, "out");
             }
 
             if (!uncond.empty()) {
@@ -2725,7 +2761,11 @@ public:
             return {};
         }
         auto waveform = audio_vae_model->decode(n_threads, audio_latent);
-        if (free_params_immediately) {
+        // !keep_diffusion_model_resident: on a warm resident chain (in-process N-segment
+        // chaining) the audio VAE, like the video VAE/DiT/TE, must survive across segments —
+        // free_params_buffer() nulls its tensors, and the next segment's decode would then
+        // hit GGML_ASSERT(buffer). The video-VAE/DiT frees already carry this guard.
+        if (free_params_immediately && !keep_diffusion_model_resident) {
             audio_vae_model->free_params_buffer();
         }
         return waveform;
@@ -3305,6 +3345,9 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
+    sd_vid_gen_params->drive_audio_path                      = nullptr;
+    sd_vid_gen_params->cont_latent_path                      = nullptr;
+    sd_vid_gen_params->cont_anchor_path                      = nullptr;
     sd_vid_gen_params->cont_latent                           = nullptr;
     sd_vid_gen_params->cont_latent_frames                    = 0;
     sd_vid_gen_params->audio_frame_offset                    = 0;
@@ -3903,6 +3946,7 @@ struct ImageGenerationLatents {
     int64_t video_conditioning_frame_count = 0;
     int64_t video_target_frame_count       = 0;
     int audio_length                       = 0;
+    bool audio_fixed                       = false;  // LTXAV: hold audio latent fixed (drive lip-sync to a given wav)
 };
 
 static float ltxv_latent_corner_to_pixel_frame(int64_t corner_index,
@@ -4019,7 +4063,8 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<flo
 
 static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
                                                                  const sd::Tensor<float>& video_latent,
-                                                                 const sd::Tensor<float>& audio_latent) {
+                                                                 const sd::Tensor<float>& audio_latent,
+                                                                 float audio_mask_value = 1.f) {
     if (video_mask.empty() || audio_latent.empty()) {
         return video_mask;
     }
@@ -4062,7 +4107,9 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tenso
 
     std::vector<int64_t> audio_mask_shape = video_latent.shape();
     audio_mask_shape[3]                   = extra_ch;
-    auto audio_mask                       = sd::Tensor<float>::ones(audio_mask_shape);
+    // audio_mask_value 1.0 = denoise/generate audio (default); 0.0 = hold audio FIXED
+    // (drive lip-sync to the supplied encoded wav, pinned every step via line ~2329).
+    auto audio_mask                       = sd::full<float>(audio_mask_shape, audio_mask_value);
     return sd::ops::concat(video_mask_full, audio_mask, 3);
 }
 
@@ -4198,6 +4245,72 @@ static sd::Tensor<float> resize_ltxav_audio_latent(const sd::Tensor<float>& audi
         sd::ops::slice_assign(&resized, 1, 0, copy_length, copied);
     }
     return resized;
+}
+
+// LTXAV audio-DRIVE: load a 16kHz wav, run it through the audio-VAE encoder, and lay the
+// result out as the packed audio latent [freq=16, audio_length, chan=8, 1] so it can be
+// spliced into the joint AV latent and held fixed. Returns {} (caller falls back to
+// generated/zeros audio) if there's no encoder or the wav can't be read.
+static sd::Tensor<float> encode_ltxav_drive_audio(sd_ctx_t* sd_ctx, const char* wav_path, int audio_length) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || wav_path == nullptr || wav_path[0] == '\0' || audio_length <= 0) {
+        return {};
+    }
+    auto& avae = sd_ctx->sd->audio_vae_model;
+    if (!avae || !avae->config.has_encoder) {
+        LOG_ERROR("--drive-audio needs an audio VAE with the encoder + mel basis "
+                  "(build the -ENC gguf via tools/convert_ltx_audio_vae.py --with-encoder)");
+        return {};
+    }
+    std::vector<float> wav;
+    if (!LONGCAT_AUDIO::load_wav_16k_mono(wav_path, wav) || wav.empty()) {
+        LOG_ERROR("failed to load drive audio wav: %s", wav_path);
+        return {};
+    }
+    // encoder expects waveform ne [samples, channels]; mono is duplicated to its 2 channels.
+    sd::Tensor<float> waveform({static_cast<int64_t>(wav.size()), 1}, wav);
+    auto enc = avae->encode(sd_ctx->sd->n_threads, waveform);  // [128, T_enc, (1)]
+    if (enc.empty()) {
+        LOG_ERROR("audio VAE encode failed for %s", wav_path);
+        return {};
+    }
+    constexpr int kF = 16;  // frequency bins (fastest in the 128 feature axis)
+    constexpr int kC = 8;   // latent channels
+    GGML_ASSERT(enc.shape()[0] == kF * kC);
+    int64_t T_enc = enc.shape()[1];
+    // [128 = (freq16 fastest, chan8), T_enc] -> [freq16, audio_length, chan8, 1] (zero-pad/trim T).
+    auto out          = make_ltxav_empty_audio_latent(audio_length);
+    float* dst        = out.data();
+    const float* src  = enc.data();
+    int64_t feat      = enc.shape()[0];
+    int64_t Tcopy     = std::min<int64_t>(T_enc, audio_length);
+    for (int64_t c = 0; c < kC; ++c) {
+        for (int64_t t = 0; t < Tcopy; ++t) {
+            for (int64_t f = 0; f < kF; ++f) {
+                dst[c * static_cast<int64_t>(kF) * audio_length + t * kF + f] = src[t * feat + c * kF + f];
+            }
+        }
+    }
+    LOG_INFO("LTXAV audio-drive: encoded %s (%zu samples) -> audio latent T_enc=%" PRId64 " -> %d (lip-sync target)",
+             wav_path, wav.size(), T_enc, audio_length);
+    // LTX_NAN_DEBUG: scan the encoded + packed audio latent so the audio's role in any NaN is
+    // visible (e.g. a silent/clipped slice → extreme encode → tips the joint forward to NaN).
+    if (getenv("LTX_NAN_DEBUG") != nullptr) {
+        auto scan = [](const sd::Tensor<float>& t, const char* tag) {
+            const float* d = t.data();
+            int64_t n      = t.numel();
+            long nn = 0, ni = 0;
+            float mx = -1e30f, mn = 1e30f;
+            double sum = 0.0;
+            for (int64_t i = 0; i < n; ++i) {
+                float v = d[i];
+                if (std::isnan(v)) { nn++; } else if (std::isinf(v)) { ni++; } else { if (v > mx) mx = v; if (v < mn) mn = v; sum += v; }
+            }
+            LOG_INFO("[LTX_NAN] audio %s n=%lld nan=%ld inf=%ld range=%.3f..%.3f mean=%.4f", tag, (long long)n, nn, ni, mn, mx, n ? sum / n : 0.0);
+        };
+        scan(enc, "enc ");
+        scan(out, "pack");
+    }
+    return out;
 }
 
 static int get_ltxav_num_audio_latents(int frames, int fps) {
@@ -5142,7 +5255,18 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
         latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
-        latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+        const char* drive_wav = SAFE_STR(sd_vid_gen_params->drive_audio_path);
+        if (strlen(drive_wav) > 0) {
+            auto driven = encode_ltxav_drive_audio(sd_ctx, drive_wav, latents.audio_length);
+            if (!driven.empty()) {
+                latents.audio_latent = driven;       // lip-sync to THIS audio
+                latents.audio_fixed  = true;         // hold it fixed through the denoise loop
+            } else {
+                latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+            }
+        } else {
+            latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+        }
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
@@ -5240,6 +5364,112 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
             int64_t t2 = ggml_time_ms();
             LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
+        } else if (sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+            // LTXAV IN-MEMORY LATENT CONTINUATION (in-process N-segment chaining): identical
+            // semantics to the file-based --cont-latent path below, but the prior segment's
+            // motion-carrying tail arrives as a contiguous float* (cont_latent) instead of a
+            // file. This keeps the ~11GB DiT RESIDENT across segments (one sd-cli process
+            // renders N segments; no per-segment reload). The caller (examples/cli/main.cpp
+            // --ltx-chain-segments loop) slices the prior segment's returned latent to exactly
+            // K = cont_latent_frames tail frames AND the first get_latent_channel() (==128)
+            // VIDEO channels (audio channels stripped), in ggml-ne order [Wl, Hl, K, Cl] with
+            // W fastest. We rebuild that as an sd::Tensor and apply it with the SAME logic as
+            // the file path: place at the head of init_latent, hold (graded) via denoise mask.
+            latents.init_latent  = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            // Geometry from the segment's own init latent so Wl/Hl/Cl always match what
+            // apply_ltxav_condition_by_latent_index expects (shape()[0/1/3] equality). The
+            // init_latent is 5D [Wl, Hl, T, Cl, 1]; cont_tail is 4D [Wl, Hl, K, Cl] (the file
+            // path's cont_tail is also 4D after slicing the saved 4D video latent), and the
+            // apply check compares shape()[3]==Cl only, so 4D is fine.
+            int64_t Wl = latents.init_latent.shape()[0];
+            int64_t Hl = latents.init_latent.shape()[1];
+            int64_t Cl = latents.init_latent.shape()[3];  // == get_latent_channel() == 128 for LTXAV (VIDEO channels)
+            int64_t K  = sd_vid_gen_params->cont_latent_frames;
+            // 5D [Wl,Hl,K,Cl,1] to match init_latent's rank — apply_ltxav_condition_by_latent_index
+            // -> slice_assign requires equal rank (the file path's cont_full is 5D after slicing).
+            sd::Tensor<float> cont_tail({Wl, Hl, K, Cl, 1});
+            std::memcpy(cont_tail.data(), sd_vid_gen_params->cont_latent,
+                        (size_t)cont_tail.numel() * sizeof(float));
+            if (K > latents.init_latent.shape()[2]) {
+                LOG_ERROR("cont latent frames %lld exceed segment latent frames %lld",
+                          (long long)K, (long long)latents.init_latent.shape()[2]);
+                return std::nullopt;
+            }
+            // Overlap mask value: 0 = frozen (carries motion, may stall); >0 lets the overlap
+            // re-denoise so motion evolves instead of freezing. Tunable via LTXAV_CONT_OVERLAP_MASK
+            // (same env knob as the file path).
+            float omask = 0.0f;
+            if (const char* e = std::getenv("LTXAV_CONT_OVERLAP_MASK")) {
+                omask = std::clamp((float)atof(e), 0.f, 1.f);
+            }
+            // NOTE: appearance anchor (cont_anchor) is intentionally NOT supported on the
+            // in-memory path for now — it's a follow-up (would need an in-memory anchor float*).
+            // The in-process chain relies on the motion overlap alone; base_idx stays 0.
+            int64_t base_idx = 0;
+            LOG_INFO("LTXAV CONTINUATION (in-memory): %lld prior latent frames as motion overlap at idx %lld, mask=%.2f",
+                     (long long)K, (long long)base_idx, omask);
+            if (!apply_ltxav_condition_by_latent_index(&latents.init_latent, &latents.denoise_mask,
+                                                       cont_tail, base_idx, "cont-mem", omask)) {
+                return std::nullopt;
+            }
+        } else if (sd_vid_gen_params->cont_latent_path != nullptr && sd_vid_gen_params->cont_latent_path[0] != '\0' &&
+                   sd_vid_gen_params->cont_latent_frames > 0) {
+            // LTXAV LATENT CONTINUATION: condition on the LAST K diffusion-latent frames of
+            // the prior segment (motion-carrying; no pixel decode/re-encode). Place them at
+            // the head of init_latent and hold them (graded) fixed; the rest denoise and
+            // continue the motion via the DiT's full temporal attention over the T axis.
+            sd::Tensor<float> cont_full;
+            try {
+                cont_full = sd::load_tensor_from_file_as_tensor<float>(sd_vid_gen_params->cont_latent_path);
+            } catch (const std::exception& e) {
+                LOG_ERROR("failed to load --cont-latent %s: %s", sd_vid_gen_params->cont_latent_path, e.what());
+                return std::nullopt;
+            }
+            int64_t Tprev = cont_full.shape()[2];
+            int64_t K     = std::min<int64_t>(sd_vid_gen_params->cont_latent_frames, Tprev);
+            auto cont_tail = sd::ops::slice(cont_full, 2, Tprev - K, Tprev);  // last K latent frames
+            latents.init_latent  = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            if (K > latents.init_latent.shape()[2]) {
+                LOG_ERROR("cont latent frames %lld exceed segment latent frames %lld",
+                          (long long)K, (long long)latents.init_latent.shape()[2]);
+                return std::nullopt;
+            }
+            // Overlap mask value: 0 = frozen (carries motion, may stall); >0 lets the overlap
+            // re-denoise so motion evolves instead of freezing. Tunable via LTXAV_CONT_OVERLAP_MASK.
+            float omask = 0.0f;
+            if (const char* e = std::getenv("LTXAV_CONT_OVERLAP_MASK")) {
+                omask = std::clamp((float)atof(e), 0.f, 1.f);
+            }
+            // APPEARANCE ANCHOR (anti-drift): optionally pin the ORIGINAL character (frame 0 of
+            // --cont-anchor) at the head so style can't migrate off the source over a long chain.
+            // Layout [anchor(1), motion_tail(K), generated...]; anchor+overlap are dropped at stitch.
+            int64_t base_idx = 0;
+            if (sd_vid_gen_params->cont_anchor_path != nullptr && sd_vid_gen_params->cont_anchor_path[0] != '\0') {
+                try {
+                    auto anchor_full = sd::load_tensor_from_file_as_tensor<float>(sd_vid_gen_params->cont_anchor_path);
+                    auto anchor      = sd::ops::slice(anchor_full, 2, 0, 1);  // original char = frame 0
+                    if (apply_ltxav_condition_by_latent_index(&latents.init_latent, &latents.denoise_mask,
+                                                              anchor, 0, "cont-anchor", 0.0f)) {
+                        base_idx = 1;
+                        LOG_INFO("LTXAV CONTINUATION: + appearance anchor pinned at frame 0");
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("failed to load --cont-anchor %s: %s", sd_vid_gen_params->cont_anchor_path, e.what());
+                }
+            }
+            if (base_idx + K > latents.init_latent.shape()[2]) {
+                LOG_ERROR("anchor+cont frames (%lld) exceed segment latent frames %lld",
+                          (long long)(base_idx + K), (long long)latents.init_latent.shape()[2]);
+                return std::nullopt;
+            }
+            LOG_INFO("LTXAV CONTINUATION: %lld prior latent frames (of %lld) as motion overlap at idx %lld, mask=%.2f",
+                     (long long)K, (long long)Tprev, (long long)base_idx, omask);
+            if (!apply_ltxav_condition_by_latent_index(&latents.init_latent, &latents.denoise_mask,
+                                                       cont_tail, base_idx, "cont", omask)) {
+                return std::nullopt;
+            }
         }
     }
 
@@ -5529,10 +5759,17 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version) && !latents.audio_latent.empty()) {
+        // Driving audio needs a denoise mask so the audio slot can be pinned (mask=0)
+        // every step. If none exists (pure t2v), make a fully-generated video mask (1.0)
+        // so only the audio is held fixed.
+        if (latents.audio_fixed && latents.denoise_mask.empty()) {
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+        }
         if (!latents.denoise_mask.empty()) {
             latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
                                                                            latents.init_latent,
-                                                                           latents.audio_latent);
+                                                                           latents.audio_latent,
+                                                                           latents.audio_fixed ? 0.0f : 1.0f);
         }
         latents.init_latent = pack_ltxav_audio_and_video_latents(latents.init_latent, latents.audio_latent);
     }
@@ -5605,7 +5842,11 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
-    if (sd_ctx->sd->free_params_immediately && !use_text_cache) {
+    // !keep_diffusion_model_resident: an in-process chain with PER-SEGMENT prompts must re-encode
+    // the text encoder every segment, so it cannot be freed after seg0 (the avatar dodges this by
+    // caching one cond). In --offload-to-cpu mode the TE param buffer is host RAM (mmap), not VRAM,
+    // so keeping it resident costs host RAM, not GPU; it still streams to the GPU per encode.
+    if (sd_ctx->sd->free_params_immediately && !use_text_cache && !sd_ctx->sd->keep_diffusion_model_resident) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
     // Avatar umT5-on-GPU: now that the TE is freed, bring the DiT weights onto the
@@ -5639,6 +5880,19 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
     if (sd_version_is_ltxav(sd_ctx->sd->version) &&
         video_latent.shape()[3] > sd_ctx->sd->get_latent_channel()) {
         video_latent = sd::ops::slice(video_latent, 3, 0, sd_ctx->sd->get_latent_channel());
+    }
+    // LTXAV latent chaining: bank the clean VIDEO latent (channels only, audio stripped) so
+    // the next segment can condition on its motion-carrying tail via --cont-latent.
+    if (const char* sp = getenv("LTXAV_SAVE_VIDEO_LATENT"); sp != nullptr && sp[0] != '\0' &&
+        sd_version_is_ltxav(sd_ctx->sd->version)) {
+        try {
+            sd::save_tensor_to_file<float>(sp, video_latent, "ltxav_video_latent");
+            LOG_INFO("LTXAV_SAVE_VIDEO_LATENT: wrote video latent (%dx%dx%dx%d) to %s",
+                     (int)video_latent.shape()[0], (int)video_latent.shape()[1],
+                     (int)video_latent.shape()[2], (int)video_latent.shape()[3], sp);
+        } catch (const std::exception& e) {
+            LOG_ERROR("LTXAV_SAVE_VIDEO_LATENT failed: %s", e.what());
+        }
     }
     LOG_DEBUG("decode_video_outputs latent %dx%dx%dx%d",
               (int)video_latent.shape()[0],
@@ -6165,7 +6419,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                         latents.audio_length,
                                                         static_cast<float>(request.fps),
                                                         request.cache_params,
-                                                        latents.video_positions);
+                                                        latents.video_positions,
+                                                        latents.audio_fixed);
     }
 
     int64_t sampling_end = ggml_time_ms();
