@@ -24,6 +24,11 @@ gallery/
 profiles/
 /tmp_*
 
+# render output dirs (PNG/mp4 artifacts; regenerable)
+it_*/
+sm[0-9]*/
+sm_tail/
+
 # nsys/ncu binary traces (large; keep markdown writeups)
 bench/results/*.nsys-rep
 bench/results/*.sqlite
