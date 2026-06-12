@@ -5,21 +5,119 @@ You are continuing the C++/ggml port of the Pixal3D (TRELLIS.2) image→3D pipel
 them unless you are genuinely, hard-stuck** (a decision that reverses direction, or a
 tool that's actually broken). Otherwise: decide, do, validate, document, continue.
 
-## Where things stand (2026-06-12)
-- **Spike**: submanifold sparse conv3d ported + validated (CPU bit-exact + CUDA Rung-1).
-- **M0 DONE**: every stage boundary of one real decode (miku.png, res 1024) captured in
-  `tools/sparse_spike/golden_stages/` (409 MB, gitignored) + per-stage VRAM (`vram.json`)
-  + all model configs (`golden_stages/configs/`). This is the golden set for M1–M5.
-- **M1 Stage-1 DONE at reference level**: fp32 numpy refs in `tools/m1_ref/`
-  (`dinov3_proj.py`, `ss_dit.py`, `ss_vae_decode.py`, assembled in `stage1_e2e.py`)
-  reproduce the real **fp32** torch pipeline EXACTLY (image→coords 1120≡1120, IoU 0.9859;
-  cross-checked by `torch_stage1_ref.py` = real model+sampler). vs the **bf16** golden =
-  98.6% IoU (11 coarse boundary voxels = bf16-torso rounding, expected, refined downstream).
-- Read these first, in order: `E2E-PORT-KICKOFF.md` (philosophy + ladder + the PROGRESS
-  LOG at top), `CONFIGS-RESOLVED.md`, `M1-STAGE1-PORT-SPEC.md`, `DINOV3-ENCODER-SPEC.md`,
-  `E2E-PORT-MAP.md`, the 3 spike docs. Memory: `project_3dgen_cpp_port`,
-  `feedback_correctness_before_perf`, `feedback_no_heavy_parallel_subagents_during_gpu_test`,
-  `feedback_no_workflow_for_basic_research`, `reference_subagent_background_stall`.
+## Where things stand (updated 2026-06-12 — EVERY GEOMETRY COMPONENT DONE; NEXT = M5 chain assembly)
+- **NEWEST (2026-06-12) — M3a + M4 + M5-shape-cond all VALIDATED.** Every geometry component of the pipeline
+  is now ported + validated:
+  - **M3a** sparse-VAE upsample: `decoder.upsample(lr_slat,x4)→hr_coords` **bit-exact CPU+CUDA** (hr_coords
+    SET-EQUAL fp32 oracle 382584; per-stage coords EXACT). `m3a_upsample.cpp`+`sparse_vae.hpp`.
+  - **M4** O-Voxel mesh: full `decoder.forward` (bit-exact) + `flexible_dual_grid_to_mesh` **BIT-EXACT vs
+    the real o_voxel `_C.so`** (verts maxabs 0.0, faces elem-diff 8/9.75M; 1547112v/3251950f). `m4_mesh.cpp`
+    +`m4_mesh_only.cpp`.
+  - **M5 shape cond** (true cond, both stages): DINOv3@512/1024 + NAF@512/1024 + proj_grid16/32/64; stage2
+    cond (cosine 1.0, lr 2.2e-5) + stage3b cond (cosine 1.0, lr 2.2e-5, hr 1.29e-4) validated vs golden.
+    `stage2_cond_test`/`stage3b_cond_test`/`dinov3_1024_test`/`naf_1024_test`; parameterized dinov3/naf graphs.
+- **Earlier rungs (full detail in `E2E-PORT-KICKOFF.md` PROGRESS LOG, newest-first):** spike (submanifold
+  sparse conv, bit-exact) · M0 goldens (`tools/sparse_spike/golden_stages/`) · M1 fp32 refs · RUNG-1 (Stage-1
+  image→coords in ggml, == torch fp32: 1120 coords, IoU 0.9859) · M2 (shape-LR DiT+sampler+denorm+NAF) ·
+  M3b (shape-HR DiT). All validated CPU+CUDA vs true-fp32 oracles. Durable gotchas: (a) t_seq/guidance-interval
+  MUST be float64 (M2/M3b hit a step exactly at t=0.6); (b) validate vs the true-fp32 oracle, NOT the tf32/bf16
+  golden; (c) persistent-weights buffer + `NVIDIA_TF32_OVERRIDE=0` for fp32 on CUDA.
+
+## ★ THE PRODUCT GOAL — a usable CLI (read this first)
+The north star is **a self-contained CLI: load a Pixal3D/TRELLIS.2 GGUF, give it an image, get a usable
+3D model out — matching the Python library.** Then textures, then make it fast. Three phases:
+
+**PHASE A — Geometry CLI (image → untextured GLB, from GGUF).** All the geometry *math* is DONE + validated
+(every stage below). What's left is **assembly + packaging**:
+  1. **M5 chain assembly** — wire the validated programs (stage1_e2e + shape cond + m2/m3a/m3b/m4) into ONE
+     driver: image → mesh. Net-new plumbing only (cross-stage seed-42 noise, grid64 quantize+unique, mesh→GLB).
+     Precise step-by-step: **`HANDOFF-M5-assembly.md`**.
+  2. **GGUF (the deferred task #5)** — the ports currently load per-tensor `.npy` (dev format). For a real CLI,
+     convert the safetensors (ss_flow, ss_dec, dinov3, slat_flow_512/1024, shape_dec, NAF) → GGUF and load in
+     C++ (base repo has GGUF load+convert in `src/convert.cpp`). This is the bridge from dev-harness to product.
+  3. **Front-end + CLI** — `pixal3d --model m.gguf --image in.png --out out.glb [--fov F | --cam ...]`. Camera
+     scalars (camera_angle_x, distance, mesh_scale) are inputs; recommended cut-line = host-side rembg (BiRefNet)
+     + `--fov` to bypass MoGe (both are standard nets off the ggml math path; port only for "raw photo → GLB").
+  → **Phase-A done = `pixal3d` produces an untextured GLB from a photo, matching Python geometry (IoU ~0.99).**
+
+**PHASE B — Textures (M6 = feature-complete).** tex SLat DiT (`slat_flow_imgshape2tex_dit_1_3B_1024`, in_ch 64
+= 32 noise ‖ 32 shape_slat re-normed, CFG off, interval [0.6,0.9]; reuses build_slat_dit_forward) + tex decoder
+(`tex_dec_next_dc_f16c32_fp16`, out 6 PBR, pred_subdiv=false → reuses shape's `subs` as guide_subs; reuses the
+M3a/M4 sparse-VAE backbone) + NAF@1024 (reused) + **textured-GLB bake** (`o_voxel.postprocess.to_glb` — UV unwrap
++ atlas + sample attrs from the volume; the largest net-new M6 piece, `_C.so`-backed → golden-validate). Goldens
+already captured: `golden_stages/stage4_{cond,out}`. → **image → TEXTURED PBR GLB.**
+
+**PHASE C — Performance run ("fast and usable").** Only AFTER feature-complete. Loosen precision / quantize
+(GGUF Q-types) / fuse / CUDA-optimize the per-stage kernels / fit ~7.5 GB co-resident (the low_vram budget;
+per-stage peak is DINOv3@1024+NAF ≈ 6.3 GB alloc / 7.6 GB reserved, from M0 `vram.json`). Expect precision to
+loosen (tf32/fp16, 1e-7→1e-3) — that's rounding, judged by E2E mesh IoU, NOT breakage. Bank perf intel as you
+go (a PERF-NOTES doc). See memory `feedback_correctness_before_perf`.
+
+### How to build/run the C++ port (cpp_port/)
+`cd tools/m1_ref/cpp_port && ./build.sh <test> [cuda]` then `./​<test>` (CPU) or
+`LD_LIBRARY_PATH=/mnt/hdd/3d/avatar-shootout/toolchain/lib:/usr/lib NVIDIA_TF32_OVERRIDE=0 ./<test> cuda`.
+Validated tests by stage:
+- **Stage1**: proj_grid_test, dinov3_test, ss_dit_test, ss_vae_test, sampler_test, **stage1_e2e** (image→coords).
+- **M2/M3b**: slat_dit_test, **m2_sampler_test**, **m3b_sampler_test**, naf_test (NAF@512).
+- **M3a**: **m3a_upsample** (bit-exact upsample, CPU+CUDA).
+- **M4**: **m4_mesh** (decoder→head→mesh, CPU+CUDA), **m4_mesh_only** (mesh extractor isolation, emits
+  `miku_geometry.ply`). `build.sh` cuda branch covers m3a/m4 (nvcc spike `.cu` + g++ host, no ggml).
+- **M5 cond**: **stage2_cond_test**, **stage3b_cond_test**, **dinov3_1024_test**, **naf_1024_test**.
+Weights: `weights_npy/` (per-tensor `.npy` — DEV format; **GGUF is Phase-A item #2**) from `unpack_weights.py`
+(+ `stage3a_capture.py` exports shape_dec). Refs `refs/` from the `*_capture.py` / `torch_stage*_ref.py` oracles.
+Headers: `m1_ggml.hpp` (harness), `dinov3_graph.hpp` (Cfg CFG512/1024), `naf_graph.hpp` (Cfg CFG512/1024),
+`slat_dit_graph.hpp`, `ss_dit_graph.hpp`, `ss_vae_graph.hpp`, `sparse_vae.hpp` (M3a/M4 + write_ply).
+
+## FULL SCOPE LADDER — the horizon (GOAL = FEATURE-COMPLETE with Pixal3D = textured GLB from a photo)
+Don't lose sight of the end state. The detailed "## The ladder" below is geometry-only (M2–M5);
+this is the whole arc:
+```
+[DONE✅] spike (sparse conv) · M0 goldens · M1 fp32 refs · RUNG-1 (Stage-1 image→coords, ==torch fp32)
+[DONE✅] M2 (shape-LR DiT+sampler+denorm+NAF→lr_slat) · M3a (upsample→hr_coords, BIT-EXACT)
+[DONE✅] M3b (shape-HR DiT→shape_slat) · M4 (decoder + O-Voxel mesh extractor, BIT-EXACT vs _C.so)
+[DONE✅] M5 shape COND (DINOv3@512/1024 + NAF@512/1024 + proj_grid16/32/64; both shape conds validated)
+         ── ^ EVERY GEOMETRY COMPONENT validated. Cascade validated stage-by-stage w/ golden hand-offs.
+── PHASE A (geometry CLI): assembly + packaging of the validated components ──
+A1  M5 CHAIN ASSEMBLY: wire stage1+cond+m2+m3a+m3b+m4 → one image→mesh driver (+seed-42 noise, GLB).
+    ── ^ "functionally complete geometry". Plan: HANDOFF-M5-assembly.md.
+A2  GGUF (deferred task #5): safetensors → GGUF + load in C++ (replace per-tensor .npy dev format).
+A3  CLI + front-end: `pixal3d --model m.gguf --image in.png --out out.glb [--fov F]`; host rembg + --fov.
+── PHASE B (feature-complete) ──
+M6  TEXTURE branch: tex SLat DiT (in_ch 64, reuses M2/M3 DiT) + tex decoder (out 6 PBR, reuses M3/M4
+    sparse-VAE) + NAF@1024 (reused) + textured-GLB bake (o_voxel.postprocess.to_glb, UV/atlas).
+    → image → TEXTURED PBR GLB ✅   (goldens stage4_{cond,out} captured)
+── PHASE C (product goals, separate phases) ──
+PERF  loosen precision / quantize (GGUF Q-types) / fuse / fit ~7.5 GB co-resident / CUDA-optimize.
+PROD  integrate as longcat-avatar.cpp subsystem / koblem heavy engine (worker-iso, idle-unload,
+      REST + panel, docker) — like acestep/flux2/longcat.
+RIG/MOTION  SkinTokens rig + body motion → textured RIGGED GLB — the north-star; separate model chain.
+```
+
+## Working style — parallelize PREP, serialize VALIDATION (obey the contention rules)
+The port is already built for isolation: each op = a numpy/torch fp32 ref + a standalone ggml
+test validated against a captured golden, on a shared harness (`m1_ggml.hpp`) + per-stage graph
+headers. Every remaining stage (NAF, sparse up/C2S/subdiv, FDG mesh extractor, tex DiT/decoder)
+is a self-contained unit you build + validate in isolation — same recipe as Stage-1. So:
+
+**USE SUBAGENTS (Agent tool) for the parallelizable, non-contending prep:**
+- Read-only research/spec, in parallel: bounded `Explore`/`general-purpose` reads of the Pixal3D
+  source are explicitly fine (e.g. one maps NAF `na2d`, one the FDG mesh head, one the sparse
+  up/down index maps). They don't contend.
+- Authoring a stage's numpy ref + C++ graph header + standalone test SCAFFOLD (CPU-light file
+  writing, no GPU) — a subagent can draft `naf_ref.py`+`naf_graph.hpp`+`naf_test.cpp` in isolation.
+
+**DO NOT fan out the heavy/contending work — keep it SERIAL in the main loop:**
+- GPU is SINGLE → only ONE ggml CUDA build+run at a time; no parallel GPU runs.
+- Heavy torch/numpy oracles are ONE PROCESS AT A TIME (CPU/RAM/swap — running two thrashed the
+  box; memory `feedback_no_heavy_parallel_subagents_during_gpu_test`).
+- Agent subagents are NOT woken on `run_in_background` completion → they DEADLOCK on long
+  GPU/torch jobs (memory `reference_subagent_background_stall`). Drive every long build/validate
+  from the MAIN loop (`run_in_background:true`, you get the notification). No multi-agent Workflow
+  for research (`feedback_no_workflow_for_basic_research`).
+
+**Rhythm per stage:** (subagents, parallel) read source + draft ref/graph/test scaffold →
+(main loop, serial) run the torch oracle once → build → run the ggml test on GPU → validate vs
+golden → fix → document. Always re-validate a subagent-authored scaffold yourself before trusting it.
 
 ## Mentality / approach (obey)
 1. **Correctness + precision FIRST; performance is a SEPARATE LATER phase.** Keep fp32.
