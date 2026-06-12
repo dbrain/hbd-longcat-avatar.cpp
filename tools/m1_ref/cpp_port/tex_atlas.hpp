@@ -9,6 +9,7 @@
 // bit-exact (m6_tex_decode). Replaces the interim per-vertex COLOR_0 bake.
 #pragma once
 #include "tex_grid_sample.hpp"
+#include "tex_reproject.hpp"     // lap-18: closest-point-on-dense-mesh reproject (kills splatter/cracks)
 #include "../../../thirdparty/xatlas.h"
 #include "../../../thirdparty/meshoptimizer/meshoptimizer.h"
 #include <cstdint>
@@ -189,7 +190,15 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
                                 const std::vector<float>& pbr_feats, const std::vector<int32_t>& pbr_coords,
                                 int grid_res, int texture_size, int decimate_target_faces=0,
                                 int padding=4, bool verbose=true, int sample_fallback_r=0,
-                                bool precluster=false, float cone_deg=55.f) {
+                                bool precluster=false, float cone_deg=55.f,
+                                // lap-18 BVH-reproject: if reproject, snap each texel onto the DENSE
+                                // outer-shell mesh (closest-pt-on-tri + front-face reject) and barycentric
+                                // -interp dense_attr (6-ch PBR per dense vert) instead of grid_sample'ing
+                                // the volume at the raw (possibly interior) rasterised position.
+                                const std::vector<float>* dense_verts=nullptr,
+                                const std::vector<int64_t>* dense_faces=nullptr,
+                                const std::vector<float>* dense_attr=nullptr,
+                                bool reproject=false) {
     // optional decimation (Python decimates to ~1M verts before unwrap; keeps xatlas tractable)
     std::vector<float> dverts; std::vector<int64_t> dfaces;
     const bool deci = (decimate_target_faces>0 && (int)in_faces0.size()/3 > decimate_target_faces);
@@ -262,8 +271,9 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     }
     for (size_t i=0;i<bt.faces.size();i++) bt.faces[i]=om.indexArray[i];
 
-    // ---- rasterize (serial; writes per-texel 3D position + mask) ----
+    // ---- rasterize (serial; writes per-texel 3D position + interpolated normal + mask) ----
     std::vector<float> pos((size_t)W*Ht*3, 0.f);
+    std::vector<float> nrm((size_t)W*Ht*3, 0.f);   // lap-18: texel normal for front-face reproject
     std::vector<uint8_t> mask((size_t)W*Ht, 0);
     for (int t=0;t<Fout;t++){
         uint32_t a=om.indexArray[t*3], b=om.indexArray[t*3+1], c=om.indexArray[t*3+2];
@@ -275,29 +285,62 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         int y0=(int)std::floor(std::min({ay,by,cy})), y1=(int)std::ceil(std::max({ay,by,cy}));
         x0=std::max(0,x0); y0=std::max(0,y0); x1=std::min(W-1,x1); y1=std::min(Ht-1,y1);
         const float *Pa=&bt.verts[(size_t)a*3], *Pb=&bt.verts[(size_t)b*3], *Pc=&bt.verts[(size_t)c*3];
+        const float *Na=&bt.normals[(size_t)a*3], *Nb=&bt.normals[(size_t)b*3], *Nc=&bt.normals[(size_t)c*3];
         for (int y=y0;y<=y1;y++) for (int x=x0;x<=x1;x++){
             float sx=x+0.5f, sy=y+0.5f;
             float w0=((bx-sx)*(cy-sy)-(by-sy)*(cx-sx))*inv;   // bary for vertex a
             float w1=((cx-sx)*(ay-sy)-(cy-sy)*(ax-sx))*inv;   // for b
             float w2=1.f-w0-w1;                                // for c
             if (w0<0||w1<0||w2<0) continue;                    // outside (winding-normalized by inv)
-            float* P=&pos[((size_t)y*W+x)*3];
-            for (int d=0;d<3;d++) P[d]=w0*Pa[d]+w1*Pb[d]+w2*Pc[d];
+            float* P=&pos[((size_t)y*W+x)*3]; float* Nn=&nrm[((size_t)y*W+x)*3];
+            for (int d=0;d<3;d++){ P[d]=w0*Pa[d]+w1*Pb[d]+w2*Pc[d]; Nn[d]=w0*Na[d]+w1*Nb[d]+w2*Nc[d]; }
             mask[(size_t)y*W+x]=1;
         }
     }
     int covered=0; for (auto m:mask) covered+=m;
     if (verbose) printf("[atlas] rasterized: %d / %d texels covered (%.1f%%)\n", covered, W*Ht, 100.0*covered/(W*Ht));
 
-    // ---- grid_sample the PBR volume at each covered texel (parallel) ----
-    texgs::VolIndex vol(pbr_coords.data(), (int)pbr_coords.size()/4, 4, 1);
+    // ---- per-texel attribute: either reproject onto the dense shell (lap-18) or grid_sample the
+    //      PBR volume at the rasterised position (the legacy/teal-splatter path) ----
     std::vector<float> atl((size_t)W*Ht*C, 0.f);
-    #pragma omp parallel for schedule(dynamic, 4096)
-    for (int p=0;p<W*Ht;p++){
-        if (!mask[p]) continue;
-        const float* P=&pos[(size_t)p*3];
-        float q0=(P[0]+0.5f)*grid_res, q1=(P[1]+0.5f)*grid_res, q2=(P[2]+0.5f)*grid_res;
-        texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r);
+    const bool do_reproject = reproject && dense_verts && dense_faces && dense_attr && !dense_faces->empty();
+    if (do_reproject) {
+        const int ncell  = std::getenv("RP_NCELL")  ? atoi(std::getenv("RP_NCELL"))  : 256;
+        const int maxring= std::getenv("RP_MAXRING")? atoi(std::getenv("RP_MAXRING")): 12;
+        const float fdot = std::getenv("RP_FRONTDOT")? (float)atof(std::getenv("RP_FRONTDOT")) : 0.0f;
+        // SAMPLE MODE: default = snap the texel onto the dense shell (closest-pt-on-tri, front-face
+        // reject) then trilinear grid_sample the VOLUME there (stable → no per-texel speckle from
+        // triangle-choice flips on fine hair; == pyref's sampling, but on the correct on-shell point).
+        // RP_ATTR=1 uses the barycentric dense-mesh attr instead (speckles on fine strand detail).
+        const bool use_attr = std::getenv("RP_ATTR")!=nullptr;
+        texgs::VolIndex vol(pbr_coords.data(), (int)pbr_coords.size()/4, 4, 1);
+        double tbh=_now();
+        texrp::DenseHash dh(dense_verts->data(), dense_faces->data(), (int64_t)dense_faces->size()/3, ncell);
+        if (verbose) printf("[atlas] reproject: dense %zu v / %zu f, hash %d^3 cells (%.2fs build), front_dot=%.2f, mode=%s\n",
+                            dense_verts->size()/3, dense_faces->size()/3, ncell, _now()-tbh, fdot, use_attr?"mesh-attr":"snap+volume");
+        size_t miss=0;
+        #pragma omp parallel for schedule(dynamic, 2048) reduction(+:miss)
+        for (int p=0;p<W*Ht;p++){
+            if (!mask[p]) continue;
+            const float* P=&pos[(size_t)p*3]; const float* Nn=&nrm[(size_t)p*3];
+            float qn[3]={Nn[0],Nn[1],Nn[2]}; float L=std::sqrt(qn[0]*qn[0]+qn[1]*qn[1]+qn[2]*qn[2]);
+            if (L>1e-20f){ qn[0]/=L;qn[1]/=L;qn[2]/=L; }
+            float snap[3];
+            if (!dh.sample(P, qn, use_attr?dense_attr->data():nullptr, C, use_attr?&atl[(size_t)p*C]:nullptr, snap, fdot, maxring)) { miss++; continue; }
+            if (!use_attr){ float q0=(snap[0]+0.5f)*grid_res, q1=(snap[1]+0.5f)*grid_res, q2=(snap[2]+0.5f)*grid_res;
+                texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r); }
+        }
+        if (verbose && miss) printf("[atlas] reproject misses (no dense tri in range): %zu (%.3f%% of covered)\n",
+                                    miss, 100.0*miss/(double)std::max(1,covered));
+    } else {
+        texgs::VolIndex vol(pbr_coords.data(), (int)pbr_coords.size()/4, 4, 1);
+        #pragma omp parallel for schedule(dynamic, 4096)
+        for (int p=0;p<W*Ht;p++){
+            if (!mask[p]) continue;
+            const float* P=&pos[(size_t)p*3];
+            float q0=(P[0]+0.5f)*grid_res, q1=(P[1]+0.5f)*grid_res, q2=(P[2]+0.5f)*grid_res;
+            texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r);
+        }
     }
 
     // ---- inpaint: gutter + INTERIOR HOLES. A texel can be covered (inside a chart triangle) yet

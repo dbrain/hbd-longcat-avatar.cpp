@@ -384,6 +384,20 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         // full PBR volume (feeds the UV-atlas bake): feats [V6*6] + coords [V6*4]
         if (out_pbr_feats)  *out_pbr_feats  = pbr;
         if (out_pbr_coords) *out_pbr_coords = pbr_coords;
+        // PIXAL3D_DUMP_BAKE: also bank the DENSE (pre-QEM) outer-shell mesh here, while it still
+        // exists — the lap-18 BVH-reproject needs the smooth dense surface (closest-point-on-triangle)
+        // as the colour source-of-truth, not just the decimated QEM mesh. `mesh` is the dense dual-grid
+        // mesh at this point (the deferred QEM decimate runs below). The QEM mesh + the PBR volume are
+        // dumped separately from pixal3d.cpp once run_geometry returns. (out_pbr_feats != null ⇒ the
+        // uvatlas dump path; gate on the same env so plain runs pay nothing.)
+        if (out_pbr_feats && remesh_deferred && std::getenv("PIXAL3D_DUMP_BAKE")) {
+            auto sv=[](const char* p, const void* d, size_t n){ FILE* f=fopen(p,"wb"); if(f){fwrite(d,1,n,f);fclose(f);} };
+            sv("dump_dense_v.bin", mesh.verts.data(), mesh.verts.size()*4);
+            sv("dump_dense_f.bin", mesh.faces.data(), mesh.faces.size()*8);
+            FILE* m=fopen("dump_dense.txt","w");
+            if (m){ fprintf(m,"%zu %zu\n", mesh.verts.size()/3, mesh.faces.size()/3); fclose(m); }
+            if (V) printf("  [dump] dense mesh -> dump_dense_*.bin (%zu v / %zu f)\n", mesh.verts.size()/3, mesh.faces.size()/3);
+        }
         // per-vertex base_color. NON-remesh: mesh.verts[i] <-> pbr voxel i 1:1 zip (the dual-grid mesh
         // vertex IS voxel i). REMESH: the QEM mesh verts are NEW, so grid_sample (trilinear) the PBR
         // volume at each vertex position. This is the CLEAN colour path for the remeshed mesh — the
