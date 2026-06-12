@@ -130,12 +130,28 @@ int main(int argc, char** argv) {
     pix::ChainStats st;
     std::vector<float> vcolors, pbr_feats;
     std::vector<int32_t> pbr_coords;
+    // --remesh textured → PER-VERTEX colour by default: the QEM mesh's UV-atlas bake samples the teal
+    // model INTERIOR at folded charts ("teal splattered everywhere"); per-vertex grid_sample at the
+    // surface vertices is clean. UV-atlas remains opt-in (PIXAL3D_FORCE_UVATLAS) for non-remesh meshes
+    // or once a manifold remesh lands. (Per-vertex loses the metallic/roughness maps — fine for now.)
+    if (remesh && textured && !vcolor && !std::getenv("PIXAL3D_FORCE_UVATLAS")) vcolor = true;
     const bool uvatlas = textured && !vcolor;
     svae::Mesh mesh = pix::run_geometry(in, &st,
         (textured && vcolor) ? &vcolors : nullptr,
         uvatlas ? &pbr_feats : nullptr,
         uvatlas ? &pbr_coords : nullptr);
 
+    // PIXAL3D_DUMP_BAKE: dump the ALIGNED bake inputs (decimated mesh + the PBR volume from the SAME
+    // run) so the atlas/bake can be iterated offline (tex_bake_test) without misaligned golden data.
+    if (uvatlas && std::getenv("PIXAL3D_DUMP_BAKE")) {
+        auto sv=[](const char* p, const void* d, size_t n){ FILE* f=fopen(p,"wb"); if(f){fwrite(d,1,n,f);fclose(f);} };
+        sv("dump_mesh_v.bin", mesh.verts.data(), mesh.verts.size()*4);
+        sv("dump_mesh_f.bin", mesh.faces.data(), mesh.faces.size()*8);
+        sv("dump_pbr_f.bin",  pbr_feats.data(),  pbr_feats.size()*4);
+        sv("dump_pbr_c.bin",  pbr_coords.data(), pbr_coords.size()*4);
+        FILE* m=fopen("dump_bake.txt","w"); if(m){ fprintf(m,"%zu %zu %zu\n", mesh.verts.size()/3, mesh.faces.size()/3, pbr_feats.size()/6); fclose(m);}
+        printf("  [dump] bake inputs -> dump_*.bin (mesh %zu v / %zu f, pbr %zu)\n", mesh.verts.size()/3, mesh.faces.size()/3, pbr_feats.size()/6);
+    }
     bool ok;
     if (uvatlas) {
         // UV-atlas PBR bake: xatlas unwrap (decimated) -> rasterize -> grid_sample the per-voxel

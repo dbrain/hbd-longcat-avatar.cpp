@@ -13,6 +13,7 @@
 #include "svp_gpu.hpp"            // GPU-resident decode (Phase C #1): linear→cuBLAS, feats resident
 #include "remesh.hpp"            // A1: marching-tetrahedra manifold watertight remesh
 #include "qem.hpp"               // lap-17: feature-preserving QEM decimation of the dual-grid mesh
+#include "tex_grid_sample.hpp"   // lap-17: per-vertex PBR grid_sample for the remeshed mesh
 #include "torch_randn.hpp"
 #include <cstdio>
 #include <cmath>
@@ -378,10 +379,25 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         // full PBR volume (feeds the UV-atlas bake): feats [V6*6] + coords [V6*4]
         if (out_pbr_feats)  *out_pbr_feats  = pbr;
         if (out_pbr_coords) *out_pbr_coords = pbr_coords;
-        // interim per-vertex base_color (mesh.verts[i] <-> pbr voxel i, approximate zip)
+        // per-vertex base_color. NON-remesh: mesh.verts[i] <-> pbr voxel i 1:1 zip (the dual-grid mesh
+        // vertex IS voxel i). REMESH: the QEM mesh verts are NEW, so grid_sample (trilinear) the PBR
+        // volume at each vertex position. This is the CLEAN colour path for the remeshed mesh — the
+        // UV-atlas bake's per-texel positions interpolate across folded charts into the TEAL INTERIOR
+        // of the model (→ the "teal splattered everywhere" glitch); sampling at the actual surface
+        // VERTICES never reads the interior. Small fallback (off-shell QEM verts are sub-voxel away).
         if (out_vcolors) {
             out_vcolors->resize((size_t)mesh.N*3);
-            for (int i=0;i<mesh.N && i<V6;i++) for (int c=0;c<3;c++){ float v=pbr[(size_t)i*6+c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); }
+            if (in.remesh) {
+                texgs::VolIndex vol(pbr_coords.data(), V6, 4, 1);
+                const int fbr = std::getenv("PIXAL3D_VCOLOR_FB") ? atoi(std::getenv("PIXAL3D_VCOLOR_FB")) : 3;
+                #pragma omp parallel for schedule(dynamic,2048)
+                for (int i=0;i<mesh.N;i++){ float s[6]={0};
+                    float q0=(mesh.verts[(size_t)i*3]+0.5f)*1024.f, q1=(mesh.verts[(size_t)i*3+1]+0.5f)*1024.f, q2=(mesh.verts[(size_t)i*3+2]+0.5f)*1024.f;
+                    texgs::sample_one(vol, pbr.data(), 6, q0,q1,q2, s, fbr);
+                    for (int c=0;c<3;c++){ float v=s[c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); } }
+            } else {
+                for (int i=0;i<mesh.N && i<V6;i++) for (int c=0;c<3;c++){ float v=pbr[(size_t)i*6+c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); }
+            }
         }
     }
 

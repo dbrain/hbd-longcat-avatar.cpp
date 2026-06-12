@@ -314,8 +314,15 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     }
     if (verbose && holes) printf("[atlas] interior holes (covered but unsampled): %zu (%.2f%% of covered) -> inpainting\n",
                                  holes, 100.0*holes/(double)covered);
-    int inp_iters = std::getenv("TEX_INPAINT_ITERS") ? atoi(std::getenv("TEX_INPAINT_ITERS")) : 64;
-    inpaint(atl, mask2, W, Ht, C, std::max(padding+2, inp_iters));
+    // Gutter dilation. NON-precluster (few large charts, far apart): a big fill (64) also seals
+    // interior grid_sample-miss holes. PRECLUSTER (thousands of tiny charts packed ~padding apart):
+    // a big fill BLEEDS each chart's colour across the gutter into its neighbours → teal "peeking
+    // through the cuts" (the seam-glitch). Cap the fill at padding-1 so each chart only fills its OWN
+    // gutter and never reaches a neighbour's rendered texels (neighbours are `padding` apart). Interior
+    // holes are instead prevented by the nearest-voxel sample fallback, not by dilation.
+    int inp_iters = std::getenv("TEX_INPAINT_ITERS") ? atoi(std::getenv("TEX_INPAINT_ITERS"))
+                                                     : (precluster ? std::max(1, padding-1) : 64);
+    inpaint(atl, mask2, W, Ht, C, precluster ? inp_iters : std::max(padding+2, inp_iters));
 
     // ---- pack to uint8 textures (Python layout) ----
     bt.base_color.resize((size_t)W*Ht*4);

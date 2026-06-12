@@ -55,7 +55,7 @@ fi
 
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
-if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ]; then
+if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ]; then
   CXX="${CXX:-/usr/bin/g++}"
   TP="$HERE/../../../thirdparty"
   echo ">> build $BASE (xatlas + meshopt + raster + grid_sample, no ggml)"
