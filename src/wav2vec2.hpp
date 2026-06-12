@@ -83,7 +83,33 @@ namespace WAV2VEC2 {
         int pos_conv_groups = 16;
         float eps           = 1e-5f;
         int n_hidden_states = 25;  // input embeds + 24 layers
+        // feat_extract_norm: "layer" (wav2vec2-large: LayerNorm on EVERY conv layer,
+        // over channels) vs "group" (wav2vec2-base: GroupNorm per-channel-over-time on
+        // ONLY the first conv layer, the rest have no norm).
+        std::string feat_extract_norm = "layer";
+        // do_stable_layer_norm: true=pre-LN (large, encoder.layer_norm AFTER layers) vs
+        // false=post-LN (base, encoder.layer_norm BEFORE layers).
+        bool do_stable_layer_norm = true;
+
+        // chinese-wav2vec2-base (InfiniteTalk audio encoder): 768/12/12, post-LN,
+        // group feat-extract-norm. hidden_states[1:] (12 layer outputs) feed AudioProjModel.
+        static Wav2Vec2Params base() {
+            Wav2Vec2Params p;
+            p.d_model               = 768;
+            p.n_layers              = 12;
+            p.n_heads               = 12;
+            p.head_dim              = 64;  // 768/12
+            p.ffn_dim               = 3072;
+            p.n_hidden_states       = 13;  // input embeds + 12 layers
+            p.feat_extract_norm     = "group";
+            p.do_stable_layer_norm  = false;
+            return p;
+        }
     };
+
+    // Feat-extractor conv norm mode: per-timestep LayerNorm (large), per-channel
+    // GroupNorm (base, first conv only), or none (base, conv layers 1..6).
+    enum class ConvNorm { LAYER, GROUP, NONE };
 
     // --------------------------------------------------------------------
     // Feature-extractor conv layer (feat_extract_norm == "layer"):
@@ -96,35 +122,53 @@ namespace WAV2VEC2 {
         int64_t in_dim, out_dim;
         int kernel, stride;
         float eps;
+        ConvNorm norm;
 
         void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
             (void)tensor_storage_map;
-            params["conv.weight"]       = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kernel, in_dim, out_dim);
-            params["conv.bias"]         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_dim);
-            params["layer_norm.weight"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_dim);
-            params["layer_norm.bias"]   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_dim);
+            params["conv.weight"] = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kernel, in_dim, out_dim);
+            params["conv.bias"]   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_dim);
+            // LAYER (per-timestep) + GROUP (per-channel) both carry layer_norm.{weight,bias};
+            // NONE (base conv layers 1..6) has no norm params.
+            if (norm != ConvNorm::NONE) {
+                params["layer_norm.weight"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_dim);
+                params["layer_norm.bias"]   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_dim);
+            }
         }
 
     public:
-        Wav2Vec2ConvLayer(int64_t in_dim, int64_t out_dim, int kernel, int stride, float eps)
-            : in_dim(in_dim), out_dim(out_dim), kernel(kernel), stride(stride), eps(eps) {}
+        Wav2Vec2ConvLayer(int64_t in_dim, int64_t out_dim, int kernel, int stride, float eps,
+                          ConvNorm norm = ConvNorm::LAYER)
+            : in_dim(in_dim), out_dim(out_dim), kernel(kernel), stride(stride), eps(eps), norm(norm) {}
 
         // x: [T_in, in_dim, 1] (ggml ne: [length, channels, batch]); returns [T_out, out_dim, 1].
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
-            ggml_tensor* w  = params["conv.weight"];
-            ggml_tensor* b  = params["conv.bias"];
-            ggml_tensor* ln_w = params["layer_norm.weight"];
-            ggml_tensor* ln_b = params["layer_norm.bias"];
+            ggml_tensor* w = params["conv.weight"];
+            ggml_tensor* b = params["conv.bias"];
 
             x = ggml_conv_1d(ctx->ggml_ctx, w, x, stride, 0, 1);  // [T_out, out_dim, 1], padding 0
             x = ggml_add(ctx->ggml_ctx, x, ggml_reshape_3d(ctx->ggml_ctx, b, 1, out_dim, 1));
 
-            // LayerNorm over channels: ggml_norm normalizes over dim0, so transpose
-            // [T,C,1] -> [C,T,1], norm, scale/shift, transpose back.
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [C, T, 1]
-            x = ggml_norm(ctx->ggml_ctx, x, eps);
-            x = ggml_add(ctx->ggml_ctx, ggml_mul(ctx->ggml_ctx, x, ln_w), ln_b);
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [T, C, 1]
+            if (norm == ConvNorm::LAYER) {
+                // LayerNorm over channels: ggml_norm normalizes over dim0, so transpose
+                // [T,C,1] -> [C,T,1], norm, scale/shift, transpose back.
+                ggml_tensor* ln_w = params["layer_norm.weight"];
+                ggml_tensor* ln_b = params["layer_norm.bias"];
+                x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [C, T, 1]
+                x = ggml_norm(ctx->ggml_ctx, x, eps);
+                x = ggml_add(ctx->ggml_ctx, ggml_mul(ctx->ggml_ctx, x, ln_w), ln_b);
+                x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [T, C, 1]
+            } else if (norm == ConvNorm::GROUP) {
+                // GroupNorm(num_groups=C): each channel normalized over time. x is
+                // [T,C,1] so ggml_norm over dim0 (T) is exactly per-channel-over-time;
+                // affine weight/bias are per-channel [C] -> [1,C,1].
+                ggml_tensor* gn_w = params["layer_norm.weight"];
+                ggml_tensor* gn_b = params["layer_norm.bias"];
+                x = ggml_norm(ctx->ggml_ctx, x, eps);
+                x = ggml_add(ctx->ggml_ctx,
+                             ggml_mul(ctx->ggml_ctx, x, ggml_reshape_3d(ctx->ggml_ctx, gn_w, 1, out_dim, 1)),
+                             ggml_reshape_3d(ctx->ggml_ctx, gn_b, 1, out_dim, 1));
+            }
             x = ggml_gelu(ctx->ggml_ctx, x);
             return x;
         }
@@ -200,15 +244,17 @@ namespace WAV2VEC2 {
         }
     };
 
-    // Stable-layer-norm (pre-LN) transformer layer.
+    // Transformer layer. stable=true: pre-LN (wav2vec2-large stable-layer-norm).
+    // stable=false: post-LN (wav2vec2-base) — norm AFTER each residual add.
     class Wav2Vec2EncoderLayer : public GGMLBlock {
     protected:
         int64_t d_model, n_heads, ffn_dim;
         float eps;
+        bool stable;
 
     public:
-        Wav2Vec2EncoderLayer(int64_t d_model, int64_t n_heads, int64_t ffn_dim, float eps)
-            : d_model(d_model), n_heads(n_heads), ffn_dim(ffn_dim), eps(eps) {
+        Wav2Vec2EncoderLayer(int64_t d_model, int64_t n_heads, int64_t ffn_dim, float eps, bool stable = true)
+            : d_model(d_model), n_heads(n_heads), ffn_dim(ffn_dim), eps(eps), stable(stable) {
             blocks["attention.q_proj"]   = std::shared_ptr<GGMLBlock>(new Linear(d_model, d_model, true));
             blocks["attention.k_proj"]   = std::shared_ptr<GGMLBlock>(new Linear(d_model, d_model, true));
             blocks["attention.v_proj"]   = std::shared_ptr<GGMLBlock>(new Linear(d_model, d_model, true));
@@ -219,7 +265,7 @@ namespace WAV2VEC2 {
             blocks["final_layer_norm"]   = std::shared_ptr<GGMLBlock>(new LayerNorm(d_model, eps, true, true));
         }
 
-        // x: [d_model, T, 1]; pre-LN (stable layer norm) variant.
+        // x: [d_model, T, 1].
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, bool flash_attn) {
             auto q_proj = std::dynamic_pointer_cast<Linear>(blocks["attention.q_proj"]);
             auto k_proj = std::dynamic_pointer_cast<Linear>(blocks["attention.k_proj"]);
@@ -230,24 +276,29 @@ namespace WAV2VEC2 {
             auto fc2    = std::dynamic_pointer_cast<Linear>(blocks["feed_forward.output_dense"]);
             auto lnf    = std::dynamic_pointer_cast<LayerNorm>(blocks["final_layer_norm"]);
 
-            // attention (pre-LN)
-            auto residual = x;
-            auto h = ln->forward(ctx, x);
-            auto q = q_proj->forward(ctx, h);
-            auto k = k_proj->forward(ctx, h);
-            auto v = v_proj->forward(ctx, h);
-            auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v,
+            auto attn_of = [&](ggml_tensor* h) -> ggml_tensor* {
+                auto q = q_proj->forward(ctx, h);
+                auto k = k_proj->forward(ctx, h);
+                auto v = v_proj->forward(ctx, h);
+                auto a = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v,
                                                 n_heads, nullptr, false, flash_attn);  // [d_model, T, 1]
-            attn = outp->forward(ctx, attn);
-            x    = ggml_add(ctx->ggml_ctx, residual, attn);
+                return outp->forward(ctx, a);
+            };
 
-            // ffn (pre-LN), gelu
-            residual = x;
-            h = lnf->forward(ctx, x);
-            h = fc1->forward(ctx, h);
-            h = ggml_gelu(ctx->ggml_ctx, h);
-            h = fc2->forward(ctx, h);
-            x = ggml_add(ctx->ggml_ctx, residual, h);
+            if (stable) {
+                // pre-LN: residual + sublayer(LN(x))
+                auto residual = x;
+                x = ggml_add(ctx->ggml_ctx, residual, attn_of(ln->forward(ctx, x)));
+                residual = x;
+                auto h = lnf->forward(ctx, x);
+                h = fc2->forward(ctx, ggml_gelu(ctx->ggml_ctx, fc1->forward(ctx, h)));
+                x = ggml_add(ctx->ggml_ctx, residual, h);
+            } else {
+                // post-LN: LN(residual + sublayer(x))
+                x = ln->forward(ctx, ggml_add(ctx->ggml_ctx, x, attn_of(x)));
+                auto h = fc2->forward(ctx, ggml_gelu(ctx->ggml_ctx, fc1->forward(ctx, x)));
+                x = lnf->forward(ctx, ggml_add(ctx->ggml_ctx, x, h));
+            }
             return x;
         }
     };
@@ -260,12 +311,16 @@ namespace WAV2VEC2 {
         Wav2Vec2Encoder() {}
         Wav2Vec2Encoder(Wav2Vec2Params p)
             : p(p) {
-            // feature extractor conv layers
+            // feature extractor conv layers. "group" (base): GroupNorm on conv 0 only,
+            // the rest unnormed. "layer" (large): LayerNorm on every conv.
             int64_t in_dim = 1;
             for (int i = 0; i < p.n_conv_layers; i++) {
                 int64_t out_dim = p.conv_dim[i];
+                ConvNorm cn = (p.feat_extract_norm == "group")
+                                  ? (i == 0 ? ConvNorm::GROUP : ConvNorm::NONE)
+                                  : ConvNorm::LAYER;
                 blocks["feature_extractor.conv_layers." + std::to_string(i)] =
-                    std::shared_ptr<GGMLBlock>(new Wav2Vec2ConvLayer(in_dim, out_dim, p.conv_kernel[i], p.conv_stride[i], p.eps));
+                    std::shared_ptr<GGMLBlock>(new Wav2Vec2ConvLayer(in_dim, out_dim, p.conv_kernel[i], p.conv_stride[i], p.eps, cn));
                 in_dim = out_dim;
             }
             // feature projection
@@ -273,10 +328,10 @@ namespace WAV2VEC2 {
             blocks["feature_projection.projection"] = std::shared_ptr<GGMLBlock>(new Linear(p.conv_dim.back(), p.d_model, true));
             // pos conv
             blocks["encoder.pos_conv_embed"] = std::shared_ptr<GGMLBlock>(new Wav2Vec2PosConvEmbed(p.d_model, p.pos_conv_kernel, p.pos_conv_groups));
-            // stable-layer-norm transformer
+            // transformer (pre-LN if do_stable_layer_norm, else post-LN)
             for (int i = 0; i < p.n_layers; i++) {
                 blocks["encoder.layers." + std::to_string(i)] =
-                    std::shared_ptr<GGMLBlock>(new Wav2Vec2EncoderLayer(p.d_model, p.n_heads, p.ffn_dim, p.eps));
+                    std::shared_ptr<GGMLBlock>(new Wav2Vec2EncoderLayer(p.d_model, p.n_heads, p.ffn_dim, p.eps, p.do_stable_layer_norm));
             }
             blocks["encoder.layer_norm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(p.d_model, p.eps, true, true));
         }
@@ -307,17 +362,21 @@ namespace WAV2VEC2 {
 
             auto lnf = std::dynamic_pointer_cast<LayerNorm>(blocks["encoder.layer_norm"]);
 
+            // post-LN (base): encoder.layer_norm runs BEFORE the transformer layers.
+            if (!p.do_stable_layer_norm) {
+                x = lnf->forward(ctx, x);
+            }
+
             int64_t T = x->ne[1];
             std::vector<ggml_tensor*> hs;
-            // hidden_states[0] = pre-layer hidden state (post pos_conv). In stable-LN
-            // Wav2Vec2 the final encoder.layer_norm is applied AFTER all layers; HF's
-            // output_hidden_states captures the pre-final-LN states for [0..n-1] and the
-            // post-final-LN for the last entry.
+            // hidden_states[0] = pre-layer hidden state. stable-LN: post pos_conv (final
+            // encoder.layer_norm applied only to the LAST captured state, HF semantics).
+            // post-LN: post encoder.layer_norm; every layer output is already normed.
             hs.push_back(x);
             for (int i = 0; i < p.n_layers; i++) {
                 auto layer = std::dynamic_pointer_cast<Wav2Vec2EncoderLayer>(blocks["encoder.layers." + std::to_string(i)]);
                 x = layer->forward(ctx, x, flash_attn);
-                if (i == p.n_layers - 1) {
+                if (p.do_stable_layer_norm && i == p.n_layers - 1) {
                     hs.push_back(lnf->forward(ctx, x));
                 } else {
                     hs.push_back(x);
@@ -342,8 +401,9 @@ namespace WAV2VEC2 {
         Wav2Vec2EncoderRunner(ggml_backend_t backend,
                               ggml_backend_t params_backend,
                               const String2TensorStorage& tensor_storage_map = {},
-                              const std::string prefix                       = "audio_encoder")
-            : GGMLRunner(backend, params_backend) {
+                              const std::string prefix                       = "audio_encoder",
+                              Wav2Vec2Params params                          = {})
+            : GGMLRunner(backend, params_backend), p(params) {
             encoder = Wav2Vec2Encoder(p);
             encoder.init(params_ctx, tensor_storage_map, prefix);
         }

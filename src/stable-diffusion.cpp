@@ -758,9 +758,10 @@ public:
                                                                                   "model.high_noise_diffusion_model",
                                                                                   version);
                 }
-                if (diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
-                    diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
-                    diffusion_model->get_desc() == "Wan2.1-I2V-1.3B") {
+                if ((diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
+                     diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
+                     diffusion_model->get_desc() == "Wan2.1-I2V-1.3B") &&
+                    strlen(SAFE_STR(sd_ctx_params->clip_vision_path)) > 0) {
                     if (!ensure_backend_pair(SDBackendModule::CLIP_VISION)) {
                         return false;
                     }
@@ -5872,7 +5873,13 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         if (sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
             sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-I2V-1.3B" ||
             sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-FLF2V-14B") {
-            if (!start_image.empty()) {
+            if (sd_ctx->sd->clip_vision == nullptr) {
+                // Wan2.1-I2V with no --clip-vision model: feed zeroed clip_fea [1280,257]
+                // instead of failing. Degrades identity (the 257 image tokens are an
+                // appearance anchor) but lets the i2v path run from c_concat alone.
+                LOG_WARN("Wan2.1-I2V with no clip_vision: feeding zero clip_fea [1280,257]");
+                latents.clip_vision_output = sd::zeros<float>({1280, 257});
+            } else if (!start_image.empty()) {
                 auto clip_vision_output = sd_ctx->sd->get_clip_vision_output(start_image, false, -2);
                 if (clip_vision_output.empty()) {
                     LOG_ERROR("failed to compute clip vision output for init image");
@@ -6071,6 +6078,14 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     } else if (sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-VACE-1.3B" ||
                sd_ctx->sd->diffusion_model->get_desc() == "Wan2.x-VACE-14B") {
         LOG_INFO("VACE");
+        // Continuation mode: keep the first K control frames (mask=0, inactive context) and
+        // generate the rest, so the segment continues from the prior segment's carried-over
+        // tail. Default 0 = control mode (all frames reactive/generated). Env-toggled to match
+        // the codebase's experimental-flag pattern (no public-struct churn).
+        int vace_cont_frames = 0;
+        if (const char* e = getenv("VACE_CONT_FRAMES")) {
+            vace_cont_frames = std::max(0, atoi(e));
+        }
         int64_t t1 = ggml_time_ms();
         sd::Tensor<float> ref_image_latent;
         if (!start_image.empty()) {
@@ -6091,6 +6106,11 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         }
 
         sd::Tensor<float> mask = sd::full<float>({request->width, request->height, request->frames, 1, 1}, 1.0f);
+        if (vace_cont_frames > 0) {
+            int kpx = std::min<int>(vace_cont_frames, static_cast<int>(request->frames));
+            sd::ops::fill_slice(&mask, 2, 0, kpx, 0.0f);  // keep first K pixel frames (continuation context)
+            LOG_INFO("VACE continuation: %d kept pixel frames (mask=0)", kpx);
+        }
 
         control_video              = control_video - 0.5f;
         sd::Tensor<float> inactive = control_video * (1.0f - mask) + 0.5f;
@@ -6100,6 +6120,47 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         if (inactive.empty()) {
             LOG_ERROR("failed to encode VACE inactive context");
             return std::nullopt;
+        }
+
+        // VACE LATENT BACKDOOR: replace the re-encoded pixels in the kept (mask=0) head
+        // frames of `inactive` with the prior segment's TAIL diffusion latents, bypassing
+        // the lossy VAE decode->re-encode roundtrip. The saved latent (VACE_SAVE_LATENT)
+        // is already in encode_first_stage's (mu-mean)/std diffusion space, so it drops in
+        // directly. Composes with VACE_CONT_FRAMES (which sets mask=0 on those slots);
+        // unset => the re-encoded pixel path above is untouched (byte-identical default).
+        if (vace_cont_frames > 0) {
+            if (const char* lp = getenv("VACE_CONT_LATENT"); lp != nullptr && lp[0] != '\0') {
+                int64_t klat = std::min<int64_t>(
+                    (std::min<int64_t>(vace_cont_frames, request->frames) - 1) / 4 + 1,
+                    inactive.shape()[2]);
+                try {
+                    auto cont_full = sd::load_tensor_from_file_as_tensor<float>(lp);
+                    int64_t Tprev  = cont_full.shape()[2];
+                    int64_t K      = std::min<int64_t>(klat, Tprev);
+                    // last K latent frames of the prior segment (its tail = seg2's overlap head)
+                    auto cont_tail = sd::ops::slice(cont_full, 2, Tprev - K, Tprev);
+                    // rank/shape-match `inactive` ([W,H,T,C,1]) for slice_assign
+                    std::vector<int64_t> tgt = inactive.shape();
+                    tgt[2]                   = K;
+                    if (cont_tail.numel() != [&] { int64_t n = 1; for (auto d : tgt) n *= d; return n; }()) {
+                        LOG_ERROR("VACE_CONT_LATENT: shape mismatch, saved latent (%dx%dx%dx%d) "
+                                  "incompatible with inactive (%dx%dx%dx%d); skipping injection",
+                                  (int)cont_full.shape()[0], (int)cont_full.shape()[1],
+                                  (int)cont_full.shape()[2],
+                                  (int)(cont_full.dim() > 3 ? cont_full.shape()[3] : 1),
+                                  (int)inactive.shape()[0], (int)inactive.shape()[1],
+                                  (int)inactive.shape()[2], (int)inactive.shape()[3]);
+                    } else {
+                        cont_tail.reshape_(tgt);
+                        sd::ops::slice_assign(&inactive, 2, 0, K, cont_tail);
+                        LOG_INFO("VACE_CONT_LATENT: injected %lld tail latent frames (of %lld) into "
+                                 "inactive head, bypassing pixel re-encode",
+                                 (long long)K, (long long)Tprev);
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("VACE_CONT_LATENT: failed to load %s: %s (keeping re-encoded pixels)", lp, e.what());
+                }
+            }
         }
 
         reactive = sd_ctx->sd->encode_first_stage(reactive);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
@@ -6117,6 +6178,11 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         auto vace_context = sd::ops::concat(inactive, reactive, 3);  // [b, 2*c, t, h/vae_scale_factor, w/vae_scale_factor]
 
         mask              = sd::full<float>({request->width, request->height, inactive.shape()[2], 1, 1}, 1.0f);
+        if (vace_cont_frames > 0) {
+            int klat = std::min<int>((std::min<int>(vace_cont_frames, static_cast<int>(request->frames)) - 1) / 4 + 1,
+                                     static_cast<int>(inactive.shape()[2]));
+            sd::ops::fill_slice(&mask, 2, 0, klat, 0.0f);  // keep first K-equiv latent frames (continuation context)
+        }
         auto mask_context = mask.reshape({request->vae_scale_factor,
                                           inactive.shape()[0],
                                           request->vae_scale_factor,
@@ -6287,6 +6353,21 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
                      (int)video_latent.shape()[2], (int)video_latent.shape()[3], sp);
         } catch (const std::exception& e) {
             LOG_ERROR("LTXAV_SAVE_VIDEO_LATENT failed: %s", e.what());
+        }
+    }
+    // VACE latent chaining: bank the post-sampling diffusion-space latent (already
+    // ref-frame stripped, same (mu-mean)/std space as encode_first_stage's output) so
+    // the next VACE segment can inject its kept-frame tail directly into the `inactive`
+    // context via VACE_CONT_LATENT, bypassing the lossy pixel decode->re-encode roundtrip.
+    if (const char* sp = getenv("VACE_SAVE_LATENT"); sp != nullptr && sp[0] != '\0') {
+        try {
+            sd::save_tensor_to_file<float>(sp, video_latent, "vace_video_latent");
+            LOG_INFO("VACE_SAVE_LATENT: wrote diffusion latent (%dx%dx%dx%d) to %s",
+                     (int)video_latent.shape()[0], (int)video_latent.shape()[1],
+                     (int)video_latent.shape()[2],
+                     (int)(video_latent.dim() > 3 ? video_latent.shape()[3] : 1), sp);
+        } catch (const std::exception& e) {
+            LOG_ERROR("VACE_SAVE_LATENT failed: %s", e.what());
         }
     }
     LOG_DEBUG("decode_video_outputs latent %dx%dx%dx%d",
