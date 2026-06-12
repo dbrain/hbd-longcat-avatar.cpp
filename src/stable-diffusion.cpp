@@ -96,6 +96,7 @@ const char* model_version_to_str[] = {
     "Longcat-Video-Avatar",
     "PiD",
     "Ideogram 4",
+    "Wan 2.2 S2V (LiveAvatar)",
 };
 
 const char* sampling_methods_str[] = {

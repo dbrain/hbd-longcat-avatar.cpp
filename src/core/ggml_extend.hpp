@@ -2102,6 +2102,12 @@ protected:
     std::map<std::string, ggml_tensor*> cache_tensor_map;  // name -> tensor
     std::vector<std::pair<ggml_tensor*, std::string>> debug_tensors;
     const std::string final_result_name = "ggml_runner_final_result_tensor";
+    // Optional per-segment readback hook: called inside execute_graph after compute
+    // + sync but BEFORE the segment compute buffer is freed, so the caller can copy
+    // segment-local outputs (e.g. the causal KV cache's per-block K/V) to host. The
+    // arg is the just-computed (segment) graph. Used by wan_s2v's causal block path
+    // to read each block's K/V without materializing all 40 layers simultaneously.
+    std::function<void(ggml_cgraph*)> segment_readback_hook_ = nullptr;
 
     bool flash_attn_enabled    = false;
     bool conv2d_direct_enabled = false;
@@ -2327,6 +2333,7 @@ protected:
         // size — no nvidia-smi sampling/guessing. `driver_used` = everything on the
         // board (this module's params + compute + every other resident buffer +
         // CUDA context); `compute_buf` is this graph's activations only.
+#ifdef SD_USE_CUDA
         if (!sd_backend_is_cpu(runtime_backend) && getenv("LONGCAT_VRAM_BREAKDOWN") != nullptr) {
             size_t cuda_free = 0, cuda_total = 0;
             ggml_backend_cuda_get_device_memory(0, &cuda_free, &cuda_total);
@@ -2348,6 +2355,7 @@ protected:
                      pool_mb, prefetch_buf_pool_.size(),
                      bufmb(runtime_params_buffer), bufmb(resident_runtime_params_buffer));
         }
+#endif
         // Activation breakdown (env LONGCAT_TENSOR_DUMP=1). The gallocr compute buffer
         // above is the PEAK simultaneous-live activation set (what scales with frames).
         // This lists the largest graph tensors so we can see WHAT fills it and what
@@ -3864,6 +3872,12 @@ protected:
             }
         }
 
+        // Per-segment readback: the compute buffer is still alive here. Lets the
+        // caller copy this segment's local outputs to host before they're freed.
+        if (segment_readback_hook_) {
+            segment_readback_hook_(gf);
+        }
+
         int64_t t_cache_begin = ggml_time_ms();
         if (!copy_cache_tensors_to_cache_buffer(cache_keep_names)) {
             if (free_compute_buffer_immediately) {
@@ -4352,6 +4366,7 @@ public:
             !pinned_offload_params_disabled &&
             sd_backend_is_cpu(params_backend) &&
             !sd_backend_is_cpu(runtime_backend);
+#ifdef SD_USE_CUDA
         if (use_pinned_offload) {
             ggml_backend_buffer_type_t cuda_host_buft = ggml_backend_cuda_host_buffer_type();
             if (cuda_host_buft != nullptr) {
@@ -4362,6 +4377,7 @@ public:
                 }
             }
         }
+#endif
         if (params_buffer == nullptr) {
             params_buffer = ggml_backend_alloc_ctx_tensors(params_ctx, params_backend);
         }
