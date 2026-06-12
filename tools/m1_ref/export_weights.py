@@ -73,12 +73,27 @@ def export_torch(name, st_path):
 
 
 def main():
-    # SS flow (bf16) + SS decoder (fp16) -> use torch path for safe dtype cast
-    export_torch('ss_flow', os.path.join(SNAP, 'ss_flow_img_dit_1_3B_64_bf16.safetensors'))
-    export_torch('ss_dec', os.path.join(SNAP, 'ss_dec_conv3d_16l8_fp16.safetensors'))
-    # DINOv3 (fp32)
-    dst = find_safetensors(DINO)
-    export_torch('dinov3', dst)
+    import sys
+    which = sys.argv[1:] or ['ss_flow', 'ss_dec', 'dinov3']
+    if 'ss_flow' in which:
+        export_torch('ss_flow', os.path.join(SNAP, 'ss_flow_img_dit_1_3B_64_bf16.safetensors'))
+    if 'ss_dec' in which:
+        export_torch('ss_dec', os.path.join(SNAP, 'ss_dec_conv3d_16l8_fp16.safetensors'))
+    if 'dinov3' in which:
+        export_torch('dinov3', find_safetensors(DINO))
+    # --- M2: Shape SLat LR flow (grid 32, proj_in 2048, in/out 32) ---
+    if 'slat_flow_512' in which:
+        export_torch('slat_flow_512', os.path.join(SNAP, 'slat_flow_img2shape_dit_1_3B_512_bf16.safetensors'))
+    # --- M3b: Shape SLat HR flow (grid 64; same arch as 512) ---
+    if 'slat_flow_1024' in which:
+        export_torch('slat_flow_1024', os.path.join(SNAP, 'slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors'))
+    # --- M6: Tex SLat flow (in_ch 64 = 32 noise || 32 shape_slat; same DiT arch, CFG-off) ---
+    if 'slat_flow_imgshape2tex_1024' in which:
+        export_torch('slat_flow_imgshape2tex_1024',
+                     os.path.join(SNAP, 'slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors'))
+    # NOTE: tex_dec (tex_dec_next_dc_f16c32_fp16) is a sparse-VAE decoder like shape_dec — its
+    # SparseConv3d weights need the spike [27,Cin,Cout] transpose, so export it via the
+    # stage3a_capture.py path (mirror shape_dec export), NOT plain export_torch.
     print("\n[export_weights] done ->", OUT)
 
 

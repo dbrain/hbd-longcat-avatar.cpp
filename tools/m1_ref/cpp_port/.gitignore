@@ -1,0 +1,7 @@
+# Keep only source; ignore generated weights (12GB), refs, and compiled binaries.
+*
+!*.cpp
+!*.hpp
+!*.sh
+!*.py
+!.gitignore

@@ -68,6 +68,10 @@ def main():
         verbose=True,
     )
     z_s = out.samples.numpy().astype(np.float32)
+    _refs = os.path.join(HERE, "cpp_port", "refs")
+    os.makedirs(_refs, exist_ok=True)
+    np.save(os.path.join(_refs, "torch_z_s_fp32.npy"), z_s)
+    print(f"[torch_ref] saved torch_z_s_fp32.npy {z_s.shape}", flush=True)
 
     z_s_gold = np.load(os.path.join(GOLD, "stage1_ssdec", "z_s.npy")).astype(np.float32)
     print(f"\n[torch_ref] z_s(fp32 torch) vs golden(bf16 torso): "

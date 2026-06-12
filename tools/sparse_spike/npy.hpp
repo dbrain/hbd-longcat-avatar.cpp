@@ -22,7 +22,18 @@ struct NpyArray {
     const float*   f32() const { return reinterpret_cast<const float*>(raw.data()); }
     const double*  f64() const { return reinterpret_cast<const double*>(raw.data()); }
     const int32_t* i32() const { return reinterpret_cast<const int32_t*>(raw.data()); }
+    const int64_t* i64() const { return reinterpret_cast<const int64_t*>(raw.data()); }
+    const int8_t*  i8()  const { return reinterpret_cast<const int8_t*>(raw.data()); }
 };
+
+// element size for a numpy descr (little-endian / byte types).
+static inline size_t npy_elem_size(const std::string& d) {
+    if (d == "<f8" || d == "<i8" || d == "<u8") return 8;
+    if (d == "<f4" || d == "<i4" || d == "<u4") return 4;
+    if (d == "<f2" || d == "<i2" || d == "<u2") return 2;
+    if (d == "|i1" || d == "|u1" || d == "|b1") return 1;
+    return 4;  // default (legacy)
+}
 
 inline NpyArray npy_load(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -66,7 +77,7 @@ inline NpyArray npy_load(const std::string& path) {
     }
     if (a.shape.empty()) a.shape.push_back(1);
 
-    size_t elem = (a.descr == "<f8") ? 8 : 4;  // f4/i4 = 4
+    size_t elem = npy_elem_size(a.descr);
     a.raw.resize((size_t)a.numel() * elem);
     f.read(reinterpret_cast<char*>(a.raw.data()), a.raw.size());
     if (!f) throw std::runtime_error("npy: short read " + path);
