@@ -310,19 +310,24 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
     //   fewer polys. Decimates 3.25M→~150-200k in ~3s, render ≈ the golden full mesh.
     //   PIXAL3D_REMESH_FACES = target triangle budget (default 200000; **0 = keep the raw max-detail
     //   mesh** for the "give me the massive mesh" option). PIXAL3D_REMESH_AGGR = QEM aggressiveness.
-    if (in.remesh) {
+    // REMESH timing: when TEXTURED, the QEM is DEFERRED to the texture branch so we can colour the
+    // DENSE mesh first (exact, smooth, hole-free) and carry the colour through the collapses (avoids
+    // the noisy "zombie" patchwork from re-sampling the sparse PBR volume at the moved output verts).
+    // Geometry-only remesh decimates here.
+    const bool remesh_deferred = in.remesh && in.textured;
+    const int   remesh_target = std::getenv("PIXAL3D_REMESH_FACES") ? atoi(std::getenv("PIXAL3D_REMESH_FACES")) : 200000;
+    const double remesh_aggr  = std::getenv("PIXAL3D_REMESH_AGGR")  ? atof(std::getenv("PIXAL3D_REMESH_AGGR"))  : 7.0;
+    if (in.remesh && !remesh_deferred) {
         double tw = now_s();
-        int target = std::getenv("PIXAL3D_REMESH_FACES") ? atoi(std::getenv("PIXAL3D_REMESH_FACES")) : 200000;
-        double aggr = std::getenv("PIXAL3D_REMESH_AGGR")  ? atof(std::getenv("PIXAL3D_REMESH_AGGR"))  : 7.0;
-        if (target > 0 && mesh.F > target) {
+        if (remesh_target > 0 && mesh.F > remesh_target) {
             int f0 = mesh.F;
-            mesh = qem::qem_simplify(mesh, target, aggr);
+            mesh = qem::qem_simplify(mesh, remesh_target, remesh_aggr);
             svae::orient_consistent(mesh);
             int64_t b,nm; svae::mesh_topology_stats(mesh, b, nm);
             if (V) printf("[7b] REMESH (QEM %d→%d faces, target %d, aggr %.1f): verts=%d boundary=%lld nonmanifold=%lld (%.1fs)\n",
-                          f0, mesh.F, target, aggr, mesh.N, (long long)b, (long long)nm, now_s()-tw);
+                          f0, mesh.F, remesh_target, remesh_aggr, mesh.N, (long long)b, (long long)nm, now_s()-tw);
         } else if (V) {
-            printf("[7b] REMESH: raw max-detail mesh kept (faces=%d, target=%d) (%.1fs)\n", mesh.F, target, now_s()-tw);
+            printf("[7b] REMESH: raw max-detail mesh kept (faces=%d, target=%d) (%.1fs)\n", mesh.F, remesh_target, now_s()-tw);
         }
     } else if (in.watertight) {
         double tw = now_s();
@@ -386,19 +391,42 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         // of the model (→ the "teal splattered everywhere" glitch); sampling at the actual surface
         // VERTICES never reads the interior. Small fallback (off-shell QEM verts are sub-voxel away).
         if (out_vcolors) {
-            out_vcolors->resize((size_t)mesh.N*3);
-            if (in.remesh) {
+            if (remesh_deferred) {
+                // colour the DENSE dual-grid mesh per-vertex (verts sit on the shell → trilinear hits
+                // the exact voxel → smooth, hole-free), THEN QEM-decimate carrying the colour through
+                // the collapses. This is what kills the "zombie" patchwork (re-sampling the sparse
+                // volume at the sparse, slightly-off output verts was the noise source).
                 texgs::VolIndex vol(pbr_coords.data(), V6, 4, 1);
-                const int fbr = std::getenv("PIXAL3D_VCOLOR_FB") ? atoi(std::getenv("PIXAL3D_VCOLOR_FB")) : 3;
+                const int fbr = std::getenv("PIXAL3D_VCOLOR_FB") ? atoi(std::getenv("PIXAL3D_VCOLOR_FB")) : 12;
+                std::vector<float> dcol((size_t)mesh.N*3);
                 #pragma omp parallel for schedule(dynamic,2048)
                 for (int i=0;i<mesh.N;i++){ float s[6]={0};
                     float q0=(mesh.verts[(size_t)i*3]+0.5f)*1024.f, q1=(mesh.verts[(size_t)i*3+1]+0.5f)*1024.f, q2=(mesh.verts[(size_t)i*3+2]+0.5f)*1024.f;
                     texgs::sample_one(vol, pbr.data(), 6, q0,q1,q2, s, fbr);
-                    for (int c=0;c<3;c++){ float v=s[c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); } }
+                    for (int c=0;c<3;c++){ float v=s[c]; dcol[(size_t)i*3+c]=v<0?0:(v>1?1:v); } }
+                double tw=now_s();
+                if (remesh_target > 0 && mesh.F > remesh_target) {
+                    int f0=mesh.F;
+                    svae::Mesh dec = qem::qem_simplify(mesh, remesh_target, remesh_aggr, &dcol, out_vcolors);
+                    svae::orient_consistent(dec); mesh = dec;
+                    int64_t b,nm; svae::mesh_topology_stats(mesh,b,nm);
+                    if (V) printf("[7b] REMESH (QEM+colour %d→%d faces, target %d): verts=%d boundary=%lld nonmanifold=%lld (%.1fs)\n",
+                                  f0, mesh.F, remesh_target, mesh.N, (long long)b, (long long)nm, now_s()-tw);
+                } else { *out_vcolors = dcol; if (V) printf("[7b] REMESH: raw max-detail mesh + per-vertex colour (faces=%d)\n", mesh.F); }
             } else {
+                out_vcolors->resize((size_t)mesh.N*3);
                 for (int i=0;i<mesh.N && i<V6;i++) for (int c=0;c<3;c++){ float v=pbr[(size_t)i*6+c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); }
             }
         }
+    }
+
+    // Catch-all: if the QEM was deferred (textured remesh) but the colour path above didn't run it
+    // (e.g. forced UV-atlas, no out_vcolors), decimate now so the returned/baked mesh is web-sized.
+    if (remesh_deferred && remesh_target > 0 && mesh.F > remesh_target) {
+        double tw=now_s(); int f0=mesh.F;
+        mesh = qem::qem_simplify(mesh, remesh_target, remesh_aggr);
+        svae::orient_consistent(mesh);
+        if (V) printf("[7b] REMESH (QEM deferred %d→%d faces) (%.1fs)\n", f0, mesh.F, now_s()-tw);
     }
 
     if (stats) { stats->N1=N1; stats->M=M; stats->secs=now_s()-t0; }
