@@ -267,3 +267,40 @@ plane so planar UVs don't overlap → no ambiguous volumetric samples; >~85° ri
 `texatlas::bake(..., precluster, cone_deg=80)`; `pixal3d.cpp` sets `precluster=true` for `--remesh`
 (env `PIXAL3D_NO_PRECLUSTER` reverts, `ATL_CONE` tunes). Offline test harness:
 `QEM_ATLAS_PRECLUSTER=1` in `remesh_test`. E2E texture-quality validation: see below.
+
+---
+## 6. LAP-17 — TEXTURE: UV-atlas teal-splatter → PER-VERTEX colour (the clean fix)
+
+**Owner:** "ours is splattered with teal everywhere, even the legs" (pyref's skirt is black with a few
+intended teal dots; the model's INTERIOR is teal and pyref shows it only through tiny seam-holes).
+**Cause:** the QEM mesh's UV-atlas bake. xatlas ComputeCharts hangs on its non-manifold edges, so we
+used the normal-cone precluster (planar projection of region-grown charts) — but those charts FOLD
+where the surface curves, so the per-texel rasterized 3D positions interpolate INTO the teal model
+interior → teal splattered over the whole body. (The atlas image confirmed it: streaks + teal sea.)
+make_manifold→xatlas also dead-ends (nm 53769→0 in 0.1s but +253k boundary edges → xatlas still slow).
+**FIX = per-vertex colour for `--remesh --tex`:** grid_sample (trilinear, `texgs::sample_one`, small
+fallback) the PBR volume at each SURFACE VERTEX (`pixal3d_chain.hpp` out_vcolors remesh branch). Surface
+verts never read the interior → no teal splatter, no seams, no atlas at all. COLOR_0 mean [0.20,0.37,0.35],
+28% teal (= the big twin-tails); render = teal tails + dark body/skirt/boots ≈ pyref. ~5MB GLB.
+`pixal3d.cpp`: remesh+textured ⇒ vcolor by default (UV-atlas opt-in via `PIXAL3D_FORCE_UVATLAS`).
+**Residual:** some teal still bleeds where hair sits against the body (trilinear blends the adjacent
+hair voxels + some genuinely-generated teal). The proper fix (Python's, per the handoff) = **BVH-reproject
+onto the original dense dual-grid mesh** (closest surface point + barycentric per-vertex PBR) — stays on
+the correct surface; also the path to true UV PBR maps (metallic/roughness, which per-vertex drops).
+**Offline iter harness:** `pixal3d ... PIXAL3D_DUMP_BAKE=1` dumps aligned mesh+PBR → `tex_bake_dump`
+(+`VCOLOR`) bakes/renders in seconds (the golden stage4-PBR-on-stage5-mesh offline tests were MISALIGNED
+→ false teal; always validate texture with same-run aligned data). `render_geo_detail.py`/`front_render.py`.
+
+### 6b. Texture follow-up — colour-CARRY through QEM (kills the per-vertex noise)
+Per-vertex grid_sample AT the QEM output verts gave a noisy teal/black "zombie" patchwork (the
+sparse output verts sit slightly off the sparse shell → adjacent verts hit different voxels; ~17%
+near-black holes). **Fix: colour the DENSE dual-grid mesh first** (its verts sit exactly on the shell
+→ trilinear hits the exact voxel → smooth, hole-free) **and CARRY the colour through the QEM
+collapses** (averaged on merge — `qem::Vert.col`, `qem_simplify(in_col,out_col)`, carried in
+`compact()`). Chain DEFERS the QEM to the texture branch (`remesh_deferred`) so the dense mesh is
+coloured before decimation. Result: clean teal tails + dark outfit + skin, ≈ pyref, 200k f / 5MB,
+near-black 17%→13%, holes →0.04%. **Residual:** dark patches on the thin double-sided twin-tails
+(QEM collapses can merge a tail vert with a spatially-near dark/back vert → averaged dark; + genuine
+dark in the volume). Proper fix = front-face-aware sampling / BVH-reproject onto the dense mesh — also
+the path to true UV PBR maps (per-vertex drops metallic/roughness). compare.html tex tab A =
+miku_qem_vcolor.glb. **Validated front-on vs pyref (`ours_vs_pyref.png`): recognisably clean Miku.**
