@@ -48,6 +48,34 @@ reference_subagent_background_stall, feedback_no_build_on_server, feedback_clean
 
 Build: cd tools/m1_ref/cpp_port && ./build.sh <t> cuda. Weights /mnt/hdd/pixal3d (symlinked); --fast =
 perf config (+weights_gguf_f16/); flash = PIXAL3D_FLASH=1; NVIDIA_TF32_OVERRIDE=0. Render venv =
-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python. Long jobs run_in_background:true from the MAIN loop
-(sub-agents deadlock on bg completion); chain build&&run, track+kill PIDs, no pkill -f / rm-globs.
-compare.html on :8011. Keep docs/memory current. Worktree UNCOMMITTED — leave it.
+/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python. compare.html on :8011 (python3 -m http.server 8011
+in cpp_port). The repo IS now committed (branch spike/sparse-conv-3d); commit progress as you go
+(source only — cpp_port/.gitignore keeps *.cpp/.hpp/.sh/.py and excludes weights/binaries/glb/ply/png;
+no Co-Authored-By trailers). The ggml submodule has a local-only diagnostic fattn.cu env override —
+leave it unless you fix the mma_f16 PV-accumulator properly.
+
+## HOW TO RUN THIS AS A LONG AUTONOMOUS SESSION (stay alive, keep going, don't false-"done")
+This is a multi-hour solo run; the owner wants to wake to it DONE + user-testable. Operating rules:
+- DON'T STOP AT ONE WIN. Last lap's mistake was declaring victory on side-quests. After each result:
+  update FINDINGS/PERF-NOTES/memory + commit, then IMMEDIATELY pick the next item. Loop until the whole
+  DoD is met (crispness FIRST, then atlas speed, perf/VRAM, MoGe service, API). Only halt if hard-stuck.
+- CONTEXT HYGIENE (so summarization never loses state): the docs ARE your resume state. Bank every
+  finding/number/dead-end into FINDINGS-15 / PERF-NOTES / the project memory AS YOU GO, not at the end.
+  If context gets summarized mid-task, re-read the handoff + FINDINGS + memory to rebuild and continue.
+- SUBAGENTS — use them to keep the MAIN context lean, but know the trap: spawn Explore/general-purpose
+  agents ONLY for bounded READ/RESEARCH fan-out (locate code across files, survey QEM/dual-contour libs,
+  read xatlas/meshopt APIs) and have them return just the conclusion. **Do NOT use a sub-agent to drive
+  GPU iteration or to wait on a background job — sub-agents are NOT woken on run_in_background completion
+  and will DEADLOCK** (project memory: reference_subagent_background_stall). Drive all heavy
+  build->run->measure loops from the MAIN loop. Do NOT fan out multiple torch/python/GPU subagents at
+  once during a GPU run (contention: feedback_no_heavy_parallel_subagents_during_gpu_test). No multi-agent
+  workflow for basic research (feedback_no_workflow_for_basic_research).
+- LONG GPU JOBS: launch run_in_background:true FROM THE MAIN LOOP (you get woken on completion); chain
+  build && run with && (a failed build must not launch a stale binary); track + kill PIDs by PID; never
+  pkill -f / rm-globs (trips the CLI gate). Sweep pgrep before handoff; leave no strays.
+- ITERATE CHEAP: use iter_remesh.sh (offline, seconds, geometry render) for ALL crispness tuning; only
+  spend a full ~4-5min E2E once the geometry is crisp. Same spirit for perf — use the standalone tests
+  (m3b_sampler_test, m4_gpu_test, fa_repro, etc.) before full E2Es.
+- VRAM intel (owner observed the Miku run): mostly ~3.3GB resident, ONE blip higher mid-run — that blip
+  is the NAF@1024 im2col peak (~5.9GB, see PERF-NOTES LAP 4); that single spike is the VRAM target to
+  flatten (tiling / streaming the im2col). Re-measure peak after the crispness+atlas changes.
