@@ -256,3 +256,18 @@ branch): pre-scale V by 1/64 (power-of-2 = bit-exact), flash, scale output back 
 - Cleaner follow-up: patch the `mma_f16` kernel PV accumulator to honor PREC_F32 (recovers 0.9991→0.9998,
   drops the V-scale workaround). Repro tooling left in-tree: `fa_repro.cpp` (FA_LOAD replay, FA_REALPATH,
   FA_QKDOWN/VDOWN, FA_GALLOC, FA_BLOCKS), m3b `PIXAL3D_FA_CAPTURE`+`CAPFWD`, harness `PIXAL3D_{SCHED,NO_GALLOC}`.
+
+---
+## LAP 17 (2026-06-13) — VRAM re-profile (post-flash, --remesh --tex --fast, Miku)
+Tight nvidia-smi poll (2.5s) over the full E2E. **Baseline ~3.5GB; single PEAK = 6021 MiB at the
+stage-5 1024² window** (DINOv3@1024 encode + NAF@1024 im2col — the poll label lags so it's one of
+those two; matches the handoff's "NAF@1024 im2col ~5.9GB" call). Per-stage (MiB): DINOv3@512 4185 ·
+SS DiT 4007 · NAF@512/M2 ~780 · **[5] 1024² 6021 (PEAK)** · NAF@1024 settles 3563 · M3b 423 ·
+remesh/QEM 3565 · tex DiT 1489. (M4/QEM/bake are host-CPU → low GPU.)
+**Sub-4GB target = flatten the 6021 spike** (everything else already ≤4.2GB; DINOv3@512 4185 + SS DiT
+4007 are the next tier). The 1024² conv im2col is already F16 under --fast (`naf_graph.hpp conv()`).
+**Plan: tile the @1024 conv spatially** (split 1024² into overlapping tiles with a 1px reflect-pad
+halo for k3, im2col+matmul per tile, concat) to bound the im2col tensor — OR confirm/instrument
+whether the spike is DINOv3@1024 attention vs NAF im2col first (add per-op cudaMemGetInfo logging;
+pixal3d has no per-phase VRAM log yet). If DINOv3@1024 attention: wire flash there too. NOT YET DONE
+— scoped, correctness-sensitive (validate N1==1120 + mesh IoU + render after tiling).
