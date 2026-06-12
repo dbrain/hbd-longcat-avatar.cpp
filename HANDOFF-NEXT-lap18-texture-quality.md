@@ -75,12 +75,39 @@ slow); aggressive ChartOptions (timed out); per-vertex nearest-voxel (zombie noi
 trilinear without carry (noise); naive planar precluster wide cone (sliver streaks). The golden
 stage4-PBR-on-stage5-mesh offline tests are MISALIGNED → false teal; ALWAYS use same-run dump data.
 
-## CONCURRENT: sub-4GB VRAM (owner #2)
-Miku peak **6021 MiB at the stage-5 1024² conv im2col** (baseline ~3.5GB; PERF-NOTES LAP 17). FIRST
-instrument which op (DINOv3@1024 attention vs NAF@1024 im2col — add `cudaMemGetInfo` per-phase; the
+## RUN BOTH Miku AND turtle, with TWO compare pages (owner wants two things to eyeball)
+Every texture/perf change must be validated on BOTH assets and surfaced on its OWN compare page:
+- Miku: input `tools/sparse_spike/golden_stages/pre/preprocessed.png` (default cam). compare.html
+  (`:8011`) tex/geo tab A → `miku_qem_*.glb`.
+- Turtle (the HEAVY asset, N1=3605 / 9M f / M3b ~169s — slow + high-VRAM is INHERENT, not a bug):
+  input `tools/m1_ref/cpp_port/prep_test_matte.png`. **Spin up a SECOND page `compare_turtle.html`**
+  (copy compare.html, point at `turtle_qem_*.glb`, serve on a 2nd port e.g. `:8012`). Owner: "running
+  for Miku and spinning up an extra compare page for turtle so I have two things to look at."
+- Render both front-on vs their refs each iteration; the texture fix + perf must hold on the turtle too.
+
+## CONCURRENT: VRAM — sub-4GB Miku AND sub-10GB turtle (owner #2)
+Owner: "vram wise it should be sub 4 GB for Miku but [sub] 10 for turtle as well ideally." Miku peak
+**6021 MiB at the stage-5 1024² conv im2col** (baseline ~3.5GB; PERF-NOTES LAP 17). **Turtle NOT yet
+peak-measured** — an 8s poll caught 5611 MiB at M3b but the true peak (denser im2col/attention) is
+higher; MEASURE it (tight poll or per-phase cudaMemGetInfo) and drive it <10GB. FIRST instrument which
+op is the 1024² spike (DINOv3@1024 attention vs NAF@1024 im2col — add `cudaMemGetInfo` per-phase; the
 poll label lagged). Then: tile the @1024 conv spatially (overlapping tiles + 1px reflect halo for k3,
-im2col+matmul per tile, concat) OR wire flash to DINOv3@1024. Validate N1==1120 + mesh IoU + render.
-Next tier after the spike: DINOv3@512 4185 + SS DiT 4007.
+im2col+matmul per tile, concat) — this helps BOTH assets — OR wire flash to DINOv3@1024. Validate
+N1==1120 + mesh IoU + render. Next tier after the spike: DINOv3@512 4185 + SS DiT 4007.
+
+## CONCURRENT: kill the remaining HOST-CPU poles (owner: "atlas still seems CPU bound")
+The fast precluster made xatlas ~2s, but several poles are STILL host CPU and dominate the non-DiT
+wall (and the turtle's atlas was minutes at 296k f). Move to GPU:
+- **xatlas PackCharts** is CPU (~2s Miku, worse on turtle) — precluster already skips the slow
+  ComputeCharts; if the UV-PBR path needs it faster, GPU the pack or cap chart count.
+- **Tex BAKE raster + grid_sample** (`tex_atlas.hpp` CPU triangle rasterizer + `tex_grid_sample.hpp`):
+  the per-texel 3D-pos raster + volume sample is CPU — nvdiffrast-style GPU raster + GPU grid_sample.
+  The lap-18 BVH-reproject (closest-point on the dense mesh per texel) should be done ON GPU too
+  (it's the new heavy per-texel op).
+- **M4 mesh-extract ~19.8s HOST** (`build_nmap` hashmap-per-level + host coord arithmetic) — GPU/Morton
+  neighbour-map. Flagged since lap-15, still open; it's a big chunk of the turtle's CPU tail.
+Measure the per-stage wall on BOTH assets (the chain prints per-stage `(%.1fs)`); the host-CPU poles
+are M4-extract + bake-raster + pack. Owner cares because the turtle made them visible.
 
 ## ALSO QUEUED (lower priority, after texture)
 - MoGe camera as a warm Python host SERVICE (owner #3, kill the last per-call Python; mirror
