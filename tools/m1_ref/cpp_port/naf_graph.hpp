@@ -39,6 +39,11 @@ static inline ggml_tensor* conv(ggml_context* ctx, M1Harness& H, ggml_tensor* x,
         x = ggml_pad_reflect_1d(ctx, x, pad, pad);                 // pad ne0 (now H)
         x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));      // back [W',H',C,B]
     }
+    // VRAM lever (D): ggml_conv_2d's im2col takes the KERNEL's dtype. At @1024 the ImageEncoder's
+    // 128ch k3 im2col over 1024² is the chain's VRAM PEAK (~4.8GB f32). Under PIXAL3D_FAST, cast the
+    // kernel to F16 -> F16 im2col (halves it) + tensor cores; the mul_mat still accumulates in F32.
+    // Near-lossless (im2col is data rearrangement; cosine validated). Default path stays f32 bit-exact.
+    if (pix_fast_prec()) w = ggml_cast(ctx, w, GGML_TYPE_F16);
     x = ggml_conv_2d(ctx, w, x, 1, 1, 0, 0, 1, 1);                 // pad already applied
     ggml_tensor* bb = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);  // [1,1,OC,1]
     return ggml_add(ctx, x, bb);
