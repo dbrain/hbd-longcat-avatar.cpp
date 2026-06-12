@@ -141,17 +141,20 @@ int main(int argc, char** argv) {
         // UV-atlas PBR bake: xatlas unwrap (decimated) -> rasterize -> grid_sample the per-voxel
         // PBR volume -> baseColor + metallicRoughness atlases -> textured glTF.
         double tb = pix::now_s();
-        // --remesh produces a SOLIDIFIED outer surface that sits a few voxels off the sparse PBR
-        // shell → the trilinear grid_sample misses → enable the nearest-voxel fallback (radius scales
-        // with the remesh stride; ~3× covers the solidify+smooth displacement).
-        // generous radius (st*12): the solidified+smoothed surface can sit well off the sparse PBR
-        // shell in concavities (skirt/underarm/between-legs); a small radius left black holes there.
-        // Cost is negligible — only the rare far-from-shell texels search deep (bake time unchanged).
-        int fb_r = 0;
-        if (remesh) { int st = std::getenv("PIXAL3D_REMESH_STRIDE") ? atoi(std::getenv("PIXAL3D_REMESH_STRIDE")) : 4;
-                      fb_r = st*12; }
+        // --remesh now QEM-decimates the dual-grid mesh IN THE CHAIN (feature-preserving, clean), so
+        // the bake must NOT re-decimate (that would re-run meshopt sloppy → undo the clean QEM). Pass
+        // deci=0 for remesh. The QEM vertices are the dual-grid QEF positions (≈ on the PBR shell), so
+        // grid_sample mostly hits; a moderate nearest-voxel fallback still covers QEM's small in/out
+        // displacement in flat/concave regions (skirt/underarm) so no black texels. Non-remesh path
+        // keeps the auto decimate (dual mesh is full-res there).
+        int fb_r = remesh ? 16 : 0;
+        int bake_deci = remesh ? 0 : decimate;
+        // remesh path: the QEM mesh has ~50k non-manifold edges that make xatlas ComputeCharts
+        // segmentation hang (minutes); use our normal-cone PRE-CLUSTER + AddUvMesh (pack-only) instead.
+        bool precluster = remesh && !std::getenv("PIXAL3D_NO_PRECLUSTER");
         texatlas::BakedTexture bt = texatlas::bake(mesh.verts, mesh.faces, pbr_feats, pbr_coords,
-                                                   /*grid_res*/1024, texsize, decimate, 4, true, fb_r);
+                                                   /*grid_res*/1024, texsize, bake_deci, 4, true, fb_r,
+                                                   precluster);
         printf("  [tex] UV-atlas bake: %dx%d, %d charts, %d out-verts (%.1fs)\n",
                bt.tw, bt.th, bt.chart_count, (int)bt.verts.size()/3, pix::now_s()-tb);
         ok = glb::write_glb_textured(out.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces,

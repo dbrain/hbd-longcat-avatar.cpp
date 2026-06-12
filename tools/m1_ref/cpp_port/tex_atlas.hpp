@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
+#include <array>
+#include <unordered_map>
 
 namespace texatlas {
 
@@ -120,10 +122,74 @@ static inline uint8_t u8(float v){ v=v*255.f+0.5f; return (uint8_t)(v<0?0:(v>255
 
 // Bake. in_verts [Vin*3] in [-0.5,0.5]; in_faces int64 [Fin*3]; PBR volume feats [N*6] + coords
 // [N*4] (b,x,y,z) at grid `grid_res`; texture_size target; padding texels for the gutter.
+// Normal-cone CHART PRE-CLUSTER (lap-17 P1). xatlas' ComputeCharts segmentation is pathologically
+// slow on the QEM remesh (its ~50k non-manifold edges blow up the half-edge build → minutes / hangs).
+// Since the texture bakes VOLUMETRICALLY (per-texel 3D position → grid_sample), UV layout quality is
+// irrelevant — we only need disjoint, low-distortion islands to pack. So we build the charts
+// ourselves: region-grow faces over edge adjacency while their normals stay within a cone of the
+// chart seed normal, planar-project each chart, and hand xatlas pre-made UV islands via AddUvMesh +
+// faceMaterialData → it only PACKS (seconds), skipping segmentation entirely. Robust to non-manifold
+// (our own face adjacency). Returns per-uv-vertex 2D coords + uv→orig-vertex map + remapped faces +
+// per-face chart/material id. cone_cos = cos(half-angle); lower = bigger charts/fewer islands.
+static inline void precluster_charts(const std::vector<float>& V, const std::vector<int64_t>& F,
+        float cone_cos, std::vector<float>& uv, std::vector<int>& uv2orig,
+        std::vector<uint32_t>& uvfaces, std::vector<uint32_t>& facemat, int& n_charts) {
+    const int64_t Nf = (int64_t)F.size()/3;
+    // face normals
+    std::vector<float> fn((size_t)Nf*3);
+    for (int64_t t=0;t<Nf;t++){ const float*a=&V[F[t*3]*3],*b=&V[F[t*3+1]*3],*c=&V[F[t*3+2]*3];
+        float e1[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, e2[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        float n[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+        float L=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if(L<1e-20f)L=1;
+        fn[t*3]=n[0]/L; fn[t*3+1]=n[1]/L; fn[t*3+2]=n[2]/L; }
+    // edge -> faces (for face adjacency)
+    std::unordered_map<int64_t,std::vector<int>> e2f; e2f.reserve((size_t)Nf*3);
+    auto ukey=[](int64_t a,int64_t b){ int64_t lo=a<b?a:b,hi=a<b?b:a; return (lo<<32)|(uint32_t)hi; };
+    for (int64_t t=0;t<Nf;t++){ int64_t v[3]={F[t*3],F[t*3+1],F[t*3+2]};
+        for(int e=0;e<3;e++) e2f[ukey(v[e],v[(e+1)%3])].push_back((int)t); }
+    // region-grow charts (BFS). A face joins iff within the cone of the chart's SEED normal — the SAME
+    // normal used as the projection plane below. So every face in a chart projects with area scale
+    // >= cone_cos (cos of the cone half-angle): at 40° that's 0.77 (no degenerate slivers → no UV
+    // streaks); at 80° it'd be 0.17 (the garbled-atlas bug). Keep the cone tight (~40°).
+    std::vector<int> chart((size_t)Nf,-1); std::vector<int> stack; n_charts=0;
+    std::vector<std::array<float,3>> seedn;   // each chart's seed (= projection) normal
+    for (int64_t s=0;s<Nf;s++){ if(chart[s]>=0) continue;
+        int c=n_charts++; const float* sn=&fn[s*3]; seedn.push_back({sn[0],sn[1],sn[2]});
+        chart[s]=c; stack.push_back((int)s);
+        while(!stack.empty()){ int t=stack.back(); stack.pop_back(); int64_t v[3]={F[t*3],F[t*3+1],F[t*3+2]};
+            for(int e=0;e<3;e++){ for(int nf: e2f[ukey(v[e],v[(e+1)%3])]){ if(chart[nf]>=0) continue;
+                if (fn[nf*3]*sn[0]+fn[nf*3+1]*sn[1]+fn[nf*3+2]*sn[2] >= cone_cos){ chart[nf]=c; stack.push_back(nf); } } } }
+    }
+    // planar-project each chart onto its SEED-normal plane; new uv-vertex per (chart, orig-vertex)
+    std::vector<std::array<float,6>> basis((size_t)n_charts);   // tangent(3)+bitangent(3)
+    for (int c=0;c<n_charts;c++){ double n[3]={seedn[c][0],seedn[c][1],seedn[c][2]};
+        double L=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if(L<1e-20)L=1; n[0]/=L;n[1]/=L;n[2]/=L;
+        double ref[3]; if (std::fabs(n[1])<0.9){ ref[0]=0;ref[1]=1;ref[2]=0; } else { ref[0]=1;ref[1]=0;ref[2]=0; }
+        double t1[3]={ ref[1]*n[2]-ref[2]*n[1], ref[2]*n[0]-ref[0]*n[2], ref[0]*n[1]-ref[1]*n[0] };
+        double tl=std::sqrt(t1[0]*t1[0]+t1[1]*t1[1]+t1[2]*t1[2]); if(tl<1e-20)tl=1; t1[0]/=tl;t1[1]/=tl;t1[2]/=tl;
+        double b1[3]={ n[1]*t1[2]-n[2]*t1[1], n[2]*t1[0]-n[0]*t1[2], n[0]*t1[1]-n[1]*t1[0] };
+        basis[c]={(float)t1[0],(float)t1[1],(float)t1[2],(float)b1[0],(float)b1[1],(float)b1[2]};
+    }
+    uv.clear(); uv2orig.clear(); uvfaces.resize((size_t)Nf*3); facemat.resize((size_t)Nf);
+    std::unordered_map<int64_t,int> seen; seen.reserve((size_t)Nf*3);
+    for (int64_t t=0;t<Nf;t++){ int c=chart[t]; facemat[t]=(uint32_t)c; const auto&bs=basis[c];
+        for(int k=0;k<3;k++){ int64_t ov=F[t*3+k]; int64_t key=((int64_t)c<<34)^ov;
+            auto it=seen.find(key); int id;
+            if(it==seen.end()){ id=(int)uv2orig.size(); seen[key]=id; uv2orig.push_back((int)ov);
+                const float* p=&V[ov*3];
+                uv.push_back(p[0]*bs[0]+p[1]*bs[1]+p[2]*bs[2]);
+                uv.push_back(p[0]*bs[3]+p[1]*bs[4]+p[2]*bs[5]);
+            } else id=it->second;
+            uvfaces[t*3+k]=(uint32_t)id;
+        }
+    }
+}
+
 static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::vector<int64_t>& in_faces0,
                                 const std::vector<float>& pbr_feats, const std::vector<int32_t>& pbr_coords,
                                 int grid_res, int texture_size, int decimate_target_faces=0,
-                                int padding=4, bool verbose=true, int sample_fallback_r=0) {
+                                int padding=4, bool verbose=true, int sample_fallback_r=0,
+                                bool precluster=false, float cone_deg=55.f) {
     // optional decimation (Python decimates to ~1M verts before unwrap; keeps xatlas tractable)
     std::vector<float> dverts; std::vector<int64_t> dfaces;
     const bool deci = (decimate_target_faces>0 && (int)in_faces0.size()/3 > decimate_target_faces);
@@ -138,33 +204,44 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
 
     // ---- xatlas UV unwrap ----
     xatlas::Atlas* atlas = xatlas::Create();
-    xatlas::MeshDecl md;
-    md.vertexCount = (uint32_t)Vin;
-    md.vertexPositionData = in_verts.data();
-    md.vertexPositionStride = 3*sizeof(float);
-    md.indexCount = (uint32_t)Fin*3;
-    md.indexData = idx32.data();
-    md.indexFormat = xatlas::IndexFormat::UInt32;
     if (verbose) xatlas::SetProgressCallback(atlas, _xatlas_progress, nullptr);
-    xatlas::AddMeshError e = xatlas::AddMesh(atlas, md);
-    if (e != xatlas::AddMeshError::Success) { fprintf(stderr,"[atlas] AddMesh error: %s\n", xatlas::StringForEnum(e)); }
-    xatlas::AddMeshJoin(atlas);
-    // Fewer/larger charts: the O-Voxel dual-grid surface has blocky per-voxel normals, so xatlas'
-    // defaults seed a chart every few faces (24k+ charts -> ComputeCharts dominates). Texture is
-    // baked per-texel from the 3D volume, so UV distortion does NOT smear content -> we trade UV
-    // quality for far fewer charts (raise maxCost, drop normal/seam weights).
-    xatlas::ChartOptions co;
-    co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
-    co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
-    co.normalSeamWeight = 1.0f;
-    co.straightnessWeight = 1.0f;
-    co.roundnessWeight = 0.1f;
-    co.maxIterations = 1;
+    std::vector<int> xref2orig;   // output-vertex xref -> original in_verts index (for 3D position)
     xatlas::PackOptions po; po.resolution=(uint32_t)texture_size; po.padding=(uint32_t)padding;
     po.bilinear=true; po.bruteForce=false; po.blockAlign=true; po.createImage=false;
-    if (verbose){ printf("[atlas] unwrapping %d verts / %d faces ...\n", Vin, Fin); fflush(stdout); }
-    xatlas::ComputeCharts(atlas, co);
-    xatlas::PackCharts(atlas, po);
+    if (precluster) {
+        // P1: build our own charts (normal-cone region-grow), hand xatlas pre-made UV islands ->
+        // AddUvMesh skips the slow segmentation (xatlas hangs on the QEM mesh's non-manifold edges).
+        std::vector<float> uv; std::vector<int> uv2orig; std::vector<uint32_t> uvfaces, facemat; int ncl=0;
+        double tp=_now();
+        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : cone_deg;
+        precluster_charts(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f), uv, uv2orig, uvfaces, facemat, ncl);
+        if (verbose){ printf("[atlas] precluster: %d charts (cone %.0f°, %.2fs), %zu uv-verts\n",
+                              ncl, cdeg, _now()-tp, uv2orig.size()); fflush(stdout); }
+        xatlas::UvMeshDecl um; um.vertexCount=(uint32_t)uv2orig.size(); um.vertexUvData=uv.data();
+        um.vertexStride=2*sizeof(float); um.indexCount=(uint32_t)uvfaces.size(); um.indexData=uvfaces.data();
+        um.indexFormat=xatlas::IndexFormat::UInt32; um.faceMaterialData=facemat.data();
+        xatlas::AddMeshError e = xatlas::AddUvMesh(atlas, um);
+        if (e != xatlas::AddMeshError::Success) fprintf(stderr,"[atlas] AddUvMesh error: %s\n", xatlas::StringForEnum(e));
+        xatlas::ComputeCharts(atlas);   // for UV meshes: just groups existing islands (fast)
+        xatlas::PackCharts(atlas, po);
+        xref2orig = uv2orig;
+    } else {
+        xatlas::MeshDecl md;
+        md.vertexCount = (uint32_t)Vin; md.vertexPositionData = in_verts.data();
+        md.vertexPositionStride = 3*sizeof(float); md.indexCount = (uint32_t)Fin*3;
+        md.indexData = idx32.data(); md.indexFormat = xatlas::IndexFormat::UInt32;
+        xatlas::AddMeshError e = xatlas::AddMesh(atlas, md);
+        if (e != xatlas::AddMeshError::Success) { fprintf(stderr,"[atlas] AddMesh error: %s\n", xatlas::StringForEnum(e)); }
+        xatlas::AddMeshJoin(atlas);
+        xatlas::ChartOptions co;
+        co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
+        co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
+        co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
+        if (verbose){ printf("[atlas] unwrapping %d verts / %d faces ...\n", Vin, Fin); fflush(stdout); }
+        xatlas::ComputeCharts(atlas, co);
+        xatlas::PackCharts(atlas, po);
+        xref2orig.resize(Vin); for (int i=0;i<Vin;i++) xref2orig[i]=i;
+    }
     const xatlas::Mesh& om = atlas->meshes[0];
     int W=(int)atlas->width, Ht=(int)atlas->height;
     if (verbose) printf("[atlas] %ux%u  charts=%u sub-atlases=%u  out: %u verts / %u tris\n",
@@ -178,7 +255,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     std::vector<float> px(Vout), py(Vout);   // pixel-space UV for rasterization
     for (int i=0;i<Vout;i++){
         const xatlas::Vertex& v = om.vertexArray[i];
-        uint32_t r = v.xref;
+        uint32_t r = (uint32_t)xref2orig[v.xref];
         for (int d=0;d<3;d++){ bt.verts[(size_t)i*3+d]=in_verts[(size_t)r*3+d]; bt.normals[(size_t)i*3+d]=in_norm[(size_t)r*3+d]; }
         px[i]=v.uv[0]; py[i]=v.uv[1];
         bt.uvs[(size_t)i*2+0]=v.uv[0]/(float)W; bt.uvs[(size_t)i*2+1]=v.uv[1]/(float)Ht;
