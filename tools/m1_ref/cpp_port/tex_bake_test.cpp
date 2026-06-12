@@ -52,8 +52,11 @@ int main(int argc, char** argv) {
 
     double t0=now();
     int fbr = getenv("SAMPLE_FALLBACK_R") ? atoi(getenv("SAMPLE_FALLBACK_R")) : 0;
+    bool precl = getenv("PRECLUSTER") != nullptr;
+    float cone = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : 40.f;
+    int pad = getenv("ATL_PAD") ? atoi(getenv("ATL_PAD")) : 4;
     texatlas::BakedTexture bt = texatlas::bake(verts, faces, pbr, coords, /*grid_res*/1024, TS, DECI,
-                                               /*padding*/4, /*verbose*/true, fbr);
+                                               pad, /*verbose*/true, fbr, precl, cone);
     printf("[bake] done in %.1fs  (atlas %dx%d, %d out-verts)\n", now()-t0, bt.tw, bt.th, (int)bt.verts.size()/3);
 
     // debug PNGs

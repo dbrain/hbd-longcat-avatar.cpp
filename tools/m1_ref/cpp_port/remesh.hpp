@@ -23,6 +23,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <cstdio>
 
 namespace svae {
@@ -543,6 +544,72 @@ inline void taubin_smooth(Mesh& m, int iters, float lambda = 0.5f, float mu = -0
         m.verts.swap(tmp);
     };
     for (int it=0; it<iters; it++){ pass(lambda); pass(mu); }
+}
+
+// make_manifold — convert a non-manifold triangle soup (the O-Voxel dual-grid mesh has ~162k
+// non-manifold edges where >2 quads meet at thin sheets) into an edge+vertex manifold mesh by
+// VERTEX-UMBRELLA SPLITTING. For each vertex, its incident faces are grouped into "umbrellas"
+// (fans) connected through MANIFOLD edges (edges with exactly 2 faces); each umbrella becomes its
+// own copy of the vertex. After the split every edge has <=2 incident faces and every vertex a
+// single fan → meshopt QUALITY (QEM) decimation is no longer locked by the non-manifold skeleton,
+// so it flows all the way to the target instead of stalling (~1.08M) and falling to sloppy. Former
+// non-manifold edges + the dual-grid frontier become boundaries (decimate with SimplifyLockBorder
+// to keep them, or close with fill_holes). Pure host; adds vertices only where topology demands.
+// (This is the principled "feed QEM a sharp MANIFOLD mesh" fix — keeps the dual-grid's QEF vertex
+// positions, i.e. the sharp heel spikes / fingers, while making it decimatable.)
+inline int64_t make_manifold(Mesh& m) {
+    int64_t F = (int64_t)m.faces.size()/3;
+    // 0. drop degenerate faces (a repeated index → not a real triangle, pollutes edge counts)
+    {
+        std::vector<int64_t> ff; ff.reserve(m.faces.size());
+        for (int64_t t=0;t<F;t++){ int64_t a=m.faces[t*3],b=m.faces[t*3+1],c=m.faces[t*3+2];
+            if(a!=b&&b!=c&&a!=c){ ff.push_back(a);ff.push_back(b);ff.push_back(c);} }
+        m.faces.swap(ff); F=(int64_t)m.faces.size()/3;
+    }
+    const int64_t V = (int64_t)m.verts.size()/3;
+    auto ukey=[](int64_t a,int64_t b){ int64_t lo=a<b?a:b,hi=a<b?b:a; return (lo<<32)|(uint32_t)hi; };
+    // edge -> the (up to 2) faces we will treat as manifold-paired. Record exactly two; a 3rd+ face
+    // on the same edge is left UNPAIRED on that edge (so it splits away → boundary there).
+    std::unordered_map<int64_t,std::pair<int,int>> epair; epair.reserve((size_t)F*3);
+    for (int64_t t=0;t<F;t++){ int64_t v[3]={m.faces[t*3],m.faces[t*3+1],m.faces[t*3+2]};
+        for(int e=0;e<3;e++){ int64_t k=ukey(v[e],v[(e+1)%3]); auto it=epair.find(k);
+            if(it==epair.end()) epair[k]={(int)t,-1};
+            else if(it->second.second<0) it->second.second=(int)t;   // 2nd face pairs
+            /* 3rd+ : ignore (stays unpaired → boundary on this side) */ } }
+    // per-vertex incident faces
+    std::vector<std::vector<int>> vf(V);
+    for (int64_t t=0;t<F;t++) for(int c=0;c<3;c++) vf[m.faces[t*3+c]].push_back((int)t);
+    // union-find over the GLOBAL face set, but only union faces that share a PAIRED (manifold) edge.
+    std::vector<int> uf((size_t)F); for(int64_t i=0;i<F;i++) uf[i]=(int)i;
+    std::function<int(int)> find=[&](int x){ while(uf[x]!=x){ uf[x]=uf[uf[x]]; x=uf[x]; } return x; };
+    auto uni=[&](int a,int b){ a=find(a); b=find(b); if(a!=b) uf[a]=b; };
+    for (auto& kv:epair){ if(kv.second.second>=0) uni(kv.second.first,kv.second.second); }
+    // new vertex per (original vertex, umbrella-group). Group key = uf-root of the face, restricted
+    // to faces incident to v.
+    std::vector<float> nv = m.verts;        // copies of original positions appended below
+    std::vector<int64_t> nf((size_t)F*3);
+    std::unordered_map<int64_t,int> grp;    // (v<<32 | root) -> new vertex id
+    grp.reserve((size_t)V*2);
+    for (int64_t t=0;t<F;t++){
+        int root=find((int)t);
+        for(int c=0;c<3;c++){ int64_t v=m.faces[t*3+c]; int64_t key=(v<<20)^((int64_t)root);
+            // collision-safe key: combine v and root with a hash, store map keyed by both
+            key = (v*2654435761ULL) ^ ((uint64_t)root*40503ULL);
+            auto it=grp.find(key);
+            int nvid;
+            if(it==grp.end()){
+                // first time this (v,root) seen: reuse v for its first group, else append a copy
+                // (cheap heuristic: always append except keep original index space coherent)
+                nvid=(int)(nv.size()/3);
+                nv.push_back(m.verts[(size_t)v*3]); nv.push_back(m.verts[(size_t)v*3+1]); nv.push_back(m.verts[(size_t)v*3+2]);
+                grp[key]=nvid;
+            } else nvid=it->second;
+            nf[t*3+c]=nvid;
+        }
+    }
+    int64_t added=(int64_t)(nv.size()/3) - V;
+    m.verts.swap(nv); m.faces.swap(nf); m.N=(int)(m.verts.size()/3); m.F=(int)(m.faces.size()/3);
+    return added;
 }
 
 // Make triangle winding globally CONSISTENT by BFS over face adjacency, then flip globally so the

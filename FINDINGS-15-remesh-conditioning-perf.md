@@ -203,3 +203,67 @@ stays the validated default (cosine 0.999877). Prize unchanged: ~50% of DiT GPU 
 ### Remaining levers (unchanged, quality-preserving): spike conv tensor-core, NAF spatial tiling.
 ### Quant LAST: DiTs are F16 now (Q8 = step down; plain-Q8 cosine 0.968, distributed error →
 imatrix-Q8 before Q4); peak is NAF activation/im2col, NOT DiT weights, so weight-quant won't move it.
+
+---
+## 1c. LAP-17 P0 — CRISPNESS SOLVED: feature-preserving QEM on the dual-grid mesh ✅
+
+**Owner complaint (lap-16 output):** "N64 putty creature" — the coarse-MC remesh (solidify +
+box-blur + coarse marching-cubes stride3 + Taubin) ROUNDS every feature: heel spikes→nubs,
+fingers→mitten, chin/neck merge. The target = the Python "PS4" mesh: **fingers persisted, high
+heels that aren't nubs**, just smoother/lower-poly. (golden = `miku_geometry.ply`, 1.55M v / 3.25M f.)
+
+**Root cause of the rounding:** we never decimated the SHARP source. The crisp source is the M4
+dual-grid mesh itself (`flexible_dual_grid_to_mesh`) — its vertices ARE the O-Voxel QEF positions, so
+heel spikes / fingers are reconstructed exactly. Two failed routes (both measured via `remesh_test`,
+`render_geo_detail.py` off-axis-lit geometry render that actually SHOWS sharpness — flat camera-axis
+lighting in `render_mesh.py` hid everything as a silhouette):
+- **coarse-MC re-march** (lap-16 default): blur+Taubin round by construction → blob.
+- **meshopt QUALITY on the dual mesh STALLS at ~1.08M faces** then falls to `simplifySloppy` → noisy
+  mottled normals (the "putty" surface). Cause: the dual mesh is non-manifold (**~162k nm edges +
+  ~58k boundary**); meshopt locks on that skeleton. `close_surface` barely helps (boundary 57914→57905);
+  `make_manifold` (vertex-umbrella split) only cut nm 162k→133k (same-group nm edges don't separate)
+  and inflated boundary; `SimplifyPermissive` + LockBorder did not break the stall. **Dead ends.**
+
+**FIX = our own non-manifold-tolerant Garland-Heckbert QEM (`qem.hpp`).** Accumulates a per-vertex
+error quadric from ALL incident faces and collapses each edge INDEPENDENTLY (non-manifold is no
+obstacle), flattening flat regions while deferring sharp-edge collapses (high quadric cost) + rejecting
+normal flips (n·n_orig<0.2) + locking the open frontier (border verts collapse only to border verts).
+Self-contained iterative-threshold scheme (sp4cerat structure, reimplemented). Result on Miku
+(`REMESH_DUAL=1 QEM_PURE=1`):
+- **3.25M → 200k faces in ~2.7s**, render ≈ golden: heel spikes POINTED, fingers SEPARATED, skirt
+  folds + chin gap kept, surface clean (coherent normals, no sloppy mottle). The PS4 target, met.
+- Natural feature-preserving FLOOR ≈ **165k** (targets <165k plateau there — remaining collapses would
+  flip normals on thin features, so QEM refuses = exactly the "keep all shapes" behaviour). Early-exit
+  added (stall-3-rounds) so the plateau case doesn't burn to max_iters (~16s→fast).
+
+**Wired into the pipeline** (`pixal3d_chain.hpp` step 7b, `--remesh`): QEM-decimate the M4 dual-grid
+`mesh` directly (the coarse-MC/grid-1024 path is gone; `coords1024` no longer captured). Config:
+`PIXAL3D_REMESH_FACES` = target tri budget (default **200000**; **0 = keep the raw ~3.25M max-detail
+mesh** — the owner's "give me the massive mesh" option), `PIXAL3D_REMESH_AGGR` = QEM aggressiveness
+(default 7). Texture bake (`pixal3d.cpp`): for `--remesh` pass `decimate=0` to `texatlas::bake` (mesh
+already QEM-decimated — must NOT re-run meshopt sloppy) + nearest-voxel fallback r=16 (QEM verts ≈ on
+the PBR shell; covers small in/out displacement in concavities). E2E validation: see below.
+
+---
+## 5. LAP-17 P1 — FAST ATLAS: xatlas ComputeCharts HANGS on the QEM mesh → normal-cone pre-cluster ✅
+
+**New problem the QEM remesh introduced:** the QEM output mesh has large flat faces + ~50k
+NON-MANIFOLD edges. xatlas `ComputeCharts` builds a half-edge structure and its segmentation goes
+pathological on the non-manifold input — Miku's 200k QEM mesh **hangs >180s** (lap-16's smooth
+coarse-MC mesh unwrapped in 13s); the turtle's 296k mesh ran >10min and never finished. Aggressive
+ChartOptions (maxCost 1e5, all normal/seam weights 0) **also timed out** — so it is NOT chart-count,
+it is the segmentation choking on non-manifold. ChartOptions cannot fix it.
+
+**FIX = normal-cone CHART PRE-CLUSTER + `AddUvMesh` (pack-only), skipping ComputeCharts entirely.**
+Since the texture bakes VOLUMETRICALLY (per-texel 3D pos → grid_sample), UV layout quality is
+irrelevant — we only need disjoint low-distortion islands. `texatlas::precluster_charts` (own face
+adjacency, robust to non-manifold): region-grow faces while their normal stays within a cone of the
+chart SEED normal, planar-project each chart onto its average-normal plane (per-(chart,vertex) uv-vert),
+emit `UvMeshDecl{vertexUvData, faceMaterialData=chartId}` → `AddUvMesh` → `ComputeCharts` (just groups
+the pre-made islands, fast) → `PackCharts`. Measured on Miku 200k QEM:
+**precluster 0.08s + pack 1.8s = ~2s** (was >180s hang). Cone sweep (chart count): 62°→21.6k, 80°→13.5k,
+100°→7.8k, 120°→6.3k, 140°→5.5k. **Default cone 55°** (seed-normal projection: faces project with area scale >= cos(55°)=0.57, no degenerate slivers → clean atlas; 24.5k charts, 67% util on Miku). Earlier cone 80° garbled the atlas (cos80°=0.17 → sliver streaks); fix = project onto the SEED normal + tight cone, not the average normal + wide cone.
+plane so planar UVs don't overlap → no ambiguous volumetric samples; >~85° risks folds). Wired:
+`texatlas::bake(..., precluster, cone_deg=80)`; `pixal3d.cpp` sets `precluster=true` for `--remesh`
+(env `PIXAL3D_NO_PRECLUSTER` reverts, `ATL_CONE` tunes). Offline test harness:
+`QEM_ATLAS_PRECLUSTER=1` in `remesh_test`. E2E texture-quality validation: see below.

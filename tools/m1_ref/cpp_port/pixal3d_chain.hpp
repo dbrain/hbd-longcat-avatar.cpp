@@ -12,6 +12,7 @@
 #include "sparse_vae_pipeline.hpp"
 #include "svp_gpu.hpp"            // GPU-resident decode (Phase C #1): linear→cuBLAS, feats resident
 #include "remesh.hpp"            // A1: marching-tetrahedra manifold watertight remesh
+#include "qem.hpp"               // lap-17: feature-preserving QEM decimation of the dual-grid mesh
 #include "torch_randn.hpp"
 #include <cstdio>
 #include <cmath>
@@ -285,7 +286,8 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
     std::vector<std::vector<uint8_t>> subs;
     std::vector<int32_t> coords1024;
     const bool cs = in.watertight && !in.remesh;                 // interim close_surface only when NOT remeshing
-    std::vector<int32_t>* pc1024 = in.remesh ? &coords1024 : nullptr;
+    std::vector<int32_t>* pc1024 = nullptr;   // (lap-17) QEM remesh decimates the dual mesh directly; no grid-1024 occupancy needed
+    (void)coords1024;
 #ifdef M3A_USE_CUDA
     svae::Mesh mesh = cuda ? svpg::m4_decode_mesh(coordsM, shape_denorm, SHAPEDEC_W, in.textured ? &subs : nullptr, cs, pc1024)
                            : svp::m4_decode_mesh(coordsM, shape_denorm, SHAPEDEC_W, cuda, in.textured ? &subs : nullptr, cs, pc1024);
@@ -294,41 +296,33 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
 #endif
     if (V) printf("[7] M4 mesh: verts=%d faces=%d (%.1fs)\n", mesh.N, mesh.F, now_s()-t);
 
-    // (7b) A1 watertight. Two paths:
-    //   remesh (proper): marching-tetrahedra on the grid-1024 occupancy -> clean MANIFOLD watertight
-    //     mesh (boundary==0, nonmanifold==0, no flaps). Unblocks quality decimation + a tight atlas.
-    //     The dual-grid extractor's output (above) is discarded; textures bake volumetrically so the
-    //     remeshed topology is independent of the PBR volume.
-    //   watertight (interim): close_surface + fill_holes ear/mirror-cap hack (adds degenerate flaps).
+    // (7b) A1 remesh — FEATURE-PRESERVING QEM DECIMATION of the crisp dual-grid mesh (lap-17).
+    //   The M4 dual-grid mesh above (`mesh`) IS the sharp "PS4-quality" source: its vertices are the
+    //   O-Voxel QEF positions, so heel spikes / fingers / chin gap are reconstructed exactly — it's
+    //   just massive (~3.25M faces) and non-manifold (~162k nm edges + ~58k boundary). Earlier laps
+    //   re-marched a COARSE/blurred grid (rounded everything to nubs — the "N64 putty blob") OR fell
+    //   to meshopt simplifySloppy (noisy mottled normals), because meshopt QUALITY LOCKS on the
+    //   non-manifold skeleton (~1.08M floor). Fix = our own Garland-Heckbert QEM (`qem.hpp`) which
+    //   accumulates a per-vertex quadric from all incident faces and collapses each edge
+    //   independently — non-manifold is no obstacle — flattening flat regions while DEFERRING
+    //   collapses across sharp edges (high quadric cost) + rejecting normal flips → keeps the shape,
+    //   fewer polys. Decimates 3.25M→~150-200k in ~3s, render ≈ the golden full mesh.
+    //   PIXAL3D_REMESH_FACES = target triangle budget (default 200000; **0 = keep the raw max-detail
+    //   mesh** for the "give me the massive mesh" option). PIXAL3D_REMESH_AGGR = QEM aggressiveness.
     if (in.remesh) {
         double tw = now_s();
-        int Nocc = (int)coords1024.size()/4;
-        // SOLIDIFY + COARSE marching-cubes: the M4 occupancy is a thin SHELL, so meshing it directly
-        // (marching-tet) gives a faceted lattice surface that meshopt can't quality-decimate and
-        // xatlas shatters into ~48k charts (840s). Instead solidify the shell (coarse-rasterise →
-        // flood-fill exterior → interior=solid) and march the smoothed solid at a coarse grid →
-        // a SMOOTH, WATERTIGHT, SINGLE-COMPONENT, coherent-normal low-poly outer surface. Then
-        // orient_consistent (inside) + Taubin → quality-decimatable → tight atlas (55% util, ~1k
-        // charts, ~13s unwrap). PIXAL3D_REMESH_STRIDE (fine voxels/coarse cell, default 6 → grid
-        // 170), _BLUR (field box-blur, default 1), _SMOOTH (Taubin iters, default 5).
-        // stride 4 (grid 256) keeps the chin/neck gap + finger separation that coarser strides bridge
-        // (stride 6 over-rounded those into blobs); light Taubin (2) avoids further rounding. The face
-        // budget is recovered by QUALITY decimation downstream (winding-fix unblocked it), which
-        // preserves sharp features far better than coarser marching. stride 3 = max detail (slower).
-        // stride 3 (grid 341) is the crispness/speed balance: keeps the chin/neck gap, finger gaps, and
-        // boot/heel shape far better than stride 4-6 (which rounded them to nubs). blur 1 + light Taubin
-        // (1) cleans facet noise without rounding sharp corners. NOTE: MC-on-a-field still rounds hard
-        // edges by construction — the full "keep the spikes" fix is dual-contouring (next lap). stride 2
-        // (grid 512) = crisper still, slower. Quality decimation downstream preserves the detail.
-        int stride = std::getenv("PIXAL3D_REMESH_STRIDE") ? atoi(std::getenv("PIXAL3D_REMESH_STRIDE")) : 3;
-        int blur   = std::getenv("PIXAL3D_REMESH_BLUR")   ? atoi(std::getenv("PIXAL3D_REMESH_BLUR"))   : 1;
-        int sm     = std::getenv("PIXAL3D_REMESH_SMOOTH") ? atoi(std::getenv("PIXAL3D_REMESH_SMOOTH")) : 1;
-        mesh = svae::marching_cubes_solid(coords1024.data(), Nocc, 1024, stride, blur<1?1:blur, 0.5f);
-        if (sm > 0) svae::taubin_smooth(mesh, sm);
-        int64_t b,nm; svae::mesh_topology_stats(mesh, b, nm);
-        if (V) printf("[7b] REMESH (solid+coarse-MC stride=%d blur=%d smooth=%d on %d shell voxels): verts=%d faces=%d boundary=%lld nonmanifold=%lld %s (%.1fs)\n",
-                      stride, blur, sm, Nocc, mesh.N, mesh.F, (long long)b, (long long)nm,
-                      (b==0&&nm==0)?"= CLEAN MANIFOLD ✓":"(RESIDUAL)", now_s()-tw);
+        int target = std::getenv("PIXAL3D_REMESH_FACES") ? atoi(std::getenv("PIXAL3D_REMESH_FACES")) : 200000;
+        double aggr = std::getenv("PIXAL3D_REMESH_AGGR")  ? atof(std::getenv("PIXAL3D_REMESH_AGGR"))  : 7.0;
+        if (target > 0 && mesh.F > target) {
+            int f0 = mesh.F;
+            mesh = qem::qem_simplify(mesh, target, aggr);
+            svae::orient_consistent(mesh);
+            int64_t b,nm; svae::mesh_topology_stats(mesh, b, nm);
+            if (V) printf("[7b] REMESH (QEM %d→%d faces, target %d, aggr %.1f): verts=%d boundary=%lld nonmanifold=%lld (%.1fs)\n",
+                          f0, mesh.F, target, aggr, mesh.N, (long long)b, (long long)nm, now_s()-tw);
+        } else if (V) {
+            printf("[7b] REMESH: raw max-detail mesh kept (faces=%d, target=%d) (%.1fs)\n", mesh.F, target, now_s()-tw);
+        }
     } else if (in.watertight) {
         double tw = now_s();
         int64_t b0 = svae::boundary_edge_count(mesh);
