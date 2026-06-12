@@ -49,7 +49,7 @@ struct Vec3 { double x,y,z;
 };
 
 struct Tri { int v[3]; double err[4]; int deleted, dirty; Vec3 n; };
-struct Vert { Vec3 p; int tstart, tcount, border; SymMat q; };
+struct Vert { Vec3 p; int tstart, tcount, border; SymMat q; Vec3 col; };  // col = carried per-vertex colour
 struct Ref { int tid, tv; };
 
 struct Simplify {
@@ -142,7 +142,7 @@ struct Simplify {
         int dst=0; for(auto&v:verts) v.tcount=0;
         for(auto&t:tris) if(!t.deleted){ tris[dst++]=t; for(int j=0;j<3;j++) verts[t.v[j]].tcount=1; }
         tris.resize(dst); dst=0;
-        for(auto&v:verts) if(v.tcount){ v.tstart=dst; verts[dst].p=v.p; dst++; }
+        for(auto&v:verts) if(v.tcount){ v.tstart=dst; verts[dst].p=v.p; verts[dst].col=v.col; dst++; }
         for(auto&t:tris) for(int j=0;j<3;j++) t.v[j]=verts[t.v[j]].tstart;
         verts.resize(dst);
     }
@@ -172,6 +172,7 @@ struct Simplify {
                     if(flipped(p,i0,i1,verts[i0],deleted0)) continue;
                     if(flipped(p,i1,i0,verts[i1],deleted1)) continue;
                     verts[i0].p=p; verts[i0].q=verts[i1].q+verts[i0].q;
+                    verts[i0].col=(verts[i0].col+verts[i1].col)*0.5;   // carry/average per-vertex colour
                     int rstart=(int)refs.size();
                     update_tris(i0,verts[i0],deleted0,deleted_tris);
                     update_tris(i0,verts[i1],deleted1,deleted_tris);
@@ -188,12 +189,19 @@ struct Simplify {
 
 // Decimate a (possibly non-manifold) svae::Mesh to ~target_faces, preserving features. Returns the
 // simplified mesh. aggr controls speed/quality (lower = gentler/slower/cleaner; 7 = sp4cerat default).
-inline svae::Mesh qem_simplify(const svae::Mesh& in, int target_faces, double aggr=7.0){
+// in_col/out_col (optional): per-vertex RGB [V*3] carried through the collapses (averaged on merge),
+// so the decimated mesh inherits the DENSE mesh's exact, smooth, hole-free colour — instead of
+// re-sampling the sparse PBR volume at the moved/sparse output verts (which gives the noisy
+// teal/black "zombie" patchwork). The dense source verts sit exactly on the shell so their colour is
+// correct; averaging down a local cluster stays on that surface and is smooth.
+inline svae::Mesh qem_simplify(const svae::Mesh& in, int target_faces, double aggr=7.0,
+                               const std::vector<float>* in_col=nullptr, std::vector<float>* out_col=nullptr){
     Simplify s;
     const int64_t V=(int64_t)in.verts.size()/3, F=(int64_t)in.faces.size()/3;
     s.verts.resize(V);
     for(int64_t i=0;i<V;i++){ s.verts[i].p={in.verts[i*3],in.verts[i*3+1],in.verts[i*3+2]};
-        s.verts[i].tstart=0; s.verts[i].tcount=0; s.verts[i].border=0; }
+        s.verts[i].tstart=0; s.verts[i].tcount=0; s.verts[i].border=0;
+        s.verts[i].col = in_col ? Vec3{(*in_col)[i*3],(*in_col)[i*3+1],(*in_col)[i*3+2]} : Vec3{0,0,0}; }
     s.tris.resize(F);
     for(int64_t i=0;i<F;i++){ s.tris[i].v[0]=(int)in.faces[i*3]; s.tris[i].v[1]=(int)in.faces[i*3+1];
         s.tris[i].v[2]=(int)in.faces[i*3+2]; s.tris[i].deleted=0; s.tris[i].dirty=0; }
@@ -203,6 +211,9 @@ inline svae::Mesh qem_simplify(const svae::Mesh& in, int target_faces, double ag
         out.verts[i*3+1]=(float)s.verts[i].p.y; out.verts[i*3+2]=(float)s.verts[i].p.z; }
     for(size_t i=0;i<s.tris.size();i++) for(int j=0;j<3;j++) out.faces[i*3+j]=s.tris[i].v[j];
     out.N=(int)s.verts.size(); out.F=(int)s.tris.size();
+    if(out_col){ out_col->resize(s.verts.size()*3);
+        for(size_t i=0;i<s.verts.size();i++){ (*out_col)[i*3]=(float)s.verts[i].col.x;
+            (*out_col)[i*3+1]=(float)s.verts[i].col.y; (*out_col)[i*3+2]=(float)s.verts[i].col.z; } }
     return out;
 }
 
