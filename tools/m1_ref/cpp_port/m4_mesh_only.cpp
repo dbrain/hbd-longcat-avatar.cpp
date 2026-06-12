@@ -22,7 +22,19 @@ int main() {
     std::vector<int8_t> inter(iN.i8(), iN.i8() + (size_t)N*3);
 
     svae::Mesh mesh = svae::flexible_dual_grid_to_mesh(cN.i32(), N, dN.f32(), inter.data(), qN.f32(), 1024);
-    printf("[m4-mesh] mine: verts=%d faces=%d\n", mesh.N, mesh.F);
+    printf("[m4-mesh] mine: verts=%d faces=%d  boundary_edges=%lld\n",
+           mesh.N, mesh.F, (long long)svae::boundary_edge_count(mesh));
+
+    // A1 watertight check: close_surface + fill_holes must drive boundary edges to 0 (= no holes,
+    // matching Python's remeshed glb).
+    {
+        svae::Mesh wt = svae::flexible_dual_grid_to_mesh(cN.i32(), N, dN.f32(), inter.data(), qN.f32(), 1024, /*close_surface=*/true);
+        int64_t bcs = svae::boundary_edge_count(wt);
+        int added = svae::fill_holes(wt, 0, true);
+        int64_t bfin = svae::boundary_edge_count(wt);
+        printf("[m4-mesh] WATERTIGHT: close_surface boundary=%lld -> fill_holes +%d tris -> boundary=%lld %s (verts=%d faces=%d)\n",
+               (long long)bcs, added, (long long)bfin, bfin == 0 ? "== 0 HOLES ✓" : "(RESIDUAL)", wt.N, wt.F);
+    }
 
     NpyArray ovN = npy_load(P("oracle_verts"));      // f32 [V,3]
     NpyArray ofN = npy_load(P("oracle_faces"));      // i64 [F,3]

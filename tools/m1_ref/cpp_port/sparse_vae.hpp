@@ -17,9 +17,12 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
+#include <chrono>
 #include "../../sparse_spike/sparse_subm_conv_cpu.hpp"   // launch_subm_conv_cpu
 
 #ifdef M3A_USE_CUDA
@@ -33,6 +36,18 @@ extern "C" void launch_subm_conv_cuda(
 namespace svae {
 
 static const uint32_t SENTINEL = 0xFFFFFFFFu;
+
+// ---- optional lightweight profiling (gated by SVAE_PROF env; serial calls only) ----
+struct Prof {
+    double conv_malloc=0, conv_h2d=0, conv_kernel=0, conv_d2h=0, conv_free=0;
+    int    conv_calls=0;
+    bool   on=false;
+};
+inline Prof& prof() { static Prof p; return p; }
+inline double now_s() {
+    return (double)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() * 1e-9;
+}
 
 // ---- rulebook (neighbor map), z-major k offsets — matches sparse_conv.cpp / spike ----
 static inline int64_t coord_key(int32_t b, int32_t c1, int32_t c2, int32_t c3) {
@@ -70,21 +85,28 @@ inline std::vector<float> subm_conv(const std::vector<float>& feats, const std::
     const int V = 27;
 #ifdef M3A_USE_CUDA
     if (use_cuda) {
+        Prof& P = prof(); bool pf = P.on; double t0 = 0;
         float *d_feats, *d_weight, *d_bias, *d_out; uint32_t* d_nmap;
+        if (pf) t0 = now_s();
         cudaMalloc(&d_feats, (size_t)N*Cin*4);
         cudaMalloc(&d_weight, (size_t)V*Cin*Cout*4);
         cudaMalloc(&d_bias, (size_t)Cout*4);
         cudaMalloc(&d_out, (size_t)N*Cout*4);
         cudaMalloc(&d_nmap, (size_t)N*V*4);
+        if (pf) { cudaDeviceSynchronize(); P.conv_malloc += now_s()-t0; t0 = now_s(); }
         cudaMemcpy(d_feats, feats.data(), (size_t)N*Cin*4, cudaMemcpyHostToDevice);
         cudaMemcpy(d_weight, weight.data(), (size_t)V*Cin*Cout*4, cudaMemcpyHostToDevice);
         cudaMemcpy(d_bias, bias.data(), (size_t)Cout*4, cudaMemcpyHostToDevice);
         cudaMemcpy(d_nmap, nmap.data(), (size_t)N*V*4, cudaMemcpyHostToDevice);
+        if (pf) { cudaDeviceSynchronize(); P.conv_h2d += now_s()-t0; t0 = now_s(); }
         launch_subm_conv_cuda(d_feats, d_nmap, d_weight, d_bias, d_out, N, Cin, Cout, V, 0);
         cudaDeviceSynchronize();
+        if (pf) { P.conv_kernel += now_s()-t0; t0 = now_s(); }
         std::vector<float> out((size_t)N*Cout);
         cudaMemcpy(out.data(), d_out, (size_t)N*Cout*4, cudaMemcpyDeviceToHost);
+        if (pf) { cudaDeviceSynchronize(); P.conv_d2h += now_s()-t0; t0 = now_s(); }
         cudaFree(d_feats); cudaFree(d_weight); cudaFree(d_bias); cudaFree(d_out); cudaFree(d_nmap);
+        if (pf) { cudaDeviceSynchronize(); P.conv_free += now_s()-t0; P.conv_calls++; }
         return out;
     }
 #endif
@@ -216,9 +238,15 @@ inline std::vector<float> repeat_interleave(const std::vector<float>& x, int M, 
 // so face vertex-indices + order match the real o_voxel output exactly.
 struct Mesh { std::vector<float> verts; std::vector<int64_t> faces; int N, F; };
 
+// close_surface (A1): when false, reproduces o_voxel EXACTLY (a quad forms only where all 4 neighbour
+// cells exist -> the dual-grid frontier leaves ~17k holes; bit-exact vs the .so for validation). When
+// true, SYNTHESISES the missing frontier corner cells (centred dual vertex 0.5) so EVERY intersected
+// quad forms -> the dual mesh closes (boundary edges == 0 = WATERTIGHT, matching Python's remeshed
+// to_glb). Synth cells are quad CORNERS only (no intersected flags -> they emit no quads); they are
+// textured by the UV-atlas volume bake (grid_sample at the rasterized position, not per-vertex).
 inline Mesh flexible_dual_grid_to_mesh(const int32_t* coords, int N,
                                        const float* dual_vertices, const int8_t* intersected,
-                                       const float* quad_lerp, int grid_size) {
+                                       const float* quad_lerp, int grid_size, bool close_surface = false) {
     // 3 edge dirs x 4 neighbor offsets (x,y,z) — verbatim from o_voxel
     static const int OFF[3][4][3] = {
         {{0,0,0},{0,0,1},{0,1,1},{0,1,0}},   // x-axis
@@ -241,6 +269,26 @@ inline Mesh flexible_dual_grid_to_mesh(const int32_t* coords, int N,
     for (int i = 0; i < N; i++)
         index[coord_key(0, coords[i*4+1], coords[i*4+2], coords[i*4+3])] = i;
 
+    // close_surface: pre-pass to add the missing corner cells referenced by any intersected quad.
+    if (close_surface) {
+        for (int n = 0; n < N; n++) {
+            int32_t x = coords[n*4+1], y = coords[n*4+2], z = coords[n*4+3];
+            for (int e = 0; e < 3; e++) {
+                if (!intersected[(size_t)n*3 + e]) continue;
+                for (int k = 0; k < 4; k++) {
+                    int32_t cx = x+OFF[e][k][0], cy = y+OFF[e][k][1], cz = z+OFF[e][k][2];
+                    int64_t key = coord_key(0, cx, cy, cz);
+                    if (index.find(key) != index.end()) continue;
+                    index[key] = (int)(m.verts.size() / 3);                 // new synth vertex
+                    m.verts.push_back((cx + 0.5f) * voxel_size + aabb0);    // centred (dual 0.5)
+                    m.verts.push_back((cy + 0.5f) * voxel_size + aabb0);
+                    m.verts.push_back((cz + 0.5f) * voxel_size + aabb0);
+                }
+            }
+        }
+    }
+    auto ql = [&](int idx) { return idx < N ? quad_lerp[idx] : 1.0f; };     // synth corners: neutral
+
     // assemble quads in torch order, split into triangles
     m.faces.reserve((size_t)N * 6);
     int q[4];
@@ -255,14 +303,121 @@ inline Mesh flexible_dual_grid_to_mesh(const int32_t* coords, int N,
                 q[k] = it->second;
             }
             if (!ok) continue;
-            float w02 = quad_lerp[q[0]] * quad_lerp[q[2]];
-            float w13 = quad_lerp[q[1]] * quad_lerp[q[3]];
+            float w02 = ql(q[0]) * ql(q[2]);
+            float w13 = ql(q[1]) * ql(q[3]);
             const int* sp = (w02 > w13) ? SPLIT1 : SPLIT2;
             for (int t = 0; t < 6; t++) m.faces.push_back((int64_t)q[sp[t]]);
         }
     }
+    m.N = (int)(m.verts.size() / 3);   // includes synth cells (close_surface)
     m.F = (int)(m.faces.size() / 3);
     return m;
+}
+
+// ---- watertight hole-fill (A1) ----
+// The raw O-Voxel dual-grid mesh is NOT watertight: a quad only forms where all 4 neighbour
+// voxels exist, leaving ~17k tiny boundary loops (median 3 verts). Consequences: (1) lower mesh
+// quality than Python (which remeshes via proprietary cumesh); (2) xatlas seeds a chart per
+// boundary-bounded region (~24k charts -> ~120s unwrap, bloated atlas); (3) meshopt quality
+// decimation is border-locked (stalls ~2x target -> the sloppy fallback).
+//
+// fill_holes closes every boundary loop with a triangle fan, in pure host C++, ADDING FACES ONLY
+// (reuses existing vertices) so any per-vertex data (PBR/COLOR_0) stays 1:1 aligned. A boundary
+// half-edge is a directed edge a->b whose reverse b->a is absent; we walk these into loops and
+// fan-triangulate (reverse winding so the patch faces outward — cosmetic anyway, GLB is doubleSided).
+// Junction vertices (boundary degree >2) are handled by greedy per-start consumption; a couple of
+// fan passes drives residual boundary to ~0. Returns the number of loops filled.
+inline int64_t boundary_edge_count(const Mesh& m);   // defined below
+
+inline int fill_holes(Mesh& m, int /*unused*/ = 0, bool verbose = false) {
+    auto ukey = [](int32_t a, int32_t b) { int32_t lo=a<b?a:b, hi=a<b?b:a; return ((int64_t)lo<<32)|(uint32_t)hi; };
+    const int64_t F0 = (int64_t)m.faces.size() / 3;
+    // live edge-incidence count (boundary <=> count==1)
+    std::unordered_map<int64_t,int> ec; ec.reserve((size_t)F0*3*2);
+    for (int64_t t = 0; t < F0; t++) {
+        int32_t v[3] = {(int32_t)m.faces[t*3], (int32_t)m.faces[t*3+1], (int32_t)m.faces[t*3+2]};
+        for (int e = 0; e < 3; e++) ec[ukey(v[e], v[(e+1)%3])]++;
+    }
+    // boundary adjacency (each boundary edge listed at both endpoints)
+    std::unordered_map<int32_t,std::vector<int32_t>> badj; badj.reserve(ec.size());
+    int64_t b0 = 0;
+    for (auto& kv : ec) if (kv.second == 1) {
+        int32_t a = (int32_t)(kv.first >> 32), b = (int32_t)(uint32_t)kv.first;
+        badj[a].push_back(b); badj[b].push_back(a); b0++;
+    }
+    if (b0 == 0) { if (verbose) printf("[fill_holes] already watertight (0 boundary edges)\n"); return 0; }
+    auto rm = [](std::vector<int32_t>& vec, int32_t x){ for (size_t i=0;i<vec.size();i++) if (vec[i]==x){ vec[i]=vec.back(); vec.pop_back(); return; } };
+    // incrementing an edge's incidence updates boundary status
+    auto incedge = [&](int32_t a, int32_t b){
+        int c = ++ec[ukey(a,b)];
+        if (c == 1) { badj[a].push_back(b); badj[b].push_back(a); }     // became boundary
+        else if (c == 2) { rm(badj[a], b); rm(badj[b], a); }            // no longer boundary
+    };
+    // Advancing-front ear fill: at a vertex v with >=2 boundary edges, add the triangle (v,a,b)
+    // between two of them. Each ear closes edges (v,a),(v,b) and toggles (a,b) -> the total boundary
+    // edge count strictly decreases, so this terminates at 0 (watertight). Robust to the dual-grid's
+    // non-manifold junctions (no winding/loop assumptions). Adds FACES ONLY (per-vertex data stays 1:1).
+    std::vector<int32_t> stack;
+    for (auto& kv : badj) if (kv.second.size() >= 2) stack.push_back(kv.first);
+    int64_t added = 0; int64_t guard = b0 * 4 + 16;
+    while (!stack.empty() && guard-- > 0) {
+        int32_t v = stack.back(); stack.pop_back();
+        while (badj[v].size() >= 2) {
+            int32_t a = badj[v].back(); badj[v].pop_back();
+            int32_t b = badj[v].back(); badj[v].pop_back();
+            rm(badj[a], v); rm(badj[b], v);            // remove (v,a),(v,b) from a/b side
+            ++ec[ukey(v,a)]; ++ec[ukey(v,b)];          // those edges close (1->2); badj already updated
+            if (a == b) continue;                      // degenerate (parallel boundary) — skip
+            m.faces.push_back(v); m.faces.push_back(a); m.faces.push_back(b); added++;
+            incedge(a, b);
+            if (badj[a].size() >= 2) stack.push_back(a);
+            if (badj[b].size() >= 2) stack.push_back(b);
+        }
+    }
+    // GUARANTEE boundary == 0: the ear-fill leaves "slit"/lone-edge residue at the dual-grid's
+    // non-manifold junctions (both endpoints degree-1 -> no ear possible). Mirror-cap each remaining
+    // boundary edge with the reverse of its single owning triangle -> the edge gets a 2nd face -> not
+    // boundary. The caps are coincident (zero-volume) flaps on the messy slivers only (~0.4% of faces;
+    // meshopt collapses most on decimation); the result is fully watertight (no holes), matching the
+    // closed topology of Python's remeshed glb. (A true cumesh-style dual-contour remesh would avoid
+    // the flaps entirely — that's the higher-fidelity follow-up.)
+    std::vector<std::pair<int32_t,int32_t>> resid;
+    for (auto& kv : badj) for (int32_t nb : kv.second) if (kv.first < nb) resid.push_back({kv.first, nb});
+    int64_t capped = 0;
+    if (!resid.empty()) {
+        std::unordered_map<int64_t,int32_t> third;   // boundary edge -> the 3rd vertex of its owning tri
+        third.reserve(resid.size() * 4);
+        const int64_t F = (int64_t)m.faces.size() / 3;
+        for (int64_t t = 0; t < F; t++) {
+            int32_t v[3] = {(int32_t)m.faces[t*3], (int32_t)m.faces[t*3+1], (int32_t)m.faces[t*3+2]};
+            for (int e = 0; e < 3; e++) third[ukey(v[e], v[(e+1)%3])] = v[(e+2)%3];
+        }
+        for (auto& pr : resid) {
+            auto it = third.find(ukey(pr.first, pr.second));
+            if (it == third.end() || it->second == pr.first || it->second == pr.second) continue;
+            m.faces.push_back(pr.first); m.faces.push_back(it->second); m.faces.push_back(pr.second);
+            capped++;
+        }
+    }
+    m.F = (int)(m.faces.size() / 3);
+    int64_t b1 = boundary_edge_count(m);
+    if (verbose) printf("[fill_holes] boundary %lld -> %lld (+%lld ear, +%lld cap tris), faces now %d\n",
+                        (long long)b0, (long long)b1, (long long)added, (long long)capped, m.F);
+    return (int)(added + capped);
+}
+
+// count boundary edges (used exactly once) — watertight <=> 0.
+inline int64_t boundary_edge_count(const Mesh& m) {
+    const int64_t F = (int64_t)m.faces.size() / 3;
+    std::unordered_map<int64_t,int> ec;
+    ec.reserve((size_t)F * 3 * 2);
+    auto ukey = [](int64_t a, int64_t b) { int64_t lo = a<b?a:b, hi = a<b?b:a; return (lo << 32) | (uint32_t)hi; };
+    for (int64_t t = 0; t < F; t++) {
+        int64_t v[3] = {m.faces[t*3], m.faces[t*3+1], m.faces[t*3+2]};
+        for (int e = 0; e < 3; e++) ec[ukey(v[e], v[(e+1)%3])]++;
+    }
+    int64_t b = 0; for (auto& kv : ec) if (kv.second == 1) b++;
+    return b;
 }
 
 // write a binary little-endian PLY (verts [N*3] f32, faces [F*3] int) — loadable in
@@ -284,6 +439,25 @@ inline bool write_ply(const char* path, const std::vector<float>& verts,
     }
     std::fclose(f);
     return true;
+}
+
+// Minimal reader for the binary_little_endian PLY written by write_ply above (float xyz verts +
+// uchar-count int-index triangle faces). Returns false on parse failure.
+inline bool read_ply(const char* path, std::vector<float>& verts, std::vector<int64_t>& faces) {
+    FILE* f = std::fopen(path, "rb"); if (!f) return false;
+    char line[256]; int64_t V=0, F=0;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (!strncmp(line, "element vertex", 14)) V = atoll(line+14);
+        else if (!strncmp(line, "element face", 12)) F = atoll(line+12);
+        else if (!strncmp(line, "end_header", 10)) break;
+    }
+    verts.resize((size_t)V*3);
+    if (std::fread(verts.data(), sizeof(float), verts.size(), f) != verts.size()) { std::fclose(f); return false; }
+    faces.resize((size_t)F*3);
+    for (int64_t i=0;i<F;i++){ unsigned char n=0; if(std::fread(&n,1,1,f)!=1||n!=3){std::fclose(f);return false;}
+        int idx[3]; if(std::fread(idx,sizeof(int),3,f)!=3){std::fclose(f);return false;}
+        faces[i*3]=idx[0]; faces[i*3+1]=idx[1]; faces[i*3+2]=idx[2]; }
+    std::fclose(f); return true;
 }
 
 } // namespace svae

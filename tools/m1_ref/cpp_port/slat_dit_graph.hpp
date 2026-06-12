@@ -58,6 +58,19 @@ static inline ggml_tensor* build_slat_dit_forward(ggml_context* ctx, M1Harness& 
 
     ggml_tensor* h = lin(ctx, H.weight("input_layer.weight"), H.weight("input_layer.bias"), xin);  // [1536,N] (xin [32,N])
 
+    // Flash-attn padding mask (PIXAL3D_FLASH + FAST): F16 [n_kv_pad, n_q_pad], -inf on the padded
+    // keys, built ONCE and shared by all NB self-attn blocks (one ~47MB tensor, not NB copies).
+    ggml_tensor* fa_mask = nullptr;
+    if (pix_fast_prec() && std::getenv("PIXAL3D_FLASH")) {
+        int64_t nkvpad = GGML_PAD((int64_t)N, 256), nqpad = GGML_PAD((int64_t)N, 256);
+        std::vector<uint16_t> md((size_t)nkvpad * nqpad, 0);   // 0x0000 = keep
+        uint16_t maskval = std::getenv("FLASH_ZM") ? 0x0000 : 0xFBFF;   // diag: all-zero mask
+        for (int64_t j = 0; j < nqpad; j++)
+            for (int64_t kk = N; kk < nkvpad; kk++) md[(size_t)j * nkvpad + kk] = maskval;  // -65504 pad keys
+        int64_t mne[4] = {nkvpad, nqpad, 1, 1};
+        fa_mask = H.const_tensor_f16("fa_mask", 2, mne, std::move(md));
+    }
+
     for (int bi = 0; bi < NB; bi++) {
         std::string bp = "blocks." + std::to_string(bi) + ".";
         ggml_tensor* mod6 = ggml_add(ctx, H.weight(bp + "modulation"), tmod);
@@ -78,7 +91,7 @@ static inline ggml_tensor* build_slat_dit_forward(ggml_context* ctx, M1Harness& 
         k = mh_rms_norm(ctx, k, H.weight(bp + "self_attn.k_rms_norm.gamma"));
         q = ssdit::rope_inter(ctx, q, COS, SIN);
         k = ssdit::rope_inter(ctx, k, COS, SIN);
-        ggml_tensor* sa = attention(ctx, q, k, v, 1.0f / std::sqrt((float)HD));
+        ggml_tensor* sa = attention(ctx, q, k, v, 1.0f / std::sqrt((float)HD), fa_mask);
         sa = lin(ctx, H.weight(bp + "self_attn.to_out.weight"), H.weight(bp + "self_attn.to_out.bias"), sa);
         sa = ggml_mul(ctx, sa, g_msa);
         h = ggml_add(ctx, h, sa);

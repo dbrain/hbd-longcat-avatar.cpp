@@ -92,7 +92,8 @@ static inline float softplusf(float x){ return x>20.f ? x : std::log1p(std::exp(
 //   guide_subs (pred_subdiv=false reuses the SHAPE decoder's subs).
 inline svae::Mesh m4_decode_mesh(const std::vector<int32_t>& coords_in,
         const std::vector<float>& shape_slat, const std::string& wdir, bool use_cuda,
-        std::vector<std::vector<uint8_t>>* out_subs = nullptr) {
+        std::vector<std::vector<uint8_t>>* out_subs = nullptr, bool close_surface = false,
+        std::vector<int32_t>* out_coords1024 = nullptr) {
     WLoad W(wdir);
     const int MC[5] = {1024,512,256,128,64}; const int NB[4] = {4,16,8,4}; const float EPS = 1e-6f;
     int N = (int)coords_in.size() / 4;
@@ -143,7 +144,8 @@ inline svae::Mesh m4_decode_mesh(const std::vector<int32_t>& coords_in,
         for (int d=0;d<3;d++) inter[(size_t)i*3+d] = (h7[(size_t)i*7+3+d] > 0.f) ? 1 : 0;
         qlerp[i] = softplusf(h7[(size_t)i*7+6]);
     }
-    return svae::flexible_dual_grid_to_mesh(coords.data(), N, dual.data(), inter.data(), qlerp.data(), 1024);
+    if (out_coords1024) *out_coords1024 = coords;   // A1: grid-1024 occupancy for the marching-tet remesh
+    return svae::flexible_dual_grid_to_mesh(coords.data(), N, dual.data(), inter.data(), qlerp.data(), 1024, close_surface);
 }
 
 // M6: tex decoder (SparseUnetVaeDecoder, out 6, pred_subdiv=false). Reuses the m4 backbone but

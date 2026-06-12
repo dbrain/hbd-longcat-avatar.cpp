@@ -10,6 +10,8 @@
 #include "slat_dit_graph.hpp"
 #include "geometry_e2e.hpp"
 #include "sparse_vae_pipeline.hpp"
+#include "svp_gpu.hpp"            // GPU-resident decode (Phase C #1): linear→cuBLAS, feats resident
+#include "remesh.hpp"            // A1: marching-tetrahedra manifold watertight remesh
 #include "torch_randn.hpp"
 #include <cstdio>
 #include <cmath>
@@ -92,25 +94,46 @@ static inline std::vector<float> imagenet_norm(const std::vector<float>& raw, in
     return n;
 }
 
+// Per-stage Trellis.2/Pixal3D sampler config (the knobs Python's run_inference exposes; see
+// inference.py). guidance = "how close to the image" (CFG strength: higher = more faithful to the
+// input, less invention); rescale = guidance_rescale (std re-normalization, 0..1); rescale_t = the
+// Möbius time-warp; [lo,hi] = the guidance interval; steps = sampler iterations (detail/speed).
+struct StageSampler { float guidance, rescale, rescale_t; double lo, hi; int steps; };
+
 struct ChainInput {
     std::vector<float> img512_raw, img1024_raw;   // [0,1] CHW (DINOv3 input is normalized internally)
-    float cam, dist, ms;                          // camera scalars (radians / units)
+    float cam, dist, ms;                          // camera scalars (radians / units); ms = mesh_scale
     std::vector<float> norm_mean, norm_std;       // shape_slat denorm [32]
     std::vector<float> tex_mean, tex_std;         // tex_slat denorm [32] (only if textured)
     bool use_cuda = true;
     bool verbose = true;
     bool textured = false;                        // M6: also run the tex branch -> per-vertex color
+    bool watertight = true;                       // A1: close the dual-grid holes (interim hack path)
+    bool remesh = false;                          // A1: proper manifold watertight remesh (marching-tet)
+    // sampler conditioning (defaults == inference.py run_inference defaults). seed = noise variation.
+    int seed = 42;
+    StageSampler ss    {7.5f, 0.7f, 5.0f, 0.6, 1.0, 12};   // sparse-structure (SS) DiT
+    StageSampler shape {7.5f, 0.5f, 3.0f, 0.6, 1.0, 12};   // shape_slat DiT (M2 lr + M3b hr share this)
+    StageSampler tex   {1.0f, 0.0f, 3.0f, 0.6, 0.9, 12};   // tex_slat DiT (CFG off: guidance 1.0)
+    // image_resolution (512) is structurally baked into the cond config (CFG512/CFG1024 graphs);
+    // max_num_tokens (Python's complex-asset OOM guard) is superseded by query-tiled attention (A2).
+    int max_num_tokens = 49152;
 };
 struct ChainStats { int N1=0, M=0; double secs=0; };
 
-// image -> mesh (+ optional per-vertex base_color if in.textured). seed-42 noise reproduced.
-// out_vcolors (if textured): per-vertex RGB [V*3] (base_color), aligned 1:1 with mesh.verts.
+// image -> mesh (+ optional texture outputs if in.textured). seed-42 noise reproduced.
+//   out_vcolors    : interim per-vertex RGB [V*3] (base_color), aligned 1:1 with mesh.verts.
+//   out_pbr_feats  : the full per-voxel 6-ch PBR volume [Nvox*6] (base_color3/metallic/roughness/alpha)
+//   out_pbr_coords : the matching voxel coords [Nvox*4] (b,x,y,z) on the grid-1024 lattice.
+// The (feats,coords) volume feeds the UV-atlas bake (texatlas::bake); vcolors is the interim COLOR_0.
 static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = nullptr,
-                                      std::vector<float>* out_vcolors = nullptr) {
+                                      std::vector<float>* out_vcolors = nullptr,
+                                      std::vector<float>* out_pbr_feats = nullptr,
+                                      std::vector<int32_t>* out_pbr_coords = nullptr) {
     const bool V = in.verbose; const bool cuda = in.use_cuda;
     auto LOG = [&](const char* fmt, double a){ if (V) printf(fmt, a); fflush(stdout); };
     double t0 = now_s();
-    trandn::Generator gen(42);
+    trandn::Generator gen(in.seed);
     std::vector<float> img512_norm = imagenet_norm(in.img512_raw, 512);
     std::vector<float> img1024_norm = imagenet_norm(in.img1024_raw, 1024);
     geo::ProjCam cam(in.cam, in.dist, in.ms);
@@ -143,7 +166,7 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
                 Hf.upload_input_raw(gin, c?global512:zg); Hf.upload_input_raw(pin, c?proj_ss:zp);
                 Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
             double t=now_s();
-            z_s = geo::flow_sampler(NEL, noise1, 1e-5f, 7.5f, 0.7f, 5.0, 0.6, 1.0, 12, fwd, V?"ss-dit":nullptr);
+            z_s = geo::flow_sampler(NEL, noise1, 1e-5f, in.ss.guidance, in.ss.rescale, in.ss.rescale_t, in.ss.lo, in.ss.hi, in.ss.steps, fwd, V?"ss-dit":nullptr);
             LOG("[2] SS DiT (%.1fs)\n", now_s()-t);
         }
         {
@@ -192,7 +215,7 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
                 Hf.upload_input_raw(gin, c?global512:zg); Hf.upload_input_raw(pin, c?cond2:zp);
                 Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
             double t=now_s();
-            std::vector<float> lr_raw = geo::flow_sampler(NEL, noise2, 1e-5f, 7.5f, 0.5f, 3.0, 0.6, 1.0, 12, fwd, V?"m2-dit":nullptr);
+            std::vector<float> lr_raw = geo::flow_sampler(NEL, noise2, 1e-5f, in.shape.guidance, in.shape.rescale, in.shape.rescale_t, in.shape.lo, in.shape.hi, in.shape.steps, fwd, V?"m2-dit":nullptr);
             LOG("[3] M2 DiT (%.1fs)\n", now_s()-t);
             lr_denorm = lr_raw;
             geo::denorm_inplace(lr_denorm, in.norm_mean.data(), in.norm_std.data(), slatdit::INCH);
@@ -203,7 +226,12 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
     std::vector<int32_t> coordsM;
     {
         double t=now_s();
+#ifdef M3A_USE_CUDA
+        std::vector<int32_t> hr_coords = cuda ? svpg::m3a_upsample(coords1, lr_denorm, SHAPEDEC_W)
+                                              : svp::m3a_upsample(coords1, lr_denorm, SHAPEDEC_W, cuda);
+#else
         std::vector<int32_t> hr_coords = svp::m3a_upsample(coords1, lr_denorm, SHAPEDEC_W, cuda);
+#endif
         int Nh = (int)hr_coords.size()/4;
         coordsM = geo::quantize_grid_unique(hr_coords.data(), Nh, 512, 64);
         if (V) printf("[4] M3a Nh=%d -> M=%d (%.1fs)\n", Nh, (int)coordsM.size()/4, now_s()-t);
@@ -245,21 +273,74 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
             Hf.upload_input_raw(gin, c?global1024:zg); Hf.upload_input_raw(pin, c?cond3b:zp);
             Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
         double t=now_s();
-        std::vector<float> hr_raw = geo::flow_sampler(NEL, noise3, 1e-5f, 7.5f, 0.5f, 3.0, 0.6, 1.0, 12, fwd, V?"m3b-dit":nullptr);
+        std::vector<float> hr_raw = geo::flow_sampler(NEL, noise3, 1e-5f, in.shape.guidance, in.shape.rescale, in.shape.rescale_t, in.shape.lo, in.shape.hi, in.shape.steps, fwd, V?"m3b-dit":nullptr);
         LOG("[6] M3b DiT (%.1fs)\n", now_s()-t);
         shape_denorm = hr_raw;
         geo::denorm_inplace(shape_denorm, in.norm_mean.data(), in.norm_std.data(), slatdit::INCH);
     }
 
-    // (7) M4 shape decoder + mesh (capture per-level subs for the tex branch)
+    // (7) M4 shape decoder + mesh (capture per-level subs for the tex branch; grid-1024 occupancy
+    //     for the remesh). close_surface (the interim hole-fill hack) is skipped when remeshing.
     double t=now_s();
     std::vector<std::vector<uint8_t>> subs;
-    svae::Mesh mesh = svp::m4_decode_mesh(coordsM, shape_denorm, SHAPEDEC_W, cuda, in.textured ? &subs : nullptr);
+    std::vector<int32_t> coords1024;
+    const bool cs = in.watertight && !in.remesh;                 // interim close_surface only when NOT remeshing
+    std::vector<int32_t>* pc1024 = in.remesh ? &coords1024 : nullptr;
+#ifdef M3A_USE_CUDA
+    svae::Mesh mesh = cuda ? svpg::m4_decode_mesh(coordsM, shape_denorm, SHAPEDEC_W, in.textured ? &subs : nullptr, cs, pc1024)
+                           : svp::m4_decode_mesh(coordsM, shape_denorm, SHAPEDEC_W, cuda, in.textured ? &subs : nullptr, cs, pc1024);
+#else
+    svae::Mesh mesh = svp::m4_decode_mesh(coordsM, shape_denorm, SHAPEDEC_W, cuda, in.textured ? &subs : nullptr, cs, pc1024);
+#endif
     if (V) printf("[7] M4 mesh: verts=%d faces=%d (%.1fs)\n", mesh.N, mesh.F, now_s()-t);
+
+    // (7b) A1 watertight. Two paths:
+    //   remesh (proper): marching-tetrahedra on the grid-1024 occupancy -> clean MANIFOLD watertight
+    //     mesh (boundary==0, nonmanifold==0, no flaps). Unblocks quality decimation + a tight atlas.
+    //     The dual-grid extractor's output (above) is discarded; textures bake volumetrically so the
+    //     remeshed topology is independent of the PBR volume.
+    //   watertight (interim): close_surface + fill_holes ear/mirror-cap hack (adds degenerate flaps).
+    if (in.remesh) {
+        double tw = now_s();
+        int Nocc = (int)coords1024.size()/4;
+        // SOLIDIFY + COARSE marching-cubes: the M4 occupancy is a thin SHELL, so meshing it directly
+        // (marching-tet) gives a faceted lattice surface that meshopt can't quality-decimate and
+        // xatlas shatters into ~48k charts (840s). Instead solidify the shell (coarse-rasterise →
+        // flood-fill exterior → interior=solid) and march the smoothed solid at a coarse grid →
+        // a SMOOTH, WATERTIGHT, SINGLE-COMPONENT, coherent-normal low-poly outer surface. Then
+        // orient_consistent (inside) + Taubin → quality-decimatable → tight atlas (55% util, ~1k
+        // charts, ~13s unwrap). PIXAL3D_REMESH_STRIDE (fine voxels/coarse cell, default 6 → grid
+        // 170), _BLUR (field box-blur, default 1), _SMOOTH (Taubin iters, default 5).
+        // stride 4 (grid 256) keeps the chin/neck gap + finger separation that coarser strides bridge
+        // (stride 6 over-rounded those into blobs); light Taubin (2) avoids further rounding. The face
+        // budget is recovered by QUALITY decimation downstream (winding-fix unblocked it), which
+        // preserves sharp features far better than coarser marching. stride 3 = max detail (slower).
+        // stride 3 (grid 341) is the crispness/speed balance: keeps the chin/neck gap, finger gaps, and
+        // boot/heel shape far better than stride 4-6 (which rounded them to nubs). blur 1 + light Taubin
+        // (1) cleans facet noise without rounding sharp corners. NOTE: MC-on-a-field still rounds hard
+        // edges by construction — the full "keep the spikes" fix is dual-contouring (next lap). stride 2
+        // (grid 512) = crisper still, slower. Quality decimation downstream preserves the detail.
+        int stride = std::getenv("PIXAL3D_REMESH_STRIDE") ? atoi(std::getenv("PIXAL3D_REMESH_STRIDE")) : 3;
+        int blur   = std::getenv("PIXAL3D_REMESH_BLUR")   ? atoi(std::getenv("PIXAL3D_REMESH_BLUR"))   : 1;
+        int sm     = std::getenv("PIXAL3D_REMESH_SMOOTH") ? atoi(std::getenv("PIXAL3D_REMESH_SMOOTH")) : 1;
+        mesh = svae::marching_cubes_solid(coords1024.data(), Nocc, 1024, stride, blur<1?1:blur, 0.5f);
+        if (sm > 0) svae::taubin_smooth(mesh, sm);
+        int64_t b,nm; svae::mesh_topology_stats(mesh, b, nm);
+        if (V) printf("[7b] REMESH (solid+coarse-MC stride=%d blur=%d smooth=%d on %d shell voxels): verts=%d faces=%d boundary=%lld nonmanifold=%lld %s (%.1fs)\n",
+                      stride, blur, sm, Nocc, mesh.N, mesh.F, (long long)b, (long long)nm,
+                      (b==0&&nm==0)?"= CLEAN MANIFOLD ✓":"(RESIDUAL)", now_s()-tw);
+    } else if (in.watertight) {
+        double tw = now_s();
+        int64_t b0 = svae::boundary_edge_count(mesh);
+        int added = (b0 > 0) ? svae::fill_holes(mesh) : 0;
+        int64_t b1 = svae::boundary_edge_count(mesh);
+        if (V) printf("[7b] watertight: boundary %lld->%lld (+%d ear tris), verts=%d faces=%d (%.1fs)\n",
+                      (long long)b0, (long long)b1, added, mesh.N, mesh.F, now_s()-tw);
+    }
 
     // (8) M6 TEXTURE branch: tex DiT (in_ch64 = noise || re-normed shape_slat, CFG off, 4th
     //     seed-42 draw) -> tex_slat -> tex decoder (out 6 PBR, guide_subs=subs) -> per-vertex color.
-    if (in.textured && out_vcolors) {
+    if (in.textured && (out_vcolors || out_pbr_feats)) {
         // re-normalize shape_slat for the concat: (x - shape_mean)/shape_std
         std::vector<float> shape_renorm = shape_denorm;
         for (size_t i=0;i<shape_renorm.size();i++){ int c=(int)(i%slatdit::INCH); shape_renorm[i]=(shape_renorm[i]-in.norm_mean[c])/in.norm_std[c]; }
@@ -285,18 +366,29 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
                 Hf.upload_input_raw(gin,global1024); Hf.upload_input_raw(pin,cond3b);
                 Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
             double tt=now_s();
-            tex_raw = geo::flow_sampler(NEL, tex_noise, 1e-5f, 1.0f, 0.0f, 3.0, 0.6, 0.9, 12, fwd, V?"tex-dit":nullptr);
+            tex_raw = geo::flow_sampler(NEL, tex_noise, 1e-5f, in.tex.guidance, in.tex.rescale, in.tex.rescale_t, in.tex.lo, in.tex.hi, in.tex.steps, fwd, V?"tex-dit":nullptr);
             LOG("[8] tex DiT (%.1fs)\n", now_s()-tt);
         }
         std::vector<float> tex_slat = tex_raw;
         geo::denorm_inplace(tex_slat, in.tex_mean.data(), in.tex_std.data(), INCH);
         double tt=now_s();
-        std::vector<float> pbr = svp::m6_tex_decode(coordsM, tex_slat, subs, TEXDEC_W, cuda);  // [V,6]
+        std::vector<int32_t> pbr_coords;
+#ifdef M3A_USE_CUDA
+        std::vector<float> pbr = cuda ? svpg::m6_tex_decode(coordsM, tex_slat, subs, TEXDEC_W, &pbr_coords)
+                                      : svp::m6_tex_decode(coordsM, tex_slat, subs, TEXDEC_W, cuda, &pbr_coords);  // [V,6]
+#else
+        std::vector<float> pbr = svp::m6_tex_decode(coordsM, tex_slat, subs, TEXDEC_W, cuda, &pbr_coords);  // [V,6]
+#endif
         if (V) printf("[8] tex decoder: %d PBR voxels (%.1fs)\n", (int)pbr.size()/6, now_s()-tt);
-        // per-vertex base_color (mesh.verts[i] <-> pbr voxel i)
         int V6 = (int)pbr.size()/6;
-        out_vcolors->resize((size_t)mesh.N*3);
-        for (int i=0;i<mesh.N && i<V6;i++) for (int c=0;c<3;c++){ float v=pbr[(size_t)i*6+c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); }
+        // full PBR volume (feeds the UV-atlas bake): feats [V6*6] + coords [V6*4]
+        if (out_pbr_feats)  *out_pbr_feats  = pbr;
+        if (out_pbr_coords) *out_pbr_coords = pbr_coords;
+        // interim per-vertex base_color (mesh.verts[i] <-> pbr voxel i, approximate zip)
+        if (out_vcolors) {
+            out_vcolors->resize((size_t)mesh.N*3);
+            for (int i=0;i<mesh.N && i<V6;i++) for (int c=0;c<3;c++){ float v=pbr[(size_t)i*6+c]; out_vcolors->at((size_t)i*3+c)=v<0?0:(v>1?1:v); }
+        }
     }
 
     if (stats) { stats->N1=N1; stats->M=M; stats->secs=now_s()-t0; }

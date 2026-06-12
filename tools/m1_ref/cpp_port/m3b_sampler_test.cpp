@@ -61,8 +61,28 @@ int main(int argc, char** argv) {
         Hf.upload_input_raw(gin, cond ? cond_g : zero_g);
         Hf.upload_input_raw(pin, cond ? cond_p : zero_p);
         Hf.compute(gff);
+        // DIAG: dump captured block-0 q/k/v (PIXAL3D_FA_CAPTURE) once → cap_{q,k,v}.bin for replay.
+        if (std::getenv("PIXAL3D_FA_CAPTURE")) { static int fc=0; int capfwd=getenv("CAPFWD")?atoi(getenv("CAPFWD")):0;
+          bool fire = (fc==capfwd); fc++; if (fire) {
+            // find the FIRST block whose flash output is NaN (cap_out_<n>)
+            for (int n=0;n<40;n++){ char nm[24]; snprintf(nm,sizeof(nm),"cap_out_%d",n);
+                ggml_tensor* t=ggml_get_tensor(cf,nm); if(!t) break;
+                std::vector<float> buf(ggml_nelements(t)); ggml_backend_tensor_get(t,buf.data(),0,ggml_nbytes(t));
+                size_t nan=0; float amax=0; for(float x:buf){ if(std::isnan(x)||std::isinf(x))nan++; else amax=std::max(amax,std::fabs(x)); }
+                printf("[cap] block %2d flash out: nan=%zu absmax=%.1f\n", n, nan, amax);
+                if (nan>0) { printf("[cap] >>> FIRST NaN at block %d\n", n); break; }
+            }
+            for (const char* nm : {"cap_q","cap_k","cap_v"}) {
+                ggml_tensor* t = ggml_get_tensor(cf, nm); if (!t) continue;
+                std::vector<float> buf(ggml_nelements(t)); ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+                FILE* fp = fopen((std::string(nm)+".bin").c_str(), "wb"); fwrite(buf.data(), 4, buf.size(), fp); fclose(fp);
+            } fflush(stdout); }
+        }
         std::vector<float> v(NEL);
         ggml_backend_tensor_get(vout, v.data(), 0, NEL * sizeof(float));
+        { static int fwd=0; size_t nan=0; float amax=0; for(float x:v){ if(std::isnan(x)||std::isinf(x))nan++; else amax=std::max(amax,std::fabs(x)); }
+          if (std::getenv("FWD_DBG")) printf("    [fwd %d] vout nan=%zu absmax=%.2f\n", fwd, nan, amax);
+          fwd++; }
         return v;
     };
     auto pred_to_x0 = [&](const std::vector<float>& xt, float t, const std::vector<float>& pr) {
