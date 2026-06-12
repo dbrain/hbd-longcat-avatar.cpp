@@ -432,6 +432,12 @@ SDVersion ModelLoader::get_sd_version() {
         if (tensor_storage.name.find("model.diffusion_model.blocks.0.audio_cross_attn.q_linear.weight") != std::string::npos) {
             return VERSION_LONGCAT_AVATAR;
         }
+        // Wan2.2-S2V-14B (LiveAvatar): the audio_injector cross-attn + trainable_cond_mask
+        // are unique to the S2V arch (vs stock Wan2.x which has neither).
+        if (tensor_storage.name.find("model.diffusion_model.audio_injector.injector.0.q.weight") != std::string::npos ||
+            tensor_storage.name.find("model.diffusion_model.trainable_cond_mask.weight") != std::string::npos) {
+            return VERSION_WAN_S2V;
+        }
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
             tensor_storage.name.find("model.diffusion_model.single_transformer_blocks.") != std::string::npos) {
             is_flux = true;

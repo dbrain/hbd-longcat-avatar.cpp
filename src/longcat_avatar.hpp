@@ -1753,6 +1753,7 @@ namespace LONGCAT_AVATAR {
                             // happens inside the FA K-tile loop and is bit-exact (skipping
                             // a fully-denied K-tile is mathematically identical to running
                             // it — its softmax weights are all exp(-INF)=0).
+#ifdef SD_USE_CUDA
                             static const bool bsa_bitmap_disabled = []{
                                 const char* s = getenv("LONGCAT_NO_BSA_BITMAP");
                                 if (s && s[0] == '1') return true;
@@ -1767,10 +1768,13 @@ namespace LONGCAT_AVATAR {
                             } else {
                                 ggml_cuda_set_longcat_fa_bsa_bitmap(nullptr, 0, 0);
                             }
+#endif
                         } else {
                             // Step 1 (or pre-consume): no BSA mask in flight → ensure the
                             // FA bitmap state is clear so prior renders' state doesn't leak.
+#ifdef SD_USE_CUDA
                             ggml_cuda_set_longcat_fa_bsa_bitmap(nullptr, 0, 0);
+#endif
                         }
                     } else {
                         LOG_WARN("[BSA] disabled — latent h=%lld w=%lld not divisible by cube [%d,%d]",

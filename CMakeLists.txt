@@ -138,6 +138,15 @@ if(SD_MUSA)
     set(GGML_MUSA ON)
 endif()
 
+# The LongCat offload/BSA fast paths (lap-31.2/lap-32) call ggml-cuda-family
+# symbols (ggml_backend_cuda_host_buffer_type, ggml_backend_cuda_get_device_memory,
+# ggml_cuda_set_longcat_fa_bsa_bitmap) directly. Those symbols only exist when a
+# CUDA-family backend (CUDA/HIP/MUSA) is compiled; on a CPU/Vulkan build they are
+# undefined at link. SD_USE_CUDA gates the call sites so the CPU build links.
+if(SD_CUDA OR SD_HIPBLAS OR SD_MUSA)
+    add_compile_definitions(SD_USE_CUDA)
+endif()
+
 if(SD_WEBP)
     if(NOT SD_SUBMODULE_WEBP AND NOT SD_USE_SYSTEM_WEBP)
         message(FATAL_ERROR "WebP support enabled but no source found.
