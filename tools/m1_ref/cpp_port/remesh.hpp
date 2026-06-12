@@ -567,44 +567,46 @@ inline int64_t make_manifold(Mesh& m) {
         m.faces.swap(ff); F=(int64_t)m.faces.size()/3;
     }
     const int64_t V = (int64_t)m.verts.size()/3;
+    // global edge incidence: how many faces share each undirected edge (==2 manifold, >2 non-manifold)
     auto ukey=[](int64_t a,int64_t b){ int64_t lo=a<b?a:b,hi=a<b?b:a; return (lo<<32)|(uint32_t)hi; };
-    // edge -> the (up to 2) faces we will treat as manifold-paired. Record exactly two; a 3rd+ face
-    // on the same edge is left UNPAIRED on that edge (so it splits away → boundary there).
-    std::unordered_map<int64_t,std::pair<int,int>> epair; epair.reserve((size_t)F*3);
+    std::unordered_map<int64_t,int> ec; ec.reserve((size_t)F*3);
     for (int64_t t=0;t<F;t++){ int64_t v[3]={m.faces[t*3],m.faces[t*3+1],m.faces[t*3+2]};
-        for(int e=0;e<3;e++){ int64_t k=ukey(v[e],v[(e+1)%3]); auto it=epair.find(k);
-            if(it==epair.end()) epair[k]={(int)t,-1};
-            else if(it->second.second<0) it->second.second=(int)t;   // 2nd face pairs
-            /* 3rd+ : ignore (stays unpaired → boundary on this side) */ } }
-    // per-vertex incident faces
+        for(int e=0;e<3;e++) ec[ukey(v[e],v[(e+1)%3])]++; }
+    // per-vertex incident faces (faceid)
     std::vector<std::vector<int>> vf(V);
     for (int64_t t=0;t<F;t++) for(int c=0;c<3;c++) vf[m.faces[t*3+c]].push_back((int)t);
-    // union-find over the GLOBAL face set, but only union faces that share a PAIRED (manifold) edge.
-    std::vector<int> uf((size_t)F); for(int64_t i=0;i<F;i++) uf[i]=(int)i;
-    std::function<int(int)> find=[&](int x){ while(uf[x]!=x){ uf[x]=uf[uf[x]]; x=uf[x]; } return x; };
-    auto uni=[&](int a,int b){ a=find(a); b=find(b); if(a!=b) uf[a]=b; };
-    for (auto& kv:epair){ if(kv.second.second>=0) uni(kv.second.first,kv.second.second); }
-    // new vertex per (original vertex, umbrella-group). Group key = uf-root of the face, restricted
-    // to faces incident to v.
-    std::vector<float> nv = m.verts;        // copies of original positions appended below
-    std::vector<int64_t> nf((size_t)F*3);
-    std::unordered_map<int64_t,int> grp;    // (v<<32 | root) -> new vertex id
-    grp.reserve((size_t)V*2);
-    for (int64_t t=0;t<F;t++){
-        int root=find((int)t);
-        for(int c=0;c<3;c++){ int64_t v=m.faces[t*3+c]; int64_t key=(v<<20)^((int64_t)root);
-            // collision-safe key: combine v and root with a hash, store map keyed by both
-            key = (v*2654435761ULL) ^ ((uint64_t)root*40503ULL);
-            auto it=grp.find(key);
-            int nvid;
-            if(it==grp.end()){
-                // first time this (v,root) seen: reuse v for its first group, else append a copy
-                // (cheap heuristic: always append except keep original index space coherent)
-                nvid=(int)(nv.size()/3);
-                nv.push_back(m.verts[(size_t)v*3]); nv.push_back(m.verts[(size_t)v*3+1]); nv.push_back(m.verts[(size_t)v*3+2]);
-                grp[key]=nvid;
-            } else nvid=it->second;
-            nf[t*3+c]=nvid;
+    // PER-VERTEX umbrella split: for each vertex v, locally union its incident faces that share an
+    // edge (v,x) which is MANIFOLD (exactly 2 faces). Faces meeting only at a non-manifold edge of v
+    // land in different umbrellas → get distinct vertex copies → that edge ends up with <=2 faces.
+    // (The earlier bug was a GLOBAL face union-find: faces could be merged through a manifold edge NOT
+    // incident to v, re-sharing v's non-manifold edge. Local grouping fixes that.)
+    std::vector<float> nv = m.verts;                   // appended copies below
+    std::vector<int64_t> nf(m.faces.begin(), m.faces.end());
+    // for each (faceid, corner) we record the new vertex id; default = original (group 0 keeps v)
+    for (int64_t v=0; v<V; v++){
+        auto& inc = vf[v]; const int n=(int)inc.size(); if(n==0) continue;
+        // local union-find over inc[0..n-1]
+        std::vector<int> uf(n); for(int i=0;i<n;i++) uf[i]=i;
+        std::function<int(int)> find=[&](int x){ while(uf[x]!=x){ uf[x]=uf[uf[x]]; x=uf[x]; } return x; };
+        // neighbor x -> local face indices that have edge (v,x); union pairs on a MANIFOLD edge
+        std::unordered_map<int64_t,int> firstFace;     // x -> local idx of first face seen (only if edge manifold)
+        for (int i=0;i<n;i++){ int t=inc[i]; int64_t a=m.faces[t*3],b=m.faces[t*3+1],c=m.faces[t*3+2];
+            int64_t other[2]; int oc=0;
+            if(a==v){other[0]=b;other[1]=c;} else if(b==v){other[0]=a;other[1]=c;} else {other[0]=a;other[1]=b;}
+            for(oc=0;oc<2;oc++){ int64_t x=other[oc]; if(ec[ukey(v,x)]!=2) continue;   // only manifold edges merge
+                auto it=firstFace.find(x);
+                if(it==firstFace.end()) firstFace[x]=i;
+                else { int a1=find(i),b1=find(it->second); if(a1!=b1) uf[a1]=b1; } }
+        }
+        // assign a new vertex per local group; group of the FIRST face keeps original index v
+        std::unordered_map<int,int> groupVid; int firstRoot=find(0); groupVid[firstRoot]=(int)v;
+        for (int i=0;i<n;i++){ int r=find(i); int vid;
+            auto it=groupVid.find(r);
+            if(it==groupVid.end()){ vid=(int)(nv.size()/3);
+                nv.push_back(m.verts[v*3]); nv.push_back(m.verts[v*3+1]); nv.push_back(m.verts[v*3+2]);
+                groupVid[r]=vid; } else vid=it->second;
+            // set this corner of face inc[i]
+            int t=inc[i]; for(int c=0;c<3;c++) if(m.faces[t*3+c]==v) nf[t*3+c]=vid;
         }
     }
     int64_t added=(int64_t)(nv.size()/3) - V;
