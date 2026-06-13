@@ -29,8 +29,11 @@ ap.add_argument('--mesh', default='qem', choices=['qem','dense'])
 ap.add_argument('--texsize', type=int, default=2048)
 ap.add_argument('--out', default='out_uv.glb')
 ap.add_argument('--inpaint', type=int, default=3)   # cv2 TELEA radius for the gutter
+ap.add_argument('--ssaa', type=int, default=1)       # supersample: bake at texsize*ssaa, area-downsample → AA/smooth
+ap.add_argument('--blur', type=float, default=0.0)   # gaussian sigma on baseColor (after inpaint) — gentle smoothing
+ap.add_argument('--decimate', type=int, default=0)   # cumesh.simplify the DENSE mesh to N faces (finer silhouette than the 200k QEM)
 a = ap.parse_args()
-TS = a.texsize
+TS = a.texsize * a.ssaa
 vbase = 'dump_mesh' if a.mesh == 'qem' else 'dump_dense'
 v = np.fromfile(os.path.join(a.dump, f'{vbase}_v.bin'), dtype=np.float32).reshape(-1,3)
 f = np.fromfile(os.path.join(a.dump, f'{vbase}_f.bin'), dtype=np.int64).reshape(-1,3)
@@ -39,13 +42,17 @@ coords = np.fromfile(os.path.join(a.dump, 'dump_pbr_c.bin'), dtype=np.int32).res
 print(f"[bake] mesh={a.mesh} V={v.shape[0]} F={f.shape[0]} vol N={feats.shape[0]} TS={TS}")
 
 vt = torch.from_numpy(v).float().cuda(); ft = torch.from_numpy(f.astype(np.int32)).int().cuda()
-normals = trimesh.Trimesh(vertices=v, faces=f, process=False).vertex_normals
 t0 = time.time()
 cm = cumesh.CuMesh(); cm.init(vt, ft)
+if a.decimate > 0:
+    cm.simplify(a.decimate)
+    print(f"[bake] cumesh simplify -> {a.decimate} faces target ({time.time()-t0:.1f}s)")
 vt, ft, uvt, vmap = cm.uv_unwrap(return_vmaps=True)
 vt = vt.cuda(); ft = ft.cuda(); uvt = uvt.cuda()
 print(f"[bake] cumesh unwrap: {vt.shape[0]} verts / {ft.shape[0]} tris ({time.time()-t0:.1f}s)")
-verts = vt.cpu().numpy(); faces = ft.cpu().numpy(); uvs = uvt.cpu().numpy(); normals = normals[vmap.cpu().numpy()]
+verts = vt.cpu().numpy(); faces = ft.cpu().numpy(); uvs = uvt.cpu().numpy()
+# smooth vertex normals on the (possibly simplified) UNWRAPPED mesh
+normals = trimesh.Trimesh(vertices=verts, faces=faces, process=False).vertex_normals
 
 ctx = dr.RasterizeCudaContext()
 uvr = torch.cat([uvt*2-1, torch.zeros_like(uvt[:,:1]), torch.ones_like(uvt[:,:1])], -1).unsqueeze(0)
@@ -62,6 +69,16 @@ def chan(sl, r):
 base = chan(LAYOUT['base_color'], a.inpaint)
 metal = chan(LAYOUT['metallic'], 1)[..., None]; rough = chan(LAYOUT['roughness'], 1)[..., None]
 alpha = chan(LAYOUT['alpha'], 1)[..., None]
+# gentle smoothing: optional gaussian blur (gutters are inpainted so no dark bleed), then
+# supersample-downsample to the target size (area-average AA across charts/texels).
+if a.blur > 0:
+    base = cv2.GaussianBlur(base, (0,0), a.blur)
+if a.ssaa > 1:
+    ts = a.texsize
+    base = cv2.resize(base, (ts,ts), interpolation=cv2.INTER_AREA)
+    metal = cv2.resize(metal, (ts,ts), interpolation=cv2.INTER_AREA)[...,None]
+    rough = cv2.resize(rough, (ts,ts), interpolation=cv2.INTER_AREA)[...,None]
+    alpha = cv2.resize(alpha, (ts,ts), interpolation=cv2.INTER_AREA)[...,None]
 mat = trimesh.visual.material.PBRMaterial(
     baseColorTexture=Image.fromarray(np.concatenate([base, alpha], -1)),
     baseColorFactor=np.array([255,255,255,255], np.uint8),
@@ -71,4 +88,4 @@ uvs2 = uvs.copy(); uvs2[:,1] = 1 - uvs2[:,1]
 out = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=False,
                       visual=trimesh.visual.TextureVisuals(uv=uvs2, material=mat))
 out.export(a.out)
-print(f"[bake] wrote {a.out} ({faces.shape[0]} tris, {TS}² atlas, valid mean {base[m].mean(0).round(1)})")
+print(f"[bake] wrote {a.out} ({faces.shape[0]} tris, {a.texsize}² atlas, ssaa={a.ssaa} blur={a.blur})")
