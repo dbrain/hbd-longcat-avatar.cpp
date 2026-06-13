@@ -61,6 +61,12 @@ genuinely-hard blocker, not a wiring detail.**
 - **C++ precluster atlas** (`tex_atlas.hpp` precluster path): folds where the surface curves → teal +
   sliver STREAKS. Also not acceptable. (HANDOFF-A §7.)
 
+**Reverse-engineered why cumesh wins (this session):** its `uv_unwrap` does its own GPU **"fast
+clustering"** (~62k clusters) → feeds them to xatlas which parameterizes + packs → 6 clean charts,
+crack-free, ~5 s. Same xatlas you have in C++; the gap is the clustering + a non-planar (conformal)
+per-cluster UV. **Full detail + the prioritized leads are in `HANDOFF-A-model-smoothness.md` §1 + §5** —
+that handoff owns the crack-free-unwrap task; this section is just the infra framing.
+
 So a native C++ texture needs a **crack-free conformal unwrap** — the open research problem:
   1. **Manifold-repair the mesh, THEN xatlas** — the cracks come from non-manifold fragmentation. If the
      mesh is welded/repaired to (near-)manifold first, xatlas should produce few clean charts like cumesh.
