@@ -119,10 +119,12 @@ static inline std::vector<float> flow_sampler(int NEL, const std::vector<float>&
     std::vector<float> x = noise;
     auto pred_to_x0 = [&](const std::vector<float>& xt, float t, const std::vector<float>& pr){
         std::vector<float> o(NEL); float a=(1-SM), b=(SM+(1-SM)*t);
-        for(int i=0;i<NEL;i++) o[i]=a*xt[i]-b*pr[i]; return o; };
+        for(int i=0;i<NEL;i++) o[i]=a*xt[i]-b*pr[i];
+        return o; };
     auto x0_to_pred = [&](const std::vector<float>& xt, float t, const std::vector<float>& x0){
         std::vector<float> o(NEL); float a=(1-SM), b=(SM+(1-SM)*t);
-        for(int i=0;i<NEL;i++) o[i]=(a*xt[i]-x0[i])/b; return o; };
+        for(int i=0;i<NEL;i++) o[i]=(a*xt[i]-x0[i])/b;
+        return o; };
     std::vector<double> tseq(STEPS+1);
     for (int i=0;i<=STEPS;i++){ double lt=1.0-(double)i/STEPS; tseq[i]=RT*lt/(1+(RT-1)*lt); }
     const bool cfg_off = (GS == 1.0f);  // tex: GS1.0/GR0 -> CFG branch == cond-only; skip neg forward

@@ -27,9 +27,17 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ]; } && [ "$MODE" = "
     -c "$SPIKE/sparse_subm_conv.cu" -o "$HERE/sparse_subm_conv.o"
   "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
     -c "$HERE/svae_cuda.cu" -o "$HERE/svae_cuda.o"
-  "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA $INC -I"$TOOL/include" \
+  CUMESH="$HERE/../../../thirdparty/cumesh_native"
+  mkdir -p "$CUMESH/build"
+  CUMESH_OBJS=""
+  for f in cumesh shared geometry connectivity clean_up simplify atlas native_io; do
+    "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
+      -I"$CUMESH/src" -c "$CUMESH/src/$f.cu" -o "$CUMESH/build/$f.o"
+    CUMESH_OBJS="$CUMESH_OBJS $CUMESH/build/$f.o"
+  done
+  "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH $INC -I"$TOOL/include" -I"$CUMESH/src" \
     "$HERE/$SRC" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
-    "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
+    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" $CUMESH_OBJS -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
     -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
   exit 0
@@ -55,7 +63,26 @@ fi
 
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
-if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ]; then
+if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ] || [ "$BASE" = "glb_repack" ]; then
+  if [ "$MODE" = "cuda" ] && [ "$BASE" = "tex_reproject" ]; then
+    TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+    TP="$HERE/../../../thirdparty"
+    CUMESH="$HERE/../../../thirdparty/cumesh_native"
+    mkdir -p "$CUMESH/build"
+    CUMESH_OBJS=""
+    for f in cumesh shared geometry connectivity clean_up simplify atlas native_io; do
+      "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
+        -I"$CUMESH/src" -c "$CUMESH/src/$f.cu" -o "$CUMESH/build/$f.o"
+      CUMESH_OBJS="$CUMESH_OBJS $CUMESH/build/$f.o"
+    done
+    echo ">> build $BASE cuda (xatlas + meshopt + raster + native CuMesh)"
+    "$TOOL/bin/g++" $COMMON -fopenmp -DTEXATLAS_NATIVE_CUMESH -I"$TOOL/include" -I"$CUMESH/src" \
+      "$HERE/$SRC" "$HERE/native_cumesh_bridge.cpp" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
+      $CUMESH_OBJS -o "$HERE/$BIN" -L"$TOOL/lib" -lcudart -L/usr/lib -lcuda -lm -lpthread \
+      -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+    echo ">> built $BIN"
+    exit 0
+  fi
   CXX="${CXX:-/usr/bin/g++}"
   TP="$HERE/../../../thirdparty"
   echo ">> build $BASE (xatlas + meshopt + raster + grid_sample, no ggml)"

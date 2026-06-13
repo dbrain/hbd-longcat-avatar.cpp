@@ -10,6 +10,9 @@
 #include "tex_atlas.hpp"
 #include "tex_grid_sample.hpp"
 #include "qem.hpp"               // feature-preserving QEM decimation (the production bake-target path)
+#ifdef TEXATLAS_NATIVE_CUMESH
+#include "native_cumesh_bridge.hpp"
+#endif
 #include "glb_textured.hpp"
 #include "glb_writer.hpp"
 #include <cstdio>
@@ -91,11 +94,22 @@ int main(int argc,char**argv){
     // streaky texture is from the coarse 200k QEM facets). Reproject source stays the full dense mesh.
     int texmf=getenv("TEX_MESH_FACES")?atoi(getenv("TEX_MESH_FACES")):0;
     int qemt =getenv("QEM_TARGET")?atoi(getenv("QEM_TARGET")):0;
+    int cmt =getenv("CUMESH_TARGET")?atoi(getenv("CUMESH_TARGET")):0;
     const std::vector<float>*  tv=&qverts; const std::vector<int64_t>* tf=&qfaces; int decim=0;
     std::vector<float> qv2; std::vector<int64_t> qf2;
     if (getenv("DENSE_TARGET")){
         // best-look path: bake on the full DENSE mesh with a real conformal xatlas unwrap (use NO_PRECL).
         tv=&dverts; tf=&dfaces; printf("[rp] bake target = full DENSE mesh %zu f (use NO_PRECL=1 for real unwrap)\n", NFd);
+#ifdef TEXATLAS_NATIVE_CUMESH
+    } else if (cmt>0){
+        double tq=texatlas::_now();
+        native_cumesh::simplify_to_faces(dverts, dfaces, cmt, qv2, qf2,
+            getenv("CUMESH_THRESH") ? (float)atof(getenv("CUMESH_THRESH")) : 1e-8f,
+            getenv("CUMESH_LAMBDA_EDGE") ? (float)atof(getenv("CUMESH_LAMBDA_EDGE")) : 1e-2f,
+            getenv("CUMESH_LAMBDA_SKINNY") ? (float)atof(getenv("CUMESH_LAMBDA_SKINNY")) : 1e-3f);
+        tv=&qv2; tf=&qf2;
+        printf("[rp] bake target = native CuMesh simplify(dense) %zu -> %zu faces (%.2fs)\n", NFd, qf2.size()/3, texatlas::_now()-tq);
+#endif
     } else if (qemt>0){
         // PRODUCTION path: feature-preserving QEM-decimate the DENSE mesh to QEM_TARGET faces.
         svae::Mesh dm; dm.verts=dverts; dm.faces=dfaces; dm.N=(int)NVd; dm.F=(int)NFd;
@@ -105,8 +119,9 @@ int main(int argc,char**argv){
         qv2=qm.verts; qf2=qm.faces; tv=&qv2; tf=&qf2;
         printf("[rp] bake target = QEM(dense) %zu -> %zu faces (aggr %.1f, %.2fs)\n", NFd, qf2.size()/3, aggr, texatlas::_now()-tq);
     } else if (texmf>0){ tv=&dverts; tf=&dfaces; decim=texmf; printf("[rp] bake target = DENSE sloppy-decimated to %d faces\n", texmf); }
+    bool reproject = getenv("RP_OFF") ? false : true;
     texatlas::BakedTexture bt=texatlas::bake(*tv,*tf,pbr,coords,1024,TS,decim,pad,true,/*fbr*/16,
-                                             precl,cone, &dverts,&dfaces,&dattr,/*reproject*/true);
+                                             precl,cone, &dverts,&dfaces,&dattr,reproject);
     glb::write_glb_textured(OUT, bt.verts,bt.normals,bt.uvs,bt.faces,bt.base_color,bt.metal_rough,bt.tw,bt.th);
     printf("[rp] wrote %s (atlas %dx%d, %d charts)\n", OUT, bt.tw,bt.th,bt.chart_count);
     return 0;

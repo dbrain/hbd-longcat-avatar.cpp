@@ -28,7 +28,7 @@ static void usage() {
            "               [--{ss,shape,tex}-rescale-t <T>] [--{ss,shape,tex}-steps <N>]\n"
            "       --tex          : texture branch -> UV-atlas PBR (baseColor+metallicRoughness) GLB\n"
            "       --vcolor       : interim per-vertex COLOR_0 instead of the UV-atlas bake\n"
-           "       --texsize <N>  : atlas resolution (default 2048)\n"
+           "       --texsize <N>  : final texture resolution (default 512; set higher for inspection)\n"
            "       --decimate <F> : downmesh to ~F faces (default 150000; 0=off=full mesh).\n"
            "                        Game assets want a low budget, e.g. --decimate 40000.\n"
            "       --remesh       : proper marching-tet MANIFOLD watertight remesh (no flaps; unblocks\n"
@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     std::string model, image, out;
     float cam = DEF_CAM, dist = DEF_DIST, ms = DEF_MS;
     bool use_cuda = true, write_ply = false, textured = false, fast = false, vcolor = false, watertight = true, remesh = false;
-    int texsize = 2048, decimate = -1;   // -1 = auto (remesh→90k tight/fast atlas, else 150k). dual-grid
+    int texsize = 512, decimate = -1;    // -1 = auto (remesh→90k tight/fast atlas, else 150k). dual-grid
                                           // mesh holes -> xatlas charts/boundary; keep
                                               // face count tractable (~100s unwrap). --decimate to tune.
     pix::ChainInput in;   // sampler conditioning parsed straight into its defaults (== inference.py)
@@ -130,11 +130,8 @@ int main(int argc, char** argv) {
     pix::ChainStats st;
     std::vector<float> vcolors, pbr_feats;
     std::vector<int32_t> pbr_coords;
-    // --remesh textured → PER-VERTEX colour by default: the QEM mesh's UV-atlas bake samples the teal
-    // model INTERIOR at folded charts ("teal splattered everywhere"); per-vertex grid_sample at the
-    // surface vertices is clean. UV-atlas remains opt-in (PIXAL3D_FORCE_UVATLAS) for non-remesh meshes
-    // or once a manifold remesh lands. (Per-vertex loses the metallic/roughness maps — fine for now.)
-    if (remesh && textured && !vcolor && !std::getenv("PIXAL3D_FORCE_UVATLAS")) vcolor = true;
+    // --vcolor remains a diagnostic fallback. The default textured remesh path is now the native
+    // conformal-precluster UV atlas; GLB quantization is opt-in until every renderer handles it cleanly.
     const bool uvatlas = textured && !vcolor;
     svae::Mesh mesh = pix::run_geometry(in, &st,
         (textured && vcolor) ? &vcolors : nullptr,
