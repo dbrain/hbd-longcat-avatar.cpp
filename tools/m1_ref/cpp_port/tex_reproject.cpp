@@ -120,7 +120,8 @@ int main(int argc,char**argv){
         printf("[rp] bake target = QEM(dense) %zu -> %zu faces (aggr %.1f, %.2fs)\n", NFd, qf2.size()/3, aggr, texatlas::_now()-tq);
     } else if (texmf>0){ tv=&dverts; tf=&dfaces; decim=texmf; printf("[rp] bake target = DENSE sloppy-decimated to %d faces\n", texmf); }
     bool reproject = getenv("RP_OFF") ? false : true;
-    texatlas::BakedTexture bt=texatlas::bake(*tv,*tf,pbr,coords,1024,TS,decim,pad,true,/*fbr*/16,
+    int bake_fbr = getenv("TEX_FBR") ? atoi(getenv("TEX_FBR")) : 16;
+    texatlas::BakedTexture bt=texatlas::bake(*tv,*tf,pbr,coords,1024,TS,decim,pad,true,bake_fbr,
                                              precl,cone, &dverts,&dfaces,&dattr,reproject);
     glb::write_glb_textured(OUT, bt.verts,bt.normals,bt.uvs,bt.faces,bt.base_color,bt.metal_rough,bt.tw,bt.th);
     printf("[rp] wrote %s (atlas %dx%d, %d charts)\n", OUT, bt.tw,bt.th,bt.chart_count);
