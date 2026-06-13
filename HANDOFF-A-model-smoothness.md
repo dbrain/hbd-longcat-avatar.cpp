@@ -63,13 +63,16 @@ pipeline: **conformal UV unwrap of the crisp 200k mesh** → rasterize per-texel
 PBR volume → sRGB baseColor + metallicRoughness textures. Validated on Miku + turtle vs their source
 images (compare pages live).
 
-**Two ways the unwrap has been done — same quality, very different speed:**
-- **C++ xatlas** (bundled `thirdparty/xatlas`, real `ComputeCharts`): SMOOTH + correct (verified render).
-  But SLOW: ~173 s on the 200k QEM, >20 min on the dense mesh. This is the NATIVE path and its quality is
-  fine — speed is the only issue (and it's offline asset-gen, so slow may be acceptable). Run it via
-  `tex_reproject` with `NO_PRECL=1` (real unwrap) — see §6.
-- **cumesh** (Python/GPU xatlas, `bake_uv.py`): same look, ~5 s. **This is the REFERENCE only — it is
-  Python and must NOT be the production path.** It exists so you can see the target quality fast.
+**Two ways the unwrap has been done — NOT the same quality (judge in model-viewer, NOT pyrender):**
+- **cumesh** (Python/GPU xatlas, `bake_uv.py`): FEW CLEAN charts → no UV seams → **crisp + crack-free**.
+  The quality bar (owner confirmed "B is the clear winner"). **REFERENCE ONLY — it is Python and must NOT
+  be the production path** (see §0). It exists so you can see the target quality fast (~5 s).
+- **C++ xatlas** (bundled `thirdparty/xatlas`, `NO_PRECL=1`): fragments the non-manifold mesh into ~37k
+  charts → UV seams → **visible CRACKS in model-viewer** (looks like pyref; owner: "A has cracks all over
+  it"). Also slow (173 s) + bloated atlas. The native path is BLOCKED here — getting a crack-free C++
+  unwrap is the open hard problem (see HANDOFF-B §3: manifold-repair-then-xatlas is the most promising).
+  NOTE: an earlier repo claim that "C++ xatlas matches cumesh" was WRONG — judged in pyrender, which hides
+  the seam cracks. ALWAYS judge the texture in model-viewer.
 
 **The size problem — the smoothest version (B) is too heavy:**
 - Owner picked **B** = a finer **500k-face** mesh (smoother hair-tail silhouette than 200k) → **44 MB**.
