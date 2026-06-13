@@ -910,6 +910,10 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         const int ncell  = std::getenv("RP_NCELL")  ? atoi(std::getenv("RP_NCELL"))  : 256;
         const int maxring= std::getenv("RP_MAXRING")? atoi(std::getenv("RP_MAXRING")): 12;
         const float fdot = std::getenv("RP_FRONTDOT")? (float)atof(std::getenv("RP_FRONTDOT")) : 0.0f;
+        const float maxdist_vox = std::getenv("RP_MAXDIST_VOX") ? (float)atof(std::getenv("RP_MAXDIST_VOX")) : -1.f;
+        const float maxdist = maxdist_vox >= 0.f ? maxdist_vox / (float)grid_res : -1.f;
+        const float maxdist2 = maxdist >= 0.f ? maxdist * maxdist : -1.f;
+        const bool allow_back = std::getenv("RP_NO_BACKFALLBACK") == nullptr;
         // SAMPLE MODE: default = snap the texel onto the dense shell (closest-pt-on-tri, front-face
         // reject) then trilinear grid_sample the VOLUME there (stable → no per-texel speckle from
         // triangle-choice flips on fine hair; == pyref's sampling, but on the correct on-shell point).
@@ -918,8 +922,9 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         texgs::VolIndex vol(pbr_coords.data(), (int)pbr_coords.size()/4, 4, 1);
         double tbh=_now();
         texrp::DenseHash dh(dense_verts->data(), dense_faces->data(), (int64_t)dense_faces->size()/3, ncell);
-        if (verbose) printf("[atlas] reproject: dense %zu v / %zu f, hash %d^3 cells (%.2fs build), front_dot=%.2f, mode=%s\n",
-                            dense_verts->size()/3, dense_faces->size()/3, ncell, _now()-tbh, fdot, use_attr?"mesh-attr":"snap+volume");
+        if (verbose) printf("[atlas] reproject: dense %zu v / %zu f, hash %d^3 cells (%.2fs build), front_dot=%.2f, maxdist=%.2f vox, back_fallback=%s, mode=%s\n",
+                            dense_verts->size()/3, dense_faces->size()/3, ncell, _now()-tbh, fdot, maxdist_vox,
+                            allow_back?"on":"off", use_attr?"mesh-attr":"snap+volume");
         size_t miss=0;
         #pragma omp parallel for schedule(dynamic, 2048) reduction(+:miss)
         for (int p=0;p<W*Ht;p++){
@@ -928,7 +933,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             float qn[3]={Nn[0],Nn[1],Nn[2]}; float L=std::sqrt(qn[0]*qn[0]+qn[1]*qn[1]+qn[2]*qn[2]);
             if (L>1e-20f){ qn[0]/=L;qn[1]/=L;qn[2]/=L; }
             float snap[3];
-            if (!dh.sample(P, qn, use_attr?dense_attr->data():nullptr, C, use_attr?&atl[(size_t)p*C]:nullptr, snap, fdot, maxring)) { miss++; continue; }
+            if (!dh.sample(P, qn, use_attr?dense_attr->data():nullptr, C, use_attr?&atl[(size_t)p*C]:nullptr, snap, fdot, maxring, maxdist2, allow_back)) { miss++; continue; }
             if (!use_attr){ float q0=(snap[0]+0.5f)*grid_res, q1=(snap[1]+0.5f)*grid_res, q2=(snap[2]+0.5f)*grid_res;
                 texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r); }
         }

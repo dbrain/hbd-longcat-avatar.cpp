@@ -97,7 +97,8 @@ struct DenseHash {
     // when the caller prefers the mesh attr). Returns false if no triangle found at all (caller
     // inpaints). front_dot = min dot to count as same-facing; falls back to nearest-any if no front.
     inline bool sample(const float* P, const float* qn, const float* attr, int C,
-                       float* out, float* out_pt, float front_dot, int max_ring) const {
+                       float* out, float* out_pt, float front_dot, int max_ring,
+                       float max_dist2 = -1.f, bool allow_back_fallback = true) const {
         int bx=(int)((P[0]+0.5f)*inv), by=(int)((P[1]+0.5f)*inv), bz=(int)((P[2]+0.5f)*inv); clamp3(bx,by,bz);
         float bestd=1e30f, bestu=0,bestv=0,bestw=0; int bestt=-1;
         float bestd_any=1e30f, bu_any=0,bv_any=0,bw_any=0; int bt_any=-1;
@@ -122,8 +123,9 @@ struct DenseHash {
             if ((bestt>=0||bt_any>=0) && found_ring<0) found_ring=r;
         }
         int t=bestt; float U=bestu,Vv=bestv,Wv=bestw;
-        if (t<0){ t=bt_any; U=bu_any;Vv=bv_any;Wv=bw_any; }   // no front tri → fall back to nearest any
+        if (t<0 && allow_back_fallback){ t=bt_any; U=bu_any;Vv=bv_any;Wv=bw_any; bestd=bestd_any; }   // no front tri → fall back to nearest any
         if (t<0) return false;
+        if (max_dist2 >= 0.f && bestd > max_dist2) return false;
         const float* a=&V[F[t*3]*3]; const float* b=&V[F[t*3+1]*3]; const float* c=&V[F[t*3+2]*3];
         if (out_pt) for (int d=0;d<3;d++) out_pt[d]=U*a[d]+Vv*b[d]+Wv*c[d];   // snapped on-shell 3D point
         if (out && attr){ const float* fa=&attr[(size_t)F[t*3]*C]; const float* fb=&attr[(size_t)F[t*3+1]*C]; const float* fc=&attr[(size_t)F[t*3+2]*C];
