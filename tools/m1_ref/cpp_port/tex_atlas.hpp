@@ -103,6 +103,45 @@ static inline std::vector<float> vert_normals(const std::vector<float>& v, const
     return n;
 }
 
+static inline std::vector<float> welded_vert_normals(const std::vector<float>& v, const std::vector<uint32_t>& f) {
+    const size_t V=v.size()/3, F=f.size()/3;
+    std::vector<float> n(V*3,0.f);
+    struct Key { int64_t x,y,z; bool operator==(const Key& o) const { return x==o.x && y==o.y && z==o.z; } };
+    struct Hash {
+        size_t operator()(const Key& k) const {
+            uint64_t h=(uint64_t)k.x*0x9E3779B185EBCA87ull;
+            h ^= (uint64_t)k.y + 0x9E3779B97F4A7C15ull + (h<<6) + (h>>2);
+            h ^= (uint64_t)k.z + 0xC2B2AE3D27D4EB4Full + (h<<6) + (h>>2);
+            return (size_t)h;
+        }
+    };
+    const double S = 10000000.0; // weld exact/split copies without merging distinct nearby surface verts.
+    std::unordered_map<Key, std::vector<uint32_t>, Hash> groups;
+    groups.reserve(V);
+    for (uint32_t i=0;i<(uint32_t)V;i++) {
+        Key k{(int64_t)llround((double)v[(size_t)i*3+0]*S),
+              (int64_t)llround((double)v[(size_t)i*3+1]*S),
+              (int64_t)llround((double)v[(size_t)i*3+2]*S)};
+        groups[k].push_back(i);
+    }
+    for (size_t t=0;t<F;t++){ uint32_t a=f[t*3],b=f[t*3+1],c=f[t*3+2];
+        const float*pa=&v[(size_t)a*3],*pb=&v[(size_t)b*3],*pc=&v[(size_t)c*3];
+        float e1[3]={pb[0]-pa[0],pb[1]-pa[1],pb[2]-pa[2]}, e2[3]={pc[0]-pa[0],pc[1]-pa[1],pc[2]-pa[2]};
+        float fn[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+        for (uint32_t vi:{a,b,c}) {
+            Key k{(int64_t)llround((double)v[(size_t)vi*3+0]*S),
+                  (int64_t)llround((double)v[(size_t)vi*3+1]*S),
+                  (int64_t)llround((double)v[(size_t)vi*3+2]*S)};
+            auto it = groups.find(k);
+            if (it == groups.end()) continue;
+            for (uint32_t wi: it->second) for(int d=0;d<3;d++) n[(size_t)wi*3+d]+=fn[d];
+        }
+    }
+    for (size_t i=0;i<V;i++){ float*p=&n[i*3]; float L=std::sqrt(p[0]*p[0]+p[1]*p[1]+p[2]*p[2]);
+        if(L>1e-20f){p[0]/=L;p[1]/=L;p[2]/=L;} else {p[0]=0;p[1]=0;p[2]=1;} }
+    return n;
+}
+
 // fill invalid (mask==0) texels of a C-channel float atlas from valid neighbours (multi-pass
 // dilation; the cheap cv2.inpaint analog used only to seal the UV gutter so bilinear filtering at
 // chart edges doesn't sample background). Iterates `iters` rings outward.
@@ -635,11 +674,15 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             }
         }
         xatlas::AddMeshJoin(atlas);
-        xatlas::ChartOptions co;
-        co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
-        co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
-        co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
-        xatlas::ComputeCharts(atlas, co);
+        if (use_cluster_sources && !std::getenv("ATL_FORCE_CUSTOM_CHARTS")) {
+            xatlas::ComputeCharts(atlas);
+        } else {
+            xatlas::ChartOptions co;
+            co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
+            co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
+            co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
+            xatlas::ComputeCharts(atlas, co);
+        }
         xatlas::PackCharts(atlas, po);
     } else if (precluster) {
         // Legacy diagnostic path: build our own charts (normal-cone region-grow), hand xatlas pre-made
@@ -704,11 +747,19 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         for (uint32_t i=0;i<om.indexCount;i++) bt.faces[(size_t)ioff+i]=voff+om.indexArray[i];
         voff += om.vertexCount; ioff += om.indexCount;
     }
+    if (!std::getenv("TEX_NO_WELD_NORMALS")) {
+        double tn=_now();
+        bt.normals = welded_vert_normals(bt.verts, bt.faces);
+        if (verbose) printf("[atlas] welded output normals (%.2fs)\n", _now()-tn);
+    }
 
     // ---- rasterize (serial; writes per-texel 3D position + interpolated normal + mask) ----
     std::vector<float> pos((size_t)W*Ht*3, 0.f);
     std::vector<float> nrm((size_t)W*Ht*3, 0.f);   // lap-18: texel normal for front-face reproject
     std::vector<uint8_t> mask((size_t)W*Ht, 0);
+    int raster_ss = std::getenv("TEX_RASTER_SS") ? atoi(std::getenv("TEX_RASTER_SS")) : (precluster ? 2 : 1);
+    raster_ss = std::max(1, std::min(4, raster_ss));
+    if (verbose && raster_ss > 1) printf("[atlas] raster supersample: %dx%d\n", raster_ss, raster_ss);
     for (int t=0;t<Fout;t++){
         uint32_t a=bt.faces[(size_t)t*3], b=bt.faces[(size_t)t*3+1], c=bt.faces[(size_t)t*3+2];
         float ax=px[a],ay=py[a], bx=px[b],by=py[b], cx=px[c],cy=py[c];
@@ -721,11 +772,19 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         const float *Pa=&bt.verts[(size_t)a*3], *Pb=&bt.verts[(size_t)b*3], *Pc=&bt.verts[(size_t)c*3];
         const float *Na=&bt.normals[(size_t)a*3], *Nb=&bt.normals[(size_t)b*3], *Nc=&bt.normals[(size_t)c*3];
         for (int y=y0;y<=y1;y++) for (int x=x0;x<=x1;x++){
-            float sx=x+0.5f, sy=y+0.5f;
-            float w0=((bx-sx)*(cy-sy)-(by-sy)*(cx-sx))*inv;   // bary for vertex a
-            float w1=((cx-sx)*(ay-sy)-(cy-sy)*(ax-sx))*inv;   // for b
-            float w2=1.f-w0-w1;                                // for c
-            if (w0<0||w1<0||w2<0) continue;                    // outside (winding-normalized by inv)
+            float bw0=0.f,bw1=0.f,bw2=0.f; int hits=0;
+            for (int syi=0; syi<raster_ss; syi++) for (int sxi=0; sxi<raster_ss; sxi++) {
+                float sx=x+((float)sxi+0.5f)/(float)raster_ss;
+                float sy=y+((float)syi+0.5f)/(float)raster_ss;
+                float w0=((bx-sx)*(cy-sy)-(by-sy)*(cx-sx))*inv;   // bary for vertex a
+                float w1=((cx-sx)*(ay-sy)-(cy-sy)*(ax-sx))*inv;   // for b
+                float w2=1.f-w0-w1;                                // for c
+                if (w0<0||w1<0||w2<0) continue;                    // outside (winding-normalized by inv)
+                bw0+=w0; bw1+=w1; bw2+=w2; hits++;
+            }
+            if (!hits) continue;
+            float invh=1.f/(float)hits;
+            float w0=bw0*invh, w1=bw1*invh, w2=bw2*invh;
             float* P=&pos[((size_t)y*W+x)*3]; float* Nn=&nrm[((size_t)y*W+x)*3];
             for (int d=0;d<3;d++){ P[d]=w0*Pa[d]+w1*Pb[d]+w2*Pc[d]; Nn[d]=w0*Na[d]+w1*Nb[d]+w2*Nc[d]; }
             mask[(size_t)y*W+x]=1;
