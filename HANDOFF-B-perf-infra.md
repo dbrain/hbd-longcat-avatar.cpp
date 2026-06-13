@@ -45,24 +45,37 @@ Per-stage wall is printed by the chain as `(%.1fs)`. Remaining HOST-CPU poles:
 - **xatlas unwrap** is CPU and SLOW (173 s on 200k, >20 min on dense) — see §3; this is the biggest infra
   question.
 
-## 3. DE-PYTHON the texture bake (the infra blocker)
-**Problem:** the lap-18 texture bake that produced the smooth result is currently a **Python cumesh
-sidecar** (`bake_uv.py`). The port's whole point is native C++/ggml — this must go.
-- **Good news:** the **native C++ xatlas** unwrap (bundled `thirdparty/xatlas`, `ComputeCharts`, run via
-  `tex_reproject NO_PRECL=1`) gives the **SAME smooth quality** (verified by render this session). So the
-  native bake is quality-complete: C++ xatlas unwrap + the C++ snap+volume reproject (`tex_atlas.hpp`
-  `bake(..., reproject=true)`) + sRGB baseColor/metalRough output (`glb_textured.hpp`).
-- **The only gap = SPEED:** C++ xatlas `ComputeCharts` is pathologically slow on these meshes (173 s /
-  200k; >20 min / dense — non-manifold edges blow up its half-edge segmentation). cumesh is fast because
-  it's GPU xatlas. Options, in order of preference:
-  1. **Accept the C++ xatlas cost** — texture bake is offline asset-gen; 173 s once may be fine. Wire the
-     C++ bake (`tex_reproject` logic) into `pixal3d --tex` directly, drop `bake_uv.py`. Simplest path to
-     "native + done".
-  2. **Speed up the C++ unwrap** — reduce xatlas segmentation cost (chart options), or make the mesh more
-     manifold first (weld/repair) so `ComputeCharts` isn't pathological, or port a GPU xatlas.
-  3. The precluster atlas is NOT an option (folds → streaks; see HANDOFF-A §7).
-- Also kill the other Python crutches eventually: `estimate_camera.py` (MoGe camera → warm host service
-  or C++ port), `preprocess_photo.py` (rembg → existing host service). These are front-end, lower priority.
+## 3. DE-PYTHON the texture bake (the REAL hard blocker — a crack-free C++ unwrap)
+**Problem:** the lap-18 texture bake that produced the smooth, crack-free result is a **Python cumesh
+sidecar** (`bake_uv.py`). The port's whole point is native C++/ggml — this must go. **But this is the
+genuinely-hard blocker, not a wiring detail.**
+
+**The crux = the UV unwrap, judged IN MODEL-VIEWER (not pyrender — pyrender hides seam cracks):**
+- **cumesh** (GPU xatlas, Python) produces FEW CLEAN charts → no visible UV seams → **crack-free + crisp**.
+  This is the only thing that currently looks right. It's the REFERENCE quality bar.
+- **C++ xatlas** (bundled `thirdparty/xatlas`, `ComputeCharts`, `tex_reproject NO_PRECL=1`): fragments the
+  NON-MANIFOLD mesh into ~37k tiny charts → tons of UV seams → **visible CRACKS all over in model-viewer**
+  (looks like pyref — same defect). Also slow (173 s/200k, >20 min/dense) and the fragmented charts pack
+  into a bloated atlas (4276² → big texture). **NOT acceptable as-is.** (An earlier note in this repo that
+  "C++ xatlas matches cumesh quality" was WRONG — it was judged in pyrender, which hid the seam cracks.)
+- **C++ precluster atlas** (`tex_atlas.hpp` precluster path): folds where the surface curves → teal +
+  sliver STREAKS. Also not acceptable. (HANDOFF-A §7.)
+
+So a native C++ texture needs a **crack-free conformal unwrap** — the open research problem:
+  1. **Manifold-repair the mesh, THEN xatlas** — the cracks come from non-manifold fragmentation. If the
+     mesh is welded/repaired to (near-)manifold first, xatlas should produce few clean charts like cumesh.
+     cumesh internally has `repair_non_manifold_edges` / `unify_face_orientations` / `remove_degenerate_faces`
+     — replicate that in C++ (bundled meshopt has some; may need own weld). FINDINGS-15 tried a naive
+     `make_manifold` (→ +253k boundary, fragmented worse) — needs a smarter repair. **This is the most
+     promising native path.**
+  2. **Seam-aware texture dilation** — aggressively pad/dilate each chart's gutter in the atlas so
+     model-viewer's bilinear/mipmap can't sample across seams. May hide cracks even with many charts;
+     cheap to try on the existing C++ xatlas bake (bump padding + inpaint iters in `tex_atlas.hpp`).
+  3. **Port a better/GPU unwrapper to C++** (heaviest).
+- The C++ bake MATH downstream of the unwrap is done + fine (`tex_atlas.hpp bake(reproject=true)` snap+
+  volume + `glb_textured.hpp` sRGB output) — ONLY the unwrap is blocking.
+- Lower-priority Python crutches to kill later: `estimate_camera.py` (MoGe cam), `preprocess_photo.py`
+  (rembg → existing host service).
 
 ## 4. Quick reference
 - `PERF-NOTES-pixal3d.md` LAP 17 = the VRAM re-profile (per-stage MiB table).
