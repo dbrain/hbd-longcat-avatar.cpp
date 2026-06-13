@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cstring>
+#include <queue>
+#include <limits>
 
 namespace texatlas {
 
@@ -162,6 +164,99 @@ static inline void inpaint(std::vector<float>& img, std::vector<uint8_t>& mask, 
         }
         if (coords.empty()) break;
         for (int idx : coords) mask[idx]=1;   // promote after the full pass (ring-by-ring)
+    }
+}
+
+// Small native approximation of OpenCV's Telea inpaint: advance invalid pixels from the
+// valid boundary by distance and estimate each new texel from an already-known radius
+// neighbourhood. This is intentionally bounded by fill_rings for atlas gutters; it avoids
+// turning the whole background into meaningful texture while giving seam pixels the same
+// distance-ordered treatment that hides tiny cracks in the Python bake.
+static inline void inpaint_telea(std::vector<float>& img, std::vector<uint8_t>& mask,
+        int W, int H, int C, int fill_rings, int radius) {
+    if (W <= 0 || H <= 0 || C <= 0 || fill_rings <= 0 || radius <= 0) return;
+    const int N = W * H;
+    const float INF = std::numeric_limits<float>::infinity();
+    std::vector<float> dist((size_t)N, INF);
+    std::vector<uint8_t> state((size_t)N, 2); // 0 known, 1 band, 2 unknown
+    struct Node { float d; int p; bool operator<(const Node& o) const { return d > o.d; } };
+    std::priority_queue<Node> pq;
+    auto push_band = [&](int p, float d) {
+        if (state[(size_t)p] == 0 || d >= dist[(size_t)p]) return;
+        state[(size_t)p] = 1; dist[(size_t)p] = d; pq.push({d, p});
+    };
+    for (int p=0;p<N;p++) {
+        if (mask[(size_t)p]) { state[(size_t)p]=0; dist[(size_t)p]=0.f; }
+    }
+    for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
+        int p=y*W+x;
+        if (state[(size_t)p] != 0) continue;
+        for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++) {
+            if(!dx&&!dy) continue;
+            int nx=x+dx, ny=y+dy;
+            if(nx<0||ny<0||nx>=W||ny>=H) continue;
+            int q=ny*W+nx;
+            if (state[(size_t)q] == 2) push_band(q, dx && dy ? 1.41421356f : 1.f);
+        }
+    }
+    const float maxd = (float)fill_rings + 0.01f;
+    while (!pq.empty()) {
+        Node n = pq.top(); pq.pop();
+        int p = n.p;
+        if (state[(size_t)p] == 0 || n.d != dist[(size_t)p]) continue;
+        if (n.d > maxd) break;
+        int x=p%W, y=p/W;
+
+        float gx=0.f, gy=0.f;
+        if (x > 0 && dist[(size_t)p-1] < INF) gx += dist[(size_t)p] - dist[(size_t)p-1];
+        if (x+1 < W && dist[(size_t)p+1] < INF) gx += dist[(size_t)p+1] - dist[(size_t)p];
+        if (y > 0 && dist[(size_t)p-W] < INF) gy += dist[(size_t)p] - dist[(size_t)p-W];
+        if (y+1 < H && dist[(size_t)p+W] < INF) gy += dist[(size_t)p+W] - dist[(size_t)p];
+        float gl=std::sqrt(gx*gx+gy*gy);
+        if (gl < 1e-6f) { gx=0.f; gy=1.f; gl=1.f; }
+        gx/=gl; gy/=gl;
+
+        float acc[8]={0}; float wsum=0.f;
+        for (int dy=-radius; dy<=radius; dy++) for (int dx=-radius; dx<=radius; dx++) {
+            if (!dx && !dy) continue;
+            int nx=x+dx, ny=y+dy;
+            if(nx<0||ny<0||nx>=W||ny>=H) continue;
+            int q=ny*W+nx;
+            if (state[(size_t)q] != 0) continue;
+            float d2=(float)(dx*dx+dy*dy);
+            if (d2 < 1e-6f || d2 > (float)(radius*radius)) continue;
+            float dl=std::sqrt(d2);
+            float dir=std::fabs((-(float)dx/dl)*gx + (-(float)dy/dl)*gy);
+            float lev=1.f/(1.f + std::fabs(dist[(size_t)p]-dist[(size_t)q]));
+            float w=(0.001f + dir) * lev / d2;
+            const float* s=&img[(size_t)q*C];
+            for (int c=0;c<C;c++) acc[c]+=w*s[c];
+            wsum+=w;
+        }
+        if (wsum <= 1e-20f) {
+            for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++) {
+                int nx=x+dx, ny=y+dy;
+                if(nx<0||ny<0||nx>=W||ny>=H) continue;
+                int q=ny*W+nx;
+                if (state[(size_t)q] != 0) continue;
+                const float* s=&img[(size_t)q*C];
+                for (int c=0;c<C;c++) acc[c]+=s[c];
+                wsum+=1.f;
+            }
+        }
+        if (wsum > 1e-20f) {
+            float* d=&img[(size_t)p*C];
+            for (int c=0;c<C;c++) d[c]=acc[c]/wsum;
+        }
+        state[(size_t)p]=0; mask[(size_t)p]=1;
+        for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++) {
+            if(!dx&&!dy) continue;
+            int nx=x+dx, ny=y+dy;
+            if(nx<0||ny<0||nx>=W||ny>=H) continue;
+            int q=ny*W+nx;
+            if (state[(size_t)q] == 0) continue;
+            push_band(q, n.d + (dx && dy ? 1.41421356f : 1.f));
+        }
     }
 }
 
@@ -614,11 +709,15 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     std::vector<std::vector<int>> xref_maps;   // per xatlas mesh: output xref -> original in_verts index
     std::vector<std::vector<float>> cluster_source_verts;
     std::vector<std::vector<float>> cluster_source_norms;
-    xatlas::PackOptions po; po.resolution=(uint32_t)texture_size; po.padding=(uint32_t)padding;
+    xatlas::PackOptions po;
+    po.resolution=(uint32_t)texture_size; po.padding=(uint32_t)padding;
     po.bilinear=true; po.bruteForce=false; po.blockAlign=true; po.createImage=false;
+    if (std::getenv("ATL_PYREF_XATLAS")) {
+        po.padding=0; po.blockAlign=false;
+    }
     if (precluster && !std::getenv("ATL_PLANAR")) {
         double tp=_now();
-        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : cone_deg;
+        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (std::getenv("ATL_PYREF_XATLAS") ? 90.f : cone_deg);
         std::vector<ClusterMesh> clusters;
         const char* cluster_mode = "cumesh-cpu";
         bool use_cluster_sources = false;
@@ -674,10 +773,20 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             }
         }
         xatlas::AddMeshJoin(atlas);
-        if (use_cluster_sources && !std::getenv("ATL_FORCE_CUSTOM_CHARTS")) {
+        xatlas::ChartOptions co;
+        if (std::getenv("ATL_PYREF_XATLAS")) {
+            // Match cumesh.xatlas.Atlas.compute_charts defaults used by Python CuMesh.uv_unwrap().
+            co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 2.0f;
+            co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 2.0f;
+            co.normalSeamWeight = getenv("ATL_NSW") ? atof(getenv("ATL_NSW")) : 4.0f;
+            co.straightnessWeight = getenv("ATL_SW") ? atof(getenv("ATL_SW")) : 6.0f;
+            co.roundnessWeight = getenv("ATL_RW") ? atof(getenv("ATL_RW")) : 0.01f;
+            co.textureSeamWeight = getenv("ATL_TSW") ? atof(getenv("ATL_TSW")) : 0.5f;
+            co.maxIterations = getenv("ATL_XITERS") ? atoi(getenv("ATL_XITERS")) : 1;
+            xatlas::ComputeCharts(atlas, co);
+        } else if (use_cluster_sources && !std::getenv("ATL_FORCE_CUSTOM_CHARTS")) {
             xatlas::ComputeCharts(atlas);
         } else {
-            xatlas::ChartOptions co;
             co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
             co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
             co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
@@ -858,7 +967,14 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     // holes are instead prevented by the nearest-voxel sample fallback, not by dilation.
     int inp_iters = std::getenv("TEX_INPAINT_ITERS") ? atoi(std::getenv("TEX_INPAINT_ITERS"))
                                                      : (precluster ? std::max(1, padding-1) : 64);
-    inpaint(atl, mask2, W, Ht, C, precluster ? inp_iters : std::max(padding+2, inp_iters));
+    if (std::getenv("TEX_TELEA_INPAINT")) {
+        int tr = std::getenv("TEX_TELEA_RADIUS") ? atoi(std::getenv("TEX_TELEA_RADIUS")) : 3;
+        int rings = precluster ? inp_iters : std::max(padding+2, inp_iters);
+        if (verbose) printf("[atlas] telea-style inpaint rings=%d radius=%d\n", rings, tr);
+        inpaint_telea(atl, mask2, W, Ht, C, rings, tr);
+    } else {
+        inpaint(atl, mask2, W, Ht, C, precluster ? inp_iters : std::max(padding+2, inp_iters));
+    }
 
     // ---- pack to uint8 textures (Python layout) ----
     bt.base_color.resize((size_t)W*Ht*4);
@@ -871,6 +987,15 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         bt.metal_rough[p*3+1]=u8(a[4]);                       // G = roughness
         bt.metal_rough[p*3+2]=u8(a[3]);                       // B = metallic
     }
+    bool blur_done = false;
+    if (std::getenv("TEX_BASE_BLUR_PRE_RESIZE")) {
+        if (const char* b = std::getenv("TEX_BASE_BLUR")) {
+            float sigma = (float)atof(b);
+            if (verbose && sigma > 0.f) printf("[atlas] baseColor pre-resize gaussian blur sigma=%.2f\n", sigma);
+            blur_u8_gaussian_rgb(bt.base_color, W, Ht, 4, sigma);
+            blur_done = sigma > 0.f;
+        }
+    }
     int final_size = std::getenv("TEX_FINAL_SIZE") ? atoi(std::getenv("TEX_FINAL_SIZE")) : texture_size;
     if (!std::getenv("TEX_KEEP_ATLAS_SIZE") && final_size > 0 && (W > final_size || Ht > final_size)) {
         int nw = final_size;
@@ -880,7 +1005,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         bt.metal_rough = resize_u8_area(bt.metal_rough, W, Ht, nw, nh, 3);
         bt.tw = nw; bt.th = nh;
     }
-    if (const char* b = std::getenv("TEX_BASE_BLUR")) {
+    if (!blur_done && (std::getenv("TEX_BASE_BLUR_PRE_RESIZE") == nullptr)) if (const char* b = std::getenv("TEX_BASE_BLUR")) {
         float sigma = (float)atof(b);
         if (verbose && sigma > 0.f) printf("[atlas] baseColor gaussian blur sigma=%.2f\n", sigma);
         blur_u8_gaussian_rgb(bt.base_color, bt.tw, bt.th, 4, sigma);
