@@ -10,6 +10,9 @@
 #pragma once
 #include "tex_grid_sample.hpp"
 #include "tex_reproject.hpp"     // lap-18: closest-point-on-dense-mesh reproject (kills splatter/cracks)
+#ifdef TEXATLAS_NATIVE_CUMESH
+#include "native_cumesh_bridge.hpp"
+#endif
 #include "../../../thirdparty/xatlas.h"
 #include "../../../thirdparty/meshoptimizer/meshoptimizer.h"
 #include <cstdint>
@@ -20,6 +23,8 @@
 #include <chrono>
 #include <array>
 #include <unordered_map>
+#include <cstdlib>
+#include <cstring>
 
 namespace texatlas {
 
@@ -109,7 +114,9 @@ static inline void inpaint(std::vector<float>& img, std::vector<uint8_t>& mask, 
             if (mask[(size_t)y*W+x]) continue;
             float acc[8]={0}; int cnt=0;
             for (int dy=-1;dy<=1;dy++) for (int dx=-1;dx<=1;dx++){
-                if(!dx&&!dy) continue; int nx=x+dx,ny=y+dy; if(nx<0||ny<0||nx>=W||ny>=H) continue;
+                if(!dx&&!dy) continue;
+                int nx=x+dx,ny=y+dy;
+                if(nx<0||ny<0||nx>=W||ny>=H) continue;
                 if(mask[(size_t)ny*W+nx]){ const float*s=&img[((size_t)ny*W+nx)*C]; for(int c=0;c<C;c++) acc[c]+=s[c]; cnt++; }
             }
             if(cnt){ float*d=&img[((size_t)y*W+x)*C]; for(int c=0;c<C;c++) d[c]=acc[c]/cnt; coords.push_back(y*W+x); }
@@ -120,6 +127,97 @@ static inline void inpaint(std::vector<float>& img, std::vector<uint8_t>& mask, 
 }
 
 static inline uint8_t u8(float v){ v=v*255.f+0.5f; return (uint8_t)(v<0?0:(v>255?255:v)); }
+
+static inline std::vector<uint8_t> resize_u8_bilinear(const std::vector<uint8_t>& src,
+        int sw, int sh, int dw, int dh, int C) {
+    std::vector<uint8_t> dst((size_t)dw*dh*C);
+    for (int y=0;y<dh;y++) {
+        float sy = ((y + 0.5f) * sh / (float)dh) - 0.5f;
+        int y0 = (int)std::floor(sy), y1 = y0 + 1;
+        float fy = sy - y0;
+        y0 = std::max(0, std::min(sh-1, y0));
+        y1 = std::max(0, std::min(sh-1, y1));
+        for (int x=0;x<dw;x++) {
+            float sx = ((x + 0.5f) * sw / (float)dw) - 0.5f;
+            int x0 = (int)std::floor(sx), x1 = x0 + 1;
+            float fx = sx - x0;
+            x0 = std::max(0, std::min(sw-1, x0));
+            x1 = std::max(0, std::min(sw-1, x1));
+            for (int c=0;c<C;c++) {
+                float a = src[((size_t)y0*sw+x0)*C+c] * (1.f-fx) + src[((size_t)y0*sw+x1)*C+c] * fx;
+                float b = src[((size_t)y1*sw+x0)*C+c] * (1.f-fx) + src[((size_t)y1*sw+x1)*C+c] * fx;
+                dst[((size_t)y*dw+x)*C+c] = u8((a * (1.f-fy) + b * fy) / 255.f);
+            }
+        }
+    }
+    return dst;
+}
+
+static inline std::vector<uint8_t> resize_u8_area(const std::vector<uint8_t>& src,
+        int sw, int sh, int dw, int dh, int C) {
+    if (dw >= sw || dh >= sh) return resize_u8_bilinear(src, sw, sh, dw, dh, C);
+    std::vector<uint8_t> dst((size_t)dw*dh*C);
+    for (int y=0;y<dh;y++) {
+        double y0 = (double)y * sh / dh, y1 = (double)(y+1) * sh / dh;
+        int iy0 = (int)std::floor(y0), iy1 = (int)std::ceil(y1);
+        for (int x=0;x<dw;x++) {
+            double x0 = (double)x * sw / dw, x1 = (double)(x+1) * sw / dw;
+            int ix0 = (int)std::floor(x0), ix1 = (int)std::ceil(x1);
+            double acc[8]={0}, wsum=0;
+            for (int sy=iy0; sy<iy1; sy++) {
+                if (sy < 0 || sy >= sh) continue;
+                double wy = std::max(0.0, std::min(y1, (double)sy+1.0) - std::max(y0, (double)sy));
+                if (wy <= 0) continue;
+                for (int sx=ix0; sx<ix1; sx++) {
+                    if (sx < 0 || sx >= sw) continue;
+                    double wx = std::max(0.0, std::min(x1, (double)sx+1.0) - std::max(x0, (double)sx));
+                    double w = wx * wy;
+                    if (w <= 0) continue;
+                    const uint8_t* p=&src[((size_t)sy*sw+sx)*C];
+                    for (int c=0;c<C;c++) acc[c] += w * p[c];
+                    wsum += w;
+                }
+            }
+            for (int c=0;c<C;c++) dst[((size_t)y*dw+x)*C+c] = (uint8_t)std::max(0.0, std::min(255.0, acc[c]/std::max(wsum,1e-12)+0.5));
+        }
+    }
+    return dst;
+}
+
+static inline void blur_u8_gaussian_rgb(std::vector<uint8_t>& img, int W, int H, int C, float sigma) {
+    if (sigma <= 0.f || W <= 1 || H <= 1 || C < 3) return;
+    int r = std::max(1, (int)std::ceil(sigma * 3.f));
+    std::vector<float> k((size_t)r*2+1);
+    float sum = 0.f;
+    for (int i=-r;i<=r;i++) {
+        float v = std::exp(-(float)(i*i) / (2.f*sigma*sigma));
+        k[(size_t)(i+r)] = v; sum += v;
+    }
+    for (float& v:k) v /= sum;
+    std::vector<uint8_t> tmp(img.size());
+    for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
+        for (int c=0;c<C;c++) {
+            if (c >= 3) { tmp[((size_t)y*W+x)*C+c] = img[((size_t)y*W+x)*C+c]; continue; }
+            float acc=0.f;
+            for (int dx=-r;dx<=r;dx++) {
+                int xx = std::max(0, std::min(W-1, x+dx));
+                acc += k[(size_t)(dx+r)] * img[((size_t)y*W+xx)*C+c];
+            }
+            tmp[((size_t)y*W+x)*C+c] = (uint8_t)std::max(0.f, std::min(255.f, acc + 0.5f));
+        }
+    }
+    for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
+        for (int c=0;c<C;c++) {
+            if (c >= 3) { img[((size_t)y*W+x)*C+c] = tmp[((size_t)y*W+x)*C+c]; continue; }
+            float acc=0.f;
+            for (int dy=-r;dy<=r;dy++) {
+                int yy = std::max(0, std::min(H-1, y+dy));
+                acc += k[(size_t)(dy+r)] * tmp[((size_t)yy*W+x)*C+c];
+            }
+            img[((size_t)y*W+x)*C+c] = (uint8_t)std::max(0.f, std::min(255.f, acc + 0.5f));
+        }
+    }
+}
 
 // Bake. in_verts [Vin*3] in [-0.5,0.5]; in_faces int64 [Fin*3]; PBR volume feats [N*6] + coords
 // [N*4] (b,x,y,z) at grid `grid_res`; texture_size target; padding texels for the gutter.
@@ -186,6 +284,266 @@ static inline void precluster_charts(const std::vector<float>& V, const std::vec
     }
 }
 
+// Same normal-cone clustering as precluster_charts, but instead of planar-projecting each chart,
+// split vertices on chart boundaries and feed the resulting disconnected islands back to xatlas
+// AddMesh. This removes the global non-manifold topology that made xatlas fragment/hang, while still
+// letting xatlas do its own conformal parameterization per island (LSCM/piecewise) instead of our
+// folding planar UVs.
+static inline void precluster_split_mesh(const std::vector<float>& V, const std::vector<int64_t>& F,
+        float cone_cos, std::vector<float>& out_v, std::vector<uint32_t>& out_f,
+        std::vector<int>& split2orig, int& n_charts) {
+    const int64_t Nf = (int64_t)F.size()/3;
+    std::vector<float> fn((size_t)Nf*3);
+    for (int64_t t=0;t<Nf;t++){ const float*a=&V[F[t*3]*3],*b=&V[F[t*3+1]*3],*c=&V[F[t*3+2]*3];
+        float e1[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, e2[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        float n[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+        float L=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if(L<1e-20f)L=1;
+        fn[t*3]=n[0]/L; fn[t*3+1]=n[1]/L; fn[t*3+2]=n[2]/L; }
+
+    std::unordered_map<int64_t,std::vector<int>> e2f; e2f.reserve((size_t)Nf*3);
+    auto ukey=[](int64_t a,int64_t b){ int64_t lo=a<b?a:b,hi=a<b?b:a; return (lo<<32)|(uint32_t)hi; };
+    for (int64_t t=0;t<Nf;t++){ int64_t v[3]={F[t*3],F[t*3+1],F[t*3+2]};
+        for(int e=0;e<3;e++) e2f[ukey(v[e],v[(e+1)%3])].push_back((int)t); }
+
+    std::vector<int> chart((size_t)Nf,-1), stack; n_charts=0;
+    for (int64_t s=0;s<Nf;s++){ if(chart[s]>=0) continue;
+        int c=n_charts++; const float* sn=&fn[s*3];
+        chart[s]=c; stack.push_back((int)s);
+        while(!stack.empty()){ int t=stack.back(); stack.pop_back(); int64_t v[3]={F[t*3],F[t*3+1],F[t*3+2]};
+            for(int e=0;e<3;e++){ for(int nf: e2f[ukey(v[e],v[(e+1)%3])]){ if(chart[nf]>=0) continue;
+                if (fn[nf*3]*sn[0]+fn[nf*3+1]*sn[1]+fn[nf*3+2]*sn[2] >= cone_cos){ chart[nf]=c; stack.push_back(nf); } } } }
+    }
+
+    out_v.clear(); out_f.resize((size_t)Nf*3); split2orig.clear();
+    out_v.reserve(V.size()); split2orig.reserve(V.size()/3);
+    std::unordered_map<int64_t,int> seen; seen.reserve((size_t)Nf*3);
+    for (int64_t t=0;t<Nf;t++){ int c=chart[t];
+        for(int k=0;k<3;k++){ int64_t ov=F[t*3+k]; int64_t key=((int64_t)c<<34)^ov;
+            auto it=seen.find(key); int id;
+            if(it==seen.end()){ id=(int)split2orig.size(); seen[key]=id; split2orig.push_back((int)ov);
+                out_v.push_back(V[(size_t)ov*3]); out_v.push_back(V[(size_t)ov*3+1]); out_v.push_back(V[(size_t)ov*3+2]);
+            } else id=it->second;
+            out_f[(size_t)t*3+k]=(uint32_t)id;
+        }
+    }
+}
+
+struct ClusterMesh {
+    std::vector<float> verts;
+    std::vector<uint32_t> faces;
+    std::vector<int> vmap;
+};
+
+struct FaceAdj {
+    int f;
+    float len;
+};
+
+static inline int compress_chart_ids(std::vector<int>& chart) {
+    std::unordered_map<int,int> remap; remap.reserve(chart.size());
+    int n=0;
+    for (int& c: chart) {
+        auto it=remap.find(c);
+        if (it==remap.end()) { remap[c]=n; c=n++; }
+        else c=it->second;
+    }
+    return n;
+}
+
+static inline void split_disconnected_charts(const std::vector<std::vector<FaceAdj>>& adj, std::vector<int>& chart) {
+    const int F=(int)chart.size();
+    std::vector<char> seen(F,0);
+    std::vector<int> out(F,-1), stack;
+    int next=0;
+    for (int s=0;s<F;s++) {
+        if (seen[s]) continue;
+        int old=chart[s];
+        seen[s]=1; out[s]=next; stack.push_back(s);
+        while(!stack.empty()) {
+            int f=stack.back(); stack.pop_back();
+            for (const FaceAdj& a: adj[f]) if (!seen[a.f] && chart[a.f]==old) {
+                seen[a.f]=1; out[a.f]=next; stack.push_back(a.f);
+            }
+        }
+        next++;
+    }
+    chart.swap(out);
+}
+
+static inline std::vector<ClusterMesh> build_cluster_meshes_from_ids(const std::vector<float>& V, const std::vector<int64_t>& F,
+        const std::vector<int>& chart, int n_charts) {
+    const int64_t Nf=(int64_t)F.size()/3;
+    std::vector<ClusterMesh> out((size_t)n_charts);
+    std::vector<std::unordered_map<int64_t,uint32_t>> remap((size_t)n_charts);
+    for (int64_t t=0;t<Nf;t++){ int c=chart[(size_t)t]; ClusterMesh& cm=out[(size_t)c]; auto& rm=remap[(size_t)c];
+        for(int k=0;k<3;k++){ int64_t ov=F[t*3+k]; auto it=rm.find(ov); uint32_t id;
+            if (it==rm.end()) {
+                id=(uint32_t)cm.vmap.size(); rm[ov]=id; cm.vmap.push_back((int)ov);
+                cm.verts.push_back(V[(size_t)ov*3]); cm.verts.push_back(V[(size_t)ov*3+1]); cm.verts.push_back(V[(size_t)ov*3+2]);
+            } else id=it->second;
+            cm.faces.push_back(id);
+        }
+    }
+    out.erase(std::remove_if(out.begin(), out.end(), [](const ClusterMesh& c){ return c.faces.empty(); }), out.end());
+    return out;
+}
+
+static inline std::vector<ClusterMesh> precluster_meshes_cumesh_cpu(const std::vector<float>& V, const std::vector<int64_t>& F,
+        float threshold_rad, int refine_iterations=100, int global_iterations=3,
+        float smooth_strength=1.f, float area_weight=0.1f, float perim_weight=0.0001f) {
+    const int Nf=(int)F.size()/3;
+    std::vector<float> fn((size_t)Nf*3), farea((size_t)Nf);
+    for (int t=0;t<Nf;t++){ const float*a=&V[(size_t)F[t*3]*3],*b=&V[(size_t)F[t*3+1]*3],*c=&V[(size_t)F[t*3+2]*3];
+        float e1[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, e2[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        float n[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+        float L=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); farea[(size_t)t]=0.5f*L; if(L<1e-20f)L=1;
+        fn[(size_t)t*3]=n[0]/L; fn[(size_t)t*3+1]=n[1]/L; fn[(size_t)t*3+2]=n[2]/L; }
+
+    std::vector<std::vector<FaceAdj>> adj((size_t)Nf);
+    std::unordered_map<int64_t,std::vector<int>> e2f; e2f.reserve((size_t)Nf*3);
+    auto ukey=[](int64_t a,int64_t b){ int64_t lo=a<b?a:b,hi=a<b?b:a; return (lo<<32)|(uint32_t)hi; };
+    for (int t=0;t<Nf;t++){ int64_t v[3]={F[(size_t)t*3],F[(size_t)t*3+1],F[(size_t)t*3+2]};
+        for(int e=0;e<3;e++) e2f[ukey(v[e],v[(e+1)%3])].push_back(t); }
+    for (const auto& kv: e2f) {
+        const std::vector<int>& fs=kv.second;
+        if (fs.size()<2) continue;
+        int64_t lo=(int64_t)(kv.first>>32), hi=(int64_t)(uint32_t)kv.first;
+        const float* a=&V[(size_t)lo*3]; const float* b=&V[(size_t)hi*3];
+        float dx=a[0]-b[0],dy=a[1]-b[1],dz=a[2]-b[2]; float len=std::sqrt(dx*dx+dy*dy+dz*dz);
+        for (size_t i=0;i<fs.size();i++) for (size_t j=i+1;j<fs.size();j++) {
+            adj[(size_t)fs[i]].push_back({fs[j],len});
+            adj[(size_t)fs[j]].push_back({fs[i],len});
+        }
+    }
+
+    std::vector<int> chart((size_t)Nf);
+    for (int i=0;i<Nf;i++) chart[(size_t)i]=i;
+
+    struct Stats { float ax=0,ay=0,az=1,half=0,area=0,perim=0; };
+    auto compute_stats = [&](int C, std::vector<Stats>& st, std::unordered_map<uint64_t,float>* edge_len) {
+        st.assign((size_t)C, Stats{});
+        std::vector<float> sx((size_t)C,0), sy((size_t)C,0), sz((size_t)C,0);
+        for (int f=0; f<Nf; f++) { int c=chart[(size_t)f]; float a=farea[(size_t)f];
+            sx[(size_t)c]+=fn[(size_t)f*3]*a; sy[(size_t)c]+=fn[(size_t)f*3+1]*a; sz[(size_t)c]+=fn[(size_t)f*3+2]*a; st[(size_t)c].area+=a; }
+        for (int c=0;c<C;c++) { float L=std::sqrt(sx[c]*sx[c]+sy[c]*sy[c]+sz[c]*sz[c]);
+            if (L>1e-20f){ st[c].ax=sx[c]/L; st[c].ay=sy[c]/L; st[c].az=sz[c]/L; } }
+        for (int f=0; f<Nf; f++) { int c=chart[(size_t)f];
+            float d=std::max(-1.f,std::min(1.f, st[(size_t)c].ax*fn[(size_t)f*3]+st[(size_t)c].ay*fn[(size_t)f*3+1]+st[(size_t)c].az*fn[(size_t)f*3+2]));
+            st[(size_t)c].half=std::max(st[(size_t)c].half, std::acos(d)); }
+        if (edge_len) {
+            edge_len->clear(); edge_len->reserve((size_t)Nf*2);
+            for (int f=0; f<Nf; f++) for (const FaceAdj& a: adj[(size_t)f]) if (f<a.f) {
+                int c0=chart[(size_t)f], c1=chart[(size_t)a.f]; if(c0==c1) continue;
+                int lo=std::min(c0,c1), hi=std::max(c0,c1);
+                (*edge_len)[((uint64_t)(uint32_t)lo<<32)|(uint32_t)hi] += a.len;
+            }
+            for (auto& kv:*edge_len) { int c0=(int)(kv.first>>32), c1=(int)(uint32_t)kv.first; st[(size_t)c0].perim+=kv.second; st[(size_t)c1].perim+=kv.second; }
+        }
+    };
+    auto merged_half = [](const Stats& a, const Stats& b) {
+        float dot=std::max(-1.f,std::min(1.f,a.ax*b.ax+a.ay*b.ay+a.az*b.az));
+        float axis_angle=std::acos(dot);
+        float low=std::min(-a.half, axis_angle-b.half);
+        float high=std::max(a.half, axis_angle+b.half);
+        return (high-low)*0.5f;
+    };
+
+    int C=Nf;
+    for (int gi=0; gi<global_iterations; gi++) {
+        while (true) {
+            std::vector<Stats> st; std::unordered_map<uint64_t,float> edges;
+            compute_stats(C, st, &edges);
+            if (edges.empty()) break;
+            std::vector<uint64_t> best((size_t)C, UINT64_MAX);
+            std::vector<float> ecost; ecost.reserve(edges.size());
+            std::vector<uint64_t> ekeys; ekeys.reserve(edges.size());
+            for (auto& kv: edges) {
+                int c0=(int)(kv.first>>32), c1=(int)(uint32_t)kv.first;
+                float new_area=st[(size_t)c0].area+st[(size_t)c1].area;
+                float new_perim=st[(size_t)c0].perim+st[(size_t)c1].perim-2.f*kv.second;
+                float cost=merged_half(st[(size_t)c0],st[(size_t)c1]) + area_weight*new_area + perim_weight*(new_perim*new_perim/std::max(new_area,1e-20f));
+                uint32_t ei=(uint32_t)ecost.size(); ecost.push_back(cost); ekeys.push_back(kv.first);
+                uint32_t cv; std::memcpy(&cv,&cost,4); uint64_t packed=((uint64_t)cv<<32)|ei;
+                if (packed<best[(size_t)c0]) best[(size_t)c0]=packed;
+                if (packed<best[(size_t)c1]) best[(size_t)c1]=packed;
+            }
+            std::vector<int> parent((size_t)C); for(int i=0;i<C;i++) parent[(size_t)i]=i;
+            int merges=0;
+            for (uint32_t ei=0; ei<ecost.size(); ei++) {
+                if (ecost[ei] > threshold_rad) continue;
+                int c0=(int)(ekeys[ei]>>32), c1=(int)(uint32_t)ekeys[ei];
+                uint32_t cv; std::memcpy(&cv,&ecost[ei],4); uint64_t packed=((uint64_t)cv<<32)|ei;
+                if (best[(size_t)c0]==packed && best[(size_t)c1]==packed) { parent[(size_t)c1]=c0; merges++; }
+            }
+            if (!merges) break;
+            for (int& c: chart) while(parent[(size_t)c]!=c) c=parent[(size_t)c];
+            C=compress_chart_ids(chart);
+        }
+        for (int ri=0; ri<refine_iterations; ri++) {
+            std::vector<Stats> st; compute_stats(C, st, nullptr);
+            std::vector<int> next=chart;
+            for (int f=0; f<Nf; f++) {
+                int cand[16]; float smooth[16]; int nc=1; cand[0]=chart[(size_t)f]; smooth[0]=0;
+                for (const FaceAdj& a: adj[(size_t)f]) {
+                    int c=chart[(size_t)a.f], idx=-1; for(int i=0;i<nc;i++) if(cand[i]==c){idx=i;break;}
+                    if(idx<0 && nc<16){idx=nc; cand[nc]=c; smooth[nc]=0; nc++;}
+                    if(idx>=0) smooth[idx]+=a.len;
+                }
+                int bestc=chart[(size_t)f]; float bests=-1e9f;
+                for(int i=0;i<nc;i++){ const Stats& s=st[(size_t)cand[i]];
+                    float geo=s.ax*fn[(size_t)f*3]+s.ay*fn[(size_t)f*3+1]+s.az*fn[(size_t)f*3+2]; if(geo<=0) continue;
+                    float score=geo + smooth_strength*smooth[i];
+                    if(score>bests+1e-5f || (std::fabs(score-bests)<=1e-5f && cand[i]<bestc)){ bests=score; bestc=cand[i]; }
+                }
+                next[(size_t)f]=bestc;
+            }
+            chart.swap(next); C=compress_chart_ids(chart);
+        }
+        split_disconnected_charts(adj, chart);
+        C=compress_chart_ids(chart);
+    }
+    return build_cluster_meshes_from_ids(V, F, chart, C);
+}
+
+static inline std::vector<ClusterMesh> precluster_meshes(const std::vector<float>& V, const std::vector<int64_t>& F,
+        float cone_cos) {
+    const int64_t Nf = (int64_t)F.size()/3;
+    std::vector<float> fn((size_t)Nf*3);
+    for (int64_t t=0;t<Nf;t++){ const float*a=&V[F[t*3]*3],*b=&V[F[t*3+1]*3],*c=&V[F[t*3+2]*3];
+        float e1[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, e2[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        float n[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+        float L=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if(L<1e-20f)L=1;
+        fn[t*3]=n[0]/L; fn[t*3+1]=n[1]/L; fn[t*3+2]=n[2]/L; }
+
+    std::unordered_map<int64_t,std::vector<int>> e2f; e2f.reserve((size_t)Nf*3);
+    auto ukey=[](int64_t a,int64_t b){ int64_t lo=a<b?a:b,hi=a<b?b:a; return (lo<<32)|(uint32_t)hi; };
+    for (int64_t t=0;t<Nf;t++){ int64_t v[3]={F[t*3],F[t*3+1],F[t*3+2]};
+        for(int e=0;e<3;e++) e2f[ukey(v[e],v[(e+1)%3])].push_back((int)t); }
+
+    std::vector<int> chart((size_t)Nf,-1), stack; int n_charts=0;
+    for (int64_t s=0;s<Nf;s++){ if(chart[s]>=0) continue;
+        int c=n_charts++; const float* sn=&fn[s*3];
+        chart[s]=c; stack.push_back((int)s);
+        while(!stack.empty()){ int t=stack.back(); stack.pop_back(); int64_t v[3]={F[t*3],F[t*3+1],F[t*3+2]};
+            for(int e=0;e<3;e++){ for(int nf: e2f[ukey(v[e],v[(e+1)%3])]){ if(chart[nf]>=0) continue;
+                if (fn[nf*3]*sn[0]+fn[nf*3+1]*sn[1]+fn[nf*3+2]*sn[2] >= cone_cos){ chart[nf]=c; stack.push_back(nf); } } } }
+    }
+
+    std::vector<ClusterMesh> out((size_t)n_charts);
+    std::vector<std::unordered_map<int64_t,uint32_t>> remap((size_t)n_charts);
+    for (int64_t t=0;t<Nf;t++){ int c=chart[t]; ClusterMesh& cm=out[(size_t)c]; auto& rm=remap[(size_t)c];
+        for(int k=0;k<3;k++){ int64_t ov=F[t*3+k]; auto it=rm.find(ov); uint32_t id;
+            if (it==rm.end()) {
+                id=(uint32_t)cm.vmap.size(); rm[ov]=id; cm.vmap.push_back((int)ov);
+                cm.verts.push_back(V[(size_t)ov*3]); cm.verts.push_back(V[(size_t)ov*3+1]); cm.verts.push_back(V[(size_t)ov*3+2]);
+            } else id=it->second;
+            cm.faces.push_back(id);
+        }
+    }
+    out.erase(std::remove_if(out.begin(), out.end(), [](const ClusterMesh& c){ return c.faces.empty(); }), out.end());
+    return out;
+}
+
 static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::vector<int64_t>& in_faces0,
                                 const std::vector<float>& pbr_feats, const std::vector<int32_t>& pbr_coords,
                                 int grid_res, int texture_size, int decimate_target_faces=0,
@@ -214,12 +572,78 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     // ---- xatlas UV unwrap ----
     xatlas::Atlas* atlas = xatlas::Create();
     if (verbose) xatlas::SetProgressCallback(atlas, _xatlas_progress, nullptr);
-    std::vector<int> xref2orig;   // output-vertex xref -> original in_verts index (for 3D position)
+    std::vector<std::vector<int>> xref_maps;   // per xatlas mesh: output xref -> original in_verts index
+    std::vector<std::vector<float>> cluster_source_verts;
+    std::vector<std::vector<float>> cluster_source_norms;
     xatlas::PackOptions po; po.resolution=(uint32_t)texture_size; po.padding=(uint32_t)padding;
     po.bilinear=true; po.bruteForce=false; po.blockAlign=true; po.createImage=false;
-    if (precluster) {
-        // P1: build our own charts (normal-cone region-grow), hand xatlas pre-made UV islands ->
-        // AddUvMesh skips the slow segmentation (xatlas hangs on the QEM mesh's non-manifold edges).
+    if (precluster && !std::getenv("ATL_PLANAR")) {
+        double tp=_now();
+        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : cone_deg;
+        std::vector<ClusterMesh> clusters;
+        const char* cluster_mode = "cumesh-cpu";
+        bool use_cluster_sources = false;
+        if (std::getenv("ATL_BFS")) {
+            cluster_mode = "BFS";
+            clusters = precluster_meshes(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f));
+#ifdef TEXATLAS_NATIVE_CUMESH
+        } else if (std::getenv("ATL_NATIVE_CUMESH")) {
+            cluster_mode = "native-cumesh";
+            use_cluster_sources = true;
+            std::vector<native_cumesh::ClusterMesh> nc = native_cumesh::compute_clusters(
+                in_verts, in_faces, cdeg*3.14159265f/180.f,
+                std::getenv("ATL_REFINE") ? atoi(std::getenv("ATL_REFINE")) : 100,
+                std::getenv("ATL_GLOBAL") ? atoi(std::getenv("ATL_GLOBAL")) : 3,
+                std::getenv("ATL_SMOOTH") ? (float)atof(std::getenv("ATL_SMOOTH")) : 1.f,
+                std::getenv("ATL_AREA") ? (float)atof(std::getenv("ATL_AREA")) : 0.1f,
+                std::getenv("ATL_PERIM") ? (float)atof(std::getenv("ATL_PERIM")) : 0.0001f);
+            clusters.resize(nc.size());
+            for (size_t i=0;i<nc.size();i++) {
+                clusters[i].verts.swap(nc[i].verts);
+                clusters[i].faces.swap(nc[i].faces);
+                clusters[i].vmap.swap(nc[i].vmap);
+            }
+#endif
+        } else {
+            clusters = precluster_meshes_cumesh_cpu(in_verts, in_faces, cdeg*3.14159265f/180.f,
+                    std::getenv("ATL_REFINE") ? atoi(std::getenv("ATL_REFINE")) : 100,
+                    std::getenv("ATL_GLOBAL") ? atoi(std::getenv("ATL_GLOBAL")) : 3,
+                    std::getenv("ATL_SMOOTH") ? (float)atof(std::getenv("ATL_SMOOTH")) : 1.f,
+                    std::getenv("ATL_AREA") ? (float)atof(std::getenv("ATL_AREA")) : 0.1f,
+                    std::getenv("ATL_PERIM") ? (float)atof(std::getenv("ATL_PERIM")) : 0.0001f);
+        }
+        size_t splitv=0; for (const auto& c:clusters) splitv += c.vmap.size();
+        if (verbose){ printf("[atlas] %s precluster: %zu xatlas meshes (cone %.0f°, %.2fs), %zu split-verts\n",
+                              cluster_mode, clusters.size(), cdeg, _now()-tp, splitv); fflush(stdout); }
+        xref_maps.reserve(clusters.size());
+        if (use_cluster_sources) {
+            cluster_source_verts.reserve(clusters.size());
+            cluster_source_norms.reserve(clusters.size());
+        }
+        for (const ClusterMesh& cm : clusters) {
+            xatlas::MeshDecl md;
+            md.vertexCount = (uint32_t)cm.vmap.size(); md.vertexPositionData = cm.verts.data();
+            md.vertexPositionStride = 3*sizeof(float); md.indexCount = (uint32_t)cm.faces.size();
+            md.indexData = cm.faces.data(); md.indexFormat = xatlas::IndexFormat::UInt32;
+            xatlas::AddMeshError e = xatlas::AddMesh(atlas, md, (uint32_t)clusters.size());
+            if (e != xatlas::AddMeshError::Success) fprintf(stderr,"[atlas] AddMesh(cluster) error: %s\n", xatlas::StringForEnum(e));
+            xref_maps.push_back(cm.vmap);
+            if (use_cluster_sources) {
+                cluster_source_verts.push_back(cm.verts);
+                std::vector<int64_t> lf(cm.faces.begin(), cm.faces.end());
+                cluster_source_norms.push_back(vert_normals(cm.verts, lf));
+            }
+        }
+        xatlas::AddMeshJoin(atlas);
+        xatlas::ChartOptions co;
+        co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
+        co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
+        co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
+        xatlas::ComputeCharts(atlas, co);
+        xatlas::PackCharts(atlas, po);
+    } else if (precluster) {
+        // Legacy diagnostic path: build our own charts (normal-cone region-grow), hand xatlas pre-made
+        // planar UV islands. Fast, but folds on curved sheets; keep only for A/B with ATL_PLANAR=1.
         std::vector<float> uv; std::vector<int> uv2orig; std::vector<uint32_t> uvfaces, facemat; int ncl=0;
         double tp=_now();
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : cone_deg;
@@ -233,7 +657,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (e != xatlas::AddMeshError::Success) fprintf(stderr,"[atlas] AddUvMesh error: %s\n", xatlas::StringForEnum(e));
         xatlas::ComputeCharts(atlas);   // for UV meshes: just groups existing islands (fast)
         xatlas::PackCharts(atlas, po);
-        xref2orig = uv2orig;
+        xref_maps.push_back(uv2orig);
     } else {
         xatlas::MeshDecl md;
         md.vertexCount = (uint32_t)Vin; md.vertexPositionData = in_verts.data();
@@ -249,34 +673,44 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (verbose){ printf("[atlas] unwrapping %d verts / %d faces ...\n", Vin, Fin); fflush(stdout); }
         xatlas::ComputeCharts(atlas, co);
         xatlas::PackCharts(atlas, po);
-        xref2orig.resize(Vin); for (int i=0;i<Vin;i++) xref2orig[i]=i;
+        xref_maps.emplace_back(Vin); for (int i=0;i<Vin;i++) xref_maps.back()[i]=i;
     }
-    const xatlas::Mesh& om = atlas->meshes[0];
     int W=(int)atlas->width, Ht=(int)atlas->height;
-    if (verbose) printf("[atlas] %ux%u  charts=%u sub-atlases=%u  out: %u verts / %u tris\n",
+    uint32_t total_v=0,total_i=0; for(uint32_t mi=0; mi<atlas->meshCount; mi++){ total_v+=atlas->meshes[mi].vertexCount; total_i+=atlas->meshes[mi].indexCount; }
+    if (verbose) printf("[atlas] %ux%u  charts=%u sub-atlases=%u meshes=%u out: %u verts / %u tris\n",
                         atlas->width, atlas->height, atlas->chartCount, atlas->atlasCount,
-                        om.vertexCount, om.indexCount/3);
+                        atlas->meshCount, total_v, total_i/3);
 
     BakedTexture bt; bt.tw=W; bt.th=Ht; bt.chart_count=(int)atlas->chartCount; bt.atlas_count=(int)atlas->atlasCount;
-    const int Vout=(int)om.vertexCount, Fout=(int)om.indexCount/3;
+    const int Vout=(int)total_v, Fout=(int)total_i/3;
     bt.verts.resize((size_t)Vout*3); bt.normals.resize((size_t)Vout*3); bt.uvs.resize((size_t)Vout*2);
     bt.faces.resize((size_t)Fout*3);
     std::vector<float> px(Vout), py(Vout);   // pixel-space UV for rasterization
-    for (int i=0;i<Vout;i++){
-        const xatlas::Vertex& v = om.vertexArray[i];
-        uint32_t r = (uint32_t)xref2orig[v.xref];
-        for (int d=0;d<3;d++){ bt.verts[(size_t)i*3+d]=in_verts[(size_t)r*3+d]; bt.normals[(size_t)i*3+d]=in_norm[(size_t)r*3+d]; }
-        px[i]=v.uv[0]; py[i]=v.uv[1];
-        bt.uvs[(size_t)i*2+0]=v.uv[0]/(float)W; bt.uvs[(size_t)i*2+1]=v.uv[1]/(float)Ht;
+    uint32_t voff=0, ioff=0;
+    for (uint32_t mi=0; mi<atlas->meshCount; mi++) {
+        const xatlas::Mesh& om = atlas->meshes[mi];
+        const std::vector<int>& xref2orig = xref_maps[mi];
+        const bool use_cluster_source = mi < cluster_source_verts.size() && !cluster_source_verts[mi].empty();
+        const std::vector<float>* src_v = use_cluster_source ? &cluster_source_verts[mi] : &in_verts;
+        const std::vector<float>* src_n = use_cluster_source ? &cluster_source_norms[mi] : &in_norm;
+        for (uint32_t i=0;i<om.vertexCount;i++){
+            const xatlas::Vertex& v = om.vertexArray[i];
+            uint32_t r = use_cluster_source ? v.xref : (uint32_t)xref2orig[v.xref];
+            uint32_t oi = voff + i;
+            for (int d=0;d<3;d++){ bt.verts[(size_t)oi*3+d]=(*src_v)[(size_t)r*3+d]; bt.normals[(size_t)oi*3+d]=(*src_n)[(size_t)r*3+d]; }
+            px[oi]=v.uv[0]; py[oi]=v.uv[1];
+            bt.uvs[(size_t)oi*2+0]=v.uv[0]/(float)W; bt.uvs[(size_t)oi*2+1]=v.uv[1]/(float)Ht;
+        }
+        for (uint32_t i=0;i<om.indexCount;i++) bt.faces[(size_t)ioff+i]=voff+om.indexArray[i];
+        voff += om.vertexCount; ioff += om.indexCount;
     }
-    for (size_t i=0;i<bt.faces.size();i++) bt.faces[i]=om.indexArray[i];
 
     // ---- rasterize (serial; writes per-texel 3D position + interpolated normal + mask) ----
     std::vector<float> pos((size_t)W*Ht*3, 0.f);
     std::vector<float> nrm((size_t)W*Ht*3, 0.f);   // lap-18: texel normal for front-face reproject
     std::vector<uint8_t> mask((size_t)W*Ht, 0);
     for (int t=0;t<Fout;t++){
-        uint32_t a=om.indexArray[t*3], b=om.indexArray[t*3+1], c=om.indexArray[t*3+2];
+        uint32_t a=bt.faces[(size_t)t*3], b=bt.faces[(size_t)t*3+1], c=bt.faces[(size_t)t*3+2];
         float ax=px[a],ay=py[a], bx=px[b],by=py[b], cx=px[c],cy=py[c];
         float area = (bx-ax)*(cy-ay)-(by-ay)*(cx-ax);
         if (std::fabs(area)<1e-9f) continue;
@@ -377,6 +811,20 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         bt.metal_rough[p*3+0]=0;                              // R unused
         bt.metal_rough[p*3+1]=u8(a[4]);                       // G = roughness
         bt.metal_rough[p*3+2]=u8(a[3]);                       // B = metallic
+    }
+    int final_size = std::getenv("TEX_FINAL_SIZE") ? atoi(std::getenv("TEX_FINAL_SIZE")) : texture_size;
+    if (!std::getenv("TEX_KEEP_ATLAS_SIZE") && final_size > 0 && (W > final_size || Ht > final_size)) {
+        int nw = final_size;
+        int nh = std::max(1, (int)std::lround((double)Ht * final_size / (double)W));
+        if (verbose) printf("[atlas] resize final textures: %dx%d -> %dx%d\n", W, Ht, nw, nh);
+        bt.base_color = resize_u8_area(bt.base_color, W, Ht, nw, nh, 4);
+        bt.metal_rough = resize_u8_area(bt.metal_rough, W, Ht, nw, nh, 3);
+        bt.tw = nw; bt.th = nh;
+    }
+    if (const char* b = std::getenv("TEX_BASE_BLUR")) {
+        float sigma = (float)atof(b);
+        if (verbose && sigma > 0.f) printf("[atlas] baseColor gaussian blur sigma=%.2f\n", sigma);
+        blur_u8_gaussian_rgb(bt.base_color, bt.tw, bt.th, 4, sigma);
     }
     xatlas::Destroy(atlas);
     return bt;

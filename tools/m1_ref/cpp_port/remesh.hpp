@@ -637,7 +637,8 @@ inline void orient_consistent(Mesh& m) {
     // helper: does face t currently contain the DIRECTED edge (a->b)?
     auto has_dir=[&](int t,int64_t a,int64_t b)->bool{
         int64_t v[3]={m.faces[(int64_t)t*3],m.faces[(int64_t)t*3+1],m.faces[(int64_t)t*3+2]};
-        for(int e=0;e<3;e++) if(v[e]==a && v[(e+1)%3]==b) return true; return false; };
+        for(int e=0;e<3;e++) if(v[e]==a && v[(e+1)%3]==b) return true;
+        return false; };
     auto flip=[&](int t){ std::swap(m.faces[(int64_t)t*3+1], m.faces[(int64_t)t*3+2]); };
     for (int64_t s=0;s<F;s++){
         if (visited[s]) continue;
