@@ -757,7 +757,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     std::vector<float> pos((size_t)W*Ht*3, 0.f);
     std::vector<float> nrm((size_t)W*Ht*3, 0.f);   // lap-18: texel normal for front-face reproject
     std::vector<uint8_t> mask((size_t)W*Ht, 0);
-    int raster_ss = std::getenv("TEX_RASTER_SS") ? atoi(std::getenv("TEX_RASTER_SS")) : (precluster ? 2 : 1);
+    int raster_ss = std::getenv("TEX_RASTER_SS") ? atoi(std::getenv("TEX_RASTER_SS")) : 1;
     raster_ss = std::max(1, std::min(4, raster_ss));
     if (verbose && raster_ss > 1) printf("[atlas] raster supersample: %dx%d\n", raster_ss, raster_ss);
     for (int t=0;t<Fout;t++){
