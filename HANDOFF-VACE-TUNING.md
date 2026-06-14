@@ -376,3 +376,16 @@ car (3 high enough, == 4 high); grain (neon zoom) = CLEAN (3 low ≈ 4 low). Cos
 Updated step menu: 2+2=draft(both issues) | **3+3(+17%)=RECOMMENDED DEFAULT (grain+coherence clean)** | 4+4(+39%)=
 marginal max. run_musicvideo_fixed.sh default bumped 2+4 -> 3+3 (HSTEPS/LSTEPS still override). build_wan_distill_sigmas
 handles odd n_high/n_low (3 high=[1000,833,667], 3 low=[500,250,125]).
+
+# FINDINGS-L9 — FR ceiling @1280 + the long-form frames/throughput tension (the real LTX-2.3 blocker)
+The LTX-2.3 test = ONE continuous ~27s video; our FR=13 segs = 0.8s (net ~0.5s after K=5 continuation overlap)
+=> ~54 segs. LTX ~90f/seg (~5-6 segs; 8x temporal VAE vs Wan 4x = structural 2x disadvantage). FR-ceiling probe
+(run_fr_ceiling.sh, 1280x704 t2v 3+3): **FR=17 FIT (5 latent, peak 8.6GB, 461s) | FR=21 FIT (6 latent, peak
+11.0GB, 610s) | FR=25 OOM (buf 8.5GB).** So FR=21 fits TODAY (old "FR=21 OOMs" was the init-img/control path);
+FR=25 = the buffer-shrink frontier. BUT throughput WORSENS with frames (attention O(L^2) in tokens; tokens ∝
+latent frames): render-s/s-video ~222(FR13)/435(FR17)/466(FR21) vs LTX 111. ⇒ longer segs = fewer seams/better
+coherence but quadratically slower (WIDENS LTX gap). Strategic fork (handoff GOAL 1): (a)1280 short+continuation
+(b)1280 long-seg FR21 (c)480p long-seg (~4x fewer tokens => more frames + faster; prior verdict 480 BEATS LTX ~78
+vs 111). RECO: prove long-form quality at 480 first. Buffer-shrink (in-block cuts / F16 intermediates) = the
+lever to push FR past the OOM IF the 1280-long-seg lane is chosen — for FRAMES not speed (1280 compute-bound).
+See HANDOFF-CONTINUATIONS-3X3.md.

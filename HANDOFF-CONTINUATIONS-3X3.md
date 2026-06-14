@@ -34,6 +34,33 @@ to LTX's 50min/27s — measure it, not the t2v rate).
 The montage is random hard-cuts. Goal: a REAL music video where subject/motion/identity **carries across the
 seam** so each scene flows as one continuous shot (cuts only between scenes).
 
+### ★ GOAL 1 (DECIDE FIRST) — frames-per-segment / resolution / seam-count strategy
+The segments are tiny: FR=13 ≈ 0.8s; continuation drops K≈5 overlap frames → **net ~0.5s/seg** → ~54 segs for
+27s. LTX does ~90f/seg (~5–6 segs) — it has 8× temporal VAE vs Wan's 4× (structural 2× disadvantage) + efficient
+long-context attention. So "more frames per segment" is the real long-form enabler — BUT there's a hard tension
+(MEASURED, FR-ceiling probe `run_fr_ceiling.sh`, 1280×704 t2v 3+3):
+| FR | latent | out | sec/seg | fits | peak | gen | render-s/s-video |
+|--|--|--|--|--|--|--|--|
+| 13 | 4 | 13 | 0.8s | ✅ | ~9.4GB | ~180s | ~222 |
+| 17 | 5 | 17 | 1.06s | ✅ | 8.6GB | 461s | ~435 |
+| 21 | 6 | 21 | 1.31s | ✅ | 11.0GB | 610s | ~466 |
+| 25 | 7 | 25 | 1.56s | ❌ OOM | — | — | — |
+- **FR=21 fits TODAY** (pure t2v; the old "FR=21 OOMs" was the init-img/control path). So 0.8→1.3s/seg needs no
+  code. **FR=25 OOMs** — THAT's the buffer-shrink frontier (in-block graph cuts / F16 non-matmul intermediates /
+  finer VAE tiling shave the ~8.5GB DiT buffer). Buffer-shrink is the right Phase-1 lever HERE (for frames), NOT
+  for speed (1280 is compute-bound, FINDINGS-L6/L7 — don't re-chase speed from it).
+- **BUT throughput WORSENS with frames** (attention O(L²) in tokens; tokens ∝ latent frames): 222→435→466
+  render-s/s-video vs **LTX 111**. Longer segments = better coherence (fewer seams) but quadratically slower =
+  WIDENS the LTX gap. Continuation segs are heavier still (control path).
+- **The strategic fork (user call, decide before grinding):**
+  (a) **1280 + short segs + continuation** — current path; seam-limited, ~27–54 segs, slow.
+  (b) **1280 + longer segs (FR=21)** — fewer seams/better coherence, but ~4× LTX throughput.
+  (c) **480p + long segs** — ~4× fewer tokens ⇒ fits MANY more frames AND runs faster; prior verdict says
+      **480 BEATS LTX throughput** (~78 vs 111). Loses the 1280 quality bet, but is the only lane that wins on
+      LTX's own metric. **Strongly consider proving the long-form quality at 480 first**, then decide if 1280 is
+      worth the throughput hit for the quality.
+- ACTION: pick the lane (likely test 480 long-form first — it's the throughput winner), then size FR + seams.
+
 ### Continuation mechanism (already built, validated PRE-fix)
 - Script: **`run_vace_musicvideo.sh`** (4-scene chained script: seg0 = t2v, segN = continuation from prior tail).
   **Already updated to `WAN_DISTILL_SIGMAS=1 --high-noise-steps 3 --steps 3`** (verify the COMMON array + the
@@ -76,6 +103,13 @@ seam** so each scene flows as one continuous shot (cuts only between scenes).
 - Build: `docker run --rm --gpus all -v $PWD:/src -v longcat-avatar-iter-ccache:/root/.ccache -w /src
   longcat-avatar-dev:builder bash -lc "cmake --build build -j\$(nproc) --target sd-cli"`.
 
-## START: run ONE scene of `run_vace_musicvideo.sh` as a 2–3 seg continuation chain at 3+3, stitch, eye-test the
-## SEAM (join frames). If the seam holds → render the full 4-scene continuation music video. Report seam quality
-## + continuation seg time. The schedule/step work is DONE and committed; this phase is continuity + perf only.
+## START (in order):
+## (1) GOAL-1 lane decision — strongly consider proving long-form QUALITY at 480p first (the only lane that wins
+##     LTX's throughput metric; fits many more frames/seg). Establish the 480p FR ceiling (run_fr_ceiling.sh with
+##     W/H=832x480) + continuation FR ceiling (control path adds buffer, so < t2v's FR=21 @1280).
+## (2) GOAL-2 seam eye-test at 3+3 at the chosen res/FR — one scene as a 2–3 seg continuation chain, inspect the
+##     JOIN frames (does subject/motion carry? grain/brightness jump?). Measure continuation seg time = the real
+##     throughput-vs-LTX number.
+## (3) Build the ONE continuous ~27s video (continuity within scenes, hard cuts between) = the actual LTX-2.3 test.
+## The schedule/step/quality work is DONE + committed (74ba08c); this phase is frames/res/seam strategy + the
+## continuous long-form render.
