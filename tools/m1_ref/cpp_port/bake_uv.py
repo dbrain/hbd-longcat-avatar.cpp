@@ -34,6 +34,7 @@ ap.add_argument('--blur', type=float, default=0.0)   # gaussian sigma on baseCol
 ap.add_argument('--decimate', type=int, default=0)   # cumesh.simplify the DENSE mesh to N faces (finer silhouette than the 200k QEM)
 ap.add_argument('--normal_offset', type=float, default=0.0)  # push each texel's sample point OUTWARD along the surface normal by N voxels before grid_sample — kills thin-shell interior bleed (teal slivers on the black skirt)
 ap.add_argument('--dilate', type=int, default=0)     # >0: fill the atlas gutter/background by TRUE nearest-valid (Voronoi) instead of cv2 TELEA — each chart bleeds its OWN colour into the gutter so a bilinear/mip read at a chart seam never pulls a teal->black diffusion ramp (the "teal slivers on the skirt" / hairline seam cracks)
+ap.add_argument('--bilateral', type=str, default='') # "d,sigmaColor,sigmaSpace" — edge-preserving smoothing on baseColor (applied at the supersample res, only inside covered texels). Evens out per-texel volume-sample noise on flat skin/cloth (the "immaculate porcelain" look) WITHOUT blurring crisp boundaries (eyes, hair/skin edges). e.g. 9,40,9
 a = ap.parse_args()
 TS = a.texsize * a.ssaa
 vbase = 'dump_mesh' if a.mesh == 'qem' else 'dump_dense'
@@ -53,6 +54,7 @@ vt, ft, uvt, vmap = cm.uv_unwrap(return_vmaps=True)
 vt = vt.cuda(); ft = ft.cuda(); uvt = uvt.cuda()
 print(f"[bake] cumesh unwrap: {vt.shape[0]} verts / {ft.shape[0]} tris ({time.time()-t0:.1f}s)")
 verts = vt.cpu().numpy(); faces = ft.cpu().numpy(); uvs = uvt.cpu().numpy()
+del cm; torch.cuda.empty_cache()   # free the CuMesh GPU residency before the big raster/grid_sample (8192 headroom)
 # smooth vertex normals on the (possibly simplified) UNWRAPPED mesh
 normals = trimesh.Trimesh(vertices=verts, faces=faces, process=False).vertex_normals
 
@@ -71,8 +73,15 @@ if a.normal_offset != 0.0:
     pos = pos + nrm_i * (a.normal_offset / RES)
 feats_t = torch.from_numpy(feats).float().cuda(); coords_t = torch.from_numpy(coords).int().cuda()
 attrs = torch.zeros(TS, TS, 6, device='cuda')
-attrs[mask] = grid_sample_3d(feats_t, coords_t, shape=torch.Size([1,6,RES,RES,RES]),
-                             grid=((pos[mask]+0.5)*RES).reshape(1,-1,3), mode='trilinear')
+# chunk the grid_sample so very large atlases (8192^2) fit in 12 GB — peak scales with the chunk, not
+# the full covered-texel count.
+grid_all = ((pos[mask] + 0.5) * RES)            # [M,3]
+M = grid_all.shape[0]; CH = 6_000_000
+samp = torch.empty(M, 6, device='cuda')
+for i in range(0, M, CH):
+    samp[i:i+CH] = grid_sample_3d(feats_t, coords_t, shape=torch.Size([1,6,RES,RES,RES]),
+                                  grid=grid_all[i:i+CH].reshape(1,-1,3), mode='trilinear')
+attrs[mask] = samp
 m = mask.cpu().numpy()
 from scipy.ndimage import distance_transform_edt
 def fill_nearest(img, valid):
@@ -92,6 +101,13 @@ def chan(sl, r):
 base = chan(LAYOUT['base_color'], a.inpaint)
 metal = chan(LAYOUT['metallic'], 1)[..., None]; rough = chan(LAYOUT['roughness'], 1)[..., None]
 alpha = chan(LAYOUT['alpha'], 1)[..., None]
+# edge-preserving smoothing: bilateral averages only SIMILAR-colour neighbours (sigmaColor), so it
+# evens out the speckly per-texel volume-sample noise on flat skin/cloth while leaving crisp colour
+# boundaries (eyes, hair/skin edge, teal-vs-black) sharp — and the colour-similarity guard means it
+# won't pull a teal-hair gutter into adjacent skin. Run at the supersample res, before area-downsample.
+if a.bilateral:
+    bd, bsc, bss = (float(x) for x in a.bilateral.split(','))
+    base = cv2.bilateralFilter(base, int(bd), bsc, bss)
 # gentle smoothing: optional gaussian blur (gutters are inpainted so no dark bleed), then
 # supersample-downsample to the target size (area-average AA across charts/texels).
 if a.blur > 0:
