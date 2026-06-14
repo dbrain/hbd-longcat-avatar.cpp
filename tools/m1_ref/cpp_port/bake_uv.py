@@ -32,6 +32,8 @@ ap.add_argument('--inpaint', type=int, default=3)   # cv2 TELEA radius for the g
 ap.add_argument('--ssaa', type=int, default=1)       # supersample: bake at texsize*ssaa, area-downsample → AA/smooth
 ap.add_argument('--blur', type=float, default=0.0)   # gaussian sigma on baseColor (after inpaint) — gentle smoothing
 ap.add_argument('--decimate', type=int, default=0)   # cumesh.simplify the DENSE mesh to N faces (finer silhouette than the 200k QEM)
+ap.add_argument('--normal_offset', type=float, default=0.0)  # push each texel's sample point OUTWARD along the surface normal by N voxels before grid_sample — kills thin-shell interior bleed (teal slivers on the black skirt)
+ap.add_argument('--dilate', type=int, default=0)     # >0: fill the atlas gutter/background by TRUE nearest-valid (Voronoi) instead of cv2 TELEA — each chart bleeds its OWN colour into the gutter so a bilinear/mip read at a chart seam never pulls a teal->black diffusion ramp (the "teal slivers on the skirt" / hairline seam cracks)
 a = ap.parse_args()
 TS = a.texsize * a.ssaa
 vbase = 'dump_mesh' if a.mesh == 'qem' else 'dump_dense'
@@ -58,13 +60,34 @@ ctx = dr.RasterizeCudaContext()
 uvr = torch.cat([uvt*2-1, torch.zeros_like(uvt[:,:1]), torch.ones_like(uvt[:,:1])], -1).unsqueeze(0)
 rast, _ = dr.rasterize(ctx, uvr, ft, resolution=[TS, TS]); mask = rast[0,...,3] > 0
 pos = dr.interpolate(vt.unsqueeze(0), rast, ft)[0][0]
+# normal-offset: sample the OUTER shell, not the thin-shell mid-surface. The rasterised position on a
+# thin sheet (skirt edge, twin-tails) sits between front/back voxels, so trilinear grid_sample blends
+# the front colour with empty/interior voxels (the teal "empty" colour). Nudging the sample point
+# outward along the per-texel surface normal lands it on the solid front voxel → no teal bleed.
+if a.normal_offset != 0.0:
+    nrm_t = torch.from_numpy(normals).float().cuda()
+    nrm_i = dr.interpolate(nrm_t.unsqueeze(0), rast, ft)[0][0]
+    nrm_i = nrm_i / (nrm_i.norm(dim=-1, keepdim=True) + 1e-8)
+    pos = pos + nrm_i * (a.normal_offset / RES)
 feats_t = torch.from_numpy(feats).float().cuda(); coords_t = torch.from_numpy(coords).int().cuda()
 attrs = torch.zeros(TS, TS, 6, device='cuda')
 attrs[mask] = grid_sample_3d(feats_t, coords_t, shape=torch.Size([1,6,RES,RES,RES]),
                              grid=((pos[mask]+0.5)*RES).reshape(1,-1,3), mode='trilinear')
 m = mask.cpu().numpy()
+from scipy.ndimage import distance_transform_edt
+def fill_nearest(img, valid):
+    # TRUE nearest-valid background fill (Voronoi). cv2 TELEA diffuses a colour *gradient* through the
+    # gutter, so where a teal-hair chart is packed next to a black-skirt chart the gutter becomes a
+    # teal->black ramp that bilinear/mip sampling pulls back across the seam (the "teal slivers on the
+    # skirt"). distance_transform_edt copies each gutter texel from the genuinely nearest covered texel,
+    # giving a SHARP colour boundary midway in the gutter — a seam read stays on its own chart's colour.
+    idx = distance_transform_edt(~valid, return_distances=False, return_indices=True)
+    return img[tuple(idx)]
 def chan(sl, r):
     img = np.clip(attrs[..., sl].cpu().numpy()*255, 0, 255).astype(np.uint8)
+    if img.shape[-1] == 1: img = img[..., 0]   # cv2/scipy want 2D for single-channel maps
+    if a.dilate > 0:                           # mip-safe nearest-valid gutter (kills cross-chart bleed)
+        return fill_nearest(img, m)
     return cv2.inpaint(img, (~m).astype(np.uint8), r, cv2.INPAINT_TELEA)
 base = chan(LAYOUT['base_color'], a.inpaint)
 metal = chan(LAYOUT['metallic'], 1)[..., None]; rough = chan(LAYOUT['roughness'], 1)[..., None]
