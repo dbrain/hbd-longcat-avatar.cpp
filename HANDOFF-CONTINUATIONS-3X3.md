@@ -1,6 +1,16 @@
-# HANDOFF — Make VACE continuations usable (real music video, not montage) @ 3+3
+# HANDOFF — VACE long-form continuous video @ 3+3 (the actual LTX-2.3 test)
 _Worktree `~/dev/longcat-avatar-wan22`, branch `wan22-infinitetalk`. Prior findings: `HANDOFF-VACE-TUNING.md`
 (L1–L8h). Memory: `project_wan22_infinitetalk_3060`._
+
+## THE MISSION (not a pivot — this IS the goal)
+The whole point is: **can VACE beat LTX-2.3 at long-form directed video?** LTX-2.3's benchmark is **ONE continuous
+~27s clip** (1280×704, ~50min/27s = 111 render-s/s-video). So the real test is a **single sustained, coherent
+long video** — NOT a montage of independent hard-cut fragments. The 27s montage (`perf_out/mv27`) was a DETOUR:
+a fast way to nail per-shot quality (schedule/grain/coherence) at 3+3. That's now solved + committed. The
+remaining work — making **continuations** hold across seams — is what makes the long-video test possible, and
+it's where BOTH the quality verdict (does it stay coherent over 27s?) AND the throughput-vs-LTX number actually
+get decided (continuation is the slow control path, so the continuous-video render time is the real comparison
+to LTX's 50min/27s — measure it, not the t2v rate).
 
 ## WHAT'S DONE (committed this session)
 - **Schedule fix WIRED + COMMITTED** (`src/stable-diffusion.cpp`): `WAN_DISTILL_SIGMAS=1` makes the Wan2.2
