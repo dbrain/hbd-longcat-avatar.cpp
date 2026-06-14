@@ -898,7 +898,16 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         for (uint32_t i=0;i<om.indexCount;i++) bt.faces[(size_t)ioff+i]=voff+om.indexArray[i];
         voff += om.vertexCount; ioff += om.indexCount;
     }
-    if (!std::getenv("TEX_NO_WELD_NORMALS")) {
+    if (std::getenv("TEX_TOPO_NORMALS")) {
+        // Python parity: vertex normals on the OUTPUT (chart-split) topology, exactly like bake_uv.py's
+        // trimesh.Trimesh(verts,faces).vertex_normals. Area-weighted, NOT position-welded — welding
+        // averages across the <1-voxel twin-tail front/back gap and chart-split seams, tilting normals
+        // ~16deg off the surface (the "random triangles" under lighting). Topology normals = ~Python.
+        double tn=_now();
+        std::vector<int64_t> f64(bt.faces.begin(), bt.faces.end());
+        bt.normals = vert_normals(bt.verts, f64);
+        if (verbose) printf("[atlas] output-topology normals (%.2fs)\n", _now()-tn);
+    } else if (!std::getenv("TEX_NO_WELD_NORMALS")) {
         double tn=_now();
         bt.normals = welded_vert_normals(bt.verts, bt.faces);
         if (verbose) printf("[atlas] welded output normals (%.2fs)\n", _now()-tn);
