@@ -52,14 +52,20 @@ long-context attention. So "more frames per segment" is the real long-form enabl
 - **BUT throughput WORSENS with frames** (attention O(L²) in tokens; tokens ∝ latent frames): 222→435→466
   render-s/s-video vs **LTX 111**. Longer segments = better coherence (fewer seams) but quadratically slower =
   WIDENS the LTX gap. Continuation segs are heavier still (control path).
-- **The strategic fork (user call, decide before grinding):**
-  (a) **1280 + short segs + continuation** — current path; seam-limited, ~27–54 segs, slow.
-  (b) **1280 + longer segs (FR=21)** — fewer seams/better coherence, but ~4× LTX throughput.
-  (c) **480p + long segs** — ~4× fewer tokens ⇒ fits MANY more frames AND runs faster; prior verdict says
-      **480 BEATS LTX throughput** (~78 vs 111). Loses the 1280 quality bet, but is the only lane that wins on
-      LTX's own metric. **Strongly consider proving the long-form quality at 480 first**, then decide if 1280 is
-      worth the throughput hit for the quality.
-- ACTION: pick the lane (likely test 480 long-form first — it's the throughput winner), then size FR + seams.
+- **TARGET IS FIXED AT 720p (1280×704). No 480p pivot.** The question is: how close to LTX (111) can 720p
+  long-form get, and how feasible is it? Honest current state at 720p:
+  - FR=13 ≈ 2× LTX throughput but most seams (~54 continuation segs/27s); FR=21 ≈ 4.2× LTX but fewer seams
+    (~21 segs). Shorter segs are throughput-closer to LTX but seam-heavier — opposite pulls.
+  - **The gap will NOT close from steps (3+3 = quality floor) or kernels (silicon floor, proven L6/L7).** The
+    ONE lever that attacks the O(L²) attention wall — i.e. makes long 720p segments not-quadratically-punished —
+    is **block-sparse / windowed attention (BSA)** (`additional-levers.md`: "attacks 33% of clip wall + the
+    algorithmic ceiling"; quality-trade, fork-class, static local-window mask is the cheap entry). **This is the
+    real path to "near-LTX at 720p" and the highest-leverage perf work left.**
+  - Buffer-shrink (in-block cuts / F16 intermediates) still relevant to push FR past the OOM (FR=25+) IF longer
+    segments are wanted — for FRAMES not speed.
+- ACTION: treat this as a 720p throughput problem. Measure the long-form throughput knee (continuation seg time
+  × seam count across FR=13/17/21), then the BSA lever (the only thing that bends the O(L²) curve). Decide the
+  FR/seam operating point that minimizes total 27s render time while holding coherence.
 
 ### Continuation mechanism (already built, validated PRE-fix)
 - Script: **`run_vace_musicvideo.sh`** (4-scene chained script: seg0 = t2v, segN = continuation from prior tail).
@@ -103,13 +109,13 @@ long-context attention. So "more frames per segment" is the real long-form enabl
 - Build: `docker run --rm --gpus all -v $PWD:/src -v longcat-avatar-iter-ccache:/root/.ccache -w /src
   longcat-avatar-dev:builder bash -lc "cmake --build build -j\$(nproc) --target sd-cli"`.
 
-## START (in order):
-## (1) GOAL-1 lane decision — strongly consider proving long-form QUALITY at 480p first (the only lane that wins
-##     LTX's throughput metric; fits many more frames/seg). Establish the 480p FR ceiling (run_fr_ceiling.sh with
-##     W/H=832x480) + continuation FR ceiling (control path adds buffer, so < t2v's FR=21 @1280).
-## (2) GOAL-2 seam eye-test at 3+3 at the chosen res/FR — one scene as a 2–3 seg continuation chain, inspect the
-##     JOIN frames (does subject/motion carry? grain/brightness jump?). Measure continuation seg time = the real
-##     throughput-vs-LTX number.
-## (3) Build the ONE continuous ~27s video (continuity within scenes, hard cuts between) = the actual LTX-2.3 test.
-## The schedule/step/quality work is DONE + committed (74ba08c); this phase is frames/res/seam strategy + the
-## continuous long-form render.
+## START (in order) — TARGET = 720p (1280×704), the question is throughput vs LTX:
+## (1) Measure the 720p long-form throughput knee: continuation seg time at 3+3 across FR=13/17/21 (control path
+##     adds buffer + tokens vs t2v) × seam count → which FR minimizes total 27s render time while holding coherence.
+## (2) GOAL-2 seam eye-test at 3+3 — one scene as a 2–3 seg continuation chain, inspect the JOIN frames (subject/
+##     motion carry? grain/brightness jump?). This + (1) come from the same runs.
+## (3) The big lever for near-LTX 720p: block-sparse/windowed attention (BSA, additional-levers.md) — the only
+##     thing that bends the O(L²) attention curve so long 720p segments aren't quadratically punished. Fork-class,
+##     quality-trade; start with the static local-window mask. Everything else (steps/kernels) is at its floor.
+## (4) Build the ONE continuous ~27s 720p video = the actual LTX-2.3 test.
+## Schedule/step/quality work DONE + committed (74ba08c); this phase = 720p long-form throughput + continuity.
