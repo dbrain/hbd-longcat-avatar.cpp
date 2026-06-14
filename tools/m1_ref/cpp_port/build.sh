@@ -35,9 +35,17 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ]; } && [ "$MODE" = "
       -I"$CUMESH/src" -c "$CUMESH/src/$f.cu" -o "$CUMESH/build/$f.o"
     CUMESH_OBJS="$CUMESH_OBJS $CUMESH/build/$f.o"
   done
-  "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH $INC -I"$TOOL/include" -I"$CUMESH/src" \
+  # --pack support: in-process compressed GLB (meshopt geo + KTX2 tex via basis_universal). Build the
+  # basisu static lib on demand and link it + the meshopt codec TUs; define PIXAL3D_PACK to compile in
+  # the glb_packed.hpp path. basisu KTX2 defines are needed for the pixal3d TU that includes ktx2_encode.hpp.
+  BU="$HERE/../../../thirdparty/basis_universal"
+  "$HERE/build_basisu.sh"
+  PACK_DEFS="-DPIXAL3D_PACK -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
+  "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH $PACK_DEFS $INC -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
     "$HERE/$SRC" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
-    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" $CUMESH_OBJS -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
+    "$TP/meshoptimizer/vertexcodec.cpp" "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
+    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" $CUMESH_OBJS \
+    "$BU/build/libbasisu_enc.a" -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
     -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
   exit 0
@@ -61,9 +69,55 @@ if { [ "$BASE" = "m4_gpu_test" ] || [ "$BASE" = "m6_gpu_test" ] || [ "$BASE" = "
   exit 0
 fi
 
+# ktx2_test: standalone validation of the vendored basis_universal KTX2 encoder (ktx2_encode.hpp).
+# Builds libbasisu_enc.a on demand and links it. Toolchain g++ (ABI-matches pixal3d's CUDA link).
+if [ "$BASE" = "ktx2_test" ]; then
+  TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+  BU="$HERE/../../../thirdparty/basis_universal"
+  "$HERE/build_basisu.sh"
+  echo ">> build ktx2_test (basis_universal KTX2 encoder)"
+  "$TOOL/bin/g++" $COMMON -I"$BU" "$HERE/$SRC" "$BU/build/libbasisu_enc.a" \
+    -o "$HERE/$BIN" -lm -lpthread
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# glb_pack_test: validate the in-process compressed-GLB writer (glb_packed.hpp = meshopt + KTX2).
+# Links libbasisu_enc.a + the meshopt codec TUs (encode/decode vertex+index). Toolchain g++.
+if [ "$BASE" = "glb_pack_test" ]; then
+  TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+  BU="$HERE/../../../thirdparty/basis_universal"
+  TP="$HERE/../../../thirdparty"
+  "$HERE/build_basisu.sh"
+  echo ">> build glb_pack_test (meshopt + KTX2 packed GLB writer)"
+  "$TOOL/bin/g++" $COMMON -I"$BU" "$HERE/$SRC" \
+    "$TP/meshoptimizer/vertexcodec.cpp" "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
+    "$TP/meshoptimizer/quantization.cpp" "$BU/build/libbasisu_enc.a" \
+    -o "$HERE/$BIN" -lm -lpthread
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# glb_repack: real-scale CPU validation of the in-process packer — reads an uncompressed textured GLB
+# and (REPACK_INPROC=hero|small) rewrites it via glb_packed.hpp (meshopt+KTX2). Toolchain g++ + basisu.
+if [ "$BASE" = "glb_repack" ]; then
+  TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+  BU="$HERE/../../../thirdparty/basis_universal"
+  TP="$HERE/../../../thirdparty"
+  "$HERE/build_basisu.sh"
+  PACK_DEFS="-DREPACK_INPROC_BUILD -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
+  echo ">> build glb_repack (+ in-process meshopt+KTX2 repack path)"
+  "$TOOL/bin/g++" $COMMON -fopenmp $PACK_DEFS -I"$BU" "$HERE/$SRC" \
+    "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" "$TP/meshoptimizer/vertexcodec.cpp" \
+    "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" "$BU/build/libbasisu_enc.a" \
+    -o "$HERE/$BIN" -lm -lpthread
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
-if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ] || [ "$BASE" = "glb_repack" ]; then
+if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ]; then
   if [ "$MODE" = "cuda" ] && [ "$BASE" = "tex_reproject" ]; then
     TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
     TP="$HERE/../../../thirdparty"

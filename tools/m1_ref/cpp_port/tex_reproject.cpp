@@ -5,7 +5,10 @@
 // Colours the dense verts (grid_sample, 6-ch, on-shell → exact), then bakes a UV PBR texture for the
 // QEM mesh by snapping each texel onto the dense mesh (closest-pt-on-tri + front-face reject). Iterate
 // params in seconds, NO GPU. Render vs pyref_front.png.
-//   ./build.sh tex_reproject && ./tex_reproject [texsize]
+//   ./build.sh tex_reproject cuda && ./tex_reproject 4096 out.glb   # v6 parity defaults baked in
+// The v6 FINDINGS-A flag-set (native cumesh 500k + pyref xatlas + RP_OFF + FBR0 + RASTER_SS2 + TELEA +
+// topo-normals + keep-atlas-size + fill-bg) is now the DEFAULT (see main()); any env overrides a single
+// flag. For a game LOD: `CUMESH_TARGET=70000 TEX_FINAL_SIZE=1024 ./tex_reproject 4096 lod.glb`.
 // Env: ATL_CONE, ATL_PAD, RP_NCELL, RP_MAXRING, RP_FRONTDOT, TEX_INPAINT_ITERS, VCOLOR_FB.
 #include "tex_atlas.hpp"
 #include "tex_grid_sample.hpp"
@@ -26,6 +29,21 @@ static std::vector<uint8_t> rd(const char* p){ FILE* f=fopen(p,"rb"); if(!f){pri
 int main(int argc,char**argv){
     int TS=(argc>1)?atoi(argv[1]):2048;
     const char* OUT=(argc>2)?argv[2]:"miku_reproject_tex.glb";
+
+    // v6 PARITY DEFAULTS (FINDINGS-A) — the diagnosed flag-set that reaches Python parity. Baked in as
+    // defaults so the finalized command is just `./tex_reproject 4096 out.glb`. setenv(...,0) = the
+    // env still wins (override any single flag), and the shared texatlas::bake() is left untouched so
+    // the pixal3d --tex production path is NOT changed by this. TEX_KEEP_ATLAS_SIZE is auto-skipped
+    // when a LOD downsample (TEX_FINAL_SIZE) is requested, matching the FINDINGS-A game-LOD recipe.
+    {
+        auto def=[](const char*k,const char*v){ setenv(k,v,0); }; // 0 = do NOT overwrite a user-set value
+        def("ATL_NATIVE_CUMESH","1"); def("CUMESH_TARGET","500000"); def("ATL_PYREF_XATLAS","1");
+        def("RP_OFF","1");            def("TEX_FBR","0");           def("TEX_RASTER_SS","2");
+        def("TEX_TELEA_INPAINT","1"); def("TEX_TELEA_RADIUS","4");  def("TEX_INPAINT_ITERS","16");
+        def("TEX_TOPO_NORMALS","1");  def("TEX_FILL_BACKGROUND","1");
+        if (!getenv("TEX_FINAL_SIZE")) def("TEX_KEEP_ATLAS_SIZE","1"); // full-res parity = no downsample
+        printf("[rp] v6 parity defaults active (set any env to override; TEX_FINAL_SIZE=<N> for a LOD)\n");
+    }
     size_t NVq,NFq,NP; { FILE* f=fopen("dump_bake.txt","r"); if(!f){printf("no dump_bake.txt — run pixal3d PIXAL3D_FORCE_UVATLAS=1 PIXAL3D_DUMP_BAKE=1 first\n");return 1;}
         if(fscanf(f,"%zu %zu %zu",&NVq,&NFq,&NP)!=3){fclose(f);return 1;} fclose(f); }
     size_t NVd,NFd; { FILE* f=fopen("dump_dense.txt","r"); if(!f){printf("no dump_dense.txt — rebuild the dump with the dense-mesh dump enabled\n");return 1;}

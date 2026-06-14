@@ -10,6 +10,9 @@
 #include "glb_writer.hpp"
 #include "tex_atlas.hpp"
 #include "glb_textured.hpp"
+#ifdef PIXAL3D_PACK
+#include "glb_packed.hpp"   // in-process meshopt+KTX2 compressed GLB (native gltfpack equivalent)
+#endif
 #include "../../sparse_spike/npy.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +25,10 @@ static void usage() {
     printf("usage: pixal3d --model <gguf_dir> --image <png> --out <glb>\n"
            "               [--fov <deg>] [--cam <ang_rad> <dist> <scale>] [--mesh-scale <s>]\n"
            "               [--tex] [--vcolor] [--texsize <N>] [--decimate <faces>]\n"
-           "               [--remesh] [--no-watertight] [--cpu] [--ply] [--fast]\n"
+           "               [--remesh] [--no-watertight] [--cpu] [--ply] [--fast] [--pack [hero|small]]\n"
+           "       --pack         : write a COMPRESSED GLB (native, in-process): meshopt geometry\n"
+           "                        (KHR_mesh_quantization + EXT_meshopt_compression) + KTX2 textures\n"
+           "                        (KHR_texture_basisu). hero=UASTC near-lossless (default), small=ETC1S.\n"
            "               [--seed <N>] [--guidance <G>] [--steps <N>]\n"
            "               [--{ss,shape,tex}-guidance <G>] [--{ss,shape,tex}-rescale <R>]\n"
            "               [--{ss,shape,tex}-rescale-t <T>] [--{ss,shape,tex}-steps <N>]\n"
@@ -57,6 +63,7 @@ int main(int argc, char** argv) {
     std::string model, image, out;
     float cam = DEF_CAM, dist = DEF_DIST, ms = DEF_MS;
     bool use_cuda = true, write_ply = false, textured = false, fast = false, vcolor = false, watertight = true, remesh = false;
+    int pack = 0;   // 0=off (uncompressed GLB), 1=hero (UASTC+Zstd), 2=small (ETC1S) — meshopt+KTX2
     int texsize = 512, decimate = -1;    // -1 = auto (remesh→90k tight/fast atlas, else 150k). dual-grid
                                           // mesh holes -> xatlas charts/boundary; keep
                                               // face count tractable (~100s unwrap). --decimate to tune.
@@ -79,6 +86,10 @@ int main(int argc, char** argv) {
         else if (a == "--cpu") use_cuda = false;
         else if (a == "--ply") write_ply = true;
         else if (a == "--fast") fast = true;   // Phase C perf: f16 tensor-core DiT path (use w/ weights_gguf_f16)
+        else if (a == "--pack") {               // compressed GLB: meshopt geo + KTX2 tex (native, in-process)
+            pack = 1;                            // default hero (UASTC)
+            if (i+1 < argc && argv[i+1][0] != '-') { std::string m = argv[++i]; pack = (m=="small") ? 2 : 1; }
+        }
         // ---- conditioning (Trellis.2 sampler knobs; defaults already set in ChainInput) ----
         else if (a == "--seed" && i+1 < argc) in.seed = std::atoi(argv[++i]);
         else if (a == "--guidance" && i+1 < argc) { float g=next(i); in.ss.guidance=g; in.shape.guidance=g; }
@@ -170,8 +181,24 @@ int main(int argc, char** argv) {
                                                    precluster);
         printf("  [tex] UV-atlas bake: %dx%d, %d charts, %d out-verts (%.1fs)\n",
                bt.tw, bt.th, bt.chart_count, (int)bt.verts.size()/3, pix::now_s()-tb);
-        ok = glb::write_glb_textured(out.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces,
-                                     bt.base_color, bt.metal_rough, bt.tw, bt.th);
+        if (pack) {
+#ifdef PIXAL3D_PACK
+            // native in-process compressed GLB: meshopt geo (KHR_mesh_quantization +
+            // EXT_meshopt_compression) + KTX2 textures (KHR_texture_basisu). hero=UASTC / small=ETC1S.
+            double tp = pix::now_s();
+            ok = glb::write_glb_textured_packed(out.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces,
+                                                bt.base_color, bt.metal_rough, bt.tw, bt.th,
+                                                /*uastc*/ pack == 1, /*etc1s_quality*/ 192);
+            printf("  [pack] compressed GLB (%s: meshopt + KTX2) %.1fs\n", pack==1?"hero/UASTC":"small/ETC1S", pix::now_s()-tp);
+#else
+            printf("  [pack] WARNING: --pack requested but binary built without PIXAL3D_PACK; writing uncompressed\n");
+            ok = glb::write_glb_textured(out.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces,
+                                         bt.base_color, bt.metal_rough, bt.tw, bt.th);
+#endif
+        } else {
+            ok = glb::write_glb_textured(out.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces,
+                                         bt.base_color, bt.metal_rough, bt.tw, bt.th);
+        }
     } else if (!vcolor && decimate > 0 && (int)mesh.faces.size()/3 > decimate) {
         // plain GLB with downmesh: decimate to the configurable face budget (game assets). --vcolor
         // keeps the full mesh (its COLOR_0 is zipped 1:1 to the verts; decimation would break it).

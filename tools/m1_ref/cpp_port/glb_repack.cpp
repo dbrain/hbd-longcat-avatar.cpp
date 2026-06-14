@@ -13,7 +13,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifdef REPACK_INPROC_BUILD
+#include "glb_packed.hpp"   // in-process meshopt+KTX2 writer (validate the native packer at full scale)
+#endif
 
 using json = nlohmann::json;
 
@@ -192,6 +197,26 @@ int main(int argc, char** argv) {
     };
     img0 = maybe_resize_png(image_bytes(0), tex_max, 4);
     img1 = maybe_resize_png(image_bytes(1), tex_max, 3);
+
+#ifdef REPACK_INPROC_BUILD
+    // REPACK_INPROC=hero|small: decode the PNG atlases to pixels and write a fully in-process compressed
+    // GLB (meshopt geo + KTX2 tex) — validates the native packer at real scale, no GPU. Compare size/look
+    // vs the gltfpack output.
+    if (const char* mode = std::getenv("REPACK_INPROC")) {
+        int w0,h0,c0, w1,h1,c1;
+        uint8_t* p0 = stbi_load_from_memory(img0.data(), (int)img0.size(), &w0,&h0,&c0, 4);
+        uint8_t* p1 = stbi_load_from_memory(img1.data(), (int)img1.size(), &w1,&h1,&c1, 3);
+        if (!p0 || !p1) { std::fprintf(stderr, "[inproc] PNG decode failed\n"); return 1; }
+        std::vector<uint8_t> base(p0, p0 + (size_t)w0*h0*4), mr(p1, p1 + (size_t)w1*h1*3);
+        stbi_image_free(p0); stbi_image_free(p1);
+        bool uastc = std::strcmp(mode, "small") != 0;
+        bool ok = glb::write_glb_textured_packed(argv[2], posv, nrmv, uvv, idx, base, mr, w0, h0, uastc, 192,
+                                                 (int)std::thread::hardware_concurrency());
+        std::printf("[inproc] %s -> %s (%s: meshopt+KTX2, %ux%u v, %ux%u tex)\n",
+                    argv[1], argv[2], uastc?"hero/UASTC":"small/ETC1S", V, F3/3, w0, h0);
+        return ok ? 0 : 1;
+    }
+#endif
 
     std::vector<int16_t> qpos((size_t)V * 3);
     std::vector<int8_t> qnrm((size_t)V * 3);

@@ -38,3 +38,6 @@ bench/results/*.ncu-rep
 /tools/LightX2V/
 /tools/lightx2v-test/out/
 _ablation_out/
+
+# vendored on demand by tools/m1_ref/cpp_port/build_basisu.sh (pinned BASISU_REF)
+thirdparty/basis_universal/

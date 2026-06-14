@@ -35,24 +35,40 @@ Served via `cd tools/m1_ref/cpp_port && python3 -m http.server 8011 --bind 0.0.0
 
 ## Next quality steps
 
-### 1. KTX2 + mesh quantization (HIGHEST VALUE — makes it a shippable asset, no quality loss)
-The GLBs are uncompressed (float32 geo + PNG tex): native_v6=86 MB, native_2048=44 MB. Runtime cost is
-texture VRAM (resolution-driven) + tris, not file size — but for delivery you want:
-- `gltfpack -i native_v6.glb -o native_v6_packed.glb -cc -tc` → meshopt geo compression
-  (KHR_mesh_quantization + EXT_meshopt_compression) + KTX2/BasisU textures. Expect 4096→~15 MB,
-  2048→~5–8 MB. (`gltfpack` from meshoptimizer; `-tc` needs basisu/toktx available.)
-- Verify it still loads in model-viewer (it supports both extensions). This is the one step between
-  "looks right" and "usable game asset". Do this first.
+### 1. KTX2 + mesh quantization — DONE, FULLY IN-PROCESS (2026-06-14)
+Shipped as a NATIVE C++ in-process packer (user wanted zero off-process node/python; gltfpack-the-binary
+is C++ but still a subprocess, so we vendored the libs instead):
+- `pixal3d --tex --pack [hero|small]` writes a compressed GLB DIRECTLY from the in-memory atlas — no
+  second process, no GLB re-parse. hero=UASTC+Zstd (near-lossless), small=ETC1S.
+- Geometry: `meshoptimizer` (already vendored) — KHR_mesh_quantization (int16 pos / int8-OCTAHEDRAL
+  normal / uint16 uv) + EXT_meshopt_compression (encodeVertexBuffer/IndexBuffer, fallback-buffer layout).
+- Textures: vendored `thirdparty/basis_universal` → `ktx2_encode.hpp` (basis_compressor, UASTC+Zstd or
+  ETC1S) → KHR_texture_basisu (KTX2). Built once into `thirdparty/basis_universal/build/libbasisu_enc.a`
+  via `build_basisu.sh` (toolchain g++ 12.4, ABI-matches pixal3d's CUDA link).
+- Files: `glb_packed.hpp` (writer), `ktx2_encode.hpp` (KTX2), `build_basisu.sh`. Tests: `glb_pack_test`
+  (round-trip: idx/pos/nrm-oct decode + KTX2 magic — ALL VALID) and `glb_repack REPACK_INPROC=hero|small`
+  (real-scale CPU validation: repacks native_v6.glb without GPU).
+- Full-scale result (native_v6: 816k v / 4776² tex, 86 MB uncompressed): hero 45.9 MB, small 17.9 MB,
+  both structurally valid. (gltfpack ref on the same file: 42 / 12 MB — small-tier delta is our
+  quality-first ETC1S q192, tunable via the etc1s_quality param.)
+- STILL TODO (GPU): run `pixal3d --tex --pack` on a real generation to confirm the live path + eyeball
+  in model-viewer (CPU repack already proves the writer; this just exercises it end-to-end on GPU).
+- The standalone `gltfpack` binary (~/.local/bin) + `pack_glb.sh` remain only as the A/B reference target.
 
-### 2. Clean 2048 tier (cheap, GPU)
-Per the wall note above: bake the atlas larger then downsample ≥4× to 2048 so the AA is strong enough
-to not crack. One bake to validate.
+### 2. Clean 2048 tier — DONE (2026-06-14)
+`TEX_FINAL_SIZE=2048 TEX_RASTER_SS=1 ./tex_reproject 8192 native_clean2048.glb` → bakes atlas 8806²
+then area-downsamples 4.3× to 2048 (≥4× = strong AA, no chart-merge cracks; 182k charts, 0.51% holes,
+46s, no OOM at SS=1 since the big downsample IS the AA). Packed in-process: `native_clean2048_inproc.glb`
+(hero/UASTC 15.1 MB) / `native_clean2048_inproc_small.glb` (small/ETC1S 9.6 MB). A/B vs the OLD cracky
+2.33× `native_2048*` in model-viewer to confirm the cracks are gone.
 
-### 3. Bake v6 flags in as binary defaults (tidy-up)
-Right now the good bake needs the env-var soup (ATL_PYREF_XATLAS, RP_OFF, TEX_FBR=0, TEX_RASTER_SS=2,
-TEX_TOPO_NORMALS, TEX_KEEP_ATLAS_SIZE, TEX_FILL_BACKGROUND). Make these the defaults in
-`tex_reproject.cpp` / `tex_atlas.hpp` so the finalized command is just `./tex_reproject 4096 out.glb`.
-Small code change + rebuild (`./build.sh tex_reproject cuda`, builds fine on this host).
+### 3. Bake v6 flags in as binary defaults — DONE (2026-06-14)
+The v6 flag-set is now the DEFAULT in `tex_reproject.cpp` main() via `setenv(k,v,0)` (env still overrides
+any single flag), so the finalized command is just `./tex_reproject 4096 out.glb`. Deliberately did NOT
+touch the shared `tex_atlas.hpp::bake()` defaults — that path is also used by `pixal3d --tex` (a different
+unwrap), and changing it could silently regress the production binary. `TEX_KEEP_ATLAS_SIZE` is auto-
+skipped when `TEX_FINAL_SIZE` is set, so the game-LOD recipe still downsamples. Compiles clean.
+STILL TODO (GPU): one run to confirm the default-flag bake is byte-identical to the old env-soup native_v6.
 
 ### 4. True low-poly LODs (BIGGER — needs a new tool, only if mobile/traditional-engine target)
 The bake pipeline can't produce clean low-poly LODs (non-manifold decimator, see wall). To get them:
