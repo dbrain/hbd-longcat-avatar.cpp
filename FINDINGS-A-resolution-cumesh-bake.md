@@ -1,5 +1,32 @@
 # RESOLUTION — texture quality gap (closes HANDOFF-A-quality-gap-after-fillbg)
 
+## ⇒ NATIVE C++ HITS PARITY WITH PYTHON (the actual goal). Winning recipe:
+
+    cd tools/m1_ref/cpp_port && ./build.sh tex_reproject cuda     # builds fine on this host (C++/CUDA)
+    ATL_NATIVE_CUMESH=1 CUMESH_TARGET=500000 ATL_PYREF_XATLAS=1 RP_OFF=1 \
+      TEX_TELEA_INPAINT=1 TEX_TELEA_RADIUS=4 TEX_INPAINT_ITERS=10 \
+      ./tex_reproject 4096 native_pyref_4096.glb
+    # PURE C++/CUDA bake: native cumesh simplify + compute_charts (native_cumesh_bridge links the
+    # cumesh_native lib), native xatlas pack, native volume grid_sample, native TELEA inpaint + GLB.
+    # Result: 182,222 charts vs Python B's 182,025 islands; visually at parity (face+body+tight zoom).
+
+The TWO flags that close the gap (everything else codex tried was noise):
+- **ATL_PYREF_XATLAS=1** — use Python's EXACT xatlas opts: pack padding=0 / blockAlign=false /
+  resolution=auto, chart maxCost=2.0 / normalDeviationWeight=2.0 / normalSeamWeight=4.0 /
+  straightnessWeight=6.0 / roundnessWeight=0.01 / textureSeamWeight=0.5 / maxIterations=1 (verified
+  these ARE cumesh.xatlas.Atlas's defaults). Native's default path forced resolution=texsize +
+  padding=4 + blockAlign=true → giant atlas / multi-atlas / resize smear.
+- **RP_OFF=1** — drop the snap-to-dense reproject entirely; grid_sample the PBR volume directly at the
+  rasterised position, exactly like Python (bake_uv.py line 63). The reproject WAS the artifact source.
+
+Why codex failed: it kept the snap-to-dense reproject AND the wrong (forced-resolution, padding=4)
+xatlas opts, then tuned RP_FRONTDOT/RP_MAXDIST/fill-bg/blur on top — all downstream of the real bug.
+
+The cumesh dep is C++/CUDA (thirdparty/cumesh_native, linked into the binary), NOT Python. So this is a
+genuine native port. bake_uv.py (Python) remains as the oracle/reference only.
+
+--- original session notes below (the Python-bake detour); kept for history ---
+
 User confirmed in model-viewer: the cumesh GPU bake matches the reference (B) bang-on. The native
 snap-to-dense detour is abandoned.
 
