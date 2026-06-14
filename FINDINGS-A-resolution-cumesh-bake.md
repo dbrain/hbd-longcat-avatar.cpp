@@ -56,12 +56,27 @@ plain TELEA ssaa2 stayed cleanest and matched B. Root causes:
 - nearest-valid gutter makes HARD Voronoi edges; TELEA's smooth diffusion reads better under mip/bilinear.
 The flags remain in bake_uv.py but default OFF and are NOT recommended (recorded dead-end, not a lever).
 
-## The real remaining lever is GEOMETRY smoothness, not texture
+## IMMACULATE recipe (push past "ok" — confirmed best in offline zoom)
 
-User observation: the residual "lack of smoothness" propagates from the MESH into the texture. The teal
-seam slivers / hairline cracks are mostly the cumesh-simplified surface (skinny tris at tie/mouth/hair),
-not a bake bug. No texture trick closes this — needs smoother remeshing/simplification upstream, or just
-more texel density (4096) so the seam ring is sub-pixel. Parked unless revisited.
+    $PY bake_uv.py --dump . --mesh dense --decimate 500000 --texsize 8192 --inpaint 6 --ssaa 1 \
+        --bilateral 7,30,7 --out imm_500k_8192.glb     # ~3 min, 144 MB, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+Two levers, both real wins (verified by tight UNLIT face crops vs B and vs the 4096 keeper):
+- **8192 texel density** — the residual hairline noise is SEAMS between the many thin hair charts.
+  At 8192 the seam ring is sub-pixel, so the teal hair reads smooth. (4096 already good; 8192 better.)
+- **`--bilateral d,sigmaColor,sigmaSpace`** — edge-preserving smoothing on baseColor at supersample
+  res. Evens the per-texel volume-sample speckle on flat skin/cloth WITHOUT blurring crisp boundaries
+  (eyes, hair/skin edge) — the colour-similarity guard also stops it pulling teal-hair gutter into skin.
+  7,30,7 is gentle; 11,45,11 stronger. This is the legit lever (unlike normal_offset/dilate).
+
+Shippable tiers (Game-asset tab): 100k/512 (9.4 MB), 200k/1024 (18 MB), 500k/4096+bilat (65 MB),
+500k/8192+bilat (144 MB ceiling). All ssaa2 (8192 uses ssaa1 for VRAM) + bilateral.
+
+### What did NOT help
+- **Denser mesh (full 3.12M `--mesh dense`)** — texture STARVES at 2048 (3M tris can't fit) → severe
+  white/teal speckle, far worse. More geometry needs proportional texel budget, which hits the 12 GB
+  wall. The 500k simplification face is already smooth; the win is texture res + bilateral, not polys.
+- bake_uv now chunks the grid_sample (CH=6e6) + frees CuMesh VRAM (`del cm`) so 8192^2 fits in 12 GB.
 
 ## Open (not started)
 
