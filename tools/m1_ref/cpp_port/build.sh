@@ -82,6 +82,23 @@ if [ "$BASE" = "ktx2_test" ]; then
   exit 0
 fi
 
+# retopo_bake: bake the cached PBR volume onto a QuadriFlow retopo mesh + meshopt/KTX2 pack. CPU only
+# (no cumesh/cuda: precluster=false → real xatlas). Links basisu + meshopt codec; toolchain g++ (ABI).
+if [ "$BASE" = "retopo_bake" ]; then
+  TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+  BU="$HERE/../../../thirdparty/basis_universal"
+  TP="$HERE/../../../thirdparty"
+  "$HERE/build_basisu.sh"
+  PACK_DEFS="-DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
+  echo ">> build retopo_bake (tex_atlas bake + meshopt + KTX2, CPU)"
+  "$TOOL/bin/g++" $COMMON -fopenmp $PACK_DEFS -I"$BU" "$HERE/$SRC" \
+    "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" "$TP/meshoptimizer/vertexcodec.cpp" \
+    "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" "$BU/build/libbasisu_enc.a" \
+    -o "$HERE/$BIN" -lm -lpthread
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # glb_pack_test: validate the in-process compressed-GLB writer (glb_packed.hpp = meshopt + KTX2).
 # Links libbasisu_enc.a + the meshopt codec TUs (encode/decode vertex+index). Toolchain g++.
 if [ "$BASE" = "glb_pack_test" ]; then
