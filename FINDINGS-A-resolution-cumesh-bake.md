@@ -3,14 +3,25 @@
 ## ⇒ NATIVE C++ HITS PARITY WITH PYTHON (the actual goal). Winning recipe:
 
     cd tools/m1_ref/cpp_port && ./build.sh tex_reproject cuda     # builds fine on this host (C++/CUDA)
-    ATL_NATIVE_CUMESH=1 CUMESH_TARGET=500000 ATL_PYREF_XATLAS=1 RP_OFF=1 \
-      TEX_TELEA_INPAINT=1 TEX_TELEA_RADIUS=4 TEX_INPAINT_ITERS=10 \
-      ./tex_reproject 4096 native_pyref_4096.glb
-    # PURE C++/CUDA bake: native cumesh simplify + compute_charts (native_cumesh_bridge links the
-    # cumesh_native lib), native xatlas pack, native volume grid_sample, native TELEA inpaint + GLB.
-    # Result: 182,222 charts vs Python B's 182,025 islands; visually at parity (face+body+tight zoom).
+    ATL_NATIVE_CUMESH=1 CUMESH_TARGET=500000 ATL_PYREF_XATLAS=1 RP_OFF=1 TEX_FBR=0 TEX_RASTER_SS=2 \
+      TEX_TELEA_INPAINT=1 TEX_TELEA_RADIUS=4 TEX_INPAINT_ITERS=16 \
+      TEX_TOPO_NORMALS=1 TEX_KEEP_ATLAS_SIZE=1 TEX_FILL_BACKGROUND=1 \
+      ./tex_reproject 4096 native_v6.glb
+    # PURE C++/CUDA bake (native_cumesh_bridge links cumesh_native): simplify + compute_charts +
+    # xatlas pack + trilinear volume grid_sample + TELEA inpaint + GLB. 182k charts == Python B.
 
-The TWO flags that close the gap (everything else codex tried was noise):
+The full set of fixes that close the gap (each diagnosed + measured, vs codex's blind knob-tuning):
+- ATL_PYREF_XATLAS=1 + RP_OFF=1 — see below (Python xatlas opts + direct volume sample, drop reproject).
+- TEX_TOPO_NORMALS=1 — output-topology vertex normals; median 0.44deg vs Python 0.45 (was welded=16deg
+  -> "random triangles" under lighting).
+- TEX_FBR=0 — disable the nearest-voxel fallback; off-shell texels -> 0 -> caught as holes -> inpainted
+  from skin neighbours (the fallback was grabbing dark voxels = "dark specks"). Python has no fallback.
+- TEX_RASTER_SS=2 — 2x supersampled rasterisation = AA chart edges, matches Python's --ssaa 2 (was the
+  remaining skin speckle / thick mouth cracks).
+- TEX_KEEP_ATLAS_SIZE=1 — bake at the atlas-native res, no in-loop resize (the resize misaligned
+  texels vs UVs = loud cracks). TEX_FILL_BACKGROUND=1 — mip-safe nearest-valid gutter beyond the telea rings.
+
+The TWO flags that first closed the bulk of the gap:
 - **ATL_PYREF_XATLAS=1** — use Python's EXACT xatlas opts: pack padding=0 / blockAlign=false /
   resolution=auto, chart maxCost=2.0 / normalDeviationWeight=2.0 / normalSeamWeight=4.0 /
   straightnessWeight=6.0 / roundnessWeight=0.01 / textureSeamWeight=0.5 / maxIterations=1 (verified
