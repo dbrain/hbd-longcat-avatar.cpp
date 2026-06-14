@@ -21,6 +21,29 @@ The full set of fixes that close the gap (each diagnosed + measured, vs codex's 
 - TEX_KEEP_ATLAS_SIZE=1 — bake at the atlas-native res, no in-loop resize (the resize misaligned
   texels vs UVs = loud cracks). TEX_FILL_BACKGROUND=1 — mip-safe nearest-valid gutter beyond the telea rings.
 
+### Off-shell holes (~0.5%) — DEAD lever, do not chase
+v6 leaves ~0.46% "interior holes" (covered texels whose position misses the sparse PBR shell on
+trilinear -> inpainted). Tested CUMESH_TARGET=800000 (denser mesh): holes 0.45% (unchanged), +22 MB,
+zero visual gain. native simplify_to_faces is algorithmically identical to Python cm.simplify (same
+simplify_step, same 1e-8/1e-2/1e-3, threshold-doubling; one trivial extra safety line). So the holes
+are inherent to sampling a sparse-shell volume with a simplified flat-triangle mesh, NOT a fixable
+mismatch. v6 ≈ C ("very slightly worse, close enough"). Native is DONE at v6.
+
+### Native game LODs (pure C++, no crack mess)
+Decimate the mesh to the texel budget + bake at the big atlas + area-downsample the finished texture
+(TEX_FINAL_SIZE) — the big downsample is strong AA, like Python ssaa. Same v6 flags minus
+TEX_KEEP_ATLAS_SIZE (we WANT the downsample here), plus TEX_FINAL_SIZE and a smaller CUMESH_TARGET:
+
+    # 1024 LOD, 70k tris -> 9.5 MB
+    ATL_NATIVE_CUMESH=1 CUMESH_TARGET=70000 ATL_PYREF_XATLAS=1 RP_OFF=1 TEX_FBR=0 TEX_RASTER_SS=2 \
+      TEX_TELEA_INPAINT=1 TEX_TELEA_RADIUS=4 TEX_INPAINT_ITERS=16 TEX_TOPO_NORMALS=1 \
+      TEX_FILL_BACKGROUND=1 TEX_FINAL_SIZE=1024 ./tex_reproject 4096 native_lod_1024.glb
+    # 512 LOD: CUMESH_TARGET=25000 TEX_FINAL_SIZE=512  -> 3.1 MB
+
+### TODO when revisited
+- Bake the v6 flag-set in as binary DEFAULTS so the command is just `./tex_reproject 4096 out.glb`.
+- KTX2 + KHR_mesh_quantization export -> ~3-5x smaller GLBs (file size only, not quality).
+
 The TWO flags that first closed the bulk of the gap:
 - **ATL_PYREF_XATLAS=1** — use Python's EXACT xatlas opts: pack padding=0 / blockAlign=false /
   resolution=auto, chart maxCost=2.0 / normalDeviationWeight=2.0 / normalSeamWeight=4.0 /
