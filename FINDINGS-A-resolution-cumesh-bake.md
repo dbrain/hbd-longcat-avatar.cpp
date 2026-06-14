@@ -41,8 +41,29 @@ B = `--mesh dense --decimate 500000 --texsize 2048` (490 358 tris vs B's 489 823
 - The native C++ unwrap cannot beat cumesh without a real conformal GPU unwrap in C++ (the thing
   cumesh wraps), which is out of scope. Keep the Python cumesh bake as the production bake step.
 
-## Open stretch goals (next)
+## Production recipe (the keeper, confirmed by user)
 
-- micro seam cracks on zoom (teal slivers on the black skirt, hairline face cracks) — seam/mip +
-  thin-shell interior-sampling artifacts, present in B too. See bake_uv.py normal-offset + dilation.
-- downscale to 1024/512 + quantized GLB for a game-usable asset.
+    $PY bake_uv.py --dump . --mesh dense --decimate <N> --texsize <T> --inpaint <r> --ssaa 2 --out <glb>
+    # 500k/2048 matches B; 4096 is sharper (seams sub-pixel); 200k/1024 + 100k/512 downscale clean.
+    # TELEA gutter + ssaa2, NO --normal_offset, NO --dilate.
+
+## DEAD — seam "fix" flags made it WORSE (do not reuse)
+
+`--normal_offset` and `--dilate` (nearest-valid/Voronoi gutter) were added to chase the teal-on-skirt
+seam slivers. User verdict in model-viewer: cracked the tie + other thin parts and looked cludgy;
+plain TELEA ssaa2 stayed cleanest and matched B. Root causes:
+- normal_offset pushes thin-part (tie) sample points PAST the shell into empty voxels -> teal cracks.
+- nearest-valid gutter makes HARD Voronoi edges; TELEA's smooth diffusion reads better under mip/bilinear.
+The flags remain in bake_uv.py but default OFF and are NOT recommended (recorded dead-end, not a lever).
+
+## The real remaining lever is GEOMETRY smoothness, not texture
+
+User observation: the residual "lack of smoothness" propagates from the MESH into the texture. The teal
+seam slivers / hairline cracks are mostly the cumesh-simplified surface (skinny tris at tie/mouth/hair),
+not a bake bug. No texture trick closes this — needs smoother remeshing/simplification upstream, or just
+more texel density (4096) so the seam ring is sub-pixel. Parked unless revisited.
+
+## Open (not started)
+
+- quantized/KTX2 GLB export (KHR_mesh_quantization + KTX2/Basis) — ~3-5x smaller for game use. trimesh
+  writes float32 geo + PNG tex today, so the GLB sizes are pre-compression.
