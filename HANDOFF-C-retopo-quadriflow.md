@@ -108,10 +108,25 @@ CLI shape: `quadriflow -i in.obj -o out.obj -f <target_quad_faces> [-mcf] [-shar
   `-f 25000` on it → **23,845 quads (100%) in ~21s** → xatlas → **483 CHARTS** (vs the soup's ~182,000;
   ~375× collapse; ~50 quads/chart = ample 2048 gutter budget). Pipeline: occupancy → coarse manifold MC
   → QuadriFlow → 483 charts. Tools: `coarse_obj.cpp` (occupancy→manifold OBJ), QF, `retopo_probe`.
-- **R2 (CPU too — the bake is host xatlas+raster+grid_sample+inpaint):** `retopo_bake.cpp` bakes the
-  cached PBR volume (`dump_pbr_*.bin`) onto the QF mesh's UVs at 2048 + `glb_packed` → compressed GLB.
-  No GPU (precluster=false → real xatlas, not cumesh; geometry from cached occupancy). Owner eyeball =
-  the only remaining gate (compare.html).
+- **R2 DONE + VISUALLY VERIFIED 2026-06-15 — clean Miku at 2048, CPU.** `retopo_bake.cpp` bakes cached
+  `dump_pbr_*.bin` onto the QF mesh UVs (real xatlas, v6 flags) + `glb_packed` → `native_retopo2048.glb`
+  6 MB, 0 validator errors. Render-verified (geometry + textured) — recognizable Miku, no blob, no specks.
+  **TWO FIXES from the first (blob) attempt:**
+  1. **STRIDE, not 6.** `coarse_obj` stride 6 (grid 170) was a BLOB (verified by render — melted candle,
+     no face/detail). **Stride 3 (grid 341, blur 1, smooth 2) = 502k v / 1M f manifold = proper Miku**
+     (twintails/skirt/legs/boots). QF `-f 50000` on it → 38k quads, preserves the shape. (stride 2 =
+     1.2M f, marginally more detail; stride 3 is the detail/QF-tractability sweet spot.)
+  2. **REPROJECT ON.** The coarse retopo surface sits OFF the thin PBR shell → direct grid_sample misses
+     → black/teal specks (verified by render). Fix: load `dump_dense_*` + colour the dense shell +
+     `bake(..., reproject=true)` (lap-18 snap-to-dense). FINDINGS-A said reproject was "dead" — that was
+     for the ALIGNED cumesh mesh; for an OFFSET retopo mesh it's REQUIRED. Specks gone.
+  - **LESSON (cost a wasted "de-risk closed"): chart-count ≠ visual quality. RENDER every geo/bake step**
+    (`render_mesh.py` geo, `_mv_render.py` textured via the `RETOPO_INSP=1` uncompressed sidecar — trimesh
+    can't read KTX2/meshopt). The 483-chart stride-6 result was a blob; only the render caught it.
+  - Recipe: `coarse_obj 3 1 2 c3.obj` → `quadriflow -i c3.obj -o c3q.obj -f 50000` →
+    `RETOPO_INSP=1 retopo_bake c3q.obj native_retopo2048.glb 2048`. ~2174 charts, atlas 2247×2224.
+  - Owner eyeball = compare.html packed tab B (still the only sign-off). Minor: 38k-quad silhouette is
+    slightly softer than the 4096 hero; bump QF `-f` for crisper if wanted.
 
 ### Ladder
 - **R0 — vendor + build QuadriFlow headless.** Clone hjwdzh/QuadriFlow into `thirdparty/` (gitignore +
