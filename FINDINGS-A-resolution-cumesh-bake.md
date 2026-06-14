@@ -69,8 +69,28 @@ Two levers, both real wins (verified by tight UNLIT face crops vs B and vs the 4
   (eyes, hair/skin edge) — the colour-similarity guard also stops it pulling teal-hair gutter into skin.
   7,30,7 is gentle; 11,45,11 stronger. This is the legit lever (unlike normal_offset/dilate).
 
-Shippable tiers (Game-asset tab): 100k/512 (9.4 MB), 200k/1024 (18 MB), 500k/4096+bilat (65 MB),
-500k/8192+bilat (144 MB ceiling). All ssaa2 (8192 uses ssaa1 for VRAM) + bilateral.
+### Game LODs — bake the texture HIGH, downsample it, MATCH the mesh to the texel budget
+
+A natively-baked small texture (e.g. --texsize 512 directly) CRACKS: at 100k tris / 512^2 each UV
+chart is smaller than its gutter, so seams dominate ("cracked mess"). The fix is the game-pipeline
+standard, NOT KTX2 (KTX2 only shrinks file size, it does not touch cracking):
+- bake the texture content at 4096 internal then area-downsample to the target (proper AA) via --ssaa,
+- AND decimate the mesh to fit the texel budget (fewer, bigger charts).
+
+    # 512 LOD: 4096 internal (ssaa 8) -> 512, mesh 25k tris      = 3.1 MB, clean
+    $PY bake_uv.py --dump . --mesh dense --decimate 25000 --texsize 512  --ssaa 8 --inpaint 4 --bilateral 5,25,5 --out lod512.glb
+    # 1024 LOD: 4096 internal (ssaa 4) -> 1024, mesh 68k tris    = 8.9 MB, ~= 4096 (slightly softer)
+    $PY bake_uv.py --dump . --mesh dense --decimate 70000 --texsize 1024 --ssaa 4 --inpaint 5 --bilateral 7,30,7 --out lod1024.glb
+
+Tiers: 25k/512 (3.1 MB) · 68k/1024 (8.9 MB) · 500k/4096+bilat (65 MB) · 500k/8192+bilat (144 MB ceiling).
+
+## NOT native C++ — the bake is Python GPU on the C++ dump
+
+The model/geometry/dense-shell/PBR-volume come from the native C++ Pixal3D chain (PIXAL3D_DUMP_BAKE).
+The UV unwrap (cumesh GPU xatlas) + texture bake (nvdiffrast raster + cv2/scipy) is PYTHON. This is by
+design (see top of this doc + bake_uv.py header): native C++ xatlas unwrap folds/seams and is too slow;
+cumesh is the production unwrap. A pure-native bake is the abandoned path. Making it 100% native C++
+would require a conformal GPU unwrap in C++ — large, and not worth it while cumesh works.
 
 ### What did NOT help
 - **Denser mesh (full 3.12M `--mesh dense`)** — texture STARVES at 2048 (3M tris can't fit) → severe
