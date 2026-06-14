@@ -102,7 +102,16 @@ CLI shape: `quadriflow -i in.obj -o out.obj -f <target_quad_faces> [-mcf] [-shar
     coarser-grid MT / dual-contour path (FINDINGS-15 scoped) for a small manifold mesh.
   - Tools added: `retopo_probe.cpp` (xatlas chart count), `ply_decimate_obj.cpp` (binary-PLY → meshopt
     simplify → OBJ). Big scratch in /tmp (miku_manifold.obj ~570MB, miku_quad.obj) — clean up.
-- **R2 NEXT (GPU):** bake at 2048 on the QF'd mesh, confirm teal seams gone.
+- **DE-RISK CLOSED 2026-06-15 (CPU, NO GPU): the chain works.** `coarse_obj.cpp` = `marching_cubes_solid`
+  (stride 6, blur 2, taubin 6) on the cached occupancy → **94k v / 188k f CLEAN MANIFOLD** (boundary=0
+  nonmanifold=0) — the small manifold mesh QF needs (sidesteps the 8M tet + the decimation wall). QF
+  `-f 25000` on it → **23,845 quads (100%) in ~21s** → xatlas → **483 CHARTS** (vs the soup's ~182,000;
+  ~375× collapse; ~50 quads/chart = ample 2048 gutter budget). Pipeline: occupancy → coarse manifold MC
+  → QuadriFlow → 483 charts. Tools: `coarse_obj.cpp` (occupancy→manifold OBJ), QF, `retopo_probe`.
+- **R2 (CPU too — the bake is host xatlas+raster+grid_sample+inpaint):** `retopo_bake.cpp` bakes the
+  cached PBR volume (`dump_pbr_*.bin`) onto the QF mesh's UVs at 2048 + `glb_packed` → compressed GLB.
+  No GPU (precluster=false → real xatlas, not cumesh; geometry from cached occupancy). Owner eyeball =
+  the only remaining gate (compare.html).
 
 ### Ladder
 - **R0 — vendor + build QuadriFlow headless.** Clone hjwdzh/QuadriFlow into `thirdparty/` (gitignore +
