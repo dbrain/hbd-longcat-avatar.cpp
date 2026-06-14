@@ -28,3 +28,6 @@ profiles/
 bench/results/*.nsys-rep
 bench/results/*.sqlite
 bench/results/*.ncu-rep
+
+# vendored on demand by tools/m1_ref/cpp_port/build_basisu.sh (pinned BASISU_REF)
+thirdparty/basis_universal/
