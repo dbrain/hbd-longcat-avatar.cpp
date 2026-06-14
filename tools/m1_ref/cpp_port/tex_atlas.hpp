@@ -167,6 +167,28 @@ static inline void inpaint(std::vector<float>& img, std::vector<uint8_t>& mask, 
     }
 }
 
+static inline void dilate_background(std::vector<float>& img, std::vector<uint8_t>& mask, int W, int H, int C) {
+    if (W <= 0 || H <= 0 || C <= 0) return;
+    std::queue<int> q;
+    for (int p=0; p<W*H; p++) if (mask[(size_t)p]) q.push(p);
+    while (!q.empty()) {
+        int p=q.front(); q.pop();
+        int x=p%W, y=p/W;
+        const float* src=&img[(size_t)p*C];
+        for (int dy=-1; dy<=1; dy++) for (int dx=-1; dx<=1; dx++) {
+            if (!dx && !dy) continue;
+            int nx=x+dx, ny=y+dy;
+            if (nx<0 || ny<0 || nx>=W || ny>=H) continue;
+            int n=ny*W+nx;
+            if (mask[(size_t)n]) continue;
+            float* dst=&img[(size_t)n*C];
+            for (int c=0; c<C; c++) dst[c]=src[c];
+            mask[(size_t)n]=1;
+            q.push(n);
+        }
+    }
+}
+
 // Small native approximation of OpenCV's Telea inpaint: advance invalid pixels from the
 // valid boundary by distance and estimate each new texel from an already-known radius
 // neighbourhood. This is intentionally bounded by fill_rings for atlas gutters; it avoids
@@ -712,9 +734,29 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     xatlas::PackOptions po;
     po.resolution=(uint32_t)texture_size; po.padding=(uint32_t)padding;
     po.bilinear=true; po.bruteForce=false; po.blockAlign=true; po.createImage=false;
+    if (std::getenv("ATL_NO_BLOCK_ALIGN")) po.blockAlign=false;
+    if (std::getenv("ATL_NO_BILINEAR")) po.bilinear=false;
     if (std::getenv("ATL_PYREF_XATLAS")) {
         po.padding=0; po.blockAlign=false;
     }
+    auto pack_charts = [&]() {
+        xatlas::PackCharts(atlas, po);
+        if (!std::getenv("ATL_FIT_RES") || texture_size <= 0) return;
+        for (int it=0; it<6; it++) {
+            if (atlas->atlasCount <= 1 && atlas->width <= (uint32_t)texture_size && atlas->height <= (uint32_t)texture_size)
+                break;
+            float sx = (float)texture_size / std::max(1u, atlas->width);
+            float sy = (float)texture_size / std::max(1u, atlas->height);
+            float scale = std::min(sx, sy) * 0.97f;
+            if (atlas->atlasCount > 1)
+                scale *= 0.45f / std::sqrt((float)atlas->atlasCount);
+            scale = std::max(0.05f, std::min(0.98f, scale));
+            po.texelsPerUnit = std::max(1e-6f, atlas->texelsPerUnit * scale);
+            if (verbose) printf("[atlas] repack fit-res: pass %d scale=%.3f texelsPerUnit=%.3f from %ux%u atlases=%u\n",
+                                it+1, scale, po.texelsPerUnit, atlas->width, atlas->height, atlas->atlasCount);
+            xatlas::PackCharts(atlas, po);
+        }
+    };
     if (precluster && !std::getenv("ATL_PLANAR")) {
         double tp=_now();
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (std::getenv("ATL_PYREF_XATLAS") ? 90.f : cone_deg);
@@ -792,7 +834,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
             xatlas::ComputeCharts(atlas, co);
         }
-        xatlas::PackCharts(atlas, po);
+        pack_charts();
     } else if (precluster) {
         // Legacy diagnostic path: build our own charts (normal-cone region-grow), hand xatlas pre-made
         // planar UV islands. Fast, but folds on curved sheets; keep only for A/B with ATL_PLANAR=1.
@@ -808,7 +850,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         xatlas::AddMeshError e = xatlas::AddUvMesh(atlas, um);
         if (e != xatlas::AddMeshError::Success) fprintf(stderr,"[atlas] AddUvMesh error: %s\n", xatlas::StringForEnum(e));
         xatlas::ComputeCharts(atlas);   // for UV meshes: just groups existing islands (fast)
-        xatlas::PackCharts(atlas, po);
+        pack_charts();
         xref_maps.push_back(uv2orig);
     } else {
         xatlas::MeshDecl md;
@@ -824,7 +866,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
         if (verbose){ printf("[atlas] unwrapping %d verts / %d faces ...\n", Vin, Fin); fflush(stdout); }
         xatlas::ComputeCharts(atlas, co);
-        xatlas::PackCharts(atlas, po);
+        pack_charts();
         xref_maps.emplace_back(Vin); for (int i=0;i<Vin;i++) xref_maps.back()[i]=i;
     }
     int W=(int)atlas->width, Ht=(int)atlas->height;
@@ -979,6 +1021,10 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         inpaint_telea(atl, mask2, W, Ht, C, rings, tr);
     } else {
         inpaint(atl, mask2, W, Ht, C, precluster ? inp_iters : std::max(padding+2, inp_iters));
+    }
+    if (std::getenv("TEX_FILL_BACKGROUND")) {
+        if (verbose) printf("[atlas] filling remaining atlas background by nearest valid dilation\n");
+        dilate_background(atl, mask2, W, Ht, C);
     }
 
     // ---- pack to uint8 textures (Python layout) ----
