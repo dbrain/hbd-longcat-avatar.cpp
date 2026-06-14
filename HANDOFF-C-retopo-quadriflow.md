@@ -61,6 +61,50 @@ CLI shape: `quadriflow -i in.obj -o out.obj -f <target_quad_faces> [-mcf] [-shar
 
 ## Implementation ladder (R0–R6)
 
+### Progress log
+- **R0 DONE (2026-06-14).** QuadriFlow vendored + builds headless here. `tools/m1_ref/cpp_port/
+  build_quadriflow.sh` (bootstrap-on-demand, gitignored, pinned `QF_REF=810b7a0`): pixi installs eigen +
+  libboost-devel into a `retopo-deps` global env (no root), cmake 4.x needs `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`
+  for QF's old `VERSION 3.1`, Boost is header-only (not linked). Built with `BUILD_OPENMP=ON`, Boost
+  Boykov maxflow (default; all deps commercial-clean: QF MIT / Boost+lemon BSL-1.0 / Eigen MPL2). Smoke
+  test: Gargoyle 1.77MB OBJ → `-f 5000` → 4549 faces **100% quads** in ~2s. Binary:
+  `thirdparty/QuadriFlow/build/quadriflow`. Standalone CLI (OBJ in/out) so compiler/ABI is independent of
+  pixal3d — no toolchain pin needed.
+
+- **DE-RISK (2026-06-14, CPU): downstream hypothesis VALIDATED.** `retopo_probe.cpp` (xatlas `Generate`
+  → chart count, pyref opts) on the Gargoyle: raw 50k-tri input = **378 charts**; QuadriFlow `-f 5000`
+  quad-retopo (4549 quads) = **100 charts**, util 65%. So a QuadriFlow'd mesh unwraps into ~100 charts —
+  the few-big-charts result we need (vs Miku's 182k). **CAVEAT CONFIRMED EMPIRICALLY**: QuadriFlow STALLS
+  (>400s, both `-mcf` and default maxflow) on the **non-manifold** Miku QEM/dense soup (the F≈4V mesh).
+  So QF input MUST be manifold → the marching-tet `--remesh` mesh (GPU) or a CPU manifold-cleanup. The
+  Miku-specific 182k→~100 proof is therefore GPU-gated (needs `--remesh` to produce QF's input). Tools
+  left: `retopo_probe` (chart counter), `/tmp/qem_in.obj` (the QEM mesh as OBJ).
+- **R1 INPUT-PREP is the real crux (CPU, 2026-06-14).** Closing the Miku de-risk needs a MANIFOLD mesh
+  for QF. Findings:
+  - The cached manifold marching-tet mesh `miku_remesh_smooth.ply` exists (8.1M v / 16.3M f, clean
+    manifold) — produced CPU by `remesh_test` (no GPU). But it's HUGE.
+  - **meshopt quality-decimate STALLS at ~13.8M tris on the MT voxel lattice** (FINDINGS-15 wall, now
+    re-confirmed from the decimate side: `err=0.0016` ≪ target yet it refuses to collapse further while
+    preserving manifold; `meshopt_SimplifyLockBorder`). Sloppy would go lower but breaks manifold → QF
+    stalls (as the QEM soup did). So there's NO existing path to a *small* manifold mesh.
+  - **RESULT: QF needs manifold AND tractable (~100–500k v).** Two hard limits found: the soup (200k
+    NON-manifold) STALLS QF (>400s — content); the manifold MT mesh at 6.9M v is TOO SLOW (>540s timeout
+    — size; QF's hierarchy doesn't scale to multi-M). QF IS the decimator but can't ingest a multi-M
+    input in reasonable time, and neither existing path gives a *small manifold* mesh.
+  - **THE R1 BLOCKER, precisely**: no current path to a small (~100–500k) manifold Miku mesh. meshopt
+    can't decimate the MT lattice (stalls 13.8M, manifold-locked); sloppy → non-manifold → QF stalls.
+    NEXT (small code change): **coarser-grid marching-tet** — downsample `head_coords` (÷2/÷4, dedupe
+    voxel indices) → `svae::marching_tetrahedra` at grid 512/256 → a small manifold mesh directly → QF →
+    `retopo_probe` → R2 bake. OR a **dual-contour** remesh (FINDINGS-15 scoped) for a small manifold mesh.
+    (GPU `pixal3d --remesh` won't help directly — its in-chain QEM makes the output non-manifold again.)
+  - NOTE: production `pixal3d --remesh` QEM-decimates in-chain → NON-manifold (≈50k nonmanifold edges) →
+    would ALSO stall QF. So R1 must feed QF the RAW marching-tet manifold mesh (pre-QEM), or add a
+    coarser-grid MT / dual-contour path (FINDINGS-15 scoped) for a small manifold mesh.
+  - Tools added: `retopo_probe.cpp` (xatlas chart count), `ply_decimate_obj.cpp` (binary-PLY → meshopt
+    simplify → OBJ). Big scratch in /tmp (miku_manifold.obj ~570MB, miku_quad.obj) — clean up.
+- **R2 NEXT (GPU):** bake at 2048 on the QF'd mesh, confirm teal seams gone.
+
+### Ladder
 - **R0 — vendor + build QuadriFlow headless.** Clone hjwdzh/QuadriFlow into `thirdparty/` (gitignore +
   bootstrap-on-demand like `build_basisu.sh`, pinned ref). Build the lib/CLI with the toolchain g++
   (C++ builds fine on this host). Try `BUILD_FREE_LICENSE=ON` first to avoid Boost. Smoke-test: feed a

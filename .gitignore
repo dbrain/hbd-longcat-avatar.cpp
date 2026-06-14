@@ -31,3 +31,6 @@ bench/results/*.ncu-rep
 
 # vendored on demand by tools/m1_ref/cpp_port/build_basisu.sh (pinned BASISU_REF)
 thirdparty/basis_universal/
+
+# vendored on demand by tools/m1_ref/cpp_port/build_quadriflow.sh (pinned QF_REF)
+thirdparty/QuadriFlow/
