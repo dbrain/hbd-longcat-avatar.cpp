@@ -42,8 +42,14 @@ int main(int argc, char** argv) {
     float err = 0;
     float target_error = argc > 4 ? (float)atof(argv[4]) : 1e-2f;  // raise (e.g. 1.0) to force past the
     // voxel-lattice quality-stall (FINDINGS-15); QF re-meshes anyway so intermediate error is fine.
-    size_t n = meshopt_simplify(out.data(), idx.data(), idx.size(), verts.data(), nv, 12,
-                                target_tris*3, target_error, meshopt_SimplifyLockBorder, &err);
+    bool sloppy = argc > 5 && !strcmp(argv[5], "sloppy");   // ignores topology -> actually decimates the
+    // voxel lattice (quality LockBorder stalls at ~13.8M). Preserves SHAPE/fingers; QF re-meshes anyway.
+    size_t n;
+    if (sloppy) n = meshopt_simplifySloppy(out.data(), idx.data(), idx.size(), verts.data(), nv, 12,
+                                           target_tris*3, target_error, &err);
+    else        n = meshopt_simplify(out.data(), idx.data(), idx.size(), verts.data(), nv, 12,
+                                     target_tris*3, target_error, meshopt_SimplifyLockBorder, &err);
+    printf("[simplify] mode=%s\n", sloppy?"sloppy":"quality");
     out.resize(n);
     printf("[simplify] %zu -> %zu tris (err=%.4f)\n", idx.size()/3, n/3, err);
 
