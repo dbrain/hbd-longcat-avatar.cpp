@@ -6,6 +6,7 @@
 //   run:   ./retopo_bake <quad.obj> <out.glb> [texsize=2048] [small]
 #include "tex_atlas.hpp"
 #include "tex_grid_sample.hpp"   // VolIndex + sample_one (colour the dense shell for reproject)
+#include "normal_bake.hpp"       // tangent-space normal map from the dense high-poly (the detail lift)
 #include "glb_packed.hpp"
 #include "glb_textured.hpp"   // uncompressed PNG-textured GLB sidecar (trimesh-renderable for inspection)
 #include <cstdio>
@@ -81,15 +82,31 @@ int main(int argc, char** argv) {
     printf("[retopo_bake] baked %dx%d, %d charts, %zu out-verts (%.1fs)\n",
            bt.tw, bt.th, bt.chart_count, bt.verts.size()/3, texatlas::_now()-t0);
 
+    // --- tangent-space normal map from the dense high-poly (projects the SOTA-gen detail onto the
+    //     riggable low-poly — the "sludge → diamonds" lift). Needs the dense mesh (reproject path). ---
+    std::vector<uint8_t> nmap;
+    if (reproject && !std::getenv("RETOPO_NO_NORMAL")) {
+        double tn=texatlas::_now();
+        nmap = nrmbake::bake_normal_map(bt.verts, bt.normals, bt.uvs, bt.faces, dverts, dfaces, bt.tw, bt.th);
+        printf("[retopo_bake] normal map baked from dense (%.1fs)\n", texatlas::_now()-tn);
+    }
+
     int threads = (int)std::thread::hardware_concurrency();
     bool ok = glb::write_glb_textured_packed(out, bt.verts, bt.normals, bt.uvs, bt.faces,
-                                             bt.base_color, bt.metal_rough, bt.tw, bt.th, uastc, 192, threads);
-    printf("[retopo_bake] %s -> %s (%s)\n", ok?"wrote":"FAILED", out, uastc?"hero/UASTC":"small/ETC1S");
-    // uncompressed PNG-textured sidecar for headless inspection (trimesh can't read KTX2/meshopt)
+                                             bt.base_color, bt.metal_rough, bt.tw, bt.th, uastc, 192, threads,
+                                             nmap.empty()?nullptr:&nmap);
+    printf("[retopo_bake] %s -> %s (%s%s)\n", ok?"wrote":"FAILED", out, uastc?"hero/UASTC":"small/ETC1S",
+           nmap.empty()?"":", +normal");
+    // inspection sidecars (trimesh can't read KTX2/meshopt): uncompressed baseColor GLB + the normal PNG
     if (std::getenv("RETOPO_INSP")) {
         std::string insp = std::string(out) + ".insp.glb";
         glb::write_glb_textured(insp.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces, bt.base_color, bt.metal_rough, bt.tw, bt.th);
         printf("[retopo_bake] inspection sidecar -> %s\n", insp.c_str());
+        if (!nmap.empty()) {
+            std::string np = std::string(out) + ".normal.png";
+            auto png = glb::encode_png(nmap.data(), bt.tw, bt.th, 3);
+            FILE* pf=fopen(np.c_str(),"wb"); if(pf){ fwrite(png.data(),1,png.size(),pf); fclose(pf); printf("[retopo_bake] normal PNG -> %s\n", np.c_str()); }
+        }
     }
     return ok?0:1;
 }

@@ -29,7 +29,8 @@ inline bool write_glb_textured_packed(const char* path,
         const std::vector<float>& verts, const std::vector<float>& normals,
         const std::vector<float>& uvs, const std::vector<uint32_t>& faces,
         const std::vector<uint8_t>& base_color, const std::vector<uint8_t>& metal_rough,
-        int tw, int th, bool uastc, int etc1s_quality = 192, int threads = 0) {
+        int tw, int th, bool uastc, int etc1s_quality = 192, int threads = 0,
+        const std::vector<uint8_t>* normal_map = nullptr /* RGB tw*th*3, tangent-space */) {
     using json = nlohmann::json;
     const uint32_t V = (uint32_t)(verts.size() / 3), F3 = (uint32_t)faces.size();
 
@@ -83,6 +84,10 @@ inline bool write_glb_textured_packed(const char* path,
     std::vector<uint8_t> ktx0 = ktx2enc::encode(base_color.data(), tw, th, uastc, etc1s_quality, /*srgb*/true,  /*comps*/4, threads);
     std::vector<uint8_t> ktx1 = ktx2enc::encode(metal_rough.data(), tw, th, uastc, etc1s_quality, /*srgb*/false, /*comps*/3, threads);
     if (ktx0.empty() || ktx1.empty()) { std::fprintf(stderr, "[glb_packed] KTX2 encode failed\n"); return false; }
+    std::vector<uint8_t> ktxn;   // optional tangent-space normal map (linear)
+    if (normal_map && !normal_map->empty())
+        ktxn = ktx2enc::encode(normal_map->data(), tw, th, uastc, etc1s_quality, /*srgb*/false, /*comps*/3, threads);
+    const bool hasN = !ktxn.empty();
 
     // ---- 4. lay out buffer 0 (BIN): [ktx0|ktx1|comp_pos|comp_nrm|comp_uv|comp_idx], 4-aligned ----
     auto pad4 = [](uint32_t n) { return (4 - (n & 3)) & 3; };
@@ -90,6 +95,7 @@ inline bool write_glb_textured_packed(const char* path,
     const uint32_t KTX0_OFF = alloc((uint32_t)ktx0.size()), KTX1_OFF = alloc((uint32_t)ktx1.size());
     const uint32_t CPOS_OFF = alloc((uint32_t)comp_pos.size()), CNRM_OFF = alloc((uint32_t)comp_nrm.size());
     const uint32_t CUV_OFF  = alloc((uint32_t)comp_uv.size()),  CIDX_OFF = alloc((uint32_t)comp_idx.size());
+    const uint32_t KTXN_OFF = hasN ? alloc((uint32_t)ktxn.size()) : 0;   // normal image appended (bufferView 6)
     const uint32_t BIN_LEN = off;
 
     // fallback buffer 1 (not stored): uncompressed strided sizes the loader decodes into
@@ -141,6 +147,13 @@ inline bool write_glb_textured_packed(const char* path,
         {{"bufferView", 4}, {"componentType", 5123}, {"count", V}, {"type", "VEC2"}, {"normalized", true}},
         {{"bufferView", 5}, {"componentType", 5125}, {"count", F3}, {"type", "SCALAR"}}};
 
+    if (hasN) {   // append normal map as bufferView 6 / image 2 / texture 2 → material.normalTexture
+        j["bufferViews"].push_back({{"buffer", 0}, {"byteOffset", KTXN_OFF}, {"byteLength", (uint32_t)ktxn.size()}});
+        j["images"].push_back({{"bufferView", 6}, {"mimeType", "image/ktx2"}});
+        j["textures"].push_back({{"sampler", 0}, {"extensions", {{"KHR_texture_basisu", {{"source", 2}}}}}});
+        j["materials"][0]["normalTexture"] = {{"index", 2}, {"texCoord", 0}};
+    }
+
     std::string js = j.dump();
     uint32_t json_len = (uint32_t)js.size(), json_pad = pad4(json_len), json_chunk = json_len + json_pad;
     uint32_t bin_pad = pad4(BIN_LEN), bin_chunk = BIN_LEN + bin_pad;
@@ -155,6 +168,7 @@ inline bool write_glb_textured_packed(const char* path,
     std::fwrite(js.data(), 1, json_len, f); for (uint32_t i = 0; i < json_pad; i++) std::fputc(' ', f);
     w32(bin_chunk); w32(0x004E4942u);    // "BIN\0"
     wblock(ktx0); wblock(ktx1); wblock(comp_pos); wblock(comp_nrm); wblock(comp_uv); wblock(comp_idx);
+    if (hasN) wblock(ktxn);
     for (uint32_t i = 0; i < bin_pad; i++) std::fputc(0, f);
     std::fclose(f);
     return true;
