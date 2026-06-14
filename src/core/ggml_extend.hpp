@@ -3677,6 +3677,13 @@ protected:
         int64_t compute_ms    = 0;
         int   n_segments      = 0;
         int64_t n_nodes_total = 0;
+        // segloop-level (outside execute_graph) overhead split — subdivides what was
+        // a single opaque "segment_overhead" bucket. commit_ms = the pipelining
+        // handoff (restore_partial_params + commit_prefetched_state's prefetch-H2D
+        // wait + kick_off_prefetch) = the real streaming stall in disguise;
+        // graphprep_ms = reset/bind/cache/build_segment_graph (CPU graph assembly).
+        int64_t commit_ms     = 0;
+        int64_t graphprep_ms  = 0;
     };
     offload_profile_acc offload_profile_;
     void reset_offload_profile() { offload_profile_ = {}; }
@@ -4025,6 +4032,7 @@ protected:
             // prefetched_state_ (event_wait + swap), (c) kick off next segment's
             // prefetch on the copy stream. execute_graph then runs with
             // skip_internal_offload_ so it doesn't redo the H2D.
+            int64_t t_commit_begin = ggml_time_ms();
             if (pipelining_active) {
                 // Restore any prior segment's swap state before swapping in the
                 // current segment's prefetched tensors. First segment has no
@@ -4042,12 +4050,14 @@ protected:
                 }
                 skip_internal_offload_ = true;
             }
+            offload_profile_.commit_ms += ggml_time_ms() - t_commit_begin;
             LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s",
                       get_desc().c_str(),
                       seg_idx + 1,
                       plan.segments.size(),
                       segment.group_name.c_str());
 
+            int64_t t_prep_begin = ggml_time_ms();
             reset_segment_runtime_tensors(segment, gf, &persistent_externals);
             if (!bind_segment_cached_inputs(gf, segment)) {
                 free_cache_ctx_and_buffer();
@@ -4070,6 +4080,7 @@ protected:
 
             ggml_context* segment_graph_ctx = nullptr;
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
+            offload_profile_.graphprep_ms += ggml_time_ms() - t_prep_begin;
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
                                                    true,
@@ -4115,12 +4126,17 @@ protected:
             // Capture any non-execute_graph segment-loop overhead (reset_segment,
             // bind_segment_cached_inputs, build_segment_graph, copy_cache, etc.).
             int64_t segloop_overhead_ms = segloop_total_ms - offload_profile_.total_ms;
-            LOG_INFO("[OFFLOAD_PROFILE] %s segloop wall=%lldms (execute_graph_sum=%lldms + segment_overhead=%lldms across %d segs)",
+            int64_t overhead_other_ms   = segloop_overhead_ms - offload_profile_.commit_ms - offload_profile_.graphprep_ms;
+            LOG_INFO("[OFFLOAD_PROFILE] %s segloop wall=%lldms (execute_graph_sum=%lldms + segment_overhead=%lldms across %d segs"
+                     " [commit/H2D-wait=%lldms graphprep=%lldms other=%lldms])",
                      get_desc().c_str(),
                      (long long)segloop_total_ms,
                      (long long)offload_profile_.total_ms,
                      (long long)segloop_overhead_ms,
-                     offload_profile_.n_segments);
+                     offload_profile_.n_segments,
+                     (long long)offload_profile_.commit_ms,
+                     (long long)offload_profile_.graphprep_ms,
+                     (long long)overhead_other_ms);
             dump_offload_profile(get_desc().c_str());
         }
         return output;

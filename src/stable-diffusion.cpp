@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 
 #include "gguf.h"
@@ -3763,6 +3765,57 @@ static std::vector<float> build_longcat_dmd_sigmas(int distill_steps, int num_tr
     return sigmas;
 }
 
+// Sigma grid for the Wan2.2 lightx2v DMD distill, built from n_high (structure) + n_low (detail) steps
+// around the trained boundary t=500 (boundary_step_index=2 of the trained [1000,750,500,250]). The two
+// MoE experts have distinct jobs, each its own lever:
+//   HIGH steps -> coarse structure/object coherence (the high-noise expert). More high steps fix the
+//     "two-halves car" structure failures (FINDINGS-L8f: seed123/seed7 2 high = split, 4 high = coherent).
+//     n_high evals are spaced evenly in (500,1000]: n_high=2 -> [1000,750]; n_high=4 -> [1000,875,750,625].
+//   LOW steps -> detail/cleanup; more low steps kill the few-step "dotty" grain (FINDINGS-L8d: 2+2 dotty,
+//     2+4 smooth). low evals start [500,250] then HALVE the tail (125,62,..) to refine the final denoise.
+// Trained config = n_high=2,n_low=2 -> exactly [1000,750,500,250]. Shift is the LINEAR warp
+// s=shift*r/(1+(shift-1)r), r=t/T (matches Wan fm_solvers; NOT exp/mu). The caller's --high-noise-steps
+// sets n_high (the MoE high<->low switch index), --steps sets n_low; we do NOT clobber that split.
+static std::vector<float> build_wan_distill_sigmas(int n_high, int n_low, int num_train_timesteps, float shift) {
+    const int boundary_t = num_train_timesteps / 2;  // 500: trained high<->low switch
+    if (n_high < 1) n_high = 2;
+    if (n_low < 1) n_low = 2;
+    std::vector<int> ts;
+    // HIGH region: n_high evals evenly from T down to just above the boundary (structure phase).
+    for (int i = 0; i < n_high; ++i)
+        ts.push_back(num_train_timesteps - (int)std::lround((double)i * (double)boundary_t / (double)n_high));
+    // LOW region: [boundary, boundary/2] then halve the tail (detail/cleanup phase).
+    ts.push_back(boundary_t);
+    int last = boundary_t;
+    for (int i = 1; i < n_low; ++i) { last = last > 1 ? last / 2 : 1; ts.push_back(last); }
+    std::vector<float> sigmas;
+    sigmas.reserve(ts.size() + 1);
+    for (int t : ts) {
+        double r = (double)t / (double)num_train_timesteps;
+        double s = (double)shift * r / (1.0 + ((double)shift - 1.0) * r);
+        sigmas.push_back((float)s);
+    }
+    sigmas.push_back(0.0f);  // terminal
+    return sigmas;
+}
+
+// Flow-shift for the Wan2.2 lightx2v DMD distill. NOTE: deliberately NOT resolution-coupled.
+// A multi-res shift A/B (FINDINGS-L8c: 768x432 / 640x640 / 1280x720 x shift {3,5,7,9,11}, face
+// close-up) showed the shift lever is ~FLAT for 5..11 at EVERY resolution (only shift 3 is
+// clearly worse — dark/murky) and shows NO resolution dependence — confirming the lightx2v
+// finding that "the shift lever is nearly dead at 4-step distill" (res-coupling matters for the
+// FULL-STEP base path, shift 12 native, not the distill). So a single fixed shift ~7 is correct
+// across 432p..720p; 7 is in the sweet spot everywhere and marginally crisper than 5. Overridable
+// via WAN_DISTILL_SHIFT for experimentation. (seq_len arg kept for the log line only.)
+static float wan_distill_shift(int /*spatial_seq_len*/) {
+    const char* s = getenv("WAN_DISTILL_SHIFT");
+    if (s != nullptr && s[0] != '\0') {
+        float v = static_cast<float>(atof(s));
+        if (v > 0.0f) return v;
+    }
+    return 7.0f;
+}
+
 static enum sample_method_t resolve_sample_method(sd_ctx_t* sd_ctx, enum sample_method_t sample_method) {
     if (sample_method == SAMPLE_METHOD_COUNT) {
         return sd_get_default_sample_method(sd_ctx);
@@ -4163,6 +4216,28 @@ struct SamplePlan {
             total_steps   = static_cast<int>(sigmas.size()) - 1;
             sample_steps  = total_steps;
             LOG_INFO("LongCat-Avatar DMD distilled schedule: %d steps", total_steps);
+        }
+
+        // Wan2.2 lightx2v DMD distill (wan22-*-distill GGUFs): SAME bug as LongCat above —
+        // the few-step distill needs its native DMD sigma grid ([1000,750,500,250] @ shift,
+        // = build_longcat_dmd_sigmas), but Wan2.2 falls through to the generic Discrete
+        // scheduler which emits t=[999,666,333,0]+0 = a WASTED step on the WRONG grid ->
+        // under-denoised "murk" (FINDINGS-L8, confirmed by --sigmas A/B). Opt-in via
+        // WAN_DISTILL_SIGMAS=1 (the FULL-STEP VACE-Fun base must NOT use this — no model-side
+        // marker distinguishes them, so it's an explicit env gate). Shift is resolution-coupled
+        // like LTX2. Unlike the avatar branch this MUST NOT clobber sample_steps /
+        // high_noise_sample_steps — Wan2.2 is MoE and that split drives the high<->low expert
+        // switch; we replace ONLY the sigma grid (count stays total_steps).
+        else if (sd_version_is_wan(sd_ctx->sd->version) &&
+                 getenv("WAN_DISTILL_SIGMAS") != nullptr &&
+                 sample_params->custom_sigmas_count <= 0) {
+            int n_high    = high_noise_sample_steps > 0 ? high_noise_sample_steps : 2;
+            int n_low     = sample_steps > 0 ? sample_steps : 2;
+            int seq_len   = sd_ctx->sd->get_image_seq_len(request->height, request->width);
+            float shift   = wan_distill_shift(seq_len);
+            sigmas        = build_wan_distill_sigmas(n_high, n_low, 1000, shift);
+            LOG_INFO("Wan2.2 DMD distilled schedule: %d high + %d low steps, shift=%.2f (seq_len=%d)",
+                     n_high, n_low, shift, seq_len);
         }
 
         eta = resolve_eta(sd_ctx, eta, sample_method);
@@ -6116,7 +6191,64 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         sd::Tensor<float> inactive = control_video * (1.0f - mask) + 0.5f;
         sd::Tensor<float> reactive = control_video * mask + 0.5f;
 
-        inactive = sd_ctx->sd->encode_first_stage(inactive);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
+        // VACE GRAY-LATENT FAST PATH (lever #1 — the ~30s control-context encode).
+        // For a fresh segment with no active control frames, BOTH inactive and reactive
+        // collapse to full(0.5) gray; for a continuation, reactive is still all-gray and
+        // inactive's gray tail dominates. VAE-encoding a constant is deterministic and
+        // input-independent, so we encode the gray volume ONCE per (W,H,T) and reuse it
+        // (in-run dedup of inactive==reactive). An optional cross-run disk cache
+        // (VACE_GRAY_CACHE_DIR) makes the gray encode free on every segment of a chain.
+        // Substituting cache[x]==encode(x) for an all-gray x is bit-exact by construction.
+        // VACE_NO_GRAY_FAST=1 disables (for A/B).
+        const bool vace_gray_fast = !(getenv("VACE_NO_GRAY_FAST") && getenv("VACE_NO_GRAY_FAST")[0] == '1');
+        const char* gray_cache_dir = getenv("VACE_GRAY_CACHE_DIR");
+        static std::map<std::array<int64_t, 3>, sd::Tensor<float>> vace_gray_cache;
+        auto is_const_gray = [](const sd::Tensor<float>& x) {
+            if (x.numel() <= 0) return false;
+            const float* d = x.data();
+            for (int64_t i = 0, n = x.numel(); i < n; ++i) {
+                if (d[i] != 0.5f) return false;
+            }
+            return true;
+        };
+        auto vace_encode_ctx = [&](const sd::Tensor<float>& x, const char* tag) -> sd::Tensor<float> {
+            if (!vace_gray_fast || !is_const_gray(x)) {
+                return sd_ctx->sd->encode_first_stage(x);
+            }
+            std::array<int64_t, 3> key{request->width, request->height, x.shape()[2]};
+            if (auto it = vace_gray_cache.find(key); it != vace_gray_cache.end()) {
+                LOG_INFO("VACE gray-latent cache hit (%s, skipped VAE encode)", tag);
+                return it->second;
+            }
+            std::string gray_path;
+            if (gray_cache_dir && gray_cache_dir[0] != '\0') {
+                gray_path = std::string(gray_cache_dir) + "/vace_gray_" + std::to_string(key[0]) + "x" +
+                            std::to_string(key[1]) + "x" + std::to_string(key[2]) + ".bin";
+                try {
+                    auto cached = sd::load_tensor_from_file_as_tensor<float>(gray_path);
+                    if (!cached.empty()) {
+                        LOG_INFO("VACE gray-latent disk-cache hit (%s, %s, skipped VAE encode)", tag, gray_path.c_str());
+                        vace_gray_cache[key] = cached;
+                        return cached;
+                    }
+                } catch (const std::exception&) { /* miss → compute below */ }
+            }
+            auto enc = sd_ctx->sd->encode_first_stage(x);
+            if (!enc.empty()) {
+                vace_gray_cache[key] = enc;
+                if (!gray_path.empty()) {
+                    try {
+                        sd::save_tensor_to_file(gray_path, enc, "vace_gray");
+                        LOG_INFO("VACE gray-latent computed + disk-cached (%s, %s)", tag, gray_path.c_str());
+                    } catch (const std::exception& e) {
+                        LOG_WARN("VACE gray-latent disk-cache write failed (%s): %s", gray_path.c_str(), e.what());
+                    }
+                }
+            }
+            return enc;
+        };
+
+        inactive = vace_encode_ctx(inactive, "inactive");  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
         if (inactive.empty()) {
             LOG_ERROR("failed to encode VACE inactive context");
             return std::nullopt;
@@ -6163,7 +6295,7 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             }
         }
 
-        reactive = sd_ctx->sd->encode_first_stage(reactive);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
+        reactive = vace_encode_ctx(reactive, "reactive");  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
         if (reactive.empty()) {
             LOG_ERROR("failed to encode VACE reactive context");
             return std::nullopt;
@@ -6855,19 +6987,29 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
     int64_t sampling_start = ggml_time_ms();
     sd::Tensor<float> final_latent;
+    bool final_latent_prestripped = false;
     // LTX latent-reuse harness: skip the (expensive) DiT sampling and load a banked
     // latent so the VAE-tiling quality ladder re-decodes the SAME latent under
     // different tiling. The text encode above still runs (~cheap); only sampling is
     // skipped. Bank one with LTX_SAVE_LATENTS first (see decode_video_outputs).
-    if (const char* load_path = getenv("LTX_LOAD_LATENTS"); load_path != nullptr && load_path[0] != '\0') {
+    // VACE_DECODE_LATENT is the VACE-side alias: it loads a latent banked by
+    // VACE_SAVE_LATENT (which is ALREADY ref-stripped/post-decode shape) so we also
+    // skip the post-sampling strips below — lets the VAE-tiling sweep re-decode the
+    // SAME latent at ~33s/run (encode+T5+decode) instead of ~111s (full DiT).
+    const char* vace_decode_path = getenv("VACE_DECODE_LATENT");
+    const char* ltx_load_path    = getenv("LTX_LOAD_LATENTS");
+    const char* load_path        = (vace_decode_path && vace_decode_path[0]) ? vace_decode_path : ltx_load_path;
+    if (load_path != nullptr && load_path[0] != '\0') {
         try {
             final_latent = sd::load_tensor_from_file_as_tensor<float>(load_path);
-            LOG_INFO("LTX_LOAD_LATENTS: loaded cached latent (%dx%dx%dx%d) from %s, SKIPPING DiT sampling",
+            final_latent_prestripped = (vace_decode_path && vace_decode_path[0]);
+            LOG_INFO("%s: loaded cached latent (%dx%dx%dx%d) from %s, SKIPPING DiT sampling",
+                     final_latent_prestripped ? "VACE_DECODE_LATENT" : "LTX_LOAD_LATENTS",
                      (int)final_latent.shape()[0], (int)final_latent.shape()[1],
                      (int)final_latent.shape()[2], (int)(final_latent.dim() > 3 ? final_latent.shape()[3] : 1),
                      load_path);
         } catch (const std::exception& e) {
-            LOG_ERROR("LTX_LOAD_LATENTS failed (%s); falling back to sampling", e.what());
+            LOG_ERROR("latent load failed (%s); falling back to sampling", e.what());
         }
     }
     if (final_latent.empty()) {
@@ -7131,7 +7273,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
-    if (latents.video_conditioning_frame_count > 0) {
+    if (!final_latent_prestripped && latents.video_conditioning_frame_count > 0) {
         int64_t target_frames = latents.video_target_frame_count > 0 ? latents.video_target_frame_count
                                                                      : final_latent.shape()[2] - latents.video_conditioning_frame_count;
         final_latent          = sd::ops::slice(final_latent, 2, 0, target_frames);
@@ -7141,7 +7283,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
-    if (latents.ref_image_num > 0) {
+    if (!final_latent_prestripped && latents.ref_image_num > 0) {
         final_latent = sd::ops::slice(final_latent, 2, latents.ref_image_num, final_latent.shape()[2]);
         if (!chain_base_latent.empty()) {
             chain_base_latent = sd::ops::slice(chain_base_latent, 2, latents.ref_image_num, chain_base_latent.shape()[2]);
