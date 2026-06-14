@@ -163,3 +163,15 @@ would require a conformal GPU unwrap in C++ — large, and not worth it while cu
 
 - quantized/KTX2 GLB export (KHR_mesh_quantization + KTX2/Basis) — ~3-5x smaller for game use. trimesh
   writes float32 geo + PNG tex today, so the GLB sizes are pre-compression.
+
+## GAME LODs — the real wall (texture-downscale OK, mesh-decimate NOT)
+
+- TEXTURE downscale of the FULL mesh is clean: full 490k mesh + TEX_FINAL_SIZE=2048 = clean (≈4096),
+  44 MB. So shippable = full mesh @ 2048 + KTX2 + KHR_mesh_quantization (~5-8 MB).
+- MESH decimation breaks the UV: cumesh simplify_to_faces (== Python cm.simplify) outputs NON-MANIFOLD
+  geometry (F≈4V; e.g. 5939 V / 23935 F). xatlas must cut a chart at every non-manifold edge → 12k-27k
+  charts even with ATL_MAXCOST=100000 + ATL_NDW=0.001 → at 512/1024 the seams swamp the texels →
+  colour-leak / "Mario 64". NO_PRECL real-xatlas unwrap does NOT help (same non-manifold input).
+- A genuine low-poly game LOD needs manifold RETOPO + clean re-unwrap (DCC / instant-meshes / etc.) —
+  outside the Trellis/cumesh bake. Python hits the identical wall. So: low-tex OR low-poly cleanly, not
+  both. 4096 (or 2048) full-mesh is the realistic ceiling, == Python.
