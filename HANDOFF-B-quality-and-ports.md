@@ -21,6 +21,17 @@ Served via `cd tools/m1_ref/cpp_port && python3 -m http.server 8011 --bind 0.0.0
   see below) · B=`native_v6.glb` (4096, clean, 86 MB) · C=`native_lod2_1024.glb` (decimated 70k mesh,
   the LOD wall).
 
+## Packed-tier visual verdict (user, model-viewer, 2026-06-14)
+After the in-process packer landed + rendered correctly:
+- **4096 / UASTC (native_v6_inproc, 46 MB) = the keeper** — "probably the cleanest model I've seen; the
+  little spider-webs (teal hair-chart seams) are gone." 4096 keeps the seam ring sub-pixel.
+- **2048 / UASTC (native_clean2048_inproc, 15 MB)** — teal seeps through the hair-chart seams + visible
+  cracking. The 4.3× area-downsample AA is NOT enough to kill the teal-on-skirt/hair seam bleed.
+- **2048 / ETC1S (9.6 MB)** — same cracking as 2048/UASTC but WORSE (block compression amplifies seams).
+⇒ Ship 4096/UASTC as the hero. The 2048 tier needs more than downsample-AA to be clean (gutter/seam work
+on the hair charts, or a manifold retopo so charts are big — same wall as the LOD note below). Don't ship
+2048 as-is. This matches FINDINGS-A's "teal hair-chart seams" being the residual at <8192.
+
 ## The game-asset wall (don't re-discover this)
 
 - **Texture downscale of the FULL mesh** is *mostly* fine, BUT the in-loop resize of the 182k-chart
