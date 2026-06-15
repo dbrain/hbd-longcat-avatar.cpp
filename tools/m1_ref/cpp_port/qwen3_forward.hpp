@@ -1,0 +1,104 @@
+// qwen3_forward.hpp — ggml graph for the TokenRig Qwen3-0.6B AR core (R2 of the SkinTokens port).
+// Standard Qwen3 decoder: RMSNorm -> GQA self-attn (q/k per-head RMSNorm "qk-norm" + RoPE, 16 q /
+// 8 kv heads, head_dim 128) -> RMSNorm -> SwiGLU MLP, x28, final RMSNorm, lm_head (tied embeddings).
+// Config CONFIRMED from the checkpoint: hidden 896, 28 layers, head_dim 128, intermediate 3072,
+// rms_eps 1e-6, rope_theta 1e6, vocab 33036, NO biases. Reuses m1_ggml.hpp (lin, attention helpers,
+// rotate_half). Causal mask is built here (the shared attention() helper is bidirectional).
+//
+// Teacher-forced: consumes inputs_embeds [hidden, S] (cat[mesh_cond, embed(tokens)]) and returns
+// logits [vocab, S]. Weight keys = PyTorch state_dict suffixes under `prefix` (default "transformer.").
+#pragma once
+#include "m1_ggml.hpp"
+#include <string>
+#include <vector>
+#include <cmath>
+
+struct Qwen3Cfg {
+    int hidden = 896, n_layers = 28, n_heads = 16, n_kv = 8, head_dim = 128;
+    int intermediate = 3072, vocab = 33036;
+    float eps = 1e-6f, rope_theta = 1000000.0f;
+    std::string prefix = "transformer.";
+    int n_rep() const { return n_heads / n_kv; }
+    float attn_scale() const { return 1.0f / std::sqrt((float) head_dim); }
+};
+
+// RMSNorm over ne0 (* weight). x/sqrt(mean(x^2)+eps) * w.
+static inline ggml_tensor* qw_rmsnorm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, float eps) {
+    return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+}
+
+// HF rope on x [head_dim, n_head, S]: x*cos + rotate_half(x)*sin. cos/sin [head_dim, 1, S].
+static inline ggml_tensor* qw_rope(ggml_context* ctx, ggml_tensor* x, ggml_tensor* cos, ggml_tensor* sin) {
+    return ggml_add(ctx, ggml_mul(ctx, x, cos), ggml_mul(ctx, rotate_half(ctx, x), sin));
+}
+
+// repeat_kv: [d, n_kv, S] -> [d, n_kv*n_rep, S] with new head = kv*n_rep + r (HF interleave: q head h
+// uses kv head h/n_rep). Insert n_rep as the INNER (ne1) dim, repeat, then reshape merges r + n_rep*kv.
+static inline ggml_tensor* qw_repeat_kv(ggml_context* ctx, ggml_tensor* x, int n_rep) {
+    int64_t d = x->ne[0], nkv = x->ne[1], S = x->ne[2];
+    if (n_rep == 1) return x;
+    ggml_tensor* x4 = ggml_reshape_4d(ctx, x, d, 1, nkv, S);            // [d,1,nkv,S]
+    ggml_tensor* tmpl = ggml_new_tensor_4d(ctx, x->type, d, n_rep, nkv, S);
+    ggml_tensor* r = ggml_repeat(ctx, x4, tmpl);                        // [d,n_rep,nkv,S]
+    return ggml_reshape_3d(ctx, r, d, n_rep * nkv, S);                  // head = r + n_rep*kv
+}
+
+// causal self-attention. q/k/v [head_dim, n_head, S] (kv already repeated to n_head). mask [S,S]
+// additive (0 on/below diag, -inf above). returns [hidden, S].
+static inline ggml_tensor* qw_causal_attn(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k,
+                                          ggml_tensor* v, ggml_tensor* mask, float scale) {
+    int64_t d = q->ne[0], nh = q->ne[1], S = q->ne[2];
+    ggml_tensor* kp = ggml_permute(ctx, k, 0, 2, 1, 3);                 // [d, S, head]
+    ggml_tensor* qp = ggml_permute(ctx, q, 0, 2, 1, 3);                 // [d, S, head]
+    ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3)); // [S, d, head]
+    ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);                        // [S(k), S(q), head]
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    kq = ggml_soft_max_ext(ctx, kq, mask, scale, 0.0f);                 // causal softmax (fp32)
+    ggml_tensor* kqv = ggml_mul_mat(ctx, vp, kq);                       // [d, S(q), head]
+    ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+    kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                           // [d, head, S]
+    return ggml_cont_2d(ctx, kqv, d * nh, S);                           // [hidden_q = d*nh, S]
+}
+
+// one decoder layer.
+static inline ggml_tensor* qw_layer(M1Harness& H, ggml_context* ctx, const Qwen3Cfg& cfg,
+                                    const std::string& p, ggml_tensor* x,
+                                    ggml_tensor* cos, ggml_tensor* sin, ggml_tensor* mask) {
+    const int hd = cfg.head_dim, nh = cfg.n_heads, nkv = cfg.n_kv;
+    ggml_tensor* h = qw_rmsnorm(ctx, x, H.weight(p + "input_layernorm.weight"), cfg.eps);
+    ggml_tensor* q = lin(ctx, H.weight(p + "self_attn.q_proj.weight"), nullptr, h);  // [nh*hd, S]
+    ggml_tensor* k = lin(ctx, H.weight(p + "self_attn.k_proj.weight"), nullptr, h);  // [nkv*hd, S]
+    ggml_tensor* v = lin(ctx, H.weight(p + "self_attn.v_proj.weight"), nullptr, h);
+    q = ggml_reshape_3d(ctx, q, hd, nh, q->ne[1]);
+    k = ggml_reshape_3d(ctx, k, hd, nkv, k->ne[1]);
+    v = ggml_reshape_3d(ctx, v, hd, nkv, v->ne[1]);
+    // qk-norm: RMSNorm over head_dim (* weight [hd]) BEFORE rope
+    q = qw_rmsnorm(ctx, q, H.weight(p + "self_attn.q_norm.weight"), cfg.eps);
+    k = qw_rmsnorm(ctx, k, H.weight(p + "self_attn.k_norm.weight"), cfg.eps);
+    q = qw_rope(ctx, q, cos, sin);
+    k = qw_rope(ctx, k, cos, sin);
+    k = qw_repeat_kv(ctx, k, cfg.n_rep());
+    v = ggml_cont(ctx, qw_repeat_kv(ctx, v, cfg.n_rep()));
+    ggml_tensor* o = qw_causal_attn(ctx, q, k, v, mask, cfg.attn_scale());
+    o = lin(ctx, H.weight(p + "self_attn.o_proj.weight"), nullptr, o);
+    x = ggml_add(ctx, x, o);
+    // SwiGLU MLP
+    ggml_tensor* hn = qw_rmsnorm(ctx, x, H.weight(p + "post_attention_layernorm.weight"), cfg.eps);
+    ggml_tensor* g = lin(ctx, H.weight(p + "mlp.gate_proj.weight"), nullptr, hn);
+    ggml_tensor* u = lin(ctx, H.weight(p + "mlp.up_proj.weight"), nullptr, hn);
+    ggml_tensor* m = ggml_mul(ctx, ggml_silu(ctx, g), u);
+    m = lin(ctx, H.weight(p + "mlp.down_proj.weight"), nullptr, m);
+    return ggml_add(ctx, x, m);
+}
+
+// full forward. inputs_embeds [hidden, S]. cos/sin [head_dim, 1, S]. mask [S, S]. returns logits [vocab, S].
+static inline ggml_tensor* build_qwen3(M1Harness& H, ggml_context* ctx, const Qwen3Cfg& cfg,
+                                       ggml_tensor* inputs_embeds, ggml_tensor* cos,
+                                       ggml_tensor* sin, ggml_tensor* mask) {
+    const std::string m = cfg.prefix + "model.";
+    ggml_tensor* x = inputs_embeds;
+    for (int l = 0; l < cfg.n_layers; ++l)
+        x = qw_layer(H, ctx, cfg, m + "layers." + std::to_string(l) + ".", x, cos, sin, mask);
+    x = qw_rmsnorm(ctx, x, H.weight(m + "norm.weight"), cfg.eps);
+    return lin(ctx, H.weight(cfg.prefix + "lm_head.weight"), nullptr, x);   // [vocab, S]
+}
