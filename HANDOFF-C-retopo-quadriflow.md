@@ -2,7 +2,70 @@
 
 Continues HANDOFF-B (the in-process meshopt+KTX2 packer + bake quality, both DONE). This is the **next
 real quality lever** and the prerequisite for the project's end goal (**rig + animate**, mute 3D game
-assets). Pure scope — no code written yet.
+assets).
+
+> ════════════════════════════════════════════════════════════════════════════════════════════════
+> ## ⭐ RESUME HERE — STATE + NEXT STEPS (2026-06-15, fresh-context handoff)
+>
+> **GOAL:** image → pixal3d (SOTA gen, KEEP it) → riggable retopo that PRESERVES detail (esp. **fingers**,
+> which ARE in the source) → bake baseColor+metalRough+**normal** → compressed GLB. "Sludge → diamonds,
+> at the limit of automation," faithful to the source image.
+>
+> **WHAT WORKS + IS COMMITTED (reusable regardless of retopo tool):**
+> - In-process packer (meshopt+KTX2), `--pack`, validated (HANDOFF-B). 4 model-viewer gotchas fixed.
+> - QuadriFlow vendored + builds headless (`build_quadriflow.sh`, gitignored/pinned). MIT/clean.
+> - `coarse_obj.cpp` (occupancy→manifold MC OBJ), `ply_decimate_obj.cpp` (PLY→meshopt-decimate→OBJ, has
+>   `sloppy` mode), `retopo_probe.cpp` (xatlas chart count), `retopo_bake.cpp` (PBR+reproject+normal bake
+>   → packed GLB + `RETOPO_INSP=1` uncompressed sidecar + normal PNG), `normal_bake.hpp` (tangent-space
+>   normal map dense→low-poly), `glb_packed.hpp` (now supports optional normal texture).
+>
+> **THE OPEN PROBLEM (finger-preserving retopo):** my first attempts FUSED the fingers because I fed
+> QuadriFlow a **lossy coarse remesh** (`marching_cubes_solid`, blobby) instead of the **detailed**
+> mesh. The source HAS clean fingers (rendered `dump_dense` → confirmed). PolyGen (learned retopo) is
+> **NOT open-weights** (SaaS only) — not an option.
+>
+> **CORRECTED APPROACH (the thing to finish):** decimate the **detailed manifold** mesh (the 8M
+> marching-tet `miku_remesh_smooth.ply`, which has fingers) via `ply_decimate_obj … sloppy` (quality
+> LockBorder STALLS on the voxel lattice at ~13.8M; sloppy gets 8M→385k in seconds, keeps shape) → feed
+> THAT to QuadriFlow → bake. `/tmp/det.obj` = the 385k sloppy-decimated detailed mesh, ready.
+>
+> **INCONCLUSIVE (the ONE test to redo first):** `quadriflow -i /tmp/det.obj -o det_quad.obj -f 60000`
+> — timed out at 300s BUT under heavy machine load (other agent swap-thrash, load 60+). Can't tell
+> contention vs stall. **Step 1 = re-run it when the machine is CLEAR (`cat /proc/loadavg` < ~4).**
+>   - If it COMPLETES → render hands (`render_geo_detail.py det_quad.obj /tmp/x`) → fingers preserved? If
+>     yes → `retopo_bake` it → render textured (RETOPO_INSP sidecar) → owner eyeball.
+>   - If it STALLS even when clear → sloppy output is too non-manifold for QF. Then: (a) clean before QF
+>     (weld dup verts + drop zero-area tris + keep largest component), or (b) vendor **Instant Meshes**
+>     (more robust to messy AI meshes than QuadriFlow — the likely real fix), or (c) a manifold-repair lib.
+>
+> **NEXT STEPS (priority order):**
+> 1. Re-run the QF-on-`/tmp/det.obj` test on a CLEAR machine (above). Render hands. ← unblocks everything.
+> 2. Sharpest fingers source: the **dense dual-grid** (1.5M, `dump_dense_*`) is crisper than the
+>    taubin-smoothed 8M; try sloppy-decimating that instead if smoothed-8M softens fingers.
+> 3. **Normal bake denoise:** `normal_bake` currently samples raw `dump_dense` → rainbow speckle. Sample
+>    the SMOOTHED mesh (or smooth the dense vertex normals) → clean normal map. (Machinery works; ~226s.)
+> 4. If QF won't take detailed input cleanly → vendor **Instant Meshes** headless (robust retopo).
+> 5. Full asset: retopo'd mesh + baseColor + metalRough + clean normal map → packed GLB → **render +
+>    SCRUTINIZE hands/hair/face BEFORE claiming done** (I declared victory twice on un-rendered/blobby
+>    results — DON'T; always render geo + textured).
+> 6. Then: LOD tiers (lower -f), AO bake, wire `--retopo` into the live pixal3d chain (GPU), SkinTokens
+>    deform check.
+>
+> **GOTCHAS / LESSONS:** chart-count ≠ visual quality (RENDER everything: `render_mesh.py` geo,
+> `render_geo_detail.py` hand/feet crops, `_mv_render.py` textured via the uncompressed sidecar — trimesh
+> can't read KTX2/meshopt). marching_cubes_solid (any QF-tractable stride) FUSES fingers — don't use it
+> for the retopo input. reproject(dense) is REQUIRED for the bake (offset retopo surface specks otherwise).
+>
+> **ARTIFACTS:** `/tmp/det.obj` (385k sloppy detailed, QF-ready), `miku_remesh_smooth.ply` (8M detailed
+> manifold), `dump_dense_*.bin` (1.5M crisp-finger source), `dump_pbr_*.bin` (PBR volume),
+> `refs/stage5/head_coords.npy` (occupancy). Commits this lap: 20d2772 ca6482b 69bb35b f9426bc c553935.
+>
+> **STILL PENDING (other tracks, separate):** preprocess→native C++ via matting service (de-python),
+> MoGe-2→ggml (SCOPE-moge2), owner eyeball of the packed HANDOFF-B assets (compare.html), pixal3d
+> `--retopo` live wiring.
+> ════════════════════════════════════════════════════════════════════════════════════════════════
+
+--- original scope below (R0–R6 ladder, tool decision, reuse, DoD) ---
 
 ## Why this exists (read first — it reframes "texture quality" as "topology")
 
