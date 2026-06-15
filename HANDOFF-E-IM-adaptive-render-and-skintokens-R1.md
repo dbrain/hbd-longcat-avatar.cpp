@@ -72,21 +72,25 @@ curvature rises (CPU check: `im_adapt_density_check.py`). **This is a quantitati
 of finger separation** — that is a visual question for the render (HARD RULE: never claim a mesh "works"
 from vertex counts).
 
-### ⛔ GPU STOP POINT (Track 1): the render-and-look (owner's job)
-Renders are GPU (pyrender/EGL). **Queued, ready to paste** when the GPU is free:
+### Renders DONE (2026-06-15 GPU run) — density redistribution CONFIRMED; finger verdict = owner's
 ```bash
-cd tools/m1_ref/cpp_port
-./render_im_adapt.sh        # renders all 6 variants' hand close-ups + body geometry, builds montages
-# -> /tmp/im_adapt/CMP_hands_d9.png, CMP_hands_d10.png  (a0|a0.5|a1.0 side by side)
-#    /tmp/im_adapt/CMP_geo_d9.png,   CMP_geo_d10.png    (uniform vs adaptive body — torso should coarsen)
+cd tools/m1_ref/cpp_port && ./render_im_adapt.sh     # 6 variants: hand sweeps + body + detail crops
+# -> /tmp/im_adapt/CMP_{hands,geo}_{d9,d10}.png, geo_*_detail.png, FULL_d10.png
 ```
-**Success target (owner verdict):** fingers SEPARATE at adaptivity 0.5/1.0 where the uniform (0.0) path
-webs them, with torso density visibly dropping to pay for it — same budget, better spent. Then optionally
-add an "IM adaptive" tab to `compare.html`. If the lever helps, wire `IM_ADAPTIVITY` into the live
-pixal3d retopo driver and re-bake (normal map off the V6 dense shell, per HANDOFF-C R2).
-**If it disappoints:** the normal-mapped uniform path already ships acceptable fingers — this is polish.
-Tuning knobs (all in `compute_sizing_field`, `batch.cpp` / the patch heredoc): `GAMMA` (aggressiveness),
-`GRAD` (gradation ratio; raise → more contrast but risk the extraction error returns), `DMAX/DMIN`.
+**What the renders show:** at a FIXED `-f` (final face counts ~equal), the adaptive (a1.0) mesh has
+**visibly denser, cleaner quad flow on the high-curvature regions** — the boots/heels and the skirt
+frills are noticeably finer than uniform (see `geo_d10_a{0,1}_detail.png`), and the **full-figure
+silhouette is preserved** (`FULL_d10.png`), confirming the budget-conserving shape-safety property.
+So the lever provably moves density to curvature — exactly the mechanism. **The finger-specific verdict
+is NOT closed:** this Miku's huge twintail hair dominates the side extremities, so the auto hand-framing
+(`render_hands_auto.py`) kept hitting hair, not fingers. The owner — who knows the asset — should judge
+finger separation directly on `compare.html` (add an "IM adaptive" tab; the OBJ variants are in
+`/tmp/im_adapt/`). **Success target:** fingers separate at a0.5/a1.0 where uniform (a0) webs them.
+**If it helps:** wire `IM_ADAPTIVITY` into the live pixal3d retopo driver + re-bake (normal map off the
+V6 dense shell, HANDOFF-C R2). **If not:** the normal-mapped uniform path already ships acceptable
+fingers — this is polish. Tuning knobs in `compute_sizing_field` (the patch heredoc in
+`build_instant_meshes.sh`): `GAMMA` (aggressiveness), `GRAD` (gradation ratio; raise → more contrast but
+risks the extraction error returning), `DMAX/DMIN`.
 
 ---
 
@@ -118,32 +122,47 @@ inspection of `SkinTokens/experiments/articulation_xl_quantization_256_token_4/g
   weights+inputs+latents as npy. **NOT** the R0 golden (no GPU, no FPS/rng/bf16) — a unit test of the
   ggml graph's numerics.
 
-### ✅ CPU VALIDATION (no GPU): ggml graph == PyTorch oracle to **maxabs 2.1e-6** (fp32-exact)
-```bash
-cd /mnt/hdd/3d/avatar-shootout/SkinTokens
-CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD .venv/bin/python \
-  ~/dev/longcat-sparse-spike/tools/m1_ref/cpp_port/vecset_synth_gen.py /tmp/vecset_synth
-cd ~/dev/longcat-sparse-spike/tools/m1_ref/cpp_port
-./build.sh vecset_encode && ./vecset_encode /tmp/vecset_synth      # -> PASS, maxabs 2.146e-06
-```
-This proves the encoder GRAPH (QKV slicing, both attentions, the 8-layer stack, GELU, scale, ln_post,
-the host Fourier embed) is correct, entirely on CPU. The remaining R1 unknowns are the *real-data*
-plumbing (below), not the math.
+### ✅ VALIDATED — ggml graph matches the REAL model on both backends (2026-06-15, GPU run)
+Two independent checks, both PASS the 2e-3 fp32-oracle tol with large margin:
 
-### ⛔ GPU/torch STOP POINTS (Track 2)
-1. **R0 golden capture (GPU).** Run the proven SkinTokens command on a validated pixal3d mesh and
-   monkeypatch-dump (per `HANDOFF-RIGGING-skintokens.md` R0): the input points `pc[N,3]` + normals,
-   the FPS-sampled `sampled_pc[512,3]` + `sampled_feats` (post `np.random.default_rng(0).choice` +
-   `fps(ratio=1/4)`, eval mode), and the encoder output `latents[512,512]`. Save as
-   `pc.npy/feats.npy/sampled_pc.npy/sampled_feats.npy/latents.npy` in a golden dir. *Why GPU:* the
-   proven run is bf16+flash-attn on the GPU; this is the real condition-feature target.
-2. **GGUF pack (CPU torch load, but pairs with R0).** Extend `pack_gguf.cpp`/a script to write
-   `mesh_encoder.encoder.*` (106 tensors) from the .ckpt as `<dir>/skintokens.gguf`. Keys already match.
-3. **Then validate end-to-end:**
+1. **CPU synthetic oracle** (random weights, fp32, no GPU): ggml == PyTorch to **maxabs 2.1e-6** —
+   fp32-exact. Proves the graph math (QKV slicing, both attentions, 8-layer stack, GELU, scale,
+   ln_post, host Fourier embed).
    ```bash
-   PIXAL3D_GGUF_DIR=<gguf-dir> ./vecset_encode <golden-dir> [cuda]   # expect maxabs < 2e-3 vs golden
+   cd /mnt/hdd/3d/avatar-shootout/SkinTokens
+   CUDA_VISIBLE_DEVICES="" PYTHONPATH=$PWD .venv/bin/python \
+     ~/dev/longcat-sparse-spike/tools/m1_ref/cpp_port/vecset_synth_gen.py /tmp/vecset_synth
+   cd ~/dev/longcat-sparse-spike/tools/m1_ref/cpp_port
+   ./build.sh vecset_encode && ./vecset_encode /tmp/vecset_synth        # PASS maxabs 2.1e-6
    ```
-   Validate vs the **TRUE-fp32 oracle**, not the bf16 golden (re-dump the reference in fp32 if needed).
+2. **R0 real-model golden** (REAL trained weights from the proven ckpt + REAL rng.choice(0)+FPS
+   sampling + GPU fp32 oracle, NVIDIA_TF32_OVERRIDE=0): ggml **CPU maxabs 1.2e-4 / CUDA maxabs 5.6e-5**
+   (meanabs ~2-6e-6) vs the real encoder output. So the graph is correct with the actual weight
+   distributions and the real FPS-sampled-query path, on both backends. **R1 (the de-risk spike) is
+   DONE — the VecSet encoder is portable.**
+   ```bash
+   cd /mnt/hdd/3d/avatar-shootout/SkinTokens
+   NVIDIA_TF32_OVERRIDE=0 PYTHONPATH=$PWD .venv/bin/python \
+     ~/dev/longcat-sparse-spike/tools/m1_ref/cpp_port/capture_vecset_r0.py /tmp/vecset_r0   # giraffe.glb
+   cd ~/dev/longcat-sparse-spike/tools/m1_ref/cpp_port
+   ./vecset_encode /tmp/vecset_r0                 # CPU  PASS maxabs 1.2e-4
+   ./build.sh vecset_encode cuda
+   NVIDIA_TF32_OVERRIDE=0 ./vecset_encode /tmp/vecset_r0 cuda   # CUDA PASS maxabs 5.6e-5
+   ```
+   (Golden npys live in `/tmp/vecset_r0`, regenerable via `capture_vecset_r0.py`; not committed —
+   cpp_port keeps only source. The encoder uses the custom pure-torch `fps` in `src/model/utils.py`,
+   NOT torch_cluster.)
+
+### Remaining Track-2 follow-ons (R1 closed; these are R1-polish → R2…R7)
+- **GGUF pack (optional, for prod/perf):** write `mesh_encoder.encoder.*` (106 tensors) from the .ckpt
+  as `<dir>/skintokens.gguf` (keys already match), then `PIXAL3D_GGUF_DIR=<dir> ./vecset_encode …`.
+  Not needed for correctness — npy mode already validates.
+- **Host sampling port (CPU):** numpy PCG64 `rng.choice(N, 2048, seed=0)` + the pure-torch
+  `fps(ratio=1/4)` to derive `sampled_pc` from `pc` in C++ (currently injected from golden). Validate
+  sampled indices vs golden, then drop the `sampled_*` inputs.
+- `output_proj` (Linear 512→896 + LayerNorm; `output_proj.{0,1}` in the ckpt) is the rig's, not the
+  encoder's — R2+.
+- Then R2 Qwen3-0.6B core, R3 beam decode, R4 FSQ skin decoder, R5 tokenizer, R6 rigged-GLB, R7 E2E.
 
 ### Then (R1 follow-ons → R2…R7, see the rigging handoff)
 - **Host sampling port (CPU):** numpy PCG64 `rng.choice(N, 2048, seed=0)` + `fps(ratio=1/4)` to derive
@@ -159,8 +178,8 @@ plumbing (below), not the math.
 - `tools/m1_ref/cpp_port/`:
   - `build_instant_meshes.sh` (now applies the adaptive **patch heredoc** after clone, idempotent)
   - `im_batch_main.cpp` (`-A`/`IM_ADAPTIVITY` knob)
-  - `render_im_adapt.sh` (queued GPU renders), `im_adapt_density_check.py` (CPU density check)
-  - `vecset_encoder.hpp`, `vecset_encode.cpp`, `vecset_synth_gen.py` (R1)
+  - `render_im_adapt.sh` (GPU renders), `render_hands_auto.py` (hand-locator render), `im_adapt_density_check.py` (CPU density check)
+  - `vecset_encoder.hpp`, `vecset_encode.cpp`, `vecset_synth_gen.py` (CPU oracle), `capture_vecset_r0.py` (GPU real-model golden) — R1, VALIDATED
 - IM src changes (`batch.{h,cpp}`, `hierarchy.{h,cpp}`, `field.cpp`, `extract.cpp`) live in the
   gitignored fresh clone `thirdparty/instant-meshes/` and are carried as the patch in
   `build_instant_meshes.sh` (verified: applies cleanly to a fresh upstream clone, builds, idempotent).
