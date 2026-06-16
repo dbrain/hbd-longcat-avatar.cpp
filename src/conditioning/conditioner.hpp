@@ -2282,8 +2282,24 @@ struct LTXAVEmbedder : public Conditioner {
             weights.insert(weights.end(), curr_tokens.size(), item.second);
         }
 
+        // The encoder pads the prompt to kMinLength (1024) tokens; the gemma forward
+        // then runs a DENSE O(N^2) self-attention over N=1024 regardless of the real
+        // prompt length (the [1024,1024] softmax = the bulk of the encode compute_buf).
+        // RoPE is relative and the left-padding is masked out (exact -inf -> 0), so the
+        // valid tokens' hidden states are invariant to the pad amount — trimming N is
+        // therefore expected to be output-equivalent while shrinking the encode
+        // compute_buf (~N^2) and speeding the encode. LTX_TEXT_MINLEN overrides the pad
+        // target (0 = natural length, no pad); default keeps the trained 1024. Validate
+        // any trim with an output A/B before trusting it.
+        int64_t min_len = kMinLength;
+        if (const char* e = std::getenv("LTX_TEXT_MINLEN")) {
+            long v = std::atol(e);
+            if (v >= 0) {
+                min_len = static_cast<int64_t>(v);
+            }
+        }
         std::vector<float> mask;
-        tokenizer->pad_tokens(tokens, &weights, &mask, kMinLength);
+        tokenizer->pad_tokens(tokens, &weights, &mask, min_len);
         return {tokens, weights, mask};
     }
 
