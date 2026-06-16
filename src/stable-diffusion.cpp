@@ -6433,6 +6433,18 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
 
+    // Continuation + hires: when LTX latent spatial upscale is enabled, the continuation
+    // latent handed back to the caller (final_latent_out) must be the BASE (pre-upscale)
+    // latent, so the NEXT chained segment seeds + samples at the same base resolution it
+    // will upscale from. Capture it here BEFORE the hires block overwrites final_latent
+    // with the upscaled latent; the decoded frames_out below still come from the upscaled
+    // latent. Spatial upscale preserves the temporal frame count, so the caller's overlap
+    // bookkeeping is unchanged. (Deep copy: final_latent is reassigned by the hires pass.)
+    sd::Tensor<float> chain_base_latent;
+    if (latent_upscale_enabled && final_latent_out != nullptr) {
+        chain_base_latent = final_latent;
+    }
+
     if (latent_upscale_enabled) {
         int64_t upscale_start             = ggml_time_ms();
         sd::Tensor<float> upscaled_latent = upscale_ltx_spatial_video_latent(sd_ctx,
@@ -6647,24 +6659,33 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         int64_t target_frames = latents.video_target_frame_count > 0 ? latents.video_target_frame_count
                                                                      : final_latent.shape()[2] - latents.video_conditioning_frame_count;
         final_latent          = sd::ops::slice(final_latent, 2, 0, target_frames);
+        // mirror the same temporal trim on the base continuation latent (same Tl)
+        if (!chain_base_latent.empty()) {
+            chain_base_latent = sd::ops::slice(chain_base_latent, 2, 0, target_frames);
+        }
     }
 
     if (latents.ref_image_num > 0) {
         final_latent = sd::ops::slice(final_latent, 2, latents.ref_image_num, final_latent.shape()[2]);
+        if (!chain_base_latent.empty()) {
+            chain_base_latent = sd::ops::slice(chain_base_latent, 2, latents.ref_image_num, chain_base_latent.shape()[2]);
+        }
     }
 
     // Continuation chaining: hand the post-sampling diffusion latent back to the
     // caller (before VAE decode) so the tail can condition the next segment without
-    // a lossy decode/re-encode roundtrip.
-    if (final_latent_out != nullptr && !final_latent.empty()) {
-        int64_t Wl = final_latent.shape()[0];
-        int64_t Hl = final_latent.shape()[1];
-        int64_t Tl = final_latent.shape()[2];
-        int64_t Cl = final_latent.dim() > 3 ? final_latent.shape()[3] : 1;
-        size_t n   = (size_t)final_latent.numel();
+    // a lossy decode/re-encode roundtrip. With hires on, hand back the BASE pre-upscale
+    // latent (chain_base_latent) so the next segment chains at base resolution.
+    const sd::Tensor<float>& cont_latent_src = (!chain_base_latent.empty()) ? chain_base_latent : final_latent;
+    if (final_latent_out != nullptr && !cont_latent_src.empty()) {
+        int64_t Wl = cont_latent_src.shape()[0];
+        int64_t Hl = cont_latent_src.shape()[1];
+        int64_t Tl = cont_latent_src.shape()[2];
+        int64_t Cl = cont_latent_src.dim() > 3 ? cont_latent_src.shape()[3] : 1;
+        size_t n   = (size_t)cont_latent_src.numel();
         float* buf = (float*)malloc(n * sizeof(float));
         if (buf != nullptr) {
-            std::memcpy(buf, final_latent.data(), n * sizeof(float));
+            std::memcpy(buf, cont_latent_src.data(), n * sizeof(float));
             *final_latent_out = buf;
             if (latent_width_out) *latent_width_out = (int)Wl;
             if (latent_height_out) *latent_height_out = (int)Hl;

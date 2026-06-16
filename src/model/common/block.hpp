@@ -298,6 +298,31 @@ public:
             net_2->set_force_prec_f32(true);
         }
 
+        // Token-tiled FFN (env LONGCAT_FFN_TILE_TOKENS=N, N>0): the FFN is position-wise
+        // (independent per token), so process tokens in chunks of N. This caps the
+        // [inner_dim, tokens] intermediate — the dominant DiT activation at long video
+        // lengths (e.g. 1375 MB at 22k tokens) — to [inner_dim, N]. Lossless (same math,
+        // concatenated), no extra FLOPs (only a few more kernel launches). Off by default
+        // (N<=0) so every other model/path is byte-identical. Only the simple 2D case
+        // (single batch) is tiled; anything else falls through to the original path.
+        int64_t ffn_tile = 0;
+        if (const char* e = getenv("LONGCAT_FFN_TILE_TOKENS")) {
+            ffn_tile = atoll(e);
+        }
+        const int64_t n_tok = x->ne[1];
+        if (ffn_tile > 0 && n_tok > ffn_tile && x->ne[2] == 1 && x->ne[3] == 1) {
+            ggml_tensor* out = nullptr;
+            for (int64_t c = 0; c < n_tok; c += ffn_tile) {
+                const int64_t len = (n_tok - c < ffn_tile) ? (n_tok - c) : ffn_tile;
+                ggml_tensor* xc   = ggml_view_2d(ctx->ggml_ctx, x, x->ne[0], len, x->nb[1], (size_t)c * x->nb[1]);
+                xc                = ggml_cont(ctx->ggml_ctx, xc);
+                xc                = net_0->forward(ctx, xc);  // [inner_dim, len]
+                xc                = net_2->forward(ctx, xc);  // [dim_out, len]
+                out               = (out == nullptr) ? xc : ggml_concat(ctx->ggml_ctx, out, xc, 1);
+            }
+            return out;
+        }
+
         x = net_0->forward(ctx, x);  // [ne3, ne2, ne1, inner_dim]
         x = net_2->forward(ctx, x);  // [ne3, ne2, ne1, dim_out]
         return x;

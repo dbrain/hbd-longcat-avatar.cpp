@@ -2186,6 +2186,41 @@ protected:
                      pool_mb, prefetch_buf_pool_.size(),
                      bufmb(runtime_params_buffer), bufmb(resident_runtime_params_buffer));
         }
+        // Activation breakdown (env LONGCAT_TENSOR_DUMP=1). The gallocr compute buffer
+        // above is the PEAK simultaneous-live activation set (what scales with frames).
+        // This lists the largest graph tensors so we can see WHAT fills it and what
+        // might be collapsible/streamable. `sum` >> `gallocr peak` means reuse is
+        // already working; the peak floor is set by the big tensors that are live at the
+        // same time. One run -> the whole picture, no reruns.
+        if (getenv("LONGCAT_TENSOR_DUMP") != nullptr) {
+            int n_nodes = ggml_graph_n_nodes(gf);
+            std::vector<std::pair<size_t, ggml_tensor*>> sized;
+            sized.reserve(n_nodes);
+            size_t total = 0;
+            for (int i = 0; i < n_nodes; ++i) {
+                ggml_tensor* t = ggml_graph_node(gf, i);
+                size_t b       = ggml_nbytes(t);
+                total += b;
+                sized.emplace_back(b, t);
+            }
+            const size_t topn = std::min((size_t)18, sized.size());
+            std::partial_sort(sized.begin(), sized.begin() + topn, sized.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            LOG_INFO("[TENSORS] %s: %d nodes, sum=%.0f MB, gallocr peak=%.0f MB (reuse x%.1f). top %zu:",
+                     get_desc().c_str(), n_nodes, total / 1048576.0,
+                     compute_buffer_size / 1048576.0,
+                     compute_buffer_size > 0 ? (double)total / (double)compute_buffer_size : 0.0,
+                     topn);
+            for (size_t i = 0; i < topn; ++i) {
+                ggml_tensor* t = sized[i].second;
+                LOG_INFO("[TENSORS]   %8.1f MB  %-34s [%lld,%lld,%lld,%lld] %s op=%s",
+                         sized[i].first / 1048576.0,
+                         (t->name[0] != '\0') ? t->name : "(unnamed)",
+                         (long long)t->ne[0], (long long)t->ne[1],
+                         (long long)t->ne[2], (long long)t->ne[3],
+                         ggml_type_name(t->type), ggml_op_name(t->op));
+            }
+        }
         return true;
     }
 

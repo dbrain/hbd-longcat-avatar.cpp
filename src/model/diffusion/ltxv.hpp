@@ -719,6 +719,15 @@ namespace LTXV {
                 float d = (float)atof(e);
                 if (d > 0.0f) kv_scale = 1.0f / d;
             }
+            // When there is no real attention mask (self-attention), opt into
+            // flash_skip_kv_pad: the legacy L_k->256 pad otherwise synthesizes a full
+            // [L_k_pad x L_q] all-zeros mask (~N^2, F32 + an F16 copy) purely to pad —
+            // at 1280x704 that is the dominant VRAM peak AND the super-linear (frames^2)
+            // term. Modern ggml flash_attn_ext handles unpadded L_k with mask==nullptr
+            // directly (same path the avatar already uses). No precision change (the
+            // mask is zeros), and it skips building+casting the tensor (faster). A real
+            // mask (cross-attn) keeps the legacy path.
+            const bool skip_kv_pad = (mask == nullptr);
             auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
                                               ctx->backend,
                                               q,
@@ -728,7 +737,8 @@ namespace LTXV {
                                               mask,
                                               false,
                                               ctx->flash_attn_enabled,
-                                              kv_scale);
+                                              kv_scale,
+                                              skip_kv_pad);
 
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
