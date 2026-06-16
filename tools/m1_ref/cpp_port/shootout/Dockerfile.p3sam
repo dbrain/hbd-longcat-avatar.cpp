@@ -1,0 +1,42 @@
+# P3-SAM (Hunyuan3D-Part) — native 3D part segmentation, in ONE disposable image.
+# Recipe validated locally (torch2.4+cu124 / py3.10 / spconv-cu124 / torch_scatter / vendored Sonata all
+# import). The two nvcc-compiled exts (flash-attn, chamfer3D) FAILED locally because the host has no
+# CUDA_HOME — this devel base provides nvcc + CUDA_HOME, so they build here. NO weights baked (mount from
+# /mnt/hdd); repo code mounts at runtime (only chamfer3D source is COPY'd to compile the ext into the image).
+#
+# Build context = the Hunyuan3D-Part repo root:
+#   docker build -f Dockerfile.p3sam -t p3sam /mnt/hdd/3d/avatar-shootout/Hunyuan3D-Part
+# Run (segmentation; needs GPU + EGL cap for any render):
+#   docker run --rm --gpus all -v /mnt/hdd/3d/avatar-shootout:/work p3sam bash -c \
+#     'cd /work/Hunyuan3D-Part/P3-SAM/demo && PYTHONPATH=/work/Hunyuan3D-Part/P3-SAM:/work/Hunyuan3D-Part/XPart/partgen \
+#      python3 auto_mask.py --ckpt_path /work/Hunyuan3D-Part/P3-SAM/weights/last.ckpt --mesh_path <mesh> --output_path <out>'
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=6 PATH=/usr/local/cuda/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-dev python3-pip git build-essential ninja-build \
+      libgl1 libglib2.0-0 libegl1 libgles2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir -U pip wheel setuptools
+
+# torch 2.4.0 + cu124 (XPart/requirements.txt is authoritative; P3-SAM README's cu121 is stale)
+RUN pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
+      --index-url https://download.pytorch.org/whl/cu124
+# pyg sparse ops (prebuilt pt24cu124 cp310 wheels) + the rest of the Sonata/XPart deps
+RUN pip install --no-cache-dir \
+      https://data.pyg.org/whl/torch-2.4.0+cu124/torch_scatter-2.1.2+pt24cu124-cp310-cp310-linux_x86_64.whl \
+      https://data.pyg.org/whl/torch-2.4.0+cu124/torch_cluster-1.6.3+pt24cu124-cp310-cp310-linux_x86_64.whl \
+ && pip install --no-cache-dir numpy==2.1.2 addict spconv-cu124 scikit-learn fpsample \
+      pymeshlab==2023.12.post3 easydict timm huggingface_hub safetensors scipy packaging \
+      viser trimesh numba gradio einops
+# the two CUDA exts that need nvcc/CUDA_HOME (failed on the host, build here)
+RUN pip install --no-cache-dir flash-attn --no-build-isolation
+COPY P3-SAM/utils/chamfer3D /opt/chamfer3D
+RUN cd /opt/chamfer3D && python3 setup.py install
+# late-discovered pure-python deps from the XPart/P3-SAM import chain (separate layer = keeps the
+# expensive flash-attn/chamfer layers above cached)
+RUN pip install --no-cache-dir omegaconf tqdm
+
+WORKDIR /work
+CMD ["bash"]

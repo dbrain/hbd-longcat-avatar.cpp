@@ -132,6 +132,24 @@ if [ "$BASE" = "glb_repack" ]; then
   exit 0
 fi
 
+# make_matte: square black-bg RGB matte from an RGBA source. Header-only stb (load+write), no ggml/CUDA.
+if [ "$BASE" = "make_matte" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build make_matte (stb load+write, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# dump_to_glb: write a PIXAL3D_DUMP_BAKE binary mesh dump (float verts + int64 faces) out as a GLB. No deps.
+if [ "$BASE" = "dump_to_glb" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build dump_to_glb (glb_writer, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
 if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ]; then
