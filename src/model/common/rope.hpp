@@ -948,11 +948,20 @@ namespace Rope {
         // per-segment gallocr view-output bug that lap-18 worked around by forcing
         // chain-RoPE on offload is fixed in ggml-alloc). See
         // GGMLRunnerContext::allow_fused_rope + PERF.md lap 20.
-        if (rope_interleaved && allow_fused && pe->ne[0] == 2 && pe->ne[1] == 2 &&
+        if (allow_fused && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
             x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
             getenv("LONGCAT_NO_FUSED_ROPE") == nullptr) {
-            return ggml_rope_pe(ctx, x, pe);  // [d_head, L, n_head*N]
+            // Fused RoPE op: one CUDA kernel reads x + pe and writes the rotated
+            // output, with NO cont+permute+repeat intermediates. The non-interleaved
+            // (NeoX) variant is what kills the LTX video_pe peak: video self-attn
+            // folds the per-head pe into n_head=1 / L=video_tokens*num_heads (see
+            // ltxv.hpp apply_hidden_rope), so it lands here with pe->ne[3]==L and the
+            // 687 MB video_pe (permuted)(cont) chain tensors disappear. Both variants
+            // are bit-identical to the chain (rope-pe.cu uses un-contractable
+            // __fmul_rn/__fsub_rn/__fadd_rn — see the FMA-contraction note below).
+            return rope_interleaved ? ggml_rope_pe(ctx, x, pe)      // [d_head, L, n_head*N]
+                                    : ggml_rope_pe_ni(ctx, x, pe);  // [d_head, L, n_head*N]
         }
 
         x              = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, n_head, L, d_head]

@@ -34,6 +34,35 @@ static ggml_tensor * apply_rope_chain(ggml_context * ctx, ggml_tensor * x, ggml_
     return x_out;
 }
 
+// Replicate the NON-interleaved chain (rope_interleaved=false) verbatim from
+// Rope::apply_rope: the pair is the first/second HALF of head_dim (not adjacent),
+// with the extra trailing permute(1,0,2,3). torch_permute(0,2,3,1) == ggml_permute(0,3,1,2).
+static ggml_tensor * apply_rope_chain_ni(ggml_context * ctx, ggml_tensor * x, ggml_tensor * pe) {
+    int64_t d_head = x->ne[0];
+    int64_t n_head = x->ne[1];
+    int64_t L      = x->ne[2];
+    int64_t N      = x->ne[3];
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+    x = ggml_reshape_4d(ctx, x, d_head / 2, 2, L, n_head * N);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 3, 1, 2));  // torch_permute(0,2,3,1)
+    int64_t offset = x->nb[2] * x->ne[2];
+    ggml_tensor * x_0 = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 0);
+    ggml_tensor * x_1 = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 1);
+    x_0 = ggml_reshape_4d(ctx, x_0, 1, x_0->ne[0], x_0->ne[1], x_0->ne[2]);
+    x_1 = ggml_reshape_4d(ctx, x_1, 1, x_1->ne[0], x_1->ne[1], x_1->ne[2]);
+    ggml_tensor * temp_x = ggml_new_tensor_4d(ctx, x_0->type, 2, x_0->ne[1], x_0->ne[2], x_0->ne[3]);
+    x_0 = ggml_repeat(ctx, x_0, temp_x);
+    x_1 = ggml_repeat(ctx, x_1, temp_x);
+    pe = ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
+    offset = pe->nb[2] * pe->ne[2];
+    ggml_tensor * pe_0 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 0);
+    ggml_tensor * pe_1 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 1);
+    ggml_tensor * x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));
+    x_out = ggml_cont(ctx, ggml_permute(ctx, x_out, 1, 0, 2, 3));
+    x_out = ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);
+    return x_out;
+}
+
 int main() {
     const int64_t d_head = 128, n_head = 32, L = 257, N = 1;
     const int64_t half = d_head / 2;
@@ -53,9 +82,17 @@ int main() {
     ggml_tensor * out_fused = ggml_rope_pe(ctx, x, pe);
     ggml_set_output(out_fused);
 
+    // non-interleaved (NeoX / LTX video) chain vs ggml_rope_pe_ni
+    ggml_tensor * out_chain_ni = apply_rope_chain_ni(ctx, x, pe);
+    ggml_set_output(out_chain_ni);
+    ggml_tensor * out_fused_ni = ggml_rope_pe_ni(ctx, x, pe);
+    ggml_set_output(out_fused_ni);
+
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out_chain);
     ggml_build_forward_expand(gf, out_fused);
+    ggml_build_forward_expand(gf, out_chain_ni);
+    ggml_build_forward_expand(gf, out_fused_ni);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     (void)buf;
@@ -87,11 +124,25 @@ int main() {
         double dd = fabs(a[i]-b[i]);
         if (dd > maxabs) { maxabs = dd; worst = (int64_t)i; }
     }
-    printf("n=%zu  max|chain-fused| = %.3e  at idx %lld (chain=%.6f fused=%.6f)\n",
+    printf("[interleaved]     n=%zu  max|chain-fused| = %.3e  at idx %lld (chain=%.6f fused=%.6f)\n",
            a.size(), maxabs, (long long)worst,
            worst>=0?a[worst]:0.f, worst>=0?b[worst]:0.f);
+
+    std::vector<float> ani(d_head*L*n_head*N), bni(d_head*L*n_head*N);
+    ggml_backend_tensor_get(out_chain_ni, ani.data(), 0, ani.size()*sizeof(float));
+    ggml_backend_tensor_get(out_fused_ni, bni.data(), 0, bni.size()*sizeof(float));
+    double maxabs_ni = 0; int64_t worst_ni = -1;
+    for (size_t i = 0; i < ani.size(); ++i) {
+        double dd = fabs(ani[i]-bni[i]);
+        if (dd > maxabs_ni) { maxabs_ni = dd; worst_ni = (int64_t)i; }
+    }
+    printf("[non-interleaved] n=%zu  max|chain-fused| = %.3e  at idx %lld (chain=%.6f fused=%.6f)\n",
+           ani.size(), maxabs_ni, (long long)worst_ni,
+           worst_ni>=0?ani[worst_ni]:0.f, worst_ni>=0?bni[worst_ni]:0.f);
     // dump first 16 of each
-    printf("chain[0..15]:"); for (int i=0;i<16 && i<(int)a.size();++i) printf(" %.4f", a[i]); printf("\n");
-    printf("fused[0..15]:"); for (int i=0;i<16 && i<(int)b.size();++i) printf(" %.4f", b[i]); printf("\n");
-    return maxabs < 1e-5 ? 0 : 2;
+    printf("chain[0..15]:");    for (int i=0;i<16 && i<(int)a.size();++i)   printf(" %.4f", a[i]);   printf("\n");
+    printf("fused[0..15]:");    for (int i=0;i<16 && i<(int)b.size();++i)   printf(" %.4f", b[i]);   printf("\n");
+    printf("chain_ni[0..15]:"); for (int i=0;i<16 && i<(int)ani.size();++i) printf(" %.4f", ani[i]); printf("\n");
+    printf("fused_ni[0..15]:"); for (int i=0;i<16 && i<(int)bni.size();++i) printf(" %.4f", bni[i]); printf("\n");
+    return (maxabs < 1e-5 && maxabs_ni < 1e-5) ? 0 : 2;
 }

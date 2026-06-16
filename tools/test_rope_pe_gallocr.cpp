@@ -38,17 +38,44 @@ static ggml_tensor * apply_rope_chain(ggml_context * ctx, ggml_tensor * x, ggml_
     return x_out;
 }
 
+// Non-interleaved (NeoX / LTX video) chain replica.
+static ggml_tensor * apply_rope_chain_ni(ggml_context * ctx, ggml_tensor * x, ggml_tensor * pe) {
+    int64_t d_head = x->ne[0], n_head = x->ne[1], L = x->ne[2], N = x->ne[3];
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+    x = ggml_reshape_4d(ctx, x, d_head / 2, 2, L, n_head * N);
+    x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 3, 1, 2));  // torch_permute(0,2,3,1)
+    int64_t offset = x->nb[2] * x->ne[2];
+    ggml_tensor * x_0 = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 0);
+    ggml_tensor * x_1 = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], offset * 1);
+    x_0 = ggml_reshape_4d(ctx, x_0, 1, x_0->ne[0], x_0->ne[1], x_0->ne[2]);
+    x_1 = ggml_reshape_4d(ctx, x_1, 1, x_1->ne[0], x_1->ne[1], x_1->ne[2]);
+    ggml_tensor * temp_x = ggml_new_tensor_4d(ctx, x_0->type, 2, x_0->ne[1], x_0->ne[2], x_0->ne[3]);
+    x_0 = ggml_repeat(ctx, x_0, temp_x);
+    x_1 = ggml_repeat(ctx, x_1, temp_x);
+    pe = ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
+    offset = pe->nb[2] * pe->ne[2];
+    ggml_tensor * pe_0 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 0);
+    ggml_tensor * pe_1 = ggml_view_3d(ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], pe->nb[1], pe->nb[2], offset * 1);
+    ggml_tensor * x_out = ggml_add_inplace(ctx, ggml_mul(ctx, x_0, pe_0), ggml_mul(ctx, x_1, pe_1));
+    x_out = ggml_cont(ctx, ggml_permute(ctx, x_out, 1, 0, 2, 3));
+    x_out = ggml_reshape_3d(ctx, x_out, d_head, L, n_head * N);
+    return x_out;
+}
+
 // Build the consumer side that mirrors the real self_attn: split q_rope/k_rope
 // into cond+noise, cont, flash-attn each, concat, then a proj matmul. Returns
-// the proj output. `make_rope` selects fused or chain.
+// the proj output. `fused` selects fused op vs chain; `interleaved` selects the
+// interleaved (GPT-J) vs non-interleaved (NeoX / LTX video) RoPE variant.
 static ggml_tensor * build_attn(ggml_context * ctx, ggml_backend_t backend,
                                 ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
                                 ggml_tensor * pe, ggml_tensor * proj_w,
-                                bool fused) {
+                                bool fused, bool interleaved) {
     int64_t d_head = q->ne[0], n_head = q->ne[1], L = q->ne[2];
     int64_t HN = n_head;  // N==1
-    ggml_tensor * q_rope = fused ? ggml_rope_pe(ctx, q, pe) : apply_rope_chain(ctx, q, pe);
-    ggml_tensor * k_rope = fused ? ggml_rope_pe(ctx, k, pe) : apply_rope_chain(ctx, k, pe);
+    ggml_tensor * q_rope = fused ? (interleaved ? ggml_rope_pe(ctx, q, pe) : ggml_rope_pe_ni(ctx, q, pe))
+                                 : (interleaved ? apply_rope_chain(ctx, q, pe) : apply_rope_chain_ni(ctx, q, pe));
+    ggml_tensor * k_rope = fused ? (interleaved ? ggml_rope_pe(ctx, k, pe) : ggml_rope_pe_ni(ctx, k, pe))
+                                 : (interleaved ? apply_rope_chain(ctx, k, pe) : apply_rope_chain_ni(ctx, k, pe));
     // q_rope/k_rope: [d_head, L, HN]
     int64_t n_cond = 16;  // pretend cond-frame tokens
     int64_t L_noise = L - n_cond;
@@ -101,14 +128,20 @@ int main() {
     ggml_set_input(q); ggml_set_input(k); ggml_set_input(v);
     ggml_set_input(pe); ggml_set_input(pw);
 
-    ggml_tensor * out_chain = build_attn(ctx, backend, q, k, v, pe, pw, false);
+    ggml_tensor * out_chain = build_attn(ctx, backend, q, k, v, pe, pw, false, true);
     ggml_set_output(out_chain);
-    ggml_tensor * out_fused = build_attn(ctx, backend, q, k, v, pe, pw, true);
+    ggml_tensor * out_fused = build_attn(ctx, backend, q, k, v, pe, pw, true, true);
     ggml_set_output(out_fused);
+    ggml_tensor * out_chain_ni = build_attn(ctx, backend, q, k, v, pe, pw, false, false);
+    ggml_set_output(out_chain_ni);
+    ggml_tensor * out_fused_ni = build_attn(ctx, backend, q, k, v, pe, pw, true, false);
+    ggml_set_output(out_fused_ni);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
     ggml_build_forward_expand(gf, out_chain);
     ggml_build_forward_expand(gf, out_fused);
+    ggml_build_forward_expand(gf, out_chain_ni);
+    ggml_build_forward_expand(gf, out_fused_ni);
 
     // REAL allocator (gallocr) — this is what the render uses, NOT alloc_ctx_tensors.
     ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -137,12 +170,18 @@ int main() {
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { printf("compute failed\n"); return 1; }
 
-    std::vector<float> a(C*L), b(C*L);
+    std::vector<float> a(C*L), b(C*L), ani(C*L), bni(C*L);
     ggml_backend_tensor_get(out_chain, a.data(), 0, a.size()*sizeof(float));
     ggml_backend_tensor_get(out_fused, b.data(), 0, b.size()*sizeof(float));
+    ggml_backend_tensor_get(out_chain_ni, ani.data(), 0, ani.size()*sizeof(float));
+    ggml_backend_tensor_get(out_fused_ni, bni.data(), 0, bni.size()*sizeof(float));
     double maxabs=0; int64_t worst=-1; double suma=0,sumb=0;
     for (size_t i=0;i<a.size();++i){ double dd=fabs(a[i]-b[i]); if(dd>maxabs){maxabs=dd;worst=(int64_t)i;} suma+=fabs(a[i]); sumb+=fabs(b[i]); }
-    printf("UNDER GALLOCR: n=%zu max|chain-fused|=%.3e at %lld (chain=%.6f fused=%.6f) mean|a|=%.4f mean|b|=%.4f\n",
+    printf("UNDER GALLOCR [interleaved]:     n=%zu max|chain-fused|=%.3e at %lld (chain=%.6f fused=%.6f) mean|a|=%.4f mean|b|=%.4f\n",
            a.size(), maxabs, (long long)worst, worst>=0?a[worst]:0.f, worst>=0?b[worst]:0.f, suma/a.size(), sumb/b.size());
-    return maxabs < 1e-4 ? 0 : 2;
+    double maxabs_ni=0; int64_t worst_ni=-1; double suma_ni=0,sumb_ni=0;
+    for (size_t i=0;i<ani.size();++i){ double dd=fabs(ani[i]-bni[i]); if(dd>maxabs_ni){maxabs_ni=dd;worst_ni=(int64_t)i;} suma_ni+=fabs(ani[i]); sumb_ni+=fabs(bni[i]); }
+    printf("UNDER GALLOCR [non-interleaved]: n=%zu max|chain-fused|=%.3e at %lld (chain=%.6f fused=%.6f) mean|a|=%.4f mean|b|=%.4f\n",
+           ani.size(), maxabs_ni, (long long)worst_ni, worst_ni>=0?ani[worst_ni]:0.f, worst_ni>=0?bni[worst_ni]:0.f, suma_ni/ani.size(), sumb_ni/bni.size());
+    return (maxabs < 1e-4 && maxabs_ni < 1e-4) ? 0 : 2;
 }
