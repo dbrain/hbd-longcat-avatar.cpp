@@ -81,6 +81,10 @@ struct ServerRuntime {
     // The async worker routes img_gen jobs through worker->render_image(), and
     // /v1/admin/unload SIGKILLs the child. Null = legacy in-process (sd_ctx set).
     longcat_avatar::WorkerSession* worker = nullptr;
+    // LTXAV video-chain mode (LTX_VIDEO_ISOLATION). When true, the async worker routes
+    // VidGen jobs through worker->render_video_chain(job.vid_chain_request_json) (the chain
+    // runs in the CUDA child), instead of the in-process single-segment execute_vid_gen_job.
+    bool ltx_video_mode = false;
 };
 
 struct ImgGenJobRequest {

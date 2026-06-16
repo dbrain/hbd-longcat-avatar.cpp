@@ -174,17 +174,23 @@ public:
     // segment renders against freed GPU memory (illegal access). Set by the caller via
     // sd_ctx_keep_diffusion_model_resident() before a chained run.
     bool keep_diffusion_model_resident = false;
-    // Cached avatar text conditioning for chained segments: the prompt is constant
-    // across segments, but GPU-TE freed the umT5 weights after segment 0 to make room
-    // for the resident DiT, so segments 1+ cannot re-run the TE. Compute once, reuse.
-    bool avatar_text_cond_cached = false;
-    SDCondition avatar_cached_cond;
-    SDCondition avatar_cached_uncond;
-    // Prompt the avatar text cache was computed for. On a warm worker the umT5
-    // weights were freed (free_params_immediately), so a prompt change must RELOAD
-    // umT5 and recompute — a stale cache would silently ignore the new prompt.
-    std::string avatar_cached_prompt;
-    std::string avatar_cached_negative_prompt;
+    // Prompt-keyed text-conditioning cache for chained video segments. The avatar's
+    // constant-prompt path keeps a single entry (computed lazily on segment 0, reused
+    // thereafter). The LTX director chain pre-encodes EVERY distinct per-segment prompt
+    // up front (sd_ctx_precompute_chain_text_conds) in one TE residency window, so the
+    // resident DiT then runs as one uninterrupted phase with ZERO gemma encodes
+    // interleaved between segments. SDCondition holds owning sd::Tensor<float> host
+    // buffers, so cached copies never alias a reused encode buffer. Key =
+    // prompt + '\x1f' + negative_prompt (the negative is constant across a chain).
+    struct CachedTextCond {
+        SDCondition cond;
+        SDCondition uncond;
+        bool        has_uncond = false;
+    };
+    std::map<std::string, CachedTextCond> avatar_cond_cache;
+    static std::string text_cond_key(const std::string& prompt, const std::string& negative_prompt) {
+        return prompt + std::string(1, '\x1f') + negative_prompt;
+    }
     // Standalone umT5 reload support (Conditioner has no load_from_file): a ModelLoader
     // copy + the TE tensor subset captured at init, mirroring the deferred-DiT loader.
     // Lets reload_cond_stage_model() re-alloc the params buffer and refill it after the
@@ -1535,6 +1541,65 @@ public:
         LOG_INFO("avatar: umT5 reloaded for prompt change, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
+    }
+
+    // Pre-encode the text conditioning for a whole set of chained-segment prompts in ONE
+    // text-encoder residency window, populating avatar_cond_cache. The per-segment
+    // prepare_video_generation_embeds() calls then all hit the cache, so the resident DiT
+    // runs as one uninterrupted phase with NO gemma encode interleaved between segments
+    // (the snappy long-form path). The negative prompt is constant across a chain, so its
+    // uncond is encoded once and shared into every entry. After pre-encoding we free the
+    // TE on the deferred GPU-TE path (frees VRAM for the resident DiT) and bring the DiT
+    // onto the GPU once; under --mmap both are skipped (mmap'd weights are never freed and
+    // finalize_deferred_dit_load is a no-op). No-op unless this is an avatar/LTXAV resident
+    // chain with a conditioner.
+    void precompute_chain_text_conds(const std::vector<std::string>& prompts,
+                                     const std::string&              negative_prompt,
+                                     int                             clip_skip) {
+        if ((!sd_version_is_longcat_avatar(version) && version != VERSION_LTXAV) ||
+            !keep_diffusion_model_resident || !cond_stage_model) {
+            return;
+        }
+        if (!reload_cond_stage_model()) {
+            LOG_ERROR("LTXAV chain: TE reload failed; cannot pre-encode text conds");
+            return;
+        }
+        int64_t t0 = ggml_time_ms();
+        // Constant negative prompt across the chain -> encode its uncond once, share it.
+        SDCondition shared_uncond;
+        {
+            ConditionerParams cp;
+            cp.clip_skip       = clip_skip;
+            cp.zero_out_masked = true;
+            cp.text            = negative_prompt;
+            shared_uncond      = cond_stage_model->get_learned_condition(n_threads, cp);
+        }
+        int encoded = 0;
+        for (const auto& p : prompts) {
+            std::string key = text_cond_key(p, negative_prompt);
+            if (avatar_cond_cache.count(key)) {
+                continue;  // distinct prompt already encoded (or repeated across segments)
+            }
+            ConditionerParams cp;
+            cp.clip_skip       = clip_skip;
+            cp.zero_out_masked = true;
+            cp.text            = p;
+            CachedTextCond entry;
+            entry.cond             = cond_stage_model->get_learned_condition(n_threads, cp);
+            entry.uncond           = shared_uncond;
+            entry.has_uncond       = true;
+            avatar_cond_cache[key] = std::move(entry);
+            ++encoded;
+        }
+        LOG_INFO("LTXAV chain: pre-encoded %d distinct text cond(s) over %zu segment prompt(s) "
+                 "in one TE window, taking %.2fs",
+                 encoded, prompts.size(), (ggml_time_ms() - t0) * 1.0f / 1000);
+        // We now hold every cond; on the deferred GPU-TE path free the TE to give the
+        // resident DiT its VRAM back. Skipped under --mmap (weights are not freed).
+        if (free_params_immediately && dit_load_deferred) {
+            cond_stage_model->free_params_buffer();
+        }
+        finalize_deferred_dit_load();
     }
 
     // Hot-swap the diffusion model (DiT) weights in place from a different gguf,
@@ -5814,21 +5879,26 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     // freed (free_params_immediately), so a prompt change forces a reload + recompute;
     // an identical prompt (the common boilerplate case) reuses the cache with no reload
     // and no recompute.
-    bool avatar_resident = sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+    // Both the LongCat avatar AND LTXAV keep the DiT resident across chain segments and
+    // re-run the (expensive) text encode + projection each segment — so both benefit from
+    // the prompt-keyed cache + the up-front batch precompute. (VERSION_LTXAV is distinct
+    // from VERSION_LONGCAT_AVATAR, so the avatar-only predicate isn't enough here.)
+    bool        avatar_resident = (sd_version_is_longcat_avatar(sd_ctx->sd->version) ||
+                            sd_ctx->sd->version == VERSION_LTXAV) &&
                            sd_ctx->sd->keep_diffusion_model_resident;
-    bool prompt_matches  = sd_ctx->sd->avatar_text_cond_cached &&
-                           sd_ctx->sd->avatar_cached_prompt == request.prompt &&
-                           sd_ctx->sd->avatar_cached_negative_prompt == request.negative_prompt;
-    bool use_text_cache  = avatar_resident && prompt_matches;
+    std::string cache_key       = StableDiffusionGGML::text_cond_key(request.prompt, request.negative_prompt);
+    auto        cache_it        = avatar_resident ? sd_ctx->sd->avatar_cond_cache.find(cache_key)
+                                                  : sd_ctx->sd->avatar_cond_cache.end();
+    bool        use_text_cache  = (cache_it != sd_ctx->sd->avatar_cond_cache.end());
     if (use_text_cache) {
         LOG_INFO("avatar: reusing cached text conditioning (prompt unchanged)");
-        embeds.cond = sd_ctx->sd->avatar_cached_cond;
-        if (request.use_uncond) {
-            embeds.uncond = sd_ctx->sd->avatar_cached_uncond;
+        embeds.cond = cache_it->second.cond;
+        if (request.use_uncond && cache_it->second.has_uncond) {
+            embeds.uncond = cache_it->second.uncond;
         }
     } else {
-        if (avatar_resident && sd_ctx->sd->avatar_text_cond_cached) {
-            LOG_INFO("avatar: prompt changed, reloading umT5 to recompute conditioning");
+        if (avatar_resident && !sd_ctx->sd->avatar_cond_cache.empty()) {
+            LOG_INFO("avatar: prompt not in cache, reloading umT5 to recompute conditioning");
         }
         // umT5 may have been freed after the previous encode; reload before use.
         if (!sd_ctx->sd->reload_cond_stage_model()) {
@@ -5841,13 +5911,13 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
             embeds.uncond         = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                         condition_params);
         }
-        // Stash for subsequent renders before the TE is freed, keyed by prompt.
+        // Stash for subsequent renders before the TE is freed, keyed by prompt+negative.
         if (avatar_resident) {
-            sd_ctx->sd->avatar_cached_cond            = embeds.cond;
-            sd_ctx->sd->avatar_cached_uncond          = embeds.uncond;
-            sd_ctx->sd->avatar_cached_prompt          = request.prompt;
-            sd_ctx->sd->avatar_cached_negative_prompt = request.negative_prompt;
-            sd_ctx->sd->avatar_text_cond_cached       = true;
+            StableDiffusionGGML::CachedTextCond entry;
+            entry.cond                          = embeds.cond;
+            entry.uncond                        = embeds.uncond;
+            entry.has_uncond                    = request.use_uncond;
+            sd_ctx->sd->avatar_cond_cache[cache_key] = std::move(entry);
         }
     }
     embeds.cond.c_concat     = latents.concat_latent;
@@ -6742,10 +6812,248 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                              nullptr, nullptr, nullptr, nullptr, nullptr);
 }
 
+SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
+                                 const sd_vid_gen_params_t*   base_params,
+                                 const sd_vid_chain_params_t* chain_params,
+                                 sd_image_t**                 frames_out,
+                                 int*                         num_frames_out,
+                                 sd_audio_t**                 audio_out) {
+    if (frames_out != nullptr) {
+        *frames_out = nullptr;
+    }
+    if (num_frames_out != nullptr) {
+        *num_frames_out = 0;
+    }
+    if (audio_out != nullptr) {
+        *audio_out = nullptr;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || base_params == nullptr || chain_params == nullptr ||
+        frames_out == nullptr || num_frames_out == nullptr) {
+        LOG_ERROR("generate_video_chain: null argument");
+        return false;
+    }
+
+    const int n_chain = chain_params->n_segments;
+    if (n_chain < 1) {
+        LOG_ERROR("generate_video_chain: n_segments must be >= 1 (got %d)", n_chain);
+        return false;
+    }
+    int K = std::max(1, chain_params->cont_latent_frames);  // overlap latent frames
+
+    // LTX causal-VAE temporal: K latent frames decode to 1+(K-1)*8 pixel frames. That is
+    // the head overlap we drop on seg>0 (the prior tail's re-render).
+    int overlap_px = 1 + (K - 1) * 8;
+    if (overlap_px >= base_params->video_frames) {
+        LOG_ERROR("generate_video_chain: cont_latent_frames (%d -> %d overlap pixel frames) must leave "
+                  "new frames in video_frames (%d)",
+                  K, overlap_px, base_params->video_frames);
+        return false;
+    }
+    // LTXAV VIDEO latent channel count. generate_video_ex's returned latent packs AUDIO
+    // into trailing channels (Cl_full > video_channels); the next segment is fed ONLY the
+    // video channels. For LTXAV get_latent_channel()==128.
+    const int LTXAV_VIDEO_LATENT_CHANNELS = 128;
+    LOG_INFO("generate_video_chain: %d segments, K=%d overlap latent frames (%d overlap pixel frames dropped/seg>0)",
+             n_chain, K, overlap_px);
+
+    // Keep the DiT resident across segments (the TE is freed once by the GPU-TE deferred
+    // flow; the DiT must persist or later segments render against freed GPU memory).
+    sd_ctx_keep_diffusion_model_resident(sd_ctx, true);
+
+    // Pre-encode EVERY distinct per-segment prompt in one text-encoder window so the
+    // resident DiT chain runs uninterrupted (no per-segment gemma encode interleaved).
+    {
+        std::vector<std::string> eff_prompts;
+        eff_prompts.reserve(n_chain);
+        for (int seg = 0; seg < n_chain; ++seg) {
+            const char* p = (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[seg] != nullptr)
+                                ? chain_params->segment_prompts[seg]
+                                : base_params->prompt;
+            eff_prompts.emplace_back(p != nullptr ? p : "");
+        }
+        std::vector<const char*> cptrs;
+        cptrs.reserve(eff_prompts.size());
+        for (const auto& s : eff_prompts) {
+            cptrs.push_back(s.c_str());
+        }
+        sd_ctx_precompute_chain_text_conds(
+            sd_ctx, cptrs.data(), (int)cptrs.size(),
+            base_params->negative_prompt != nullptr ? base_params->negative_prompt : "",
+            base_params->clip_skip);
+    }
+
+    // Prior segment's captured video-channel-only latent tail, ggml-ne order
+    // [Wl, Hl, K, Cv] contiguous (W fastest, channel slowest), fed as cont_latent.
+    std::vector<float>      cont_buf;
+    std::vector<sd_image_t> stitched;   // adopts each kept frame's .data
+    sd_audio_t*             chain_audio = nullptr;
+
+    for (int seg = 0; seg < n_chain; ++seg) {
+        sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
+
+        if (seg == 0) {
+            vp.cont_latent        = nullptr;
+            vp.cont_latent_frames = 0;
+            vp.audio_frame_offset = 0;
+        } else {
+            // Clear the init image for seg>0: prepare_video_generation_latents checks the
+            // start image BEFORE the cont-latent branch, so a lingering init image would
+            // re-render i2v from the same portrait and ignore the continuation.
+            vp.init_image.data    = nullptr;
+            vp.cont_latent        = cont_buf.data();
+            vp.cont_latent_frames = K;
+            vp.audio_frame_offset = seg * (base_params->video_frames - overlap_px);
+        }
+        // distinct seed per segment so the noise frames differ
+        vp.seed = (base_params->seed < 0) ? base_params->seed : base_params->seed + seg;
+
+        // Per-segment prompt (director): this segment's line, or the base prompt.
+        if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[seg] != nullptr) {
+            vp.prompt = chain_params->segment_prompts[seg];
+            LOG_INFO("generate_video_chain seg %d prompt: %s", seg, vp.prompt);
+        }
+
+        // Per-segment lip-sync audio: chain_audio_dir/aud_<seg>.wav (16kHz mono). The
+        // string must outlive the generate call, so keep it loop-scoped.
+        std::string seg_audio_path;
+        if (chain_params->chain_audio_dir != nullptr && chain_params->chain_audio_dir[0] != '\0') {
+            seg_audio_path     = std::string(chain_params->chain_audio_dir) + "/aud_" + std::to_string(seg) + ".wav";
+            vp.drive_audio_path = seg_audio_path.c_str();
+            LOG_INFO("generate_video_chain seg %d drive-audio: %s", seg, seg_audio_path.c_str());
+        }
+
+        LOG_INFO("=== generate_video_chain segment %d/%d ===", seg + 1, n_chain);
+
+        // Optional: bank each segment's saved VIDEO latent so a single failing segment can
+        // be replayed standalone (via cont_latent_path) instead of re-running the chain.
+        std::string seg_save_path;
+        if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+            seg_save_path = std::string(chain_params->save_dir) + "/seg_" + std::to_string(seg) + ".bin";
+            setenv("LTXAV_SAVE_VIDEO_LATENT", seg_save_path.c_str(), 1);
+        }
+
+        sd_image_t* seg_video    = nullptr;
+        int         seg_count    = 0;
+        sd_audio_t* seg_audio    = nullptr;
+        float*      lat_out      = nullptr;
+        int         lw = 0, lh = 0, lt = 0, lc = 0;  // lc = FULL channel count (video + audio)
+        bool        want_latent  = (seg + 1 < n_chain);
+        if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
+                               want_latent ? &lat_out : nullptr,
+                               want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
+                               want_latent ? &lt : nullptr, want_latent ? &lc : nullptr)) {
+            LOG_ERROR("generate_video_chain segment %d failed", seg + 1);
+            free_sd_audio(seg_audio);
+            free(seg_video);
+            free(lat_out);
+            // Free everything collected so far.
+            for (auto& f : stitched) {
+                free(f.data);
+            }
+            free_sd_audio(chain_audio);
+            return false;
+        }
+
+        // Capture the LAST K latent frames + the first LTXAV_VIDEO_LATENT_CHANNELS VIDEO
+        // channels into cont_buf for the next segment. Returned latent layout is
+        // [Wl, Hl, Tl, Cl] contiguous (ggml-ne): index(w,h,t,c) = ((c*Tl + t)*Hl + h)*Wl + w.
+        // Audio lives in channels >= video_channels and is dropped here.
+        if (want_latent && lat_out != nullptr) {
+            int cv = std::min(LTXAV_VIDEO_LATENT_CHANNELS, lc);  // video channels to keep
+            if (cv < lc) {
+                LOG_INFO("generate_video_chain: latent has %d channels; keeping first %d as VIDEO (audio stripped)", lc, cv);
+            }
+            int keep = std::min(K, lt);  // last `keep` latent frames
+            if (keep < K) {
+                LOG_WARN("generate_video_chain: prior segment produced only %d latent frames (< K=%d); using %d", lt, K, keep);
+            }
+            size_t plane = (size_t)lw * lh;
+            cont_buf.assign(plane * (size_t)keep * (size_t)cv, 0.f);
+            for (int c = 0; c < cv; ++c) {
+                for (int nf = 0; nf < keep; ++nf) {
+                    int          src_t = lt - keep + nf;
+                    const float* src   = lat_out + ((size_t)c * lt + src_t) * plane;
+                    float*       dst   = cont_buf.data() + ((size_t)c * keep + nf) * plane;
+                    std::memcpy(dst, src, plane * sizeof(float));
+                }
+            }
+            K = keep;  // K passed to the next segment must equal the frames actually captured
+        }
+        free(lat_out);
+
+        // Stitch: seg0 keeps all frames; seg>0 drops the overlap head re-render.
+        int drop = (seg == 0) ? 0 : overlap_px;
+        if (drop > seg_count) {
+            drop = seg_count;
+        }
+        for (int i = 0; i < seg_count; ++i) {
+            if (i < drop) {
+                free(seg_video[i].data);  // discard re-rendered overlap frame
+            } else {
+                stitched.push_back(seg_video[i]);  // adopt ownership of .data
+            }
+        }
+        free(seg_video);
+
+        // Audio: keep seg0's only (per-segment absolute-timeline audio stitching is a
+        // follow-up; for a no-drive-audio chain seg0 carries the model's generated audio).
+        if (seg == 0 && seg_audio != nullptr && chain_audio == nullptr) {
+            chain_audio = seg_audio;
+        } else {
+            free_sd_audio(seg_audio);
+        }
+    }
+
+    const int total = (int)stitched.size();
+    LOG_INFO("generate_video_chain: stitched %d segments -> %d frames", n_chain, total);
+    if (total <= 0) {
+        free_sd_audio(chain_audio);
+        LOG_ERROR("generate_video_chain: no frames produced");
+        return false;
+    }
+
+    sd_image_t* out = (sd_image_t*)malloc((size_t)total * sizeof(sd_image_t));
+    if (out == nullptr) {
+        for (auto& f : stitched) {
+            free(f.data);
+        }
+        free_sd_audio(chain_audio);
+        LOG_ERROR("generate_video_chain: out-of-memory allocating result array");
+        return false;
+    }
+    for (int i = 0; i < total; ++i) {
+        out[i] = stitched[i];  // shallow copy; .data ownership transfers to the caller
+    }
+    *frames_out     = out;
+    *num_frames_out = total;
+    if (audio_out != nullptr) {
+        *audio_out = chain_audio;
+    } else {
+        free_sd_audio(chain_audio);
+    }
+    return true;
+}
+
 SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep) {
     if (sd_ctx != nullptr && sd_ctx->sd != nullptr) {
         sd_ctx->sd->keep_diffusion_model_resident = keep;
     }
+}
+
+SD_API void sd_ctx_precompute_chain_text_conds(sd_ctx_t*    sd_ctx,
+                                               const char** prompts,
+                                               int          n_prompts,
+                                               const char*  negative_prompt,
+                                               int          clip_skip) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || prompts == nullptr || n_prompts <= 0) {
+        return;
+    }
+    std::vector<std::string> ps;
+    ps.reserve(n_prompts);
+    for (int i = 0; i < n_prompts; ++i) {
+        ps.emplace_back(prompts[i] != nullptr ? prompts[i] : "");
+    }
+    sd_ctx->sd->precompute_chain_text_conds(ps, negative_prompt != nullptr ? negative_prompt : "", clip_skip);
 }
 
 SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path) {

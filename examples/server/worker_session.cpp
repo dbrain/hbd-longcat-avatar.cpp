@@ -254,6 +254,61 @@ ImageRenderResult WorkerSession::render_image(const std::string& request_json) {
     return result;
 }
 
+RenderResult WorkerSession::render_video_chain(const std::string& chain_json) {
+    RenderResult result;
+    if (!ensure_loaded()) {
+        result.error = last_error_;
+        return result;
+    }
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    uint32_t req_id = next_req_id_.fetch_add(1);
+
+    {
+        std::lock_guard<std::mutex> slk(send_mutex_);
+        auto err = send_frame(fd_, WorkerFrame::VIDGEN_CHAIN_REQ, req_id, chain_json);
+        if (err != IpcError::OK) {
+            result.error = std::string("VIDGEN_CHAIN_REQ send failed: ") + ipc_error_str(err);
+            kill_worker_locked();
+            last_error_ = result.error;
+            return result;
+        }
+    }
+    // Publish AFTER the send so an early cancel is a harmless no-op.
+    current_render_req_id_.store(req_id, std::memory_order_release);
+    struct CurrentRenderGuard {
+        std::atomic<uint32_t>& cur;
+        ~CurrentRenderGuard() { cur.store(0, std::memory_order_release); }
+    } current_render_guard{current_render_req_id_};
+
+    FrameHeader hdr{};
+    std::vector<uint8_t> resp_payload;
+    auto err = recv_frame(fd_, &hdr, &resp_payload);
+    if (err != IpcError::OK || hdr.type != (uint32_t)WorkerFrame::VIDGEN_CHAIN_RESP) {
+        result.error = std::string("VIDGEN_CHAIN_RESP recv failed: ") + ipc_error_str(err);
+        kill_worker_locked();
+        last_error_ = result.error;
+        return result;
+    }
+
+    std::string meta;
+    if (!unpack_render_response(resp_payload, &meta, &result.video_bytes)) {
+        result.error = "VIDGEN_CHAIN_RESP unpack failed";
+        return result;
+    }
+    try {
+        json m = json::parse(meta);
+        result.ok          = m.value("ok", false);
+        result.error       = m.value("error", "");
+        result.frame_count = m.value("frame_count", 0);
+        result.fps         = m.value("fps", 24);
+        result.render_sec  = m.value("render_sec", 0.0);
+    } catch (const std::exception& e) {
+        result.ok    = false;
+        result.error = std::string("VIDGEN_CHAIN_RESP meta parse: ") + e.what();
+    }
+    return result;
+}
+
 // ─── child-side dispatch loop ────────────────────────────────────────────────
 
 // Forward decl from main.cpp — the child re-parses CLI args the same way the
@@ -299,6 +354,20 @@ int run_worker_loop(int fd, int argc, const char** argv) {
         std::fprintf(stderr, "worker: failed to parse args\n");
         return 2;
     }
+
+    // The parent installs its sd log callback AFTER forking the worker, so the child
+    // starts with none — its LOG_INFO (model load, chain per-segment progress, the TE
+    // pre-encode line, stitch) would otherwise be dropped. Mirror the parent's callback
+    // so the worker's progress shows in the container logs. svr_params outlives the
+    // process (it's this frame's local; run_worker_loop returns only on shutdown).
+    log_verbose = svr_params.verbose;
+    log_color   = svr_params.color;
+    sd_set_log_callback(
+        [](enum sd_log_level_t level, const char* text, void* data) {
+            const SDSvrParams* sp = static_cast<const SDSvrParams*>(data);
+            log_print(level, text, sp->verbose, sp->color);
+        },
+        &svr_params);
 
     // free_params_immediately=TRUE: frees the umT5 text encoder (~5.7 GB host RAM)
     // right after the one-shot text encode. On the avatar vid_gen path this is the
@@ -579,6 +648,46 @@ int run_worker_loop(int fd, int argc, const char** argv) {
                 auto serr = send_frame(fd, WorkerFrame::IMG_GEN_RESP, hdr.req_id, meta.dump());
                 if (serr != IpcError::OK) {
                     fprintf(stderr, "worker: IMG_GEN_RESP send failed: %s\n",
+                            ipc_error_str(serr));
+                    return 1;
+                }
+                break;
+            }
+            case WorkerFrame::VIDGEN_CHAIN_REQ: {
+                // LTXAV multi-segment chain. Payload is the chain request JSON; the parent
+                // already wrote any per-segment aud_<i>.wav into the dir referenced by
+                // chain_audio_dir (shared /tmp). run_vid_chain_job rebuilds params + runs
+                // generate_video_chain + encodes the container.
+                std::string chain_json(payload.begin(), payload.end());
+                std::vector<uint8_t> video_bytes;
+                std::string out_mime, err_msg;
+                int  frame_count = 0;
+                int  fps         = 0;
+                auto t0          = std::chrono::steady_clock::now();
+                // Cancel coordination — mirrors RENDER_REQ so job-cancel / force-unload reach
+                // this render via the reader thread.
+                sd_clear_cancel();
+                ctrl.active_render_req_id.store(hdr.req_id, std::memory_order_release);
+                struct ChainActiveGuard {
+                    std::atomic<uint32_t>& active;
+                    ~ChainActiveGuard() { active.store(0, std::memory_order_release); }
+                } chain_active_guard{ctrl.active_render_req_id};
+
+                bool ok = run_vid_chain_job(child_runtime, chain_json, video_bytes, out_mime,
+                                            frame_count, fps, err_msg);
+                double render_sec = std::chrono::duration<double>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                json meta = {
+                    {"ok", ok},
+                    {"error", err_msg},
+                    {"frame_count", frame_count},
+                    {"fps", fps},
+                    {"render_sec", render_sec},
+                };
+                auto resp = pack_render_response(meta.dump(), video_bytes);
+                auto serr = send_frame(fd, WorkerFrame::VIDGEN_CHAIN_RESP, hdr.req_id, resp);
+                if (serr != IpcError::OK) {
+                    fprintf(stderr, "worker: VIDGEN_CHAIN_RESP send failed: %s\n",
                             ipc_error_str(serr));
                     return 1;
                 }

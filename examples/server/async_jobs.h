@@ -40,6 +40,11 @@ struct AsyncGenerationJob {
     // Raw /sdcpp/v1/img_gen body, kept so the worker-isolation path can forward
     // it verbatim to the CUDA child (which re-parses + renders). Empty in-process.
     std::string img_gen_request_json;
+    // LTXAV multi-segment chain request JSON (base gen-params + prompts[] + n_segments +
+    // cont_latent_frames + chain_audio_dir + inline base64 init image). Forwarded verbatim
+    // to the CUDA child in LTX worker-isolation mode, or consumed in-process via
+    // run_vid_chain_job(). Set for VidGen jobs submitted on the LTX /generate route.
+    std::string vid_chain_request_json;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;
@@ -79,6 +84,17 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          int& output_frame_count,
                          int& output_fps,
                          std::string& error_message);
+// Build params from an LTXAV chain request JSON and run generate_video_chain in-process on
+// runtime.sd_ctx, encoding the stitched frames to the requested container. Shared by the
+// worker child (VIDGEN_CHAIN_REQ) and the non-isolated in-process VidGen path. Holds
+// runtime.sd_ctx_mutex around the render. out_video is the encoded container bytes.
+bool run_vid_chain_job(ServerRuntime& runtime,
+                       const std::string& chain_request_json,
+                       std::vector<uint8_t>& out_video,
+                       std::string& out_mime,
+                       int& out_frame_count,
+                       int& out_fps,
+                       std::string& error_message);
 // Ensure the DiT variant required by `target_variant` ("base"|"edit") is resident
 // in sd_ctx, swapping (or reloading after an admin unload) if necessary. An empty
 // target_variant means "use whatever is loaded" — but if the model was unloaded by

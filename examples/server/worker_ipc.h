@@ -42,6 +42,14 @@ enum class WorkerFrame : uint32_t {
     // the in-process path. RESP payload is {ok,error,output_format,images:[b64]}.
     IMG_GEN_REQ  = 0x22,  // P->W  raw img_gen request JSON
     IMG_GEN_RESP = 0x23,  // W->P  {ok,error,output_format,images:[b64,...]}
+    // LTXAV multi-segment video chain (worker-isolated, async). Payload is the chain
+    // request JSON: base gen-params + segment prompts[] + n_segments + cont_latent_frames
+    // + chain_audio_dir (a /tmp dir of aud_<i>.wav the PARENT wrote — parent/child share
+    // the container fs) + init image as inline base64. The child re-parses it and runs
+    // generate_video_chain via the shared run_vid_chain_job(). RESP reuses the RENDER_RESP
+    // pack (json meta {ok,error,frame_count,fps,render_sec} + encoded video bytes).
+    VIDGEN_CHAIN_REQ  = 0x24,  // P->W  raw chain request JSON
+    VIDGEN_CHAIN_RESP = 0x25,  // W->P  packed render response (json + video)
     // CANCEL_REQ: parent asks the worker to abort the in-flight render. Empty
     // payload; hdr.req_id = the target render's req_id. The worker's reader thread
     // matches req_id against the active render and flips the cooperative cancel flag

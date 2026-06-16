@@ -452,6 +452,22 @@ typedef struct {
     sd_hires_params_t hires;
 } sd_vid_gen_params_t;
 
+// LTXAV in-process multi-segment chain. Renders n_segments video segments with the DiT
+// kept RESIDENT across all of them (no per-segment reload), each segment continuing from
+// the prior segment's video-latent tail (motion carry, in-memory float* — no disk/VAE
+// roundtrip), and stitches them into one continuous clip (dropping the re-rendered
+// overlap head of each segment>0). Per-segment prompts (the "director" layer) are
+// pre-encoded up front in ONE text-encoder window (sd_ctx_precompute_chain_text_conds) so
+// no gemma encode is interleaved between segments. Per-segment lip-sync audio, when
+// present, is read from chain_audio_dir/aud_<i>.wav (16kHz mono, absolute timeline).
+typedef struct {
+    int          n_segments;          // number of segments to render + stitch (>=1)
+    int          cont_latent_frames;  // K overlap latent frames carried between segments
+    const char** segment_prompts;     // n_segments entries; a NULL entry reuses base prompt
+    const char*  chain_audio_dir;     // dir with aud_<i>.wav per segment, or NULL (no lip-sync)
+    const char*  save_dir;            // optional: bank each seg's video latent to save_dir/seg_<i>.bin
+} sd_vid_chain_params_t;
+
 typedef struct sd_ctx_t sd_ctx_t;
 
 typedef void (*sd_log_cb_t)(enum sd_log_level_t level, const char* text, void* data);
@@ -538,10 +554,36 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* latent_frames_out,
                               int* latent_channels_out);
 
+// Render + stitch an LTXAV multi-segment chain (see sd_vid_chain_params_t). base_params is
+// the per-segment template; the chain overrides prompt / cont_latent / drive_audio / seed /
+// audio_frame_offset per segment. Internally flips keep_diffusion_model_resident on and
+// pre-encodes all segment prompts in one TE window. On success *frames_out is a malloc'd
+// array of *num_frames_out stitched frames (caller frees each frame's .data, then the
+// array) and *audio_out is the optional segment-0 / generated audio (free via
+// free_sd_audio). Returns false on any segment failure (partial outputs are freed).
+SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
+                                 const sd_vid_gen_params_t*   base_params,
+                                 const sd_vid_chain_params_t* chain_params,
+                                 sd_image_t**                 frames_out,
+                                 int*                         num_frames_out,
+                                 sd_audio_t**                 audio_out);
+
 // Keep the diffusion (and whisper) model params resident across back-to-back
 // generate_video[_ex] calls — required for LongCat-Avatar continuation chaining so
 // later segments don't render against freed GPU memory.
 SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep);
+
+// Pre-encode the text conditioning for a set of chained-segment prompts in ONE text-
+// encoder residency window (avatar/LTXAV resident chains only). Populates an internal
+// prompt-keyed cache so the per-segment renders all hit it, letting the resident DiT run
+// as one uninterrupted phase with no gemma encode interleaved between segments. The
+// negative prompt is constant across the chain (its uncond is encoded once and shared).
+// Call once, after sd_ctx_keep_diffusion_model_resident(true), before the segment loop.
+SD_API void sd_ctx_precompute_chain_text_conds(sd_ctx_t*    sd_ctx,
+                                               const char** prompts,
+                                               int          n_prompts,
+                                               const char*  negative_prompt,
+                                               int          clip_skip);
 
 // Hot-swap the diffusion (DiT) model weights in place from a different gguf,
 // reusing the existing backend + the resident VAE/text-encoder. Intended for the

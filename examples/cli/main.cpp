@@ -876,40 +876,9 @@ int main(int argc, const char* argv[]) {
                 // frames off the head of every seg>0 (the re-rendered overlap), append rest.
                 // ============================================================================
                 int n_chain = gen_params.ltx_chain_segments;
-                int K       = std::max(1, gen_params.cont_latent_take);  // overlap latent frames (--cont-latent-frames)
-
-                // LTX causal-VAE temporal: K latent frames decode to 1+(K-1)*8 pixel frames.
-                // That is the head overlap we drop on seg>0 (the prior tail's re-render).
-                int overlap_px = 1 + (K - 1) * 8;
-                if (overlap_px >= gen_params.video_frames) {
-                    LOG_ERROR("--cont-latent-frames (%d -> %d overlap pixel frames) must leave new frames in --video-frames (%d)",
-                              K, overlap_px, gen_params.video_frames);
-                    return 1;
-                }
-                // LTXAV VIDEO latent channel count. generate_video_ex's returned latent packs
-                // AUDIO into trailing channels (Cl_full > video_channels); we must feed the
-                // next segment ONLY the video channels. For LTXAV get_latent_channel()==128.
-                // There is no public API in main.cpp to query it, so it is hardcoded here with
-                // a guard against the returned Cl. *** VERIFY at build/test time against
-                // sd_ctx->sd->get_latent_channel() (src/stable-diffusion.cpp:2609). ***
-                const int LTXAV_VIDEO_LATENT_CHANNELS = 128;
-                LOG_INFO("LTXAV chain: %d segments, K=%d overlap latent frames (%d overlap pixel frames dropped/seg>0)",
-                         n_chain, K, overlap_px);
-
-                // Keep the DiT resident across segments (the TE is freed once by the GPU-TE
-                // deferred-load flow; the DiT must persist or later segments render against
-                // freed GPU memory).
-                sd_ctx_keep_diffusion_model_resident(sd_ctx.get(), true);
-
-                // Prior segment's captured video-channel-only latent tail, ggml-ne order
-                // [Wl, Hl, K, Cv] contiguous (W fastest, channel slowest), fed as cont_latent.
-                std::vector<float> cont_buf;
-
-                // Per-segment prompts (the "director" layer for the scripted long-form pipeline):
-                // one prompt per line in --ltx-chain-prompts, applied per segment (each ~4s beat
-                // its own prompt + physical direction). Fewer lines than segments reuses the last;
-                // empty reuses the single -p for every segment. Strings must outlive the loop
-                // (vid_gen_params.prompt is a const char* into this vector).
+                // Per-segment prompts (the "director" layer): one prompt per line in
+                // --ltx-chain-prompts. Fewer lines than segments reuses the last; empty
+                // reuses the single -p for every segment.
                 std::vector<std::string> seg_prompts;
                 if (!gen_params.ltx_chain_prompts_path.empty()) {
                     std::ifstream pf(gen_params.ltx_chain_prompts_path);
@@ -930,138 +899,51 @@ int main(int argc, const char* argv[]) {
                              seg_prompts.size(), gen_params.ltx_chain_prompts_path.c_str());
                 }
 
+                // Resolve per-segment prompt strings (fewer lines reuse the last; none =>
+                // NULL => generate_video_chain reuses the base -p). Storage must outlive the call.
+                std::vector<std::string> resolved_prompts;
+                resolved_prompts.reserve(n_chain);
                 for (int seg = 0; seg < n_chain; ++seg) {
-                    if (seg == 0) {
-                        vid_gen_params.cont_latent        = nullptr;
-                        vid_gen_params.cont_latent_frames = 0;
-                        vid_gen_params.audio_frame_offset = 0;
-                    } else {
-                        // CRITICAL: clear the init image for seg>0. prepare_video_generation_latents
-                        // checks `if (!start_image.empty())` (= init_image.data != nullptr) BEFORE the
-                        // cont-latent branches, so a lingering init image would make seg>0 re-render
-                        // i2v from the SAME portrait and IGNORE the continuation. Null the pointer in
-                        // our params copy (gen_params still owns the buffer; we don't free it).
-                        vid_gen_params.init_image.data    = nullptr;
-                        vid_gen_params.cont_latent        = cont_buf.data();
-                        vid_gen_params.cont_latent_frames = K;
-                        // TODO(audio): per-segment absolute-timeline audio slicing is a
-                        // follow-up. As a first cut, advance the offset by the new pixel
-                        // frames so a future audio path can window the global wav. UNVERIFIED
-                        // for LTXAV --drive-audio (left as a known gap; primary acceptance is
-                        // the VIDEO chain). The library currently encodes the full --drive-audio
-                        // wav per segment regardless of this offset.
-                        vid_gen_params.audio_frame_offset = seg * (gen_params.video_frames - overlap_px);
-                    }
-                    // distinct seed per segment so the noise frames differ
-                    vid_gen_params.seed = (gen_params.seed < 0) ? gen_params.seed : gen_params.seed + seg;
-
-                    // Per-segment prompt (director): this segment's line, or the last if fewer.
                     if (!seg_prompts.empty()) {
-                        const std::string& p = seg_prompts[std::min((size_t)seg, seg_prompts.size() - 1)];
-                        vid_gen_params.prompt = p.c_str();
-                        LOG_INFO("LTXAV chain seg %d prompt: %s", seg, p.c_str());
-                    }
-
-                    // Per-segment audio (lip-sync): point --drive-audio at this segment's pre-sliced
-                    // wav (aud_<seg>.wav) from --ltx-chain-audio-dir. The string must outlive the
-                    // generate call, so keep it in a loop-scoped std::string consumed synchronously.
-                    std::string seg_audio_path;
-                    if (!gen_params.ltx_chain_audio_dir.empty()) {
-                        seg_audio_path = gen_params.ltx_chain_audio_dir + "/aud_" + std::to_string(seg) + ".wav";
-                        vid_gen_params.drive_audio_path = seg_audio_path.c_str();
-                        LOG_INFO("LTXAV chain seg %d drive-audio: %s", seg, seg_audio_path.c_str());
-                    }
-
-                    LOG_INFO("=== LTXAV chain segment %d/%d ===", seg + 1, n_chain);
-
-                    // Debug: bank each segment's saved VIDEO latent to LTX_CHAIN_SAVE_DIR/seg_<n>.bin
-                    // so a single failing segment can be REPLAYED standalone from the REAL chain state
-                    // (via --cont-latent) instead of re-running the whole chain. Reuses the existing
-                    // LTXAV_SAVE_VIDEO_LATENT env, repointed per segment.
-                    std::string seg_save_path;
-                    if (const char* sdir = getenv("LTX_CHAIN_SAVE_DIR")) {
-                        seg_save_path = std::string(sdir) + "/seg_" + std::to_string(seg) + ".bin";
-                        setenv("LTXAV_SAVE_VIDEO_LATENT", seg_save_path.c_str(), 1);
-                    }
-
-                    sd_image_t* seg_video = nullptr;
-                    int         seg_count = 0;
-                    sd_audio_t* seg_audio = nullptr;
-                    // We always want the post-sampling latent back to seed the next segment.
-                    float* lat_out = nullptr;
-                    int    lw = 0, lh = 0, lt = 0, lc = 0;  // lc = FULL channel count (video + audio)
-                    bool   want_latent = (seg + 1 < n_chain);
-                    if (!generate_video_ex(sd_ctx.get(), &vid_gen_params, &seg_video, &seg_count, &seg_audio,
-                                           want_latent ? &lat_out : nullptr,
-                                           want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
-                                           want_latent ? &lt : nullptr, want_latent ? &lc : nullptr)) {
-                        LOG_ERROR("LTXAV chain segment %d failed", seg + 1);
-                        free_sd_audio(seg_audio);
-                        free(seg_video);
-                        free(lat_out);
-                        return 1;
-                    }
-
-                    // Capture the LAST K latent frames + the first LTXAV_VIDEO_LATENT_CHANNELS
-                    // VIDEO channels into cont_buf for the next segment. Returned latent layout
-                    // is [Wl, Hl, Tl, Cl] contiguous (ggml-ne): index(w,h,t,c) =
-                    // ((c*Tl + t)*Hl + h)*Wl + w. We copy per (c, frame) plane. Audio lives in
-                    // channels >= video_channels and is dropped here.
-                    if (want_latent && lat_out != nullptr) {
-                        int cv = std::min(LTXAV_VIDEO_LATENT_CHANNELS, lc);  // video channels to keep
-                        if (cv < lc) {
-                            LOG_INFO("LTXAV chain: returned latent has %d channels; keeping first %d as VIDEO (audio stripped)", lc, cv);
-                        } else if (cv == lc) {
-                            // No audio channels detected — unexpected for LTXAV; proceed with all.
-                            LOG_INFO("LTXAV chain: returned latent has %d channels (== video channels); no audio to strip", lc);
-                        }
-                        int keep = std::min(K, lt);  // last `keep` latent frames
-                        if (keep < K) {
-                            LOG_WARN("LTXAV chain: prior segment produced only %d latent frames (< K=%d); using %d", lt, K, keep);
-                        }
-                        size_t plane = (size_t)lw * lh;
-                        cont_buf.assign(plane * (size_t)keep * (size_t)cv, 0.f);
-                        for (int c = 0; c < cv; ++c) {
-                            for (int nf = 0; nf < keep; ++nf) {
-                                int          src_t = lt - keep + nf;
-                                const float* src   = lat_out + ((size_t)c * lt + src_t) * plane;
-                                // dst layout [Wl, Hl, keep, cv]: index = (c*keep + nf)*plane + p
-                                float*       dst   = cont_buf.data() + ((size_t)c * keep + nf) * plane;
-                                std::memcpy(dst, src, plane * sizeof(float));
-                            }
-                        }
-                        // K passed to the next segment must equal the frames actually captured.
-                        K = keep;
-                    }
-                    free(lat_out);
-
-                    // Stitch: seg0 keeps all frames; seg>0 drops the overlap head re-render.
-                    int drop = (seg == 0) ? 0 : overlap_px;
-                    if (drop > seg_count) {
-                        drop = seg_count;
-                    }
-                    for (int i = 0; i < seg_count; ++i) {
-                        if (i < drop) {
-                            free(seg_video[i].data);  // discard re-rendered overlap frame
-                        } else {
-                            results.push_back(seg_video[i]);  // adopt ownership
-                        }
-                    }
-                    free(seg_video);
-
-                    // Audio: keep seg0's audio only for now (per-segment absolute-timeline
-                    // stitching is the audio follow-up). Free later segments' audio so it is
-                    // not leaked. For a no-drive-audio video chain, seg_audio is the model's
-                    // own generated audio; we keep seg0's so the clip is not silent.
-                    if (seg == 0 && seg_audio != nullptr && generated_audio == nullptr) {
-                        generated_audio = seg_audio;
+                        resolved_prompts.push_back(seg_prompts[std::min((size_t)seg, seg_prompts.size() - 1)]);
                     } else {
-                        free_sd_audio(seg_audio);
+                        resolved_prompts.emplace_back();  // empty -> NULL ptr below -> base prompt
                     }
                 }
+                std::vector<const char*> prompt_ptrs;
+                prompt_ptrs.reserve(n_chain);
+                for (const auto& s : resolved_prompts) {
+                    prompt_ptrs.push_back(s.empty() ? nullptr : s.c_str());
+                }
 
-                num_results = (int)results.size();
-                LOG_INFO("LTXAV chain: stitched %d segments -> %d frames", n_chain, num_results);
+                std::string save_dir;
+                if (const char* sdir = getenv("LTX_CHAIN_SAVE_DIR")) {
+                    save_dir = sdir;
+                }
+
+                // The whole chain (resident DiT, in-memory latent carry, prompts pre-encoded
+                // in one TE window, per-segment lip-sync audio, stitch) lives in the library so
+                // the CLI and the worker-isolated server share one implementation.
+                sd_vid_chain_params_t chain_params = {};
+                chain_params.n_segments         = n_chain;
+                chain_params.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
+                chain_params.segment_prompts    = prompt_ptrs.data();
+                chain_params.chain_audio_dir    = gen_params.ltx_chain_audio_dir.empty()
+                                                      ? nullptr
+                                                      : gen_params.ltx_chain_audio_dir.c_str();
+                chain_params.save_dir           = save_dir.empty() ? nullptr : save_dir.c_str();
+
+                sd_image_t* chain_frames = nullptr;
+                int         chain_count  = 0;
+                sd_audio_t* chain_audio  = nullptr;
+                if (!generate_video_chain(sd_ctx.get(), &vid_gen_params, &chain_params,
+                                          &chain_frames, &chain_count, &chain_audio)) {
+                    LOG_ERROR("LTXAV chain failed");
+                    return 1;
+                }
+                results.adopt(chain_frames, chain_count);
+                num_results     = chain_count;
+                generated_audio = chain_audio;
             } else if (n_segments > 1) {
                 // LongCat-Avatar continuation chaining: render N segments, each
                 // conditioned on the prior segment's LATENT tail (no decode/re-encode

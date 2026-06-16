@@ -270,6 +270,110 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     return true;
 }
 
+bool run_vid_chain_job(ServerRuntime& runtime,
+                       const std::string& chain_request_json,
+                       std::vector<uint8_t>& out_video,
+                       std::string& out_mime,
+                       int& out_frame_count,
+                       int& out_fps,
+                       std::string& error_message) {
+    json body;
+    try {
+        body = json::parse(chain_request_json);
+    } catch (const std::exception& e) {
+        error_message = std::string("chain request JSON parse: ") + e.what();
+        return false;
+    }
+
+    // Base per-segment generation params: defaults + request JSON (loads inline base64
+    // init_image, W/H/fps/steps/cfg/sampler/scheduler/seed/negative, and the chain knobs
+    // ltx_chain_segments + cont_latent_frames).
+    SDGenerationParams gen_params = *runtime.default_gen_params;
+    if (!gen_params.from_json_str(body.dump())) {
+        error_message = "invalid generation parameters";
+        return false;
+    }
+    if (!gen_params.resolve_and_validate(VID_GEN, runtime.ctx_params->lora_model_dir,
+                                         runtime.ctx_params->hires_upscalers_dir, true)) {
+        error_message = "invalid generation parameters (resolve_and_validate)";
+        return false;
+    }
+
+    int n_segments = std::max(1, gen_params.ltx_chain_segments);
+
+    // Per-segment prompts (the director layer): a JSON array. Fewer than n_segments reuses
+    // the last; none reuses the base prompt. Storage must outlive the chain call.
+    std::vector<std::string> seg_prompts;
+    if (body.contains("prompts") && body["prompts"].is_array()) {
+        for (const auto& p : body["prompts"]) {
+            if (p.is_string()) {
+                seg_prompts.push_back(p.get<std::string>());
+            }
+        }
+    }
+    std::vector<std::string> resolved_prompts;
+    resolved_prompts.reserve(n_segments);
+    for (int seg = 0; seg < n_segments; ++seg) {
+        if (!seg_prompts.empty()) {
+            resolved_prompts.push_back(seg_prompts[std::min((size_t)seg, seg_prompts.size() - 1)]);
+        } else {
+            resolved_prompts.emplace_back();
+        }
+    }
+    std::vector<const char*> prompt_ptrs;
+    prompt_ptrs.reserve(n_segments);
+    for (const auto& s : resolved_prompts) {
+        prompt_ptrs.push_back(s.empty() ? nullptr : s.c_str());
+    }
+
+    // Per-segment lip-sync audio dir (aud_<i>.wav), written by the parent route handler.
+    std::string audio_dir     = body.value("chain_audio_dir", std::string());
+    std::string output_format = body.value("output_format", std::string("webm"));
+    int         output_compression = body.value("output_compression", 90);
+
+    sd_vid_gen_params_t base = gen_params.to_sd_vid_gen_params_t();
+
+    sd_vid_chain_params_t chain = {};
+    chain.n_segments         = n_segments;
+    chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
+    chain.segment_prompts    = prompt_ptrs.data();
+    chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
+    chain.save_dir           = nullptr;
+
+    sd_image_t* frames      = nullptr;
+    int         frame_count = 0;
+    sd_audio_t* audio       = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
+        if (!generate_video_chain(runtime.sd_ctx, &base, &chain, &frames, &frame_count, &audio)) {
+            error_message = "generate_video_chain failed";
+            return false;
+        }
+    }
+    if (frame_count <= 0 || frames == nullptr) {
+        free_sd_audio(audio);
+        error_message = "generate_video_chain produced no frames";
+        return false;
+    }
+
+    out_video = create_video_from_sd_images_to_vector(output_format, frames, frame_count,
+                                                      gen_params.fps, output_compression, audio);
+    for (int i = 0; i < frame_count; ++i) {
+        free(frames[i].data);
+    }
+    free(frames);
+    free_sd_audio(audio);
+
+    if (out_video.empty()) {
+        error_message = "failed to encode generated video container";
+        return false;
+    }
+    out_mime        = video_mime_type(output_format);
+    out_frame_count = frame_count;
+    out_fps         = gen_params.fps;
+    return true;
+}
+
 bool ensure_variant_loaded(ServerRuntime& runtime,
                            const std::string& target_variant,
                            std::string& error_message) {
@@ -390,9 +494,32 @@ void async_job_worker(ServerRuntime& runtime) {
                 ok = execute_img_gen_job(runtime, *job, output_images, error_message);
             }
         } else if (job->kind == AsyncJobKind::VidGen && runtime.worker) {
-            // Image-isolation parent has no sd_ctx; video gen is the avatar
-            // server's job, not flux2's. koblem never sends vid_gen here.
-            error_message = "vid_gen not supported under flux2 image isolation";
+            if (runtime.ltx_video_mode && !job->vid_chain_request_json.empty()) {
+                // LTXAV multi-segment chain in the CUDA-owning child. The child re-parses
+                // the chain request and runs generate_video_chain via run_vid_chain_job.
+                longcat_avatar::RenderResult r =
+                    runtime.worker->render_video_chain(job->vid_chain_request_json);
+                ok            = r.ok;
+                error_message = r.error;
+                if (ok) {
+                    output_media_b64       = base64_encode(r.video_bytes);
+                    output_media_mime_type = video_mime_type(job->vid_gen.output_format);
+                    output_frame_count     = r.frame_count;
+                    output_fps             = r.fps;
+                }
+            } else {
+                // flux2 image-isolation parent has no sd_ctx and isn't an LTX video server.
+                error_message = "vid_gen not supported under flux2 image isolation";
+            }
+        } else if (job->kind == AsyncJobKind::VidGen && !job->vid_chain_request_json.empty()) {
+            // In-process LTXAV chain (no worker isolation).
+            std::vector<uint8_t> video_bytes;
+            ok = run_vid_chain_job(runtime, job->vid_chain_request_json, video_bytes,
+                                   output_media_mime_type, output_frame_count, output_fps,
+                                   error_message);
+            if (ok) {
+                output_media_b64 = base64_encode(video_bytes);
+            }
         } else if (job->kind == AsyncJobKind::VidGen) {
             ok = execute_vid_gen_job(runtime,
                                      *job,

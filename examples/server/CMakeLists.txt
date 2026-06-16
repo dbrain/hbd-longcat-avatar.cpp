@@ -75,6 +75,7 @@ add_executable(${TARGET}
     routes_sdapi.cpp
     routes_sdcpp.cpp
     routes_longcat.cpp
+    routes_ltx.cpp
     worker_ipc.cpp
     worker_session.cpp
 )

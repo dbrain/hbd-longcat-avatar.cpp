@@ -66,6 +66,13 @@ public:
     // current_render_req_id_ machinery as render(), so cancel_in_flight() works.
     ImageRenderResult render_image(const std::string& request_json);
 
+    // Drive an LTXAV multi-segment video chain through the worker. `chain_json` is the
+    // chain request (base gen-params + prompts[] + n_segments + cont_latent_frames +
+    // chain_audio_dir + inline base64 init image). The child re-parses it and runs
+    // generate_video_chain via run_vid_chain_job. Same io_mutex_ + cancel machinery as
+    // render(); result.video_bytes is the encoded container (webm).
+    RenderResult render_video_chain(const std::string& chain_json);
+
     // Send CANCEL_REQ to the worker for the currently in-flight render.
     // Idempotent: no-op if no render is in flight (current_render_req_id_==0).
     // Safe to call from another thread WHILE render() holds io_mutex_ in its
