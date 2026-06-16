@@ -1,0 +1,38 @@
+# UltraShape-1.0 refiner (image + coarse mesh -> refined, watertight, detail-added mesh) in one image.
+# Refine-only deps (pytorch3d/torch_cluster are "optional" per README, but the refine import chain DOES
+# use torch_cluster + cubvh + flash_attn + sageattention + diso — pytorch3d is genuinely skippable).
+# devel base provides nvcc + CUDA_HOME so flash_attn/cubvh/sageattention build (host can't).
+# Build context = this shootout/ dir (COPYs ultrashape_requirements.txt):
+#   docker build -f Dockerfile.ultrashape -t ultrashape .
+# Run (refine; GPU). Mount /mnt/hdd; weights + repo + io under it:
+#   docker run --rm --gpus all -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -v /mnt/hdd/3d/avatar-shootout:/work ultrashape \
+#     bash -c 'cd /work/UltraShape-1.0 && python3 scripts/infer_dit_refine.py --config configs/infer_dit_refine.yaml \
+#       --ckpt /work/_weights/ultrashape/ultrashape_v1.pt --image <matte.png> --mesh <coarse.glb> --output_dir <out> --low_vram'
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=6 PATH=/usr/local/cuda/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-dev python3-pip git build-essential ninja-build \
+      libgl1 libglib2.0-0 libegl1 libgles2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir -U pip wheel setuptools
+
+# torch 2.5.1 + cu121 (UltraShape README); torch_cluster prebuilt pt25cu121 cp310 wheel
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+      --index-url https://download.pytorch.org/whl/cu121
+RUN pip install --no-cache-dir \
+      https://data.pyg.org/whl/torch-2.5.0+cu121/torch_cluster-1.6.3+pt25cu121-cp310-cp310-linux_x86_64.whl
+COPY ultrashape_requirements.txt /tmp/req.txt
+RUN pip install --no-cache-dir -r /tmp/req.txt
+# host C++ ext compiles (diso) need cuda_runtime.h on the include path (CUDA_HOME alone isn't enough);
+# placed after the cached torch/req layers so only the CUDA-ext builds below rerun.
+ENV CPATH=/usr/local/cuda/include LIBRARY_PATH=/usr/local/cuda/lib64
+# source-built deps that need torch at build time (pip build isolation hides it -> --no-build-isolation)
+RUN pip install --no-cache-dir diso==0.1.4 sageattention==1.0.6 --no-build-isolation
+# CUDA exts that need nvcc/CUDA_HOME (fail on the host): flash-attn + cubvh (MC accel)
+RUN pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation
+RUN pip install --no-cache-dir "git+https://github.com/ashawkey/cubvh" --no-build-isolation
+
+WORKDIR /work
+CMD ["bash"]

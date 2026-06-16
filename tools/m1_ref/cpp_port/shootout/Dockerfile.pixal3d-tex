@@ -1,0 +1,47 @@
+# Native mesh texturing via the pixal3d repo's Trellis2TexturingPipeline (a TRELLIS.2 fine-tune).
+# Textures a PROVIDED mesh (UltraShape / 69k) from a reference image: voxelize -> shape_slat_encoder ->
+# image+shape -> tex flow -> tex decoder -> bake onto the mesh's OWN voxels (no reproject, no topology
+# bleed). Weights = microsoft/TRELLIS.2-4B texturing set (the only release that ships the shape ENCODER;
+# Tencent/Pixal3D omits it). The whole env is PREBUILT WHEELS (no nvcc compile) per setup_pixal3d.sh.
+# Sibling image (NOT shared with ultrashape: that's torch2.5.1/cu121, this is torch2.6/cu124 + TRELLIS exts).
+#   build:  docker build -f Dockerfile.pixal3d-tex -t pixal3d-tex .
+#   run:    ./pixal3d_tex_run.sh <mesh.glb> <image_rgba.png> <out.glb>   (see that script)
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive PATH=/usr/local/cuda/bin:$PATH \
+    HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.10 python3.10-dev python3-pip git \
+      libgl1 libglib2.0-0 libegl1 libgles2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir -U pip wheel setuptools
+
+# torch 2.6.0 + cu124 (the wheels below are built for torch2.6cu124/cp310)
+RUN pip install --no-cache-dir torch==2.6.0 torchvision==0.21.0 --extra-index-url https://download.pytorch.org/whl/cu124
+
+# core python deps (transformers==4.57.3 carries DINOv3ViTModel, needed by the image cond model)
+RUN pip install --no-cache-dir \
+      pillow==12.0.0 imageio==2.37.2 imageio-ffmpeg==0.6.0 tqdm==4.67.1 easydict==1.13 \
+      opencv-python-headless==4.12.0.88 trimesh==4.10.1 transformers==4.57.3 zstandard==0.25.0 \
+      kornia==0.8.2 timm==1.0.22 diffusers==0.37.1 accelerate==1.13.0 plyfile==1.1.3 triton==3.2.0 \
+      huggingface_hub
+
+# prebuilt CUDA wheels: TRELLIS.2 sparse/voxel/mesh exts (natten DiT attn, cumesh bake/uv, o_voxel
+# mesh->dual-grid, flex_gemm sparse grid_sample, nvdiffrast raster, utils3d). Built for H-series; run sm_86.
+RUN pip install --no-cache-dir \
+      "https://github.com/LDYang694/Storages/releases/download/20260430/natten-0.21.0+torch2.6cu124-cp310-cp310-linux_x86_64.whl" \
+      "https://github.com/JeffreyXiang/Storages/releases/download/Space_Wheels_251210/cumesh-0.0.1-cp310-cp310-linux_x86_64.whl" \
+      "https://github.com/JeffreyXiang/Storages/releases/download/Space_Wheels_251210/flex_gemm-0.0.1-cp310-cp310-linux_x86_64.whl" \
+      "https://github.com/JeffreyXiang/Storages/releases/download/Space_Wheels_251210/o_voxel-0.0.1-cp310-cp310-linux_x86_64.whl" \
+      "https://github.com/JeffreyXiang/Storages/releases/download/Space_Wheels_251210/nvdiffrast-0.4.0-cp310-cp310-linux_x86_64.whl" \
+      "https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl"
+
+# o_voxel + flex_gemm JIT through Triton at import -> need a host C compiler at runtime (the runtime base
+# has none). Late layer so the torch/wheels layers stay cached. (Attention backend = sdpa at run time, set
+# via ATTN_BACKEND=sdpa in the run script, so flash_attn is not required.)
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=gcc CXX=g++
+
+WORKDIR /work
+CMD ["bash"]

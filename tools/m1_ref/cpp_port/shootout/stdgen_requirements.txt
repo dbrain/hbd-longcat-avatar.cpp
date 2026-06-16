@@ -1,0 +1,25 @@
+# StdGEN requirements (verbatim repo pins) MINUS pytorch3d (built no-build-isolation in the
+# Dockerfile). torch/torchvision/xformers/torch-scatter installed earlier in the Dockerfile.
+omegaconf
+rm_anime_bg
+diffusers==0.27.2
+transformers==4.42.4
+einops
+huggingface_hub==0.25.0
+opencv-python
+accelerate
+matplotlib
+kornia
+imageio
+imageio-ffmpeg
+xatlas
+trimesh
+rembg
+onnxruntime
+scikit-learn
+pygltflib
+pymeshlab
+pytorch_lightning
+git+https://github.com/NVlabs/nvdiffrast
+git+https://github.com/Baijiong-Lin/LoRA-Torch
+git+https://github.com/facebookresearch/segment-anything.git

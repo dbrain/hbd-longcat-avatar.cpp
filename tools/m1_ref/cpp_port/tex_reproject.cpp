@@ -60,6 +60,33 @@ int main(int argc,char**argv){
     std::vector<int32_t> coords((int32_t*)pc.data(),(int32_t*)pc.data()+NP*4);
     printf("[rp] QEM %zu v / %zu f | DENSE %zu v / %zu f | PBR %zu voxels | TS=%d\n", NVq,NFq,NVd,NFd,NP,TS);
 
+    // RP_CANON_TO_DENSE: the AUTOMATED single-coordinate-frame fix. When the bake TARGET (dump_mesh =
+    // qverts) comes from a different frame than the colour source (dump_dense = dverts) — e.g. the final
+    // 69k routed through UltraShape (which re-emits in its own marching-cubes box_v=1.0 frame) — its verts
+    // don't sit on the dense shell, so the closest-point snap misses (was 97.8% inpaint). UltraShape's
+    // transform is empirically a pure CENTER + UNIFORM-SCALE (no rotation: per-axis bbox-extent ratios
+    // match to <2%, axis assignment preserved), so we reconcile it by matching the qverts bbox-centre +
+    // uniform scale onto the dverts bbox — computed from BOTH meshes at runtime, zero hand-typed numbers.
+    // This carries the pipeline into the dump frame by construction; the bake (target+source now coincident)
+    // needs no alignment. Off by default so the native pixal3d --tex path (target already in dump frame) is
+    // unchanged.
+    if (getenv("RP_CANON_TO_DENSE") && NVq && NVd) {
+        auto bbox=[](const std::vector<float>& v, size_t n, float* lo, float* hi){
+            for (int k=0;k<3;k++){ lo[k]= 1e30f; hi[k]=-1e30f; }
+            for (size_t i=0;i<n;i++) for (int k=0;k<3;k++){ float x=v[i*3+k]; if(x<lo[k])lo[k]=x; if(x>hi[k])hi[k]=x; } };
+        float qlo[3],qhi[3],dlo[3],dhi[3];
+        bbox(qverts,NVq,qlo,qhi); bbox(dverts,NVd,dlo,dhi);
+        float qc[3],dc[3],qe[3],de[3];
+        for (int k=0;k<3;k++){ qc[k]=0.5f*(qlo[k]+qhi[k]); dc[k]=0.5f*(dlo[k]+dhi[k]); qe[k]=qhi[k]-qlo[k]; de[k]=dhi[k]-dlo[k]; }
+        // uniform scale = ratio of bbox DIAGONAL lengths (robust to the small per-axis refine drift).
+        double qd=std::sqrt((double)qe[0]*qe[0]+(double)qe[1]*qe[1]+(double)qe[2]*qe[2]);
+        double dd=std::sqrt((double)de[0]*de[0]+(double)de[1]*de[1]+(double)de[2]*de[2]);
+        float s=(qd>1e-12)?(float)(dd/qd):1.f;
+        for (size_t i=0;i<NVq;i++) for (int k=0;k<3;k++) qverts[i*3+k]=(qverts[i*3+k]-qc[k])*s+dc[k];
+        printf("[rp] RP_CANON_TO_DENSE: target -> dense frame  (scale %.4f, per-axis ext ratio [%.3f %.3f %.3f])\n",
+               s, de[0]/qe[0], de[1]/qe[1], de[2]/qe[2]);
+    }
+
     // colour the DENSE verts: 6-ch grid_sample at each vertex (on the shell → trilinear exact; small
     // fallback for any sub-voxel-off vert). This is the full-saturation, smooth source-of-truth.
     int fbr = getenv("VCOLOR_FB")?atoi(getenv("VCOLOR_FB")):12;
@@ -138,6 +165,10 @@ int main(int argc,char**argv){
         printf("[rp] bake target = QEM(dense) %zu -> %zu faces (aggr %.1f, %.2fs)\n", NFd, qf2.size()/3, aggr, texatlas::_now()-tq);
     } else if (texmf>0){ tv=&dverts; tf=&dfaces; decim=texmf; printf("[rp] bake target = DENSE sloppy-decimated to %d faces\n", texmf); }
     bool reproject = getenv("RP_OFF") ? false : true;
+    // RP_CANON_TO_DENSE bakes onto a DECIMATED, canonicalised target (the 69k) whose verts no longer sit
+    // on the sparse PBR shell voxels — direct grid_sample then misses most texels. Force the closest-point
+    // reproject (snap each texel onto the dense shell → read its colour), the path built for exactly this.
+    if (getenv("RP_CANON_TO_DENSE")) reproject = true;
     int bake_fbr = getenv("TEX_FBR") ? atoi(getenv("TEX_FBR")) : 16;
     texatlas::BakedTexture bt=texatlas::bake(*tv,*tf,pbr,coords,1024,TS,decim,pad,true,bake_fbr,
                                              precl,cone, &dverts,&dfaces,&dattr,reproject);

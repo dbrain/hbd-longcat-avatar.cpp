@@ -5,3 +5,10 @@
 !*.sh
 !*.py
 !.gitignore
+# shootout/ geometry-eval prep (scripts + docker config only; outputs live on /mnt/hdd, not here)
+!shootout/
+!shootout/*.sh
+!shootout/*.py
+!shootout/*.txt
+!shootout/Dockerfile*
+!shootout/*.requirements.txt
