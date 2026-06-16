@@ -840,7 +840,25 @@ public:
                 }
             }
 
-            cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
+            // LONGCAT_ENCODE_MAX_VRAM: give the text encoder (cond stage) its own,
+            // typically lower, graph-cut budget. The encoder runs in its own phase
+            // (gemma is freed before the DiT), and its graph-cut greedily fills the
+            // budget with resident weights — so at the shared --max-vram it parks the
+            // render peak at the ceiling even though the DiT/VAE phases sit well under
+            // it (LTX 1280x704: encode 7504 vs DiT 6832 vs VAE 4914). Capping the encode
+            // near the DiT peak drops the overall peak to DiT-bound (~700 MB headroom)
+            // with the DiT still at full --max-vram speed. Pairs with LTX_TEXT_MINLEN
+            // (smaller N^2 activation => cheaper low-budget encode). GiB; <=0/unset keeps
+            // the shared budget.
+            size_t cond_graph_vram_bytes = max_graph_vram_bytes;
+            if (const char* e = getenv("LONGCAT_ENCODE_MAX_VRAM")) {
+                float enc_gib = (float)atof(e);
+                if (enc_gib > 0.f) {
+                    cond_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(enc_gib);
+                    LOG_INFO("LONGCAT_ENCODE_MAX_VRAM: text-encoder graph budget = %.2f GiB (DiT keeps %.2f)", enc_gib, max_vram);
+                }
+            }
+            cond_stage_model->set_max_graph_vram_bytes(cond_graph_vram_bytes);
             get_param_tensors(cond_stage_model, module_can_mmap(SDBackendModule::TE));
 
             diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
