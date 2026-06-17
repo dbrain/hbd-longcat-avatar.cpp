@@ -2,13 +2,120 @@
 
 #include "async_jobs.h"
 
+#include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 #include "common/log.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 #include "worker_session.h"
+
+namespace {
+
+// Background writer that banks a viewable per-segment webm (save_dir/seg_<i>.webm) as the
+// chain produces each segment, OFF the GPU sampling thread (encoding inline would stall
+// sampling — costly under swap). Strictly bounded to one segment's frames in flight via a
+// busy flag: the chain's on_segment callback blocks until the prior encode drains, so the
+// extra RAM is ~one segment of decoded frames, never an unbounded pile. The banked webm is
+// a partial-preview artifact; resume itself reloads the seg_<i>.bin latents, not the webm.
+struct SegWebmWriter {
+    std::string dir;
+    int         fps     = 24;
+    int         quality = 90;
+
+    std::mutex              m;
+    std::condition_variable cv;
+    struct Task {
+        int                     seg = 0;
+        std::vector<sd_image_t> frames;  // owned deep copies, freed after encode
+    };
+    std::deque<Task> q;
+    bool             busy = false;
+    bool             done = false;
+    std::thread      th;
+
+    void start() {
+        th = std::thread([this] {
+            for (;;) {
+                Task t;
+                {
+                    std::unique_lock<std::mutex> lk(m);
+                    cv.wait(lk, [&] { return done || !q.empty(); });
+                    if (q.empty()) {
+                        if (done) {
+                            break;
+                        }
+                        continue;
+                    }
+                    t    = std::move(q.front());
+                    q.pop_front();
+                    busy = true;
+                }
+                std::string path  = dir + "/seg_" + std::to_string(t.seg) + ".webm";
+                auto        bytes = create_video_from_sd_images_to_vector(
+                    "webm", t.frames.data(), (int)t.frames.size(), fps, quality, nullptr);
+                if (!bytes.empty()) {
+                    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                    out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+                }
+                for (auto& f : t.frames) {
+                    free(f.data);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(m);
+                    busy = false;
+                }
+                cv.notify_all();
+            }
+        });
+    }
+
+    void enqueue(int seg, const sd_image_t* fr, int n) {
+        {  // back-pressure: wait until the prior segment has drained
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] { return done || (q.empty() && !busy); });
+            if (done) {
+                return;
+            }
+        }
+        std::vector<sd_image_t> copies;
+        copies.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            sd_image_t c = fr[i];
+            size_t     sz = (size_t)c.width * c.height * c.channel;
+            c.data        = (uint8_t*)malloc(sz);
+            if (c.data != nullptr && fr[i].data != nullptr) {
+                memcpy(c.data, fr[i].data, sz);
+            }
+            copies.push_back(c);
+        }
+        {
+            std::lock_guard<std::mutex> lk(m);
+            q.push_back(Task{seg, std::move(copies)});
+        }
+        cv.notify_all();
+    }
+
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            done = true;
+        }
+        cv.notify_all();
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+};
+
+void ltx_seg_webm_cb(int seg, const sd_image_t* frames, int n, void* user) {
+    static_cast<SegWebmWriter*>(user)->enqueue(seg, frames, n);
+}
+
+}  // namespace
 
 const char* async_job_kind_name(AsyncJobKind kind) {
     switch (kind) {
@@ -110,6 +217,9 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     result["id"]             = job.id;
     result["kind"]           = async_job_kind_name(job.kind);
     result["status"]         = async_job_status_name(job.status);
+    // Artifact dir (when job persistence is on). Its presence flags a resumable VidGen job:
+    // a failed/cancelled chain can be continued via resume_job_id from the banked segments.
+    result["job_dir"]        = job.job_dir.empty() ? json(nullptr) : json(job.job_dir);
     result["created"]        = job.created_at;
     result["started"]        = job.started_at == 0 ? json(nullptr) : json(job.started_at);
     result["completed"]      = job.completed_at == 0 ? json(nullptr) : json(job.completed_at);
@@ -331,6 +441,11 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     std::string output_format = body.value("output_format", std::string("webm"));
     int         output_compression = body.value("output_compression", 90);
 
+    // Durable artifact dir (per-segment latent/webm banking + final.webm) and the resume
+    // point (skip segments already banked there). Both injected by the LTX /generate route.
+    std::string job_dir     = body.value("ltx_job_dir", std::string());
+    int         resume_from = body.value("resume_from", 0);
+
     sd_vid_gen_params_t base = gen_params.to_sd_vid_gen_params_t();
 
     sd_vid_chain_params_t chain = {};
@@ -338,14 +453,37 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
     chain.segment_prompts    = prompt_ptrs.data();
     chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
-    chain.save_dir           = nullptr;
+    chain.save_dir           = job_dir.empty() ? nullptr : job_dir.c_str();
+    chain.resume_from        = std::max(0, resume_from);
+
+    // Bank a viewable per-segment webm as each segment lands (off the GPU thread). On by
+    // default when a job dir is set; LTX_BANK_SEG_WEBM=0 disables it (e.g. under tight RAM —
+    // resume only needs the seg_<i>.bin latents, which are banked regardless).
+    std::unique_ptr<SegWebmWriter> seg_writer;
+    if (!job_dir.empty()) {
+        const char* bank = getenv("LTX_BANK_SEG_WEBM");
+        bool        on   = (bank == nullptr) || (bank[0] != '0');
+        if (on) {
+            seg_writer          = std::make_unique<SegWebmWriter>();
+            seg_writer->dir     = job_dir;
+            seg_writer->fps     = gen_params.fps;
+            seg_writer->quality = output_compression;
+            seg_writer->start();
+            chain.on_segment      = &ltx_seg_webm_cb;
+            chain.on_segment_user = seg_writer.get();
+        }
+    }
 
     sd_image_t* frames      = nullptr;
     int         frame_count = 0;
     sd_audio_t* audio       = nullptr;
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
-        if (!generate_video_chain(runtime.sd_ctx, &base, &chain, &frames, &frame_count, &audio)) {
+        bool chain_ok = generate_video_chain(runtime.sd_ctx, &base, &chain, &frames, &frame_count, &audio);
+        if (seg_writer) {
+            seg_writer->finish();  // drain pending seg webms before reporting outcome
+        }
+        if (!chain_ok) {
             error_message = "generate_video_chain failed";
             return false;
         }
@@ -368,6 +506,18 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         error_message = "failed to encode generated video container";
         return false;
     }
+
+    // Persist the finished container so it survives the in-RAM result TTL and a client
+    // disconnect (re-fetchable via GET /sdcpp/v1/jobs/{id}/media).
+    if (!job_dir.empty()) {
+        std::string final_path = job_dir + "/final." + output_format;
+        std::ofstream out(final_path, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out.write(reinterpret_cast<const char*>(out_video.data()),
+                      static_cast<std::streamsize>(out_video.size()));
+        }
+    }
+
     out_mime        = video_mime_type(output_format);
     out_frame_count = frame_count;
     out_fps         = gen_params.fps;

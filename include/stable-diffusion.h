@@ -465,7 +465,15 @@ typedef struct {
     int          cont_latent_frames;  // K overlap latent frames carried between segments
     const char** segment_prompts;     // n_segments entries; a NULL entry reuses base prompt
     const char*  chain_audio_dir;     // dir with aud_<i>.wav per segment, or NULL (no lip-sync)
-    const char*  save_dir;            // optional: bank each seg's video latent to save_dir/seg_<i>.bin
+    const char*  save_dir;            // optional: bank each seg's video latent + webm to save_dir/seg_<i>.{bin,webm}
+    int          resume_from;         // resume: skip+reload segments [0, resume_from) from save_dir banked latents (0 = fresh)
+    // Optional: invoked once per stitched segment, in order, with that segment's kept frames
+    // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
+    // (server layer) bank a viewable per-segment webm as it's produced, without the core lib
+    // depending on the example-layer media encoder. Fired only for freshly-rendered segments
+    // (skipped ones on resume already have their webm on disk). NULL = no callback.
+    void (*on_segment)(int seg_index, const sd_image_t* frames, int frame_count, void* user);
+    void*        on_segment_user;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

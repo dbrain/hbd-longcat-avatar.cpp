@@ -45,6 +45,12 @@ struct AsyncGenerationJob {
     // to the CUDA child in LTX worker-isolation mode, or consumed in-process via
     // run_vid_chain_job(). Set for VidGen jobs submitted on the LTX /generate route.
     std::string vid_chain_request_json;
+    // Per-job artifact dir (LTX_JOB_DIR/<id>, or a resumed job's existing dir). Holds
+    // request.json + prompts.txt + audio/aud_<i>.wav (inputs) and seg_<n>.bin/.webm +
+    // final.webm (outputs). Lets a finished render be re-fetched after the in-RAM TTL
+    // and a failed/cancelled chain be resumed from the last banked segment. Empty when
+    // job persistence is disabled. Set on the LTX /generate route.
+    std::string job_dir;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;

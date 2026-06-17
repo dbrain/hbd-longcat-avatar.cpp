@@ -6812,6 +6812,149 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                              nullptr, nullptr, nullptr, nullptr, nullptr);
 }
 
+// Decode a banked segment VIDEO latent (save_dir/seg_<i>.bin, written by the
+// LTXAV_SAVE_VIDEO_LATENT path) back to pixel frames via the VAE, with NO DiT sampling.
+// Used on resume to cheaply rebuild the already-rendered prefix. Returns a malloc'd
+// sd_image_t array (caller frees each .data + the array), or nullptr on failure.
+static sd_image_t* decode_banked_video_latent(sd_ctx_t* sd_ctx, const std::string& path, int* count_out) {
+    if (count_out != nullptr) {
+        *count_out = 0;
+    }
+    sd::Tensor<float> latent;
+    try {
+        latent = sd::load_tensor_from_file_as_tensor<float>(path);
+    } catch (const std::exception& e) {
+        LOG_ERROR("resume: failed to load banked latent %s: %s", path.c_str(), e.what());
+        return nullptr;
+    }
+    if (latent.empty()) {
+        LOG_ERROR("resume: banked latent %s is empty", path.c_str());
+        return nullptr;
+    }
+    sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(latent, true);
+    if (vid.empty()) {
+        LOG_ERROR("resume: decode_first_stage failed for %s", path.c_str());
+        return nullptr;
+    }
+    int         n    = (int)vid.shape()[2];
+    sd_image_t* imgs = (sd_image_t*)calloc((size_t)n, sizeof(sd_image_t));
+    if (imgs == nullptr) {
+        return nullptr;
+    }
+    for (int i = 0; i < n; ++i) {
+        imgs[i] = tensor_to_sd_image(vid, i);
+    }
+    if (count_out != nullptr) {
+        *count_out = n;
+    }
+    return imgs;
+}
+
+// Raw per-segment audio banking (header + planar [channel][sample] floats) so a resumed
+// chain can reload the already-rendered prefix's audio — the VIDEO-only seg_<i>.bin latent
+// can't carry it. Mirrors the sd_audio_t planar layout (waveform_to_sd_audio).
+static bool write_seg_audio(const std::string& path, const sd_audio_t* a) {
+    if (a == nullptr || a->data == nullptr || a->sample_count == 0) {
+        return false;
+    }
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        return false;
+    }
+    uint32_t sr = a->sample_rate, ch = a->channels;
+    uint64_t n  = a->sample_count;
+    fwrite(&sr, sizeof(sr), 1, f);
+    fwrite(&ch, sizeof(ch), 1, f);
+    fwrite(&n, sizeof(n), 1, f);
+    fwrite(a->data, sizeof(float), (size_t)n * ch, f);
+    fclose(f);
+    return true;
+}
+static sd_audio_t* read_seg_audio(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return nullptr;
+    }
+    uint32_t sr = 0, ch = 0;
+    uint64_t n = 0;
+    if (fread(&sr, sizeof(sr), 1, f) != 1 || fread(&ch, sizeof(ch), 1, f) != 1 ||
+        fread(&n, sizeof(n), 1, f) != 1) {
+        fclose(f);
+        return nullptr;
+    }
+    sd_audio_t* a   = (sd_audio_t*)malloc(sizeof(sd_audio_t));
+    a->sample_rate  = sr;
+    a->channels     = ch;
+    a->sample_count = n;
+    size_t total    = (size_t)n * ch;
+    a->data         = (float*)malloc(total * sizeof(float));
+    if (a->data == nullptr || fread(a->data, sizeof(float), total, f) != total) {
+        fclose(f);
+        free(a->data);
+        free(a);
+        return nullptr;
+    }
+    fclose(f);
+    return a;
+}
+
+// Stitches per-segment audio onto one continuous timeline (planar, channel-major), dropping
+// each seg>0's overlap head so it stays aligned with the video stitch. Replaces the old
+// "keep only seg0 audio" behaviour, which left multi-segment clips silent after seg0 (and
+// dropped audio entirely on resume).
+struct ChainAudioAcc {
+    uint32_t                        sample_rate = 0;
+    uint32_t                        channels    = 0;
+    std::vector<std::vector<float>> chans;  // per-channel samples
+
+    void append(const sd_audio_t* a, int drop_head_samples) {
+        if (a == nullptr || a->data == nullptr || a->sample_count == 0) {
+            return;
+        }
+        if (channels == 0) {
+            channels    = a->channels;
+            sample_rate = a->sample_rate;
+            chans.resize(channels);
+        }
+        if (a->channels != channels) {
+            LOG_WARN("chain audio: segment channel count %u != %u; skipping its audio", a->channels, channels);
+            return;
+        }
+        int sc    = (int)a->sample_count;
+        int start = std::min(std::max(0, drop_head_samples), sc);
+        for (uint32_t c = 0; c < channels; ++c) {
+            const float* src = a->data + (size_t)c * sc;  // planar
+            chans[c].insert(chans[c].end(), src + start, src + sc);
+        }
+    }
+    // Audio samples to drop for a seg>0 to match the dropped overlap_px video frames.
+    int drop_for(const sd_audio_t* a, int overlap_px, int fps) const {
+        if (a == nullptr || fps <= 0) {
+            return 0;
+        }
+        return (int)llround((double)overlap_px * a->sample_rate / fps);
+    }
+    sd_audio_t* build() const {
+        if (channels == 0 || chans.empty() || chans[0].empty()) {
+            return nullptr;
+        }
+        size_t      per = chans[0].size();
+        sd_audio_t* out = (sd_audio_t*)malloc(sizeof(sd_audio_t));
+        out->sample_rate  = sample_rate;
+        out->channels     = channels;
+        out->sample_count = per;
+        out->data         = (float*)malloc(per * channels * sizeof(float));
+        if (out->data == nullptr) {
+            free(out);
+            return nullptr;
+        }
+        for (uint32_t c = 0; c < channels; ++c) {
+            std::memcpy(out->data + (size_t)c * per, chans[c].data(), per * sizeof(float));
+        }
+        return out;
+    }
+};
+
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,
                                  const sd_vid_chain_params_t* chain_params,
@@ -6886,9 +7029,88 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // [Wl, Hl, K, Cv] contiguous (W fastest, channel slowest), fed as cont_latent.
     std::vector<float>      cont_buf;
     std::vector<sd_image_t> stitched;   // adopts each kept frame's .data
-    sd_audio_t*             chain_audio = nullptr;
+    ChainAudioAcc           audio_acc;  // per-segment audio stitched onto one timeline
 
-    for (int seg = 0; seg < n_chain; ++seg) {
+    // ── Resume: skip segments [0, resume_from) by reloading their banked artifacts ──
+    // Rebuild the prefix frames by VAE-decoding the banked seg_<i>.bin latents (cheap, no
+    // sampling), and seed cont_buf from seg_{resume_from-1}.bin so segment resume_from
+    // continues the motion. On any failure we fall back to a fresh full render.
+    int start_seg = 0;
+    if (chain_params->resume_from > 0 && chain_params->save_dir != nullptr &&
+        chain_params->save_dir[0] != '\0') {
+        int               resume_k = std::min(chain_params->resume_from, n_chain - 1);
+        const std::string sd_dir   = chain_params->save_dir;
+        LOG_INFO("generate_video_chain: RESUME from segment %d/%d (reloading banked prefix from %s)",
+                 resume_k, n_chain, sd_dir.c_str());
+        bool prefix_ok = true;
+        for (int seg = 0; seg < resume_k && prefix_ok; ++seg) {
+            std::string p   = sd_dir + "/seg_" + std::to_string(seg) + ".bin";
+            int         cnt = 0;
+            sd_image_t* fr  = decode_banked_video_latent(sd_ctx, p, &cnt);
+            if (fr == nullptr || cnt <= 0) {
+                LOG_ERROR("generate_video_chain: resume prefix decode failed at seg %d (%s)", seg, p.c_str());
+                free(fr);
+                prefix_ok = false;
+                break;
+            }
+            int drop = (seg == 0) ? 0 : overlap_px;  // mirror the live-stitch overlap drop
+            if (drop > cnt) {
+                drop = cnt;
+            }
+            for (int i = 0; i < cnt; ++i) {
+                if (i < drop) {
+                    free(fr[i].data);
+                } else {
+                    stitched.push_back(fr[i]);
+                }
+            }
+            free(fr);
+            // Reload this prefix segment's banked audio onto the timeline (best-effort —
+            // a missing seg audio just means that slice is silent, not a resume failure).
+            sd_audio_t* pa = read_seg_audio(sd_dir + "/seg_" + std::to_string(seg) + ".audio");
+            if (pa != nullptr) {
+                audio_acc.append(pa, (seg == 0) ? 0 : audio_acc.drop_for(pa, overlap_px, base_params->fps));
+                free_sd_audio(pa);
+            }
+        }
+        if (prefix_ok) {
+            std::string ptail = sd_dir + "/seg_" + std::to_string(resume_k - 1) + ".bin";
+            try {
+                sd::Tensor<float> tail = sd::load_tensor_from_file_as_tensor<float>(ptail);
+                int    lw = (int)tail.shape()[0], lh = (int)tail.shape()[1];
+                int    lt = (int)tail.shape()[2], cv = (int)tail.shape()[3];
+                int    keep  = std::min(K, lt);
+                size_t plane = (size_t)lw * lh;
+                cont_buf.assign(plane * (size_t)keep * (size_t)cv, 0.f);
+                const float* src_base = tail.data();
+                for (int c = 0; c < cv; ++c) {
+                    for (int nf = 0; nf < keep; ++nf) {
+                        int          src_t = lt - keep + nf;
+                        const float* src   = src_base + ((size_t)c * lt + src_t) * plane;
+                        float*       dst   = cont_buf.data() + ((size_t)c * keep + nf) * plane;
+                        std::memcpy(dst, src, plane * sizeof(float));
+                    }
+                }
+                K         = keep;
+                start_seg = resume_k;
+            } catch (const std::exception& e) {
+                LOG_ERROR("generate_video_chain: resume cont-latent load failed (%s): %s", ptail.c_str(), e.what());
+                prefix_ok = false;
+            }
+        }
+        if (!prefix_ok) {
+            LOG_WARN("generate_video_chain: resume failed — falling back to a fresh full render");
+            for (auto& f : stitched) {
+                free(f.data);
+            }
+            stitched.clear();
+            cont_buf.clear();
+            start_seg = 0;
+            K         = std::max(1, chain_params->cont_latent_frames);
+        }
+    }
+
+    for (int seg = start_seg; seg < n_chain; ++seg) {
         sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
 
         if (seg == 0) {
@@ -6946,11 +7168,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             free_sd_audio(seg_audio);
             free(seg_video);
             free(lat_out);
-            // Free everything collected so far.
+            // Free everything collected so far (audio_acc frees itself on scope exit).
             for (auto& f : stitched) {
                 free(f.data);
             }
-            free_sd_audio(chain_audio);
             return false;
         }
 
@@ -6982,7 +7203,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         free(lat_out);
 
         // Stitch: seg0 keeps all frames; seg>0 drops the overlap head re-render.
-        int drop = (seg == 0) ? 0 : overlap_px;
+        int    drop       = (seg == 0) ? 0 : overlap_px;
+        size_t kept_start = stitched.size();
         if (drop > seg_count) {
             drop = seg_count;
         }
@@ -6995,17 +7217,40 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
         free(seg_video);
 
-        // Audio: keep seg0's only (per-segment absolute-timeline audio stitching is a
-        // follow-up; for a no-drive-audio chain seg0 carries the model's generated audio).
-        if (seg == 0 && seg_audio != nullptr && chain_audio == nullptr) {
-            chain_audio = seg_audio;
-        } else {
-            free_sd_audio(seg_audio);
+        // Hand this segment's kept frames to the caller (server) so it can bank a viewable
+        // per-segment webm as it's produced. Frames stay owned by `stitched`; the callback
+        // must copy anything it needs to outlive this call.
+        int kept_n = (int)(stitched.size() - kept_start);
+        if (chain_params->on_segment != nullptr && kept_n > 0) {
+            chain_params->on_segment(seg, stitched.data() + kept_start, kept_n, chain_params->on_segment_user);
         }
+
+        // Audio: bank this segment's audio (for resume) + stitch it onto the timeline,
+        // dropping the overlap head on seg>0 to stay aligned with the video stitch.
+        if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0' && seg_audio != nullptr) {
+            write_seg_audio(std::string(chain_params->save_dir) + "/seg_" + std::to_string(seg) + ".audio", seg_audio);
+        }
+        if (seg_audio != nullptr) {
+            audio_acc.append(seg_audio, (seg == 0) ? 0 : audio_acc.drop_for(seg_audio, overlap_px, base_params->fps));
+        }
+        free_sd_audio(seg_audio);
     }
 
+    // Don't let the per-segment latent-save env leak into a later (non-chain) render in the
+    // same process — it's re-set per segment on the next chain anyway.
+    if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+        unsetenv("LTXAV_SAVE_VIDEO_LATENT");
+    }
+
+    // Assemble the stitched audio timeline (null if no segment produced audio).
+    sd_audio_t* chain_audio = audio_acc.build();
+
     const int total = (int)stitched.size();
-    LOG_INFO("generate_video_chain: stitched %d segments -> %d frames", n_chain, total);
+    LOG_INFO("generate_video_chain: stitched %d segments -> %d frames (audio: %llu samples @ %u Hz x%u)",
+             n_chain, total,
+             chain_audio != nullptr ? (unsigned long long)chain_audio->sample_count : 0ULL,
+             chain_audio != nullptr ? chain_audio->sample_rate : 0,
+             chain_audio != nullptr ? chain_audio->channels : 0);
     if (total <= 0) {
         free_sd_audio(chain_audio);
         LOG_ERROR("generate_video_chain: no frames produced");

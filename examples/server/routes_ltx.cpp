@@ -18,9 +18,12 @@
 // Per-segment lip-sync wavs (16kHz mono) ride as multipart parts audio_0, audio_1, …; the
 // parent writes them to a shared /tmp dir and passes the dir to the chain.
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,6 +39,53 @@ using json   = nlohmann::json;
 static void ltx_write_blob(const std::string& path, const std::string& bytes) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+// Root for durable per-job artifact dirs (request + per-segment latents/webm + final.webm).
+// Overridable via LTX_JOB_DIR; mounted in compose so renders survive a container restart.
+static fs::path ltx_job_root() {
+    const char* e = getenv("LTX_JOB_DIR");
+    return fs::path((e != nullptr && e[0] != '\0') ? e : "/var/lib/ltx-video/jobs");
+}
+
+// Count the contiguous run of banked segment latents (seg_0.bin, seg_1.bin, …) in a job
+// dir. This is the resume point: segments [0, k) are done, so a resume renders [k, N).
+static int ltx_banked_segment_count(const fs::path& dir) {
+    int k = 0;
+    std::error_code ec;
+    while (fs::exists(dir / ("seg_" + std::to_string(k) + ".bin"), ec)) {
+        ++k;
+    }
+    return k;
+}
+
+// Keep only the newest LTX_JOB_KEEP job dirs (default 20), deleting older ones so the
+// artifact root doesn't grow unbounded. `keep_dir` (the current/resumed job) is never
+// swept. Best-effort: filesystem errors are ignored.
+static void ltx_sweep_old_jobs(const fs::path& root, const fs::path& keep_dir) {
+    const char* e   = getenv("LTX_JOB_KEEP");
+    int         max = (e != nullptr && e[0] != '\0') ? std::atoi(e) : 20;
+    if (max <= 0) {
+        return;
+    }
+    std::error_code ec;
+    std::vector<std::pair<fs::file_time_type, fs::path>> dirs;
+    for (auto it = fs::directory_iterator(root, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_directory(ec)) {
+            continue;
+        }
+        dirs.emplace_back(fs::last_write_time(it->path(), ec), it->path());
+    }
+    if ((int)dirs.size() <= max) {
+        return;
+    }
+    std::sort(dirs.begin(), dirs.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = (size_t)max; i < dirs.size(); ++i) {
+        if (dirs[i].second == keep_dir) {
+            continue;
+        }
+        fs::remove_all(dirs[i].second, ec);
+    }
 }
 
 void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
@@ -103,45 +153,31 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 n_segments = 1;
             }
 
-            // Per-job scratch dir for the pre-sliced audio (shared with the CUDA child via
-            // /tmp). The dir name is a process-unique sequence, independent of the job id.
-            static std::atomic<uint64_t> seq{0};
-            uint64_t    my_seq = seq.fetch_add(1);
-            fs::path    job_dir = fs::temp_directory_path() / "ltx-video-jobs" / std::to_string(my_seq);
-            std::string audio_dir;
-            if (!audio_parts.empty()) {
-                std::error_code ec;
-                fs::create_directories(job_dir / "audio", ec);
-                for (const auto& [idx, bytes] : audio_parts) {
-                    ltx_write_blob((job_dir / "audio" / ("aud_" + std::to_string(idx) + ".wav")).string(), bytes);
-                }
-                audio_dir = (job_dir / "audio").string();
-            }
+            // Resume: a prior job's id whose banked segments we continue from. The new job
+            // renders into the SAME artifact dir, skipping segments already on disk.
+            std::string resume_job_id = body.value("resume_job_id", std::string());
 
             // The chain request the worker (or the in-process path) re-parses. Start from the
             // client's params (W/H/fps/steps/cfg/sampler/scheduler/seed/negative/init_image/
             // hires), then inject the chain extras. from_json_str reads the gen params + the
-            // inline base64 init_image + ltx_chain_segments; run_vid_chain_job reads prompts[]
-            // and chain_audio_dir.
-            json chain                 = body;
+            // inline base64 init_image + ltx_chain_segments; run_vid_chain_job reads prompts[],
+            // chain_audio_dir, ltx_job_dir and resume_from.
+            json chain                  = body;
             chain["ltx_chain_segments"] = n_segments;
             chain["prompts"]            = prompts;
             if (!prompts.empty()) {
                 chain["prompt"] = prompts[0];  // base prompt = seg0 (seg0 / fallback)
             }
-            if (!audio_dir.empty()) {
-                chain["chain_audio_dir"] = audio_dir;
-            }
             std::string output_format = body.value("output_format", std::string("webm"));
 
+            // Register the job (assign an id) before touching the filesystem, so a fresh job's
+            // artifact dir can be keyed by its own id.
             AsyncJobManager&                    manager = *runtime->async_job_manager;
             std::shared_ptr<AsyncGenerationJob> job     = std::make_shared<AsyncGenerationJob>();
-            job->kind                     = AsyncJobKind::VidGen;
-            job->status                   = AsyncJobStatus::Queued;
-            job->created_at               = unix_timestamp_now();
-            job->vid_gen.output_format    = output_format;  // drives make_async_job_json mime
-            job->vid_chain_request_json   = chain.dump();
-
+            job->kind                  = AsyncJobKind::VidGen;
+            job->status                = AsyncJobStatus::Queued;
+            job->created_at            = unix_timestamp_now();
+            job->vid_gen.output_format = output_format;  // drives make_async_job_json mime
             {
                 std::lock_guard<std::mutex> lock(manager.mutex);
                 purge_expired_jobs(manager);
@@ -151,18 +187,82 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
                 job->id               = make_async_job_id(manager);
-                manager.jobs[job->id] = job;
+                manager.jobs[job->id] = job;  // registered but not queued until inputs are on disk
+            }
+
+            // Resolve the artifact dir: an existing dir on resume, else this job's own.
+            fs::path        root = ltx_job_root();
+            fs::path        job_dir;
+            int             resume_from = 0;
+            std::error_code ec;
+            if (!resume_job_id.empty()) {
+                job_dir = root / resume_job_id;
+                if (!fs::exists(job_dir, ec)) {
+                    std::lock_guard<std::mutex> lock(manager.mutex);
+                    manager.jobs.erase(job->id);
+                    res.status = 404;
+                    res.set_content(R"({"error":"resume_job_id not found"})", "application/json");
+                    return;
+                }
+                resume_from = ltx_banked_segment_count(job_dir);
+                if (resume_from >= n_segments) {
+                    resume_from = std::max(0, n_segments - 1);  // re-render at least the last seg
+                }
+            } else {
+                job_dir = root / job->id;
+            }
+            fs::create_directories(job_dir, ec);
+
+            // Pre-sliced per-segment lip-sync wavs (16kHz mono). On a fresh job they ride in
+            // as multipart parts; on resume they already sit in the dir from the first submit.
+            std::string audio_dir;
+            if (!audio_parts.empty()) {
+                fs::create_directories(job_dir / "audio", ec);
+                for (const auto& [idx, bytes] : audio_parts) {
+                    ltx_write_blob((job_dir / "audio" / ("aud_" + std::to_string(idx) + ".wav")).string(), bytes);
+                }
+            }
+            if (fs::exists(job_dir / "audio", ec)) {
+                audio_dir = (job_dir / "audio").string();
+            }
+            if (!audio_dir.empty()) {
+                chain["chain_audio_dir"] = audio_dir;
+            }
+            chain["ltx_job_dir"] = job_dir.string();
+            chain["resume_from"] = resume_from;
+
+            // Persist the inputs so the job is fully replayable / resumable. request.json
+            // carries every param incl. the inline base64 init image; prompts.txt is the
+            // human-readable director script.
+            job->job_dir                = job_dir.string();
+            job->vid_chain_request_json = chain.dump();
+            ltx_write_blob((job_dir / "request.json").string(), job->vid_chain_request_json);
+            {
+                std::string ptxt;
+                for (const auto& p : prompts) {
+                    ptxt += p;
+                    ptxt += '\n';
+                }
+                ltx_write_blob((job_dir / "prompts.txt").string(), ptxt);
+            }
+            ltx_sweep_old_jobs(root, job_dir);
+
+            {
+                std::lock_guard<std::mutex> lock(manager.mutex);
                 manager.queue.push_back(job->id);
             }
             manager.cv.notify_one();
 
             json out;
-            out["id"]       = job->id;
-            out["kind"]     = async_job_kind_name(job->kind);
-            out["status"]   = async_job_status_name(job->status);
-            out["created"]  = job->created_at;
-            out["poll_url"] = "/sdcpp/v1/jobs/" + job->id;
-            out["segments"] = n_segments;
+            out["id"]          = job->id;
+            out["kind"]        = async_job_kind_name(job->kind);
+            out["status"]      = async_job_status_name(job->status);
+            out["created"]     = job->created_at;
+            out["poll_url"]    = "/sdcpp/v1/jobs/" + job->id;
+            out["media_url"]   = "/sdcpp/v1/jobs/" + job->id + "/media";
+            out["segments"]    = n_segments;
+            out["resume_from"] = resume_from;
+            out["job_dir"]     = job_dir.string();
 
             res.status = 202;
             res.set_content(out.dump(), "application/json");
@@ -175,5 +275,35 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
-    LOG_INFO("ltx-video: POST /ltx/v1/generate registered (async chain; poll /sdcpp/v1/jobs/{id})\n");
+    // GET /sdcpp/v1/jobs/{id}/media — stream the finished final.webm from the job's artifact
+    // dir. Survives the in-RAM result TTL and a koblem disconnect: the file is read from disk
+    // by job id, falling back to LTX_JOB_DIR/<id> when the job has already aged out of RAM.
+    svr.Get(R"(/sdcpp/v1/jobs/([^/]+)/media)", [runtime](const httplib::Request& req, httplib::Response& res) {
+        const std::string job_id = req.matches[1];
+        fs::path          dir;
+        {
+            AsyncJobManager&            manager = *runtime->async_job_manager;
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            auto                        it = manager.jobs.find(job_id);
+            if (it != manager.jobs.end() && !it->second->job_dir.empty()) {
+                dir = it->second->job_dir;
+            }
+        }
+        if (dir.empty()) {
+            dir = ltx_job_root() / job_id;  // job aged out of RAM; serve from disk
+        }
+        fs::path        final_webm = dir / "final.webm";
+        std::error_code ec;
+        if (!fs::exists(final_webm, ec)) {
+            res.status = 404;
+            res.set_content(R"({"error":"no final.webm for job"})", "application/json");
+            return;
+        }
+        std::ifstream in(final_webm.string(), std::ios::binary);
+        std::string   bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        res.set_content(bytes, "video/webm");
+    });
+
+    LOG_INFO("ltx-video: POST /ltx/v1/generate + GET /sdcpp/v1/jobs/{id}/media registered "
+             "(async chain; poll /sdcpp/v1/jobs/{id})\n");
 }
