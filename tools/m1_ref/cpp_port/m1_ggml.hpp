@@ -65,6 +65,10 @@ struct M1Harness {
     gguf_context* gctx = nullptr;
     ggml_context* gctx_data = nullptr;
     bool use_gguf = false;
+    // When set, weight() stores big matmul weights as F16 (halves resident weight VRAM; the matmul still
+    // accumulates F32 via set_prec). Norm/layernorm gammas stay F32 (tiny + precision-sensitive). Callers
+    // must upload via a converting path (upload_weights_maybe_f16) since the npy on disk is F32.
+    bool w_f16 = false;
     std::vector<std::pair<ggml_tensor*, const void*>> gguf_uploads;  // (ctx_w dst, gguf host src)
     // tensors that need host data uploaded after alloc: (tensor, npy path)
     std::vector<std::pair<ggml_tensor*, std::string>> uploads;
@@ -146,7 +150,10 @@ struct M1Harness {
         NpyArray a = npy_load(path);
         int64_t ne[4]; int nd;
         rev_ne(a.shape, ne, nd);
-        ggml_tensor* t = ggml_new_tensor(ctx_w, GGML_TYPE_F32, nd, ne);
+        // F16 storage for big matmul weights when w_f16 is set (skip norm gammas / 1-D vectors).
+        ggml_type wt = (w_f16 && nd >= 2 && key.find("norm") == std::string::npos)
+                       ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        ggml_tensor* t = ggml_new_tensor(ctx_w, wt, nd, ne);
         ggml_set_name(t, key.c_str());
         uploads.push_back({t, path});
         wcache[key] = t;
