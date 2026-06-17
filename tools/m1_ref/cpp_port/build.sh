@@ -150,6 +150,140 @@ if [ "$BASE" = "dump_to_glb" ]; then
   exit 0
 fi
 
+# rig_grammar_test: CPU self-test for the SkinTokens/TokenRig "R3" constrained-decode grammar
+# (rig_grammar.hpp). Replays the golden emitted sequence and validates the mask at every step.
+# Pure CPU logic, header-only, no ggml. Tiny self-contained .npy reader in the .cpp.
+if [ "$BASE" = "rig_grammar_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build rig_grammar_test (rig_grammar.hpp grammar state machine, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# rig_score: skeleton-quality scorer for a rigged GLB (joint/symmetry/coverage/depth metrics).
+# Header-only (reuses glb_reader.hpp JSON parser + read_glb), no ggml. Used for best-of-N + A/B ranking.
+if [ "$BASE" = "rig_score" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build rig_score (skeleton-quality scorer, glb_reader.hpp, no ggml)"
+  "$CXX" -O2 -std=c++17 -Wall -Wno-unused-variable "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# rig_fsq_test: CPU self-test for the SkinTokens skin-VAE "R4" FSQ.indices_to_codes port
+# (rig_fsq.hpp). Maps the golden skin tokens -> vae indices (offset 267) -> codes and compares
+# to the Python FSQ reference. Header-only + the dependency-free gguf_reader.hpp (mmap, no ggml).
+if [ "$BASE" = "rig_fsq_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build rig_fsq_test (rig_fsq.hpp FSQ index->code, gguf_reader mmap, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# voxelizer_test: validate vox::mesh_to_flexible_dual_grid (voxelizer.hpp, the FORWARD o_voxel
+# flexible-dual-grid contouring) against the captured golden. Header-only + tiny npy reader in
+# the .cpp, OpenMP. No ggml/CUDA — CPU g++.
+if [ "$BASE" = "voxelizer_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build voxelizer_test (voxelizer.hpp QEF dual-grid, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# voxelizer_e2e: voxelizer -> shape_slat_encoder -> compare vs golden_69k. CPU or CUDA (spike conv).
+if [ "$BASE" = "voxelizer_e2e" ]; then
+  if [ "$MODE" = "cuda" ]; then
+    TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+    SPIKE="$HERE/../../sparse_spike"
+    echo ">> CUDA build voxelizer_e2e (nvcc spike+svae_cuda + g++ host -DM3A_USE_CUDA + cublas)"
+    "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
+      -c "$SPIKE/sparse_subm_conv.cu" -o "$HERE/sparse_subm_conv.o"
+    "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
+      -c "$HERE/svae_cuda.cu" -o "$HERE/svae_cuda.o"
+    "$TOOL/bin/g++" $COMMON -fopenmp -DM3A_USE_CUDA -I"$TOOL/include" "$HERE/$SRC" \
+      "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" \
+      -o "$HERE/$BIN" -L"$TOOL/lib" -lcudart -lcublas -L/usr/lib -lcuda -lm \
+      -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+    echo ">> built $BIN"
+    exit 0
+  fi
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build voxelizer_e2e (voxelizer + shape_slat_encoder CPU, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# glb_reader_test: round-trip self-test for the header-only glTF .glb reader (glb_reader.hpp).
+# Writes a cube via glb_writer.hpp, reads it back, asserts verts/faces. No deps.
+if [ "$BASE" = "glb_reader_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build glb_reader_test (glb_reader, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# glb_rigged_test: self-test for the rigged/skinned .glb writer (glb_rigged.hpp). Loads the
+# SkinTokens goldens, writes a skinned GLB (skeleton + JOINTS_0/WEIGHTS_0 + IBM), re-parses it
+# (glb_reader.hpp) + independently verifies the skin encoding. Header-only, no ggml/CUDA.
+if [ "$BASE" = "glb_rigged_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build glb_rigged_test (glb_rigged + glb_reader + glb_writer, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# rig_transfer_main: R7 — transfer the SAMPLED rig (joints/parents/skin weights) onto a high-res
+# target mesh (glb_reader.hpp) via inverse-distance kNN (rig_transfer.hpp, voxel grid + OpenMP),
+# then write a rigged full-mesh GLB (glb_rigged.hpp). Header-only, no ggml/CUDA — CPU g++ + -fopenmp.
+if [ "$BASE" = "rig_transfer_main" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build rig_transfer_main (rig_transfer + glb_reader + glb_rigged, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# combine_rig_tex_main: FINAL-ASSET GLUE — merge a TEXTURED source mesh (glb_reader.hpp verts/uvs +
+# read_glb_basecolor_png image bytes) with a SAMPLED rig (joints/parents/skin) by kNN skin-transfer
+# (rig_transfer.hpp) onto the full mesh, then write a TEXTURED + SKINNED GLB (glb_rigged_textured.hpp,
+# which reuses glb_rigged.hpp's IBM/top-4 logic). Header-only, no ggml/CUDA — CPU g++ + -fopenmp.
+if [ "$BASE" = "combine_rig_tex_main" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build combine_rig_tex_main (combine_rig_tex + glb_reader + glb_rigged_textured + rig_transfer, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# per_part_decimate_main: rung-5 GLUE — split a P3-SAM-segmented mesh by per-FACE label, decimate
+# each part to a region-adaptive budget by SHELLING OUT to ./obj_decimate (same meshopt+LockBorder
+# binary the python ref uses), recombine -> out.glb. glb_reader/glb_writer + self-contained npy/obj
+# I/O; header-only, no ggml/CUDA — CPU g++ + -fopenmp. (obj_decimate must be built separately.)
+if [ "$BASE" = "per_part_decimate_main" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build per_part_decimate_main (per_part_decimate + glb_reader/writer + npy/obj, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# mesh_sample_main: auto-rig PREPROCESSING — load arbitrary GLB (glb_reader.hpp), normalize to
+# [-1,1]^3, area-weighted surface-sample N pts+normals, derive R1 query sampled_pc[M] via
+# choice N->4M then FPS 4M->M (mesh_sample.hpp). Header-only, no ggml/CUDA — CPU g++ + -fopenmp.
+if [ "$BASE" = "mesh_sample_main" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build mesh_sample_main (mesh_sample + glb_reader, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
 if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ]; then
@@ -192,6 +326,76 @@ if { [ "$BASE" = "m3a_upsample" ] || [ "$BASE" = "m4_mesh" ] || [ "$BASE" = "m6_
   "$TOOL/bin/g++" $COMMON -fopenmp -DM3A_USE_CUDA -I"$TOOL/include" "$HERE/$SRC" "$HERE/sparse_subm_conv.o" \
     -o "$HERE/$BIN" -L"$TOOL/lib" -lcudart -L/usr/lib -lcuda -lm \
     -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# rig_skin_decoder_test: the SkinTokens skin-VAE "R4" cond-encoder + skin-weight decoder ggml port
+# (rig_skin_decoder.hpp). Links ggml (CPU default, or `cuda`); weights load from the packed GGUF via
+# m1_ggml.hpp's GGUF mode (env PIXAL3D_GGUF_DIR=<dir-with-skin_vae.gguf>). Reuses rig_fsq.hpp +
+# vecset_encoder.hpp (Tripo2 interleaved head-split) + gguf_reader.hpp (FSQ project_out). Same link
+# recipe as the generic ggml tests below; this branch documents it explicitly.
+if [ "$BASE" = "rig_skin_decoder_test" ]; then
+  if [ "$MODE" = "cuda" ]; then
+    BUILD="$GGML/build-cuda"; TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+    LIBS="-L$BUILD/src -L$BUILD/src/ggml-cuda -lggml -lggml-base -lggml-cpu -lggml-cuda"
+    CUDALIBS="-L$TOOL/lib -lcudart -lcublas -L/usr/lib -lcuda"
+    echo ">> CUDA build rig_skin_decoder_test (ggml-cuda + GGUF skin-VAE decoder)"
+    "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA $INC "$HERE/$SRC" -o "$HERE/$BIN" \
+      $LIBS $CUDALIBS -lm \
+      -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+  else
+    BUILD="$GGML/build-cpu"; LIBS="-L$BUILD/src -lggml -lggml-base -lggml-cpu"
+    CXX="${CXX:-/usr/bin/g++}"
+    echo ">> CPU build rig_skin_decoder_test (ggml CPU backend + GGUF skin-VAE decoder)"
+    "$CXX" $COMMON -fopenmp $INC "$HERE/$SRC" -o "$HERE/$BIN" $LIBS -lm -Wl,-rpath,"$BUILD/src"
+  fi
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# skintokens_e2e: the FULL SkinTokens auto-rigging driver (R1->R3->R5->R4->R6). Single-TU: links
+# ggml (CPU default, or `cuda`) for the qwen3 AR core (rig_generate.hpp/qwen3_forward.hpp) + the
+# skin-VAE decoder (rig_skin_decoder.hpp); pure-host R5 detok (detok_r5.hpp), FSQ (rig_fsq.hpp),
+# GLB writer (glb_rigged.hpp) and the dependency-free gguf_reader.hpp (FSQ project_out). Same link
+# recipe as rig_skin_decoder_test / the generic ggml path; this branch documents it explicitly.
+if [ "$BASE" = "skintokens_e2e" ]; then
+  if [ "$MODE" = "cuda" ]; then
+    BUILD="$GGML/build-cuda"; TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+    LIBS="-L$BUILD/src -L$BUILD/src/ggml-cuda -lggml -lggml-base -lggml-cpu -lggml-cuda"
+    CUDALIBS="-L$TOOL/lib -lcudart -lcublas -L/usr/lib -lcuda"
+    echo ">> CUDA build skintokens_e2e (ggml-cuda + qwen3 AR core + skin-VAE decoder + GLB)"
+    "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA $INC "$HERE/$SRC" -o "$HERE/$BIN" \
+      $LIBS $CUDALIBS -lm \
+      -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+  else
+    BUILD="$GGML/build-cpu"; LIBS="-L$BUILD/src -lggml -lggml-base -lggml-cpu"
+    CXX="${CXX:-/usr/bin/g++}"
+    echo ">> CPU build skintokens_e2e (ggml CPU backend + qwen3 AR core + skin-VAE decoder + GLB)"
+    "$CXX" $COMMON -fopenmp $INC "$HERE/$SRC" -o "$HERE/$BIN" $LIBS -lm -Wl,-rpath,"$BUILD/src"
+  fi
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# qwen3_decode_test: KV-cache incremental-decode validation (qwen3_decode.hpp on top of the VALIDATED
+# qwen3_forward.hpp). Single-TU; same ggml link recipe as the generic path / qwen3_r2_test. Explicit
+# branch so the cache-backed decode build is self-documenting.
+if [ "$BASE" = "qwen3_decode_test" ]; then
+  if [ "$MODE" = "cuda" ]; then
+    BUILD="$GGML/build-cuda"; TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+    LIBS="-L$BUILD/src -L$BUILD/src/ggml-cuda -lggml -lggml-base -lggml-cpu -lggml-cuda"
+    CUDALIBS="-L$TOOL/lib -lcudart -lcublas -L/usr/lib -lcuda"
+    echo ">> CUDA build qwen3_decode_test (ggml-cuda + qwen3 KV-cache incremental decode)"
+    "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA $INC "$HERE/$SRC" -o "$HERE/$BIN" \
+      $LIBS $CUDALIBS -lm \
+      -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+  else
+    BUILD="$GGML/build-cpu"; LIBS="-L$BUILD/src -lggml -lggml-base -lggml-cpu"
+    CXX="${CXX:-/usr/bin/g++}"
+    echo ">> CPU build qwen3_decode_test (ggml CPU backend + qwen3 KV-cache incremental decode)"
+    "$CXX" $COMMON -fopenmp $INC "$HERE/$SRC" -o "$HERE/$BIN" $LIBS -lm -Wl,-rpath,"$BUILD/src"
+  fi
   echo ">> built $BIN"
   exit 0
 fi
