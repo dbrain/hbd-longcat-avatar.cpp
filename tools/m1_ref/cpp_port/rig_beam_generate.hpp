@@ -276,8 +276,8 @@ inline std::vector<int> rig_beam_generate(M1Harness& H, const Qwen3Cfg& cfg,
                                           float length_penalty = 1.0f,
                                           float repetition_penalty = 2.0f,
                                           bool do_sample = true,
-                                          float temperature = 1.5f,
-                                          int top_k = 10,
+                                          float temperature = 1.0f,
+                                          int top_k = 5,
                                           float top_p = 0.95f,
                                           uint64_t seed = 0,
                                           bool verbose = true) {
@@ -618,13 +618,20 @@ inline std::vector<int> rig_beam_generate(M1Harness& H, const Qwen3Cfg& cfg,
             // ---- 4: eos candidates -> finished pool; non-eos top num_beams by acc -> next active set. ----
             std::vector<std::pair<double,int>> noneos;   // (acc, index into jc)
             noneos.reserve(picks.size());
-            for (int pk : picks) {
-                const JC& c = jc[pk];
+            // HF 5.9.0 `top_num_beam_mask`: bank an eos candidate as finished ONLY if it's in the top
+            // num_beams of the 2*num_beams picks (rank order greedy / draw order sample). Candidates beyond
+            // num_beams are live-beam backups that HF masks out of the finished update. Banking ALL eos
+            // picks let short low-ranked eos hyps win on length-normalized score -> sparser rigs than Python.
+            for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                const JC& c = jc[picks[pi]];
                 if (c.tok == spec.model_eos) {
-                    std::vector<int> seq = beams[c.parent].sequence; seq.push_back(spec.model_eos);
-                    bank_finished(std::move(seq), norm(c.acc, gen_len), /*eos=*/true);  // genuine termination
+                    if (pi < num_beams) {
+                        std::vector<int> seq = beams[c.parent].sequence; seq.push_back(spec.model_eos);
+                        bank_finished(std::move(seq), norm(c.acc, gen_len), /*eos=*/true);  // genuine termination
+                    }
+                    // else: eos ranked >= num_beams -> discarded (not finished, not a running beam), per HF.
                 } else {
-                    noneos.push_back({ c.acc, pk });
+                    noneos.push_back({ c.acc, picks[pi] });
                 }
             }
             std::sort(noneos.begin(), noneos.end(),

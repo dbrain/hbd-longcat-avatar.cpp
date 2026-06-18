@@ -158,18 +158,22 @@ int main(int argc, char** argv) {
     // golden) | "real" (COMPUTE cond_latents via the cond-encoder from THIS mesh's verts/normals).
     // "auto" (default) follows r1: real when r1=real (rigging a new mesh), banked otherwise.
     std::string cond_mode = "auto";
-    // R3 decode mode: "sample" (HF golden config) | "beam" | "greedy".  Default = sample.
-    std::string r3_mode = "sample";
-    int num_beams = 10;            // the proven HF beam config.
-    // HF sampling warper params (golden defaults from capture_skintokens_e2e.py); CLI-overridable.
+    // R3 decode mode: "sample" | "beam" (HF official) | "greedy".  Default = beam (Python = num_beams=10).
+    std::string r3_mode = "beam";
+    int num_beams = 10;            // the proven HF beam config (Python official).
+    // HF OFFICIAL sampling params (SkinTokens demo.py / spec.py: do_sample=True, temp=1.0, top_k=5,
+    // top_p=0.95, repetition_penalty=2.0, num_beams=10, max_length=2048). These are the DEFAULTS now —
+    // the model is bf16-native (spec.py torch_dtype=bfloat16); fp32 is an upcast that under-articulates.
     uint64_t seed       = 0;
-    float    temp       = 1.5f;
+    float    temp       = 1.0f;
     float    reppen     = 2.0f;
-    int      topk       = 10;
+    int      topk       = 5;
     float    topp       = 0.95f;
-    int      maxnew     = -1;     // -1 => per-mode default; `maxnew=` overrides. A clean rig is ~1536
-                                  // tokens (Python gilly golden), so the old 600/800 caps guillotined it.
-    ggml_type prec      = GGML_TYPE_F32;   // AR compute precision (prec=f16|bf16 => trained regime)
+    int      maxnew     = -1;     // -1 => per-mode default (1534 = max_length 2048 - 514-token prefix
+                                  // [512 mesh_cond + 2 start], matching Python exactly); `maxnew=` overrides.
+    ggml_type prec      = GGML_TYPE_BF16;  // AR compute precision. bf16 = model's NATIVE regime (matches
+                                           // Python's torch_dtype=bfloat16). prec=fp32 upcasts (shorter rigs).
+    bool do_sample      = true;   // `nosample` => deterministic beam (no warpers/RNG; HF do_sample=False)
     int pos = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -185,6 +189,7 @@ int main(int argc, char** argv) {
         else if (a == "greedy") r3_mode = "greedy";
         else if (a == "sample") r3_mode = "sample";
         else if (a == "tfprobe") r3_mode = "tfprobe";
+        else if (a == "nosample") do_sample = false;   // deterministic beam (HF do_sample=False)
         else if (a.rfind("beams=", 0) == 0) num_beams = std::atoi(a.c_str() + 6);
         else if (a.rfind("seed=",  0) == 0) seed   = std::strtoull(a.c_str() + 5, nullptr, 10);
         else if (a.rfind("temp=",  0) == 0) temp   = std::atof(a.c_str() + 5);
@@ -452,7 +457,7 @@ int main(int argc, char** argv) {
                                               mesh_cond.data(), n_cond, start_tokens, gspec,
                                               /*repetition_penalty=*/reppen, /*temperature=*/temp,
                                               /*top_k=*/topk, /*top_p=*/topp,
-                                              /*max_new_tokens=*/(maxnew>0?maxnew:1700), /*seed=*/seed, /*verbose=*/true);
+                                              /*max_new_tokens=*/(maxnew>0?maxnew:1534), /*seed=*/seed, /*verbose=*/true);
         } else if (r3_mode == "beam") {
             // BEAM-SAMPLE (do_sample=true) by default — matches the golden HF config
             // (.generate(num_beams=10, do_sample=True, temperature=1.5, top_k=10, top_p=0.95,
@@ -464,15 +469,15 @@ int main(int argc, char** argv) {
             printf("[STAGE R3] beam decode = %s\n", seq_beam ? "SEQUENTIAL" : "BATCHED");
             tokens = beam_fn(Hq, qcfg, embed_table.data(),
                              mesh_cond.data(), n_cond, start_tokens, gspec,
-                             /*num_beams=*/num_beams, /*max_new_tokens=*/(maxnew>0?maxnew:1700),
+                             /*num_beams=*/num_beams, /*max_new_tokens=*/(maxnew>0?maxnew:1534),
                              /*length_penalty=*/1.0f, /*repetition_penalty=*/reppen,
-                             /*do_sample=*/true, /*temperature=*/temp,
+                             /*do_sample=*/do_sample, /*temperature=*/temp,
                              /*top_k=*/topk, /*top_p=*/topp, /*seed=*/seed,
                              /*verbose=*/true);
         } else {
             tokens = rig::rig_generate(Hq, qcfg, embed_table.data(),
                                        mesh_cond.data(), n_cond, start_tokens, gspec,
-                                       /*max_new_tokens=*/(maxnew>0?maxnew:1700), /*verbose=*/true);
+                                       /*max_new_tokens=*/(maxnew>0?maxnew:1534), /*verbose=*/true);
         }
         // Sample VRAM peak HERE — Hq (and its ~3 GB weight buffer + the AR/beam KV caches) is still
         // alive in this scope. Sampling after the closing brace would see the device post-free.
