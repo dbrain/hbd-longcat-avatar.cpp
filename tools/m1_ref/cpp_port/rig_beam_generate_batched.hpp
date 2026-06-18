@@ -34,8 +34,8 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
                                                   const GrammarSpec& spec = GrammarSpec(),
                                                   int num_beams = 10, int max_new_tokens = 600,
                                                   float length_penalty = 1.0f, float repetition_penalty = 2.0f,
-                                                  bool do_sample = true, float temperature = 1.5f,
-                                                  int top_k = 10, float top_p = 0.95f,
+                                                  bool do_sample = true, float temperature = 1.0f,
+                                                  int top_k = 5, float top_p = 0.95f,
                                                   uint64_t seed = 0, bool verbose = true) {
     const int hidden = cfg.hidden, hd = cfg.head_dim, V = cfg.vocab;
     const int P = n_cond + (int)start_tokens.size();
@@ -250,6 +250,7 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         }
 
         bool improvement_possible = true, stopped_early = false;
+        const bool dump_dbg = std::getenv("RIG_BEAM_DUMP") && std::getenv("RIG_BEAM_DUMP")[0] != '0';
         const int beams_to_keep = 2 * num_beams;
         auto norm = [&](double score, int gen_len) { return score / std::pow((double)std::max(1, gen_len), (double)length_penalty); };
         auto worst_finished_norm = [&]() -> double { if (finished.empty()) return -1e30; double w = std::numeric_limits<double>::infinity(); for (auto& h : finished) w = std::min(w, h.normscore); return w; };
@@ -301,11 +302,20 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
             }
 
             // ---- 4: eos -> finished; non-eos top num_beams -> next active ----
+            // HF 5.9.0 `top_num_beam_mask`: an eos candidate is banked as a finished hypothesis ONLY if
+            // it sits in the top `num_beams` of the 2*num_beams candidates (greedy: rank order; sample:
+            // multinomial draw order). Candidates beyond num_beams exist only as live-beam backups —
+            // HF's _update_finished_beams masks them out (`& top_num_beam_mask`). Banking ALL eos picks
+            // (the old behavior) let a SHORT, low-ranked eos hyp slip in; being short its length-normalized
+            // score could win -> the C++ rigs terminated sparser than Python (J37 vs 56 on det gilly).
             std::vector<std::pair<double,int>> noneos; noneos.reserve(picks.size());
-            for (int pk : picks) {
-                const JC& c = jc[pk];
-                if (c.tok == spec.model_eos) { std::vector<int> seq = beams[c.parent].sequence; seq.push_back(spec.model_eos); bank_finished(std::move(seq), norm(c.acc, gen_len), true); }
-                else noneos.push_back({ c.acc, pk });
+            for (int pi = 0; pi < (int)picks.size(); ++pi) {
+                const JC& c = jc[picks[pi]];
+                if (c.tok == spec.model_eos) {
+                    if (pi < num_beams) { std::vector<int> seq = beams[c.parent].sequence; seq.push_back(spec.model_eos); bank_finished(std::move(seq), norm(c.acc, gen_len), true);
+                        if (dump_dbg) printf("[bdump] BANK eos step=%d gen_len=%d pi=%d rawscore=%.4f normscore=%.5f best_act_norm=%.5f\n", step, gen_len, pi, c.acc, norm(c.acc,gen_len), beams.empty()?0.0:norm([&]{double m=-1e30;for(auto&b:beams)m=std::max(m,b.score);return m;}(),gen_len)); }
+                    // else: eos ranked >= num_beams -> discarded (not finished, not a running beam), per HF.
+                } else noneos.push_back({ c.acc, picks[pi] });
             }
             std::sort(noneos.begin(), noneos.end(), [](const auto&a, const auto&b){ return a.first > b.first; });
             int nkeep = std::min((int)noneos.size(), num_beams);
@@ -350,6 +360,13 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         bool any_eos = false; for (auto& h : finished) any_eos |= h.eos;
         if (!stopped_early) for (auto& b : beams) { int gl = (int)b.sequence.size() - (int)start_tokens.size(); bank_finished(b.sequence, norm(b.score, gl), false); }
         if (finished.empty()) throw std::runtime_error("rig_beam_generate_batched: no hypotheses produced");
+        if (dump_dbg) {
+            printf("[bdump] STOP reason: %s ; finished pool (%zu hyps):\n", stopped_early ? "early/improvement-impossible-or-S==0" : "max_new_tokens budget", finished.size());
+            std::vector<const RigHyp*> sorted; for (auto& h : finished) sorted.push_back(&h);
+            std::sort(sorted.begin(), sorted.end(), [](const RigHyp* a, const RigHyp* b){ return a->normscore > b->normscore; });
+            for (auto* h : sorted) { int gl = (int)h->sequence.size() - (int)start_tokens.size();
+                printf("[bdump]   %s gen_len=%4d normscore=%.5f rawscore=%.4f %s\n", h->eos?"EOS ":"TRUNC", gl, h->normscore, h->normscore*std::pow((double)std::max(1,gl),(double)length_penalty), (h==sorted.front())?"<== WINNER":""); }
+        }
         auto best = std::max_element(finished.begin(), finished.end(), [](const RigHyp& a, const RigHyp& b){ return a.normscore < b.normscore; });
         if (verbose) {
             int gl = (int)best->sequence.size() - (int)start_tokens.size();
