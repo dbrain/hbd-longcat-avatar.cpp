@@ -146,6 +146,12 @@ int main(int argc, const char** argv) {
 
         LongCatRuntime ctx;
         ctx.worker = std::make_unique<longcat_avatar::WorkerSession>(argv[0], child_extra_argv);
+        // Default GPU (UUID) for un-targeted/direct requests; per-request `gpu`
+        // (inside the render body) overrides. Standard env across kob services.
+        if (const char* g = std::getenv("WORKER_DEFAULT_GPU")) {
+            ctx.worker->set_default_gpu(g);
+            LOG_INFO("default GPU: %s\n", g);
+        }
         const char* outdir_env = std::getenv("LONGCAT_AVATAR_OUTDIR");
         ctx.outdir = outdir_env ? outdir_env : "/tmp/avatar-out";
 

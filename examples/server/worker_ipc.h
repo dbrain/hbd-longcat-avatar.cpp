@@ -115,9 +115,14 @@ bool unpack_render_response(const std::vector<uint8_t>& payload,
 
 // socketpair() + fork() + execv(argv[0], "--worker <fd>" extra_argv...).
 // Parent gets parent-side fd in *out_parent_fd and the child pid as return.
+// `cuda_visible_devices` (UUID), when non-empty, is set as CUDA_VISIBLE_DEVICES
+// in the child before execv — pins the worker to a physical GPU. Empty =
+// inherit the parent/container env (default). Parent is CUDA-free so per-spawn
+// device selection is safe (enables placement + relocation across cards).
 pid_t spawn_worker(const char* self_argv0,
                    const std::vector<std::string>& extra_argv,
                    int* out_parent_fd,
-                   const char* role_flag = "--worker");
+                   const char* role_flag = "--worker",
+                   const std::string& cuda_visible_devices = "");
 
 } // namespace longcat_avatar

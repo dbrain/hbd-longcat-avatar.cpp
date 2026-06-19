@@ -42,14 +42,21 @@ public:
 
     // Spawn the worker if it isn't running. Sends a LOAD_REQ wait-for-ok
     // gating handshake. Returns true once the worker is ready to accept
-    // RENDER_REQ. Sets last_error_ on failure.
-    bool ensure_loaded();
+    // RENDER_REQ. Sets last_error_ on failure. `gpu` (UUID) overrides the
+    // target card; if the live worker is on a different GPU it is relocated
+    // (kill + respawn). Empty → default_gpu_ (or inherited container env).
+    bool ensure_loaded(const std::string& gpu = "");
 
     // SIGKILL + waitpid. Idempotent.
     void shutdown();
 
+    // Default GPU (UUID) for un-targeted/direct requests; per-request `gpu`
+    // (inside the render JSON) overrides. Empty = inherit container env.
+    void set_default_gpu(std::string gpu) { default_gpu_ = std::move(gpu); }
+
     bool is_alive() const { return pid_ > 0; }
     pid_t pid() const     { return pid_; }
+    const std::string& worker_gpu() const { return worker_gpu_; }
     const std::string& last_error() const { return last_error_; }
 
     // Drive a render through the worker. JSON is the SDGenerationParams
@@ -85,6 +92,8 @@ private:
 
     std::string              argv0_;
     std::vector<std::string> extra_argv_;
+    std::string              default_gpu_;   // CVD for un-targeted spawns
+    std::string              worker_gpu_;    // GPU the live worker is pinned to
     pid_t                    pid_         = -1;
     int                      fd_          = -1;
     bool                     loaded_      = false;

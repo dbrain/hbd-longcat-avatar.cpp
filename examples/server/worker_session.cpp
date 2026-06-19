@@ -65,9 +65,17 @@ void WorkerSession::shutdown() {
     kill_worker_locked();
 }
 
-bool WorkerSession::ensure_loaded() {
+bool WorkerSession::ensure_loaded(const std::string& want_gpu) {
     std::lock_guard<std::mutex> lock(io_mutex_);
-    if (pid_ > 0 && fd_ >= 0 && loaded_) return true;
+    const std::string gpu = want_gpu.empty() ? default_gpu_ : want_gpu;
+    if (pid_ > 0 && fd_ >= 0 && loaded_ && worker_gpu_ == gpu) return true;
+
+    // Relocate: a live worker on the wrong card is killed + respawned.
+    if (pid_ > 0 && loaded_ && worker_gpu_ != gpu) {
+        std::fprintf(stderr, "flux2-session: relocating worker '%s' -> '%s'\n",
+                     worker_gpu_.c_str(), gpu.c_str());
+        kill_worker_locked();  // clears pid_/fd_/loaded_
+    }
 
     // Re-spawn if pid_ is stale (child died).
     if (pid_ > 0) {
@@ -79,13 +87,14 @@ bool WorkerSession::ensure_loaded() {
     }
     if (pid_ <= 0) {
         int parent_fd = -1;
-        pid_t pid = spawn_worker(argv0_.c_str(), extra_argv_, &parent_fd);
+        pid_t pid = spawn_worker(argv0_.c_str(), extra_argv_, &parent_fd, "--worker", gpu);
         if (pid <= 0) {
             last_error_ = "spawn_worker failed";
             return false;
         }
         pid_ = pid;
         fd_  = parent_fd;
+        worker_gpu_ = gpu;
     }
 
     // Send LOAD_REQ (empty JSON — child rebuilds args from extra_argv via argv).
@@ -145,7 +154,10 @@ RenderResult WorkerSession::render(const std::string& gen_json,
                                    const std::vector<uint8_t>& image,
                                    const std::vector<uint8_t>& audio) {
     RenderResult result;
-    if (!ensure_loaded()) {
+    // Per-request GPU target rides inside the generate body. Empty → default.
+    std::string gpu;
+    try { gpu = json::parse(gen_json).value("gpu", std::string()); } catch (...) {}
+    if (!ensure_loaded(gpu)) {
         result.error = last_error_;
         return result;
     }
@@ -203,7 +215,10 @@ RenderResult WorkerSession::render(const std::string& gen_json,
 
 ImageRenderResult WorkerSession::render_image(const std::string& request_json) {
     ImageRenderResult result;
-    if (!ensure_loaded()) {
+    // Per-request GPU target rides inside the img_gen body. Empty → default.
+    std::string gpu;
+    try { gpu = json::parse(request_json).value("gpu", std::string()); } catch (...) {}
+    if (!ensure_loaded(gpu)) {
         result.error = last_error_;
         return result;
     }
