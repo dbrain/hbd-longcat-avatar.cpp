@@ -689,6 +689,17 @@ static void sdcpp_handle_health(ServerRuntime& rt, httplib::Response& res) {
     res.set_content(h.dump(), "application/json");
 }
 
+// GPU residency announce for the koblem gate.
+static void sdcpp_handle_gpu_status(ServerRuntime& rt, httplib::Response& res) {
+    const bool loaded = rt.worker && rt.worker->is_alive();
+    json body = {{"loaded", loaded}};
+    if (loaded && !rt.worker->worker_gpu().empty())
+        body["gpu"] = rt.worker->worker_gpu();
+    else
+        body["gpu"] = nullptr;
+    res.set_content(body.dump(), "application/json");
+}
+
 static void sdcpp_handle_drain(ServerRuntime& rt, httplib::Response& res) {
     if (rt.model_swap) {
         rt.model_swap->draining.store(true);
@@ -783,6 +794,9 @@ void register_sdcpp_admin_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
     svr.Get("/health", [runtime](const httplib::Request&, httplib::Response& res) {
         sdcpp_handle_health(*runtime, res);
+    });
+    svr.Get("/v1/gpu/status", [runtime](const httplib::Request&, httplib::Response& res) {
+        sdcpp_handle_gpu_status(*runtime, res);
     });
     svr.Post("/v1/admin/drain", [runtime](const httplib::Request&, httplib::Response& res) {
         sdcpp_handle_drain(*runtime, res);

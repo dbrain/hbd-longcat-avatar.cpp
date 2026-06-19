@@ -395,6 +395,18 @@ static void handle_health(const httplib::Request&, httplib::Response& res,
     res.set_content(h.dump(), "application/json");
 }
 
+// GPU residency announce for the koblem gate.
+static void handle_gpu_status(const httplib::Request&, httplib::Response& res,
+                              LongCatRuntime& ctx) {
+    const bool loaded = ctx.worker && ctx.worker->is_alive();
+    json body = {{"loaded", loaded}};
+    if (loaded && !ctx.worker->worker_gpu().empty())
+        body["gpu"] = ctx.worker->worker_gpu();
+    else
+        body["gpu"] = nullptr;
+    res.set_content(body.dump(), "application/json");
+}
+
 static void handle_unload(const httplib::Request& req, httplib::Response& res,
                           LongCatRuntime& ctx) {
     bool force = false;
@@ -452,6 +464,9 @@ void register_longcat_endpoints(httplib::Server& svr, LongCatRuntime& ctx) {
 
     svr.Get("/health", [ctxp](const httplib::Request& req, httplib::Response& res) {
         handle_health(req, res, *ctxp);
+    });
+    svr.Get("/v1/gpu/status", [ctxp](const httplib::Request& req, httplib::Response& res) {
+        handle_gpu_status(req, res, *ctxp);
     });
     svr.Post("/generate", [ctxp](const httplib::Request& req, httplib::Response& res) {
         handle_generate(req, res, *ctxp);
