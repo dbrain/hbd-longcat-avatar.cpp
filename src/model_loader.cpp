@@ -27,6 +27,21 @@
 #include "ggml.h"
 #include "zip.h"
 
+// ---------------------------------------------------------------------------
+// Convert-time imatrix (nvfp4-twolevel)
+// ---------------------------------------------------------------------------
+// Per-tensor activation importance (per-input-COLUMN, length == n_per_row),
+// keyed by tensor name. Populated from an imatrix gguf via set_convert_imatrix()
+// before convert(). convert_tensor() looks up the active tensor's name here and
+// feeds the importance vector to ggml_quantize_chunk -> quantize_nvfp4 (AWQ-style)
+// instead of the all-1.0 dummy.
+namespace {
+std::map<std::string, std::vector<float>>* g_convert_imatrix = nullptr;
+}
+void set_convert_imatrix(std::map<std::string, std::vector<float>>* m) {
+    g_convert_imatrix = m;
+}
+
 #include "name_conversion.h"
 
 /*================================================= Preprocess ==================================================*/
@@ -151,12 +166,45 @@ void i64_to_i32_vec(int64_t* src, int32_t* dst, int64_t n) {
     }
 }
 
+// Resolve the importance vector for a given tensor. Returns the imatrix entry
+// (length n_per_row) if present and valid, else an all-1.0 fallback.
+static std::string strip_dit_prefix(const std::string& name) {
+    static const std::string p1 = "model.diffusion_model.";
+    static const std::string p2 = "diffusion_model.";
+    if (name.rfind(p1, 0) == 0) {
+        return name.substr(p1.size());
+    }
+    if (name.rfind(p2, 0) == 0) {
+        return name.substr(p2.size());
+    }
+    return name;
+}
+
+static const float* resolve_imatrix(const std::string& name,
+                                    int n_per_row,
+                                    std::vector<float>& fallback) {
+    if (g_convert_imatrix != nullptr && !name.empty()) {
+        // Try exact name, then prefix-stripped name (imatrix is keyed by raw
+        // flux weight name; convert export may or may not carry the
+        // model.diffusion_model. prefix depending on --convert-name).
+        for (const std::string& key : {name, strip_dit_prefix(name)}) {
+            auto it = g_convert_imatrix->find(key);
+            if (it != g_convert_imatrix->end() && (int)it->second.size() == n_per_row) {
+                return it->second.data();
+            }
+        }
+    }
+    fallback.assign(n_per_row, 1.0f);
+    return fallback.data();
+}
+
 void convert_tensor(void* src,
                     ggml_type src_type,
                     void* dst,
                     ggml_type dst_type,
                     int nrows,
-                    int n_per_row) {
+                    int n_per_row,
+                    const std::string& name) {
     int n = nrows * n_per_row;
     if (src_type == dst_type) {
         size_t nbytes = n * ggml_type_size(src_type) / ggml_blck_size(src_type);
@@ -165,8 +213,8 @@ void convert_tensor(void* src,
         if (dst_type == GGML_TYPE_F16) {
             ggml_fp32_to_fp16_row((float*)src, (ggml_fp16_t*)dst, n);
         } else {
-            std::vector<float> imatrix(n_per_row, 1.0f);  // dummy importance matrix
-            const float* im = imatrix.data();
+            std::vector<float> fallback;
+            const float* im = resolve_imatrix(name, n_per_row, fallback);
             ggml_quantize_chunk(dst_type, (float*)src, dst, 0, nrows, n_per_row, im);
         }
     } else if (dst_type == GGML_TYPE_F32) {
@@ -195,8 +243,8 @@ void convert_tensor(void* src,
         if (dst_type == GGML_TYPE_F16) {
             ggml_fp32_to_fp16_row((float*)src_data_f32, (ggml_fp16_t*)dst, n);
         } else {
-            std::vector<float> imatrix(n_per_row, 1.0f);  // dummy importance matrix
-            const float* im = imatrix.data();
+            std::vector<float> fallback;
+            const float* im = resolve_imatrix(name, n_per_row, fallback);
             ggml_quantize_chunk(dst_type, (float*)src_data_f32, dst, 0, nrows, n_per_row, im);
         }
     }
@@ -1113,7 +1161,8 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                                        convert_buf,
                                        dst_tensor->type,
                                        (int)tensor_storage.nelements() / (int)tensor_storage.ne[0],
-                                       (int)tensor_storage.ne[0]);
+                                       (int)tensor_storage.ne[0],
+                                       dst_tensor->name);
                     } else {
                         convert_buf = read_buf;
                     }

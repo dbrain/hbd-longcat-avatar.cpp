@@ -662,6 +662,28 @@ SD_API bool preprocess_canny(sd_image_t image,
 SD_API const char* sd_commit(void);
 SD_API const char* sd_version(void);
 
+// ---- nvfp4-twolevel diffusion imatrix collection ----
+// Enable per-DiT-Linear activation importance collection (AWQ-style per-input
+// column second moment). `name_filter` restricts collection to weights whose
+// name contains the substring (e.g. "diffusion_model"); pass NULL/"" for all.
+SD_API void sd_imatrix_collect_begin(const char* name_filter);
+// Write the accumulated imatrix as a gguf (one f32 1-D tensor per weight, keyed
+// by the prefix-stripped weight name). Returns true on success and reports the
+// number of tensors written via *n_written (may be NULL).
+SD_API bool sd_imatrix_collect_write_gguf(const char* out_path, int* n_written);
+
+// ---- nvfp4-twolevel convert imatrix feed ----
+// Like convert(), but additionally loads an imatrix gguf and feeds AWQ-style
+// per-column importance into the nvfp4 (and other) quantizers. Pass NULL/"" for
+// imatrix_path to behave exactly like convert().
+SD_API bool convert_with_imatrix(const char* input_path,
+                                 const char* vae_path,
+                                 const char* output_path,
+                                 enum sd_type_t output_type,
+                                 const char* tensor_type_rules,
+                                 bool convert_name,
+                                 const char* imatrix_path);
+
 #ifdef __cplusplus
 }
 #endif

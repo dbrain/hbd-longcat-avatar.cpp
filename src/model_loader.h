@@ -12,6 +12,10 @@
 
 TensorTypeRules parse_tensor_type_rules(const std::string& tensor_type_rules);
 
+// nvfp4-twolevel: set the per-tensor convert-time imatrix (keyed by tensor name,
+// each value length == n_per_row). Pass nullptr to clear. Not owned.
+void set_convert_imatrix(std::map<std::string, std::vector<float>>* m);
+
 class MmapWrapper;
 
 struct ModelFileData {

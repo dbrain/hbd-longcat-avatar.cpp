@@ -45,6 +45,13 @@ struct SDCliParams {
     bool canny_preprocess = false;
     bool convert_name     = false;
 
+    // nvfp4-twolevel diffusion imatrix:
+    //   --collect-imatrix <out.gguf>  (img_gen): enable DiT activation collection,
+    //                                   write imatrix gguf after generation.
+    //   --imatrix <in.gguf>           (convert): feed AWQ importance into nvfp4 quant.
+    std::string collect_imatrix_path;
+    std::string imatrix_path;
+
     preview_t preview_method = PREVIEW_NONE;
     int preview_interval     = 1;
     std::string preview_path = "preview.png";
@@ -78,6 +85,14 @@ struct SDCliParams {
              "--preview-path",
              "path to write preview image to (default: ./preview.png). Multi-frame previews support .avi, .webm, and animated .webp",
              &preview_path},
+            {"",
+             "--collect-imatrix",
+             "(img_gen) collect per-DiT-Linear activation importance during generation and write an imatrix gguf to this path",
+             &collect_imatrix_path},
+            {"",
+             "--imatrix",
+             "(convert) path to an imatrix gguf to drive AWQ-style importance for nvfp4 quantization",
+             &imatrix_path},
         };
 
         options.int_options = {
@@ -672,12 +687,13 @@ int main(int argc, const char* argv[]) {
     LOG_DEBUG("%s", gen_params.to_string().c_str());
 
     if (cli_params.mode == CONVERT) {
-        bool success = convert(ctx_params.model_path.c_str(),
-                               ctx_params.vae_path.c_str(),
-                               cli_params.output_path.c_str(),
-                               ctx_params.wtype,
-                               ctx_params.tensor_type_rules.c_str(),
-                               cli_params.convert_name);
+        bool success = convert_with_imatrix(ctx_params.model_path.c_str(),
+                                            ctx_params.vae_path.c_str(),
+                                            cli_params.output_path.c_str(),
+                                            ctx_params.wtype,
+                                            ctx_params.tensor_type_rules.c_str(),
+                                            cli_params.convert_name,
+                                            cli_params.imatrix_path.c_str());
         if (!success) {
             LOG_ERROR("convert '%s'/'%s' to '%s' failed",
                       ctx_params.model_path.c_str(),
@@ -848,8 +864,23 @@ int main(int argc, const char* argv[]) {
         if (cli_params.mode == IMG_GEN) {
             sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
 
+            // nvfp4-twolevel: enable diffusion imatrix collection before render.
+            if (!cli_params.collect_imatrix_path.empty()) {
+                sd_imatrix_collect_begin("diffusion_model");
+            }
+
             num_results = gen_params.batch_count;
             results.adopt(generate_image(sd_ctx.get(), &img_gen_params), num_results);
+
+            if (!cli_params.collect_imatrix_path.empty()) {
+                int n_written = 0;
+                if (!sd_imatrix_collect_write_gguf(cli_params.collect_imatrix_path.c_str(), &n_written)) {
+                    LOG_ERROR("failed to write imatrix to '%s'", cli_params.collect_imatrix_path.c_str());
+                } else {
+                    LOG_INFO("imatrix: wrote %d DiT Linear tensors to '%s'",
+                             n_written, cli_params.collect_imatrix_path.c_str());
+                }
+            }
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
 
