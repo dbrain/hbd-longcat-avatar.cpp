@@ -7,3 +7,7 @@ kg.json
 kg.err
 *.ncu-rep
 *.nsys-rep
+attn_golden
+attn_prof/
+attn.err
+nvfp4_repack_golden
