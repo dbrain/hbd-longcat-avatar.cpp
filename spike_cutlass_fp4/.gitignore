@@ -17,3 +17,8 @@ conv_ggml_baseline
 conv_cudnn_out/
 combined_out/
 decomp_out/
+ltx_out/
+attn_ltx_golden
+attn_ggml_baseline
+conv3d_golden
+conv3d_ggml_baseline
