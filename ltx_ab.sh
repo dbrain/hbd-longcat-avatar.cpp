@@ -41,7 +41,18 @@ OUT="${OUT:-$REPO/ltx_ab_out}"
 LABEL="${LABEL:-ltx_ab}"
 mkdir -p "$OUT"
 
-ENV_FLAGS=()
+# Prod recipe env (from kobbler docker-compose.yml ltx-video service). These materially
+# affect VRAM peak (esp. LONGCAT_FFN_TILE_TOKENS — tiles the FFN compute buffer) + perf.
+# Without them a 192f render peaks ~14GB; with them it matches the 12GB-card prod path.
+PROD_ENV=(
+  -e LONGCAT_NO_OFFLOAD_PIPELINING=1
+  -e LONGCAT_VAE_KEEP_RESIDENT=1
+  -e LONGCAT_SHARED_RESIDENT=1
+  -e LONGCAT_FFN_TILE_TOKENS=4096
+  -e LONGCAT_ENCODE_MAX_VRAM=9.5
+  -e LONGCAT_DIT_NO_MMAP=0
+)
+ENV_FLAGS=("${PROD_ENV[@]}")
 for kv in ${EXTRA_ENV:-}; do ENV_FLAGS+=(-e "$kv"); done
 
 # Optional init image (i2v). INIT_IMG = host path; mounted at /init.png.

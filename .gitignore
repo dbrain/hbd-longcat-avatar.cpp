@@ -28,3 +28,7 @@ profiles/
 bench/results/*.nsys-rep
 bench/results/*.sqlite
 bench/results/*.ncu-rep
+spike_cutlass_fp4/iprobe
+spike_cutlass_fp4/rgold
+spike_cutlass_fp4/w.bin
+spike_cutlass_fp4/gg_*
