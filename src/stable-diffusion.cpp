@@ -1003,7 +1003,7 @@ public:
             // GGML_CUDNN_CONV=1 routes VAE convs through GGML_OP_CONV_2D so the
             // env-gated cuDNN implicit-GEMM conv path in ggml-cuda intercepts them
             // (replacing the heavy im2col+GEMM VAE decode convs).
-            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV")) {
+            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV") || getenv("GGML_CUDNN_CONV3D")) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {

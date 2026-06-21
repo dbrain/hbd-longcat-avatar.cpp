@@ -1327,6 +1327,18 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
             // Pass, do not convert. For MMDiT
         } else if (contains(name, "time_embed.") || contains(name, "label_emb.")) {
             // Pass, do not convert. For Unet
+        } else if (contains(name, "scale_shift_table") ||
+                   contains(name, "adaln") ||
+                   contains(name, "norm") ||
+                   contains(name, "patchify_proj") ||
+                   contains(name, "proj_out") ||
+                   contains(name, "time_embedder") ||
+                   contains(name, "timestep_embedder")) {
+            // Pass, do not convert. For LTX-2.3 (LTXAV): modulation tables (scale_shift_table,
+            // adaLN), all norms, the patchify input proj and the output proj, and the timestep
+            // embedders stay high-precision. Mirrors the FLUX img_in/final_layer/time_in policy;
+            // modulation/norm weights MUST NOT be quantized or binbcast.cu asserts at runtime
+            // (this was the LTX-NVFP4 load crash).
         } else if (contains(name, "embedding")) {
             // Pass, do not convert embedding
         } else {
