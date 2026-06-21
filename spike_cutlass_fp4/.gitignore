@@ -12,3 +12,8 @@ attn_prof/
 attn.err
 nvfp4_repack_golden
 cudnn_out/
+conv_golden
+conv_ggml_baseline
+conv_cudnn_out/
+combined_out/
+decomp_out/
