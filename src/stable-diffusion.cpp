@@ -5104,6 +5104,40 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         sd_ctx->sd->sampler_rng->manual_seed(cur_seed);
         sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
 
+        // FP4 bench harness: replay a fixed initial latent across configs so the ONLY
+        // difference between renders is the compute path -> LPIPS/PSNR/latent-cosine
+        // become meaningful. FLUX2_INIT_LATENT=<file> loads the noise (raw f32, must
+        // match numel); FLUX2_SAVE_LATENT=<file> banks the freshly-sampled noise.
+        // File format: magic "FLX2LAT1" + int64 numel + numel*f32 (row-major).
+        if (const char* lp = getenv("FLUX2_INIT_LATENT")) {
+            FILE* f = fopen(lp, "rb");
+            if (!f) { LOG_ERROR("FLUX2_INIT_LATENT: cannot open %s", lp); }
+            else {
+                char magic[8] = {0}; int64_t nel = 0;
+                if (fread(magic, 1, 8, f) == 8 && memcmp(magic, "FLX2LAT1", 8) == 0 &&
+                    fread(&nel, sizeof(nel), 1, f) == 1 && nel == noise.numel() &&
+                    fread(noise.data(), sizeof(float), (size_t)nel, f) == (size_t)nel) {
+                    LOG_INFO("FLUX2_INIT_LATENT: loaded %lld-elem fixed latent from %s", (long long)nel, lp);
+                } else {
+                    LOG_ERROR("FLUX2_INIT_LATENT: bad/mismatched file %s (numel=%lld) — using RNG noise",
+                              lp, (long long)noise.numel());
+                }
+                fclose(f);
+            }
+        }
+        if (const char* sp = getenv("FLUX2_SAVE_LATENT")) {
+            FILE* f = fopen(sp, "wb");
+            if (!f) { LOG_ERROR("FLUX2_SAVE_LATENT: cannot open %s", sp); }
+            else {
+                int64_t nel = noise.numel();
+                fwrite("FLX2LAT1", 1, 8, f);
+                fwrite(&nel, sizeof(nel), 1, f);
+                fwrite(noise.data(), sizeof(float), (size_t)nel, f);
+                fclose(f);
+                LOG_INFO("FLUX2_SAVE_LATENT: banked %lld-elem latent to %s", (long long)nel, sp);
+            }
+        }
+
         sd::Tensor<float> x_0 = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                                    true,
                                                    latents.init_latent,
