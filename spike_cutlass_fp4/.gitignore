@@ -1,0 +1,9 @@
+# compiled spike binaries + run artifacts
+poc
+poc13
+kernel_golden
+*.o
+kg.json
+kg.err
+*.ncu-rep
+*.nsys-rep
