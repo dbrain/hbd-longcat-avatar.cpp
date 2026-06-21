@@ -53,6 +53,127 @@
 #define SD_UNUSED(x) (void)(x)
 #endif
 
+// ============================================================================
+// Diffusion imatrix collector (nvfp4-twolevel)
+// ----------------------------------------------------------------------------
+// AWQ-style per-input-COLUMN activation importance for DiT Linear weights.
+// When enabled, after every graph compute we walk the graph nodes and for each
+// GGML_OP_MUL_MAT whose src0 is a named weight tensor we accumulate the
+// per-column second moment of src1 (the activation): imatrix[col] += sum_tokens
+// (act[col]^2). Column == src1->ne[0] == weight->ne[0] == n_per_row, matching
+// the q4_K / quantize_nvfp4 quant_weights convention (length n_per_row,
+// broadcast across rows). Stats are keyed by the weight tensor name so the
+// emitted file can be looked up by model_loader during convert.
+// ============================================================================
+class SDImatrixCollector {
+public:
+    static SDImatrixCollector& instance() {
+        static SDImatrixCollector inst;
+        return inst;
+    }
+
+    void enable(bool on) { enabled_ = on; }
+    bool enabled() const { return enabled_; }
+
+    // Only collect for weights whose name contains this substring (e.g.
+    // "diffusion_model") so we skip VAE / text-encoder matmuls.
+    void set_name_filter(const std::string& f) { name_filter_ = f; }
+
+    // Accumulate one row of stats. `sums` length == n_per_row.
+    void accumulate(const std::string& name, const std::vector<double>& sums, int64_t n_tokens) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& e = data_[name];
+        if (e.sums.empty()) {
+            e.sums.assign(sums.size(), 0.0);
+        }
+        if (e.sums.size() != sums.size()) {
+            return;  // shape mismatch guard
+        }
+        for (size_t i = 0; i < sums.size(); ++i) {
+            e.sums[i] += sums[i];
+        }
+        e.n_tokens += n_tokens;
+        e.n_calls += 1;
+    }
+
+    bool matches_filter(const char* name) const {
+        if (name == nullptr || name[0] == '\0') {
+            return false;
+        }
+        if (name_filter_.empty()) {
+            return true;
+        }
+        return std::string(name).find(name_filter_) != std::string::npos;
+    }
+
+    struct Entry {
+        std::vector<double> sums;
+        int64_t n_tokens = 0;
+        int64_t n_calls  = 0;
+    };
+
+    const std::map<std::string, Entry>& data() const { return data_; }
+
+private:
+    SDImatrixCollector() = default;
+    bool enabled_ = false;
+    std::string name_filter_;
+    std::map<std::string, Entry> data_;
+    std::mutex mutex_;
+};
+
+// Walk a built+computed graph and accumulate column-wise activation stats for
+// every mul_mat whose src0 is a named weight passing the collector filter.
+__STATIC_INLINE__ void sd_imatrix_collect_from_graph(struct ggml_cgraph* gf, ggml_backend_t backend) {
+    auto& col = SDImatrixCollector::instance();
+    if (!col.enabled() || gf == nullptr) {
+        return;
+    }
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    std::vector<float> host;
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor* node = ggml_graph_node(gf, i);
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        ggml_tensor* w = node->src[0];  // weight
+        ggml_tensor* x = node->src[1];  // activation
+        if (w == nullptr || x == nullptr) {
+            continue;
+        }
+        if (!col.matches_filter(w->name)) {
+            continue;
+        }
+        // Only standard 2D-ish weights (out, in). n_per_row == in_features == w->ne[0] == x->ne[0].
+        const int64_t n_per_row = x->ne[0];
+        if (n_per_row != w->ne[0] || n_per_row <= 0) {
+            continue;
+        }
+        const int64_t n_tokens = x->ne[1] * x->ne[2] * x->ne[3];
+        if (n_tokens <= 0) {
+            continue;
+        }
+        // Read activation back to host as f32 (x is an intermediate in the compute
+        // buffer; valid here, before the next graph overwrites it).
+        const int64_t n_elem = n_per_row * n_tokens;
+        host.resize((size_t)n_elem);
+        if (x->type == GGML_TYPE_F32 && ggml_is_contiguous(x)) {
+            ggml_backend_tensor_get(x, host.data(), 0, (size_t)n_elem * sizeof(float));
+        } else {
+            continue;  // skip non-f32 / non-contiguous activations (rare for Linear inputs)
+        }
+        std::vector<double> sums((size_t)n_per_row, 0.0);
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const float* row = host.data() + (size_t)t * n_per_row;
+            for (int64_t c = 0; c < n_per_row; ++c) {
+                const double v = (double)row[c];
+                sums[(size_t)c] += v * v;
+            }
+        }
+        col.accumulate(w->name, sums, n_tokens);
+    }
+}
+
 __STATIC_INLINE__ int align_up_offset(int n, int multiple) {
     return (multiple - n % multiple) % multiple;
 }
@@ -3619,6 +3740,14 @@ protected:
                 restore_partial_params();
             }
             return std::nullopt;
+        }
+
+        // Diffusion imatrix collection (nvfp4-twolevel): accumulate per-column
+        // activation stats for DiT Linear mul_mats while activations are still
+        // live in the compute buffer. No-op unless the collector is enabled.
+        if (SDImatrixCollector::instance().enabled()) {
+            ggml_backend_synchronize(runtime_backend);
+            sd_imatrix_collect_from_graph(gf, runtime_backend);
         }
 
         std::unordered_set<const ggml_tensor*> debug_graph_tensor_set;

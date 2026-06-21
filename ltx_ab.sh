@@ -63,6 +63,7 @@ docker run --rm --gpus all \
   "${IMG_FLAGS[@]}" \
   -v "$REPO:/src" \
   -v "$MODELS:/models:ro" \
+  -v /mnt/ssd/models:/mnt/ssd/models:ro \
   -v "$OUT:/out" \
   -w /src \
   "$IMG" "$BIN" \

@@ -1,11 +1,15 @@
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <regex>
 #include <vector>
 
+#include "core/ggml_extend.hpp"  // SDImatrixCollector (nvfp4-twolevel)
+#include "gguf.h"                 // gguf_init_from_file (imatrix load)
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
 #include "model_loader.h"
+#include "stable-diffusion.h"
 #include "util.h"
 
 #include "ggml_extend_backend.h"
@@ -147,4 +151,137 @@ bool convert(const char* input_path,
 
     ggml_free(ggml_ctx);
     return success;
+}
+
+// ===========================================================================
+// nvfp4-twolevel: diffusion imatrix collection + imatrix-fed convert
+// ===========================================================================
+
+static std::string imx_strip_dit_prefix(const std::string& name) {
+    static const std::string p1 = "model.diffusion_model.";
+    static const std::string p2 = "diffusion_model.";
+    if (name.rfind(p1, 0) == 0)
+        return name.substr(p1.size());
+    if (name.rfind(p2, 0) == 0)
+        return name.substr(p2.size());
+    return name;
+}
+
+void sd_imatrix_collect_begin(const char* name_filter) {
+    auto& col = SDImatrixCollector::instance();
+    col.set_name_filter(name_filter != nullptr ? std::string(name_filter) : std::string());
+    col.enable(true);
+    LOG_INFO("[imatrix] collection enabled (filter='%s')", name_filter ? name_filter : "");
+}
+
+bool sd_imatrix_collect_write_gguf(const char* out_path, int* n_written) {
+    auto& col          = SDImatrixCollector::instance();
+    const auto& entries = col.data();
+    if (entries.empty()) {
+        LOG_ERROR("[imatrix] no stats collected; nothing to write");
+        if (n_written)
+            *n_written = 0;
+        return false;
+    }
+
+    // Build a CPU ggml context to hold one f32 1-D tensor per weight, named by
+    // the prefix-stripped weight name. Value == mean per-column second moment
+    // (sum(act^2) / n_tokens), which is the AWQ-style importance.
+    size_t mem = ggml_tensor_overhead() * (entries.size() + 1);
+    for (const auto& kv : entries) {
+        mem += kv.second.sums.size() * sizeof(float) + 256;
+    }
+    ggml_context* ctx = ggml_init({mem, nullptr, false});
+    if (ctx == nullptr) {
+        LOG_ERROR("[imatrix] ggml_init failed");
+        return false;
+    }
+
+    std::vector<TensorWriteInfo> tensors;
+    int written = 0;
+    for (const auto& kv : entries) {
+        const std::string name = imx_strip_dit_prefix(kv.first);
+        const auto& e          = kv.second;
+        if (e.sums.empty() || e.n_tokens <= 0) {
+            continue;
+        }
+        ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t)e.sums.size());
+        ggml_set_name(t, name.c_str());
+        float* dst = (float*)t->data;
+        for (size_t i = 0; i < e.sums.size(); ++i) {
+            dst[i] = (float)(e.sums[i] / (double)e.n_tokens);
+        }
+        TensorWriteInfo wi;
+        wi.tensor  = t;
+        wi.n_dims  = 1;
+        wi.ne[0]   = (int64_t)e.sums.size();
+        tensors.push_back(wi);
+        written++;
+    }
+
+    std::string error;
+    bool ok = write_gguf_file(out_path, tensors, &error);
+    if (!ok) {
+        LOG_ERROR("[imatrix] write failed: %s", error.c_str());
+    } else {
+        LOG_INFO("[imatrix] wrote %d tensors to %s", written, out_path);
+    }
+    ggml_free(ctx);
+    if (n_written)
+        *n_written = written;
+    return ok;
+}
+
+// Load an imatrix gguf into a name->vector<float> map.
+static bool load_imatrix_gguf(const std::string& path,
+                              std::map<std::string, std::vector<float>>& out) {
+    struct gguf_init_params gp = {/*no_alloc=*/false, /*ctx=*/nullptr};
+    ggml_context* data_ctx     = nullptr;
+    gp.ctx                     = &data_ctx;
+    gguf_context* gctx         = gguf_init_from_file(path.c_str(), gp);
+    if (gctx == nullptr) {
+        LOG_ERROR("[imatrix] failed to open '%s'", path.c_str());
+        return false;
+    }
+    const int n = (int)gguf_get_n_tensors(gctx);
+    for (int i = 0; i < n; ++i) {
+        const char* name = gguf_get_tensor_name(gctx, i);
+        ggml_tensor* t   = ggml_get_tensor(data_ctx, name);
+        if (t == nullptr || t->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const int64_t ne = ggml_nelements(t);
+        std::vector<float> v((size_t)ne);
+        memcpy(v.data(), t->data, (size_t)ne * sizeof(float));
+        out[name] = std::move(v);
+    }
+    gguf_free(gctx);
+    if (data_ctx)
+        ggml_free(data_ctx);
+    LOG_INFO("[imatrix] loaded %zu tensors from %s", out.size(), path.c_str());
+    return !out.empty();
+}
+
+bool convert_with_imatrix(const char* input_path,
+                          const char* vae_path,
+                          const char* output_path,
+                          enum sd_type_t output_type,
+                          const char* tensor_type_rules,
+                          bool convert_name,
+                          const char* imatrix_path) {
+    std::map<std::string, std::vector<float>> imatrix;
+    bool have_imatrix = false;
+    if (imatrix_path != nullptr && strlen(imatrix_path) > 0) {
+        if (!load_imatrix_gguf(imatrix_path, imatrix)) {
+            LOG_ERROR("convert: failed to load imatrix '%s'", imatrix_path);
+            return false;
+        }
+        set_convert_imatrix(&imatrix);
+        have_imatrix = true;
+    }
+    bool ok = convert(input_path, vae_path, output_path, output_type, tensor_type_rules, convert_name);
+    if (have_imatrix) {
+        set_convert_imatrix(nullptr);
+    }
+    return ok;
 }
