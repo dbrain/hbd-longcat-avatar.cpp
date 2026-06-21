@@ -1164,6 +1164,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         x          = ggml_reshape_4d(ctx, x, im2col->ne[1] * im2col->ne[2], OD, N, OC);
         x          = ggml_cont(ctx, ggml_permute(ctx, x, 0, 1, 3, 2));
         x          = ggml_reshape_4d(ctx, x, im2col->ne[1], im2col->ne[2], OD, OC * N);
+    } else if ((getenv("GGML_CUDNN_CONV3D") || getenv("GGML_CUDNN_CONV")) &&
+               s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1) {
+        // Route to the single-op ggml_conv_3d_direct (GGML_OP_CONV_3D) so the env-gated
+        // cuDNN implicit-GEMM 3D conv (ggml-cuda/conv3d-cudnn.cu) can take it on Blackwell,
+        // skipping the im2col_3d IC*27 HBM blowup. Restricted to stride/dilation 1 (the LTX
+        // VAE CausalConv3d profile, where the cuDNN path is validated cosine 1.0). On a
+        // non-CUDA backend / unsupported shape this op falls back to the CPU conv_3d.
+        int64_t OC = w->ne[3] / IC;
+        int64_t N  = x->ne[3] / IC;
+        x = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
     } else {
         x = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
     }

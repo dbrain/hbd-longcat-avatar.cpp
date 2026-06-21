@@ -1000,7 +1000,7 @@ public:
                 get_param_tensors_p(audio_vae_model, vae_mmap, "");
             }
 
-            if (sd_ctx_params->vae_conv_direct) {
+            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV") || getenv("GGML_CUDNN_CONV3D")) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {
@@ -5553,6 +5553,14 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                        cont_tail, base_idx, "cont", omask)) {
                 return std::nullopt;
             }
+        } else {
+            // Pure text-to-video (no init/end image, no continuation). Without this branch the
+            // LTXAV t2v path set no init_latent and fell through to the generic image-latent
+            // init ([W,H,C,1], no frames dim) -> split_av_latents misread channels as frames and
+            // asserted. Mirror the image-cond branch: full-length video noise + fully-denoised mask.
+            LOG_INFO("TXT2VID (LTXAV)");
+            latents.init_latent  = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
         }
     }
 
