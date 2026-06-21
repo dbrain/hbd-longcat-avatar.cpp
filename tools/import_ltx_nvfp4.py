@@ -14,7 +14,7 @@ PFX='model.diffusion_model.'
 GT_F32=0; GT_BF16=30; GT_NVFP4=40
 # Non-fp4 tensors: BF16 keeps the gguf small enough to fit the 5060 Ti resident+offload budget
 # (F32 bloated it to 20GB -> OOM). The loader converts BF16->F32 for the F32-allocated params.
-NONFP4_TYPE=GT_F32  # all non-fp4 -> F32 (correct types; the model concatenates some of these and
+NONFP4_TYPE=GT_BF16  # trace mode: BF16 non-fp4 (keepf32 list keeps modulation/norm F32) -> triggers concat assert to pin offenders
                     # ggml_concat asserts uniform type, so BF16 breaks it). Bigger gguf, fit via offload.
 
 def st_open(p):
