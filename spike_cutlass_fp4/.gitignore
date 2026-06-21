@@ -11,3 +11,4 @@ attn_golden
 attn_prof/
 attn.err
 nvfp4_repack_golden
+cudnn_out/
