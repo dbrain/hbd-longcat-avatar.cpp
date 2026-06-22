@@ -554,6 +554,13 @@ namespace LTXV {
                                                      int64_t dim_head,
                                                      bool rope_interleaved) {
         GGML_ASSERT(x->ne[0] == heads * dim_head);
+        // ggml_rope_pe is F32-only (rope-pe.cu asserts F32 in/pe/out). When the DiT
+        // runs the F16 residual stream (dit_f16 + F16-dst Linears), q/k arrive F16 —
+        // cast them back to F32 here so RoPE is satisfied. (v skips RoPE and stays F16
+        // for the flash-attn path, which casts K/V to F16 anyway.)
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F32);
+        }
         auto x4 = ggml_reshape_4d(ctx, x, dim_head, heads, x->ne[1], x->ne[2]);
         if (pe != nullptr && pe->ne[3] == x->ne[1] * heads) {
             auto x_flat   = ggml_reshape_4d(ctx, x4, dim_head, 1, x->ne[1] * heads, x->ne[2]);
@@ -1665,6 +1672,25 @@ namespace LTXV {
                 ax = nullptr;
             }
 
+            // WORKSTREAM B experiment (LTX_DIT_F16, default OFF) — run the DiT residual
+            // stream in F16 to halve glue memory traffic (§9c). MEASURED 2026-06-22: F16 is
+            // range-SAFE (nnan=0, clean latents at 1280x704 — the kv_scale overflow note does
+            // NOT bite the residual stream) BUT a NET LOSS at prod scale: 193f sampling
+            // 228s(F32) -> 304s(F16), +33%, per-segment compute 1767->5485ms. Cause: F16
+            // activations fed into the FP4 cuBLASLt GEMM fall OFF the fast tensor-core path
+            // (the quantized matmul wants F32 activation). So naive activation-dtype casting
+            // is capped by the matmul. The real glue+matmul lever = a fast FP4 GEMM that
+            // takes low-precision (FP8/FP16) activations directly (comfy's native scaled_mm)
+            // — a ggml-cuda nvfp4-cublaslt change, NOT this cast. Kept env-gated as the
+            // scaffold for that follow-up; leave OFF.
+            static const bool dit_f16 = (std::getenv("LTX_DIT_F16") != nullptr);
+            if (dit_f16) {
+                vx = ggml_cast(ctx->ggml_ctx, vx, GGML_TYPE_F16);
+                if (ax != nullptr) {
+                    ax = ggml_cast(ctx->ggml_ctx, ax, GGML_TYPE_F16);
+                }
+            }
+
             bool run_ax    = ax != nullptr && ggml_nelements(ax) > 0 && audio_time > 0;
             auto contexts  = preprocess_contexts(ctx, context, video_connector_pe, audio_connector_pe, run_ax);
             auto v_context = contexts.first;
@@ -1799,6 +1825,9 @@ namespace LTXV {
                 }
             }
 
+            if (dit_f16 && vx->type != GGML_TYPE_F32) {
+                vx = ggml_cast(ctx->ggml_ctx, vx, GGML_TYPE_F32);
+            }
             auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, ctx->ltx_video_token_sel);
             vx                 = norm_out->forward(ctx, vx);
             vx                 = modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
@@ -1806,6 +1835,9 @@ namespace LTXV {
             vx                 = unpatchify_video(ctx, vx, width, height, frames);
 
             if (ax != nullptr && audio_time > 0) {
+                if (dit_f16 && ax->type != GGML_TYPE_F32) {
+                    ax = ggml_cast(ctx->ggml_ctx, ax, GGML_TYPE_F32);
+                }
                 auto a_shift_scale = get_output_scale_shift(ctx, params["audio_scale_shift_table"], a_embedded_time, config.audio_hidden_size);
                 ax                 = audio_norm_out->forward(ctx, ax);
                 ax                 = modulate(ctx->ggml_ctx, ax, a_shift_scale[0], a_shift_scale[1]);
