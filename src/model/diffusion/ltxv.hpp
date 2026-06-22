@@ -558,6 +558,10 @@ namespace LTXV {
         // runs the F16 residual stream (dit_f16 + F16-dst Linears), q/k arrive F16 —
         // cast them back to F32 here so RoPE is satisfied. (v skips RoPE and stays F16
         // for the flash-attn path, which casts K/V to F16 anyway.)
+        // NB: an F16 rope_pe path was tried (so q/k flow F16 end-to-end, dropping this
+        // cast) — measured +16% DiT compute on the proxy (3725→4340 ms/step-pair), a
+        // clean LOSS, so reverted. The F16 q/k stream slows the downstream attention
+        // reshape/cont + flash path more than the saved cast; F32 rope stays the win.
         if (x->type != GGML_TYPE_F32) {
             x = ggml_cast(ctx, x, GGML_TYPE_F32);
         }
