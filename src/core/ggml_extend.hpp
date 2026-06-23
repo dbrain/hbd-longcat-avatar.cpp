@@ -1556,6 +1556,28 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        // beat-comfy cast-reduction: keep the cuDNN attn output F16 in the LTX_DIT_F16
+        // stream. cuDNN already produces F16 internally and is selected exactly for the
+        // mask-free, F16-Q, D in {64,128} shape — matching this gate — so the only change
+        // is dropping the bhsd->F32 upcast (1.1% of DiT) and keeping the following to_out
+        // Linear on the cheaper F16 activation-quant path instead of the F32 one. F32
+        // accumulation is unchanged inside cuDNN; only the stored output is F16 (= what
+        // the residual stream already is). Env-gated, default OFF (prod/F32 untouched).
+        // NB: do NOT gate on q_in->type — under LTX_DIT_F16 the rope'd self-attn q is
+        // cast to F32 (rope_pe is F32-only), yet cuDNN still emits F16 internally and the
+        // to_out consumer is F16. The env is the dit_f16 opt-in; gate only on the cuDNN
+        // selection shape (mask-free, D in {64,128}). cuDNN casts an F32 q to F16 itself.
+        static const bool cudnn_f16_out = getenv("GGML_CUDNN_ATTN_F16_OUT") != nullptr;
+        if (cudnn_f16_out && mask_in == nullptr && (d_head == 64 || d_head == 128)) {
+            // Retype the (contiguous) flash output F32->F16 and recompute its strides;
+            // ggml_flash_attn_ext hard-codes an F32 result, so nb[] is F32-sized and must
+            // be rebuilt for the half element size or downstream reads mis-stride.
+            out->type  = GGML_TYPE_F16;
+            out->nb[0] = ggml_type_size(GGML_TYPE_F16);
+            out->nb[1] = out->nb[0] * out->ne[0];
+            out->nb[2] = out->nb[1] * out->ne[1];
+            out->nb[3] = out->nb[2] * out->ne[2];
+        }
         if (kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
         }
