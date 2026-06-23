@@ -2857,6 +2857,32 @@ public:
         return waveform;
     }
 
+    // LTXAV chain inter-segment GPU reclaim. A warm resident chain (keep_diffusion_model_resident)
+    // keeps every runner's CPU params alive so the next segment re-offloads without a disk reload,
+    // but it ALSO leaves each runner's GPU-side residency + temporal/causal-conv CACHE buffer
+    // resident across the segment boundary. Those stack onto the next segment's DiT sampling: a
+    // 2-seg chain peaks ~12.5 GB @ mv10.5 vs ~11.1 GB single-seg (the +1.4 GB "chain anchor") —
+    // measured leftover after seg-0's decode = ~1.74 GB (audio-VAE params left on-GPU by its
+    // free_compute_buffer_immediately=false decode + the DiT/video-VAE/audio-VAE compute & cache
+    // buffers). Everything here is rebuilt by the next segment's own compute, so release it. We
+    // only drop the GPU-side residency + caches; each runner KEEPS its host params buffer
+    // (free_compute_buffer restores the offload to host; free_params_buffer is NOT called), so the
+    // next segment re-offloads from RAM with no reload and the resident-chain contract holds.
+    void release_chain_segment_gpu_residency() {
+        auto reclaim = [](auto& runner) {
+            if (!runner) {
+                return;
+            }
+            runner->release_streaming_residency();    // drop any cross-step shared-resident payload
+            runner->free_compute_buffer();            // restore offloaded params to host + free activations
+            runner->free_cache_ctx_and_buffer();      // free the temporal/causal-conv cache buffer
+        };
+        reclaim(diffusion_model);
+        reclaim(high_noise_diffusion_model);
+        reclaim(first_stage_model);
+        reclaim(audio_vae_model);
+    }
+
     void set_flow_shift(float flow_shift = INFINITY) {
         auto flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser);
         if (flow_denoiser) {
@@ -7279,6 +7305,16 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             audio_acc.append(seg_audio, (seg == 0) ? 0 : audio_acc.drop_for(seg_audio, overlap_px, base_params->fps));
         }
         free_sd_audio(seg_audio);
+
+        // Reclaim the per-segment GPU residency + caches before the NEXT segment's DiT
+        // sampling allocates its full footprint on top (the +1.4 GB chain anchor). Skipped
+        // after the last segment (nothing follows) and gated so it only runs on the warm
+        // resident chain path. Default-on; env LTXAV_NO_CHAIN_GPU_RECLAIM=1 restores the
+        // old (leaky) behaviour for A/B.
+        if (seg + 1 < n_chain && sd_ctx->sd->keep_diffusion_model_resident &&
+            getenv("LTXAV_NO_CHAIN_GPU_RECLAIM") == nullptr) {
+            sd_ctx->sd->release_chain_segment_gpu_residency();
+        }
     }
 
     // Don't let the per-segment latent-save env leak into a later (non-chain) render in the
