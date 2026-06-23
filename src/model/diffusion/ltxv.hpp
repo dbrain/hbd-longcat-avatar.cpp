@@ -62,6 +62,29 @@ namespace LTXV {
         return Flux::modulate(ctx, x, shift, scale, true);
     }
 
+    __STATIC_INLINE__ bool ltx_rms_mod_fuse_enabled() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = getenv("GGML_CUDA_RMS_MOD_FUSE");
+            v = (e && atoi(e)) ? 1 : 0;
+        }
+        return v == 1;
+    }
+
+    // Fused rms_norm + modulate as ONE custom CUDA op: rms(x)*(1+scale)+shift.
+    // x_prenorm stays PRE-rms (the op normalizes internally over ne[0]); scale/shift are
+    // aligned (permuted) exactly like modulate() does, so the permute guard fires identically.
+    // The +1 of (1+scale) is intrinsic to the op, so RAW scale is passed (NOT scale+1).
+    // Uses the SAME eps as rms_norm() above (1e-6f) so quality matches the unfused chain.
+    __STATIC_INLINE__ ggml_tensor* modulate_fused(ggml_context* ctx,
+                                                  ggml_tensor* x_prenorm,
+                                                  ggml_tensor* shift,
+                                                  ggml_tensor* scale) {
+        shift = align_token_modulation(ctx, x_prenorm, shift);
+        scale = align_token_modulation(ctx, x_prenorm, scale);
+        return ggml_rms_modulate(ctx, x_prenorm, scale, shift, 1e-6f);
+    }
+
     __STATIC_INLINE__ ggml_tensor* apply_gate(ggml_context* ctx,
                                               ggml_tensor* x,
                                               ggml_tensor* gate) {
@@ -1253,8 +1276,13 @@ namespace LTXV {
                                                 ggml_tensor* expand_sel = nullptr) {
             if (cross_attention_adaln) {
                 auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, expand_sel);
-                auto q           = rms_norm(ctx->ggml_ctx, x);
-                q                = modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
+                ggml_tensor* q   = nullptr;
+                if (ltx_rms_mod_fuse_enabled()) {
+                    q = modulate_fused(ctx->ggml_ctx, x, q_mods[0], q_mods[1]);
+                } else {
+                    q = rms_norm(ctx->ggml_ctx, x);
+                    q = modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
+                }
                 auto context_mod = context;
                 if (prompt_timestep != nullptr && prompt_table != nullptr) {
                     auto p_mods = get_ada_values(ctx, prompt_table, prompt_timestep, dim, 2);
@@ -1304,8 +1332,13 @@ namespace LTXV {
             bool run_v2a = run_ax;
 
             auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
-            auto v_norm = rms_norm(ctx->ggml_ctx, vx);
-            v_norm      = modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
+            ggml_tensor* v_norm = nullptr;
+            if (ltx_rms_mod_fuse_enabled()) {
+                v_norm = modulate_fused(ctx->ggml_ctx, vx, v_mods[0], v_mods[1]);
+            } else {
+                v_norm = rms_norm(ctx->ggml_ctx, vx);
+                v_norm = modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
+            }
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
             if (stop_at_subop == 0) {
@@ -1329,8 +1362,13 @@ namespace LTXV {
 
             if (run_ax) {
                 auto a_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6);
-                auto a_norm = rms_norm(ctx->ggml_ctx, ax);
-                a_norm      = modulate(ctx->ggml_ctx, a_norm, a_mods[0], a_mods[1]);
+                ggml_tensor* a_norm = nullptr;
+                if (ltx_rms_mod_fuse_enabled()) {
+                    a_norm = modulate_fused(ctx->ggml_ctx, ax, a_mods[0], a_mods[1]);
+                } else {
+                    a_norm = rms_norm(ctx->ggml_ctx, ax);
+                    a_norm = modulate(ctx->ggml_ctx, a_norm, a_mods[0], a_mods[1]);
+                }
                 auto a_sa   = audio_attn1->forward(ctx, a_norm, nullptr, nullptr, a_pe);
                 ax          = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_sa, a_mods[2]));
                 auto a_txt  = apply_text_cross_attention(ctx,
@@ -1377,15 +1415,25 @@ namespace LTXV {
                     ax                   = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, v2a_out, v2a_gate));
                 }
                 auto a_ff_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6, 3, 3);
-                auto ax_scaled = rms_norm(ctx->ggml_ctx, ax);
-                ax_scaled      = modulate(ctx->ggml_ctx, ax_scaled, a_ff_mods[0], a_ff_mods[1]);
+                ggml_tensor* ax_scaled = nullptr;
+                if (ltx_rms_mod_fuse_enabled()) {
+                    ax_scaled = modulate_fused(ctx->ggml_ctx, ax, a_ff_mods[0], a_ff_mods[1]);
+                } else {
+                    ax_scaled = rms_norm(ctx->ggml_ctx, ax);
+                    ax_scaled = modulate(ctx->ggml_ctx, ax_scaled, a_ff_mods[0], a_ff_mods[1]);
+                }
                 auto a_ff_out  = audio_ff->forward(ctx, ax_scaled);
                 ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
             }
 
             auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, ctx->ltx_video_token_sel);
-            auto vx_scaled = rms_norm(ctx->ggml_ctx, vx);
-            vx_scaled      = modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
+            ggml_tensor* vx_scaled = nullptr;
+            if (ltx_rms_mod_fuse_enabled()) {
+                vx_scaled = modulate_fused(ctx->ggml_ctx, vx, v_ff_mods[0], v_ff_mods[1]);
+            } else {
+                vx_scaled = rms_norm(ctx->ggml_ctx, vx);
+                vx_scaled = modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
+            }
             auto v_ff_out  = ff->forward(ctx, vx_scaled);
             vx             = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_ff_out, v_ff_mods[2]));
 
