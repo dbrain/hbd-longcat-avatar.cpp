@@ -1212,10 +1212,19 @@ public:
         // above only engages for umT5-on-GPU, but the free-then-reload-on-prompt-change
         // requirement is independent of placement. Gate only on avatar + freed-weights +
         // no-mmap (mmap'd weights are never freed, so no reload is needed).
-        if (sd_version_is_longcat_avatar(version) && cond_stage_model &&
-            free_params_immediately && !sd_ctx_params->enable_mmap) {
+        // Existing avatar (umT5, !mmap) PLUS the flux2 IMAGE path (incl. --mmap): a warm
+        // resident image worker re-encodes a fresh prompt every /generate, but with NVFP4
+        // offload-off the TE (~4.7 GB Qwen3) would otherwise sit on-GPU between requests.
+        // Capturing the loader + TE tensor subset lets prepare_image_generation_embeds free
+        // it after each cond and reload_cond_stage_model() restore it before the next prompt
+        // (release-after-encode -> resident ~6 GB vs ~11). The reload loader re-reads the
+        // file, so this works under --mmap too. This condition preserves the avatar's exact
+        // prior behavior (avatar => captured only when !mmap) and adds the image path.
+        if (cond_stage_model && free_params_immediately &&
+            (!sd_ctx_params->enable_mmap || !sd_version_is_longcat_avatar(version))) {
             for (const auto& [key, tensor] : tensors) {
-                if (starts_with(key, "text_encoders.t5xxl.transformer")) {
+                if (starts_with(key, "text_encoders.t5xxl.transformer") ||
+                    starts_with(key, "text_encoders.llm")) {
                     te_reload_tensors[key] = tensor;
                 }
             }
@@ -1528,7 +1537,7 @@ public:
             return true;  // still resident, nothing to reload
         }
         if (!te_reload_loader || te_reload_tensors.empty()) {
-            LOG_ERROR("avatar: umT5 reload requested but no reload state captured");
+            LOG_ERROR("text-encoder reload requested but no reload state captured");
             return false;
         }
         int64_t t0 = ggml_time_ms();
@@ -1538,10 +1547,10 @@ public:
                                                  n_threads,
                                                  te_reload_use_mmap);
         if (!ok) {
-            LOG_ERROR("avatar: umT5 reload failed");
+            LOG_ERROR("text-encoder reload failed");
             return false;
         }
-        LOG_INFO("avatar: umT5 reloaded for prompt change, taking %.2fs",
+        LOG_INFO("text-encoder reloaded for prompt change, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
@@ -4778,6 +4787,14 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     int64_t prepare_start_ms         = ggml_time_ms();
     condition_params.zero_out_masked = false;
 
+    // Release-after-encode (warm image worker): the TE may have been freed after the
+    // previous request's cond to keep the NVFP4 DiT's resident footprint low (~6 GB vs
+    // ~11). Reload it from the captured loader before this prompt's encode. No-op if the
+    // TE is still resident or no reload state was captured (one-shot CLI / non-warm).
+    if (!sd_ctx->sd->reload_cond_stage_model()) {
+        LOG_ERROR("text-encoder reload failed; text conditioning may be unavailable");
+    }
+
     // flux2 lap-11 Lever A: CFG does two consecutive text encodes (cond below,
     // uncond just after). With --offload-to-cpu the text-encoder params get
     // restored to CPU after the cond encode and fully re-uploaded for the uncond
@@ -4868,7 +4885,17 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     // --offload-to-cpu the TE params live on the CPU params backend (the per-compute GPU
     // copy is freed by free_compute_buffer), so keeping them resident costs no VRAM; under
     // --mmap they are reclaimable file-backed pages.
-    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
+    //
+    // Release-after-encode: the warm resident IMAGE worker frees the TE TOO when we
+    // captured reload state above — with NVFP4 offload-off the Qwen3 encoder (~4.7 GB)
+    // would otherwise stay GPU-resident between requests; freeing it here drops the warm
+    // footprint to ~6 GB and reload_cond_stage_model() (top of prepare_image_generation_embeds)
+    // restores it before the next prompt from the captured mmap'd loader (~1-2s/render).
+    const bool warm_release_te = sd_ctx->sd->keep_diffusion_model_resident &&
+                                 sd_ctx->sd->te_reload_loader &&
+                                 !sd_ctx->sd->te_reload_tensors.empty();
+    if (sd_ctx->sd->free_params_immediately &&
+        (!sd_ctx->sd->keep_diffusion_model_resident || warm_release_te)) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
 
