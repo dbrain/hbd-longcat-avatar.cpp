@@ -56,7 +56,13 @@ namespace LTXV {
         }
 
         int output_sample_rate() const {
-            return sample_rate;
+            // BWE upsamples 16k -> 48k; the model's real output rate is the BWE
+            // output when present. (Regressed to a flat `sample_rate` in b0b639d,
+            // which mislabelled + muffled the audio — restored here.)
+            if (has_bwe) {
+                return bwe_output_sample_rate;
+            }
+            return base_output_sample_rate();
         }
 
         static LTXAudioVAEConfig detect_from_weights(const String2TensorStorage& tensor_storage_map, const std::string& prefix = "") {
@@ -1279,7 +1285,12 @@ namespace LTXV {
                                        -1.0f,
                                        1.0f);
                 waveform  = crop_waveform_samples(ctx->ggml_ctx, waveform, out_time);
-                if (config.bwe_output_sample_rate != config.sample_rate) {
+                // KEEP the full-band 48k BWE output (this is the model's real output rate).
+                // b0b639d added a 48k->16k downsample here that discarded exactly the
+                // bandwidth-extension highs BWE just synthesised (muffled audio). Default
+                // to NOT downsampling; set NAVA_AUDIO_BWE_DOWNSAMPLE_16K=1 to restore it.
+                if (config.bwe_output_sample_rate != config.sample_rate &&
+                    std::getenv("NAVA_AUDIO_BWE_DOWNSAMPLE_16K") != nullptr) {
                     GGML_ASSERT(bwe_downsample_filter != nullptr);
                     waveform = downsample_waveform_torchaudio_hann(ctx,
                                                                    waveform,
