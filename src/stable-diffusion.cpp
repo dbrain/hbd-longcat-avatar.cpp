@@ -7030,10 +7030,14 @@ static sd_audio_t* read_seg_audio(const std::string& path) {
 // "keep only seg0 audio" behaviour, which left multi-segment clips silent after seg0 (and
 // dropped audio entirely on resume).
 struct ChainAudioAcc {
-    uint32_t                        sample_rate = 0;
-    uint32_t                        channels    = 0;
-    std::vector<std::vector<float>> chans;  // per-channel samples
+    uint32_t           sample_rate = 0;
+    uint32_t           channels    = 0;
+    std::vector<float> frames;  // INTERLEAVED: [f0c0, f0c1, f1c0, f1c1, ...]
 
+    // sd_audio_t.data is interleaved (channel-minor) — same layout the single-segment
+    // path feeds the opus/pcm writers, which read interleaved. The old per-channel
+    // (planar) accumulate/rebuild scrambled the stereo pair across segments, which is
+    // why multi-segment renders sounded broken while single-segment was clean.
     void append(const sd_audio_t* a, int drop_head_samples) {
         if (a == nullptr || a->data == nullptr || a->sample_count == 0) {
             return;
@@ -7041,20 +7045,19 @@ struct ChainAudioAcc {
         if (channels == 0) {
             channels    = a->channels;
             sample_rate = a->sample_rate;
-            chans.resize(channels);
         }
         if (a->channels != channels) {
             LOG_WARN("chain audio: segment channel count %u != %u; skipping its audio", a->channels, channels);
             return;
         }
-        int sc    = (int)a->sample_count;
+        int sc    = (int)a->sample_count;  // frames
         int start = std::min(std::max(0, drop_head_samples), sc);
-        for (uint32_t c = 0; c < channels; ++c) {
-            const float* src = a->data + (size_t)c * sc;  // planar
-            chans[c].insert(chans[c].end(), src + start, src + sc);
-        }
+        // Drop `start` whole frames off the head, then append the rest interleaved.
+        frames.insert(frames.end(),
+                      a->data + (size_t)start * channels,
+                      a->data + (size_t)sc * channels);
     }
-    // Audio samples to drop for a seg>0 to match the dropped overlap_px video frames.
+    // Audio samples (frames) to drop for a seg>0 to match the dropped overlap_px video frames.
     int drop_for(const sd_audio_t* a, int overlap_px, int fps) const {
         if (a == nullptr || fps <= 0) {
             return 0;
@@ -7062,22 +7065,20 @@ struct ChainAudioAcc {
         return (int)llround((double)overlap_px * a->sample_rate / fps);
     }
     sd_audio_t* build() const {
-        if (channels == 0 || chans.empty() || chans[0].empty()) {
+        if (channels == 0 || frames.empty()) {
             return nullptr;
         }
-        size_t      per = chans[0].size();
+        size_t      per = frames.size() / channels;  // frames
         sd_audio_t* out = (sd_audio_t*)malloc(sizeof(sd_audio_t));
         out->sample_rate  = sample_rate;
         out->channels     = channels;
         out->sample_count = per;
-        out->data         = (float*)malloc(per * channels * sizeof(float));
+        out->data         = (float*)malloc(frames.size() * sizeof(float));
         if (out->data == nullptr) {
             free(out);
             return nullptr;
         }
-        for (uint32_t c = 0; c < channels; ++c) {
-            std::memcpy(out->data + (size_t)c * per, chans[c].data(), per * sizeof(float));
-        }
+        std::memcpy(out->data, frames.data(), frames.size() * sizeof(float));
         return out;
     }
 };
