@@ -3970,7 +3970,36 @@ struct SamplePlan {
 
         total_steps = sample_steps + std::max(0, high_noise_sample_steps);
 
-        if (sample_params->custom_sigmas_count > 0) {
+        // A/B hook: LTX_CUSTOM_SIGMAS="1.0,0.99375,...,0.0" overrides the scheduler with an
+        // explicit sigma list, used RAW (no flow-shift) exactly like sample_params.custom_sigmas.
+        // Lets us feed the official LTX-2.3 distilled 8-step schedule for a scheduler A/B.
+        std::vector<float> env_sigmas;
+        if (const char* e = getenv("LTX_CUSTOM_SIGMAS"); e != nullptr && e[0] != '\0') {
+            const char* p = e;
+            while (*p != '\0') {
+                char* end = nullptr;
+                float v   = std::strtof(p, &end);
+                if (end == p) {
+                    break;
+                }
+                env_sigmas.push_back(v);
+                p = end;
+                while (*p == ',' || *p == ' ') {
+                    ++p;
+                }
+            }
+        }
+
+        if (env_sigmas.size() >= 2) {
+            sigmas      = env_sigmas;
+            total_steps = static_cast<int>(sigmas.size()) - 1;
+            sample_steps = std::min(sample_steps, total_steps);
+            if (high_noise_sample_steps > 0) {
+                high_noise_sample_steps = total_steps - sample_steps;
+            }
+            LOG_INFO("LTX_CUSTOM_SIGMAS override: %d sigmas => %d steps [%.5f .. %.5f]",
+                     static_cast<int>(sigmas.size()), total_steps, sigmas.front(), sigmas.back());
+        } else if (sample_params->custom_sigmas_count > 0) {
             sigmas      = std::vector<float>(sample_params->custom_sigmas,
                                         sample_params->custom_sigmas + sample_params->custom_sigmas_count);
             total_steps = static_cast<int>(sigmas.size()) - 1;

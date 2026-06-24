@@ -89,8 +89,8 @@ docker run --rm --gpus all \
     --cfg-scale "$CFG" --sampling-method euler --steps "$STEPS" --scheduler simple \
     -W "$W" -H "$H" --video-frames "$FRAMES" --fps "$FPS" --seed "$SEED" \
     --offload-to-cpu --mmap --diffusion-fa --max-vram "$MAX_VRAM" \
-    --vae-tiling --vae-relative-tile-size 4x4 --temporal-tiling \
-    --extra-tiling-args temporal_tile_frames=4,temporal_tile_overlap=1 \
+    --vae-tiling --vae-relative-tile-size "${VAE_REL_TILE:-4x4}" --temporal-tiling \
+    --extra-tiling-args "temporal_tile_frames=${VAE_TEMPORAL_FRAMES:-4},temporal_tile_overlap=1" \
     -o "$WEBM" -v 2>&1 \
   | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g;s/\r/\n/g' | tee "$RLOG"
 EXIT=${PIPESTATUS[0]}
