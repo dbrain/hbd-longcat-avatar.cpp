@@ -21,7 +21,9 @@ BIN=/src/build-cudnn/bin/sd-cli
 GPU="${GPU:-GPU-bd93e020-65d1-1a5c-ad6c-57c9f655cf45}"   # RTX 5060 Ti
 MODELS="${MODELS:-/home/dbrain/dev/longcat-avatar.cpp/models}"
 
-DIFFUSION_GGUF="${DIFFUSION_GGUF:-ltx2/distilled-1.1/ltx-2.3-22b-distilled-1.1-UD-Q4_K_M.gguf}"
+# Default = the prod DiT (NVFP4). Q4_K lives on /mnt/ssd now; re-symlink it under
+# models/ltx2/ and pass DIFFUSION_GGUF=... to A/B it.
+DIFFUSION_GGUF="${DIFFUSION_GGUF:-ltx2/nvfp4-CLEAN.gguf}"
 VIDEO_VAE="${VIDEO_VAE:-ltx2/vae/ltx-2.3-22b-distilled_video_vae.safetensors}"
 AUDIO_VAE="${AUDIO_VAE:-ltx2/vae/ltx-2.3-22b-distilled_audio_vae-ENC-f16.gguf}"
 LLM="${LLM:-ltx2/gemma-3-12b-it-UD-Q4_K_XL.gguf}"
