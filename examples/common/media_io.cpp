@@ -658,33 +658,16 @@ void write_fourcc(std::vector<uint8_t>& data, const char* fourcc) {
     data.insert(data.end(), fourcc, fourcc + 4);
 }
 
-std::vector<float> audio_planar_to_interleaved(const sd_audio_t* audio) {
-    if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 || audio->channels == 0) {
-        return {};
-    }
-    const uint64_t n  = audio->sample_count;
-    const uint32_t ch = audio->channels;
-    std::vector<float> out(static_cast<size_t>(n) * ch);
-    for (uint64_t f = 0; f < n; ++f) {
-        for (uint32_t c = 0; c < ch; ++c) {
-            out[static_cast<size_t>(f) * ch + c] = audio->data[static_cast<size_t>(c) * n + f];
-        }
-    }
-    return out;
-}
-
 static std::vector<uint8_t> audio_to_pcm16_bytes(const sd_audio_t* audio) {
     if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 || audio->channels == 0 || audio->sample_rate == 0) {
         return {};
     }
 
-    // sd_audio_t.data is planar; PCM16 chunks are interleaved frames.
-    const std::vector<float> interleaved = audio_planar_to_interleaved(audio);
-    const size_t pcm_samples             = interleaved.size();
+    const size_t pcm_samples = static_cast<size_t>(audio->sample_count) * static_cast<size_t>(audio->channels);
     std::vector<uint8_t> bytes(pcm_samples * sizeof(int16_t));
     auto* pcm = reinterpret_cast<int16_t*>(bytes.data());
     for (size_t i = 0; i < pcm_samples; ++i) {
-        const float sample = std::clamp(interleaved[i], -1.0f, 1.0f);
+        const float sample = std::clamp(audio->data[i], -1.0f, 1.0f);
         pcm[i]             = static_cast<int16_t>(std::lrint(sample * 32767.0f));
     }
     return bytes;
@@ -1246,19 +1229,17 @@ static bool encode_audio_to_opus(const sd_audio_t* audio,
     const uint32_t dst_ch = src_ch == 1 ? 1 : 2;
     opus_channels         = dst_ch;
 
-    // sd_audio_t.data is planar; the resampler and the copy below want interleaved.
-    const std::vector<float> interleaved = audio_planar_to_interleaved(audio);
     std::vector<float> res;
     if (src_sr == dst_sr) {
         res.resize(static_cast<size_t>(src_n * dst_ch));
         for (uint64_t i = 0; i < src_n; ++i) {
             for (uint32_t c = 0; c < dst_ch; ++c) {
                 const uint32_t src_c = src_ch == 1 ? 0 : std::min<uint32_t>(c, src_ch - 1);
-                res[static_cast<size_t>(i * dst_ch + c)] = interleaved[static_cast<size_t>(i * src_ch + src_c)];
+                res[static_cast<size_t>(i * dst_ch + c)] = audio->data[static_cast<size_t>(i * src_ch + src_c)];
             }
         }
     } else {
-        res = resample_interleaved_hann_sinc(interleaved.data(), src_n, src_ch, dst_ch, src_sr, dst_sr);
+        res = resample_interleaved_hann_sinc(audio->data, src_n, src_ch, dst_ch, src_sr, dst_sr);
     }
     if (res.empty()) {
         return false;

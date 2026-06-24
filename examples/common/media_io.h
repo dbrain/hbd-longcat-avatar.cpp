@@ -110,10 +110,4 @@ bool write_wav_to_file(const std::string& path,
                        uint32_t channels,
                        uint32_t sample_rate);
 
-// sd_audio_t.data is PLANAR (channel-major: all ch0 samples, then all ch1, ...),
-// as produced by waveform_to_sd_audio() / ChainAudioAcc. The PCM16 / Opus / WAV
-// writers all consume interleaved frames, so flatten planar -> interleaved first.
-// (Identity for mono, where the two layouts coincide.)
-std::vector<float> audio_planar_to_interleaved(const sd_audio_t* audio);
-
 #endif  // __MEDIA_IO_H__
