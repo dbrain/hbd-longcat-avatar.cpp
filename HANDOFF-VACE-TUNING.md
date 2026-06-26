@@ -389,3 +389,213 @@ coherence but quadratically slower (WIDENS LTX gap). Strategic fork (handoff GOA
 vs 111). RECO: prove long-form quality at 480 first. Buffer-shrink (in-block cuts / F16 intermediates) = the
 lever to push FR past the OOM IF the 1280-long-seg lane is chosen — for FRAMES not speed (1280 compute-bound).
 See HANDOFF-CONTINUATIONS-3X3.md.
+
+# ============ LAP LOG (2026-06-14, run #3 — "is the 720p throughput path real?") ============
+
+# FINDINGS-L10 — PHASE A1: off-the-shelf efficient-attention scan + the BIG in-fork discovery
+**Headline: the fork-class barrier is ALREADY GONE — this fork ALREADY HAS a working, bit-exact,
+block-SKIPPING sparse-FA CUDA kernel** (LongCat lap-31.2 "BSA bitmap"). The hard 80% (a ggml-CUDA FA kernel
+that genuinely skips denied K-tiles, not just masks them) is DONE + validated. BUT its measured payoff on this
+exact kernel+GPU was SMALL, which is the real verdict on whether the throughput path closes the LTX gap.
+
+## The in-fork BSA (the thing to actually reason about — it dominates the off-the-shelf options)
+- Files: `ggml/src/ggml-cuda/longcat-fa-bsa-bitmap.cuh` + `fattn.cu` (device bitmap symbols +
+  `ggml_cuda_set_longcat_fa_bsa_bitmap()` host setter) + `fattn-mma-f16.cuh` (the ncols2==1 MMA-f16 kernel reads
+  a per-(Q-tile,K-tile) all-deny bitmap from smem, SKIPS iter dispatch for fully-denied K-tiles = real FLOP cut).
+  Runner side: `longcat_avatar.hpp` `ensure_bsa_mask()` builds a STATIC cube local-window mask
+  (radius + self_frame + bookend, cube_h=4 cube_w=6) + the matching CPU bitmap; `stable-diffusion.cpp`
+  threads `bsa_*` params. Gated `LONGCAT_BSA=1 LONGCAT_BSA_BITMAP=1`, default-off ⇒ dense/bit-exact.
+- **MEASURED on the avatar (480×832, 25f, 8-step, RTX 3060 — the SAME kernel I'd reuse for VACE):**
+  r=1+self_frame skips **50% of K-tiles** yet wall only **−1.98s on 139.88s = −1.4% wall** (−2.92s sampling
+  = −2.7%). Bit-exact-to-its-own-baseline (it's a quality trade vs dense; the r=1 mask itself was the quality
+  decision, PSNR-gated against the BSA baseline not dense). lap-31 close: the FA codepath is "closed" — empirical
+  ceiling for more mask-driven wins ≈ 0.8s. ncols=128 (2× Q-rows/CTA) PROVEN DEAD (+1.6..+5.4s, K-HBM was never
+  the bottleneck; ncols2==1 forces nstages=0 ⇒ no cp.async overlap).
+- **WHY only −1.4% despite 50% K-skip:** (1) avatar seq is SHORT (480/25f) so FA is a small slice + per-tile
+  bitmap overhead (smem load + per-iter bit check + branch) eats most of it; (2) the DiT step is mul_mat 44% +
+  flash 37% + glue 18% (FINDINGS-L5) — **sparse attention touches ONLY the 37% flash slice; the 44% mul_mat
+  FFN/proj GEMMs (q4_K silicon floor) are untouched.** Even a PERFECT 50%-skip removes ≤18% of the step.
+- **Wiring BSA into VACE/Wan2.2 = BOUNDED, not from-scratch:** Wan self-attn (`wan.hpp:145`
+  `Rope::attention(…, pe, mask)`) already plumbs a `mask` through `ggml_ext_attention_ext` — the SAME arg the
+  avatar's BSA mask rides (`longcat_avatar.hpp:337`), same head_dim=128 ⇒ same ncols2==1 MMA-f16 path. To enable:
+  build a cube mask + CPU bitmap for Wan's [T,H,W] token geometry (the avatar's `ensure_bsa_mask` is
+  avatar-token-layout-specific) and `set_longcat_fa_bsa_bitmap()` before sampling, pass mask into the Wan
+  self-attn call. Days (mask geometry + wiring + coherence gate), NOT weeks. The kernel is the hard part and it's done.
+
+## Off-the-shelf scan (ranked — all are PyTorch/Triton/CUDA, NONE ggml-native; all attack only the 37% FA slice)
+| method | claimed speedup | hardware | quality | port effort to sd.cpp/ggml | worth chasing? |
+|--|--|--|--|--|--|
+| **In-fork BSA bitmap** (already built) | **−1.4% wall measured @480/25f** (50% K-skip); unproven but bigger at long seq | Ampere ✅ (this kernel) | static r=1 mask, PSNR-gated trade | **wire into Wan: days** (kernel exists) | **MEASURE-ONLY** — cheapest realization, but ceiling is low |
+| Radial Attention (MIT, NeurIPS'25) | 1.9× attn @native len, up to 3.7× for 4× longer video | CUDA (block-sparse backend) | STATIC O(n log n) energy-decay mask, ~lossless w/ LoRA | re-impl mask on in-fork bitmap = days; its kernel = weeks | concept yes (maps to in-fork bitmap), its kernel no |
+| Sliding-Tile Attn / FastVideo (hao-ai-lab) | 2.8–17× over FA2 **but** big nums need FA3/ThunderKittens + finetune | **Hopper** for headline; Ampere weak | ~lossless training-free ~1.8× e2e Hunyuan | FA3 kernel, fork-class **weeks**; Ampere strips the win | NO (Hopper-tuned) |
+| Sparse VideoGen 2 (SVG2) | 1.89× Wan2.1 / 2.3× Hunyuan | CUDA (dynamic + flash-kmeans kernel) | top-p dynamic, PSNR~26-30 | dynamic per-step top-k + kmeans kernel = **weeks** | NO (dynamic = heavy, our L3 showed per-step recompute) |
+| SageAttention 2 (thu-ml) | 1.5–2.7× over FA2 | **Ampere-native sm80/86** ✅ (INT8 QK, FP16 V) | plug-and-play, ~lossless e2e | INT8-QK attn kernel into ggml FA = fork-class **weeks** | NO for the gain (still only the 37% slice; weeks for ~1.5×-of-37%) |
+| lightx2v attn | (mostly STEP-distill, which we ALREADY use) + wraps Sage/sparse | — | — | n/a — we already run its 4-step distill | already adopted (the distill) |
+| ComfyUI sparse nodes (KJ/WanVideoWrapper) | wrappers over Sage/Radial/STA | — | — | not a kernel source | NO (just wrappers) |
+
+## A1 VERDICT — is the 720p throughput path worth chasing? **NO for closing the LTX gap; the kernel already exists so a MEASURE-ONLY confirm is cheap.**
+Arithmetic ceiling: at 720p the DiT step is mul_mat 44% + flash 37% + glue 18%. EVERY method above (off-the-shelf
+or in-fork) attacks ONLY the 37% flash slice. A perfect 2× attention ⇒ ≤18% DiT cut; the realistic in-fork
+number was −1.4% wall. So no attention lever — not Radial, not Sage, not STA, not the in-fork BSA — can bend
+720p VACE from ~2× LTX (FR=13) toward 1×. The 720p gap is dominated by (a) the 44% mul_mat FFN GEMMs at the q4_K
+silicon floor and (b) the dual-9.87GB-expert MoE not fitting 12GB (weight-streaming, FINDINGS-L6/L7) — neither is
+an attention problem. Confirms additional-levers.md's BSA framing was OPTIMISTIC ("attacks 33% of clip wall"):
+the shipped avatar result was −1.4%. RECO: do NOT port any off-the-shelf kernel; the only justified BSA work is
+wiring the EXISTING in-fork bitmap into Wan to MEASURE the 720p payoff empirically (it should beat 480/25f's
+−1.4% since FA is a bigger fraction at 720p, but won't approach the 2–4× needed). The real near-LTX-720p levers
+remain non-attention: a ≥24GB card (experts resident → L6 projects 3–4×) or the forbidden 480p pivot (already
+beats LTX 78 vs 111).
+
+# FINDINGS-L11 — PHASE A2 (throughput knee, MEASURED) + B3 (seam eye-test) — the mission verdict
+Ran `run_cont_knee.sh` (NEW): 1 scene, 3 chained continuation segs, 1280×704, 3+3, maxv7.3, K=5, gray-cache
+pre-warmed. Output perf_out/contknee/fr13/{seg0,1,2, chain_fr13.mp4, seams/}.
+
+## A2 — continuation cost + the HONEST continuous-video throughput knee
+**MEASURED seg times (FR=13 720p 3+3):** seg0 (t2v) **201.7s** · seg1 (cont) **209.2s** · seg2 (cont) **199.7s**.
+⇒ **CONTINUATION OVERHEAD IS ~NOISE (+0..8s).** The control path is fully absorbed: gray-cache (L1) kills the
+inactive/reactive gray encodes, and the real K=5-tail encode + the 8 vace blocks add only seconds. (seg1 decode
+21.5s; DiT dominates as in t2v.) So at 720p, continuation ≈ t2v — the earlier "continuation = slow path" fear is
+GONE post-L1.
+**The honest continuous-27s number (counts BOTH the K-overlap waste AND all segs — NOT the naive t2v rate):**
+- Net video/seg = (FR − K)/16 s. seg0 keeps all FR. 27s @16fps = 432 frames.
+| FR | seg time | net frames/seg | segs for 27s | total render | render-s/s-video | vs LTX(111) |
+|--|--|--|--|--|--|--|
+| **13** | **~204s (MEAS)** | 8 (13−5) | **54** | **~11,000s (183min)** | **~408** | **3.7×** ← KNEE (best) |
+| 17 | ~461s (L9 t2v; +~0 cont) | 12 | 36 | ~16,600s | ~615 | 5.5× |
+| 21 | ~610s (L9 t2v; +~0 cont) | 16 | 27 | ~16,500s | ~613 | 5.5× |
+(17/21 seg times = L9 t2v + the measured ~0 continuation overhead; not re-run on GPU — the FR ordering is
+O(L²)-robust, not worth the burn.) **FR=13 minimizes total 27s render time = the knee.** Note these are ~2×
+WORSE than L9's per-seg t2v rate (222) because the honest continuous number MUST count (a) the K-overlap waste
+(render 13, keep 8 = 1.6× tax) and (b) all 54 segs. **Honest 720p continuous = ~3.7× LTX at the best FR.** BSA
+(≤−10-15% DiT, attention-only) → ~3.2× at best. Not near LTX. K can't shrink (already the continuity carry, and
+the seam already drifts at K=5 — see B3).
+
+## B3 — SEAM EYE-TEST @ 3+3: structure CARRIES, but EXPOSURE/CONTRAST DRIFTS CUMULATIVELY (a real defect)
+Inspected the visible joins (stitched g0012|g0013 = seam1, g0020|g0021 = seam2; seams/big/*.png) + per-frame
+luma/std trace across the 29-frame chain.
+- **GOOD: structure/identity/camera CARRY.** Both seams keep the same "Rosie's" neon corner-bar, the same vintage
+  car, same composition, same slow-track camera. The VACE velocity continuation mechanism WORKS — subject holds.
+- **BAD: a visible, MEASURABLE, CUMULATIVE brightness+contrast/grain JUMP at each seam.** Per-frame stats:
+  seg0 g00→g12 luma 49.6→45.6 std ~32 (stable) · **SEAM1 g12→g13: luma 45.6→51.1, std 32.0→48.8 (+52%)** ·
+  seg1 ~luma52/std52 · **SEAM2 g20→g21: luma 53.2→65.1 (+22%), std 52.5→64.6** · seg2 ~luma66/std66.
+  ⇒ each continuation segment re-generates BRIGHTER + higher-contrast; by seg2 the neon is visibly blown out
+  (luma 45→65, std 32→66 over just 2 seams). This is a per-generation distribution shift that COMPOUNDS — a
+  54-seg / 27s chain would runaway into over-saturation/artifacting. The PRE-fix note "mild, not invisible" was
+  optimistic at 3+3: it's visible AND cumulative.
+- Same defect family as LTX mod-collapse / qwen3-tts cb0 drift. Likely fix = exposure/contrast AGC-normalize each
+  continuation against the prior tail (cf. TTS LoudnessAGC), or tighten the latent-injection distribution match.
+  That's a FIX (next pass), not this measurement.
+
+## ============ MISSION VERDICT (2026-06-14, run #3) — "can VACE do long-form 720p near LTX?" = NO ============
+Two INDEPENDENT blockers, both now measured:
+1. **THROUGHPUT:** best operating point FR=13 = **~3.7× LTX** (408 vs 111 render-s/s-video, honest continuous
+   number). The ONLY attention lever (BSA) — whose kernel ALREADY EXISTS in-fork — measured −1.4% on the avatar
+   and is ceiling-bound to ≤−15% DiT here (attacks only the 37% flash slice). It CANNOT close 3.7×→1×. The gap is
+   structural: 44% mul_mat q4_K GEMMs (silicon floor) + Wan 4× temporal VAE vs LTX 8× + dual-9.87GB-expert MoE
+   not fitting 12GB (FINDINGS-L6/L7). None are attention problems.
+2. **CONTINUITY:** even ignoring throughput, the 3+3 continuation has cumulative exposure/contrast drift that
+   would runaway over 54 segs. Needs an AGC-style normalization fix before a clean continuous 27s video exists.
+**RECO (unchanged from L5b/L7, now double-confirmed): 720p long-form on a 3060 stays 2–4× LTX; do NOT port any
+off-the-shelf attention kernel (confirmed not worth chasing per the handoff's gate). The lanes that actually
+reach/beat LTX are the forbidden 480p (78 vs 111, beats it) or a ≥24GB card (experts resident → 3–4×). If 720p
+on the 3060 is mandatory, the next-highest-value work is the continuation EXPOSURE-DRIFT FIX (makes the long
+video coherent) — NOT attention perf.** The in-fork BSA could be wired into Wan to get an empirical 720p number
+(days: build cube mask+bitmap for Wan token geometry + wire + coherence-gate) but the arithmetic says it won't
+change this verdict — surfaced to owner as an option, not done.
+
+# FINDINGS-L12 — CORRECTION to B3: the seam contrast bump is a CONTINUATION BUG (latent-variance ratchet), NOT inherent drift
+Owner flagged the continuation as "broken — every cut bumps contrast ridiculously, jumps weird, replays frames,
+probably not even continuing." Investigated GPU-free (parsed the banked .bin latents + the predecode-latent logs).
+**CONFIRMED: the drift is in the DIFFUSION LATENT, and it COMPOUNDS — a positive-feedback ratchet in the
+continuation path, fixable.** Per-latent-frame std (predecode, frame0=head … frame3=tail-that-gets-carried):
+- seg0 (fresh t2v, NO injection): 0.44 → 0.67 → 0.69 → **0.73**  (healthy; intra-seg ramp present but tolerable)
+- seg1 (cont, injects seg0 tail): 0.63 → 0.72 → 0.90 → **0.91**
+- seg2 (cont, injects seg1 tail): 0.82 → 0.87 → 0.98 → **0.99**
+Banked whole-latent std: seg0 0.643 → seg1 0.799 → seg2 0.919 (range ±2.9 → ±3.8 → ±4.4). Decoded image std
+tracked it 32→52→66. **Two stacked effects: (1) intra-segment ramp — the free-generated tail over-drives vs the
+pinned/injected head (even seg0 ramps 0.44→0.73; property of the few-step distill + VACE gray-control on the
+generated frames = weaker constraint → variance creep); (2) inter-segment COMPOUNDING — VACE_CONT_LATENT carries
+the prior segment's TAIL (its HIGHEST-variance frames, slice Tprev−K..Tprev) as the next segment's injected head,
+so the baseline RATCHETS up every cut (min std 0.44→0.63→0.82, max 0.73→0.91→0.99). Geometric ⇒ blown-out neon by
+seg2, would saturate/explode over a 54-seg/27s chain.** Injection DID fire (logs: "injected 2 tail latent frames"
+each cont seg) — it IS continuing; the "replays frames" perception = each seg adds only 8 NET frames (0.5s motion,
+tiny) + the K=5 overlap reproduction + the contrast ratchet dominating the eye.
+**THE FIX (the real B3 unblock — supersedes L11's "AGC the displayed exposure"): break the ratchet at the latent
+level.** Renormalize the carried tail latent to a CANONICAL reference scale before injection (per-frame/per-channel
+standardize cont_tail to ~seg0's head distribution) so every segment starts from the SAME baseline instead of the
+prior elevated tail — AGC-for-latents, directly analogous to the TTS LoudnessAGC drift fix. Code site:
+stable-diffusion.cpp ~5874-5907 (the VACE_CONT_LATENT block) — rescale cont_tail before `slice_assign`. Optionally
+also standardize the whole video_latent before banking (6100) + before decode (fixes the displayed bump too).
+Small change; NEEDS GPU to validate (owner GPU busy 2026-06-14 — deferred).
+
+**IMPLEMENTED 2026-06-14 (UNCOMMITTED, UNBUILT — owner bench active, don't build/run yet):**
+stable-diffusion.cpp ~5897 (VACE_CONT_LATENT else-branch): contrast-only AGC on the carried `cont_tail`
+BEFORE reshape/slice_assign — compute global mean+std, apply a single uniform gain `g=target/std` about the
+mean so it preserves brightness + per-channel ratios (no colour distortion), pulling the carried-tail std to a
+canonical target. Opt-in (output NOT bit-exact): `VACE_CONT_AGC=1` enables, `VACE_CONT_AGC_TARGET` overrides
+(default 0.65 = measured seg0 global latent std @ 3+3). Logs `VACE_CONT_AGC: carried-tail std X -> Y (gain g)`.
+run_cont_knee.sh wired: `AGC=1 [AGC_TARGET=0.65] [TAG=agc] FR=13 bash run_cont_knee.sh` + it now prints
+per-seg maxFrameStd (the ratchet metric) so the A/B shows the std flattening (expect: AGC-off seg0/1/2 maxStd
+0.73/0.91/0.99 ratcheting; AGC-on ~flat ~0.65-0.75). TAG makes a distinct output dir+mp4 for clean A/B vs the
+banked AGC-off baseline (perf_out/contknee/fr13/). VALIDATION PLAN: (1) build (docker builder, sd-cli target);
+(2) `TAG=agc AGC=1 FR=13 SEGS=3 bash run_cont_knee.sh`; (3) compare chain_fr13_agc.mp4 vs chain_fr13.mp4 +
+the maxFrameStd column + eyeball the seams (contrast should hold). If a per-segment sawtooth remains (intra-seg
+ramp still visible), follow-up = per-frame output AGC before decode. Tune AGC_TARGET if 0.65 over/under-flattens.
+Caveat still open: confirm banked latent == encode_first_stage space (grep found only spatial scale_factor, no
+per-channel latents_mean/std — if Wan per-channel latent norm is missing from the VAE path that's the deeper root).
+
+**VALIDATED 2026-06-14 (built + A/B run, GPU): input-AGC is MARGINAL, NOT a fix — and the result reframes the root cause.**
+A/B chain FR=13 720p 3+3, AGC=1 target 0.65 vs the banked baseline. Per-seg maxFrameStd (latent) + decoded image std:
+| seg | baseline latent std | AGC latent std | AGC gain applied | decoded img std (base→AGC) |
+|--|--|--|--|--|
+| seg0 (fresh) | 0.727 | 0.727 (untouched) | — | 32→32 (byte-identical) |
+| seg1 (cont) | 0.910 | **0.892** | tail 0.708→0.650 (g0.919) | 52→51 |
+| seg2 (cont) | 0.993 | **0.920** | tail 0.887→0.650 (g0.733) | 66→62 |
+**Verdict: AGC fired correctly (logs confirm) and shaved the ratchet ~6% at seg2 (0.99→0.92) — but the blow-out
+trajectory is intact** (latent std still 0.73→0.89→0.92 climbing; decoded contrast still 32→51→62, neon still
+blows out). **KEY DIAGNOSTIC: pulling the conditioning input DOWN (0.71→0.65, 0.89→0.65) did NOT pull the output
+down proportionally — the output rode up to ~0.89-0.92 regardless. ⇒ the per-segment over-drive is INTRINSIC to
+the continuation generation, NOT a conditioning-scale feedback loop.** This kills the "loop-gain" hypothesis as
+the primary driver; input-AGC can only ever shave the small input-coupled fraction. The drift is generation-
+intrinsic (the few-step distill over-sharpens when continuing) — the same class as LTX mod-collapse, and input-
+side regulation can't reach it. **Two harder fixes remain IF Wan is pursued: (a) OUTPUT-side AGC — normalize the
+video_latent per-frame to seg0's profile BEFORE decode+bank (forces the displayed + carried statistics directly,
+regardless of intrinsic cause; needs a per-frame target profile saved to a sidecar since segments run as separate
+processes); (b) root-cause the intrinsic over-drive (gray-context discontinuity in `inactive` [real 0.65 head vs
+gray 1.1 tail], VACE control-branch gain, or the continuation noise schedule).**
+**STRATEGIC (the bigger point): Wan continuation has TWO compounding problems — this contrast drift AND tiny
+per-segment motion (8 net frames = 0.5s/seg → "barely moves/replays"). LTX-2.3 generates the full ~27s in ONE
+pass (no seams, no continuation drift, no chaining) + does native audio-lipsync — so it SIDESTEPS this entire mess.
+⇒ Wan continuation tuning PARKED; the decision gate is the LTX dev-model (UD-Q4, downloaded models/ltx23-dev/)
+warpy-character A/B. Only resume Wan/output-AGC if LTX dev can't do clean medium-shot characters.** AGC code stays
+(opt-in, default-off, harmless); run_cont_knee.sh keeps AGC/TAG knobs. chain_fr13_agc.mp4 banked.
+
+**PIXEL-PATH A/B 2026-06-14 (owner idea: "proper VACE outpainting" = drop the raw-latent backdoor, use pixel
+re-encode) — the BEST continuation mechanism tested; latent backdoor was HURTING.** Ran `NOLATENT=1` (omit
+VACE_CONT_LATENT, keep VACE_CONT_FRAMES + control video → pure pixel decode→re-encode extension). The VAE
+roundtrip LAUNDERS the off-manifold latent drift the backdoor was re-injecting. Three-way (latent maxFrameStd):
+| seg | latent backdoor | input-AGC | **pixel path** |
+|--|--|--|--|
+| seg0 | 0.727 | 0.727 | 0.727 |
+| seg1 | 0.910 | 0.892 | **0.857** |
+| seg2 | 0.993 | 0.920 | **0.907** |
+But the DECODED-image delta is BIGGER than the latent metric shows (OOD latent decodes to disproportionate
+blowup): decoded luma drift seg1→seg2 **pixel +14% (47.6→54.3) vs baseline +31% (51→67)**; decoded contrast std
+**pixel 39→52 vs baseline 49→66**. Seam2 right-frame: pixel luma53/std49 vs baseline luma65/std65 — the blown-out
+neon is GONE, the two sides match (seams/seam2.png). **Owner's "compression compounding/softening" worry did NOT
+materialize: frames are lossless PNG (no codec in loop, mp4 only at end); and SHARPNESS (laplacian-var) actually
+ROSE over segments (pixel g13 6.4→g28 10.8) — the diffusion regen + distill over-sharpen bias dominated any
+VAE-roundtrip softening.** Continuity held (scene/car/composition carries). **VERDICT: pixel-based extension
+drifts ~HALF as much as the latent backdoor, doesn't soften, gentler seams — it's strictly better. The latent
+backdoor (a perf optimization saving ~15s/seg) was actively HURTING quality; drop it as the continuation default.**
+STILL not flat (luma 47→54 climbing) — the few-step-distill intrinsic over-drive remains the floor → for a clean
+54-seg chain, stack a LIGHT output-AGC on the pixel path (laundering + regularization), or run more steps. But
+pixel-extension is the right base mechanism. **Root-cause meta across all 3 experiments: the drift is the few-step
+distill over-driving on continuation — SAME root as LTX warping. Conditioning-mechanism fixes (latent scale,
+pixel roundtrip) only shave it; the real cures are more-steps (dev model) or one-pass gen (LTX). LTX-dev test
+still the gate; if Wan pursued, use NOLATENT pixel extension + light output-AGC.** chain_fr13_pixel.mp4 banked. **This makes long-form continuity a
+fixable bug, not a fundamental limit — and it's broken at ANY res (shared code), so it's the #1 prerequisite for a
+clean continuous video at 480 OR 720.** Caveat to check on validation: confirm the banked diffusion latent is
+truly in encode_first_stage's (mu-mean)/std space (the injection comment asserts it; if Wan per-channel
+latents_mean/std normalization is missing from the VAE path that could be the deeper root — grep found only spatial
+scale_factor, no per-channel latent norm constants).

@@ -392,10 +392,13 @@ int main(int argc, char** argv) {
 
     sd_tiling_params_t tiling = {};
     tiling.enabled = getenv("IT_NO_VAE_TILE") == nullptr;
-    tiling.temporal_tiling = false;
+    // Temporal-tile the multi-frame conditioning encode too: without it the whole
+    // window is one buffer (~6.8 GB at 448x448x21) -> OOM above toy resolutions.
+    // Env IT_NO_ENCODE_TEMPORAL reverts to the old whole-window encode.
+    tiling.temporal_tiling = getenv("IT_NO_ENCODE_TEMPORAL") == nullptr;
     tiling.target_overlap = 0.25f;
-    tiling.rel_size_x = 0.5f;
-    tiling.rel_size_y = 0.5f;
+    tiling.rel_size_x = getenv("IT_VAE_TILE_REL") ? atof(getenv("IT_VAE_TILE_REL")) : 0.5f;
+    tiling.rel_size_y = getenv("IT_VAE_TILE_REL") ? atof(getenv("IT_VAE_TILE_REL")) : 0.5f;
 
     // VAE-encode a pixel video [W,H,Tpix,3] [0,1] -> diffusion latent [W,H,Tlat,16].
     // The VAE _compute unsqueeze(2)'s a 4D input (wrong for multi-frame), so pass 5D
