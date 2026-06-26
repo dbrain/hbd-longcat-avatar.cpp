@@ -3832,6 +3832,7 @@ struct GenerationRequest {
     int requested_frames                     = -1;
     int fps                                  = 16;
     float vace_strength                      = 1.f;
+    enum sample_method_t sample_method       = SAMPLE_METHOD_COUNT;
 
     GenerationRequest(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) {
         prompt                      = SAFE_STR(sd_img_gen_params->prompt);
@@ -3854,6 +3855,7 @@ struct GenerationRequest {
         pm_params                   = sd_img_gen_params->pm_params;
         hires                       = sd_img_gen_params->hires;
         cache_params                = &sd_img_gen_params->cache;
+        sample_method               = sd_img_gen_params->sample_params.sample_method;
         resolve(sd_ctx);
     }
 
@@ -3875,6 +3877,7 @@ struct GenerationRequest {
         guidance                    = sd_vid_gen_params->sample_params.guidance;
         high_noise_guidance         = sd_vid_gen_params->high_noise_sample_params.guidance;
         hires                       = sd_vid_gen_params->hires;
+        sample_method               = sd_vid_gen_params->sample_params.sample_method;
         resolve(sd_ctx);
         if (frames != requested_frames) {
             LOG_WARN("align video frames from %d to %d for %s",
@@ -3974,6 +3977,7 @@ struct GenerationRequest {
                                  bool* use_uncond,
                                  bool* use_img_uncond,
                                  bool has_ref_images,
+                                 enum sample_method_t sample_method,
                                  const char* stage_name = nullptr) {
         GGML_ASSERT(guidance != nullptr);
         GGML_ASSERT(use_uncond != nullptr);
@@ -4000,6 +4004,13 @@ struct GenerationRequest {
             *use_uncond = true;
         }
 
+        // CFG++ samplers require a real uncond prediction every step, even at cfg==1
+        // (ComfyUI forces this via disable_cfg1_optimization). Without it pred_uncond is
+        // empty and the cfg_pp step degenerates / blows up.
+        if (sample_method == EULER_CFG_PP_SAMPLE_METHOD || sample_method == EULER_A_CFG_PP_SAMPLE_METHOD) {
+            *use_uncond = true;
+        }
+
         if (guidance->img_cfg != 1.f) {
             *use_img_uncond = true;
         }
@@ -4020,13 +4031,14 @@ struct GenerationRequest {
         resolve_hires();
         seed = resolve_seed(seed);
 
-        resolve_guidance(sd_ctx, &guidance, &use_uncond, &use_img_uncond, has_ref_images);
+        resolve_guidance(sd_ctx, &guidance, &use_uncond, &use_img_uncond, has_ref_images, sample_method);
         if (sd_ctx->sd->high_noise_diffusion_model) {
             resolve_guidance(sd_ctx,
                              &high_noise_guidance,
                              &use_high_noise_uncond,
                              &use_high_noise_img_uncond,
                              has_ref_images,
+                             sample_method,
                              "high noise: ");
         }
 
@@ -7747,6 +7759,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             getenv("LTXAV_NO_CHAIN_GPU_RECLAIM") == nullptr) {
             sd_ctx->sd->release_chain_segment_gpu_residency();
         }
+    }
+
+    // End-of-render GPU reclaim (opt-in: LTXAV_END_RENDER_RECLAIM=1). The between-segment
+    // release above is gated `seg + 1 < n_chain`, so the FINAL segment's compute/cache
+    // buffers, shared residency, and the grown VMM scratch-pool high-water persist into
+    // the idle warm worker and stack under the NEXT render's peak — a ~2.4 GB cross-render
+    // VRAM creep (render 1 ~11.5 GB -> render 2+ ~13-14 GB) on the long-lived server worker.
+    // Releasing here returns each render to the clean fresh-worker baseline. Safe: all frames
+    // are already copied host-side (stitched/audio below touch no GPU). Does not free params
+    // (weights stay warm; idle floor unchanged). Honours LTXAV_NO_CHAIN_GPU_RECLAIM as a
+    // master off-switch; LTXAV_CHAIN_POOL_TRIM still controls whether the pool high-water is
+    // returned to the OS inside the reclaim.
+    if (sd_ctx->sd->keep_diffusion_model_resident &&
+        getenv("LTXAV_END_RENDER_RECLAIM") != nullptr &&
+        getenv("LTXAV_NO_CHAIN_GPU_RECLAIM") == nullptr) {
+        sd_ctx->sd->release_chain_segment_gpu_residency();
     }
 
     // Don't let the per-segment latent-save env leak into a later (non-chain) render in the
