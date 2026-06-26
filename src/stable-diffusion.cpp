@@ -1,7 +1,11 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <set>
+
+#include "gguf.h"
 
 #include "core/ggml_extend.hpp"
 #include "core/ggml_graph_cut.h"
@@ -155,6 +159,38 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
         }
     }
     return std::max(0.0f, reuse_threshold);
+}
+
+// P2 (nvfp4 patchy fix): read the per-tensor weight globals (ModelOpt weight_scale_2)
+// from an UNFOLDED-import DiT gguf. They are stored as tiny sibling F32 tensors named
+// "<weight>.wglobal". Uses no_alloc=true (metadata only — must NOT alloc the 16 GB of
+// real tensors) and reads only the 4-byte wglobal payloads by file offset. out is keyed
+// by the BARE gguf name "<weight>.wglobal". A legacy folded gguf has none -> empty map.
+static void load_nvfp4_weight_globals(const std::string& path, std::map<std::string, float>& out) {
+    struct gguf_init_params gp = {/*no_alloc=*/true, /*ctx=*/nullptr};
+    gguf_context* gctx = gguf_init_from_file(path.c_str(), gp);
+    if (gctx == nullptr) {
+        return;
+    }
+    const size_t data_off = gguf_get_data_offset(gctx);
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f != nullptr) {
+        const int64_t n = gguf_get_n_tensors(gctx);
+        for (int64_t i = 0; i < n; ++i) {
+            const char* name = gguf_get_tensor_name(gctx, i);
+            const size_t L   = name ? strlen(name) : 0;
+            if (L < 8 || strcmp(name + L - 8, ".wglobal") != 0) {
+                continue;
+            }
+            const size_t off = data_off + gguf_get_tensor_offset(gctx, i);
+            float g = 1.0f;
+            if (fseek(f, (long)off, SEEK_SET) == 0 && fread(&g, sizeof(float), 1, f) == 1) {
+                out[name] = g;
+            }
+        }
+        fclose(f);
+    }
+    gguf_free(gctx);
 }
 
 /*=============================================== StableDiffusionGGML ================================================*/
@@ -1284,6 +1320,35 @@ public:
 
         LOG_DEBUG("finished loaded file");
 
+        // P2 (nvfp4 patchy fix): if the DiT gguf is an UNFOLDED import, it carries per-tensor
+        // weight globals as "<weight>.wglobal" sibling tensors. Register each against the
+        // corresponding graph weight tensor's ACTUAL name (ggml_set_name truncates to
+        // GGML_MAX_NAME, so we must register t->name — what src0->name will be at GEMM time —
+        // not the untruncated map key). The FP4 cuBLASLt GEMM then folds the global into alpha
+        // (alpha = A_global * W_global). A legacy folded gguf has no .wglobal -> map empty ->
+        // nothing registered -> GEMM multiplier defaults to 1.0 (byte-identical legacy path).
+        if (strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) > 0) {
+            std::map<std::string, float> wglobals;
+            load_nvfp4_weight_globals(sd_ctx_params->diffusion_model_path, wglobals);
+            if (!wglobals.empty()) {
+                const std::string pfx = "model.diffusion_model.";
+                size_t n_reg = 0;
+                for (auto& kv : tensors) {
+                    const std::string& full = kv.first;
+                    if (full.compare(0, pfx.size(), pfx) != 0 || kv.second == nullptr) {
+                        continue;
+                    }
+                    const std::string bare = full.substr(pfx.size());
+                    auto it = wglobals.find(bare + ".wglobal");
+                    if (it != wglobals.end()) {
+                        ggml_cuda_nvfp4_register_weight_global(kv.second->name, it->second);
+                        ++n_reg;
+                    }
+                }
+                LOG_INFO("nvfp4: registered %zu/%zu weight globals (unfolded import)", n_reg, wglobals.size());
+            }
+        }
+
         {
             size_t clip_params_mem_size = cond_stage_model->get_params_buffer_size();
             size_t unet_params_mem_size = diffusion_model->get_params_buffer_size();
@@ -2384,6 +2449,24 @@ public:
         sd::Tensor<float> denoised   = x_t;
         SamplePreviewContext preview = prepare_sample_preview_context();
 
+        // Official LTX motion-continuity for hard-conditioning (continuation overlap +
+        // i2v) frames: instead of feeding them perfectly clean (sigma 0), inject
+        // timestep-dependent noise each step (diffusers add_noise_to_image_conditioning_latents):
+        //   cond = init_latent + image_cond_noise_scale * t^2 * eps,  t = sigma in [0,1].
+        // A frozen clean conditioning wall creates a velocity discontinuity at the seam
+        // (the continuation segment jumps then catches up); matched-noise conditioning lets
+        // motion flow across. Gated by LTXAV_COND_NOISE_SCALE (default 0 = legacy frozen).
+        float cond_noise_scale = 0.0f;
+        if (const char* e = std::getenv("LTXAV_COND_NOISE_SCALE")) {
+            cond_noise_scale = std::max(0.0f, (float)atof(e));
+        }
+        std::shared_ptr<RNG> cond_noise_rng;
+        if (cond_noise_scale > 0.0f) {
+            cond_noise_rng = std::make_shared<MT19937RNG>(0x10ec0de5ULL);
+            LOG_INFO("LTXAV cond-noise: image_cond_noise_scale=%.4f (timestep-dependent noise on hard-conditioning frames)",
+                     cond_noise_scale);
+        }
+
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             // Cooperative cancel: client disconnected mid-render. Bail before launching
             // this step's DiT compute. An empty pred makes sample_k_diffusion yield an
@@ -2430,7 +2513,14 @@ public:
                 // VAE-encoded reference image and must be held fixed (mask=0) through
                 // the whole denoise loop; only the generated frames (mask=1) evolve.
                 // (pipeline keeps latents[:,:,:1] = cond_latents every step.)
-                noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
+                if (cond_noise_scale > 0.0f && cond_noise_rng && sd_version_is_ltxav(version)) {
+                    sd::Tensor<float> cond_eps    = sd::randn_like<float>(init_latent, cond_noise_rng);
+                    float             s           = cond_noise_scale * sigma * sigma;
+                    sd::Tensor<float> cond_latent = init_latent + cond_eps * s;
+                    noised_input = noised_input * denoise_mask + cond_latent * (1.0f - denoise_mask);
+                } else {
+                    noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
+                }
             }
 
             if (cache_runtime.spectrum_enabled && cache_runtime.spectrum.should_predict()) {
@@ -2890,6 +2980,21 @@ public:
         reclaim(high_noise_diffusion_model);
         reclaim(first_stage_model);
         reclaim(audio_vae_model);
+
+        // P3: optionally return the ggml CUDA VMM pool's committed high-water to the OS
+        // between segments (real cuMemUnmap, not the prior empty-counter trim). MEASURED
+        // PEAK-NEUTRAL (2026-06-25): a 3-seg chain peaks identically with this on or off,
+        // because the peak is the genuine within-segment continuation working set (resident
+        // DiT + the ~3.1 GB attention/FFN transient + offload) which re-commits every
+        // segment — NOT cross-seg pool accumulation. So this is DEFAULT-OFF (opt-in). It is
+        // still correct + harmless (lowers the inter-segment idle valley for gate
+        // co-tenancy) and never frees params buffers, so SHARED_RESIDENT is preserved. The
+        // real peak lever remains --max-vram (mv9.0 -> ~10.77 GB flat at +~31% sampling).
+        if (getenv("LTXAV_CHAIN_POOL_TRIM") != nullptr) {
+            ggml_backend_cuda_trim_pools(backend_for(SDBackendModule::DIFFUSION));
+            ggml_backend_cuda_trim_pools(backend_for(SDBackendModule::VAE));
+            ggml_backend_cuda_trim_pools(backend_for(SDBackendModule::TE));
+        }
     }
 
     void set_flow_shift(float flow_shift = INFINITY) {
@@ -4325,6 +4430,53 @@ static bool apply_ltxav_condition_by_latent_index(sd::Tensor<float>* video_laten
     return true;
 }
 
+// LTXAV CONTINUATION via the ComfyUI LTX-Director keyframe convention: append the prior
+// segment's motion-carrying guide latent as EXTRA tokens at the TAIL of the sequence (NOT
+// overwriting output frames 0..K), give those guide tokens their OWN true-past-timeline RoPE
+// position via keyframe_frame_idx, hold them (conditioned_mask, frozen at 0), and let the rest
+// of the segment denoise freely. The appended guide tokens are cropped off the output after
+// sampling (video_conditioning_frame_count). This avoids the head-placement bug where the guide
+// frames steal the new segment's low RoPE slots 0..K-1 and over-anchor the immediately-adjacent
+// generated frames into a faded echo — an effect that gets WORSE at higher fps (the frozen
+// anchors sit closer in pixel-time to the generated content). frame_idx 0 pins the guide at the
+// segment start (smooth continuation); the generated output evolves rather than freezing.
+static bool apply_ltxav_video_guide_by_keyframe_index(ImageGenerationLatents* latents,
+                                                      const sd::Tensor<float>& guide,
+                                                      int keyframe_frame_idx,
+                                                      int fps,
+                                                      int spatial_scale,
+                                                      float conditioned_mask) {
+    if (latents == nullptr || latents->init_latent.empty() || latents->denoise_mask.empty() || guide.empty()) {
+        return false;
+    }
+    if (guide.shape()[0] != latents->init_latent.shape()[0] ||
+        guide.shape()[1] != latents->init_latent.shape()[1] ||
+        guide.shape()[3] != latents->init_latent.shape()[3]) {
+        LOG_ERROR("invalid LTXAV continuation guide latent shape");
+        return false;
+    }
+    int64_t keyframe_frames                 = guide.shape()[2];
+    latents->video_target_frame_count       = latents->init_latent.shape()[2];
+    latents->video_conditioning_frame_count = keyframe_frames;
+    latents->init_latent                    = sd::ops::concat(latents->init_latent, guide, 2);
+
+    auto keyframe_mask = sd::full<float>({guide.shape()[0], guide.shape()[1], keyframe_frames, 1, 1}, conditioned_mask);
+    latents->denoise_mask = sd::ops::concat(latents->denoise_mask, keyframe_mask, 2);
+    // keyframe_pixel_frames must be != 1 so each guide latent frame spans a full temporal_scale
+    // window (real video motion), not the single-pixel image-keyframe convention.
+    latents->video_positions = build_ltxv_video_positions(latents->init_latent.shape()[0],
+                                                          latents->init_latent.shape()[1],
+                                                          latents->video_target_frame_count,
+                                                          keyframe_frames,
+                                                          keyframe_frame_idx,
+                                                          /*keyframe_pixel_frames*/ 8,
+                                                          fps,
+                                                          spatial_scale,
+                                                          8,
+                                                          true);
+    return true;
+}
+
 static bool apply_ltxav_condition_image_by_latent_index(sd_ctx_t* sd_ctx,
                                                         const sd::Tensor<float>& image,
                                                         sd::Tensor<float>* video_latent,
@@ -5607,13 +5759,40 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             }
             // NOTE: appearance anchor (cont_anchor) is intentionally NOT supported on the
             // in-memory path for now — it's a follow-up (would need an in-memory anchor float*).
-            // The in-process chain relies on the motion overlap alone; base_idx stays 0.
-            int64_t base_idx = 0;
-            LOG_INFO("LTXAV CONTINUATION (in-memory): %lld prior latent frames as motion overlap at idx %lld, mask=%.2f",
-                     (long long)K, (long long)base_idx, omask);
-            if (!apply_ltxav_condition_by_latent_index(&latents.init_latent, &latents.denoise_mask,
-                                                       cont_tail, base_idx, "cont-mem", omask)) {
-                return std::nullopt;
+            // The in-process chain relies on the motion overlap alone.
+            //
+            // DEFAULT (Director keyframe convention): append the guide at the TAIL with its own
+            // true-past RoPE position and crop it off the output — avoids the high-fps echo/ghost
+            // the legacy head-placement causes. LTXAV_CONT_LEGACY_HEAD=1 restores the old
+            // head-placement (guide overwrites output frames 0..K) for A/B comparison.
+            bool legacy_head = false;
+            if (const char* e = std::getenv("LTXAV_CONT_LEGACY_HEAD")) {
+                legacy_head = atoi(e) != 0;
+            }
+            if (legacy_head) {
+                int64_t base_idx = 0;
+                LOG_INFO("LTXAV CONTINUATION (in-memory, LEGACY head-place): %lld prior latent frames at idx %lld, mask=%.2f",
+                         (long long)K, (long long)base_idx, omask);
+                if (!apply_ltxav_condition_by_latent_index(&latents.init_latent, &latents.denoise_mask,
+                                                           cont_tail, base_idx, "cont-mem", omask)) {
+                    return std::nullopt;
+                }
+            } else {
+                // Guide pinned at the segment start (frame_idx 0): this segment re-renders the
+                // overlap region (warm-up) then continues. The re-render gives the join frame a
+                // settled trajectory (a cold start at a negative frame_idx jumps harder), and the
+                // stitcher auto-aligns the trim to the smoothest continuation (ltxav_auto_trim_drop)
+                // — this beat guide-in-the-past on the seam metric (raw seam 1.58 vs 3.1).
+                int kf_idx = 0;
+                if (const char* e = std::getenv("LTXAV_CONT_KEYFRAME_IDX")) {
+                    kf_idx = atoi(e);
+                }
+                LOG_INFO("LTXAV CONTINUATION (in-memory, keyframe-append): %lld prior latent frames at frame_idx %d, mask=%.2f",
+                         (long long)K, kf_idx, omask);
+                if (!apply_ltxav_video_guide_by_keyframe_index(&latents, cont_tail, kf_idx,
+                                                               request->fps, request->vae_scale_factor, omask)) {
+                    return std::nullopt;
+                }
             }
         } else if (sd_vid_gen_params->cont_latent_path != nullptr && sd_vid_gen_params->cont_latent_path[0] != '\0' &&
                    sd_vid_gen_params->cont_latent_frames > 0) {
@@ -7083,6 +7262,121 @@ struct ChainAudioAcc {
     }
 };
 
+// Seam auto-trim for keyframe-append continuation. The warm-up segment re-renders the overlap
+// region then continues; the re-render is slightly phase-shifted from the prior segment's true
+// tail, so a fixed overlap_px trim leaves a visible "skip" at the join. Search a small window of
+// candidate trim points for the frame whose downsampled luma best matches the prior segment's
+// last frame — that frame is the smoothest continuation. Returns the trim (drop) count. (A
+// per-segment exposure match — seg N+1 renders ~0.85 luma darker — further flattens the residual
+// tone step; validated offline, not yet ported here. See HANDOFF.)
+static int ltxav_auto_trim_drop(const sd_image_t& prev_last, const sd_image_t* frames,
+                                int n_frames, int overlap_px) {
+    if (frames == nullptr || n_frames <= 0 || prev_last.data == nullptr) return overlap_px;
+    int lo = std::max(1, overlap_px - 6);
+    int hi = std::min(n_frames - 2, overlap_px + 14);
+    if (hi <= lo) return std::min(overlap_px, std::max(0, n_frames - 1));
+    const int GW = 32, GH = 18;
+    auto grid = [](const sd_image_t& im, std::vector<float>& out, int gw, int gh) {
+        out.assign((size_t)gw * gh, 0.f);
+        int ch = (int)im.channel;
+        for (int gy = 0; gy < gh; ++gy) {
+            int sy = std::min((int)im.height - 1, (int)(((float)gy + 0.5f) * im.height / gh));
+            for (int gx = 0; gx < gw; ++gx) {
+                int sx = std::min((int)im.width - 1, (int)(((float)gx + 0.5f) * im.width / gw));
+                const uint8_t* p = im.data + ((size_t)sy * im.width + sx) * ch;
+                out[(size_t)gy * gw + gx] = (ch >= 3) ? (0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2])
+                                                      : (float)p[0];
+            }
+        }
+    };
+    std::vector<float> ref, cur;
+    grid(prev_last, ref, GW, GH);
+    int   best_t = overlap_px;
+    float best   = 1e30f;
+    for (int t = lo; t <= hi; ++t) {
+        if (frames[t].data == nullptr) continue;
+        grid(frames[t], cur, GW, GH);
+        float mae = 0.f;
+        for (size_t i = 0; i < ref.size(); ++i) mae += std::fabs(ref[i] - cur[i]);
+        mae /= (float)ref.size();
+        if (mae < best) { best = mae; best_t = t; }
+    }
+    return best_t;
+}
+
+// P1-C seam polish: per-segment exposure/tone match. A conditioned continuation segment renders
+// ~0.85 luma darker than the prior segment, leaving a visible tone STEP at the join even after the
+// auto-trim aligns content. Correct it with a gentle global per-channel gain+offset on the new
+// segment so its colour stats match the prior segment's tail across the seam — a continuity
+// correction, NOT a cross-fade (the whole segment shifts uniformly, so no doubling/ghost returns).
+// Stats: last N kept frames of the accumulated output (pre) vs first N kept frames of the new
+// segment (post). gain = pre_std/post_std clamped [0.9,1.1] (only correct drift, don't regrade);
+// offset = pre_mean - gain*post_mean. Applied in-place to ALL `n_new` frames. Ported from the
+// validated expo_match.py. Default-on for the keyframe path; LTXAV_NO_EXPOSURE_MATCH=1 disables.
+static void ltxav_exposure_match(const sd_image_t* prev_tail, int n_prev,
+                                 sd_image_t* new_frames, int n_new) {
+    if (getenv("LTXAV_NO_EXPOSURE_MATCH") != nullptr) return;
+    if (prev_tail == nullptr || new_frames == nullptr || n_prev <= 0 || n_new <= 0) return;
+    const int N  = 16;
+    const int ch = (int)new_frames[0].channel;
+    if (ch < 3) return;  // luma-only frames: nothing per-channel to match
+    const int np = std::min(N, n_prev);
+    const int ns = std::min(N, n_new);
+
+    // accumulate per-channel mean and mean-of-squares over the two windows
+    auto stats = [ch](const sd_image_t* fr, int base, int cnt, double* mean, double* var) {
+        double sum[4] = {0,0,0,0}, sq[4] = {0,0,0,0};
+        size_t npx = 0;
+        for (int f = 0; f < cnt; ++f) {
+            const sd_image_t& im = fr[base + f];
+            if (im.data == nullptr) continue;
+            size_t pix = (size_t)im.width * im.height;
+            for (size_t p = 0; p < pix; ++p) {
+                const uint8_t* px = im.data + p * (size_t)im.channel;
+                for (int c = 0; c < ch; ++c) { double v = px[c]; sum[c] += v; sq[c] += v * v; }
+            }
+            npx += pix;
+        }
+        if (npx == 0) return false;
+        for (int c = 0; c < ch; ++c) {
+            mean[c] = sum[c] / (double)npx;
+            double v = sq[c] / (double)npx - mean[c] * mean[c];
+            var[c]  = v > 0.0 ? v : 0.0;
+        }
+        return true;
+    };
+
+    double pre_mean[4], pre_var[4], post_mean[4], post_var[4];
+    if (!stats(prev_tail, n_prev - np, np, pre_mean, pre_var)) return;
+    if (!stats(new_frames, 0, ns, post_mean, post_var)) return;
+
+    float gain[4], off[4];
+    for (int c = 0; c < ch; ++c) {
+        double g = std::sqrt(pre_var[c]) / std::max(std::sqrt(post_var[c]), 1e-3);
+        g        = std::min(1.1, std::max(0.9, g));  // gentle: only drift, no regrade
+        gain[c]  = (float)g;
+        off[c]   = (float)(pre_mean[c] - g * post_mean[c]);
+    }
+    LOG_INFO("generate_video_chain: exposure-match gain[%.3f %.3f %.3f] off[%.1f %.1f %.1f] "
+             "(pre luma %.1f vs post %.1f)",
+             gain[0], gain[1], gain[2], off[0], off[1], off[2],
+             0.299 * pre_mean[0] + 0.587 * pre_mean[1] + 0.114 * pre_mean[2],
+             0.299 * post_mean[0] + 0.587 * post_mean[1] + 0.114 * post_mean[2]);
+
+    for (int f = 0; f < n_new; ++f) {
+        sd_image_t& im = new_frames[f];
+        if (im.data == nullptr) continue;
+        size_t pix = (size_t)im.width * im.height;
+        for (size_t p = 0; p < pix; ++p) {
+            uint8_t* px = im.data + p * (size_t)im.channel;
+            for (int c = 0; c < ch; ++c) {
+                float v = gain[c] * (float)px[c] + off[c];
+                px[c]   = (uint8_t)(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
+            }
+        }
+    }
+}
+
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,
                                  const sd_vid_chain_params_t* chain_params,
@@ -7181,7 +7475,17 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 prefix_ok = false;
                 break;
             }
-            int drop = (seg == 0) ? 0 : overlap_px;  // mirror the live-stitch overlap drop
+            // mirror the live-stitch overlap drop (legacy head-place trims; keyframe-append = 0)
+            bool legacy_head_r = false;
+            if (const char* e = std::getenv("LTXAV_CONT_LEGACY_HEAD")) {
+                legacy_head_r = atoi(e) != 0;
+            }
+            int drop = (seg == 0) ? 0 : (legacy_head_r ? overlap_px : 0);
+            if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
+                if (seg > 0) {
+                    drop = atoi(e);
+                }
+            }
             if (drop > cnt) {
                 drop = cnt;
             }
@@ -7303,11 +7607,48 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return false;
         }
 
+        // DRIFT-SINK (env LONGCAT_CONT_REENCODE=1): condition the next segment on the
+        // VAE-ENCODED pixels of this segment's tail instead of the raw diffusion latent.
+        // Official LTX continuation conditions on VAE-encoded frames; our raw DMD-x0 latent
+        // carries high-freq sampling structure that, frozen as conditioning, can ghost
+        // throughout the continuation segment. Decode→re-encode snaps it onto the VAE
+        // manifold. Mirrors the main.cpp manual-chain path. Default off (raw latent).
+        bool reencoded = false;
+        if (want_latent && getenv("LONGCAT_CONT_REENCODE") != nullptr && seg_video != nullptr && seg_count > 0) {
+            int tail = std::min(overlap_px, seg_count);  // pixel frames that re-encode to K latents
+            int rlw = 0, rlh = 0, rlt = 0, rlc = 0;
+            float* reenc = sd_ctx_encode_video_frames(sd_ctx, seg_video + (seg_count - tail), tail,
+                                                      seg_video[0].width, seg_video[0].height,
+                                                      &rlw, &rlh, &rlt, &rlc);
+            if (reenc != nullptr && rlt > 0) {
+                int    cv    = std::min(LTXAV_VIDEO_LATENT_CHANNELS, rlc);
+                int    keep  = std::min(K, rlt);
+                size_t plane = (size_t)rlw * rlh;
+                cont_buf.assign(plane * (size_t)keep * (size_t)cv, 0.f);
+                for (int c = 0; c < cv; ++c) {
+                    for (int nf = 0; nf < keep; ++nf) {
+                        int          src_t = rlt - keep + nf;
+                        const float* src   = reenc + ((size_t)c * rlt + src_t) * plane;
+                        float*       dst   = cont_buf.data() + ((size_t)c * keep + nf) * plane;
+                        std::memcpy(dst, src, plane * sizeof(float));
+                    }
+                }
+                free(reenc);
+                K          = keep;
+                reencoded  = true;
+                LOG_INFO("generate_video_chain: cont via VAE RE-ENCODE of last %d px frames -> %d cond latents (drift sink)",
+                         tail, keep);
+            } else {
+                free(reenc);
+                LOG_WARN("generate_video_chain: re-encode failed; falling back to raw latent tail");
+            }
+        }
+
         // Capture the LAST K latent frames + the first LTXAV_VIDEO_LATENT_CHANNELS VIDEO
         // channels into cont_buf for the next segment. Returned latent layout is
         // [Wl, Hl, Tl, Cl] contiguous (ggml-ne): index(w,h,t,c) = ((c*Tl + t)*Hl + h)*Wl + w.
         // Audio lives in channels >= video_channels and is dropped here.
-        if (want_latent && lat_out != nullptr) {
+        if (!reencoded && want_latent && lat_out != nullptr) {
             int cv = std::min(LTXAV_VIDEO_LATENT_CHANNELS, lc);  // video channels to keep
             if (cv < lc) {
                 LOG_INFO("generate_video_chain: latent has %d channels; keeping first %d as VIDEO (audio stripped)", lc, cv);
@@ -7330,11 +7671,45 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
         free(lat_out);
 
-        // Stitch: seg0 keeps all frames; seg>0 drops the overlap head re-render.
-        int    drop       = (seg == 0) ? 0 : overlap_px;
+        // Stitch: seg0 keeps all frames. For seg>0 the LEGACY head-placement path re-renders
+        // the overlap at the head and must drop it (overlap_px); the keyframe-append path
+        // (default) places the guide in the PAST and generates only NEW frames, so it drops
+        // nothing — that re-render+trim is exactly what caused the seam "skip". Override the
+        // drop with LTXAV_CHAIN_OVERLAP_DROP for tuning.
+        bool legacy_head = false;
+        if (const char* e = std::getenv("LTXAV_CONT_LEGACY_HEAD")) {
+            legacy_head = atoi(e) != 0;
+        }
+        int drop;
+        if (seg == 0) {
+            drop = 0;
+        } else if (legacy_head) {
+            drop = overlap_px;  // legacy head-placement re-renders + trims the fixed overlap
+        } else {
+            // keyframe-append (default): auto-align the trim to the smoothest continuation of
+            // the prior segment's last kept frame, instead of a fixed overlap_px (the phase
+            // mismatch at a fixed cut is the seam "skip").
+            drop = ltxav_auto_trim_drop(stitched.empty() ? sd_image_t{} : stitched.back(),
+                                        seg_video, seg_count, overlap_px);
+            LOG_INFO("generate_video_chain: seam auto-trim -> drop %d (fixed overlap_px would be %d)",
+                     drop, overlap_px);
+        }
+        if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
+            if (seg > 0) {
+                drop = atoi(e);
+            }
+        }
         size_t kept_start = stitched.size();
         if (drop > seg_count) {
             drop = seg_count;
+        }
+        // P1-C: tone-match this segment's kept frames to the prior segment's tail before stitching,
+        // flattening the ~0.85-luma step at the seam (continuity correction, not a cross-fade). seg0
+        // has nothing to match against. Operates on the post-trim kept frames so the matched window
+        // lines up with what actually lands in the timeline.
+        if (seg > 0 && !stitched.empty() && seg_count - drop > 0) {
+            ltxav_exposure_match(stitched.data(), (int)stitched.size(),
+                                 seg_video + drop, seg_count - drop);
         }
         for (int i = 0; i < seg_count; ++i) {
             if (i < drop) {
@@ -7359,7 +7734,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             write_seg_audio(std::string(chain_params->save_dir) + "/seg_" + std::to_string(seg) + ".audio", seg_audio);
         }
         if (seg_audio != nullptr) {
-            audio_acc.append(seg_audio, (seg == 0) ? 0 : audio_acc.drop_for(seg_audio, overlap_px, base_params->fps));
+            audio_acc.append(seg_audio, (seg == 0) ? 0 : audio_acc.drop_for(seg_audio, drop, base_params->fps));
         }
         free_sd_audio(seg_audio);
 

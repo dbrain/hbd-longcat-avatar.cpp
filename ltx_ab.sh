@@ -63,6 +63,8 @@ IMG_FLAGS=()
 if [ -n "${INIT_IMG:-}" ]; then IMG_FLAGS+=(-v "$INIT_IMG:/init.png:ro"); fi
 CLI_IMG=(); [ -n "${INIT_IMG:-}" ] && CLI_IMG=(--init-img /init.png)
 CLI_CHAIN=(); [ -n "${CHAIN:-}" ] && [ "${CHAIN}" != "0" ] && CLI_CHAIN=(--ltx-chain-segments "$CHAIN")
+# Pass-through extra CLI args (space-separated), e.g. EXTRA_CLI="--cont-cond-frames 25 --cont-latent-frames 5"
+CLI_EXTRA=(); [ -n "${EXTRA_CLI:-}" ] && read -r -a CLI_EXTRA <<< "${EXTRA_CLI}"
 
 WEBM="/out/${LABEL}.webm"
 RLOG="$OUT/log_${LABEL}.txt"
@@ -87,7 +89,7 @@ docker run --rm --gpus all \
     --llm                   "/models/$LLM" \
     --embeddings-connectors "/models/$CONNECTORS" \
     -p "$PROMPT" \
-    "${CLI_IMG[@]}" "${CLI_CHAIN[@]}" \
+    "${CLI_IMG[@]}" "${CLI_CHAIN[@]}" "${CLI_EXTRA[@]}" \
     --cfg-scale "$CFG" --sampling-method euler --steps "$STEPS" --scheduler simple \
     -W "$W" -H "$H" --video-frames "$FRAMES" --fps "$FPS" --seed "$SEED" \
     --offload-to-cpu --mmap --diffusion-fa --max-vram "$MAX_VRAM" \

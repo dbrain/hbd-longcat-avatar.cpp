@@ -884,6 +884,14 @@ int main(int argc, const char* argv[]) {
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
 
+            // nvfp4: enable diffusion imatrix collection before the video render. The graph
+            // hook is mode-agnostic (accumulates per-column activation 2nd-moment on every
+            // DiT Linear mul_mat), so this mirrors the IMG_GEN path and lets an avatar
+            // calibration imatrix be collected with `-M vid_gen --collect-imatrix <out>`.
+            if (!cli_params.collect_imatrix_path.empty()) {
+                sd_imatrix_collect_begin("diffusion_model");
+            }
+
             // LongCat-Avatar mouth-exaggeration knobs -> runtime env (the library reads
             // these per-render; the API will set the equivalent fields directly).
             if (gen_params.audio_mouth_scale != 1.0f) {
@@ -1227,6 +1235,18 @@ int main(int argc, const char* argv[]) {
                     generated_video = nullptr;
                 }
                 results.adopt(generated_video, num_results);
+            }
+
+            // nvfp4: write the accumulated diffusion imatrix (every DiT Linear driven by
+            // the render(s) above — one 8-step avatar denoise covers all 48 blocks).
+            if (!cli_params.collect_imatrix_path.empty()) {
+                int n_written = 0;
+                if (!sd_imatrix_collect_write_gguf(cli_params.collect_imatrix_path.c_str(), &n_written)) {
+                    LOG_ERROR("failed to write imatrix to '%s'", cli_params.collect_imatrix_path.c_str());
+                } else {
+                    LOG_INFO("imatrix: wrote %d DiT Linear tensors to '%s'",
+                             n_written, cli_params.collect_imatrix_path.c_str());
+                }
             }
         }
 

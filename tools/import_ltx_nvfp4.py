@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Import an official-format ModelOpt NVFP4 LTX-2.3 DiT safetensors -> a ggml block_nvfp4 gguf
-that longcat-avatar.cpp's LTXAV loader reads. Preserves official's EXACT e2m1 codes (single-level
-fold: per-16 ggml d = e4m3(weight_scale * global)). Non-fp4 tensors (modulation/norm/bias/embed)
+that longcat-avatar.cpp's LTXAV loader reads. Preserves official's EXACT e2m1 codes AND its
+well-conditioned per-16 e4m3 block scales (UNFOLDED: per-16 ggml d = e4m3(weight_scale), the
+per-tensor weight global weight_scale_2 is carried separately as a "<weight>.wglobal" sibling
+tensor and folded into the cuBLASLt GEMM alpha — folding it into the block scale underflows
+~85% of blocks into e4m3 subnormals = the patchy-colour bug).
+Non-fp4 tensors (modulation/norm/bias/embed)
 are written F32 (what the model allocates). Clones the SRC gguf's tensor list/dims/KV verbatim;
 maps ggml bare names <- official 'model.diffusion_model.<name>'. All 4444 SRC tensors map (verified).
 
@@ -41,13 +45,20 @@ def swz_index(out,nb):
 
 fo,bo,ho=st_open(OFF)
 
+def read_wglobal(oname):
+    # ModelOpt per-tensor weight global (weight_scale_2). UNFOLDED import keeps this OUT of
+    # the per-block ue4m3 scale (folding it underflows ~85% of blocks into e4m3 subnormals ->
+    # ~11.5% per-block error = the patchy colour). Carried as a sibling .wglobal tensor; the
+    # FP4 cuBLASLt GEMM folds it into alpha (alpha = A_global * W_global).
+    return float(st_raw(fo,bo,ho,oname.replace('.weight','.weight_scale_2'))[0].view(np.float32)[0])
+
 def build_nvfp4(oname,dims):
     wu,_,wsh=st_raw(fo,bo,ho,oname); su,_,_=st_raw(fo,bo,ho,oname.replace('.weight','.weight_scale'))
-    g=float(st_raw(fo,bo,ho,oname.replace('.weight','.weight_scale_2'))[0].view(np.float32)[0])
     out,inn=wsh[0],wsh[1]*2; nb16=inn//16
     W=wu.reshape(out,inn//2); code=np.empty((out,inn),dtype=np.uint8)
     code[:,0::2]=W>>4; code[:,1::2]=W&0xF
-    sc=e4m3_dec_byte(su).ravel()[swz_index(out,nb16)]*g
+    # UNFOLDED: store official's well-conditioned per-block e4m3 scale verbatim (no *g).
+    sc=e4m3_dec_byte(su).ravel()[swz_index(out,nb16)]
     d=e4m3_enc_pos(sc); nblk=inn//64
     oc=code.reshape(out,nblk,64); qs=np.empty((out,nblk,32),dtype=np.uint8)
     for s in range(4):
@@ -97,18 +108,26 @@ def nbytes_of(tt,dims):
     raise Exception(tt)
 
 plan=[];nfp4=0;nf32=0
+wglobals={}   # bare weight name -> g (carried separately, folded into the GEMM alpha)
 for name,dims in infos:
     oname=PFX+name
     assert oname in ho, f"missing official {oname}"
     if ho[oname]['dtype']=='U8':
         plan.append((name,oname,dims,GT_NVFP4));nfp4+=1
+        wglobals[name]=read_wglobal(oname)
     else:
         # Small / graph-concatenated params (modulation, norm, embedders, biases, scales) MUST
         # stay F32 — the model allocates them F32 and ggml_concat asserts uniform type. Big
         # non-fp4 Linears (the ones official left BF16) go BF16 to fit VRAM.
         keepf32 = any(k in name for k in ('scale_shift','adaln','norm','embedder','.bias','.scale'))
         plan.append((name,oname,dims, GT_F32 if keepf32 else NONFP4_TYPE)); nf32+=1
-print(f"plan: {nfp4} nvfp4 + {nf32} nonfp4 = {len(plan)} tensors")
+# Sibling per-tensor weight globals: one 1-element F32 "<weight>.wglobal" per nvfp4 tensor.
+# The loader reads these (unknown tensors are tolerated) and registers them so the FP4 GEMM
+# folds W's global into alpha. nt must grow to include them.
+for wname in wglobals:
+    plan.append((wname+'.wglobal', None, [1], GT_F32))
+nt = nt + len(wglobals)
+print(f"plan: {nfp4} nvfp4 + {nf32} nonfp4 + {len(wglobals)} wglobal = {len(plan)} tensors")
 
 o=open(OUT,'wb')
 o.write(magic);o.write(struct.pack('<I',ver));o.write(struct.pack('<Q',nt));o.write(struct.pack('<Q',nkv));o.write(KV)
@@ -119,7 +138,12 @@ for name,oname,dims,ot in plan:
     nb=nbytes_of(ot,dims);o.write(struct.pack('<I',ot));o.write(struct.pack('<Q',off));off+=nb+((-nb)%align)
 cur=o.tell();o.write(b'\x00'*((-cur)%align))
 for name,oname,dims,ot in plan:
-    data=build_nvfp4(oname,dims) if ot==GT_NVFP4 else official_nonfp4(oname,ot)
+    if name.endswith('.wglobal'):
+        data=struct.pack('<f', wglobals[name[:-len('.wglobal')]])
+    elif ot==GT_NVFP4:
+        data=build_nvfp4(oname,dims)
+    else:
+        data=official_nonfp4(oname,ot)
     nb=nbytes_of(ot,dims);assert len(data)==nb,f"{name} {len(data)} vs {nb}"
     o.write(data);o.write(b'\x00'*((-len(data))%align))
 o.close()
