@@ -1220,9 +1220,28 @@ namespace Flux {
             }
 
             if (ref_latents.size() > 0) {
+                // [TASK E instrument] dump img/ref shapes+types+data ptr around the ref concat.
+                // Enable with env TASKE_DEBUG=1. Prints right before each ggml_concat(img,ref,1).
+                bool taske_dbg = getenv("TASKE_DEBUG") != nullptr;
+                int64_t taske_total_tokens = img->ne[1];  // img tokens so far
                 for (ggml_tensor* ref : ref_latents) {
+                    if (taske_dbg) {
+                        fprintf(stderr, "[TASKE] pre-patchify ref: ne=[%ld,%ld,%ld,%ld] type=%d data=%p buffer=%p\n",
+                                (long)ref->ne[0], (long)ref->ne[1], (long)ref->ne[2], (long)ref->ne[3],
+                                (int)ref->type, (void*)ref->data, (void*)ref->buffer);
+                    }
                     ref = DiT::pad_and_patchify(ctx, ref, patch_size, patch_size);
+                    if (taske_dbg) {
+                        fprintf(stderr, "[TASKE] CONCAT  img: ne=[%ld,%ld,%ld,%ld] type=%d  ||  ref(patched): ne=[%ld,%ld,%ld,%ld] type=%d\n",
+                                (long)img->ne[0], (long)img->ne[1], (long)img->ne[2], (long)img->ne[3], (int)img->type,
+                                (long)ref->ne[0], (long)ref->ne[1], (long)ref->ne[2], (long)ref->ne[3], (int)ref->type);
+                        taske_total_tokens += ref->ne[1];
+                    }
                     img = ggml_concat(ctx->ggml_ctx, img, ref, 1);
+                }
+                if (taske_dbg) {
+                    fprintf(stderr, "[TASKE] post-concat img: ne=[%ld,%ld,%ld,%ld]  ATTN_SEQ_LEN(L)=%ld\n",
+                            (long)img->ne[0], (long)img->ne[1], (long)img->ne[2], (long)img->ne[3], (long)img->ne[1]);
                 }
             }
 
@@ -1443,7 +1462,15 @@ namespace Flux {
                                             config.axes_dim,
                                             sd_version_is_longcat(version));
             int pos_len = static_cast<int>(pe_vec.size() / config.axes_dim_sum / 2);
-            // LOG_DEBUG("pos_len %d", pos_len);
+            if (getenv("TASKE_DEBUG") != nullptr) {
+                // [TASK E instrument] pos_len is the length of the pe tensor (pe->ne[3]==L
+                // expected by apply_rope). If pos_len < the post-concat ATTN_SEQ_LEN printed
+                // above, the CUDA ggml_rope_pe kernel will index pe out of bounds on the
+                // first attention op => silent segfault. This is the #1 suspected cause.
+                fprintf(stderr, "[TASKE] pos_len(pe->ne[3])=%d  pe_vec.size()=%zu  axes_dim_sum=%d  n_ref=%zu\n",
+                        pos_len, pe_vec.size(), config.axes_dim_sum, ref_latents.size());
+                fprintf(stderr, "[TASKE] >>> COMPARE: pos_len(%d) must EQUAL post-concat ATTN_SEQ_LEN above. If pos_len < L => OOB segfault.\n", pos_len);
+            }
             auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.axes_dim_sum / 2, pos_len);
             // pe->data = pe_vec.data();
             // print_ggml_tensor(pe);

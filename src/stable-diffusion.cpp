@@ -254,6 +254,13 @@ public:
     std::set<std::string> deferred_ignore_tensors;
     bool dit_load_deferred  = false;
     bool deferred_use_mmap  = false;
+    // TASK F (flux2 warm worker): when armed, finalize_deferred_dit_load() does NOT tear
+    // down the deferred-DiT loader state, so the DiT can be re-deferred (freed +
+    // dit_load_deferred re-set) after every request. This lets a warm resident image
+    // worker alternate TE-resident <-> DiT-resident each /generate so the Qwen3 TE
+    // (~4.7 GB) and the NVFP4 DiT (~5.8 GB) never coexist (peak ~max(TE,DiT) ~7 GB vs
+    // ~12.3 GB). Avatar keeps this false => single-shot defer, byte-identical to before.
+    bool dit_redefer_armed  = false;
 
     // lora_name => multiplier
     std::unordered_map<std::string, float> curr_lora_state;
@@ -870,6 +877,13 @@ public:
             diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
             diffusion_model->set_stream_layers_enabled(stream_layers);
             get_param_tensors(diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION) && !dit_no_mmap);
+            // [TASK E] swap_diffusion_model() must load a swapped DiT the SAME way boot does.
+            // The earlier dit_swap_enable_mmap=enable_mmap_tensors (line ~553) ignored
+            // module_can_mmap: for an NVFP4 GPU DiT (cuBLASLt, no host-buffer) the boot load
+            // is NON-mmap (real writable buffer) so the in-place FP4 repack can write the
+            // weights; but the swap mmap'd them to read-only file pages -> the first edit
+            // matmul's in-place repack faulted (silent child crash). Mirror the boot decision.
+            dit_swap_enable_mmap = module_can_mmap(SDBackendModule::DIFFUSION) && !dit_no_mmap;
 
             if (sd_version_is_unet_edit(version)) {
                 vae_decode_only = false;
@@ -1181,8 +1195,26 @@ public:
         // freed-immediately (one-shot CLI). The DiT tensors are split out of the load
         // map here and loaded by finalize_deferred_dit_load() after the TE is freed.
         dit_load_deferred = false;
-        if (sd_version_is_longcat_avatar(version) && diffusion_model && cond_stage_model &&
-            free_params_immediately && !sd_ctx_params->enable_mmap &&
+        dit_redefer_armed = false;
+        // TASK F: extend the deferred-DiT mechanism to flux2's warm IMAGE worker. The
+        // avatar gate requires !enable_mmap (umT5 weights are real GPU buffers that get
+        // freed/reloaded); flux2's NVFP4 DiT also runs as a real GPU buffer (no offload —
+        // cuBLASLt in-place repack is offload-incompatible) so the defer works whether or
+        // not --mmap is passed (load_tensors re-reads the file on each reload). For flux2
+        // we ALSO arm re-deferral so the DiT is freed + reloaded every request.
+        // [TASK E] runtime A/B kill-switch: FLUX2_NO_TE_DIT_ALTERNATE=1 disables the whole
+        // TASK F deferral/redefer alternation for flux2 (DiT loads eagerly at boot, stays
+        // resident, no per-request free/reload, finalize_deferred_dit_load() never fires).
+        // Lets us isolate the base->edit swap bug (E) from the TASK F interaction without a
+        // rebuild: set it -> if the swap now works, the crash was (B) the TASK F interaction.
+        static const bool flux2_no_alternate = []{
+            const char* s = getenv("FLUX2_NO_TE_DIT_ALTERNATE");
+            return s && s[0] == '1';
+        }();
+        const bool defer_flux2 = sd_version_is_flux2(version) && !flux2_no_alternate;
+        if ((sd_version_is_longcat_avatar(version) || defer_flux2) &&
+            diffusion_model && cond_stage_model && free_params_immediately &&
+            (defer_flux2 || !sd_ctx_params->enable_mmap) &&
             !sd_backend_is_cpu(params_backend_for(SDBackendModule::TE)) &&
             !sd_backend_is_cpu(params_backend_for(SDBackendModule::DIFFUSION))) {
             for (auto it = tensors.begin(); it != tensors.end();) {
@@ -1198,8 +1230,13 @@ public:
                 deferred_ignore_tensors  = ignore_tensors;
                 deferred_use_mmap        = sd_ctx_params->enable_mmap;
                 deferred_loader          = std::make_shared<ModelLoader>(model_loader);
-                LOG_INFO("avatar: deferring DiT weight load (umT5-on-GPU); %zu DiT tensors",
-                         deferred_dit_tensors.size());
+                // flux2 warm worker: keep the loader/tensor maps alive across requests so
+                // the DiT can be re-deferred every /generate (see redefer_dit_load()).
+                dit_redefer_armed        = defer_flux2;
+                LOG_INFO("%s: deferring DiT weight load; %zu DiT tensors%s",
+                         defer_flux2 ? "flux2" : "avatar",
+                         deferred_dit_tensors.size(),
+                         dit_redefer_armed ? " (re-deferrable)" : "");
             }
         }
 
@@ -1212,10 +1249,16 @@ public:
         // above only engages for umT5-on-GPU, but the free-then-reload-on-prompt-change
         // requirement is independent of placement. Gate only on avatar + freed-weights +
         // no-mmap (mmap'd weights are never freed, so no reload is needed).
-        if (sd_version_is_longcat_avatar(version) && cond_stage_model &&
-            free_params_immediately && !sd_ctx_params->enable_mmap) {
+        // TASK F: also capture for flux2 (the Qwen3 "llm" TE). The flux2 warm worker
+        // frees the TE after each cond and reloads it before the next prompt; the loader
+        // re-reads the file so this is correct under --mmap too (mirrors the avatar path,
+        // which is gated !enable_mmap because its umT5 GPU buffer is freed identically).
+        if ((sd_version_is_longcat_avatar(version) || sd_version_is_flux2(version)) &&
+            cond_stage_model && free_params_immediately &&
+            (sd_version_is_flux2(version) || !sd_ctx_params->enable_mmap)) {
             for (const auto& [key, tensor] : tensors) {
-                if (starts_with(key, "text_encoders.t5xxl.transformer")) {
+                if (starts_with(key, "text_encoders.t5xxl.transformer") ||
+                    starts_with(key, "text_encoders.llm")) {
                     te_reload_tensors[key] = tensor;
                 }
             }
@@ -1503,16 +1546,37 @@ public:
                                                 deferred_ignore_tensors,
                                                 n_threads,
                                                 deferred_use_mmap);
-        deferred_loader.reset();
-        deferred_dit_tensors.clear();
-        deferred_ignore_tensors.clear();
+        // TASK F: keep the loader/tensor maps when re-deferral is armed (flux2 warm
+        // worker) so the next request can free the DiT and reload it again. Avatar
+        // (not armed) tears them down exactly as before => byte-identical.
+        if (!dit_redefer_armed) {
+            deferred_loader.reset();
+            deferred_dit_tensors.clear();
+            deferred_ignore_tensors.clear();
+        }
         if (!ok) {
             LOG_ERROR("deferred DiT weight load failed");
             return false;
         }
-        LOG_INFO("avatar: deferred DiT weight load completed, taking %.2fs",
+        LOG_INFO("deferred DiT weight load completed, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
+    }
+
+    // TASK F (flux2 warm worker): free the resident DiT params and re-arm the deferred
+    // load so the NEXT request re-runs TE-reload -> encode -> free-TE -> load-DiT, i.e.
+    // TE and DiT never coexist. No-op unless re-deferral was armed at load time. The
+    // NVFP4 cuBLASLt in-place repack overwrites src0->data (the DiT's GPU buffer) and its
+    // repack cache is keyed on that pointer; if a freed buffer is later reallocated at the
+    // same address the stale entry would serve an un-repacked buffer as "repacked"
+    // (silent corruption / blank image). Clearing the cache on free is MANDATORY here.
+    void redefer_dit_load() {
+        if (!dit_redefer_armed || !diffusion_model || deferred_dit_tensors.empty()) {
+            return;
+        }
+        diffusion_model->free_params_buffer();
+        ggml_cuda_nvfp4_clear_repack_cache();  // drop pointer-keyed repack entries (see above)
+        dit_load_deferred = true;              // next finalize_deferred_dit_load() reloads it
     }
 
     // Reload the umT5 text-encoder params after they were freed
@@ -1528,7 +1592,7 @@ public:
             return true;  // still resident, nothing to reload
         }
         if (!te_reload_loader || te_reload_tensors.empty()) {
-            LOG_ERROR("avatar: umT5 reload requested but no reload state captured");
+            LOG_ERROR("text-encoder reload requested but no reload state captured");
             return false;
         }
         int64_t t0 = ggml_time_ms();
@@ -1538,10 +1602,10 @@ public:
                                                  n_threads,
                                                  te_reload_use_mmap);
         if (!ok) {
-            LOG_ERROR("avatar: umT5 reload failed");
+            LOG_ERROR("text-encoder reload failed");
             return false;
         }
-        LOG_INFO("avatar: umT5 reloaded for prompt change, taking %.2fs",
+        LOG_INFO("text-encoder reloaded for prompt change, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
@@ -1680,6 +1744,31 @@ public:
         if (!ok) {
             LOG_ERROR("swap_diffusion_model: load tensors from '%s' failed", new_diffusion_model_path.c_str());
             return false;
+        }
+
+        // [TASK E] swap reloads weights into the (possibly reused) param buffer; the NVFP4
+        // cuBLASLt repack cache is keyed by raw weight pointer and would serve the PREVIOUS
+        // model's repacked layout for the new weights -> wrong/OOB GEMM. Drop stale entries
+        // so the swapped weights re-repack fresh on next matmul.
+        ggml_cuda_nvfp4_clear_repack_cache();
+
+        // [TASK E] The DiT is now fully resident with the SWAPPED variant's weights. Under
+        // TASK F the previous render's redefer_dit_load() left dit_load_deferred=true with
+        // the deferred bookkeeping (deferred_loader / deferred_dit_tensors) still pointing
+        // at the ORIGINAL (boot/base) gguf. If we don't fix that, the very next
+        // finalize_deferred_dit_load() (in prepare_image_generation_embeds) would fire a
+        // SECOND, stale load of the ORIGINAL weights on top of the just-swapped buffer:
+        // alloc_params_buffer() takes the all-have-data fast-path (orphaning this buffer)
+        // and deferred_loader->load_tensors() rebinds/overwrites the runner tensors from the
+        // wrong gguf (under --mmap, to host pages) -> crash before the DiT forward (TASK E).
+        // So mark the load satisfied AND repoint the redefer bookkeeping at the swapped gguf
+        // so warm alternation re-arms against the CURRENT variant, not the boot one.
+        dit_load_deferred = false;  // the next finalize_deferred_dit_load() is a no-op
+        if (dit_redefer_armed) {
+            deferred_loader         = std::make_shared<ModelLoader>(swap_loader);
+            deferred_dit_tensors    = dit_tensors;  // runner's current param tensors
+            deferred_ignore_tensors = {};
+            deferred_use_mmap       = dit_swap_enable_mmap;
         }
 
         LOG_INFO("swap_diffusion_model: loaded DiT from '%s' (mmap=%d), taking %.2fs",
@@ -4723,6 +4812,14 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     int64_t prepare_start_ms         = ggml_time_ms();
     condition_params.zero_out_masked = false;
 
+    // TASK F (flux2 warm worker): the TE may have been freed after the previous request's
+    // cond (release-after-encode) to keep the resident footprint low. Reload it from the
+    // captured loader before this prompt's encode. No-op if the TE is still resident or no
+    // reload state was captured (one-shot CLI / non-warm / non-flux2).
+    if (!sd_ctx->sd->reload_cond_stage_model()) {
+        LOG_ERROR("text-encoder reload failed; text conditioning may be unavailable");
+    }
+
     // flux2 lap-11 Lever A: CFG does two consecutive text encodes (cond below,
     // uncond just after). With --offload-to-cpu the text-encoder params get
     // restored to CPU after the cond encode and fully re-uploaded for the uncond
@@ -4813,9 +4910,23 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     // --offload-to-cpu the TE params live on the CPU params backend (the per-compute GPU
     // copy is freed by free_compute_buffer), so keeping them resident costs no VRAM; under
     // --mmap they are reclaimable file-backed pages.
-    if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
+    //
+    // TASK F (flux2 warm worker, release-after-encode): when the DiT load is re-deferrable
+    // (dit_redefer_armed) the TE MUST be freed here even on a resident worker — the DiT is
+    // about to be loaded onto the GPU and we need its VRAM. reload_cond_stage_model() at
+    // the top of generate_image's encode (here) restored the TE before this prompt from the
+    // captured loader; freeing it now drops the warm footprint so the DiT loads into the
+    // freed VRAM (peak ~max(TE,DiT)).
+    if (sd_ctx->sd->free_params_immediately &&
+        (!sd_ctx->sd->keep_diffusion_model_resident || sd_ctx->sd->dit_redefer_armed)) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
+
+    // TASK F: TE is now freed; bring the DiT onto the GPU for sampling (no-op unless a
+    // deferred/re-deferred load is pending). Second half of the alternation: request N =
+    // reload TE -> encode -> free TE (above) -> load DiT (here) -> sample ->
+    // redefer_dit_load() (in generate_image) frees the DiT before request N+1's TE reload.
+    sd_ctx->sd->finalize_deferred_dit_load();
 
     ImageGenerationEmbeds embeds;
     embeds.img_uncond = std::move(img_uncond);
@@ -5196,6 +5307,15 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     }
     if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident && !request.hires.enabled) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
+    }
+    // TASK F (flux2 warm worker): re-defer the DiT — free it now and re-arm the deferred
+    // load so it is reloaded only AFTER the next prompt's TE encode (keeps TE+DiT from
+    // coexisting; clears the NVFP4 repack cache to avoid stale pointer-keyed entries).
+    // Only fires when armed (flux2 + deferred load captured) and not mid-hires (that pass
+    // still needs the DiT). The VAE decode that follows runs with the DiT already gone, so
+    // peak stays under max(TE,DiT). No-op for avatar / one-shot CLI.
+    if (sd_ctx->sd->dit_redefer_armed && !request.hires.enabled) {
+        sd_ctx->sd->redefer_dit_load();
     }
     int64_t denoise_end = ggml_time_ms();
     LOG_INFO("generating %zu latent images completed, taking %.2fs",
