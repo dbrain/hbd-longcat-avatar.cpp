@@ -6283,6 +6283,44 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                   (int)inactive.shape()[0], (int)inactive.shape()[1],
                                   (int)inactive.shape()[2], (int)inactive.shape()[3]);
                     } else {
+                        // VACE continuation latent-AGC (FINDINGS-L12 fix): the carried tail is the
+                        // prior segment's HIGHEST-variance frames; re-injecting it as the next
+                        // segment's VACE conditioning ratchets the latent std up every cut
+                        // (measured 0.64->0.80->0.92...), blowing out contrast over a long chain.
+                        // Pull the tail's global std back to a canonical reference (the measured
+                        // fresh-segment scale) so every segment re-seeds from the SAME baseline —
+                        // contrast-only AGC: a single uniform gain about the mean, so it preserves
+                        // brightness + per-channel ratios (no colour distortion), just de-drifts
+                        // the contrast. Opt-in (output is NOT bit-exact): VACE_CONT_AGC=1 enables;
+                        // VACE_CONT_AGC_TARGET overrides the target std (default 0.65 = seg0 global
+                        // latent std at the 3+3 distill — res/model-robust as a global scalar).
+                        if (const char* a = getenv("VACE_CONT_AGC"); a != nullptr && a[0] == '1') {
+                            float target = 0.65f;
+                            if (const char* t = getenv("VACE_CONT_AGC_TARGET"); t != nullptr && t[0] != '\0') {
+                                float v = static_cast<float>(atof(t));
+                                if (v > 0.0f) target = v;
+                            }
+                            float* d        = cont_tail.data();
+                            const int64_t n = cont_tail.numel();
+                            if (n > 1) {
+                                double sum = 0.0, sq = 0.0;
+                                for (int64_t i = 0; i < n; ++i) {
+                                    sum += d[i];
+                                    sq += static_cast<double>(d[i]) * d[i];
+                                }
+                                double mean = sum / static_cast<double>(n);
+                                double var  = sq / static_cast<double>(n) - mean * mean;
+                                double cur_std = var > 0.0 ? std::sqrt(var) : 0.0;
+                                if (cur_std > 1e-6) {
+                                    float g = static_cast<float>(target / cur_std);
+                                    for (int64_t i = 0; i < n; ++i) {
+                                        d[i] = static_cast<float>((d[i] - mean) * g + mean);
+                                    }
+                                    LOG_INFO("VACE_CONT_AGC: carried-tail std %.4f -> %.4f (gain %.3f, mean %.4f kept)",
+                                             cur_std, target, g, mean);
+                                }
+                            }
+                        }
                         cont_tail.reshape_(tgt);
                         sd::ops::slice_assign(&inactive, 2, 0, K, cont_tail);
                         LOG_INFO("VACE_CONT_LATENT: injected %lld tail latent frames (of %lld) into "

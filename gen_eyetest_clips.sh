@@ -49,6 +49,24 @@ cat <<HEAD
 <p class=note>Generated $(date '+%Y-%m-%d %H:%M'). Murk root-cause = sampler grid (FINDINGS-L8): generic DiscreteScheduler gave a wasted step on the wrong grid; fix = proper lightx2v DMD grid via <code>--sigmas</code> / <code>WAN_DISTILL_SIGMAS</code>. All clips below are the FIXED schedule unless labelled BEFORE.</p>
 HEAD
 
+# --- contknee: FR=13 720p 3+3 continuation chain (run #3, seam + throughput) ---
+echo "<h2>★ Continuation chain FR=13 720p 3+3 (run #3) — seam eye-test + throughput knee</h2>"
+CK="$ROOT/contknee/fr13"
+if [ -f "$CK/chain_fr13.mp4" ]; then
+  cp "$CK/chain_fr13.mp4" "$EY/media/contknee_chain_fr13.mp4"
+  [ -f "$CK/seams/big/seam1_join.png" ] && cp "$CK/seams/big/seam1_join.png" "$EY/media/contknee_seam1.png"
+  [ -f "$CK/seams/big/seam2_join.png" ] && cp "$CK/seams/big/seam2_join.png" "$EY/media/contknee_seam2.png"
+  echo "<p class=note>seg0 t2v 201.7s · seg1 cont 209.2s · seg2 cont 199.7s ⇒ continuation overhead ≈ noise. Honest continuous-27s = ~408 render-s/s-video = <b>3.7× LTX</b> (the FR=13 knee). Seam: structure/identity CARRY but cumulative exposure/contrast DRIFT (luma 45→53→65, std 32→52→66 over 2 seams — neon blows out by seg2).</p>"
+  echo "<div class='grid big'>"
+  fig "media/contknee_chain_fr13.mp4" "3-seg continuation chain (29f) — watch the neon brightness creep up at each seam"
+  echo "</div><div class=grid>"
+  [ -f "$EY/media/contknee_seam1.png" ] && figimg "media/contknee_seam1.png" "SEAM1 join: g12 end-seg0 (L) | g13 start-seg1 (R) — continuation pops brighter/sharper"
+  [ -f "$EY/media/contknee_seam2.png" ] && figimg "media/contknee_seam2.png" "SEAM2 join: g20 end-seg1 (L) | g21 start-seg2 (R) — neon now over-saturated"
+  echo "</div>"
+else
+  echo "<p class=note>⏳ contknee chain not present at $CK.</p>"
+fi
+
 # --- 27s montage ---
 echo "<h2>27s music-video montage (1280×704, fixed sigma grid shift 7, t2v hard-cuts)</h2>"
 if [ -f "$ROOT/mv27/musicvideo_27s.mp4" ]; then
