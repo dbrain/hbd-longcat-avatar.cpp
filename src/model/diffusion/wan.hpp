@@ -138,6 +138,20 @@ namespace WAN {
             k      = norm_k->forward(ctx, k);
             auto v = v_proj->forward(ctx, x);  // [N, n_token, n_head*d_head]
 
+            // WAN_DIT_F16: under the F16 residual stream the q/k/v Linears emit F16, but
+            // the fast fused RoPE (ggml_rope_pe) is F32-only (rope.hpp:953) — an F16 q
+            // would fall back to the slow cont+repeat+mul+add chain (big intermediates,
+            // the lap-08b smell). Upcast q/k to F32 here so the fused RoPE fires; this is
+            // the F32-cast LTX applies for the same reason. The cuDNN flash kernel casts
+            // q→F16 internally and, with GGML_CUDNN_ATTN_F16_OUT, stores an F16 output
+            // that feeds the F16 o_proj. v is re-cast to F16 inside ggml_ext_attention_ext
+            // (build_kqv), so leave it F16. Self-gated on the F16 type → no-op in the
+            // default F32 path (byte-identical).
+            if (q->type == GGML_TYPE_F16) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+                k = ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_F32);
+            }
+
             q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
@@ -767,6 +781,29 @@ namespace WAN {
             x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
 
+            // WAN_DIT_F16 (default OFF, prod byte-identical when unset): run the DiT
+            // residual stream in F16 to halve the per-block glue/copy/cast HBM traffic
+            // (the nsys wall of k_bin_bcast<op_add> 5754-call residual adds, the
+            // <op_mul> AdaLN modulates, the convert_unary<half,float> casts) and to feed
+            // the cuDNN F16 attention output (GGML_CUDNN_ATTN_F16_OUT) straight into the
+            // next Linear with no re-upcast. Mirrors LTX_DIT_F16 (ltxv.hpp:1738). The
+            // NVFP4 Linears emit F16 here (cuBLASLt FP4 GEMM: F32 accumulate, F16 store —
+            // supports_op gate ggml-cuda.cu:6046, mm_dst gate ggml_extend.hpp:1149);
+            // e0/context/pe stay F32 and broadcast into the F16 stream via the
+            // F16,F32->F16 binbcast combos (binbcast.cu:378). Cast back to F32 before the
+            // head (below) so the model output / sampler / VAE path is unchanged.
+            // Only the residual `x` is cast; e0/context stay F32 and mix into x through
+            // adds whose F16 `x` is src0 (dst type = F16). VACE is excluded: the VACE
+            // block's `ggml_add(c, x_orig)` would mix an F32 `c` (src0) with the F16
+            // x_orig (src1) → the <float,float,float> binbcast branch on an F16 src1 =
+            // the binbcast.cu:261 stride assert. The prod i2v/t2v path has vace_layers==0,
+            // so this just scopes F16 to the supported (and target) path.
+            static const bool wan_dit_f16 = (std::getenv("WAN_DIT_F16") != nullptr);
+            const bool use_dit_f16        = wan_dit_f16 && config.vace_layers == 0;
+            if (use_dit_f16 && x->type == GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
+
             // time_embedding
             auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
             e      = time_embedding_0->forward(ctx, e);
@@ -834,6 +871,12 @@ namespace WAN {
                 }
             }
 
+            // WAN_DIT_F16: bring the residual stream back to F32 before the head so the
+            // norm_out/modulate/proj_out tail + unpatchify + VAE run exactly as in prod
+            // (the head Linear then sees an F32 activation → F32 dst, unchanged output).
+            if (use_dit_f16 && x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
             x = head->forward(ctx, x, e);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
 
             return x;

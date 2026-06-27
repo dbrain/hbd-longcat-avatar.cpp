@@ -27,13 +27,21 @@ PROMPT="${PROMPT:-The person dances energetically with big, expressive head and 
 # DOTS_ENV adds/overrides act-quant knobs for the dots experiments (space-separated KEY=VAL).
 declare -a ENVV=( "GGML_NVFP4_CUBLASLT=${NVFP4_CUBLASLT:-1}" "GGML_NVFP4_QUANT_TWOLEVEL=${TWOLEVEL:-1}" LONGCAT_FFN_TILE_TOKENS=4096 )
 [ "${FP8_OFF:-0}" = "1" ]   || ENVV+=( GGML_FP8_FFN=1 "GGML_FP8_LAYERS=${FP8_LAYERS:-blocks.}" )
-[ "${CUDNN_OFF:-0}" = "1" ] || ENVV+=( GGML_CUDNN_ATTN=1 GGML_CUDNN_ATTN_F16_OUT=1 )
+# cuDNN Blackwell SDPA borrow. CUDNN_F16=1 keeps the maskless d_head=128 attn output F16.
+# Standalone it tripped binbcast (an F16 attn output added into the F32 residual hits the
+# <float,float,float> binbcast branch on an F16 src1 → assert binbcast.cu:261); it is only
+# safe together with the F16 residual stream (DITF16=1, which sets it for you).
+[ "${CUDNN_OFF:-0}" = "1" ] || ENVV+=( GGML_CUDNN_ATTN=1 )
+[ "${CUDNN_F16:-0}" = "1" ] && ENVV+=( GGML_CUDNN_ATTN_F16_OUT=1 )
 [ "${FUSE_OFF:-0}" = "1" ]  || ENVV+=( GGML_CUDA_F16_BCAST_FUSE=1 GGML_CUDA_BIAS_GELU_FUSE=1 GGML_CUDA_BIAS_RMS_FUSE=1 GGML_CUDA_RMS_MOD_FUSE=1 )
+# F16 residual-stream DiT (WAN_DIT_F16) — the #1 remaining DiT glue/cast lever. Implies the
+# F16 cuDNN attention output so the stream stays F16 through o_proj (no re-upcast). DITF16=1.
+[ "${DITF16:-0}" = "1" ] && ENVV+=( WAN_DIT_F16=1 GGML_CUDNN_ATTN_F16_OUT=1 )
 for kv in ${DOTS_ENV:-}; do ENVV+=("$kv"); done
 ENV_FLAGS=(); for e in "${ENVV[@]}"; do ENV_FLAGS+=(-e "$e"); done
 # Forward any GGML_*/LONGCAT_*/LTX_* debug toggles set in the parent shell (DBG, TRACE,
 # NANCHECK, ACT_* knobs, etc.) into the container without baking them into the stack.
-for v in $(compgen -e | grep -E '^(GGML_|LONGCAT_|LTX_)' || true); do
+for v in $(compgen -e | grep -E '^(GGML_|LONGCAT_|LTX_|WAN_)' || true); do
   case " ${ENVV[*]} " in *" $v="*) continue;; esac   # don't double-set stack vars
   ENV_FLAGS+=(-e "$v=${!v}")
 done
@@ -53,6 +61,7 @@ t0=$(date +%s.%N)
   --steps "$LSTEPS" --high-noise-steps "$HSTEPS" --flow-shift "$SHIFT" \
   -W "$W" -H "$H" --video-frames "$FR" --diffusion-fa --offload-to-cpu --mmap --max-vram "$MAXV" \
   --vae-tiling --temporal-tiling --vae-relative-tile-size "${VAE_TILE:-0.5x0.5}" \
+  ${EXTRA_TILING:+--extra-tiling-args "$EXTRA_TILING"} \
   --init-img "$IMG" -p "$PROMPT" -s "$SEED" \
   -o /src/wan_dance_out/$TAG/frames/f%03d.png -v 2>&1 | tee "$OUT/run.log"
 rc=${PIPESTATUS[0]}; t1=$(date +%s.%N)
