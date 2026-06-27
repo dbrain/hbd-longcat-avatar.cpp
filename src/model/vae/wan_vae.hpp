@@ -1,8 +1,11 @@
 #ifndef __SD_MODEL_VAE_WAN_VAE_HPP__
 #define __SD_MODEL_VAE_WAN_VAE_HPP__
 
+#include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "model/common/block.hpp"
@@ -1117,6 +1120,45 @@ namespace WAN {
             return out;
         }
 
+        // Streaming/cached decode of a RANGE of latent frames [frame_base, frame_base+z->ne[2]).
+        // This is decode()'s per-frame loop, but (a) restricted to the frames present in
+        // `z` (a temporal slice of the full latent) and (b) WITHOUT the clear_cache() at
+        // either end, so the causal _feat_map is carried in/out by the caller across
+        // separate compute() passes (temporal streaming). conv2 is a {1,1,1} CausalConv3d
+        // (pointwise in time) and unpatchify is per-frame independent, so decoding the
+        // latent in temporal chunks is numerically identical to decode() of the whole
+        // latent in one graph — only the peak activation memory is bounded (to one
+        // chunk's worth of full-spatial-res decoder activations).
+        //
+        // `frame_base` is the GLOBAL latent-frame index of z's first frame: the decoder's
+        // CausalConv3d branches on chunk_idx (==0 / ==1 / >=2), so each frame MUST be fed
+        // its global index, not a per-chunk-local one, for the cache logic to match.
+        ggml_tensor* decode_chunk(GGMLRunnerContext* ctx,
+                                  ggml_tensor* z,
+                                  int frame_base,
+                                  int64_t b = 1) {
+            // z: [b*c, t_chunk, h, w]
+            GGML_ASSERT(b == 1);
+
+            auto decoder = std::dynamic_pointer_cast<Decoder3d>(blocks["decoder"]);
+            auto conv2   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
+
+            auto x          = conv2->forward(ctx, z);  // {1,1,1} pointwise -> per-frame independent
+            int64_t n_chunk = x->ne[2];
+            ggml_tensor* out = nullptr;
+            for (int64_t k = 0; k < n_chunk; k++) {
+                _conv_idx = 0;
+                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, k, k + 1);  // [b*c, 1, h, w]
+                int gi    = frame_base + static_cast<int>(k);
+                auto out_ = decoder->forward(ctx, in, b, _feat_map, _conv_idx, gi);
+                out       = (out == nullptr) ? out_ : ggml_concat(ctx->ggml_ctx, out, out_, 2);
+            }
+            if (wan2_2) {
+                out = unpatchify(ctx->ggml_ctx, out, 2, b);
+            }
+            return out;
+        }
+
         // Streaming/cached encode of ONE encoder chunk, mirror of decode_partial.
         // Unlike encode() (which clear_cache()'s at both ends), this keeps the
         // causal encoder history in _enc_feat_map so a chunk encoded after priming
@@ -1399,58 +1441,216 @@ namespace WAN {
             return mu;
         }
 
+        // --- Temporal streaming (full spatial resolution, bounded VRAM) ------------------
+        //
+        // 1x1 spatial tiling (zero spatial seams) OOMs because a full-frame x all-frames
+        // decode allocates one giant activation buffer (~15.7GB). Instead we stream the
+        // CAUSAL VAE over temporal chunks of latent (decode) / pixel (encode) frames at
+        // FULL spatial resolution, carrying the causal feat_cache across compute() passes
+        // via the runner's persistent (non-gallocr) cache buffer. Chunk boundaries are
+        // seamless because the cache reproduces the exact causal context decode()/encode()
+        // would have had in a single graph. Env-gated, OFF by default.
+        //
+        // LONGCAT_VAE_TEMPORAL_CHUNK=N : N>=1 enables decode streaming with N latent frames
+        //                            per compute pass (encode streams its natural 1+4k groups).
+        //                            0/unset = disabled (committed full-frame path untouched).
+        //                            (LONGCAT_ prefix so run_wan22_i2v_nvfp4.sh forwards it.)
+        static int wan_vae_temporal_chunk() {
+            static const int n = [] {
+                const char* s = getenv("LONGCAT_VAE_TEMPORAL_CHUNK");
+                if (s == nullptr || s[0] == '\0')
+                    return 0;
+                int v = atoi(s);
+                return v < 0 ? 0 : v;
+            }();
+            return n;
+        }
+
+        static std::string wan_dec_feat_name(size_t i) { return "wan_dec_feat:" + std::to_string(i); }
+        static std::string wan_enc_feat_name(size_t i) { return "wan_enc_feat:" + std::to_string(i); }
+
+        // Persist the per-conv causal feat_cache into the runner's cross-graph cache buffer.
+        //
+        // GALLOCR/CACHE FIX (root cause of the disabled build_graph_partial "chunk 1 weird"
+        // bug): WAN::CausalConv3d stores its cache slot as a ggml_ext_slice VIEW into this
+        // graph's activations (e.g. wan_vae.hpp `cache_x = ggml_ext_slice(...)`). The old
+        // path did `cache(name, view); ggml_build_forward_expand(gf, view);`. cache() conts
+        // a view INTO A NEW tensor stored in cache_tensor_map, but the loop expanded the
+        // VIEW, so the cont node was never wired into the cgraph and never computed -->
+        // copy_cache_tensors_to_cache_buffer() persisted UNINITIALIZED memory. Chunk 0's
+        // OUTPUT was still correct (it reads no cache), but its STORED cache was garbage, so
+        // chunk 1 (which reads it) came out "weird". The LTX streaming path avoids this by
+        // storing ggml_cont(...) in the cache slot up-front. We fix it at the persist
+        // boundary instead (keeping the committed conv forward byte-identical): cont the
+        // view OURSELVES, then cache AND expand the SAME cont node so it is computed before
+        // the cache copy reads it.
+        void persist_feat_map(ggml_cgraph* gf,
+                              std::vector<ggml_tensor*>& fmap,
+                              const std::function<std::string(size_t)>& name_of) {
+            for (size_t fi = 0; fi < fmap.size(); fi++) {
+                ggml_tensor* fc = fmap[fi];
+                if (fc == nullptr) {
+                    continue;
+                }
+                if (fc->view_src != nullptr || !ggml_is_contiguous(fc)) {
+                    fc = ggml_cont(compute_ctx, fc);
+                }
+                cache(name_of(fi), fc);
+                ggml_build_forward_expand(gf, fc);
+            }
+        }
+
+        ggml_cgraph* build_graph_temporal_decode_chunk(const sd::Tensor<float>& z_chunk, int frame_base) {
+            ggml_cgraph* gf = new_graph_custom(10240 * std::max<int64_t>(1, z_chunk.shape()[2]) + 4096);
+
+            // Reload the decoder's causal cache from the persistent cross-graph buffer
+            // (null on the first chunk -> history-less I-frame, == decode()'s chunk_idx 0).
+            for (size_t fi = 0; fi < ae._feat_map.size(); fi++) {
+                ae._feat_map[fi] = get_cache_tensor_by_name(wan_dec_feat_name(fi));
+            }
+
+            ggml_tensor* z         = make_input(z_chunk);
+            auto runner_ctx        = get_context();
+            g_ext_vae_phase_encode = false;
+            ggml_tensor* out       = ae.decode_chunk(&runner_ctx, z, frame_base);
+
+            persist_feat_map(gf, ae._feat_map, &wan_dec_feat_name);
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        }
+
+        ggml_cgraph* build_graph_temporal_encode_chunk(const sd::Tensor<float>& x_chunk, int group_idx) {
+            ggml_cgraph* gf = new_graph_custom(10240 * std::max<int64_t>(1, x_chunk.shape()[2]) + 4096);
+
+            for (size_t fi = 0; fi < ae._enc_feat_map.size(); fi++) {
+                ae._enc_feat_map[fi] = get_cache_tensor_by_name(wan_enc_feat_name(fi));
+            }
+
+            ggml_tensor* x         = make_input(x_chunk);
+            auto runner_ctx        = get_context();
+            g_ext_vae_phase_encode = true;
+            // encode_partial(): patchify + encoder->forward(group_idx) + conv1 ({1,1,1}) +
+            // channel-chunk -> this group's mu. Carries _enc_feat_map (no clear_cache).
+            ggml_tensor* mu        = ae.encode_partial(&runner_ctx, x, group_idx);
+
+            persist_feat_map(gf, ae._enc_feat_map, &wan_enc_feat_name);
+            ggml_build_forward_expand(gf, mu);
+            return gf;
+        }
+
+        sd::Tensor<float> decode_temporal_streaming(const int n_threads,
+                                                    const sd::Tensor<float>& z,
+                                                    int chunk_frames) {
+            const int64_t total = z.shape()[2];  // latent frames
+            const size_t expected_dim = static_cast<size_t>(z.dim());
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            ae.clear_cache();  // sizes _feat_map to _conv_num nullptrs
+
+            LOG_DEBUG("wan_vae temporal-streaming decode: %lld latent frames, chunk=%d",
+                      (long long)total, chunk_frames);
+
+            sd::Tensor<float> output;
+            for (int64_t start = 0; start < total; start += chunk_frames) {
+                const int64_t end = std::min<int64_t>(total, start + chunk_frames);
+                auto z_chunk      = sd::ops::slice(z, 2, start, end);
+                auto get_graph    = [&]() -> ggml_cgraph* {
+                    return build_graph_temporal_decode_chunk(z_chunk, static_cast<int>(start));
+                };
+                auto chunk = restore_trailing_singleton_dims(
+                    GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                if (chunk.empty()) {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    return {};
+                }
+                output = output.empty() ? std::move(chunk) : sd::ops::concat(output, chunk, 2);
+            }
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            return output;
+        }
+
+        sd::Tensor<float> encode_temporal_streaming(const int n_threads,
+                                                    const sd::Tensor<float>& x) {
+            const int64_t t_pix       = x.shape()[2];  // pixel frames
+            const int64_t iter_       = 1 + (t_pix - 1) / 4;
+            const size_t expected_dim = static_cast<size_t>(x.dim());
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            ae.clear_cache();  // sizes _enc_feat_map to _enc_conv_num nullptrs
+
+            LOG_DEBUG("wan_vae temporal-streaming encode: %lld pixel frames, %lld groups",
+                      (long long)t_pix, (long long)iter_);
+
+            sd::Tensor<float> output;
+            for (int64_t i = 0; i < iter_; i++) {
+                // encode()'s chunking: group 0 = pixel frame [0,1), group i = [1+4(i-1), 1+4i).
+                const int64_t fs = (i == 0) ? 0 : 1 + 4 * (i - 1);
+                const int64_t fe = (i == 0) ? 1 : std::min<int64_t>(t_pix, 1 + 4 * i);
+                auto x_chunk     = sd::ops::slice(x, 2, fs, fe);
+                auto get_graph   = [&]() -> ggml_cgraph* {
+                    return build_graph_temporal_encode_chunk(x_chunk, static_cast<int>(i));
+                };
+                auto mu = restore_trailing_singleton_dims(
+                    GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                if (mu.empty()) {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    return {};
+                }
+                output = output.empty() ? std::move(mu) : sd::ops::concat(output, mu, 2);
+            }
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            return output;
+        }
+
         sd::Tensor<float> _compute(const int n_threads,
                                    const sd::Tensor<float>& z,
                                    bool decode_graph) override {
-            if (true) {
-                sd::Tensor<float> input;
-                if (z.dim() == 4) {
-                    input = z.unsqueeze(2);
-                }
-                auto get_graph = [&]() -> ggml_cgraph* {
-                    if (input.empty()) {
-                        return build_graph(z, decode_graph);
-                    } else {
-                        return build_graph(input, decode_graph);
-                    }
-                };
-                auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true),
-                                                              input.empty() ? z.dim() : input.dim());
-                if (!result.empty() && z.dim() == 4) {
-                    result.squeeze_(2);
-                }
-                return result;
-            } else {  // chunk 1 result is weird
-                ae.clear_cache();
-                int64_t t      = z.shape()[2];
-                int i          = 0;
-                auto get_graph = [&]() -> ggml_cgraph* {
-                    return build_graph_partial(z, decode_graph, i);
-                };
-                auto out_opt = GGMLRunner::compute<float>(get_graph, n_threads, true);
-                if (!out_opt.has_value()) {
-                    return {};
-                }
-                sd::Tensor<float> out = std::move(*out_opt);
-                ae.clear_cache();
-                if (t == 1) {
-                    return out;
-                }
-
-                sd::Tensor<float> output = std::move(out);
-
-                for (i = 1; i < t; i++) {
-                    auto chunk_opt = GGMLRunner::compute<float>(get_graph, n_threads, true);
-                    if (!chunk_opt.has_value()) {
-                        return {};
-                    }
-                    out = std::move(*chunk_opt);
-                    ae.clear_cache();
-                    output = sd::ops::concat(output, out, 2);
-                }
-                free_cache_ctx_and_buffer();
-                return output;
+            sd::Tensor<float> input;
+            if (z.dim() == 4) {
+                input = z.unsqueeze(2);
             }
+            const sd::Tensor<float>& src = input.empty() ? z : input;
+            const size_t out_dim         = src.dim();
+
+            // Temporal streaming (full spatial res, bounded VRAM). Only for genuine video
+            // (more than one frame on the temporal axis); single frames use the plain path.
+            const int chunk = wan_vae_temporal_chunk();
+            LOG_DEBUG("wan_vae _compute %s: z.dim=%zu src.dim=%zu src.shape=[%lld,%lld,%lld,%lld,%lld] chunk=%d",
+                      decode_graph ? "decode" : "encode", (size_t)z.dim(), out_dim,
+                      (long long)(src.dim() > 0 ? src.shape()[0] : -1), (long long)(src.dim() > 1 ? src.shape()[1] : -1),
+                      (long long)(src.dim() > 2 ? src.shape()[2] : -1), (long long)(src.dim() > 3 ? src.shape()[3] : -1),
+                      (long long)(src.dim() > 4 ? src.shape()[4] : -1), chunk);
+            if (chunk >= 1 && src.dim() == 5 && src.shape()[2] > 1) {
+                sd::Tensor<float> result = decode_graph
+                                               ? decode_temporal_streaming(n_threads, src, chunk)
+                                               : encode_temporal_streaming(n_threads, src);
+                if (!result.empty()) {
+                    result = restore_trailing_singleton_dims(std::move(result), out_dim);
+                    if (z.dim() == 4) {
+                        result.squeeze_(2);
+                    }
+                    return result;
+                }
+                LOG_WARN("wan_vae temporal streaming produced no output; falling back to full-frame path");
+            }
+
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(src, decode_graph);
+            };
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true),
+                                                          out_dim);
+            if (!result.empty() && z.dim() == 4) {
+                result.squeeze_(2);
+            }
+            return result;
         }
 
         void test() {
