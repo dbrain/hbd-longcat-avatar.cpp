@@ -2916,7 +2916,22 @@ public:
     }
 
     sd::Tensor<float> encode_to_vae_latents(const sd::Tensor<float>& x) {
-        auto latents = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
+        // Decode can run full-spatial (1x1, temporal-streamed) but the encode's 4-pixel-frame
+        // temporal groups overrun both conv paths at full spatial (cuDNN CONV_3D 2^31-element
+        // limit / im2col IC*27 OOM). LONGCAT_VAE_ENCODE_REL_TILE=R (0<R<1) spatially tiles the
+        // ENCODE only (e.g. 0.5 -> 0.5x0.5) while decode keeps its own (1x1) vae_tiling_params.
+        sd_tiling_params_t enc_tp = vae_tiling_params;
+        if (const char* s = getenv("LONGCAT_VAE_ENCODE_REL_TILE")) {
+            float r = atof(s);
+            if (r > 0.f && r < 1.f) {
+                enc_tp.enabled    = true;
+                enc_tp.tile_size_x = 0;
+                enc_tp.tile_size_y = 0;
+                enc_tp.rel_size_x = r;
+                enc_tp.rel_size_y = r;
+            }
+        }
+        auto latents = first_stage_model->encode(n_threads, x, enc_tp, circular_x, circular_y);
         if (latents.empty()) {
             return {};
         }

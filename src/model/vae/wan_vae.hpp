@@ -1628,7 +1628,12 @@ namespace WAN {
                       (long long)(src.dim() > 0 ? src.shape()[0] : -1), (long long)(src.dim() > 1 ? src.shape()[1] : -1),
                       (long long)(src.dim() > 2 ? src.shape()[2] : -1), (long long)(src.dim() > 3 ? src.shape()[3] : -1),
                       (long long)(src.dim() > 4 ? src.shape()[4] : -1), chunk);
-            if (chunk >= 1 && src.dim() == 5 && src.shape()[2] > 1) {
+            // Temporal streaming applies to DECODE only (mirrors LTX decode_tiled window=1):
+            // the output decode is where 1x1 buys zero seams + the ~30s win. The ENCODE's
+            // 4-pixel-frame groups blow up at full spatial (cuDNN 2^31 conv / im2col IC*27),
+            // so encode stays on the spatial-tiled path (a smaller encode tile via
+            // LONGCAT_VAE_ENCODE_REL_TILE in encode_to_vae_latents).
+            if (chunk >= 1 && decode_graph && src.dim() == 5 && src.shape()[2] > 1) {
                 sd::Tensor<float> result = decode_graph
                                                ? decode_temporal_streaming(n_threads, src, chunk)
                                                : encode_temporal_streaming(n_threads, src);
