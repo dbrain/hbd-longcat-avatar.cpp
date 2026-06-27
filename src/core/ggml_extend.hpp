@@ -1513,7 +1513,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (kv_scale != 1.0f) {
                 k_in = ggml_ext_scale(ctx, k_in, kv_scale);
             }
-            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+            // Skip a redundant F16->F16 re-cast: ggml_cast never short-circuits on a
+            // matching type (ggml.c: it unconditionally emits a CPY node), so when the
+            // caller already feeds F16 K (the *_DIT_F16 / NVFP4 stream, whose Linears
+            // emit F16 and whose RoPE output is F16-or-F32-cast → here K is a contiguous
+            // F16 after the scale, which preserves type) this would launch a full-width
+            // F16 copy of K every attention call for no value. F32 K (the default prod
+            // stream) still casts F32->F16 as before, so that path is byte-identical.
+            if (k_in->type != GGML_TYPE_F16) {
+                k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+            }
         }
 
         v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
@@ -1525,7 +1534,14 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (kv_scale != 1.0f) {
                 v_in = ggml_ext_scale(ctx, v_in, kv_scale);
             }
-            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+            // Same redundant-cast guard as K above. v_in is contiguous here (the
+            // ggml_ext_cont(permute) two lines up), so an already-F16 v_in stays a
+            // contiguous F16 that flash accepts directly; skipping the no-op F16->F16
+            // CPY removes a full-width V copy per call on the F16/NVFP4 stream. F32 v_in
+            // (default) still casts → byte-identical prod path.
+            if (v_in->type != GGML_TYPE_F16) {
+                v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+            }
         }
         // else: v_in is already F16 — the permute+cont above stays on F16 (same compute,
         // different element type). The flash kernel accepts F16 K/V directly.
