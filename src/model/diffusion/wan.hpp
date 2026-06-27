@@ -142,7 +142,11 @@ namespace WAN {
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
 
-            x = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
+            // flash_skip_kv_pad when there's no real mask: the legacy L_k->256 pad otherwise
+            // synthesizes a [L_k_pad x L_q] -inf mask (O(n_token^2): ~22 GB at 1280x704x81),
+            // which the modern CUDA flash kernel doesn't need (it handles unpadded L_k).
+            x = Rope::attention(ctx, q, k, v, pe, mask, /*kv_scale=*/1.0f, /*rope_interleaved=*/true,
+                                /*flash_attn=*/true, /*flash_skip_kv_pad=*/mask == nullptr);  // [N, n_token, dim]
 
             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
             return x;
