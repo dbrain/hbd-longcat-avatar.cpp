@@ -16,6 +16,28 @@ namespace WAN {
 
     constexpr int CACHE_T = 2;
 
+    // WAN_VAE_F16 (default OFF; F32 byte-identical when unset): run the VAE DECODE activation
+    // stream in F16. The Wan VAE weights are already F16; only the activations were F32. Two
+    // payoffs: (1) it halves the chunk-1+ temporal-streaming peak (the 4x temporal upsample's
+    // ~14GB F32 intermediate -> ~7GB) so 1x1 zero-seam decode fits <=11.5GB, and (2) less HBM
+    // traffic = a faster VAE decode. Mirrors WAN_DIT_F16 (wan.hpp): cast the residual stream
+    // to F16 at the decode entry, back to F32 before the output, with F32 islands only where
+    // an op's ggml dtype would force a re-widen or an unsafe mixed-dtype op:
+    //   * CausalConv3d (cuDNN): F16-native — conv3d-cudnn.cu accepts F16 src/dst, ggml.c
+    //     ggml_conv_3d_direct emits an F16 result for an F16 input (the heavy conv-boundary
+    //     activations, incl. the temporal-upsample intermediate, are the win).
+    //   * RMS_norm / SiLU / upscale / pad / concat / residual-add: F16-native (supports_op).
+    //   * Conv2d (im2col + ggml_mul_mat): mul_mat hardcodes an F32 dst, so 1x1/3x3 convs
+    //     (attention to_qkv/proj, resample.1) emit F32 — cast back to F16 right after.
+    //   * AttentionBlock (middle/bottleneck, small): a whole-block F32 island (cast in/out)
+    //     so its F32 Conv2d outputs and the `add(proj, identity)` never form the unsafe
+    //     binbcast combo add(F32 src0, F16 src1); attention numerics stay exactly as prod.
+    // Encode is untouched (stays F32, spatially tiled).
+    inline bool wan_vae_f16_enabled() {
+        static const bool on = (std::getenv("WAN_VAE_F16") != nullptr);
+        return on;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -162,6 +184,13 @@ namespace WAN {
             int64_t h = x->ne[1];
             int64_t w = x->ne[0];
 
+            // WAN_VAE_F16 (decode/upsample): the heavy ops here (time_conv CausalConv3d, the
+            // 2x spatial ggml_upscale, the temporal-doubling cont) stay F16; only resample.1
+            // (Conv2d -> ggml_mul_mat) re-widens to F32. Remember the stream dtype so we can
+            // restore F16 before returning (the caller's residual add(x, shortcut) needs both
+            // operands F16). No-op on the F32 encode/downsample path.
+            const bool stream_f16 = (x->type == GGML_TYPE_F16);
+
             if (mode == "upsample3d") {
                 if (feat_cache.size() > 0) {
                     int idx = feat_idx;
@@ -210,6 +239,14 @@ namespace WAN {
                 } else if (mode == "downsample3d") {
                     x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
                 }
+                // WAN_VAE_F16 F32 island for resample.1 (Conv2d): ggml im2col asserts an F32
+                // src1 (im2col.cu:87) and ggml_mul_mat emits F32, so cast the conv input to
+                // F32 here. The output is restored to F16 by the cast at the function tail.
+                // (The heavy temporal-upsample tensors above — time_conv + the doubling cont —
+                // already ran F16; this island only widens the spatial conv input.)
+                if (stream_f16 && x->type == GGML_TYPE_F16) {
+                    x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+                }
                 x = resample_1->forward(ctx, x);
                 x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
             }
@@ -235,6 +272,10 @@ namespace WAN {
                 }
             }
 
+            // Restore the F16 residual stream (resample.1 emitted F32 via mul_mat).
+            if (stream_f16 && x->type != GGML_TYPE_F16) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
             return x;
         }
     };
@@ -547,6 +588,15 @@ namespace WAN {
             auto to_qkv = std::dynamic_pointer_cast<Conv2d>(blocks["to_qkv"]);
             auto proj   = std::dynamic_pointer_cast<Conv2d>(blocks["proj"]);
 
+            // WAN_VAE_F16: whole-block F32 island. The block sits at the decoder bottleneck
+            // (smallest spatial res -> cheap) and its Conv2d (to_qkv/proj) emit F32 anyway, so
+            // running it in F32 keeps attention numerics exactly as prod AND avoids the unsafe
+            // add(F32 proj-out, F16 identity) mixed-dtype broadcast. Cast back to F16 on exit.
+            const bool island_f32 = (x->type == GGML_TYPE_F16);
+            if (island_f32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+
             auto identity = x;
 
             x = norm->forward(ctx, x);
@@ -583,6 +633,10 @@ namespace WAN {
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
 
             x = ggml_add(ctx->ggml_ctx, x, identity);
+            // Restore the F16 residual stream for the next decoder block.
+            if (island_f32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
             return x;
         }
     };
@@ -1075,6 +1129,14 @@ namespace WAN {
             auto decoder = std::dynamic_pointer_cast<Decoder3d>(blocks["decoder"]);
             auto conv2   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
 
+            // WAN_VAE_F16: cast the latent to F16 at the decode entry so the whole decoder
+            // activation stream runs F16 (conv2 onward); the unpatchified output is cast back
+            // to F32 below. Default (gate off): z stays F32, byte-identical.
+            const bool dec_f16 = wan_vae_f16_enabled();
+            if (dec_f16 && z->type == GGML_TYPE_F32) {
+                z = ggml_cast(ctx->ggml_ctx, z, GGML_TYPE_F16);
+            }
+
             int64_t iter_ = z->ne[2];
             auto x        = conv2->forward(ctx, z);
             // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.decode.prelude", "x");
@@ -1092,6 +1154,10 @@ namespace WAN {
             }
             if (wan2_2) {
                 out = unpatchify(ctx->ggml_ctx, out, 2, b);
+            }
+            // WAN_VAE_F16: bring the decoded pixels back to F32 for the host read-back.
+            if (dec_f16 && out->type != GGML_TYPE_F32) {
+                out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32);
             }
             // sd::ggml_graph_cut::mark_graph_cut(out, "wan_vae.decode.final", "out");
             clear_cache();
@@ -1143,6 +1209,14 @@ namespace WAN {
             auto decoder = std::dynamic_pointer_cast<Decoder3d>(blocks["decoder"]);
             auto conv2   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
 
+            // WAN_VAE_F16: F16 activation stream for this chunk. The cross-graph causal cache
+            // (_feat_map, persisted by persist_feat_map) is then F16 too — consistent across
+            // chunks since every chunk reloads & feeds it back in the same F16 dtype.
+            const bool dec_f16 = wan_vae_f16_enabled();
+            if (dec_f16 && z->type == GGML_TYPE_F32) {
+                z = ggml_cast(ctx->ggml_ctx, z, GGML_TYPE_F16);
+            }
+
             auto x          = conv2->forward(ctx, z);  // {1,1,1} pointwise -> per-frame independent
             int64_t n_chunk = x->ne[2];
             ggml_tensor* out = nullptr;
@@ -1155,6 +1229,10 @@ namespace WAN {
             }
             if (wan2_2) {
                 out = unpatchify(ctx->ggml_ctx, out, 2, b);
+            }
+            // WAN_VAE_F16: back to F32 for host read-back / output concat.
+            if (dec_f16 && out->type != GGML_TYPE_F32) {
+                out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32);
             }
             return out;
         }
