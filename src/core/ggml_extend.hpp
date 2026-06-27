@@ -1265,6 +1265,20 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
 // x: [N, IC, IH, IW]
 // b: [OC,]
 // result: [N*OC, OD, OH, OW]
+// VAE conv-phase hint (set by the VAE runner's build_graph). Lets GGML_CUDNN_CONV3D
+// be scoped to a single phase: the cuDNN implicit-GEMM 3D conv is ~7x lighter on VRAM
+// (no im2col IC*27 blowup) but ~2.7x slower per tile on Wan's conv shapes, so the win is
+// encode-only (short, sets the peak) while decode stays on the fast im2col path.
+inline thread_local bool g_ext_vae_phase_encode = false;
+__STATIC_INLINE__ bool ext_cudnn_conv3d_active() {
+    const char* e = getenv("GGML_CUDNN_CONV3D");
+    if (e == nullptr) { e = getenv("GGML_CUDNN_CONV"); }
+    if (e == nullptr) { return false; }
+    if (strcmp(e, "encode") == 0) { return g_ext_vae_phase_encode; }
+    if (strcmp(e, "decode") == 0) { return !g_ext_vae_phase_encode; }
+    return atoi(e) != 0;  // "1"/any-nonzero = both phases (legacy)
+}
+
 __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                                                 ggml_tensor* x,
                                                 ggml_tensor* w,
@@ -1294,7 +1308,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         x          = ggml_reshape_4d(ctx, x, im2col->ne[1] * im2col->ne[2], OD, N, OC);
         x          = ggml_cont(ctx, ggml_permute(ctx, x, 0, 1, 3, 2));
         x          = ggml_reshape_4d(ctx, x, im2col->ne[1], im2col->ne[2], OD, OC * N);
-    } else if ((getenv("GGML_CUDNN_CONV3D") || getenv("GGML_CUDNN_CONV")) &&
+    } else if (ext_cudnn_conv3d_active() &&
                s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1) {
         // Route to the single-op ggml_conv_3d_direct (GGML_OP_CONV_3D) so the env-gated
         // cuDNN implicit-GEMM 3D conv (ggml-cuda/conv3d-cudnn.cu) can take it on Blackwell,

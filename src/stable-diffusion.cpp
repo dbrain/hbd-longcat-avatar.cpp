@@ -1040,10 +1040,22 @@ public:
                 get_param_tensors_p(audio_vae_model, vae_mmap, "");
             }
 
-            // GGML_CUDNN_CONV=1 routes VAE convs through GGML_OP_CONV_2D so the
+            // GGML_CUDNN_CONV=1 routes VAE 2D convs through GGML_OP_CONV_2D so the
             // env-gated cuDNN implicit-GEMM conv path in ggml-cuda intercepts them
             // (replacing the heavy im2col+GEMM VAE decode convs).
-            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV") || getenv("GGML_CUDNN_CONV3D")) {
+            //
+            // Do NOT enable conv2d-direct for GGML_CUDNN_CONV3D alone. That env scopes cuDNN
+            // to the *3D* convs (the im2col_3d IC*27 VRAM blowup); the 2D convs (3x3 resample +
+            // 1x1 attention qkv/proj) must stay on the fast im2col+GEMM (tensor-core) path.
+            // Forcing them to GGML_OP_CONV_2D here, while the cuDNN-conv2d interceptor only
+            // activates for GGML_CUDNN_CONV (conv2d-cudnn.cu), dropped every 2D conv onto the
+            // naive spatial conv2d_kernel (conv2d.cu) -> 2.7x slower VAE decode (the naive
+            // kernel was ~59% of GPU time; the 1x1 pointwise convs are matmuls and suffer most).
+            // With direct off these 2D convs go ggml_conv_2d -> IM2COL + MUL_MAT = the validated
+            // baseline path (zero conv2d_kernel), while 3D convs still take cuDNN (low VRAM).
+            // (vae_conv_direct + GGML_CUDNN_CONV3D is honored: conv2d-cudnn now intercepts both
+            // envs, so that explicit combo gets the cuDNN 2D path rather than the naive kernel.)
+            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV")) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {

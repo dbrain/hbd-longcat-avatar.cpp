@@ -1301,6 +1301,11 @@ namespace WAN {
 
             auto runner_ctx = get_context();
 
+            // Tell ggml_ext_conv_3d which VAE phase this graph is, so GGML_CUDNN_CONV3D=encode
+            // routes only the encode's CausalConv3d to the low-VRAM cuDNN direct conv (the
+            // encode sets the peak) while the decode stays on the fast im2col path.
+            g_ext_vae_phase_encode = !decode_graph;
+
             ggml_tensor* out = decode_graph ? ae.decode(&runner_ctx, z) : ae.encode(&runner_ctx, z);
 
             ggml_build_forward_expand(gf, out);
