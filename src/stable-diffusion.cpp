@@ -1331,11 +1331,26 @@ public:
         // not the untruncated map key). The FP4 cuBLASLt GEMM then folds the global into alpha
         // (alpha = A_global * W_global). A legacy folded gguf has no .wglobal -> map empty ->
         // nothing registered -> GEMM multiplier defaults to 1.0 (byte-identical legacy path).
-        if (strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) > 0) {
-            std::map<std::string, float> wglobals;
-            load_nvfp4_weight_globals(sd_ctx_params->diffusion_model_path, wglobals);
-            if (!wglobals.empty()) {
-                const std::string pfx = "model.diffusion_model.";
+        // MoE models (e.g. Wan2.2) load TWO DiT ggufs, each under its own runtime prefix:
+        // the low-noise expert (--diffusion-model) as "model.diffusion_model." and the
+        // high-noise expert (--high-noise-diffusion-model) as "model.high_noise_diffusion_model.".
+        // Register each gguf's wglobals against its own prefix — registering only the low
+        // expert leaves the high expert's weights with w_global=1.0 (~1e4x too large -> NaN/wash).
+        {
+            const std::pair<const char*, std::string> dit_legs[] = {
+                {SAFE_STR(sd_ctx_params->diffusion_model_path),            "model.diffusion_model."},
+                {SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path), "model.high_noise_diffusion_model."},
+            };
+            for (const auto& leg : dit_legs) {
+                if (strlen(leg.first) == 0) {
+                    continue;
+                }
+                std::map<std::string, float> wglobals;
+                load_nvfp4_weight_globals(leg.first, wglobals);
+                if (wglobals.empty()) {
+                    continue;
+                }
+                const std::string& pfx = leg.second;
                 size_t n_reg = 0;
                 for (auto& kv : tensors) {
                     const std::string& full = kv.first;
@@ -1349,7 +1364,8 @@ public:
                         ++n_reg;
                     }
                 }
-                LOG_INFO("nvfp4: registered %zu/%zu weight globals (unfolded import)", n_reg, wglobals.size());
+                LOG_INFO("nvfp4: registered %zu/%zu weight globals (unfolded import) for %s",
+                         n_reg, wglobals.size(), pfx.c_str());
             }
         }
 
