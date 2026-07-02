@@ -948,9 +948,13 @@ namespace Rope {
         // per-segment gallocr view-output bug that lap-18 worked around by forcing
         // chain-RoPE on offload is fixed in ggml-alloc). See
         // GGMLRunnerContext::allow_fused_rope + PERF.md lap 20.
+        // x may be F32 (default) or F16 (the *_DIT_F16 stream feeds F16 q/k so the
+        // fused kernel emits F16 directly — no F32 rope tensors materialized; the
+        // F16 kernel computes the rotation in F32 and rounds the store to F16, which
+        // is bit-identical to F32-rope-then-cast-to-F16 that the F16 path did anyway).
         if (allow_fused && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
-            x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
+            (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) && pe->type == GGML_TYPE_F32 &&
             getenv("LONGCAT_NO_FUSED_ROPE") == nullptr) {
             // Fused RoPE op: one CUDA kernel reads x + pe and writes the rotated
             // output, with NO cont+permute+repeat intermediates. The non-interleaved
