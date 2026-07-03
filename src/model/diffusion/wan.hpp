@@ -283,21 +283,52 @@ namespace WAN {
 
             ggml_tensor* k_all = k_roped;
             ggml_tensor* v_all = v_flat;
-            // Lever 1 (S2V): the host rolling/cond caches are F16. Cast back to F32
-            // (lossless) before concat so the in-graph attention math is unchanged.
-            // ggml_concat requires matching dtypes; k_roped/v_flat are F32.
-            auto to_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
-                return (t != nullptr && t->type != GGML_TYPE_F32)
-                           ? ggml_cast(ctx->ggml_ctx, t, GGML_TYPE_F32)
-                           : t;
-            };
-            if (prev_kc != nullptr) {
-                k_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_kc), k_all, 1);
-                v_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_vc), v_all, 1);
-            }
-            if (cond_kc != nullptr) {
-                k_all = ggml_concat(ctx->ggml_ctx, k_all, to_f32(cond_kc), 1);
-                v_all = ggml_concat(ctx->ggml_ctx, v_all, to_f32(cond_vc), 1);
+            // PERF (shotstream floor deep-dive) — CONCAT IN F16, not F32.
+            // The prev/cond caches are ALREADY F16 (host make_input tensors or the resident
+            // chunk buffers). The legacy path cast the WHOLE growing cache F16->F32 (`to_f32`),
+            // concatenated in F32, then build_kqv cast the whole k_all/v_all F32->F16 for the
+            // flash kernel — i.e. the entire [prev++cur++cond] cache round-tripped F16->F32->F16
+            // EVERY forward (nsys: convert_unary<half,float> ~5k launches + an F32 concat at 2x
+            // the bytes). Instead cast only the NEW chunk (small, L_blk tokens) F32->F16 and
+            // concat in F16; the cache tensors stay their exact F16 bytes (no conversion), and
+            // build_kqv's redundant-cast guard then feeds the F16 K/V straight to flash (no
+            // F32->F16 of the whole cache). BYTE-IDENTICAL: the flash kernel already consumed
+            // F16 K/V; the new chunk still gets exactly one F32->F16 rounding (previously
+            // F32->F32(concat)->F16, same result); cached tokens were F16 and stay bit-for-bit.
+            // Halves the concat traffic + the cache's per-forward compute-buffer footprint.
+            // Env opt-out SHOTSTREAM_KV_F32_CONCAT=1 restores the legacy F32 concat for A/B.
+            static const bool ss_f32_concat = (std::getenv("SHOTSTREAM_KV_F32_CONCAT") != nullptr);
+            if (!ss_f32_concat && (prev_kc != nullptr || cond_kc != nullptr)) {
+                auto to_f16 = [&](ggml_tensor* t) -> ggml_tensor* {
+                    return (t != nullptr && t->type != GGML_TYPE_F16)
+                               ? ggml_cast(ctx->ggml_ctx, t, GGML_TYPE_F16)
+                               : t;
+                };
+                k_all = ggml_cast(ctx->ggml_ctx, k_roped, GGML_TYPE_F16);
+                v_all = ggml_cast(ctx->ggml_ctx, v_flat, GGML_TYPE_F16);
+                if (prev_kc != nullptr) {
+                    k_all = ggml_concat(ctx->ggml_ctx, to_f16(prev_kc), k_all, 1);
+                    v_all = ggml_concat(ctx->ggml_ctx, to_f16(prev_vc), v_all, 1);
+                }
+                if (cond_kc != nullptr) {
+                    k_all = ggml_concat(ctx->ggml_ctx, k_all, to_f16(cond_kc), 1);
+                    v_all = ggml_concat(ctx->ggml_ctx, v_all, to_f16(cond_vc), 1);
+                }
+            } else {
+                // Legacy F32 concat (opt-out, or the no-cache first forward where k_all stays F32).
+                auto to_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
+                    return (t != nullptr && t->type != GGML_TYPE_F32)
+                               ? ggml_cast(ctx->ggml_ctx, t, GGML_TYPE_F32)
+                               : t;
+                };
+                if (prev_kc != nullptr) {
+                    k_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_kc), k_all, 1);
+                    v_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_vc), v_all, 1);
+                }
+                if (cond_kc != nullptr) {
+                    k_all = ggml_concat(ctx->ggml_ctx, k_all, to_f32(cond_kc), 1);
+                    v_all = ggml_concat(ctx->ggml_ctx, v_all, to_f32(cond_vc), 1);
+                }
             }
             int64_t L_k = k_all->ne[1];
 
@@ -310,13 +341,24 @@ namespace WAN {
             // peak (measured 5.5 GB), which blocks keeping the Q4_K weights resident
             // on the 12 GB card. FA streams the scores so the buffer drops to a few
             // hundred MB. No causal mask: each block attends ALL cached keys (full
-            // attention over the rolling cache), so mask=nullptr is correct. The
-            // wrapper pads L_k->256 internally. Gated by the runner's flash flag so
-            // S2V_NO_FLASH=1 still selects the exact (FA-off) path for A/B.
+            // attention over the rolling cache), so mask=nullptr is correct. Gated by
+            // the runner's flash flag so S2V_NO_FLASH=1 still selects the FA-off path.
+            //
+            // PERF (shotstream floor deep-dive): pass flash_skip_kv_pad=true (matches the
+            // bidirectional WanSelfAttention::forward, which already does this). Without it
+            // the wrapper pads L_k->256-multiple AND synthesizes a [L_k_pad x L_q] -inf F16
+            // mask on EVERY self-attn call (nsys: pad_f32 + a ~220 MB mask tensor + its cast,
+            // ~30 blocks x every forward) — pure waste, since the modern MMA/WMMA flash kernel
+            // handles an unpadded L_k with no mask (the bidirectional path proves it). Result
+            // is numerically identical (padded keys had a -inf mask => 0 softmax weight anyway).
+            // Env opt-out SHOTSTREAM_KV_PAD=1 restores the legacy pad+mask path for A/B.
+            static const bool ss_kv_pad = (std::getenv("SHOTSTREAM_KV_PAD") != nullptr);
             auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend,
                                                q_roped, k_all, vv, num_heads, nullptr,
                                                /*skip_reshape=*/true,
-                                               /*flash_attn=*/ctx->flash_attn_enabled);  // [1, L_blk, dim]
+                                               /*flash_attn=*/ctx->flash_attn_enabled,
+                                               /*kv_scale=*/1.0f,
+                                               /*flash_skip_kv_pad=*/!ss_kv_pad);  // [1, L_blk, dim]
             attn = o_proj->forward(ctx, attn);
             return attn;
         }
@@ -628,6 +670,73 @@ namespace WAN {
             x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
 
             return x;
+        }
+
+        // ShotStream causal block forward. Identical to forward() except the self-attn
+        // is routed through WanSelfAttention::forward_kv_cache so this chunk attends over
+        // [prev_local_KV ++ this_chunk_KV ++ context_KV] (dual-cache streaming). The
+        // block's freshly-computed RoPE'd K + raw V are exported via new_kc/new_vc so the
+        // host runner can persist them into the rolling local cache. prev_*/cond_* may be
+        // null (empty caches = single 3-frame chunk with no history = bidirectional over
+        // its own 4680 tokens, structurally causal by cache contents).
+        //   e is per-chunk [N,6,dim] (3 latent frames share one timestep) → es[*] are
+        //   [dim,1,1] and the modulate_* broadcast over all L_blk tokens (a no-op T path).
+        ggml_tensor* forward_causal(GGMLRunnerContext* ctx,
+                                    ggml_tensor* x,        // [1, L_blk, dim]
+                                    ggml_tensor* e,        // [N,6,dim] modulation (pre-modulation-add)
+                                    ggml_tensor* pe,       // RoPE for L_blk tokens (this chunk)
+                                    ggml_tensor* context,  // text [N, ctx, dim]
+                                    ggml_tensor* prev_kc,  // [d_head, L_prev, n_head] or null (local cache)
+                                    ggml_tensor* prev_vc,
+                                    ggml_tensor* cond_kc,  // [d_head, L_ctx, n_head] or null (global cache)
+                                    ggml_tensor* cond_vc,
+                                    ggml_tensor*& new_kc,  // OUT: this chunk's RoPE'd K
+                                    ggml_tensor*& new_vc,  // OUT: this chunk's raw V
+                                    int64_t context_img_len = 0) {
+            auto modulation = params["modulation"];
+            e               = ggml_add(ctx->ggml_ctx, e, modulation);  // [N,6,dim]
+            auto es         = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);
+
+            auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+            auto self_attn  = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            auto norm3      = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm3"]);
+            auto cross_attn = std::dynamic_pointer_cast<WanCrossAttention>(blocks["cross_attn"]);
+            auto norm2      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm2"]);
+            auto ffn_0      = std::dynamic_pointer_cast<Linear>(blocks["ffn.0"]);
+            auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
+
+            // self-attention (causal, dual-KV-cache)
+            auto y = norm1->forward(ctx, x);
+            y      = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[1]));
+            y      = modulate_add(ctx->ggml_ctx, y, es[0]);
+            y      = self_attn->forward_kv_cache(ctx, y, pe, prev_kc, prev_vc, cond_kc, cond_vc, new_kc, new_vc);
+            x      = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[2]));
+
+            // cross-attention (text; each chunk's frames attend their shot's caption)
+            x = ggml_add(ctx->ggml_ctx, x,
+                         cross_attn->forward(ctx, norm3->forward(ctx, x), context, context_img_len));
+
+            // ffn
+            y = norm2->forward(ctx, x);
+            y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
+            y = modulate_add(ctx->ggml_ctx, y, es[3]);
+            y = ffn_0->forward(ctx, y);
+            y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
+            y = ffn_2->forward(ctx, y);
+            x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
+
+            return x;
+        }
+
+        // Parity probe (ShotStream block-0 oracle): run ONLY the causal self-attn sub-op on
+        // a caller-supplied [1,L_blk,dim] input (standing in for the modulated normed hidden
+        // state, exactly like the torch oracle's block0_selfattn_input), with empty caches.
+        // Reuses the production forward_kv_cache verbatim; exports this chunk's RoPE'd K + raw
+        // V for the block0_roped_k / block0_v goldens. Returns block0_selfattn_out (post-o).
+        ggml_tensor* selfattn_only(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe,
+                                   ggml_tensor*& new_kc, ggml_tensor*& new_vc) {
+            auto self_attn = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            return self_attn->forward_kv_cache(ctx, x, pe, nullptr, nullptr, nullptr, nullptr, new_kc, new_vc);
         }
     };
 
@@ -1247,6 +1356,119 @@ namespace WAN {
             dump_plane(x, "head", "wan.dumpblocks.head");
 
             return x;
+        }
+
+        // ------------------------------------------------------------------
+        // ShotStream CAUSAL block forward. Runs ONE chunk (nfb latent frames) of the
+        // streaming AR loop: patch-embed → time/text embed → 30 causal blocks (each
+        // threading the per-layer local + global KV caches) → head → unpatchify. All
+        // 3 latent frames of a chunk share one timestep, so the modulation is the plain
+        // [N,6,dim] broadcast (no per-frame path). The self-attn of each block attends
+        // over [prev_local ++ this_chunk ++ context] and exports its fresh RoPE'd K + raw
+        // V into new_kc/new_vc for the host rolling cache.
+        //   x_chunk:  [W, H, nfb, in_dim]  (latent; patch t=1 ⇒ t_len=nfb)
+        //   timestep: [1] scalar (the warped DMD t, or 0 for the clean rewrite / context)
+        //   context:  [text_dim, text_len, N]
+        //   pe_block: RoPE table for this chunk's L_blk = nfb*h_len*w_len tokens
+        // Returns velocity/flow [W, H, nfb, out_dim] (the sampler converts to x0).
+        ggml_tensor* forward_causal_block(GGMLRunnerContext* ctx,
+                                          ggml_tensor* x_chunk,
+                                          ggml_tensor* timestep,
+                                          ggml_tensor* context,
+                                          ggml_tensor* pe_block,
+                                          const std::vector<ggml_tensor*>& prev_kc,
+                                          const std::vector<ggml_tensor*>& prev_vc,
+                                          const std::vector<ggml_tensor*>& cond_kc,
+                                          const std::vector<ggml_tensor*>& cond_vc,
+                                          std::vector<ggml_tensor*>& new_kc,
+                                          std::vector<ggml_tensor*>& new_vc) {
+            const int64_t N = 1;
+            auto patch_embedding  = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding"]);
+            auto text_embedding_0 = std::dynamic_pointer_cast<Linear>(blocks["text_embedding.0"]);
+            auto text_embedding_2 = std::dynamic_pointer_cast<Linear>(blocks["text_embedding.2"]);
+            auto time_embedding_0 = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.0"]);
+            auto time_embedding_2 = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.2"]);
+            auto time_projection_1 = std::dynamic_pointer_cast<Linear>(blocks["time_projection.1"]);
+            auto head             = std::dynamic_pointer_cast<Head>(blocks["head"]);
+
+            int64_t T = x_chunk->ne[2], H = x_chunk->ne[1], W = x_chunk->ne[0];
+            int64_t t_len = ((T + (std::get<0>(config.patch_size) / 2)) / std::get<0>(config.patch_size));
+            int64_t h_len = ((H + (std::get<1>(config.patch_size) / 2)) / std::get<1>(config.patch_size));
+            int64_t w_len = ((W + (std::get<2>(config.patch_size) / 2)) / std::get<2>(config.patch_size));
+
+            // patch_embedding → [1, L_blk, dim]
+            auto x = patch_embedding->forward(ctx, x_chunk);                                          // [W_l,H_l,t_len,dim]
+            x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);   // [N, dim, L_blk]
+            x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));   // [N, L_blk, dim]
+
+            // WAN_DIT_F16 (default OFF, byte-identical when unset): run the causal residual
+            // stream in F16 to halve the per-block glue/copy/cast HBM traffic (the binbcast
+            // residual adds, the AdaLN modulate muls, the FFN activations) — the same lever
+            // as forward() line ~995, replicated here because the causal path is a separate
+            // method. NB: GGML_CUDNN_ATTN_F16_OUT must stay OFF on this path — the KV-cache
+            // self-attn uses the native ggml FA2 kernel (fattn-common.cuh), which asserts an
+            // F32 KQV output; only forward()'s cuDNN attention accepts the F16-out retype.
+            // Under WAN_DIT_F16 the block's q/k are still upcast to F32 for the fused RoPE
+            // (unless WAN_ROPE_F16), and the F32 attn output re-enters the F16 stream via
+            // o_proj (F16 dst). Cast back to F32 before the head below so the sampler/VAE
+            // path is unchanged.
+            static const bool ss_dit_f16 = (std::getenv("WAN_DIT_F16") != nullptr);
+            if (ss_dit_f16 && x->type == GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
+
+            // time embedding (scalar t → single modulation broadcast over all tokens)
+            auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
+            e      = time_embedding_0->forward(ctx, e);
+            e      = ggml_silu_inplace(ctx->ggml_ctx, e);
+            e      = time_embedding_2->forward(ctx, e);  // [N, dim]
+
+            auto e0 = ggml_silu(ctx->ggml_ctx, e);
+            e0      = time_projection_1->forward(ctx, e0);
+            e0      = ggml_reshape_4d(ctx->ggml_ctx, e0, e0->ne[0] / 6, 6, e0->ne[1], e0->ne[2]);  // [N,6,dim]
+
+            context = text_embedding_0->forward(ctx, context);
+            context = ggml_ext_gelu(ctx->ggml_ctx, context);
+            context = text_embedding_2->forward(ctx, context);  // [N, text_len, dim]
+
+            sd::ggml_graph_cut::mark_graph_cut(x, "shotstream.prelude", "x");
+            sd::ggml_graph_cut::mark_graph_cut(e0, "shotstream.prelude", "e0");
+            sd::ggml_graph_cut::mark_graph_cut(context, "shotstream.prelude", "ctx");
+            if (pe_block) sd::ggml_graph_cut::mark_graph_cut(pe_block, "shotstream.prelude", "pe");
+
+            new_kc.assign(config.num_layers, nullptr);
+            new_vc.assign(config.num_layers, nullptr);
+            for (int i = 0; i < config.num_layers; i++) {
+                auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
+                ggml_tensor* nkc = nullptr;
+                ggml_tensor* nvc = nullptr;
+                x = block->forward_causal(ctx, x, e0, pe_block, context,
+                                          prev_kc.empty() ? nullptr : prev_kc[i],
+                                          prev_vc.empty() ? nullptr : prev_vc[i],
+                                          cond_kc.empty() ? nullptr : cond_kc[i],
+                                          cond_vc.empty() ? nullptr : cond_vc[i],
+                                          nkc, nvc);
+                new_kc[i] = nkc;
+                new_vc[i] = nvc;
+                sd::ggml_graph_cut::mark_graph_cut(x, "shotstream.blocks." + std::to_string(i) + ".out", "x");
+            }
+
+            // WAN_DIT_F16: bring the residual stream back to F32 before the head so the
+            // head Linear + unpatchify + flow output run exactly as prod (F32 output).
+            if (ss_dit_f16 && x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+            auto out = head->forward(ctx, x, e);  // [N, L_blk, pt*ph*pw*out_dim]
+            out = unpatchify(ctx->ggml_ctx, out, t_len, h_len, w_len);  // [N*out_dim, t_len, H, W]
+            return out;
+        }
+
+        // Parity probe: block-0 self-attn only (ShotStream oracle P1). Bridges to
+        // WanAttentionBlock::selfattn_only on block 0. new_kc/new_vc = RoPE'd K + raw V.
+        ggml_tensor* forward_block0_selfattn(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe,
+                                             ggml_tensor*& new_kc, ggml_tensor*& new_vc) {
+            auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks.0"]);
+            return block->selfattn_only(ctx, x, pe, new_kc, new_vc);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
