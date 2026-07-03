@@ -38,6 +38,38 @@ namespace WAN {
         return on;
     }
 
+    // WAN_VAE_HEAD_F32 (default ON; set WAN_VAE_HEAD_F32=0 to reproduce the grid): keep the final
+    // decoder conv `head.2` on the cuDNN implicit-GEMM path (GGML_CUDNN_CONV3D) but request an
+    // F32-IO plan so cuDNN writes an fp32 output instead of fp16.
+    //
+    // The bug it fixes: cuDNN's conv3d output Y is normally fp16 (conv3d-cudnn.cu: y_ndhwc is a
+    // ggml_cuda_pool_alloc<half>), so the conv output is fp16-quantized regardless of the ggml
+    // dst dtype. head.2 emits 12 channels (wan2.2) of slightly different magnitude, and decode
+    // does unpatchify(out, 2) — a space-to-depth that keys each output pixel's RGB to a specific
+    // one of those 12 channels by (x%2, y%2). The per-channel fp16 quantization steps therefore
+    // land as a faint ~2px screen-door grid on photoreal content.
+    //
+    // The fix routes head.2 (only) through a full F32-IO cuDNN plan (fp32 X/W/Y, fp32 accumulate,
+    // fp32 store), so the output is never fp16-quantized and the per-channel grid is gone. (A
+    // mixed HALF-in/FLOAT-out plan was silently rejected by cuDNN's heuristic for this 3D shape,
+    // reverting to fp16; full fp32 IO is the standard, broadly-supported conv.) It stays on the
+    // implicit-GEMM engine: there is NO im2col IC*27 column
+    // materialization. (Routing head.2 to im2col OOMs — 256 input channels at ~640x352 => a
+    // [256*27, 640*352] ~3GB buffer, the exact blowup cuDNN conv3d exists to avoid.) Only head.2's
+    // tiny 12-out-channel F32 output buffer grows, a bounded cost well under the decode peak
+    // (dominated by the temporal-upsample intermediate), so the ~94s decode is preserved.
+    //
+    // No effect when GGML_CUDNN_CONV3D is off (that path is already F32 im2col). The fix also
+    // forces head.2's ggml output tensor to F32 so it holds under WAN_VAE_F16 (F16-activation
+    // decode) too. WAN_VAE_HEAD_F32=0 puts head.2 back on the cuDNN fp16 plan to A/B the grid.
+    inline bool wan_vae_head_f32_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("WAN_VAE_HEAD_F32");
+            return e == nullptr || atoi(e) != 0;  // default ON; only "0" disables
+        }();
+        return on;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -47,6 +79,7 @@ namespace WAN {
         std::tuple<int, int, int> padding;
         std::tuple<int, int, int> dilation;
         bool bias;
+        bool force_f32;  // WAN_VAE_HEAD_F32: force this conv onto the clean F32 im2col path
 
         void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
             params["weight"] = ggml_new_tensor_4d(ctx,
@@ -67,14 +100,16 @@ namespace WAN {
                      std::tuple<int, int, int> stride   = {1, 1, 1},
                      std::tuple<int, int, int> padding  = {0, 0, 0},
                      std::tuple<int, int, int> dilation = {1, 1, 1},
-                     bool bias                          = true)
+                     bool bias                          = true,
+                     bool force_f32                     = false)
             : in_channels(in_channels),
               out_channels(out_channels),
               kernel_size(std::move(kernel_size)),
               stride(std::move(stride)),
               padding(std::move(padding)),
               dilation(std::move(dilation)),
-              bias(bias) {}
+              bias(bias),
+              force_f32(force_f32) {}
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* cache_x = nullptr) {
             // x: [N*IC, ID, IH, IW]
@@ -98,10 +133,15 @@ namespace WAN {
             }
 
             x = ggml_ext_pad_ext(ctx->ggml_ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            // Convs tagged force_f32 (head.2 under WAN_VAE_HEAD_F32) stay on the cuDNN
+            // implicit-GEMM op (no im2col IC*27 blowup) but request an F32-IO plan so cuDNN writes
+            // fp32, not fp16 -> the per-channel fp16 steps don't become an unpatchify grid.
+            bool cudnn_hi_prec = force_f32 && wan_vae_head_f32_enabled();
             return ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
-                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation));
+                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
+                                    /*force_prec_f32=*/false, /*cudnn_hi_prec=*/cudnn_hi_prec);
         }
     };
 
@@ -881,10 +921,12 @@ namespace WAN {
             blocks["head.0"] = std::shared_ptr<GGMLBlock>(new RMS_norm(out_dim));
             // head.1 is nn.SiLU()
             if (wan2_2) {
-                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 12, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}));
+                // force_f32=true: this final 12-channel conv feeds unpatchify(2); request an
+                // F32-IO cuDNN plan (fp32 Y, not fp16) so the per-channel fp16 steps don't grid.
+                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 12, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, true, true));
 
             } else {
-                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 3, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}));
+                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 3, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, true, true));
             }
         }
 
@@ -1008,7 +1050,13 @@ namespace WAN {
         }
 
     public:
-        WanVAE(bool decode_only = true, bool wan2_2 = false)
+        // dec_dim_override: narrower decoder base width for a channel-pruned decoder
+        // (e.g. lightx2v LightVAE = the official Wan2.1 VAE with dec base dim 96->24).
+        // -1 = keep the full-width default for this version (byte-identical to the
+        // official VAE). Only the DECODER width changes; the encoder width (`dim`) is
+        // untouched so the encoder latent space stays identical to the official VAE
+        // (decode-only weight swap). Detected from the gguf by WanVAERunner.
+        WanVAE(bool decode_only = true, bool wan2_2 = false, int64_t dec_dim_override = -1)
             : decode_only(decode_only), wan2_2(wan2_2) {
             // attn_scales is always []
             if (wan2_2) {
@@ -1018,6 +1066,9 @@ namespace WAN {
 
                 _conv_num     = 34;
                 _enc_conv_num = 26;
+            }
+            if (dec_dim_override > 0) {
+                dec_dim = dec_dim_override;
             }
             if (!decode_only) {
                 blocks["encoder"] = std::shared_ptr<GGMLBlock>(new Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks, temperal_downsample, wan2_2));
@@ -1340,13 +1391,38 @@ namespace WAN {
         bool decode_only   = true;
         WanVAE ae;
 
+        // Decoder base width from the gguf: the final-stage decoder RMS_norm
+        // (decoder.head.0.gamma) is a 1-D [dec_dim] tensor, so its element count IS the
+        // decoder base dim. Matched by suffix so it's independent of the load prefix.
+        // Returns -1 when absent -> WanVAE keeps the version default. For the official
+        // VAEs this returns the same value as the built-in default (96 wan2.1 / 256
+        // wan2.2-ti2v), so existing models build byte-identically; a channel-pruned
+        // LightVAE gguf (gamma=[24]) builds the narrower decoder instead.
+        static int64_t detect_dec_dim(const String2TensorStorage& tensor_storage_map) {
+            static const std::string suffix = "decoder.head.0.gamma";
+            for (const auto& kv : tensor_storage_map) {
+                const std::string& k = kv.first;
+                if (k.size() >= suffix.size() &&
+                    k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    int64_t n = 1;
+                    for (int i = 0; i < kv.second.n_dims; i++) {
+                        n *= kv.second.ne[i];
+                    }
+                    return n;
+                }
+            }
+            return -1;
+        }
+
         WanVAERunner(ggml_backend_t backend,
                      ggml_backend_t params_backend,
                      const String2TensorStorage& tensor_storage_map = {},
                      const std::string prefix                       = "",
                      bool decode_only                               = false,
                      SDVersion version                              = VERSION_WAN2)
-            : decode_only(decode_only), ae(decode_only, version == VERSION_WAN2_2_TI2V), VAE(version, backend, params_backend) {
+            : decode_only(decode_only),
+              ae(decode_only, version == VERSION_WAN2_2_TI2V, detect_dec_dim(tensor_storage_map)),
+              VAE(version, backend, params_backend) {
             ae.init(params_ctx, tensor_storage_map, prefix);
         }
 
@@ -1706,12 +1782,26 @@ namespace WAN {
                       (long long)(src.dim() > 0 ? src.shape()[0] : -1), (long long)(src.dim() > 1 ? src.shape()[1] : -1),
                       (long long)(src.dim() > 2 ? src.shape()[2] : -1), (long long)(src.dim() > 3 ? src.shape()[3] : -1),
                       (long long)(src.dim() > 4 ? src.shape()[4] : -1), chunk);
-            // Temporal streaming applies to DECODE only (mirrors LTX decode_tiled window=1):
-            // the output decode is where 1x1 buys zero seams + the ~30s win. The ENCODE's
-            // 4-pixel-frame groups blow up at full spatial (cuDNN 2^31 conv / im2col IC*27),
-            // so encode stays on the spatial-tiled path (a smaller encode tile via
-            // LONGCAT_VAE_ENCODE_REL_TILE in encode_to_vae_latents).
-            if (chunk >= 1 && decode_graph && src.dim() == 5 && src.shape()[2] > 1) {
+            // Temporal streaming applies to BOTH decode and encode now (chunk = the env
+            // LONGCAT_VAE_TEMPORAL_CHUNK; for encode its non-zero value just ENABLES the path —
+            // encode_temporal_streaming self-determines its natural 1+4k pixel groups). It
+            // bounds the temporal axis so a 21-81 frame encode no longer runs the cuDNN
+            // CONV_3D / im2col(IC*27) intermediate over ALL frames at once (the OOM at e.g.
+            // [312,536,21] / 1280x704). Both directions use the SAME persist_feat_map GALLOCR
+            // fix (build_graph_temporal_{decode,encode}_chunk), so the causal feat_cache threads
+            // across compute() passes correctly -> output is numerically ~ monolithic, NOT
+            // seam-producing. (The "chunk-1 corrupts" warning is about the OLD, never-called
+            // build_graph_partial, not this path.)
+            //
+            // SPATIAL bounding for the encode (the author's original "4-frame groups blow up at
+            // full spatial" concern) comes for FREE from composition, exactly as for decode: when
+            // spatial tiling is enabled (LONGCAT_VAE_ENCODE_REL_TILE / vae_tiling_params), the
+            // encode() wrapper (vae.hpp:131) spatial-tiles via tiled_compute -> _compute(tile),
+            // so this temporal stream runs PER SPATIAL TILE (<=4 frames x one tile). No inner
+            // spatial tiling of the chunk is needed (it would double-tile). Encode at 1280x704
+            // therefore requires spatial tiling to be on (the failing IT/vid_gen paths already
+            // have it firing); without it a 4-frame full-spatial group can still OOM at high res.
+            if (chunk >= 1 && src.dim() == 5 && src.shape()[2] > 1) {
                 sd::Tensor<float> result = decode_graph
                                                ? decode_temporal_streaming(n_threads, src, chunk)
                                                : encode_temporal_streaming(n_threads, src);

@@ -1146,8 +1146,26 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     // FP4 GEMM accumulates F32, stores F16) keeps the dominant [hidden x tokens]
     // tensor + all downstream glue pure-F16. Self-gated on NVFP4 weight + F16 act so
     // only the dit_f16 DiT path is affected; every other model keeps F32 dst.
-    const ggml_type mm_dst = (!force_prec_f32 && w->type == GGML_TYPE_NVFP4 && x->type == GGML_TYPE_F16)
-                                 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    //
+    // WAN_F16_DST (opt-in, default OFF): broaden the same F16-dst emission to Linears
+    // whose weight is kept F16 (not quantized). Under the WAN F16 residual stream those
+    // still emitted an F32 dst — e.g. the [63360, 5120] f32 = 1237 MB activation that the
+    // residual add then re-reads at full width. The CUDA backend already supports F16-dst
+    // MUL_MAT for F16 a+b non-split inputs (F32 accumulation, F16 store via the dedicated
+    // cuBLAS path in ggml-cuda supports_op); the graph builder just never requested it.
+    // Split weights are rejected by that supports_op, so this requester only fires on the
+    // single-device DiT. It adds one F16 store-rounding before the residual add: numerically
+    // safe (same class as the shipped nvfp4 F16-dst above) but NOT byte-identical, hence the
+    // env gate so the main thread can A/B it. Default OFF ⇒ byte-identical to today.
+    static const bool wan_f16_dst = getenv("WAN_F16_DST") != nullptr;
+    ggml_type mm_dst = GGML_TYPE_F32;
+    if (!force_prec_f32 && x->type == GGML_TYPE_F16) {
+        if (w->type == GGML_TYPE_NVFP4) {
+            mm_dst = GGML_TYPE_F16;
+        } else if (wan_f16_dst && w->type == GGML_TYPE_F16) {
+            mm_dst = GGML_TYPE_F16;
+        }
+    }
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
@@ -1293,7 +1311,8 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                                                 int d0              = 1,
                                                 int d1              = 1,
                                                 int d2              = 1,
-                                                bool force_prec_f32 = false) {
+                                                bool force_prec_f32 = false,
+                                                bool cudnn_hi_prec  = false) {
     if (force_prec_f32) {
         ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
 
@@ -1317,7 +1336,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         // non-CUDA backend / unsupported shape this op falls back to the CPU conv_3d.
         int64_t OC = w->ne[3] / IC;
         int64_t N  = x->ne[3] / IC;
-        x = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
+        // cudnn_hi_prec (WAN_VAE_HEAD_F32 head.2): force an F32 result + F32-IO cuDNN plan so the
+        // conv output isn't fp16-quantized (the unpatchify grid). No im2col, so no IC*27 blowup.
+        x = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC, cudnn_hi_prec ? 1 : 0);
     } else {
         x = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
     }
@@ -1499,6 +1520,71 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
     ggml_tensor* kqv = nullptr;
 
+    // WAN grid diagnostics / fix candidates for the frame-count-dependent spatial grid.
+    // ALL default OFF => when unset, kv_cast_type == F16 and no dither is emitted, so the
+    // K/V prep below is byte-identical to prod. They target the confirmed mechanism: the
+    // rope-modulated K/V are cast to F16 for the flash kernel, and that F16 rounding bias is
+    // spatially phase-locked (a function of the rope phase), so it accumulates COHERENTLY as
+    // the self-attention sums over all T*hw keys => a spatial grid whose amplitude grows ~T
+    // (WAN_ZERO_T_ROPE made every frame's K spatially identical and produced the STRONGEST,
+    // uniform grid = maximal phase-lock, confirming this). Both cuDNN and the FP8 kernel
+    // consume this same F16 K/V, and it is independent of the weight quant (q8/fp4 identical).
+    //   WAN_ATTN_KV_BF16  — cast K/V to bf16 instead of F16. NOTE: cuDNN SDPA is F16-only
+    //                       (fattn-cudnn.cu asserts F16) so bf16 K/V bypass cuDNN and route
+    //                       self-attn onto the native ggml MMA flash kernel; at 65f the D=128
+    //                       bf16 MMA instance was missing => non-flash fallback => OOM (observed).
+    //                       Kept for the "stronger fix" route (a real bf16-D128-flash instance).
+    //   WAN_ATTN_KV_SR    — the targeted fix (option a), TWO cooperating halves under one flag:
+    //                       (1) WanSelfAttention::forward feeds the K/V nvfp4 linears an F32
+    //                           activation so they emit an F32 dst (no F16 store-rounding at the
+    //                           GEMM), and with WAN_ROPE_F16 the RoPE keeps K F32 too — so K/V
+    //                           arrive HERE as F32 (the earlier build_kqv-only dither was a no-op
+    //                           because prod K/V were already F16 upstream);
+    //                       (2) HERE, proper index-keyed STOCHASTIC ROUNDING of that F32 K/V into
+    //                           F16: add a uniform dither in [-0.5,+0.5)*ULP16(x) to the F32 value
+    //                           then round-to-nearest (the ggml_cast below). P(round up) = the
+    //                           fractional position => UNBIASED, and the coherent (rope-phase-
+    //                           locked) rounding bias that sums over the temporal axis becomes
+    //                           incoherent (grid ~T -> ~sqrt(T)). CRITICAL: the RNG is keyed on the
+    //                           TOKEN INDEX l = frame*hw+spatial (t->ne[1]), NOT the value, so the
+    //                           SAME spatial position on a DIFFERENT frame gets a DIFFERENT dither
+    //                           => the cross-frame sum decorrelates. cuDNN still gets F16 K/V =>
+    //                           prod kernel unchanged; only the rounding is de-biased.
+    // Only the default (non-prescaled) K/V prep is affected; the kv_prescaled_f16 cond-cache
+    // path (S2V/avatar) is untouched. build_kqv is generic, so a set flag affects every flash
+    // attention call (self + cross); for the Wan render self-attn dominates. Half (1) lives in
+    // src/model/diffusion/wan.hpp (WanSelfAttention::forward), keyed on the SAME env.
+    static const bool wan_attn_kv_bf16  = getenv("WAN_ATTN_KV_BF16") != nullptr;
+    static const bool wan_attn_kv_sr    = getenv("WAN_ATTN_KV_SR") != nullptr;
+    // WAN_ATTN_BF16 — run the attention in bf16 (Q,K,V all bf16 into the cuDNN SDPA, F32
+    // accumulate) to remove the FP16-format repeated-key divergence (the reference's format;
+    // documented not to occur in bf16). Memory-neutral vs F16 (bf16 == 2 bytes). Unlike the
+    // old WAN_ATTN_KV_BF16 (which left Q F16 and misrouted to the F16-only MMA path -> missing
+    // bf16-D128 instance -> non-flash OOM), this casts Q too and the cuDNN selection + wrapper
+    // now take bf16 directly (fattn.cu + fattn-cudnn.cu). Requires GGML_CUDNN_ATTN=1 (prod).
+    static const bool wan_attn_bf16     = getenv("WAN_ATTN_BF16") != nullptr;
+    const ggml_type   kv_cast_type      = (wan_attn_kv_bf16 || wan_attn_bf16) ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    // Under WAN_ATTN_BF16, Q must also be bf16 so the cuDNN graph's uniform bf16 IO matches.
+    if (wan_attn_bf16 && q->type != GGML_TYPE_BF16) {
+        q = ggml_cast(ctx, q, GGML_TYPE_BF16);
+    }
+    auto wan_sr_dither = [&](ggml_tensor* t) -> ggml_tensor* {
+        // t: F32 [d_head, L, n_head] (contiguous). Returns t + dither (F32); the caller's
+        // ggml_cast(..., F16) then round-to-nearest => stochastic rounding.
+        const int64_t L = t->ne[1];  // token axis; l = frame*hw + spatial (T-outer/H/W-inner layout)
+        // per-TOKEN uniform dither u(l) in [-0.5, 0.5): centred frac of a hash of the token index.
+        // Built on a small [1,L,1] tensor and broadcast => no full-size index/sin tensors.
+        ggml_tensor* idx = ggml_reshape_3d(ctx, ggml_arange(ctx, 0.0f, (float)L, 1.0f), 1, L, 1);   // [1,L,1]
+        ggml_tensor* g   = ggml_scale(ctx, ggml_sin(ctx, ggml_scale(ctx, idx, 78.233f)), 43758.5453f);
+        ggml_tensor* u   = ggml_sub(ctx, g, ggml_round(ctx, g));  // g - round(g) in [-0.5, 0.5)
+        // exact F16 ULP per element = 2^(floor(log2|x|) - 10), relative to |x| (not a constant).
+        ggml_tensor* ax  = ggml_clamp(ctx, ggml_abs(ctx, t), 1e-20f, 3.0e38f);        // avoid log(0)
+        ggml_tensor* l2  = ggml_scale(ctx, ggml_log(ctx, ax), 1.4426950408889634f);  // log2|x|
+        ggml_tensor* e2  = ggml_exp(ctx, ggml_scale(ctx, ggml_floor(ctx, l2), 0.6931471805599453f));  // 2^floor(log2|x|)
+        ggml_tensor* ulp = ggml_scale(ctx, e2, 0.0009765625f);                        // * 2^-10
+        return ggml_add(ctx, t, ggml_mul(ctx, ulp, u));  // u[1,L,1] broadcast over [d_head,L,n_head]
+    };
+
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
         if (kv_pad != 0) {
             k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
@@ -1520,8 +1606,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             // F16 after the scale, which preserves type) this would launch a full-width
             // F16 copy of K every attention call for no value. F32 K (the default prod
             // stream) still casts F32->F16 as before, so that path is byte-identical.
-            if (k_in->type != GGML_TYPE_F16) {
-                k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+            if (k_in->type != kv_cast_type) {
+                if (wan_attn_kv_sr && k_in->type == GGML_TYPE_F32 && kv_cast_type == GGML_TYPE_F16) {
+                    k_in = wan_sr_dither(k_in);  // stochastic-round to F16 (index-keyed dither)
+                }
+                k_in = ggml_cast(ctx, k_in, kv_cast_type);
             }
         }
 
@@ -1539,8 +1628,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             // contiguous F16 that flash accepts directly; skipping the no-op F16->F16
             // CPY removes a full-width V copy per call on the F16/NVFP4 stream. F32 v_in
             // (default) still casts → byte-identical prod path.
-            if (v_in->type != GGML_TYPE_F16) {
-                v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+            if (v_in->type != kv_cast_type) {
+                if (wan_attn_kv_sr && v_in->type == GGML_TYPE_F32 && kv_cast_type == GGML_TYPE_F16) {
+                    v_in = wan_sr_dither(v_in);  // stochastic-round to F16 (index-keyed dither)
+                }
+                v_in = ggml_cast(ctx, v_in, kv_cast_type);
             }
         }
         // else: v_in is already F16 — the permute+cont above stays on F16 (same compute,
@@ -1960,6 +2052,16 @@ struct GGMLRunnerContext {
     // the runner (depends only on t/h/w/n_cond), shared across all 48 blocks and 7
     // consume steps. nullptr ⇒ dense path (default; bit-exact).
     ggml_tensor* bsa_mask                  = nullptr;
+    // WAN SLA (lightx2v sparse-attention port). The selector DiT block exports its
+    // mean-pooled (64-block) RoPE'd Q and smooth-K into these persistent tensors so
+    // the host can build the next step's content-based skip bitmap. sla_capture_now
+    // is set by Wan::forward_orig only for the configured selector block; default
+    // OFF ⇒ no export, byte-identical. See src/model/diffusion/wan_sla.hpp.
+    bool         sla_capture_now  = false;
+    ggml_tensor* sla_pooled_q_dst = nullptr;  // [d_head, n_blk, n_head] F32
+    ggml_tensor* sla_pooled_k_dst = nullptr;  // [d_head, n_blk, n_head] F32
+    int          sla_blk          = 64;       // pooling block size (= FA tile = lightx2v bq/bkv)
+    int          sla_selector_block = -1;     // which DiT block exports pooled Q/K (-1 = none)
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
@@ -3781,6 +3883,15 @@ protected:
         }
 
         int64_t t_compute_begin = ggml_time_ms();
+#ifdef SD_USE_CUDA
+        // New graph compute => bump the FP8 activation-quant cache generation so
+        // the q/k/v activation-quant reuse cache (nvfp4-cublaslt.cu) can never
+        // serve a buffer cached in a previous compute, even if gallocr recycles
+        // a node/data address. Cheap relaxed atomic; harmless on non-CUDA/non-FP8.
+        if (!sd_backend_is_cpu(runtime_backend)) {
+            ggml_cuda_fp8_act_cache_new_generation();
+        }
+#endif
         ggml_status status      = ggml_backend_graph_compute(runtime_backend, gf);
         // Sync only when profiling is active so the "compute" timing reflects
         // actual GPU wall instead of CPU dispatch-and-return time. In default

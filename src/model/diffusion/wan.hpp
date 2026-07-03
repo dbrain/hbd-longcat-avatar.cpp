@@ -135,9 +135,24 @@ namespace WAN {
 
             auto q = q_proj->forward(ctx, x);
             q      = norm_q->forward(ctx, q);
-            auto k = k_proj->forward(ctx, x);
+            // WAN_ATTN_KV_SR half (1) — default OFF => byte-identical. Under the F16 residual
+            // stream (WAN_DIT_F16) the K/V nvfp4 linears store-round their output to F16 at the
+            // GEMM, and (with WAN_ROPE_F16) K stays F16 through RoPE — so K/V reach the flash
+            // kernel already F16, and that rounding bias is rope-phase-locked and sums COHERENTLY
+            // over the temporal axis (the frame-count grid). Feed the K/V projections an F32
+            // activation so the mm_dst gate (ggml_extend.hpp: F16-dst only when x is F16) emits an
+            // F32 dst — the exact nvfp4 path used when WAN_DIT_F16 is off — keeping K/V full
+            // precision into build_kqv, where the same env applies stochastic rounding to F16.
+            // Q is left F16 (per-query; it does not accumulate across keys). Only the K/V
+            // projection INPUT is widened (a local F32 transient), not the whole residual stream.
+            static const bool wan_attn_kv_sr = (std::getenv("WAN_ATTN_KV_SR") != nullptr);
+            ggml_tensor* x_kv = x;
+            if (wan_attn_kv_sr && x->type == GGML_TYPE_F16) {
+                x_kv = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+            auto k = k_proj->forward(ctx, x_kv);
             k      = norm_k->forward(ctx, k);
-            auto v = v_proj->forward(ctx, x);  // [N, n_token, n_head*d_head]
+            auto v = v_proj->forward(ctx, x_kv);  // [N, n_token, n_head*d_head]
 
             // WAN_DIT_F16: under the F16 residual stream the q/k/v Linears emit F16, but
             // the fast fused RoPE (ggml_rope_pe) is F32-only (rope.hpp:953) — an F16 q
@@ -562,9 +577,42 @@ namespace WAN {
             y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
             y = modulate_add(ctx->ggml_ctx, y, es[3]);
 
-            y = ffn_0->forward(ctx, y);
-            y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
-            y = ffn_2->forward(ctx, y);
+            // Token-tiled FFN (env LONGCAT_FFN_TILE_TOKENS=N, N>0): the FFN is position-wise
+            // (ffn_0 Linear -> GELU -> ffn_2 Linear, no token mixing), so process tokens in
+            // chunks of N to cap the [ffn_dim, tokens] intermediate — the dominant DiT
+            // activation at long video lengths (e.g. 1671 MB at [13824, 63360] f16) — to
+            // [ffn_dim, N]. Lossless (same math, concatenated in chunk order), no extra FLOPs
+            // (only a few more kernel launches). Off by default (N<=0) so every other path is
+            // byte-identical. Only the simple 2D case (single batch) is tiled; anything else
+            // falls through to the original path. Mirrors FeedForward::forward in
+            // src/model/common/block.hpp. WanAttentionBlock::forward is reused by
+            // VaceWanAttentionBlock, so the vace path is covered too.
+            int64_t ffn_tile = 0;
+            if (const char* env = getenv("LONGCAT_FFN_TILE_TOKENS")) {
+                ffn_tile = atoll(env);
+            }
+            const int64_t n_tok = y->ne[1];
+            if (ffn_tile > 0 && n_tok > ffn_tile && y->ne[2] == 1 && y->ne[3] == 1) {
+                // Growing-concat accumulate: lower peak VRAM than a preallocated [dim,n_tok]
+                // scatter (gallocr reuses the chunk buffers; the scatter kept a full-size `out`
+                // + a head-concat temp resident = +1.3 GB, a bad trade under the <=11.5GB cap).
+                // Same math, same chunk order -> byte-identical.
+                ggml_tensor* out = nullptr;
+                for (int64_t c = 0; c < n_tok; c += ffn_tile) {
+                    const int64_t len = (n_tok - c < ffn_tile) ? (n_tok - c) : ffn_tile;
+                    ggml_tensor* yc = ggml_view_2d(ctx->ggml_ctx, y, y->ne[0], len, y->nb[1], (size_t)c * y->nb[1]);
+                    yc              = ggml_cont(ctx->ggml_ctx, yc);
+                    yc              = ffn_0->forward(ctx, yc);  // [ffn_dim, len]
+                    yc              = ggml_ext_gelu(ctx->ggml_ctx, yc, true);
+                    yc              = ffn_2->forward(ctx, yc);  // [dim, len]
+                    out             = (out == nullptr) ? yc : ggml_concat(ctx->ggml_ctx, out, yc, 1);
+                }
+                y = out;
+            } else {
+                y = ffn_0->forward(ctx, y);
+                y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
+                y = ffn_2->forward(ctx, y);
+            }
 
             x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
 
@@ -938,7 +986,31 @@ namespace WAN {
                     c = ggml_cast(ctx->ggml_ctx, c, GGML_TYPE_F16);
                 }
             }
-            sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            // VRAM levers (both default OFF => byte-identical to prod; env-gated for A/B).
+            //   WAN_VACE_SPLIT           — Lever 1: split each vace-mapped block so the
+            //                              main-block attention frees before the vace-block
+            //                              attention allocates (peak segment 6268->~3174MB).
+            //   WAN_VACE_XORIG_RECOMPUTE — Lever 2: drop the prelude-x graph-cut cache so
+            //                              x_orig is retraced (patch_embedding->reshape->cast)
+            //                              per vace segment instead of held resident the whole
+            //                              DiT (-618MB cache).
+            static const bool wan_vace_split = []{
+                const char* s = getenv("WAN_VACE_SPLIT");
+                return s && s[0] == '1';
+            }();
+            static const bool wan_vace_xorig_recompute = []{
+                const char* s = getenv("WAN_VACE_XORIG_RECOMPUTE");
+                return s && s[0] == '1';
+            }();
+            // Lever 2: the prelude x (== x_orig) is consumed ONLY by the vace blocks (and
+            // block 0's main forward). Marking it here pins its F16 618MB tensor in the
+            // graph-cut cache for the ENTIRE DiT. When WAN_VACE_XORIG_RECOMPUTE is set we
+            // drop the mark so each consuming segment retraces the cheap Conv3d patch
+            // embedding from the resident raw-latent leaf instead. Byte-identical
+            // (deterministic Conv3d), -618MB cache; default keeps the prelude-x cut.
+            if (!wan_vace_xorig_recompute) {
+                sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            }
             // sd::ggml_graph_cut::mark_graph_cut(e, "wan.prelude", "e");
             // sd::ggml_graph_cut::mark_graph_cut(e0, "wan.prelude", "e0");
             // sd::ggml_graph_cut::mark_graph_cut(context, "wan.prelude", "context");
@@ -1028,6 +1100,21 @@ namespace WAN {
 
                 auto iter = config.vace_layers_mapping.find(i);
                 if (iter != config.vace_layers_mapping.end()) {
+                    // Lever 1 (WAN_VACE_SPLIT): cut the main-block output x into its OWN
+                    // graph-cut segment so the main-block attention working set completes
+                    // and is freed BEFORE the vace-block attention allocates. Without this,
+                    // the vace-mapped block is one segment holding BOTH attention working
+                    // sets live at once (~6268MB = ~2x a plain block's ~3174MB), which is the
+                    // DiT VRAM peak. main-x then crosses into the vace segment (the
+                    // `x = x + c_skip` residual add below) as an INPUT_PREVIOUS_CUT, exactly
+                    // like the other cross-segment tensors — the cache stays at 3 live tensors
+                    // (main-x replaces the previous block's x; x_orig + c are the other two).
+                    // Byte-identical: a graph-cut boundary only re-partitions the graph for
+                    // per-segment memory reservation; every arithmetic node, and the
+                    // `x = x + c_skip` residual add and its order, is unchanged.
+                    if (wan_vace_split && c != nullptr) {
+                        sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i) + ".main", "x");
+                    }
                     int n = iter->second;
 
                     auto vace_block = std::dynamic_pointer_cast<VaceWanAttentionBlock>(blocks["vace_blocks." + std::to_string(n)]);

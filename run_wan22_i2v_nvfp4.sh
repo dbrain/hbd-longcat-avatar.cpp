@@ -12,12 +12,14 @@ REPO="$PWD"; BUILDER="${BUILDER:-longcat-avatar-dev:builder-cudnn}"
 TAG="${TAG:-nvfp4_base}"
 OUT="$REPO/wan_dance_out/$TAG"; mkdir -p "$OUT/frames"
 M=/models
-if [ "${QK:-0}" = "1" ]; then
+if [ "${SPARSE:-0}" = "1" ]; then
+  VL=/sparse/wan22-i2v-a14b-low-nvfp4-SPARSE.gguf; VH=/sparse/wan22-i2v-a14b-high-nvfp4-SPARSE.gguf
+elif [ "${QK:-0}" = "1" ]; then
   VL=$M/wan22-i2v-a14b-low-q4_k.gguf;    VH=$M/wan22-i2v-a14b-high-q4_k.gguf
 else
   VL=$M/wan22-i2v-a14b-low-nvfp4.gguf;   VH=$M/wan22-i2v-a14b-high-nvfp4.gguf
 fi
-VAE=$M/longcat-wan-vae-f16.gguf; UMT5=$M/longcat-umt5-xxl-q8_0.gguf; IMG=$M/flux_neon_seed7.png
+VAE=${VAE:-$M/longcat-wan-vae-f16.gguf}; UMT5=$M/longcat-umt5-xxl-q8_0.gguf; IMG=$M/flux_neon_seed7.png
 
 W=${W:-1280}; H=${H:-704}; FR=${FR:-81}; SHIFT=${SHIFT:-5}
 HSTEPS=${HSTEPS:-2}; LSTEPS=${LSTEPS:-2}; CFG=${CFG:-1}; MAXV=${MAXV:-14}; SEED=${SEED:-42}
@@ -37,6 +39,12 @@ declare -a ENVV=( "GGML_NVFP4_CUBLASLT=${NVFP4_CUBLASLT:-1}" "GGML_NVFP4_QUANT_T
 # F16 residual-stream DiT (WAN_DIT_F16) — the #1 remaining DiT glue/cast lever. Implies the
 # F16 cuDNN attention output so the stream stays F16 through o_proj (no re-upcast). DITF16=1.
 [ "${DITF16:-0}" = "1" ] && ENVV+=( WAN_DIT_F16=1 GGML_CUDNN_ATTN_F16_OUT=1 )
+# 4-step distill sigma grid (QUALITY, not perf). lightx2v-trained DMD grid [1000,750,500,250]
+# @ shift 5 (= lightx2v config_i2v_*.json + Wan official 720p). WITHOUT this the few-step path
+# falls through to the generic scheduler = [999,666,333,0] = a wasted step on the WRONG grid ->
+# under-denoised "murk" (worse fast-motion, face loses shape). Owner eye-test 2026-06-28 confirmed
+# grid+shift5 is cleaner. Opt OUT via DISTILL_SIGMAS_OFF=1 (REQUIRED for the FULL-STEP VACE-Fun base).
+[ "${DISTILL_SIGMAS_OFF:-0}" = "1" ] || ENVV+=( WAN_DISTILL_SIGMAS=1 "WAN_DISTILL_SHIFT=${WAN_DISTILL_SHIFT:-5}" )
 for kv in ${DOTS_ENV:-}; do ENVV+=("$kv"); done
 ENV_FLAGS=(); for e in "${ENVV[@]}"; do ENV_FLAGS+=(-e "$e"); done
 # Forward any GGML_*/LONGCAT_*/LTX_* debug toggles set in the parent shell (DBG, TRACE,
@@ -46,7 +54,7 @@ for v in $(compgen -e | grep -E '^(GGML_|LONGCAT_|LTX_|WAN_)' || true); do
   ENV_FLAGS+=(-e "$v=${!v}")
 done
 
-BASE=(docker run --rm --gpus '"device=1"' "${ENV_FLAGS[@]}" -v "$REPO:/src" -v "$REPO/models:/models" -w /src)
+BASE=(docker run --rm --gpus '"device=1"' "${ENV_FLAGS[@]}" -v "$REPO:/src" -v "$REPO/models:/models" -v /mnt/ssd/wan-sparse-gguf:/sparse:ro -w /src)
 
 sample_vram() { local f="$1"; echo 0 > "$f"
   while :; do u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 1 2>/dev/null | head -1)

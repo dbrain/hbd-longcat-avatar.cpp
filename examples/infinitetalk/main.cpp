@@ -1,21 +1,33 @@
 // InfiniteTalk (MultiTalk on Wan2.1-I2V-14B) CLI — promptable lip-sync dub.
 //
 // Wan2.2-I2V-A14B generates the silent promptable shots; THIS tool dubs the user's
-// song onto the singing character (image/V2V mode). Loads the merged InfiniteTalk DiT
-// (base Wan2.1-I2V-14B + audio graft + lightx2v distill, q4_K), chinese-wav2vec2-base,
-// the Wan2.1 16ch VAE, umT5-XXL, and (optionally) CLIP-H/14 vision, then runs the
-// non-causal motion-frame streaming sampler.
+// song onto the singing character. Two conditioning modes:
+//   --image <png>  I2V: every window anchors to the SAME static image; the model invents
+//                  all motion from the audio + prompt (talking-head style).
+//   --video <mp4>  V2V (sparse-frame dubbing): every window re-anchors to the SOURCE clip's
+//                  frame at the window's start index, so the source's identity / scene /
+//                  camera / pose are preserved while the mouth (and in-between motion) are
+//                  driven by the audio. This is InfiniteTalk's sparse-frame mechanism —
+//                  upstream multitalk.py does `cond_image = extract_specific_frames(
+//                  cond_file, audio_start_idx)` per streaming window (ONE source keyframe
+//                  per ~3s window; mask=1 at latent-frame 0 only). Use V2V to lip-sync a
+//                  Wan-rendered clip while keeping its motion.
+// Loads the merged InfiniteTalk DiT (base Wan2.1-I2V-14B + audio graft + lightx2v distill,
+// q4_K), chinese-wav2vec2-base, the Wan2.1 16ch VAE, umT5-XXL, and (optionally) CLIP-H/14
+// vision, then runs the non-causal motion-frame streaming sampler.
 //
 // Streaming (multitalk.py generate_infinitetalk): 81-frame (4n+1) windows; per window
-//   the cond frame is VAE-encoded + masked into a 20ch c_concat and CLIP-H'd into 257
-//   image tokens; the song's per-frame wav2vec stack is windowed (±2) -> AudioProjModel
-//   -> 32 tokens/latent-frame; sampling pins the first `motion_lat` latent frames to the
-//   carried-over clean motion latents each step. Windows overlap by frame_num-motion_frame
-//   (the first motion_frame output frames of windows>0 are dropped).
+//   the anchor cond frame (static image OR source-video frame @ audio_start_idx) is
+//   VAE-encoded + masked into a 20ch c_concat and CLIP-H'd into 257 image tokens; the
+//   song's per-frame wav2vec stack is windowed (±2) -> AudioProjModel -> 32 tokens/
+//   latent-frame; sampling pins the first `motion_lat` latent frames to the carried-over
+//   clean motion latents each step. Windows overlap by frame_num-motion_frame (the first
+//   motion_frame output frames of windows>0 are dropped).
 //
 // Usage:
 //   sd-infinitetalk --dit <it.gguf> --wav2vec <w2v.gguf> --vae <vae.gguf> --umt5 <umt5.gguf>
-//                   [--clip-vision <clip.pth>] --image <png> --prompt "<text>" --wav <song.wav>
+//                   [--clip-vision <clip.pth>] (--image <png> | --video <mp4>)
+//                   --prompt "<text>" --wav <song.wav>
 //                   [--out <dir>] [--frames 81] [--height H] [--width W] [--steps 4]
 //                   [--shift 5] [--text-cfg 1] [--audio-cfg 1] [--motion-frame 9]
 //                   [--max-windows N] [--fps 25] [--cpu] [--distilled] [--load-only]
@@ -203,7 +215,7 @@ int main(int argc, char** argv) {
 
     if (argc < 2 || has_flag(argc, argv, "--help")) {
         printf("usage: %s --dit <it.gguf> --wav2vec <w2v.gguf> --vae <vae.gguf> --umt5 <umt5.gguf>\n", argv[0]);
-        printf("          [--clip-vision <clip.pth>] --image <png> --prompt \"<text>\" --wav <song.wav>\n");
+        printf("          [--clip-vision <clip.pth>] (--image <png> | --video <mp4>) --prompt \"<text>\" --wav <song.wav>\n");
         printf("          [--out <dir>] [--frames 81] [--height H] [--width W] [--steps 4] [--shift 5]\n");
         printf("          [--text-cfg 1] [--audio-cfg 1] [--motion-frame 9] [--max-windows N] [--fps 25]\n");
         printf("          [--cpu] [--distilled] [--load-only] [--clip-fea <bin>]\n");
@@ -217,6 +229,7 @@ int main(int argc, char** argv) {
     std::string clip_path = opt(argc, argv, "--clip-vision");
     std::string clipfea_bin = opt(argc, argv, "--clip-fea");  // precomputed [1280,257] fallback
     std::string image_path = opt(argc, argv, "--image");
+    std::string video_path = opt(argc, argv, "--video");  // V2V source clip (per-window sparse anchor)
     std::string prompt    = opt(argc, argv, "--prompt", "a person singing");
     std::string n_prompt  = opt(argc, argv, "--neg-prompt", "");
     std::string wav_path  = opt(argc, argv, "--wav");
@@ -382,13 +395,56 @@ int main(int argc, char** argv) {
     }
     int T_video = (int)full_audio.shape()[2];
 
-    // ---- cond image (static for image-mode; motion frames carry continuity) ----
-    sd::Tensor<float> cond_image_px;  // [W,H,1,3] [0,1]
-    if (!image_path.empty()) {
-        if (!load_image(image_path, width, height, cond_image_px)) return 1;
-    } else {
-        printf("ERROR: --image required\n"); return 1;
+    // ---- conditioning anchor source: V2V (--video) or I2V (--image) ----
+    // V2V = InfiniteTalk sparse-frame dubbing: each streaming window re-anchors to the
+    // SOURCE clip's frame at the window's start index (audio_start_idx). Upstream
+    // multitalk.py: `cond_image = extract_specific_frames(cond_file, audio_start_idx)` per
+    // window, mask=1 at latent-frame 0 only. The source frames (NOT the generated tail)
+    // carry identity/scene/camera; the model regenerates in-between motion from the audio.
+    // We replicate that: extract the source clip to PNG frames at the OUTPUT fps once, then
+    // re-fetch the anchor per window. (motion-frame continuity still comes from generated
+    // frames, exactly as upstream — so one sparse source keyframe per ~3s window.)
+    bool v2v = !video_path.empty();
+    std::string src_dir;
+    int n_src_frames = 0;
+    if (v2v) {
+        src_dir = out_dir + "/_src";
+        { std::string mk = "mkdir -p '" + src_dir + "'"; (void)system(mk.c_str()); }
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -y -i '%s' -vf fps=%d '%s/src_%%05d.png' >%s/ffmpeg_extract.log 2>&1",
+                 video_path.c_str(), fps, src_dir.c_str(), out_dir.c_str());
+        printf("V2V: extracting source frames @ %dfps from %s\n", fps, video_path.c_str());
+        if (system(cmd) != 0) { printf("ERROR: ffmpeg frame-extract failed (see %s/ffmpeg_extract.log)\n", out_dir.c_str()); return 1; }
+        for (int i = 1;; ++i) {  // ffmpeg numbers from 1
+            char fp[512]; snprintf(fp, sizeof(fp), "%s/src_%05d.png", src_dir.c_str(), i);
+            FILE* f = fopen(fp, "rb"); if (!f) break; fclose(f); n_src_frames = i;
+        }
+        if (n_src_frames == 0) { printf("ERROR: no source frames extracted from %s\n", video_path.c_str()); return 1; }
+        printf("V2V: %d source frames extracted (audio timeline = %d frames @ %dfps)\n", n_src_frames, T_video, fps);
+        if (n_src_frames < T_video)
+            printf("V2V WARN: source clip (%d f) shorter than audio (%d f); holding last source frame past its end\n",
+                   n_src_frames, T_video);
+    } else if (image_path.empty()) {
+        printf("ERROR: --image or --video required\n"); return 1;
     }
+
+    // Fetch the conditioning anchor pixel frame for an absolute output-frame index.
+    //   I2V: always the static --image. V2V: source frame @ idx (1-based ffmpeg, clamped to last).
+    auto load_anchor = [&](int abs_idx) -> sd::Tensor<float> {
+        sd::Tensor<float> px;
+        if (v2v) {
+            int fi = abs_idx + 1; if (fi < 1) fi = 1; if (fi > n_src_frames) fi = n_src_frames;
+            char fp[512]; snprintf(fp, sizeof(fp), "%s/src_%05d.png", src_dir.c_str(), fi);
+            if (!load_image(fp, width, height, px)) printf("WARN: load source frame %d failed\n", fi);
+        } else {
+            load_image(image_path, width, height, px);
+        }
+        return px;
+    };
+
+    sd::Tensor<float> cond_image_px = load_anchor(0);  // [W,H,1,3] [0,1] — window-0 anchor
+    if (cond_image_px.empty()) { printf("ERROR: failed to load conditioning anchor\n"); return 1; }
 
     sd_tiling_params_t tiling = {};
     tiling.enabled = getenv("IT_NO_VAE_TILE") == nullptr;
@@ -471,6 +527,15 @@ int main(int argc, char** argv) {
         if (max_windows > 0 && window >= max_windows) break;
         printf("\n=== window %d (audio_start=%d / %d, motion_frames=%d) ===\n",
                window, audio_start_idx, T_video, cur_motion_frames);
+
+        // V2V sparse-frame dubbing: re-anchor this window to the SOURCE clip's frame at
+        // the window start. Updates the c_concat cond latent + CLIP-H tokens (and, on the
+        // first window, the pinned motion latent) to the source — preserving the clip's
+        // identity/scene/camera. (I2V leaves cond_image_px = the static image.)
+        if (v2v) {
+            cond_image_px = load_anchor(audio_start_idx);
+            if (cond_image_px.empty()) { printf("ERROR: V2V anchor load failed (win %d)\n", window); return 1; }
+        }
 
         // audio embedding for this window (step/CFG-invariant) -> [768,32,lat_t].
         sd::Tensor<float> first_in, vf_in;

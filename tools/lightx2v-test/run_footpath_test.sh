@@ -43,10 +43,12 @@ PROMPT="${PROMPT:-A static eye-level camera faces a long straight footpath in a 
 NEG="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 
 # --- sanity: models present --------------------------------------------------
-for f in "nvfp4-sparse/Wan2.2-T2V-A14B_NVFP4_Sparse_high.safetensors" \
-         "nvfp4-sparse/Wan2.2-T2V-A14B_NVFP4_Sparse_low.safetensors" \
+for f in "nvfp4-sparse-sharded/high/non_block.safetensors" \
+         "nvfp4-sparse-sharded/high/block_39.safetensors" \
+         "nvfp4-sparse-sharded/low/non_block.safetensors" \
          "wan22-base-t2v/models_t5_umt5-xxl-enc-bf16.pth" \
          "wan22-base-t2v/Wan2.1_VAE.pth" \
+         "wan22-base-t2v/low_noise_model/config.json" \
          "wan22-base-t2v/google/umt5-xxl/spiece.model"; do
   [ -e "$MODELS/$f" ] || { echo "ERROR: missing model file: $MODELS/$f  (download not complete?)"; exit 1; }
 done
@@ -59,9 +61,15 @@ echo ">> Launching container…"
 # flash_attn, triton); we mount the LightX2V repo as the package source. base.sh
 # REQUIRES lightx2v_path + model_path set before sourcing (else it exit 1's), and it
 # sets PYTHONPATH, BF16 dtype, expandable_segments alloc, profiling level 2.
+# SAFETY: hard host-RAM cap. lightx2v's CPU-offload PINS weights (non-swappable);
+# on a 32GB box the full A14B offload pins ~26GB and HARD-LOCKS the host (swap can't
+# reclaim pinned pages). This cgroup cap makes the worst case a clean container
+# OOM-kill instead of a host lock. Tune MEM_CAP to leave the OS headroom.
+MEM_CAP="${MEM_CAP:-24g}"
 docker run --rm \
   --gpus "device=${GPU_IDX}" \
-  --shm-size=16g \
+  --memory="$MEM_CAP" --memory-swap="$MEM_CAP" \
+  --shm-size=8g \
   -e CUDA_VISIBLE_DEVICES=0 \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \

@@ -239,6 +239,16 @@ public:
     std::set<std::string> te_reload_ignore_tensors;
     bool te_reload_use_mmap = false;
 
+    // Lever 3 (WAN_VAE_FREE_DURING_DIT) reload support: same mechanism as the TE reload
+    // above but for the first-stage (VAE) params. Lets reload_first_stage_model() re-alloc
+    // + refill the VAE params buffer after they were freed for the DiT sample loop, so the
+    // ~254MB VAE weights don't sit resident+unused through the whole sample. Captured only
+    // when the lever env is set (one-shot CLI, !keep_diffusion_model_resident).
+    std::shared_ptr<ModelLoader> vae_reload_loader;
+    std::map<std::string, ggml_tensor*> vae_reload_tensors;
+    std::set<std::string> vae_reload_ignore_tensors;
+    bool vae_reload_use_mmap = false;
+
     // Dual-DiT (base/edit) hot-swap state. The flags mirror the boot mmap
     // config (sd_ctx_params isn't retained); the store holds the mmap of the
     // CURRENTLY-SWAPPED DiT so its file-backed pages stay alive. Reassigned on
@@ -918,7 +928,7 @@ public:
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
                 high_noise_diffusion_model->set_stream_layers_enabled(stream_layers);
-                get_param_tensors(high_noise_diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION));
+                get_param_tensors(high_noise_diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION) && !dit_no_mmap);
             }
 
             if (!ensure_backend_pair(SDBackendModule::VAE)) {
@@ -1287,6 +1297,29 @@ public:
             }
         }
 
+        // Lever 3 (WAN_VAE_FREE_DURING_DIT): capture the VAE reload state so the ~254MB
+        // first-stage params can be freed before the DiT sample loop and reloaded before
+        // decode (the VAE is otherwise resident+unused through the whole sample). Same
+        // capture pattern as the TE above, gated additionally on the lever env so the
+        // default path retains no extra loader. One-shot CLI only (the warm resident
+        // worker keeps the VAE across /generate; it has no reload hook on that side).
+        static const bool wan_vae_free_during_dit = []{
+            const char* s = getenv("WAN_VAE_FREE_DURING_DIT");
+            return s && s[0] == '1';
+        }();
+        if (wan_vae_free_during_dit && first_stage_model && free_params_immediately) {
+            for (const auto& [key, tensor] : tensors) {
+                if (starts_with(key, "first_stage_model")) {
+                    vae_reload_tensors[key] = tensor;
+                }
+            }
+            if (!vae_reload_tensors.empty()) {
+                vae_reload_ignore_tensors = ignore_tensors;
+                vae_reload_use_mmap       = sd_ctx_params->enable_mmap;
+                vae_reload_loader         = std::make_shared<ModelLoader>(model_loader);
+            }
+        }
+
         // Skip the eager DiT alloc when deferred (avatar umT5-on-GPU loads it later in
         // finalize_deferred_dit_load); otherwise alloc now and surface failure (upstream).
         if (diffusion_model && !dit_load_deferred && !diffusion_model->alloc_params_buffer()) {
@@ -1648,6 +1681,37 @@ public:
             return false;
         }
         LOG_INFO("text-encoder reloaded for prompt change, taking %.2fs",
+                 (ggml_time_ms() - t0) * 1.0f / 1000);
+        return true;
+    }
+
+    // Lever 3 (WAN_VAE_FREE_DURING_DIT): reload the first-stage (VAE) params after they
+    // were freed for the DiT sample loop. Mirrors reload_cond_stage_model(): re-alloc the
+    // params buffer (against the surviving params_ctx tensors) and refill it from the
+    // captured ModelLoader. No-op (returns true) if the VAE is still resident or no reload
+    // state was captured (lever off).
+    bool reload_first_stage_model() {
+        if (!first_stage_model) {
+            return false;
+        }
+        if (first_stage_model->get_params_buffer_size() != 0) {
+            return true;  // still resident, nothing to reload
+        }
+        if (!vae_reload_loader || vae_reload_tensors.empty()) {
+            LOG_ERROR("VAE reload requested but no reload state captured");
+            return false;
+        }
+        int64_t t0 = ggml_time_ms();
+        first_stage_model->alloc_params_buffer();
+        bool ok = vae_reload_loader->load_tensors(vae_reload_tensors,
+                                                 vae_reload_ignore_tensors,
+                                                 n_threads,
+                                                 vae_reload_use_mmap);
+        if (!ok) {
+            LOG_ERROR("VAE reload failed");
+            return false;
+        }
+        LOG_INFO("VAE reloaded before decode, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
@@ -7467,6 +7531,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                  request.frames);
     }
 
+    // Lever 3 (WAN_VAE_FREE_DURING_DIT): prepare_video_generation_embeds above finished all
+    // VAE encoding (ref/control/init latents); the VAE is not needed again until decode. Free
+    // its ~254MB params now so they don't sit resident through the VRAM-peak DiT sample loop
+    // (both the high-noise and main passes). reload_first_stage_model() restores them right
+    // before decode_video_outputs. Gated on the captured reload state (present only when the
+    // lever env is set) + one-shot CLI (!keep_diffusion_model_resident).
+    if (sd_ctx->sd->free_params_immediately &&
+        !sd_ctx->sd->keep_diffusion_model_resident &&
+        sd_ctx->sd->vae_reload_loader && !sd_ctx->sd->vae_reload_tensors.empty() &&
+        sd_ctx->sd->first_stage_model) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+        LOG_INFO("WAN_VAE_FREE_DURING_DIT: freed VAE params for the DiT sample loop");
+    }
+
     int64_t latent_start = ggml_time_ms();
     int W                = request.width / request.vae_scale_factor;
     int H                = request.height / request.vae_scale_factor;
@@ -7924,6 +8002,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             if (latent_height_out) *latent_height_out = (int)Hl;
             if (latent_frames_out) *latent_frames_out = (int)Tl;
             if (latent_channels_out) *latent_channels_out = (int)Cl;
+        }
+    }
+
+    // Lever 3 (WAN_VAE_FREE_DURING_DIT): reload the VAE params freed before the sample loop,
+    // now that the DiT VRAM peak is past and decode needs them. No-op (returns true, still
+    // resident) when the lever is off. decode_video_outputs frees the VAE again after decode.
+    if (sd_ctx->sd->free_params_immediately &&
+        !sd_ctx->sd->keep_diffusion_model_resident &&
+        sd_ctx->sd->vae_reload_loader && !sd_ctx->sd->vae_reload_tensors.empty()) {
+        if (!sd_ctx->sd->reload_first_stage_model()) {
+            LOG_ERROR("WAN_VAE_FREE_DURING_DIT: VAE reload before decode failed");
+            free_sd_audio(generated_audio);
+            return false;
         }
     }
 

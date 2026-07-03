@@ -696,6 +696,16 @@ namespace Rope {
         std::vector<std::vector<float>> vid_ids(t_len * h_len * w_len, std::vector<float>(3, 0.0));
 
         std::vector<float> t_ids = linspace<float>(1.f * t_offset, 1.f * t_len - 1 + t_offset, t_len);
+        // WAN_ZERO_T_ROPE (diagnostic, default OFF => byte-identical): collapse every temporal
+        // rope position to 0 so the (t,h,w) rope loses all temporal phase, while full 3D
+        // self-attention still runs over all T frames. Splits rope-structure vs attention:
+        // if a T-scaling spatial grid survives this, the temporal rope is exonerated and the
+        // grid is pure attention accumulation over more keys; if it vanishes, the temporal
+        // rope is implicated. Only the temporal ids are zeroed; h/w ids are unchanged.
+        static const bool wan_zero_t_rope = (getenv("WAN_ZERO_T_ROPE") != nullptr);
+        if (wan_zero_t_rope) {
+            std::fill(t_ids.begin(), t_ids.end(), 0.f);
+        }
         std::vector<float> h_ids = linspace<float>(1.f * h_offset, 1.f * h_len - 1 + h_offset, h_len);
         std::vector<float> w_ids = linspace<float>(1.f * w_offset, 1.f * w_len - 1 + w_offset, w_len);
 
