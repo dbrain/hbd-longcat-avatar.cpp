@@ -900,9 +900,21 @@ int main(int argc, const char* argv[]) {
             if (gen_params.audio_lowpass > 0.0f) {
                 setenv("LONGCAT_AUDIO_LOWPASS", std::to_string(gen_params.audio_lowpass).c_str(), 1);
             }
-            // LTXAV relip knobs -> runtime env (a2v guidance / ramp / ref-tstride). A2-safe bridge
-            // so --a2v-guidance / JSON fields work identically to the warm server.
-            gen_params.apply_ltx_relip_env();
+            // LTXAV relip knobs -> runtime env (a2v guidance / ramp / ref-tstride). CLI is a COLD
+            // process (no warm-worker sticky-value problem), so bridge only when the field was set
+            // to a NON-default via --a2v-guidance / JSON — otherwise leave the env untouched so a
+            // harness that sets LTXAV_A2V_GUIDANCE / LTXAV_RELIP_REF_TSTRIDE directly (e.g.
+            // run_ltx_relip.sh) still wins. The warm server, by contrast, MUST always-overwrite
+            // (apply_ltx_relip_env) to stop a prior render's value bleeding across requests.
+            if (gen_params.a2v_guidance != 1.0f) {
+                setenv("LTXAV_A2V_GUIDANCE", std::to_string(gen_params.a2v_guidance).c_str(), 1);
+            }
+            if (gen_params.a2v_ramp_end != 1.0f) {
+                setenv("LTXAV_A2V_RAMP_END", std::to_string(gen_params.a2v_ramp_end).c_str(), 1);
+            }
+            if (gen_params.relip_ref_tstride != 1) {
+                setenv("LTXAV_RELIP_REF_TSTRIDE", std::to_string(gen_params.relip_ref_tstride).c_str(), 1);
+            }
 
             int n_segments = std::max(1, gen_params.segments);
             if (gen_params.ltx_chain_segments > 0) {

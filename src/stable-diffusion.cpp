@@ -8922,8 +8922,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 
     // FIX 3 (LTXAV two-stage) / WAN_VAE_FREE_DURING_DIT (CLI lever): bring the video VAE back if it
     // was freed to make DiT VRAM headroom. No-op (returns true) if still resident; the merged
-    // reload_first_stage_model() dispatches to whichever reload loader was captured.
-    sd_ctx->sd->reload_first_stage_model();
+    // reload_first_stage_model() dispatches to whichever reload loader was captured. On a genuine
+    // reload FAILURE it has alloc'd but not refilled the params buffer, so abort here rather than
+    // decode garbage (the pre-merge WAN-lever path checked this; the LTX path did not).
+    if (!sd_ctx->sd->reload_first_stage_model()) {
+        LOG_ERROR("video VAE reload before decode failed");
+        free_sd_audio(generated_audio);
+        return false;
+    }
     auto result = decode_video_outputs(sd_ctx, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
     if (result == nullptr) {
         free_sd_audio(generated_audio);
