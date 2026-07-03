@@ -458,6 +458,12 @@ namespace WAN {
     static ggml_tensor* modulate_add(ggml_context* ctx, ggml_tensor* x, ggml_tensor* e) {
         // x: [N, n_token, dim]
         // e: [N, 1, dim] or [N, T, 1, dim]
+        // WAN_DIT_F16=0 (F32 residual) guard: the general F32 binbcast asserts nb10 % 4 == 0
+        // (binbcast.cu). Normalize the broadcast gate to a fresh 4-aligned F32 buffer under the
+        // F32 stream; gated on x being F32 so the prod F16 path is byte-identical (no cont node).
+        if (x->type == GGML_TYPE_F32) {
+            e = ggml_cont(ctx, e);
+        }
         if (ggml_n_dims(e) == 3) {
             int64_t T = e->ne[2];
             x         = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / T, T, x->ne[2]);  // [N, T, n_token/T, dim]
@@ -472,6 +478,11 @@ namespace WAN {
     static ggml_tensor* modulate_mul(ggml_context* ctx, ggml_tensor* x, ggml_tensor* e) {
         // x: [N, n_token, dim]
         // e: [N, 1, dim] or [N, T, 1, dim]
+        // WAN_DIT_F16=0 guard (see modulate_add): normalize the F32 broadcast gate to a
+        // 4-aligned buffer; no-op/byte-identical on the prod F16 stream.
+        if (x->type == GGML_TYPE_F32) {
+            e = ggml_cont(ctx, e);
+        }
         if (ggml_n_dims(e) == 3) {
             int64_t T = e->ne[2];
             x         = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / T, T, x->ne[2]);  // [N, T, n_token/T, dim]
@@ -911,6 +922,13 @@ namespace WAN {
 
             // patch_embedding
             x = patch_embedding->forward(ctx, x);                                                    // [N*dim, t_len, h_len, w_len]
+            // WAN_DUMP_BLOCKS (grid-divergence detector): capture the DiT token-grid dims from
+            // the patch-embed output ([w_len, h_len, t_len, N*dim]) BEFORE the flatten below, so
+            // the per-block dump hook can slice one representative frame's [w_len,h_len] plane.
+            // Default OFF => these are just read into locals, never used (byte-identical prod).
+            const int64_t wan_dump_w_len = x->ne[0];
+            const int64_t wan_dump_h_len = x->ne[1];
+            const int64_t wan_dump_t_len = x->ne[2];
             x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
 
@@ -939,6 +957,66 @@ namespace WAN {
             if (use_dit_f16 && x->type == GGML_TYPE_F32) {
                 x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
             }
+
+            // ── WAN_DUMP_BLOCKS: per-block grid-divergence detector ─────────────────────────
+            // Default OFF (env unset) => dump_plane is a no-op that adds ZERO graph nodes, so
+            // prod is byte-identical. When WAN_DUMP_BLOCKS=<dir> is set, after each transformer
+            // block (and at the DiT input + head, to bracket the whole DiT) we slice ONE
+            // representative frame from the residual token grid, channel-mean it to a compact
+            // [w_len,h_len] F32 plane, and register it as a debug tap. The tap is snapshotted +
+            // read back after graph compute by the existing capture_tensor/debug_tensors path
+            // (ggml_extend.hpp), which writes each plane to <dir>/<name>.bin (int64 ndim, then
+            // ndim int64 dims in ggml ne order [w_len,h_len], then f32 data, w fastest).
+            // tools/grid_divergence.py FFTs the planes to pinpoint the block that injects the
+            // mesh. One [w_len,h_len] plane per block (a few KB) so 40 blocks x steps can't OOM.
+            // Optional WAN_DUMP_FRAME=<t> picks the frame (default = middle; negative = from end).
+            static const bool wan_dump_blocks = (std::getenv("WAN_DUMP_BLOCKS") != nullptr);
+            static int wan_dump_call_counter  = 0;
+            const int wan_dump_step           = wan_dump_blocks ? wan_dump_call_counter++ : 0;
+            auto wan_pad = [](int v, int width) {
+                std::string s = std::to_string(v);
+                while ((int)s.size() < width) s = "0" + s;
+                return s;
+            };
+            // cut_group: the graph-cut segment group this plane rides in. Under offload the
+            // DiT graph is SPLIT into segments (compute_with_graph_cuts), and build_segment_graph
+            // rebuilds each segment from ONLY its cut-marked output nodes (ggml_graph_cut.cpp) —
+            // a plain output-flagged tap is dropped from every segment graph, so the per-segment
+            // dump never sees it (the "0 .bin files" bug). We therefore mark each plane as an
+            // extra cut-output of a segment. Block planes reuse the block's OWN existing cut group
+            // ("wan.blocks.<i>", see below) so they add ZERO segments; input/head get tiny own
+            // groups. Non-segmented runs ignore the mark and dump from the full graph as before.
+            auto dump_plane = [&](ggml_tensor* h, const std::string& tag, const std::string& cut_group) {
+                if (!wan_dump_blocks || h == nullptr || ctx->debug_tensors == nullptr) return;
+                if (wan_dump_h_len <= 0 || wan_dump_w_len <= 0 || wan_dump_t_len <= 0) return;
+                const int64_t hw = wan_dump_h_len * wan_dump_w_len;  // tokens per frame
+                if (h->ne[1] < hw) return;                           // token axis < one frame => skip (safety)
+                ggml_tensor* hc = ggml_is_contiguous(h) ? h : ggml_cont(ctx->ggml_ctx, h);
+                int64_t t0 = wan_dump_t_len / 2;                     // representative middle frame
+                if (const char* fenv = std::getenv("WAN_DUMP_FRAME")) {
+                    long v = std::atol(fenv);
+                    t0     = (v < 0) ? (wan_dump_t_len + v) : v;     // negative counts from the end
+                }
+                if (t0 < 0) t0 = 0;
+                if (t0 >= wan_dump_t_len) t0 = wan_dump_t_len - 1;
+                // One frame's tokens form a contiguous slab [dim, hw] (token layout: w fastest,
+                // h next, t outermost). View it, cast to F32 (CUDA mean is F32+contiguous only),
+                // channel-mean over dim -> [1, hw], reshape to the [w_len, h_len] image plane.
+                ggml_tensor* frame = ggml_view_2d(ctx->ggml_ctx, hc, hc->ne[0], hw,
+                                                  hc->nb[1], (size_t)(t0 * hw) * hc->nb[1]);
+                frame              = ggml_cast(ctx->ggml_ctx, frame, GGML_TYPE_F32);
+                ggml_tensor* plane = ggml_mean(ctx->ggml_ctx, frame);  // [1, hw]
+                plane              = ggml_reshape_2d(ctx->ggml_ctx, plane, wan_dump_w_len, wan_dump_h_len);
+                // Concrete output node + cut-mark so it survives segment rebuild; register it in
+                // the runner's debug_tensors so the post-compute dump (ggml_extend.hpp, gated on
+                // WAN_DUMP_BLOCKS as the output dir) writes <dir>/<tag>_step_SSSS.bin.
+                ggml_tensor* snap = ggml_cont(ctx->ggml_ctx, plane);
+                ggml_set_output(snap);
+                sd::ggml_graph_cut::mark_graph_cut(snap, cut_group, "gridplane");
+                ctx->debug_tensors->push_back({snap, tag + "_step_" + wan_pad(wan_dump_step, 4)});
+            };
+            // DiT input plane (post patch-embed, i.e. block-0 input) — the low bracket.
+            dump_plane(x, "input", "wan.dumpblocks.input");
 
             // time_embedding
             auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
@@ -1151,6 +1229,10 @@ namespace WAN {
                 if (c != nullptr) {
                     sd::ggml_graph_cut::mark_graph_cut(c, "wan.blocks." + std::to_string(i), "c");
                 }
+                // WAN_DUMP_BLOCKS: capture this block's post-residual (incl. any VACE inject) plane.
+                // Ride the block's OWN cut group ("wan.blocks.<i>", marked just above) so the plane
+                // joins this block's segment and adds no extra segment.
+                dump_plane(x, "block_" + wan_pad(i, 2), "wan.blocks." + std::to_string(i));
             }
 
             // WAN_DIT_F16: bring the residual stream back to F32 before the head so the
@@ -1160,6 +1242,9 @@ namespace WAN {
                 x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
             }
             x = head->forward(ctx, x, e);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
+
+            // WAN_DUMP_BLOCKS: DiT output plane (post final norm/head) — the high bracket.
+            dump_plane(x, "head", "wan.dumpblocks.head");
 
             return x;
         }

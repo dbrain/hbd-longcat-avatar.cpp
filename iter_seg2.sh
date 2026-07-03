@@ -32,7 +32,7 @@ FWD=""; for v in $(compgen -e | grep -E '^(GGML_|LONGCAT_|WAN_|LTX_)' || true); 
 od="$REPO/cont_$TAG"; rm -rf "$od"; mkdir -p "$od"
 echo "=== SEG2 VACE continuation [$TAG] str=$STR :: $P2 ==="
 docker run --rm --gpus '"device=1"' -e WAN_DISTILL_SIGMAS=1 -e WAN_DISTILL_SHIFT=5 \
-  -e VACE_CONT_FRAMES=$K -e VACE_CONT_LATENT=/src/cont_bank/seg1.bin -e VACE_STRENGTH=$STR -e VACE_STRENGTH_TAIL=${VACE_STRENGTH_TAIL:-} -e VACE_STRENGTH_ANCHOR_FRAMES=${VACE_STRENGTH_ANCHOR_FRAMES:-2} \
+  -e VACE_SKIP_BLOCKS=0 -e VACE_CONT_FRAMES=$K -e VACE_CONT_LATENT=/src/cont_bank/seg1.bin -e VACE_STRENGTH=$STR -e VACE_STRENGTH_TAIL=${VACE_STRENGTH_TAIL:-0.2} -e VACE_STRENGTH_ANCHOR_FRAMES=${VACE_STRENGTH_ANCHOR_FRAMES:-2} \
   -e VACE_CONT_AGC=$AGC -e VACE_CONT_AGC_TARGET=$AGCT -e LONGCAT_FFN_TILE_TOKENS=${FFNTILE:-4096} ${WAN_VAE_F16:+-e WAN_VAE_F16=$WAN_VAE_F16} $NVENV $FWD \
   -v "$REPO:/src" -v "$M:/models" -w /src "$B" \
   stdbuf -oL -eL /src/build/bin/sd-cli -M vid_gen \

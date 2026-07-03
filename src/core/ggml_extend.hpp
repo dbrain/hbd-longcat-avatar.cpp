@@ -3997,6 +3997,10 @@ protected:
                 // .bin: int64 ndim, then ndim int64 dims (ggml ne[] order,
                 // little-endian, fastest-varying first), then f32 data.
                 const char* dump_dir = getenv("LONGCAT_DUMP_DIR");
+                if (dump_dir == nullptr || dump_dir[0] == '\0') {
+                    // WAN_DUMP_BLOCKS grid-divergence detector reuses this readback path.
+                    dump_dir = getenv("WAN_DUMP_BLOCKS");
+                }
                 if (dump_dir != nullptr && dump_dir[0] != '\0') {
                     std::string path = std::string(dump_dir) + "/" + entry.second + ".bin";
                     FILE* f          = fopen(path.c_str(), "wb");

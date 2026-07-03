@@ -15,7 +15,7 @@ B="longcat-avatar-dev:builder-cudnn"
 VAE="/models/longcat-wan-vae-f16.gguf"; T5="/models/longcat-umt5-xxl-q8_0.gguf"
 W=${W:-1280}; H=${H:-704}; FR=${FR:-65}; K=5; SEED=42; OUTDIR="$REPO/tools/lightx2v-test/out"
 DISCARD=${DISCARD:-4}; DROPLAT=${DROPLAT:-1}          # drop 1 degraded latent frame (4 px) per segment
-TAIL=${VACE_STRENGTH_TAIL:-}                          # empty = scalar VACE_STRENGTH (continuation striping is a non-issue)
+TAIL=${VACE_STRENGTH_TAIL:-0.2}                       # striping ramp: gray-control smear on fast limbs; 0.2 = owner pick (2026-07)
 ANCHOR=${VACE_STRENGTH_ANCHOR_FRAMES:-2}
 AGC=${AGC:-0}; AGCT=${AGCT:-0.65}                     # AGC OFF by default — colour-lock (post) handles continuity, no pulse
 MAXV=${MAXV:-3}; VTILE=${VTILE:-0.25x0.25}
@@ -24,7 +24,7 @@ QUANT="${QUANT:-nvfp4}"; REF="${REF:-/models/_drive/flux_neon_seed7.png}"
 OUTTAG="${OUTTAG:-story_1280}"; CONTRAST=${CONTRAST:-0.85}
 VL=/models/wan22-vace-fun-a14b-low-distillT2V-$QUANT.gguf; VH=/models/wan22-vace-fun-a14b-high-distillT2V-$QUANT.gguf
 # FIT recipe env (2026-07-02): F16-rope + no-offload-pipelining. gray-suffix encode is default-on.
-NVENV="-e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FFN=1 -e GGML_FP8_LAYERS=blocks. -e GGML_CUDNN_ATTN=1 -e GGML_CUDA_F16_BCAST_FUSE=1 -e GGML_CUDA_BIAS_GELU_FUSE=1 -e GGML_CUDA_BIAS_RMS_FUSE=1 -e GGML_CUDA_RMS_MOD_FUSE=1 -e WAN_DIT_F16=1 -e WAN_ROPE_F16=1 -e LONGCAT_VAE_TEMPORAL_CHUNK=1 -e LONGCAT_NO_OFFLOAD_PIPELINING=1 -e LONGCAT_FFN_TILE_TOKENS=4096"
+NVENV="-e VACE_SKIP_BLOCKS=0 -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FFN=1 -e GGML_FP8_LAYERS=blocks. -e GGML_CUDNN_ATTN=1 -e GGML_CUDA_F16_BCAST_FUSE=1 -e GGML_CUDA_BIAS_GELU_FUSE=1 -e GGML_CUDA_BIAS_RMS_FUSE=1 -e GGML_CUDA_RMS_MOD_FUSE=1 -e WAN_DIT_F16=1 -e WAN_ROPE_F16=1 -e LONGCAT_VAE_TEMPORAL_CHUNK=1 -e LONGCAT_NO_OFFLOAD_PIPELINING=1 -e LONGCAT_FFN_TILE_TOKENS=4096"
 
 [ -s cont_bank/seg1.bin ] || { echo "ERROR: cont_bank/seg1.bin missing — run bank_seg1.sh"; exit 1; }
 [ -d cont_tail ] && [ -d cont_seg1 ] || { echo "ERROR: cont_tail/ or cont_seg1/ missing — run bank_seg1.sh"; exit 1; }

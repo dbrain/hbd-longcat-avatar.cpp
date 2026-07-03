@@ -3,6 +3,13 @@
 Single source of truth for the flags/env that make VACE continuation fit + run on the 16GB 5060 Ti.
 `iter_seg2.sh` bakes these as defaults; `run_vace_*.sh` should source the same. Don't re-derive — read this.
 
+## ★ MANDATORY QUALITY FLAGS (2026-07-04) — every VACE render MUST set these
+- **`VACE_SKIP_BLOCKS=0`** — the GRID fix. The VACE-Fun PAI-adapter's block-0 residual is mis-scaled → injects a diagonal chicken-wire mesh (worst on flat regions, scales with frame count). Kijai's documented fix. Now default in `iter_seg2.sh`/`chain_long.sh`/`render_shot.sh`. Without it, every long nvfp4 clip grids. (Root-caused 2026-07-03 after a full-day mis-chase down the nvfp4 quantizer — the grid was NEVER the quant.)
+- **`VACE_STRENGTH_TAIL=0.2 VACE_STRENGTH_ANCHOR_FRAMES=2`** (continuation windows only) — the STRIPING fix. Past the K-frame prior the control video is gray; the VACE residual from it drags fast-limb tokens toward a frozen target → directional smear on fast motion. The ramp attenuates it on the free tail (identity held by the ref-latent slot). Owner pick 0.2 (0=drift/duplicate, 0.1=bg-char drift, 0.2-0.3=clean). Do NOT set on the pure base window (no control residual there).
+
+## Perf note (measured 2026-07-04, treated as the floor)
+65f@1280 nvfp4: **t2v 760s/10.8GB, i2v 828s/11.8GB, i2v-cont 833s/11.2GB**. DiT (attention, 63360 tokens) is ~84% and at the silicon floor. **Only real speed lever = clip length** (41f=392s/9.5GB ≈ half). "Free" VRAM levers (WAN_VACE_SPLIT/XORIG) + WAN_VAE_F16 do NOT help this config (raised peak). SLA parked (crossover needs 63-84% sparsity; un-finetuned VACE won't hold; prior tests void = silent no-op until 2026-06-28). `render_shot.sh` = one-prompt internal windowing (LENGTH/uniform-action only; monolithic for arcs).
+
 ## The VRAM story (measured with `LONGCAT_VRAM_BREAKDOWN=1`, per-compute-buffer `[VRAM]` lines)
 
 At 1280×704 the peak is TWO compute buffers, not the weights or the TE:
