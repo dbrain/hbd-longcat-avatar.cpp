@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 
 #include "gguf.h"
@@ -96,6 +98,7 @@ const char* model_version_to_str[] = {
     "Longcat-Video-Avatar",
     "PiD",
     "Ideogram 4",
+    "Wan 2.2 S2V (LiveAvatar)",
 };
 
 const char* sampling_methods_str[] = {
@@ -245,6 +248,15 @@ public:
     std::shared_ptr<ModelLoader> resident_reload_loader;
     bool                          resident_reload_use_mmap = false;
 
+    // Lever 3 (WAN_VAE_FREE_DURING_DIT) reload support: same mechanism as the TE reload
+    // above but for the first-stage (VAE) params. Lets reload_first_stage_model() re-alloc
+    // + refill the VAE params buffer after they were freed for the DiT sample loop, so the
+    // ~254MB VAE weights don't sit resident+unused through the whole sample. Captured only
+    // when the lever env is set (one-shot CLI, !keep_diffusion_model_resident).
+    std::shared_ptr<ModelLoader> vae_reload_loader;
+    std::map<std::string, ggml_tensor*> vae_reload_tensors;
+    std::set<std::string> vae_reload_ignore_tensors;
+    bool vae_reload_use_mmap = false;
     // Dual-DiT (base/edit) hot-swap state. The flags mirror the boot mmap
     // config (sd_ctx_params isn't retained); the store holds the mmap of the
     // CURRENTLY-SWAPPED DiT so its file-backed pages stay alive. Reassigned on
@@ -766,9 +778,10 @@ public:
                                                                                   "model.high_noise_diffusion_model",
                                                                                   version);
                 }
-                if (diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
-                    diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
-                    diffusion_model->get_desc() == "Wan2.1-I2V-1.3B") {
+                if ((diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
+                     diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
+                     diffusion_model->get_desc() == "Wan2.1-I2V-1.3B") &&
+                    strlen(SAFE_STR(sd_ctx_params->clip_vision_path)) > 0) {
                     if (!ensure_backend_pair(SDBackendModule::CLIP_VISION)) {
                         return false;
                     }
@@ -923,7 +936,7 @@ public:
             if (high_noise_diffusion_model) {
                 high_noise_diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes);
                 high_noise_diffusion_model->set_stream_layers_enabled(stream_layers);
-                get_param_tensors(high_noise_diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION));
+                get_param_tensors(high_noise_diffusion_model, module_can_mmap(SDBackendModule::DIFFUSION) && !dit_no_mmap);
             }
 
             if (!ensure_backend_pair(SDBackendModule::VAE)) {
@@ -1045,10 +1058,22 @@ public:
                 get_param_tensors_p(audio_vae_model, vae_mmap, "");
             }
 
-            // GGML_CUDNN_CONV=1 routes VAE convs through GGML_OP_CONV_2D so the
+            // GGML_CUDNN_CONV=1 routes VAE 2D convs through GGML_OP_CONV_2D so the
             // env-gated cuDNN implicit-GEMM conv path in ggml-cuda intercepts them
             // (replacing the heavy im2col+GEMM VAE decode convs).
-            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV") || getenv("GGML_CUDNN_CONV3D")) {
+            //
+            // Do NOT enable conv2d-direct for GGML_CUDNN_CONV3D alone. That env scopes cuDNN
+            // to the *3D* convs (the im2col_3d IC*27 VRAM blowup); the 2D convs (3x3 resample +
+            // 1x1 attention qkv/proj) must stay on the fast im2col+GEMM (tensor-core) path.
+            // Forcing them to GGML_OP_CONV_2D here, while the cuDNN-conv2d interceptor only
+            // activates for GGML_CUDNN_CONV (conv2d-cudnn.cu), dropped every 2D conv onto the
+            // naive spatial conv2d_kernel (conv2d.cu) -> 2.7x slower VAE decode (the naive
+            // kernel was ~59% of GPU time; the 1x1 pointwise convs are matmuls and suffer most).
+            // With direct off these 2D convs go ggml_conv_2d -> IM2COL + MUL_MAT = the validated
+            // baseline path (zero conv2d_kernel), while 3D convs still take cuDNN (low VRAM).
+            // (vae_conv_direct + GGML_CUDNN_CONV3D is honored: conv2d-cudnn now intercepts both
+            // envs, so that explicit combo gets the cuDNN 2D path rather than the naive kernel.)
+            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV")) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {
@@ -1289,6 +1314,28 @@ public:
             resident_reload_use_mmap = sd_ctx_params->enable_mmap;
         }
 
+        // Lever 3 (WAN_VAE_FREE_DURING_DIT): capture the VAE reload state so the ~254MB
+        // first-stage params can be freed before the DiT sample loop and reloaded before
+        // decode (the VAE is otherwise resident+unused through the whole sample). Same
+        // capture pattern as the TE above, gated additionally on the lever env so the
+        // default path retains no extra loader. One-shot CLI only (the warm resident
+        // worker keeps the VAE across /generate; it has no reload hook on that side).
+        static const bool wan_vae_free_during_dit = []{
+            const char* s = getenv("WAN_VAE_FREE_DURING_DIT");
+            return s && s[0] == '1';
+        }();
+        if (wan_vae_free_during_dit && first_stage_model && free_params_immediately) {
+            for (const auto& [key, tensor] : tensors) {
+                if (starts_with(key, "first_stage_model")) {
+                    vae_reload_tensors[key] = tensor;
+                }
+            }
+            if (!vae_reload_tensors.empty()) {
+                vae_reload_ignore_tensors = ignore_tensors;
+                vae_reload_use_mmap       = sd_ctx_params->enable_mmap;
+                vae_reload_loader         = std::make_shared<ModelLoader>(model_loader);
+            }
+        }
         // Skip the eager DiT alloc when deferred (avatar umT5-on-GPU loads it later in
         // finalize_deferred_dit_load); otherwise alloc now and surface failure (upstream).
         if (diffusion_model && !dit_load_deferred && !diffusion_model->alloc_params_buffer()) {
@@ -1345,11 +1392,26 @@ public:
         // not the untruncated map key). The FP4 cuBLASLt GEMM then folds the global into alpha
         // (alpha = A_global * W_global). A legacy folded gguf has no .wglobal -> map empty ->
         // nothing registered -> GEMM multiplier defaults to 1.0 (byte-identical legacy path).
-        if (strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) > 0) {
-            std::map<std::string, float> wglobals;
-            load_nvfp4_weight_globals(sd_ctx_params->diffusion_model_path, wglobals);
-            if (!wglobals.empty()) {
-                const std::string pfx = "model.diffusion_model.";
+        // MoE models (e.g. Wan2.2) load TWO DiT ggufs, each under its own runtime prefix:
+        // the low-noise expert (--diffusion-model) as "model.diffusion_model." and the
+        // high-noise expert (--high-noise-diffusion-model) as "model.high_noise_diffusion_model.".
+        // Register each gguf's wglobals against its own prefix — registering only the low
+        // expert leaves the high expert's weights with w_global=1.0 (~1e4x too large -> NaN/wash).
+        {
+            const std::pair<const char*, std::string> dit_legs[] = {
+                {SAFE_STR(sd_ctx_params->diffusion_model_path),            "model.diffusion_model."},
+                {SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path), "model.high_noise_diffusion_model."},
+            };
+            for (const auto& leg : dit_legs) {
+                if (strlen(leg.first) == 0) {
+                    continue;
+                }
+                std::map<std::string, float> wglobals;
+                load_nvfp4_weight_globals(leg.first, wglobals);
+                if (wglobals.empty()) {
+                    continue;
+                }
+                const std::string& pfx = leg.second;
                 size_t n_reg = 0;
                 for (auto& kv : tensors) {
                     const std::string& full = kv.first;
@@ -1363,7 +1425,8 @@ public:
                         ++n_reg;
                     }
                 }
-                LOG_INFO("nvfp4: registered %zu/%zu weight globals (unfolded import)", n_reg, wglobals.size());
+                LOG_INFO("nvfp4: registered %zu/%zu weight globals (unfolded import) for %s",
+                         n_reg, wglobals.size(), pfx.c_str());
             }
         }
 
@@ -1638,12 +1701,13 @@ public:
         return true;
     }
 
-    // FIX 3 helpers: re-materialize a VAE whose params were freed for the stage-2 DiT forward.
-    // No-op (returns true) when the params are still resident, so callers can invoke unconditionally
-    // before the decode. Rebuilds the tensor map from the live model (params_ctx tensor structs
-    // survive free_params_buffer(); only their data pointers were nulled), allocs a fresh params
-    // buffer, and reloads the weights via the retained loader — exactly the reload_cond_stage_model
-    // path proven for umT5.
+    // Re-materialize a VAE whose params were freed to make DiT VRAM headroom. No-op (returns true)
+    // when still resident, so callers can invoke unconditionally before decode. Dispatches to
+    // whichever reload state was captured — the two paths are mutually exclusive (different model
+    // versions / gating): resident_reload_loader = LTXAV two-stage relip (FIX 3); vae_reload_loader
+    // = the WAN_VAE_FREE_DURING_DIT CLI lever. Both re-alloc a fresh params buffer against the
+    // surviving params_ctx tensor structs (only their data pointers were nulled by free) and reload
+    // the weights from disk via the retained loader — the reload_cond_stage_model path proven for umT5.
     bool reload_first_stage_model() {
         if (!first_stage_model) {
             return false;
@@ -1651,17 +1715,26 @@ public:
         if (first_stage_model->get_params_buffer_size() != 0) {
             return true;  // still resident
         }
-        if (!resident_reload_loader) {
-            LOG_ERROR("video VAE reload requested but no reload state captured");
-            return false;
-        }
         int64_t t0 = ggml_time_ms();
         first_stage_model->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> t;
-        first_stage_model->get_param_tensors(t, "first_stage_model");
-        std::set<std::string> ignore;
-        if (!resident_reload_loader->load_tensors(t, ignore, n_threads, resident_reload_use_mmap)) {
-            LOG_ERROR("video VAE reload failed");
+        if (resident_reload_loader) {
+            // LTXAV two-stage relip path.
+            std::map<std::string, ggml_tensor*> t;
+            first_stage_model->get_param_tensors(t, "first_stage_model");
+            std::set<std::string> ignore;
+            if (!resident_reload_loader->load_tensors(t, ignore, n_threads, resident_reload_use_mmap)) {
+                LOG_ERROR("video VAE reload failed");
+                return false;
+            }
+        } else if (vae_reload_loader && !vae_reload_tensors.empty()) {
+            // WAN_VAE_FREE_DURING_DIT lever path.
+            if (!vae_reload_loader->load_tensors(vae_reload_tensors, vae_reload_ignore_tensors,
+                                                 n_threads, vae_reload_use_mmap)) {
+                LOG_ERROR("VAE reload failed");
+                return false;
+            }
+        } else {
+            LOG_ERROR("video VAE reload requested but no reload state captured");
             return false;
         }
         LOG_INFO("video VAE reloaded for decode, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
@@ -1691,7 +1764,6 @@ public:
         LOG_INFO("audio VAE reloaded for decode, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
-
     // Pre-encode the text conditioning for a whole set of chained-segment prompts in ONE
     // text-encoder residency window, populating avatar_cond_cache. The per-segment
     // prepare_video_generation_embeds() calls then all hit the cache, so the resident DiT
@@ -2167,7 +2239,8 @@ public:
     std::vector<float> process_timesteps(const std::vector<float>& timesteps,
                                          const sd::Tensor<float>& init_latent,
                                          const sd::Tensor<float>& denoise_mask) {
-        if (diffusion_model->get_desc() == "Wan2.2-TI2V-5B" || sd_version_is_longcat_avatar(version)) {
+        if (diffusion_model->get_desc() == "Wan2.2-TI2V-5B" || sd_version_is_longcat_avatar(version) ||
+            (version == VERSION_WAN2_2_I2V && !denoise_mask.empty())) {
             // Per-frame timesteps. The avatar sets EVERY fixed-cond latent frame's
             // timestep to 0 (clean) so its adaLN/attention conditioning is treated as
             // a fully-denoised anchor. For ai2v that is the single ref-image frame
@@ -2608,7 +2681,7 @@ public:
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
             sd::Tensor<float> noised_input = x * c_in;
-            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version))) {
+            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || version == VERSION_WAN2_2_I2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version))) {
                 // ai2v: the first num_cond_latents temporal latent frames ARE the
                 // VAE-encoded reference image and must be held fixed (mask=0) through
                 // the whole denoise loop; only the generated frames (mask=1) evolve.
@@ -3017,7 +3090,22 @@ public:
         // OOMs at full res (1x1 spatial). The decode path set this; the encode path did
         // not, so --temporal-tiling silently had no effect on encode.
         first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
-        auto latents = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
+        // Decode can run full-spatial (1x1, temporal-streamed) but the encode's 4-pixel-frame
+        // temporal groups overrun both conv paths at full spatial (cuDNN CONV_3D 2^31-element
+        // limit / im2col IC*27 OOM). LONGCAT_VAE_ENCODE_REL_TILE=R (0<R<1) spatially tiles the
+        // ENCODE only (e.g. 0.5 -> 0.5x0.5) while decode keeps its own (1x1) vae_tiling_params.
+        sd_tiling_params_t enc_tp = vae_tiling_params;
+        if (const char* s = getenv("LONGCAT_VAE_ENCODE_REL_TILE")) {
+            float r = atof(s);
+            if (r > 0.f && r < 1.f) {
+                enc_tp.enabled    = true;
+                enc_tp.tile_size_x = 0;
+                enc_tp.tile_size_y = 0;
+                enc_tp.rel_size_x = r;
+                enc_tp.rel_size_y = r;
+            }
+        }
+        auto latents = first_stage_model->encode(n_threads, x, enc_tp, circular_x, circular_y);
         if (latents.empty()) {
             return {};
         }
@@ -3034,6 +3122,54 @@ public:
             latents = first_stage_model->vae_to_diffusion_latents(latents);
         }
         return latents;
+    }
+
+    // TEMPORAL-CHUNKED video encode for contexts whose VAE encode OOMs when the WHOLE
+    // temporal stack is fed at once. The base VAE encode() (vae.hpp:131) spatially tiles
+    // but — unlike decode() (vae.hpp:188 set_tiling_params) — never propagates temporal
+    // tiling, and the Wan VAE's temporal streaming is hard-gated decode-only
+    // (wan_vae.hpp:1748 `chunk >= 1 && decode_graph`), so a 25-81 frame encode at
+    // 832x456+ runs the cuDNN CONV_3D / im2col(IC*27) intermediate over ALL frames at
+    // once -> the 14.7GB OOM at "failed to encode VACE inactive context".
+    //
+    // The Wan VAE encode is 4x causal-temporal: pixel group 0 = frame[0:1] -> 1 latent
+    // frame; group i = frame[1+4(i-1):1+4i] -> 1 latent frame. Encoding each group through
+    // the (still spatially-tiled) encode_first_stage and concatenating on the temporal
+    // axis bounds the per-pass VRAM to <=4 frames x one spatial tile. For a CONSTANT (gray)
+    // input every group is bit-identical to the monolithic encode (the causal conv sees
+    // gray history either way). The VACE inactive/reactive context is gray everywhere
+    // except the kept tail frames, and those are overwritten by VACE_CONT_LATENT the
+    // instant after this returns, so the chunked result is exact wherever it is actually
+    // used. Wan-only (the 4x grouping); off-switch WAN_VACE_ENCODE_NO_TCHUNK=1.
+    sd::Tensor<float> encode_first_stage_temporal_chunked(const sd::Tensor<float>& x) {
+        static const bool disabled = [] {
+            const char* e = getenv("WAN_VACE_ENCODE_NO_TCHUNK");
+            return e != nullptr && e[0] == '1';
+        }();
+        // <=4 pixel frames already encode in a single bounded pass; non-Wan VAEs do not
+        // use the 1+4k grouping, so fall back to the plain (byte-identical) encode.
+        if (disabled || !sd_version_is_wan(version) || x.dim() < 3 || x.shape()[2] <= 4) {
+            return encode_first_stage(x);
+        }
+        const int64_t T = x.shape()[2];
+        sd::Tensor<float> out;
+        int64_t i = 0;
+        for (int64_t fs = 0; fs < T;) {
+            int64_t fe    = (i == 0) ? std::min<int64_t>(T, 1) : std::min<int64_t>(T, fs + 4);
+            auto    group = sd::ops::slice(x, 2, fs, fe);                 // [W,H,<=4,C,..]
+            auto    enc   = encode_first_stage(group);                    // 1 latent frame, spatially tiled
+            if (enc.empty()) {
+                LOG_ERROR("temporal-chunked encode failed on group %lld [%lld,%lld)",
+                          (long long)i, (long long)fs, (long long)fe);
+                return {};
+            }
+            out = out.empty() ? std::move(enc) : sd::ops::concat(out, enc, 2);
+            fs  = fe;
+            i++;
+        }
+        LOG_INFO("encode_first_stage_temporal_chunked: %lld pixel frames in %lld groups -> %lld latent frames",
+                 (long long)T, (long long)i, (long long)(out.dim() > 2 ? out.shape()[2] : 1));
+        return out;
     }
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
@@ -3894,6 +4030,57 @@ static std::vector<float> build_longcat_dmd_sigmas(int distill_steps, int num_tr
     return sigmas;
 }
 
+// Sigma grid for the Wan2.2 lightx2v DMD distill, built from n_high (structure) + n_low (detail) steps
+// around the trained boundary t=500 (boundary_step_index=2 of the trained [1000,750,500,250]). The two
+// MoE experts have distinct jobs, each its own lever:
+//   HIGH steps -> coarse structure/object coherence (the high-noise expert). More high steps fix the
+//     "two-halves car" structure failures (FINDINGS-L8f: seed123/seed7 2 high = split, 4 high = coherent).
+//     n_high evals are spaced evenly in (500,1000]: n_high=2 -> [1000,750]; n_high=4 -> [1000,875,750,625].
+//   LOW steps -> detail/cleanup; more low steps kill the few-step "dotty" grain (FINDINGS-L8d: 2+2 dotty,
+//     2+4 smooth). low evals start [500,250] then HALVE the tail (125,62,..) to refine the final denoise.
+// Trained config = n_high=2,n_low=2 -> exactly [1000,750,500,250]. Shift is the LINEAR warp
+// s=shift*r/(1+(shift-1)r), r=t/T (matches Wan fm_solvers; NOT exp/mu). The caller's --high-noise-steps
+// sets n_high (the MoE high<->low switch index), --steps sets n_low; we do NOT clobber that split.
+static std::vector<float> build_wan_distill_sigmas(int n_high, int n_low, int num_train_timesteps, float shift) {
+    const int boundary_t = num_train_timesteps / 2;  // 500: trained high<->low switch
+    if (n_high < 1) n_high = 2;
+    if (n_low < 1) n_low = 2;
+    std::vector<int> ts;
+    // HIGH region: n_high evals evenly from T down to just above the boundary (structure phase).
+    for (int i = 0; i < n_high; ++i)
+        ts.push_back(num_train_timesteps - (int)std::lround((double)i * (double)boundary_t / (double)n_high));
+    // LOW region: [boundary, boundary/2] then halve the tail (detail/cleanup phase).
+    ts.push_back(boundary_t);
+    int last = boundary_t;
+    for (int i = 1; i < n_low; ++i) { last = last > 1 ? last / 2 : 1; ts.push_back(last); }
+    std::vector<float> sigmas;
+    sigmas.reserve(ts.size() + 1);
+    for (int t : ts) {
+        double r = (double)t / (double)num_train_timesteps;
+        double s = (double)shift * r / (1.0 + ((double)shift - 1.0) * r);
+        sigmas.push_back((float)s);
+    }
+    sigmas.push_back(0.0f);  // terminal
+    return sigmas;
+}
+
+// Flow-shift for the Wan2.2 lightx2v DMD distill. NOTE: deliberately NOT resolution-coupled.
+// A multi-res shift A/B (FINDINGS-L8c: 768x432 / 640x640 / 1280x720 x shift {3,5,7,9,11}, face
+// close-up) showed the shift lever is ~FLAT for 5..11 at EVERY resolution (only shift 3 is
+// clearly worse — dark/murky) and shows NO resolution dependence — confirming the lightx2v
+// finding that "the shift lever is nearly dead at 4-step distill" (res-coupling matters for the
+// FULL-STEP base path, shift 12 native, not the distill). So a single fixed shift ~7 is correct
+// across 432p..720p; 7 is in the sweet spot everywhere and marginally crisper than 5. Overridable
+// via WAN_DISTILL_SHIFT for experimentation. (seq_len arg kept for the log line only.)
+static float wan_distill_shift(int /*spatial_seq_len*/) {
+    const char* s = getenv("WAN_DISTILL_SHIFT");
+    if (s != nullptr && s[0] != '\0') {
+        float v = static_cast<float>(atof(s));
+        if (v > 0.0f) return v;
+    }
+    return 7.0f;
+}
+
 static enum sample_method_t resolve_sample_method(sd_ctx_t* sd_ctx, enum sample_method_t sample_method) {
     if (sample_method == SAMPLE_METHOD_COUNT) {
         return sd_get_default_sample_method(sd_ctx);
@@ -4007,6 +4194,13 @@ struct GenerationRequest {
         strength                    = sd_vid_gen_params->strength;
         cache_params                = &sd_vid_gen_params->cache;
         vace_strength               = sd_vid_gen_params->vace_strength;
+        // VACE_STRENGTH env override: scales the vace branch residual (c_skip *= strength).
+        // Set 0 for pure-t2v seg0 (gray control -> the undistilled vace branch stipples; zeroing
+        // it = pure base t2v = clean) and keep 1 for i2v/continuation (real reference control).
+        if (const char* vs = getenv("VACE_STRENGTH")) {
+            vace_strength = (float)atof(vs);
+            LOG_INFO("VACE_STRENGTH override: vace branch scaled to %.3f", vace_strength);
+        }
         guidance                    = sd_vid_gen_params->sample_params.guidance;
         high_noise_guidance         = sd_vid_gen_params->high_noise_sample_params.guidance;
         hires                       = sd_vid_gen_params->hires;
@@ -4306,6 +4500,28 @@ struct SamplePlan {
             total_steps   = static_cast<int>(sigmas.size()) - 1;
             sample_steps  = total_steps;
             LOG_INFO("LongCat-Avatar DMD distilled schedule: %d steps", total_steps);
+        }
+
+        // Wan2.2 lightx2v DMD distill (wan22-*-distill GGUFs): SAME bug as LongCat above —
+        // the few-step distill needs its native DMD sigma grid ([1000,750,500,250] @ shift,
+        // = build_longcat_dmd_sigmas), but Wan2.2 falls through to the generic Discrete
+        // scheduler which emits t=[999,666,333,0]+0 = a WASTED step on the WRONG grid ->
+        // under-denoised "murk" (FINDINGS-L8, confirmed by --sigmas A/B). Opt-in via
+        // WAN_DISTILL_SIGMAS=1 (the FULL-STEP VACE-Fun base must NOT use this — no model-side
+        // marker distinguishes them, so it's an explicit env gate). Shift is resolution-coupled
+        // like LTX2. Unlike the avatar branch this MUST NOT clobber sample_steps /
+        // high_noise_sample_steps — Wan2.2 is MoE and that split drives the high<->low expert
+        // switch; we replace ONLY the sigma grid (count stays total_steps).
+        else if (sd_version_is_wan(sd_ctx->sd->version) &&
+                 getenv("WAN_DISTILL_SIGMAS") != nullptr &&
+                 sample_params->custom_sigmas_count <= 0) {
+            int n_high    = high_noise_sample_steps > 0 ? high_noise_sample_steps : 2;
+            int n_low     = sample_steps > 0 ? sample_steps : 2;
+            int seq_len   = sd_ctx->sd->get_image_seq_len(request->height, request->width);
+            float shift   = wan_distill_shift(seq_len);
+            sigmas        = build_wan_distill_sigmas(n_high, n_low, 1000, shift);
+            LOG_INFO("Wan2.2 DMD distilled schedule: %d high + %d low steps, shift=%.2f (seq_len=%d)",
+                     n_high, n_low, shift, seq_len);
         }
 
         eta = resolve_eta(sd_ctx, eta, sample_method);
@@ -6481,10 +6697,22 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-FLF2V-14B") {
         LOG_INFO("IMG2VID");
 
+        // WAN LATENT CHAINING: number of leading conditioning (mask=1) latent frames.
+        // 0 in the normal (non-chained) path -> the mask below marks only frame 0 (or
+        // nothing) exactly as before; the WAN_CONT_LATENT block (after the VAE encode)
+        // raises this to anchor(0|1)+K when a prior-segment tail is injected.
+        int64_t wan_cont_known = 0;
+
         if (sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
             sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-I2V-1.3B" ||
             sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-FLF2V-14B") {
-            if (!start_image.empty()) {
+            if (sd_ctx->sd->clip_vision == nullptr) {
+                // Wan2.1-I2V with no --clip-vision model: feed zeroed clip_fea [1280,257]
+                // instead of failing. Degrades identity (the 257 image tokens are an
+                // appearance anchor) but lets the i2v path run from c_concat alone.
+                LOG_WARN("Wan2.1-I2V with no clip_vision: feeding zero clip_fea [1280,257]");
+                latents.clip_vision_output = sd::zeros<float>({1280, 257});
+            } else if (!start_image.empty()) {
                 auto clip_vision_output = sd_ctx->sd->get_clip_vision_output(start_image, false, -2);
                 if (clip_vision_output.empty()) {
                     LOG_ERROR("failed to compute clip vision output for init image");
@@ -6532,6 +6760,299 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         int64_t t2 = ggml_time_ms();
         LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
 
+        // ====================================================================
+        // WAN LATENT CHAINING (velocity-preserving long-form i2v). DEFAULT OFF:
+        // this whole block is skipped unless a prior-segment tail is supplied
+        // (sd_vid_gen_params->cont_latent in-memory, OR env WAN_CONT_LATENT=path),
+        // so the normal i2v/t2v path stays byte-identical.
+        //
+        // Wan2.x-I2V conditions purely via the c_concat side channel:
+        //   concat_latent = [4 mask channels ++ VAE-encoded conditioning video]
+        // (the latent is built just above; the mask is prepended just below). The
+        // mask channels flag which latent frames are "known"; the DiT copies those
+        // and synthesizes the rest. To chain segments WITHOUT restarting motion we
+        // inject the PRIOR segment's last K diffusion-latent frames (its motion-
+        // carrying tail) into the HEAD of concat_latent and mark them known. With
+        // K>1 the DiT sees the trajectory (position AND velocity), so it continues
+        // the motion instead of re-accelerating from a still. The banked tail
+        // (WAN_SAVE_LATENT) is already in encode_first_stage's (mu-mean)/std space
+        // — same as concat_latent — so it drops in directly, with NO pixel
+        // decode/re-encode roundtrip. Mirrors VACE_CONT_LATENT (the inactive-
+        // context backdoor) and the LTXAV in-memory/file cont-latent paths.
+        // ====================================================================
+        {
+            const float* mem_tail        = nullptr;
+            int64_t       mem_tail_frames = 0;
+            if (sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+                mem_tail        = sd_vid_gen_params->cont_latent;
+                mem_tail_frames = sd_vid_gen_params->cont_latent_frames;
+            }
+            const char* file_tail = getenv("WAN_CONT_LATENT");
+            bool        have_file = (file_tail != nullptr && file_tail[0] != '\0');
+
+            if (mem_tail != nullptr || have_file) {
+                int64_t Wl = latents.concat_latent.shape()[0];
+                int64_t Hl = latents.concat_latent.shape()[1];
+                int64_t Tl = latents.concat_latent.shape()[2];
+                int64_t Cl = latents.concat_latent.dim() > 3 ? latents.concat_latent.shape()[3] : 1;
+
+                // K in LATENT frames from WAN_CONT_K (in PIXEL frames): the Wan VAE is
+                // 4x temporal, so K_lat = (K_pix - 1) / 4 + 1 (same arithmetic as
+                // VACE_CONT_LATENT). Default 5 pixel frames -> 2 latent overlap frames.
+                int kpix = 5;
+                if (const char* e = getenv("WAN_CONT_K")) {
+                    int v = atoi(e);
+                    if (v > 0) kpix = v;
+                }
+                int64_t K_lat = std::min<int64_t>((std::min<int64_t>(kpix, request->frames) - 1) / 4 + 1, Tl);
+                if (K_lat < 1) K_lat = 1;
+
+                // per-channel mean/std over (W,H,T) for each latent channel c. The ggml
+                // layout is channel-major-contiguous (idx = ((c*T+t)*H+h)*W+w), so each
+                // channel occupies a contiguous T*H*W block at offset c*T*H*W.
+                auto per_channel_stats = [](const sd::Tensor<float>& tt,
+                                            std::vector<double>& mean,
+                                            std::vector<double>& stdv) {
+                    int64_t W = tt.shape()[0], H = tt.shape()[1], T = tt.shape()[2];
+                    int64_t C   = tt.dim() > 3 ? tt.shape()[3] : 1;
+                    int64_t per = W * H * T;
+                    const float* d = tt.data();
+                    mean.assign((size_t)C, 0.0);
+                    stdv.assign((size_t)C, 0.0);
+                    for (int64_t c = 0; c < C; ++c) {
+                        const float* base = d + c * per;
+                        double s = 0.0, sq = 0.0;
+                        for (int64_t i = 0; i < per; ++i) {
+                            double v = base[i];
+                            s += v;
+                            sq += v * v;
+                        }
+                        double m   = s / (double)per;
+                        double var = sq / (double)per - m * m;
+                        mean[(size_t)c] = m;
+                        stdv[(size_t)c] = var > 0.0 ? std::sqrt(var) : 0.0;
+                    }
+                };
+
+                // Build the [Wl,Hl,K_lat,Cl,1] tail tensor from whichever source.
+                sd::Tensor<float> cont_tail;
+                bool              ok = false;
+                if (have_file) {
+                    try {
+                        auto    cont_full = sd::load_tensor_from_file_as_tensor<float>(file_tail);
+                        int64_t Tprev     = cont_full.shape()[2];
+                        int64_t Cprev     = cont_full.dim() > 3 ? cont_full.shape()[3] : 1;
+                        int64_t K         = std::min<int64_t>(K_lat, Tprev);
+                        if (cont_full.shape()[0] != Wl || cont_full.shape()[1] != Hl || Cprev != Cl) {
+                            LOG_ERROR("WAN_CONT_LATENT: shape mismatch, saved latent (%dx%dx%dx%d) "
+                                      "incompatible with concat_latent (%dx%dx%dx%d); skipping injection",
+                                      (int)cont_full.shape()[0], (int)cont_full.shape()[1], (int)Tprev, (int)Cprev,
+                                      (int)Wl, (int)Hl, (int)Tl, (int)Cl);
+                        } else {
+                            cont_tail = sd::ops::slice(cont_full, 2, Tprev - K, Tprev);  // last K latent frames
+                            cont_tail.reshape_({Wl, Hl, K, Cl, 1});
+                            K_lat = K;
+                            ok    = true;
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("WAN_CONT_LATENT: failed to load %s: %s (keeping gray conditioning)", file_tail, e.what());
+                    }
+                } else {
+                    // In-memory (in-process chaining): the caller passes exactly the last
+                    // mem_tail_frames latent frames, [Wl,Hl,K,Cl] W-fastest (LTXAV contract).
+                    int64_t K = std::min<int64_t>(K_lat, mem_tail_frames);
+                    cont_tail = sd::Tensor<float>({Wl, Hl, K, Cl, 1});
+                    std::memcpy(cont_tail.data(), mem_tail, (size_t)cont_tail.numel() * sizeof(float));
+                    K_lat = K;
+                    ok    = true;
+                }
+
+                if (ok && K_lat >= 1) {
+                    // ---- Phase 3: ABSOLUTE-ANCHOR AGC (anti-drift) BEFORE injection ----
+                    // The carried tail is the prior segment's highest-variance frames; re-
+                    // injecting it as conditioning ratchets contrast/colour up every cut
+                    // (the VACE 0.64->0.80->0.92 runaway). We pull it back to a FIXED
+                    // reference (seg-0), NOT to the previous segment — an absolute anchor
+                    // is a regulator, a relative match is a random walk (why the pixel
+                    // exposure-match drifted). Two modes:
+                    //   WAN_CONT_AGC_REF=<seg0 latent>  -> per-channel mean+std match to
+                    //       seg-0 (controls BOTH contrast and colour/luma drift; fix opt 2).
+                    //   else                            -> global std -> WAN_CONT_AGC_TARGET
+                    //       (default 0.65), uniform gain about the global mean
+                    //       (VACE_CONT_AGC-equivalent; preserves brightness + channel ratios).
+                    if (const char* a = getenv("WAN_CONT_AGC"); a != nullptr && a[0] == '1') {
+                        const char* refp = getenv("WAN_CONT_AGC_REF");
+                        if (refp != nullptr && refp[0] != '\0') {
+                            try {
+                                auto                ref = sd::load_tensor_from_file_as_tensor<float>(refp);
+                                std::vector<double> rm, rs, cm, cs;
+                                per_channel_stats(ref, rm, rs);
+                                per_channel_stats(cont_tail, cm, cs);
+                                int64_t W = cont_tail.shape()[0], H = cont_tail.shape()[1], T = cont_tail.shape()[2];
+                                int64_t C   = cont_tail.dim() > 3 ? cont_tail.shape()[3] : 1;
+                                int64_t per = W * H * T;
+                                if ((int64_t)rm.size() == C) {
+                                    float* d = cont_tail.data();
+                                    for (int64_t c = 0; c < C; ++c) {
+                                        double g = (cs[(size_t)c] > 1e-6) ? (rs[(size_t)c] / cs[(size_t)c]) : 1.0;
+                                        if (g < 0.5) g = 0.5;  // gentle clamp: de-drift, don't regrade
+                                        if (g > 2.0) g = 2.0;
+                                        float* base = d + c * per;
+                                        for (int64_t i = 0; i < per; ++i)
+                                            base[i] = (float)((base[i] - cm[(size_t)c]) * g + rm[(size_t)c]);
+                                    }
+                                    LOG_INFO("WAN_CONT_AGC: per-channel mean+std anchored to ref %s (%lld ch, absolute)",
+                                             refp, (long long)C);
+                                } else {
+                                    LOG_WARN("WAN_CONT_AGC: ref channel count %lld != tail %lld; skipping AGC",
+                                             (long long)rm.size(), (long long)C);
+                                }
+                            } catch (const std::exception& e) {
+                                LOG_ERROR("WAN_CONT_AGC: failed to load ref %s: %s (skipping AGC)", refp, e.what());
+                            }
+                        } else {
+                            float target = 0.65f;
+                            if (const char* t = getenv("WAN_CONT_AGC_TARGET"); t != nullptr && t[0] != '\0') {
+                                float v = (float)atof(t);
+                                if (v > 0.0f) target = v;
+                            }
+                            float*  d = cont_tail.data();
+                            int64_t n = cont_tail.numel();
+                            if (n > 1) {
+                                double sum = 0.0, sq = 0.0;
+                                for (int64_t i = 0; i < n; ++i) {
+                                    sum += d[i];
+                                    sq += (double)d[i] * d[i];
+                                }
+                                double mean = sum / (double)n;
+                                double var  = sq / (double)n - mean * mean;
+                                double cur  = var > 0.0 ? std::sqrt(var) : 0.0;
+                                if (cur > 1e-6) {
+                                    float g = (float)(target / cur);
+                                    for (int64_t i = 0; i < n; ++i)
+                                        d[i] = (float)((d[i] - mean) * g + mean);
+                                    LOG_INFO("WAN_CONT_AGC: global std %.4f -> %.4f (gain %.3f, fixed target)",
+                                             cur, target, g);
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- Phase 3: APPEARANCE ANCHOR (anti style/identity drift) ----
+                    // Every M segments, ALSO pin seg-0's frame-0 latent at the head (mask=1)
+                    // so the character can't migrate off the source over a long chain. The
+                    // anchor source defaults to WAN_CONT_AGC_REF (the seg-0 latent already
+                    // used by AGC) or a dedicated WAN_CONT_ANCHOR path. Segment index is
+                    // passed by the chain driver via WAN_CONT_SEG_INDEX. Layout becomes
+                    // [anchor(1), tail(K), generated...]; the anchor+overlap are dropped at
+                    // stitch time. Mirrors the LTXAV cont-anchor.
+                    int64_t base_idx = 0;
+                    // ---- INIT-IMG APPEARANCE ANCHOR (VACE-style clean-reference pin) ----
+                    // The clean --init-img VAE encoding already sits at concat_latent idx 0
+                    // (the [init, gray, gray...] encode at ~:6104). The plain chain (base_idx
+                    // 0) and the seg1-frame-0 anchor below both OVERWRITE it — the former with
+                    // the motion tail, the latter with seg-1's already-diffused (drifted)
+                    // frame-0 latent. Either way the DiT re-derives appearance from a non-
+                    // pristine source -> identity slides to a similar-but-different face
+                    // (owner: "like i2v on the blurry final frame, not the original
+                    // character"). VACE held identity by pinning the ORIGINAL reference image
+                    // through its ref slot; mirror that here: PRESERVE the clean init-img
+                    // latent at idx 0 (mask=1, untouched) and inject the motion tail at idx 1+.
+                    // So every continuation segment keeps the true source character as a hard
+                    // known anchor, while the tail still carries velocity. Off by default.
+                    bool initimg_anchor = false;
+                    if (const char* e = getenv("WAN_CONT_ANCHOR_INITIMG");
+                        e != nullptr && e[0] == '1' && !start_image.empty() && (K_lat + 1) <= Tl) {
+                        base_idx       = 1;  // leave concat_latent[idx 0] = clean init-img encoding
+                        initimg_anchor = true;
+                        LOG_INFO("WAN_CONT_ANCHOR_INITIMG: pinned clean --init-img latent at idx 0 "
+                                 "(VACE-style ref); motion tail injects at idx 1");
+                    }
+                    int     anchor_every = 0;
+                    if (const char* e = getenv("WAN_CONT_ANCHOR_EVERY")) anchor_every = atoi(e);
+                    int seg_index = 0;
+                    if (const char* e = getenv("WAN_CONT_SEG_INDEX")) seg_index = atoi(e);
+                    const char* anchor_path = getenv("WAN_CONT_ANCHOR");
+                    if (anchor_path == nullptr || anchor_path[0] == '\0') anchor_path = getenv("WAN_CONT_AGC_REF");
+                    if (!initimg_anchor && anchor_every > 0 && seg_index > 0 && (seg_index % anchor_every) == 0 &&
+                        anchor_path != nullptr && anchor_path[0] != '\0' && (K_lat + 1) <= Tl) {
+                        try {
+                            auto anchor_full = sd::load_tensor_from_file_as_tensor<float>(anchor_path);
+                            int64_t Cancc    = anchor_full.dim() > 3 ? anchor_full.shape()[3] : 1;
+                            if (anchor_full.shape()[0] == Wl && anchor_full.shape()[1] == Hl && Cancc == Cl) {
+                                auto anchor = sd::ops::slice(anchor_full, 2, 0, 1);  // original char = frame 0
+                                anchor.reshape_({Wl, Hl, 1, Cl, 1});
+                                sd::ops::slice_assign(&latents.concat_latent, 2, 0, 1, anchor);
+                                base_idx = 1;
+                                LOG_INFO("WAN_CONT_ANCHOR: pinned seg-0 frame-0 latent at idx 0 (seg %d, every %d)",
+                                         seg_index, anchor_every);
+                            } else {
+                                LOG_WARN("WAN_CONT_ANCHOR: shape mismatch %s; skipping anchor", anchor_path);
+                            }
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("WAN_CONT_ANCHOR: failed to load %s: %s", anchor_path, e.what());
+                        }
+                    }
+
+                    // clamp the overlap so anchor + tail fit the segment
+                    if (base_idx + K_lat > Tl) {
+                        K_lat = Tl - base_idx;
+                        cont_tail = sd::ops::slice(cont_tail, 2, 0, K_lat);
+                        cont_tail.reshape_({Wl, Hl, K_lat, Cl, 1});
+                    }
+
+                    // ---- inject the (AGC'd) tail into the C-channel latent head ----
+                    // concat_latent is still the bare C-channel latent here (the 4 mask
+                    // channels are prepended below), so this writes the full Cl channels of
+                    // frames [base_idx .. base_idx+K_lat).
+                    sd::ops::slice_assign(&latents.concat_latent, 2, base_idx, base_idx + K_lat, cont_tail);
+                    wan_cont_known = base_idx + K_lat;
+                    LOG_INFO("WAN_CONT_LATENT: injected %lld tail latent frames at idx %lld "
+                             "(known=%lld of %lld, K_pix=%d, %s) bypassing pixel re-encode",
+                             (long long)K_lat, (long long)base_idx, (long long)wan_cont_known,
+                             (long long)Tl, kpix, have_file ? "file" : "in-memory");
+
+                    // ---- i2v FREEZE-BASED CONTINUATION (sidesteps the broken VACE
+                    // distill; the clean uniformly-distilled i2v expert does the chain) ----
+                    // The c_concat tail-inject above only TELLS the DiT "these head frames
+                    // are known," but Wan2.2-I2V was trained for SINGLE-image c_concat
+                    // conditioning, so the tail alone often fails to truly continue motion
+                    // (the old WAN_CONT_LATENT path that "failed"). Additionally PIN the
+                    // injected tail in the diffusion latent itself: write it into
+                    // init_latent and hold those frames fixed via denoise_mask=0 + a clean
+                    // (t=0) per-frame timestep — exactly the TI2V/avatar input-freeze
+                    // (sample loop ~:2543 + process_timesteps ~:2130, now ungated for
+                    // VERSION_WAN2_2_I2V). The remaining frames (mask=1) generate and
+                    // continue from the frozen tail.
+                    //   - byte-identical for every non-continuation path: this whole block
+                    //     only runs when a cont tail was injected (mem_tail/WAN_CONT_LATENT).
+                    //   - off-switch: WAN_I2V_CONT_FREEZE_DISABLE=1 reverts to the old
+                    //     c_concat-tail-inject-only behaviour (mask/init_latent untouched).
+                    if (sd_ctx->sd->version == VERSION_WAN2_2_I2V &&
+                        getenv("WAN_I2V_CONT_FREEZE_DISABLE") == nullptr) {
+                        // zeros base (generated frames) + the AGC'd tail at [base_idx, base_idx+K_lat)
+                        latents.init_latent = sd_ctx->sd->generate_init_latent(
+                            request->width, request->height, request->frames, true);  // sd::zeros, no RNG
+                        if (latents.init_latent.shape()[2] == Tl && latents.init_latent.shape()[3] == Cl) {
+                            sd::ops::slice_assign(&latents.init_latent, 2, base_idx, base_idx + K_lat, cont_tail);
+                            latents.denoise_mask = sd::full<float>({Wl, Hl, Tl, 1, 1}, 1.f);
+                            sd::ops::fill_slice(&latents.denoise_mask, 2, base_idx, base_idx + K_lat, 0.0f);
+                            LOG_INFO("WAN_I2V_CONT_FREEZE: pinned %lld tail latent frames [%lld,%lld) "
+                                     "at clean timestep (mask=0); %lld frames generate",
+                                     (long long)K_lat, (long long)base_idx, (long long)(base_idx + K_lat),
+                                     (long long)(Tl - (base_idx + K_lat)));
+                        } else {
+                            LOG_WARN("WAN_I2V_CONT_FREEZE: init_latent (T=%lld C=%lld) != concat (T=%lld C=%lld); "
+                                     "skipping freeze (c_concat-only continuation)",
+                                     (long long)latents.init_latent.shape()[2], (long long)latents.init_latent.shape()[3],
+                                     (long long)Tl, (long long)Cl);
+                            latents.init_latent = sd::Tensor<float>();  // clear -> default rebuild at ~:6734
+                        }
+                    }
+                }
+            }
+        }
+
         sd::Tensor<float> concat_mask = sd::zeros<float>({latents.concat_latent.shape()[0],
                                                           latents.concat_latent.shape()[1],
                                                           latents.concat_latent.shape()[2],
@@ -6539,6 +7060,12 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                           1});  // [b, 4, t, h/vae_scale_factor, w/vae_scale_factor]
         if (!start_image.empty()) {
             sd::ops::fill_slice(&concat_mask, 2, 0, 1, 1.0f);
+        }
+        // WAN LATENT CHAINING: mark the injected anchor+overlap frames [0..wan_cont_known)
+        // as known (mask=1) so the DiT treats them as given context and continues from
+        // them. 0 in the non-chained path -> behaviour unchanged.
+        if (wan_cont_known > 0) {
+            sd::ops::fill_slice(&concat_mask, 2, 0, wan_cont_known, 1.0f);
         }
         if (!end_image.empty()) {
             auto last_channel = sd::ops::slice(concat_mask, 3, 3, 4);
@@ -6683,6 +7210,14 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     } else if (sd_ctx->sd->diffusion_model->get_desc() == "Wan2.1-VACE-1.3B" ||
                sd_ctx->sd->diffusion_model->get_desc() == "Wan2.x-VACE-14B") {
         LOG_INFO("VACE");
+        // Continuation mode: keep the first K control frames (mask=0, inactive context) and
+        // generate the rest, so the segment continues from the prior segment's carried-over
+        // tail. Default 0 = control mode (all frames reactive/generated). Env-toggled to match
+        // the codebase's experimental-flag pattern (no public-struct churn).
+        int vace_cont_frames = 0;
+        if (const char* e = getenv("VACE_CONT_FRAMES")) {
+            vace_cont_frames = std::max(0, atoi(e));
+        }
         int64_t t1 = ggml_time_ms();
         sd::Tensor<float> ref_image_latent;
         if (!start_image.empty()) {
@@ -6703,18 +7238,219 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         }
 
         sd::Tensor<float> mask = sd::full<float>({request->width, request->height, request->frames, 1, 1}, 1.0f);
+        if (vace_cont_frames > 0) {
+            int kpx = std::min<int>(vace_cont_frames, static_cast<int>(request->frames));
+            sd::ops::fill_slice(&mask, 2, 0, kpx, 0.0f);  // keep first K pixel frames (continuation context)
+            LOG_INFO("VACE continuation: %d kept pixel frames (mask=0)", kpx);
+        }
 
         control_video              = control_video - 0.5f;
         sd::Tensor<float> inactive = control_video * (1.0f - mask) + 0.5f;
         sd::Tensor<float> reactive = control_video * mask + 0.5f;
 
-        inactive = sd_ctx->sd->encode_first_stage(inactive);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
+        // VACE GRAY-LATENT FAST PATH (lever #1 — the ~30s control-context encode).
+        // For a fresh segment with no active control frames, BOTH inactive and reactive
+        // collapse to full(0.5) gray; for a continuation, reactive is still all-gray and
+        // inactive's gray tail dominates. VAE-encoding a constant is deterministic and
+        // input-independent, so we encode the gray volume ONCE per (W,H,T) and reuse it
+        // (in-run dedup of inactive==reactive). An optional cross-run disk cache
+        // (VACE_GRAY_CACHE_DIR) makes the gray encode free on every segment of a chain.
+        // Substituting cache[x]==encode(x) for an all-gray x is bit-exact by construction.
+        // VACE_NO_GRAY_FAST=1 disables (for A/B).
+        const bool vace_gray_fast = !(getenv("VACE_NO_GRAY_FAST") && getenv("VACE_NO_GRAY_FAST")[0] == '1');
+        // Gray-SUFFIX fast encode (default ON): the `inactive` context is [real kept tail
+        // (kpx px) + gray (rest)] — is_const_gray is false so it falls to the full
+        // temporal-chunked encode (~179s @65f). But that encode groups the frames as
+        // 1 + 4k and encodes each group INDEPENDENTLY, so every group past the tail is the
+        // SAME constant-gray latent, and the leading (tail) latent frames get OVERWRITTEN by
+        // VACE_CONT_LATENT the instant after. So we only need: encode the real prefix
+        // (rounded up to a group boundary) + ONE gray group, then tile the gray latent for
+        // the suffix. Bit-exact by construction. Off-switch VACE_NO_GRAY_SUFFIX=1.
+        const bool vace_gray_suffix = !(getenv("VACE_NO_GRAY_SUFFIX") && getenv("VACE_NO_GRAY_SUFFIX")[0] == '1');
+        const char* gray_cache_dir = getenv("VACE_GRAY_CACHE_DIR");
+        static std::map<std::array<int64_t, 3>, sd::Tensor<float>> vace_gray_cache;
+        auto is_const_gray = [](const sd::Tensor<float>& x) {
+            if (x.numel() <= 0) return false;
+            const float* d = x.data();
+            for (int64_t i = 0, n = x.numel(); i < n; ++i) {
+                if (d[i] != 0.5f) return false;
+            }
+            return true;
+        };
+        auto vace_encode_ctx = [&](const sd::Tensor<float>& x, const char* tag) -> sd::Tensor<float> {
+            if (!vace_gray_fast || !is_const_gray(x)) {
+                // Gray-SUFFIX fast path: the continuation `inactive` = [real kept tail px +
+                // gray px]. encode_first_stage_temporal_chunked groups frames 1 + 4k and
+                // encodes each group INDEPENDENTLY (no cross-group causal state), so every
+                // group past the real tail is the SAME constant-gray latent. Encode only the
+                // real prefix (rounded up to a group boundary — the extra gray frames inside
+                // it are byte-identical to the full encode's groups) + ONE gray group, and
+                // tile the gray latent for the rest. Bit-exact; ~6x fewer VAE graphs.
+                if (vace_gray_fast && vace_gray_suffix && sd_version_is_wan(sd_ctx->sd->version) &&
+                    x.dim() >= 3 && x.shape()[2] > 5) {
+                    const int64_t T = x.shape()[2];
+                    int64_t last_real = -1;
+                    for (int64_t t = 0; t < T; ++t) {
+                        if (!is_const_gray(sd::ops::slice(x, 2, t, t + 1))) last_real = t;
+                    }
+                    if (last_real >= 0 && last_real < T - 1) {
+                        const int64_t k  = (last_real + 3) / 4;  // ceil(last_real/4): #groups covering real px past frame 0
+                        const int64_t sb = 1 + 4 * k;            // first temporal-group boundary at/after the real px
+                        if (sb < T && (T - sb) % 4 == 0) {
+                            auto prefix     = sd_ctx->sd->encode_first_stage_temporal_chunked(sd::ops::slice(x, 2, 0, sb));
+                            auto gray_group = sd::ops::slice(x, 2, sb, sb + 4);           // 4 gray px -> 1 gray latent frame
+                            auto gray_lat   = sd_ctx->sd->encode_first_stage(gray_group);
+                            if (!prefix.empty() && !gray_lat.empty()) {
+                                const int64_t n_suf = (T - sb) / 4;
+                                auto suffix = gray_lat;
+                                for (int64_t i = 1; i < n_suf; ++i) suffix = sd::ops::concat(suffix, gray_lat, 2);
+                                auto out = sd::ops::concat(prefix, suffix, 2);
+                                LOG_INFO("VACE gray-suffix fast encode (%s): real prefix [0,%lld) + %lld tiled gray "
+                                         "latent frames (was %lld temporal groups)",
+                                         tag, (long long)sb, (long long)n_suf, (long long)(1 + (T - 1 + 3) / 4));
+                                return out;
+                            }
+                        }
+                    }
+                }
+                // Temporal-chunked fallback: the inactive context (real kept tail + gray) is a
+                // genuine 25-81 frame video encode that OOMs full-temporal at useful res.
+                return sd_ctx->sd->encode_first_stage_temporal_chunked(x);
+            }
+            std::array<int64_t, 3> key{request->width, request->height, x.shape()[2]};
+            if (auto it = vace_gray_cache.find(key); it != vace_gray_cache.end()) {
+                LOG_INFO("VACE gray-latent cache hit (%s, skipped VAE encode)", tag);
+                return it->second;
+            }
+            std::string gray_path;
+            if (gray_cache_dir && gray_cache_dir[0] != '\0') {
+                gray_path = std::string(gray_cache_dir) + "/vace_gray_" + std::to_string(key[0]) + "x" +
+                            std::to_string(key[1]) + "x" + std::to_string(key[2]) + ".bin";
+                try {
+                    auto cached = sd::load_tensor_from_file_as_tensor<float>(gray_path);
+                    if (!cached.empty()) {
+                        LOG_INFO("VACE gray-latent disk-cache hit (%s, %s, skipped VAE encode)", tag, gray_path.c_str());
+                        vace_gray_cache[key] = cached;
+                        return cached;
+                    }
+                } catch (const std::exception&) { /* miss → compute below */ }
+            }
+            auto enc = sd_ctx->sd->encode_first_stage_temporal_chunked(x);
+            if (!enc.empty()) {
+                vace_gray_cache[key] = enc;
+                if (!gray_path.empty()) {
+                    try {
+                        sd::save_tensor_to_file(gray_path, enc, "vace_gray");
+                        LOG_INFO("VACE gray-latent computed + disk-cached (%s, %s)", tag, gray_path.c_str());
+                    } catch (const std::exception& e) {
+                        LOG_WARN("VACE gray-latent disk-cache write failed (%s): %s", gray_path.c_str(), e.what());
+                    }
+                }
+            }
+            return enc;
+        };
+
+        inactive = vace_encode_ctx(inactive, "inactive");  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
         if (inactive.empty()) {
             LOG_ERROR("failed to encode VACE inactive context");
             return std::nullopt;
         }
 
-        reactive = sd_ctx->sd->encode_first_stage(reactive);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
+        // VACE LATENT BACKDOOR: replace the re-encoded pixels in the kept (mask=0) head
+        // frames of `inactive` with the prior segment's TAIL diffusion latents, bypassing
+        // the lossy VAE decode->re-encode roundtrip. The saved latent (VACE_SAVE_LATENT)
+        // is already in encode_first_stage's (mu-mean)/std diffusion space, so it drops in
+        // directly. Composes with VACE_CONT_FRAMES (which sets mask=0 on those slots);
+        // unset => the re-encoded pixel path above is untouched (byte-identical default).
+        if (vace_cont_frames > 0) {
+            if (const char* lp = getenv("VACE_CONT_LATENT"); lp != nullptr && lp[0] != '\0') {
+                int64_t klat = std::min<int64_t>(
+                    (std::min<int64_t>(vace_cont_frames, request->frames) - 1) / 4 + 1,
+                    inactive.shape()[2]);
+                try {
+                    auto cont_full = sd::load_tensor_from_file_as_tensor<float>(lp);
+                    int64_t Tprev  = cont_full.shape()[2];
+                    // Discard-last-frames at the CONDITIONING level (companion to the stitch-level
+                    // discard in the chain harness): the prior segment's TERMINAL latent frames are
+                    // its most striping-degraded (farthest from that segment's own motion prior).
+                    // Ignoring the last N latent frames re-anchors the next window on the still-clean
+                    // frames BEFORE the degradation, so blur doesn't propagate across cuts (the Wan2GP
+                    // "discard last frames" fix). Default unset => byte-identical to prod.
+                    if (const char* dt = getenv("VACE_CONT_LATENT_DROP_TAIL")) {
+                        int64_t drop = std::max<int64_t>(0, (int64_t)std::atoi(dt));
+                        if (drop > 0 && Tprev - drop >= klat) {
+                            Tprev -= drop;
+                            LOG_INFO("VACE_CONT_LATENT_DROP_TAIL: ignoring %lld degraded trailing latent frame(s) "
+                                     "(prior tail now ends at latent frame %lld)",
+                                     (long long)drop, (long long)Tprev);
+                        }
+                    }
+                    int64_t K      = std::min<int64_t>(klat, Tprev);
+                    // last K latent frames of the prior segment (its tail = seg2's overlap head)
+                    auto cont_tail = sd::ops::slice(cont_full, 2, Tprev - K, Tprev);
+                    // rank/shape-match `inactive` ([W,H,T,C,1]) for slice_assign
+                    std::vector<int64_t> tgt = inactive.shape();
+                    tgt[2]                   = K;
+                    if (cont_tail.numel() != [&] { int64_t n = 1; for (auto d : tgt) n *= d; return n; }()) {
+                        LOG_ERROR("VACE_CONT_LATENT: shape mismatch, saved latent (%dx%dx%dx%d) "
+                                  "incompatible with inactive (%dx%dx%dx%d); skipping injection",
+                                  (int)cont_full.shape()[0], (int)cont_full.shape()[1],
+                                  (int)cont_full.shape()[2],
+                                  (int)(cont_full.dim() > 3 ? cont_full.shape()[3] : 1),
+                                  (int)inactive.shape()[0], (int)inactive.shape()[1],
+                                  (int)inactive.shape()[2], (int)inactive.shape()[3]);
+                    } else {
+                        // VACE continuation latent-AGC (FINDINGS-L12 fix): the carried tail is the
+                        // prior segment's HIGHEST-variance frames; re-injecting it as the next
+                        // segment's VACE conditioning ratchets the latent std up every cut
+                        // (measured 0.64->0.80->0.92...), blowing out contrast over a long chain.
+                        // Pull the tail's global std back to a canonical reference (the measured
+                        // fresh-segment scale) so every segment re-seeds from the SAME baseline —
+                        // contrast-only AGC: a single uniform gain about the mean, so it preserves
+                        // brightness + per-channel ratios (no colour distortion), just de-drifts
+                        // the contrast. Opt-in (output is NOT bit-exact): VACE_CONT_AGC=1 enables;
+                        // VACE_CONT_AGC_TARGET overrides the target std (default 0.65 = seg0 global
+                        // latent std at the 3+3 distill — res/model-robust as a global scalar).
+                        if (const char* a = getenv("VACE_CONT_AGC"); a != nullptr && a[0] == '1') {
+                            float target = 0.65f;
+                            if (const char* t = getenv("VACE_CONT_AGC_TARGET"); t != nullptr && t[0] != '\0') {
+                                float v = static_cast<float>(atof(t));
+                                if (v > 0.0f) target = v;
+                            }
+                            float* d        = cont_tail.data();
+                            const int64_t n = cont_tail.numel();
+                            if (n > 1) {
+                                double sum = 0.0, sq = 0.0;
+                                for (int64_t i = 0; i < n; ++i) {
+                                    sum += d[i];
+                                    sq += static_cast<double>(d[i]) * d[i];
+                                }
+                                double mean = sum / static_cast<double>(n);
+                                double var  = sq / static_cast<double>(n) - mean * mean;
+                                double cur_std = var > 0.0 ? std::sqrt(var) : 0.0;
+                                if (cur_std > 1e-6) {
+                                    float g = static_cast<float>(target / cur_std);
+                                    for (int64_t i = 0; i < n; ++i) {
+                                        d[i] = static_cast<float>((d[i] - mean) * g + mean);
+                                    }
+                                    LOG_INFO("VACE_CONT_AGC: carried-tail std %.4f -> %.4f (gain %.3f, mean %.4f kept)",
+                                             cur_std, target, g, mean);
+                                }
+                            }
+                        }
+                        cont_tail.reshape_(tgt);
+                        sd::ops::slice_assign(&inactive, 2, 0, K, cont_tail);
+                        LOG_INFO("VACE_CONT_LATENT: injected %lld tail latent frames (of %lld) into "
+                                 "inactive head, bypassing pixel re-encode",
+                                 (long long)K, (long long)Tprev);
+                    }
+                } catch (const std::exception& e) {
+                    LOG_ERROR("VACE_CONT_LATENT: failed to load %s: %s (keeping re-encoded pixels)", lp, e.what());
+                }
+            }
+        }
+
+        reactive = vace_encode_ctx(reactive, "reactive");  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
         if (reactive.empty()) {
             LOG_ERROR("failed to encode VACE reactive context");
             return std::nullopt;
@@ -6729,6 +7465,11 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         auto vace_context = sd::ops::concat(inactive, reactive, 3);  // [b, 2*c, t, h/vae_scale_factor, w/vae_scale_factor]
 
         mask              = sd::full<float>({request->width, request->height, inactive.shape()[2], 1, 1}, 1.0f);
+        if (vace_cont_frames > 0) {
+            int klat = std::min<int>((std::min<int>(vace_cont_frames, static_cast<int>(request->frames)) - 1) / 4 + 1,
+                                     static_cast<int>(inactive.shape()[2]));
+            sd::ops::fill_slice(&mask, 2, 0, klat, 0.0f);  // keep first K-equiv latent frames (continuation context)
+        }
         auto mask_context = mask.reshape({request->vae_scale_factor,
                                           inactive.shape()[0],
                                           request->vae_scale_factor,
@@ -6937,6 +7678,74 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
             LOG_ERROR("LTXAV_SAVE_VIDEO_LATENT failed: %s", e.what());
         }
     }
+    // VACE latent chaining: bank the post-sampling diffusion-space latent (already
+    // ref-frame stripped, same (mu-mean)/std space as encode_first_stage's output) so
+    // the next VACE segment can inject its kept-frame tail directly into the `inactive`
+    // context via VACE_CONT_LATENT, bypassing the lossy pixel decode->re-encode roundtrip.
+    if (const char* sp = getenv("VACE_SAVE_LATENT"); sp != nullptr && sp[0] != '\0') {
+        try {
+            sd::save_tensor_to_file<float>(sp, video_latent, "vace_video_latent");
+            LOG_INFO("VACE_SAVE_LATENT: wrote diffusion latent (%dx%dx%dx%d) to %s",
+                     (int)video_latent.shape()[0], (int)video_latent.shape()[1],
+                     (int)video_latent.shape()[2],
+                     (int)(video_latent.dim() > 3 ? video_latent.shape()[3] : 1), sp);
+        } catch (const std::exception& e) {
+            LOG_ERROR("VACE_SAVE_LATENT failed: %s", e.what());
+        }
+    }
+    // ---- WAN chaining OUTPUT anchor (anti-drift) ----
+    // The injected-tail WAN_CONT_AGC only constrains the K overlap frames; the
+    // freely-generated frames still let the distilled few-step DiT inflate std each
+    // segment (measured ratchet 0.73->0.78->0.83->0.86 + mean drift, even with the
+    // tail AGC on). Anchoring the WHOLE output latent's per-channel mean+std to the
+    // fixed seg-0 reference BEFORE banking/decoding stops the compounding at its
+    // source (the banked latent that feeds the next segment) and keeps the displayed
+    // video consistent. Gated, default OFF; reuses WAN_CONT_AGC_REF (seg-0 latent).
+    // seg-0 has no REF (establishes it) so it is never regraded.
+    if (const char* oa = getenv("WAN_CONT_OUTPUT_AGC"); oa != nullptr && oa[0] == '1') {
+        const char* refp = getenv("WAN_CONT_AGC_REF");
+        if (refp != nullptr && refp[0] != '\0') {
+            try {
+                auto    ref  = sd::load_tensor_from_file_as_tensor<float>(refp);
+                int64_t W    = video_latent.shape()[0], H = video_latent.shape()[1];
+                int64_t T    = video_latent.shape()[2];
+                int64_t C    = video_latent.dim() > 3 ? video_latent.shape()[3] : 1;
+                int64_t per  = W * H * T;
+                int64_t Cref = ref.dim() > 3 ? ref.shape()[3] : 1;
+                int64_t perR = ref.shape()[0] * ref.shape()[1] * ref.shape()[2];
+                if (Cref == C) {
+                    const float* rd = ref.data();
+                    float*       d  = video_latent.data();
+                    for (int64_t c = 0; c < C; ++c) {
+                        const float* rb  = rd + c * perR;
+                        double       rs0 = 0, rsq = 0;
+                        for (int64_t i = 0; i < perR; ++i) { rs0 += rb[i]; rsq += (double)rb[i] * rb[i]; }
+                        double rm   = rs0 / (double)perR;
+                        double rstd = rsq / (double)perR - rm * rm;
+                        rstd        = rstd > 0 ? std::sqrt(rstd) : 0.0;
+                        float* base = d + c * per;
+                        double cs0 = 0, csq = 0;
+                        for (int64_t i = 0; i < per; ++i) { cs0 += base[i]; csq += (double)base[i] * base[i]; }
+                        double cm   = cs0 / (double)per;
+                        double cstd = csq / (double)per - cm * cm;
+                        cstd        = cstd > 0 ? std::sqrt(cstd) : 0.0;
+                        double g = (cstd > 1e-6) ? (rstd / cstd) : 1.0;
+                        if (g < 0.5) g = 0.5;
+                        if (g > 2.0) g = 2.0;
+                        for (int64_t i = 0; i < per; ++i)
+                            base[i] = (float)((base[i] - cm) * g + rm);
+                    }
+                    LOG_INFO("WAN_CONT_OUTPUT_AGC: full-output per-channel mean+std anchored to seg-0 ref %s (%lld ch)",
+                             refp, (long long)C);
+                } else {
+                    LOG_WARN("WAN_CONT_OUTPUT_AGC: ref ch %lld != latent ch %lld; skipping",
+                             (long long)Cref, (long long)C);
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR("WAN_CONT_OUTPUT_AGC: failed to load ref %s: %s", refp, e.what());
+            }
+        }
+    }
     LOG_DEBUG("decode_video_outputs latent %dx%dx%dx%d",
               (int)video_latent.shape()[0],
               (int)video_latent.shape()[1],
@@ -6976,6 +7785,54 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
             double fm = fs / (double)cnt;
             double fv = fsq / (double)cnt - fm * fm;
             LOG_INFO("[DBG predecode latent] frame %lld mean=%.5f std=%.5f", (long long)t, fm, fv > 0 ? sqrt(fv) : 0.0);
+        }
+    }
+    // Dump the pre-VAE diffusion latent for offline VAE eval (LightVAE/LightTAE A/B).
+    // Forwards via the WAN_ prefix in run_wan22_i2v_nvfp4.sh. Same [W,H,T,C] f32 the
+    // lighttae_eval harness reads; same space decode_first_stage de-norms internally.
+    if (const char* sp = getenv("WAN_SAVE_LATENT"); sp != nullptr && sp[0] != '\0') {
+        try {
+            sd::save_tensor_to_file<float>(sp, video_latent, "wan_video_latent");
+            LOG_INFO("WAN_SAVE_LATENT: wrote diffusion latent (%dx%dx%dx%d) to %s",
+                     (int)video_latent.shape()[0], (int)video_latent.shape()[1],
+                     (int)video_latent.shape()[2],
+                     (int)(video_latent.dim() > 3 ? video_latent.shape()[3] : 1), sp);
+        } catch (const std::exception& e) {
+            LOG_ERROR("WAN_SAVE_LATENT failed: %s", e.what());
+        }
+        // WAN LATENT CHAINING drift metric: per-segment global std + per-channel
+        // mean/std of the banked latent. This is the signal that exposed the VACE
+        // 0.64->0.80->0.92 contrast runaway: if WAN_CONT_AGC holds, global std and
+        // each channel's mean/std stay flat across the chain instead of ratcheting.
+        // run_wan_latent_cont.sh greps "[WAN_CHAIN_STATS]".
+        {
+            int64_t      W = video_latent.shape()[0], H = video_latent.shape()[1];
+            int64_t      T = video_latent.shape()[2];
+            int64_t      C = video_latent.dim() > 3 ? video_latent.shape()[3] : 1;
+            int64_t      per = W * H * T;
+            const float* d   = video_latent.data();
+            double       gsum = 0.0, gsq = 0.0;
+            int64_t      gn = W * H * T * C;
+            for (int64_t i = 0; i < gn; ++i) {
+                gsum += d[i];
+                gsq += (double)d[i] * d[i];
+            }
+            double gmean = gsum / (double)gn;
+            double gvar  = gsq / (double)gn - gmean * gmean;
+            LOG_INFO("[WAN_CHAIN_STATS] global mean=%.5f std=%.5f (C=%lld T=%lld)",
+                     gmean, gvar > 0 ? sqrt(gvar) : 0.0, (long long)C, (long long)T);
+            for (int64_t c = 0; c < C; ++c) {
+                const float* base = d + c * per;
+                double       s = 0.0, sq = 0.0;
+                for (int64_t i = 0; i < per; ++i) {
+                    s += base[i];
+                    sq += (double)base[i] * base[i];
+                }
+                double m   = s / (double)per;
+                double var = sq / (double)per - m * m;
+                LOG_INFO("[WAN_CHAIN_STATS] ch %02lld mean=%.5f std=%.5f",
+                         (long long)c, m, var > 0 ? sqrt(var) : 0.0);
+            }
         }
     }
     // auto z = sd::load_tensor_from_file_as_tensor<float>("ltx_vae_z.bin");
@@ -7534,6 +8391,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                  request.frames);
     }
 
+    // Lever 3 (WAN_VAE_FREE_DURING_DIT): prepare_video_generation_embeds above finished all
+    // VAE encoding (ref/control/init latents); the VAE is not needed again until decode. Free
+    // its ~254MB params now so they don't sit resident through the VRAM-peak DiT sample loop
+    // (both the high-noise and main passes). reload_first_stage_model() restores them right
+    // before decode_video_outputs. Gated on the captured reload state (present only when the
+    // lever env is set) + one-shot CLI (!keep_diffusion_model_resident).
+    if (sd_ctx->sd->free_params_immediately &&
+        !sd_ctx->sd->keep_diffusion_model_resident &&
+        sd_ctx->sd->vae_reload_loader && !sd_ctx->sd->vae_reload_tensors.empty() &&
+        sd_ctx->sd->first_stage_model) {
+        sd_ctx->sd->first_stage_model->free_params_buffer();
+        LOG_INFO("WAN_VAE_FREE_DURING_DIT: freed VAE params for the DiT sample loop");
+    }
+
     int64_t latent_start = ggml_time_ms();
     int W                = request.width / request.vae_scale_factor;
     int H                = request.height / request.vae_scale_factor;
@@ -7669,19 +8540,29 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
     int64_t sampling_start = ggml_time_ms();
     sd::Tensor<float> final_latent;
+    bool final_latent_prestripped = false;
     // LTX latent-reuse harness: skip the (expensive) DiT sampling and load a banked
     // latent so the VAE-tiling quality ladder re-decodes the SAME latent under
     // different tiling. The text encode above still runs (~cheap); only sampling is
     // skipped. Bank one with LTX_SAVE_LATENTS first (see decode_video_outputs).
-    if (const char* load_path = getenv("LTX_LOAD_LATENTS"); load_path != nullptr && load_path[0] != '\0') {
+    // VACE_DECODE_LATENT is the VACE-side alias: it loads a latent banked by
+    // VACE_SAVE_LATENT (which is ALREADY ref-stripped/post-decode shape) so we also
+    // skip the post-sampling strips below — lets the VAE-tiling sweep re-decode the
+    // SAME latent at ~33s/run (encode+T5+decode) instead of ~111s (full DiT).
+    const char* vace_decode_path = getenv("VACE_DECODE_LATENT");
+    const char* ltx_load_path    = getenv("LTX_LOAD_LATENTS");
+    const char* load_path        = (vace_decode_path && vace_decode_path[0]) ? vace_decode_path : ltx_load_path;
+    if (load_path != nullptr && load_path[0] != '\0') {
         try {
             final_latent = sd::load_tensor_from_file_as_tensor<float>(load_path);
-            LOG_INFO("LTX_LOAD_LATENTS: loaded cached latent (%dx%dx%dx%d) from %s, SKIPPING DiT sampling",
+            final_latent_prestripped = (vace_decode_path && vace_decode_path[0]);
+            LOG_INFO("%s: loaded cached latent (%dx%dx%dx%d) from %s, SKIPPING DiT sampling",
+                     final_latent_prestripped ? "VACE_DECODE_LATENT" : "LTX_LOAD_LATENTS",
                      (int)final_latent.shape()[0], (int)final_latent.shape()[1],
                      (int)final_latent.shape()[2], (int)(final_latent.dim() > 3 ? final_latent.shape()[3] : 1),
                      load_path);
         } catch (const std::exception& e) {
-            LOG_ERROR("LTX_LOAD_LATENTS failed (%s); falling back to sampling", e.what());
+            LOG_ERROR("latent load failed (%s); falling back to sampling", e.what());
         }
     }
     if (final_latent.empty()) {
@@ -8000,7 +8881,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
-    if (latents.video_conditioning_frame_count > 0) {
+    if (!final_latent_prestripped && latents.video_conditioning_frame_count > 0) {
         int64_t target_frames = latents.video_target_frame_count > 0 ? latents.video_target_frame_count
                                                                      : final_latent.shape()[2] - latents.video_conditioning_frame_count;
         final_latent          = sd::ops::slice(final_latent, 2, 0, target_frames);
@@ -8010,7 +8891,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
-    if (latents.ref_image_num > 0) {
+    if (!final_latent_prestripped && latents.ref_image_num > 0) {
         final_latent = sd::ops::slice(final_latent, 2, latents.ref_image_num, final_latent.shape()[2]);
         if (!chain_base_latent.empty()) {
             chain_base_latent = sd::ops::slice(chain_base_latent, 2, latents.ref_image_num, chain_base_latent.shape()[2]);
@@ -8039,7 +8920,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
-    // FIX 3: bring the video VAE back if it was freed for the stage-2 forward (no-op if resident).
+    // FIX 3 (LTXAV two-stage) / WAN_VAE_FREE_DURING_DIT (CLI lever): bring the video VAE back if it
+    // was freed to make DiT VRAM headroom. No-op (returns true) if still resident; the merged
+    // reload_first_stage_model() dispatches to whichever reload loader was captured.
     sd_ctx->sd->reload_first_stage_model();
     auto result = decode_video_outputs(sd_ctx, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
     if (result == nullptr) {

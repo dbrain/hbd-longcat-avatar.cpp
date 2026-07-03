@@ -545,7 +545,47 @@ namespace sd::ggml_graph_cut {
 
         ggml_context* graph_ctx    = nullptr;
         ggml_cgraph* segment_graph = build_segment_graph(gf, segment, &graph_ctx);
-        ggml_gallocr_t allocr      = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+
+        // Measure the segment with its INPUT_PREVIOUS_CUT inputs presented as PURE leaves
+        // (op == NONE, no srcs), exactly as the execution path binds them
+        // (reset_segment_runtime_tensors + bind_segment_cached_inputs null op/data/srcs before
+        // running). In the raw graph these cross-segment tensors still carry their producing op
+        // and srcs; ggml_gallocr's allocate_node then walks those srcs (its inplace-reuse probe)
+        // and ggml_gallocr_hash_get()-inserts each parent — tensors that are NOT in this
+        // segment's node/leaf sets. On a small/tight segment (e.g. a WAN_VACE_SPLIT vace block,
+        // where the main block moved to its own `.main` segment) that pushes the gallocr hash
+        // past n_nodes+n_leafs+25% and aborts in ggml_hash_find_or_insert. The walk is *only*
+        // ever an inplace-reuse probe, and a prev-cut parent is never gallocr-"own" (it lives in
+        // an earlier segment), so it is always rejected — nulling changes zero allocation
+        // decisions and the measured size is identical; it only removes the spurious hash
+        // inserts. Saved/restored so the shared graph tensors are untouched for real execution
+        // and for measuring the segments that own them.
+        struct SavedCutLeaf {
+            ggml_tensor* tensor;
+            ggml_op op;
+            ggml_tensor* src[GGML_MAX_SRC];
+        };
+        std::vector<SavedCutLeaf> saved_cut_leaves;
+        for (const auto& input : segment.input_refs) {
+            if (input.type != Segment::INPUT_PREVIOUS_CUT) {
+                continue;
+            }
+            ggml_tensor* cut_leaf = input_tensor(gf, input);
+            if (cut_leaf == nullptr) {
+                continue;
+            }
+            SavedCutLeaf saved;
+            saved.tensor = cut_leaf;
+            saved.op     = cut_leaf->op;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                saved.src[k]     = cut_leaf->src[k];
+                cut_leaf->src[k] = nullptr;
+            }
+            cut_leaf->op = GGML_OP_NONE;
+            saved_cut_leaves.push_back(saved);
+        }
+
+        ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
 
         size_t sizes[1] = {0};
         ggml_gallocr_reserve_n_size(
@@ -555,6 +595,13 @@ namespace sd::ggml_graph_cut {
             nullptr,
             sizes);
         size_t buffer_size = sizes[0];
+
+        for (auto& saved : saved_cut_leaves) {
+            saved.tensor->op = saved.op;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                saved.tensor->src[k] = saved.src[k];
+            }
+        }
 
         ggml_gallocr_free(allocr);
         ggml_free(graph_ctx);

@@ -1,8 +1,11 @@
 #ifndef __SD_MODEL_VAE_WAN_VAE_HPP__
 #define __SD_MODEL_VAE_WAN_VAE_HPP__
 
+#include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "model/common/block.hpp"
@@ -13,6 +16,60 @@ namespace WAN {
 
     constexpr int CACHE_T = 2;
 
+    // WAN_VAE_F16 (default OFF; F32 byte-identical when unset): run the VAE DECODE activation
+    // stream in F16. The Wan VAE weights are already F16; only the activations were F32. Two
+    // payoffs: (1) it halves the chunk-1+ temporal-streaming peak (the 4x temporal upsample's
+    // ~14GB F32 intermediate -> ~7GB) so 1x1 zero-seam decode fits <=11.5GB, and (2) less HBM
+    // traffic = a faster VAE decode. Mirrors WAN_DIT_F16 (wan.hpp): cast the residual stream
+    // to F16 at the decode entry, back to F32 before the output, with F32 islands only where
+    // an op's ggml dtype would force a re-widen or an unsafe mixed-dtype op:
+    //   * CausalConv3d (cuDNN): F16-native — conv3d-cudnn.cu accepts F16 src/dst, ggml.c
+    //     ggml_conv_3d_direct emits an F16 result for an F16 input (the heavy conv-boundary
+    //     activations, incl. the temporal-upsample intermediate, are the win).
+    //   * RMS_norm / SiLU / upscale / pad / concat / residual-add: F16-native (supports_op).
+    //   * Conv2d (im2col + ggml_mul_mat): mul_mat hardcodes an F32 dst, so 1x1/3x3 convs
+    //     (attention to_qkv/proj, resample.1) emit F32 — cast back to F16 right after.
+    //   * AttentionBlock (middle/bottleneck, small): a whole-block F32 island (cast in/out)
+    //     so its F32 Conv2d outputs and the `add(proj, identity)` never form the unsafe
+    //     binbcast combo add(F32 src0, F16 src1); attention numerics stay exactly as prod.
+    // Encode is untouched (stays F32, spatially tiled).
+    inline bool wan_vae_f16_enabled() {
+        static const bool on = (std::getenv("WAN_VAE_F16") != nullptr);
+        return on;
+    }
+
+    // WAN_VAE_HEAD_F32 (default ON; set WAN_VAE_HEAD_F32=0 to reproduce the grid): keep the final
+    // decoder conv `head.2` on the cuDNN implicit-GEMM path (GGML_CUDNN_CONV3D) but request an
+    // F32-IO plan so cuDNN writes an fp32 output instead of fp16.
+    //
+    // The bug it fixes: cuDNN's conv3d output Y is normally fp16 (conv3d-cudnn.cu: y_ndhwc is a
+    // ggml_cuda_pool_alloc<half>), so the conv output is fp16-quantized regardless of the ggml
+    // dst dtype. head.2 emits 12 channels (wan2.2) of slightly different magnitude, and decode
+    // does unpatchify(out, 2) — a space-to-depth that keys each output pixel's RGB to a specific
+    // one of those 12 channels by (x%2, y%2). The per-channel fp16 quantization steps therefore
+    // land as a faint ~2px screen-door grid on photoreal content.
+    //
+    // The fix routes head.2 (only) through a full F32-IO cuDNN plan (fp32 X/W/Y, fp32 accumulate,
+    // fp32 store), so the output is never fp16-quantized and the per-channel grid is gone. (A
+    // mixed HALF-in/FLOAT-out plan was silently rejected by cuDNN's heuristic for this 3D shape,
+    // reverting to fp16; full fp32 IO is the standard, broadly-supported conv.) It stays on the
+    // implicit-GEMM engine: there is NO im2col IC*27 column
+    // materialization. (Routing head.2 to im2col OOMs — 256 input channels at ~640x352 => a
+    // [256*27, 640*352] ~3GB buffer, the exact blowup cuDNN conv3d exists to avoid.) Only head.2's
+    // tiny 12-out-channel F32 output buffer grows, a bounded cost well under the decode peak
+    // (dominated by the temporal-upsample intermediate), so the ~94s decode is preserved.
+    //
+    // No effect when GGML_CUDNN_CONV3D is off (that path is already F32 im2col). The fix also
+    // forces head.2's ggml output tensor to F32 so it holds under WAN_VAE_F16 (F16-activation
+    // decode) too. WAN_VAE_HEAD_F32=0 puts head.2 back on the cuDNN fp16 plan to A/B the grid.
+    inline bool wan_vae_head_f32_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("WAN_VAE_HEAD_F32");
+            return e == nullptr || atoi(e) != 0;  // default ON; only "0" disables
+        }();
+        return on;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -22,6 +79,7 @@ namespace WAN {
         std::tuple<int, int, int> padding;
         std::tuple<int, int, int> dilation;
         bool bias;
+        bool force_f32;  // WAN_VAE_HEAD_F32: force this conv onto the clean F32 im2col path
 
         void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
             params["weight"] = ggml_new_tensor_4d(ctx,
@@ -42,14 +100,16 @@ namespace WAN {
                      std::tuple<int, int, int> stride   = {1, 1, 1},
                      std::tuple<int, int, int> padding  = {0, 0, 0},
                      std::tuple<int, int, int> dilation = {1, 1, 1},
-                     bool bias                          = true)
+                     bool bias                          = true,
+                     bool force_f32                     = false)
             : in_channels(in_channels),
               out_channels(out_channels),
               kernel_size(std::move(kernel_size)),
               stride(std::move(stride)),
               padding(std::move(padding)),
               dilation(std::move(dilation)),
-              bias(bias) {}
+              bias(bias),
+              force_f32(force_f32) {}
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* cache_x = nullptr) {
             // x: [N*IC, ID, IH, IW]
@@ -73,10 +133,15 @@ namespace WAN {
             }
 
             x = ggml_ext_pad_ext(ctx->ggml_ctx, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            // Convs tagged force_f32 (head.2 under WAN_VAE_HEAD_F32) stay on the cuDNN
+            // implicit-GEMM op (no im2col IC*27 blowup) but request an F32-IO plan so cuDNN writes
+            // fp32, not fp16 -> the per-channel fp16 steps don't become an unpatchify grid.
+            bool cudnn_hi_prec = force_f32 && wan_vae_head_f32_enabled();
             return ggml_ext_conv_3d(ctx->ggml_ctx, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
-                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation));
+                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
+                                    /*force_prec_f32=*/false, /*cudnn_hi_prec=*/cudnn_hi_prec);
         }
     };
 
@@ -159,6 +224,13 @@ namespace WAN {
             int64_t h = x->ne[1];
             int64_t w = x->ne[0];
 
+            // WAN_VAE_F16 (decode/upsample): the heavy ops here (time_conv CausalConv3d, the
+            // 2x spatial ggml_upscale, the temporal-doubling cont) stay F16; only resample.1
+            // (Conv2d -> ggml_mul_mat) re-widens to F32. Remember the stream dtype so we can
+            // restore F16 before returning (the caller's residual add(x, shortcut) needs both
+            // operands F16). No-op on the F32 encode/downsample path.
+            const bool stream_f16 = (x->type == GGML_TYPE_F16);
+
             if (mode == "upsample3d") {
                 if (feat_cache.size() > 0) {
                     int idx = feat_idx;
@@ -207,6 +279,14 @@ namespace WAN {
                 } else if (mode == "downsample3d") {
                     x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
                 }
+                // WAN_VAE_F16 F32 island for resample.1 (Conv2d): ggml im2col asserts an F32
+                // src1 (im2col.cu:87) and ggml_mul_mat emits F32, so cast the conv input to
+                // F32 here. The output is restored to F16 by the cast at the function tail.
+                // (The heavy temporal-upsample tensors above — time_conv + the doubling cont —
+                // already ran F16; this island only widens the spatial conv input.)
+                if (stream_f16 && x->type == GGML_TYPE_F16) {
+                    x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+                }
                 x = resample_1->forward(ctx, x);
                 x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
             }
@@ -232,6 +312,10 @@ namespace WAN {
                 }
             }
 
+            // Restore the F16 residual stream (resample.1 emitted F32 via mul_mat).
+            if (stream_f16 && x->type != GGML_TYPE_F16) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
             return x;
         }
     };
@@ -544,6 +628,15 @@ namespace WAN {
             auto to_qkv = std::dynamic_pointer_cast<Conv2d>(blocks["to_qkv"]);
             auto proj   = std::dynamic_pointer_cast<Conv2d>(blocks["proj"]);
 
+            // WAN_VAE_F16: whole-block F32 island. The block sits at the decoder bottleneck
+            // (smallest spatial res -> cheap) and its Conv2d (to_qkv/proj) emit F32 anyway, so
+            // running it in F32 keeps attention numerics exactly as prod AND avoids the unsafe
+            // add(F32 proj-out, F16 identity) mixed-dtype broadcast. Cast back to F16 on exit.
+            const bool island_f32 = (x->type == GGML_TYPE_F16);
+            if (island_f32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+
             auto identity = x;
 
             x = norm->forward(ctx, x);
@@ -580,6 +673,10 @@ namespace WAN {
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
 
             x = ggml_add(ctx->ggml_ctx, x, identity);
+            // Restore the F16 residual stream for the next decoder block.
+            if (island_f32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
             return x;
         }
     };
@@ -824,10 +921,12 @@ namespace WAN {
             blocks["head.0"] = std::shared_ptr<GGMLBlock>(new RMS_norm(out_dim));
             // head.1 is nn.SiLU()
             if (wan2_2) {
-                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 12, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}));
+                // force_f32=true: this final 12-channel conv feeds unpatchify(2); request an
+                // F32-IO cuDNN plan (fp32 Y, not fp16) so the per-channel fp16 steps don't grid.
+                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 12, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, true, true));
 
             } else {
-                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 3, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}));
+                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, 3, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, true, true));
             }
         }
 
@@ -951,7 +1050,13 @@ namespace WAN {
         }
 
     public:
-        WanVAE(bool decode_only = true, bool wan2_2 = false)
+        // dec_dim_override: narrower decoder base width for a channel-pruned decoder
+        // (e.g. lightx2v LightVAE = the official Wan2.1 VAE with dec base dim 96->24).
+        // -1 = keep the full-width default for this version (byte-identical to the
+        // official VAE). Only the DECODER width changes; the encoder width (`dim`) is
+        // untouched so the encoder latent space stays identical to the official VAE
+        // (decode-only weight swap). Detected from the gguf by WanVAERunner.
+        WanVAE(bool decode_only = true, bool wan2_2 = false, int64_t dec_dim_override = -1)
             : decode_only(decode_only), wan2_2(wan2_2) {
             // attn_scales is always []
             if (wan2_2) {
@@ -961,6 +1066,9 @@ namespace WAN {
 
                 _conv_num     = 34;
                 _enc_conv_num = 26;
+            }
+            if (dec_dim_override > 0) {
+                dec_dim = dec_dim_override;
             }
             if (!decode_only) {
                 blocks["encoder"] = std::shared_ptr<GGMLBlock>(new Encoder3d(dim, z_dim * 2, dim_mult, num_res_blocks, temperal_downsample, wan2_2));
@@ -1072,6 +1180,14 @@ namespace WAN {
             auto decoder = std::dynamic_pointer_cast<Decoder3d>(blocks["decoder"]);
             auto conv2   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
 
+            // WAN_VAE_F16: cast the latent to F16 at the decode entry so the whole decoder
+            // activation stream runs F16 (conv2 onward); the unpatchified output is cast back
+            // to F32 below. Default (gate off): z stays F32, byte-identical.
+            const bool dec_f16 = wan_vae_f16_enabled();
+            if (dec_f16 && z->type == GGML_TYPE_F32) {
+                z = ggml_cast(ctx->ggml_ctx, z, GGML_TYPE_F16);
+            }
+
             int64_t iter_ = z->ne[2];
             auto x        = conv2->forward(ctx, z);
             // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.decode.prelude", "x");
@@ -1089,6 +1205,10 @@ namespace WAN {
             }
             if (wan2_2) {
                 out = unpatchify(ctx->ggml_ctx, out, 2, b);
+            }
+            // WAN_VAE_F16: bring the decoded pixels back to F32 for the host read-back.
+            if (dec_f16 && out->type != GGML_TYPE_F32) {
+                out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32);
             }
             // sd::ggml_graph_cut::mark_graph_cut(out, "wan_vae.decode.final", "out");
             clear_cache();
@@ -1114,6 +1234,57 @@ namespace WAN {
                 out = unpatchify(ctx->ggml_ctx, out, 2, b);
             }
             // sd::ggml_graph_cut::mark_graph_cut(out, "wan_vae.decode_partial.final", "out");
+            return out;
+        }
+
+        // Streaming/cached decode of a RANGE of latent frames [frame_base, frame_base+z->ne[2]).
+        // This is decode()'s per-frame loop, but (a) restricted to the frames present in
+        // `z` (a temporal slice of the full latent) and (b) WITHOUT the clear_cache() at
+        // either end, so the causal _feat_map is carried in/out by the caller across
+        // separate compute() passes (temporal streaming). conv2 is a {1,1,1} CausalConv3d
+        // (pointwise in time) and unpatchify is per-frame independent, so decoding the
+        // latent in temporal chunks is numerically identical to decode() of the whole
+        // latent in one graph — only the peak activation memory is bounded (to one
+        // chunk's worth of full-spatial-res decoder activations).
+        //
+        // `frame_base` is the GLOBAL latent-frame index of z's first frame: the decoder's
+        // CausalConv3d branches on chunk_idx (==0 / ==1 / >=2), so each frame MUST be fed
+        // its global index, not a per-chunk-local one, for the cache logic to match.
+        ggml_tensor* decode_chunk(GGMLRunnerContext* ctx,
+                                  ggml_tensor* z,
+                                  int frame_base,
+                                  int64_t b = 1) {
+            // z: [b*c, t_chunk, h, w]
+            GGML_ASSERT(b == 1);
+
+            auto decoder = std::dynamic_pointer_cast<Decoder3d>(blocks["decoder"]);
+            auto conv2   = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
+
+            // WAN_VAE_F16: F16 activation stream for this chunk. The cross-graph causal cache
+            // (_feat_map, persisted by persist_feat_map) is then F16 too — consistent across
+            // chunks since every chunk reloads & feeds it back in the same F16 dtype.
+            const bool dec_f16 = wan_vae_f16_enabled();
+            if (dec_f16 && z->type == GGML_TYPE_F32) {
+                z = ggml_cast(ctx->ggml_ctx, z, GGML_TYPE_F16);
+            }
+
+            auto x          = conv2->forward(ctx, z);  // {1,1,1} pointwise -> per-frame independent
+            int64_t n_chunk = x->ne[2];
+            ggml_tensor* out = nullptr;
+            for (int64_t k = 0; k < n_chunk; k++) {
+                _conv_idx = 0;
+                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, k, k + 1);  // [b*c, 1, h, w]
+                int gi    = frame_base + static_cast<int>(k);
+                auto out_ = decoder->forward(ctx, in, b, _feat_map, _conv_idx, gi);
+                out       = (out == nullptr) ? out_ : ggml_concat(ctx->ggml_ctx, out, out_, 2);
+            }
+            if (wan2_2) {
+                out = unpatchify(ctx->ggml_ctx, out, 2, b);
+            }
+            // WAN_VAE_F16: back to F32 for host read-back / output concat.
+            if (dec_f16 && out->type != GGML_TYPE_F32) {
+                out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32);
+            }
             return out;
         }
 
@@ -1220,13 +1391,38 @@ namespace WAN {
         bool decode_only   = true;
         WanVAE ae;
 
+        // Decoder base width from the gguf: the final-stage decoder RMS_norm
+        // (decoder.head.0.gamma) is a 1-D [dec_dim] tensor, so its element count IS the
+        // decoder base dim. Matched by suffix so it's independent of the load prefix.
+        // Returns -1 when absent -> WanVAE keeps the version default. For the official
+        // VAEs this returns the same value as the built-in default (96 wan2.1 / 256
+        // wan2.2-ti2v), so existing models build byte-identically; a channel-pruned
+        // LightVAE gguf (gamma=[24]) builds the narrower decoder instead.
+        static int64_t detect_dec_dim(const String2TensorStorage& tensor_storage_map) {
+            static const std::string suffix = "decoder.head.0.gamma";
+            for (const auto& kv : tensor_storage_map) {
+                const std::string& k = kv.first;
+                if (k.size() >= suffix.size() &&
+                    k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    int64_t n = 1;
+                    for (int i = 0; i < kv.second.n_dims; i++) {
+                        n *= kv.second.ne[i];
+                    }
+                    return n;
+                }
+            }
+            return -1;
+        }
+
         WanVAERunner(ggml_backend_t backend,
                      ggml_backend_t params_backend,
                      const String2TensorStorage& tensor_storage_map = {},
                      const std::string prefix                       = "",
                      bool decode_only                               = false,
                      SDVersion version                              = VERSION_WAN2)
-            : decode_only(decode_only), ae(decode_only, version == VERSION_WAN2_2_TI2V), VAE(version, backend, params_backend) {
+            : decode_only(decode_only),
+              ae(decode_only, version == VERSION_WAN2_2_TI2V, detect_dec_dim(tensor_storage_map)),
+              VAE(version, backend, params_backend) {
             ae.init(params_ctx, tensor_storage_map, prefix);
         }
 
@@ -1300,6 +1496,11 @@ namespace WAN {
             ggml_tensor* z  = make_input(z_tensor);
 
             auto runner_ctx = get_context();
+
+            // Tell ggml_ext_conv_3d which VAE phase this graph is, so GGML_CUDNN_CONV3D=encode
+            // routes only the encode's CausalConv3d to the low-VRAM cuDNN direct conv (the
+            // encode sets the peak) while the decode stays on the fast im2col path.
+            g_ext_vae_phase_encode = !decode_graph;
 
             ggml_tensor* out = decode_graph ? ae.decode(&runner_ctx, z) : ae.encode(&runner_ctx, z);
 
@@ -1394,58 +1595,235 @@ namespace WAN {
             return mu;
         }
 
+        // --- Temporal streaming (full spatial resolution, bounded VRAM) ------------------
+        //
+        // 1x1 spatial tiling (zero spatial seams) OOMs because a full-frame x all-frames
+        // decode allocates one giant activation buffer (~15.7GB). Instead we stream the
+        // CAUSAL VAE over temporal chunks of latent (decode) / pixel (encode) frames at
+        // FULL spatial resolution, carrying the causal feat_cache across compute() passes
+        // via the runner's persistent (non-gallocr) cache buffer. Chunk boundaries are
+        // seamless because the cache reproduces the exact causal context decode()/encode()
+        // would have had in a single graph. Env-gated, OFF by default.
+        //
+        // LONGCAT_VAE_TEMPORAL_CHUNK=N : N>=1 enables decode streaming with N latent frames
+        //                            per compute pass (encode streams its natural 1+4k groups).
+        //                            0/unset = disabled (committed full-frame path untouched).
+        //                            (LONGCAT_ prefix so run_wan22_i2v_nvfp4.sh forwards it.)
+        static int wan_vae_temporal_chunk() {
+            static const int n = [] {
+                const char* s = getenv("LONGCAT_VAE_TEMPORAL_CHUNK");
+                if (s == nullptr || s[0] == '\0')
+                    return 0;
+                int v = atoi(s);
+                return v < 0 ? 0 : v;
+            }();
+            return n;
+        }
+
+        static std::string wan_dec_feat_name(size_t i) { return "wan_dec_feat:" + std::to_string(i); }
+        static std::string wan_enc_feat_name(size_t i) { return "wan_enc_feat:" + std::to_string(i); }
+
+        // Persist the per-conv causal feat_cache into the runner's cross-graph cache buffer.
+        //
+        // GALLOCR/CACHE FIX (root cause of the disabled build_graph_partial "chunk 1 weird"
+        // bug): WAN::CausalConv3d stores its cache slot as a ggml_ext_slice VIEW into this
+        // graph's activations (e.g. wan_vae.hpp `cache_x = ggml_ext_slice(...)`). The old
+        // path did `cache(name, view); ggml_build_forward_expand(gf, view);`. cache() conts
+        // a view INTO A NEW tensor stored in cache_tensor_map, but the loop expanded the
+        // VIEW, so the cont node was never wired into the cgraph and never computed -->
+        // copy_cache_tensors_to_cache_buffer() persisted UNINITIALIZED memory. Chunk 0's
+        // OUTPUT was still correct (it reads no cache), but its STORED cache was garbage, so
+        // chunk 1 (which reads it) came out "weird". The LTX streaming path avoids this by
+        // storing ggml_cont(...) in the cache slot up-front. We fix it at the persist
+        // boundary instead (keeping the committed conv forward byte-identical): cont the
+        // view OURSELVES, then cache AND expand the SAME cont node so it is computed before
+        // the cache copy reads it.
+        void persist_feat_map(ggml_cgraph* gf,
+                              std::vector<ggml_tensor*>& fmap,
+                              const std::function<std::string(size_t)>& name_of) {
+            for (size_t fi = 0; fi < fmap.size(); fi++) {
+                ggml_tensor* fc = fmap[fi];
+                if (fc == nullptr) {
+                    continue;
+                }
+                if (fc->view_src != nullptr || !ggml_is_contiguous(fc)) {
+                    fc = ggml_cont(compute_ctx, fc);
+                }
+                cache(name_of(fi), fc);
+                ggml_build_forward_expand(gf, fc);
+            }
+        }
+
+        ggml_cgraph* build_graph_temporal_decode_chunk(const sd::Tensor<float>& z_chunk, int frame_base) {
+            ggml_cgraph* gf = new_graph_custom(10240 * std::max<int64_t>(1, z_chunk.shape()[2]) + 4096);
+
+            // Reload the decoder's causal cache from the persistent cross-graph buffer
+            // (null on the first chunk -> history-less I-frame, == decode()'s chunk_idx 0).
+            for (size_t fi = 0; fi < ae._feat_map.size(); fi++) {
+                ae._feat_map[fi] = get_cache_tensor_by_name(wan_dec_feat_name(fi));
+            }
+
+            ggml_tensor* z         = make_input(z_chunk);
+            auto runner_ctx        = get_context();
+            g_ext_vae_phase_encode = false;
+            ggml_tensor* out       = ae.decode_chunk(&runner_ctx, z, frame_base);
+
+            persist_feat_map(gf, ae._feat_map, &wan_dec_feat_name);
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        }
+
+        ggml_cgraph* build_graph_temporal_encode_chunk(const sd::Tensor<float>& x_chunk, int group_idx) {
+            ggml_cgraph* gf = new_graph_custom(10240 * std::max<int64_t>(1, x_chunk.shape()[2]) + 4096);
+
+            for (size_t fi = 0; fi < ae._enc_feat_map.size(); fi++) {
+                ae._enc_feat_map[fi] = get_cache_tensor_by_name(wan_enc_feat_name(fi));
+            }
+
+            ggml_tensor* x         = make_input(x_chunk);
+            auto runner_ctx        = get_context();
+            g_ext_vae_phase_encode = true;
+            // encode_partial(): patchify + encoder->forward(group_idx) + conv1 ({1,1,1}) +
+            // channel-chunk -> this group's mu. Carries _enc_feat_map (no clear_cache).
+            ggml_tensor* mu        = ae.encode_partial(&runner_ctx, x, group_idx);
+
+            persist_feat_map(gf, ae._enc_feat_map, &wan_enc_feat_name);
+            ggml_build_forward_expand(gf, mu);
+            return gf;
+        }
+
+        sd::Tensor<float> decode_temporal_streaming(const int n_threads,
+                                                    const sd::Tensor<float>& z,
+                                                    int chunk_frames) {
+            const int64_t total = z.shape()[2];  // latent frames
+            const size_t expected_dim = static_cast<size_t>(z.dim());
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            ae.clear_cache();  // sizes _feat_map to _conv_num nullptrs
+
+            LOG_DEBUG("wan_vae temporal-streaming decode: %lld latent frames, chunk=%d",
+                      (long long)total, chunk_frames);
+
+            sd::Tensor<float> output;
+            for (int64_t start = 0; start < total; start += chunk_frames) {
+                const int64_t end = std::min<int64_t>(total, start + chunk_frames);
+                auto z_chunk      = sd::ops::slice(z, 2, start, end);
+                auto get_graph    = [&]() -> ggml_cgraph* {
+                    return build_graph_temporal_decode_chunk(z_chunk, static_cast<int>(start));
+                };
+                auto chunk = restore_trailing_singleton_dims(
+                    GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                if (chunk.empty()) {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    return {};
+                }
+                output = output.empty() ? std::move(chunk) : sd::ops::concat(output, chunk, 2);
+            }
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            return output;
+        }
+
+        sd::Tensor<float> encode_temporal_streaming(const int n_threads,
+                                                    const sd::Tensor<float>& x) {
+            const int64_t t_pix       = x.shape()[2];  // pixel frames
+            const int64_t iter_       = 1 + (t_pix - 1) / 4;
+            const size_t expected_dim = static_cast<size_t>(x.dim());
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            ae.clear_cache();  // sizes _enc_feat_map to _enc_conv_num nullptrs
+
+            LOG_DEBUG("wan_vae temporal-streaming encode: %lld pixel frames, %lld groups",
+                      (long long)t_pix, (long long)iter_);
+
+            sd::Tensor<float> output;
+            for (int64_t i = 0; i < iter_; i++) {
+                // encode()'s chunking: group 0 = pixel frame [0,1), group i = [1+4(i-1), 1+4i).
+                const int64_t fs = (i == 0) ? 0 : 1 + 4 * (i - 1);
+                const int64_t fe = (i == 0) ? 1 : std::min<int64_t>(t_pix, 1 + 4 * i);
+                auto x_chunk     = sd::ops::slice(x, 2, fs, fe);
+                auto get_graph   = [&]() -> ggml_cgraph* {
+                    return build_graph_temporal_encode_chunk(x_chunk, static_cast<int>(i));
+                };
+                auto mu = restore_trailing_singleton_dims(
+                    GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                if (mu.empty()) {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    return {};
+                }
+                output = output.empty() ? std::move(mu) : sd::ops::concat(output, mu, 2);
+            }
+
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            return output;
+        }
+
         sd::Tensor<float> _compute(const int n_threads,
                                    const sd::Tensor<float>& z,
                                    bool decode_graph) override {
-            if (true) {
-                sd::Tensor<float> input;
-                if (z.dim() == 4) {
-                    input = z.unsqueeze(2);
-                }
-                auto get_graph = [&]() -> ggml_cgraph* {
-                    if (input.empty()) {
-                        return build_graph(z, decode_graph);
-                    } else {
-                        return build_graph(input, decode_graph);
-                    }
-                };
-                auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true),
-                                                              input.empty() ? z.dim() : input.dim());
-                if (!result.empty() && z.dim() == 4) {
-                    result.squeeze_(2);
-                }
-                return result;
-            } else {  // chunk 1 result is weird
-                ae.clear_cache();
-                int64_t t      = z.shape()[2];
-                int i          = 0;
-                auto get_graph = [&]() -> ggml_cgraph* {
-                    return build_graph_partial(z, decode_graph, i);
-                };
-                auto out_opt = GGMLRunner::compute<float>(get_graph, n_threads, true);
-                if (!out_opt.has_value()) {
-                    return {};
-                }
-                sd::Tensor<float> out = std::move(*out_opt);
-                ae.clear_cache();
-                if (t == 1) {
-                    return out;
-                }
-
-                sd::Tensor<float> output = std::move(out);
-
-                for (i = 1; i < t; i++) {
-                    auto chunk_opt = GGMLRunner::compute<float>(get_graph, n_threads, true);
-                    if (!chunk_opt.has_value()) {
-                        return {};
-                    }
-                    out = std::move(*chunk_opt);
-                    ae.clear_cache();
-                    output = sd::ops::concat(output, out, 2);
-                }
-                free_cache_ctx_and_buffer();
-                return output;
+            sd::Tensor<float> input;
+            if (z.dim() == 4) {
+                input = z.unsqueeze(2);
             }
+            const sd::Tensor<float>& src = input.empty() ? z : input;
+            const size_t out_dim         = src.dim();
+
+            // Temporal streaming (full spatial res, bounded VRAM). Only for genuine video
+            // (more than one frame on the temporal axis); single frames use the plain path.
+            const int chunk = wan_vae_temporal_chunk();
+            LOG_DEBUG("wan_vae _compute %s: z.dim=%zu src.dim=%zu src.shape=[%lld,%lld,%lld,%lld,%lld] chunk=%d",
+                      decode_graph ? "decode" : "encode", (size_t)z.dim(), out_dim,
+                      (long long)(src.dim() > 0 ? src.shape()[0] : -1), (long long)(src.dim() > 1 ? src.shape()[1] : -1),
+                      (long long)(src.dim() > 2 ? src.shape()[2] : -1), (long long)(src.dim() > 3 ? src.shape()[3] : -1),
+                      (long long)(src.dim() > 4 ? src.shape()[4] : -1), chunk);
+            // Temporal streaming applies to BOTH decode and encode now (chunk = the env
+            // LONGCAT_VAE_TEMPORAL_CHUNK; for encode its non-zero value just ENABLES the path —
+            // encode_temporal_streaming self-determines its natural 1+4k pixel groups). It
+            // bounds the temporal axis so a 21-81 frame encode no longer runs the cuDNN
+            // CONV_3D / im2col(IC*27) intermediate over ALL frames at once (the OOM at e.g.
+            // [312,536,21] / 1280x704). Both directions use the SAME persist_feat_map GALLOCR
+            // fix (build_graph_temporal_{decode,encode}_chunk), so the causal feat_cache threads
+            // across compute() passes correctly -> output is numerically ~ monolithic, NOT
+            // seam-producing. (The "chunk-1 corrupts" warning is about the OLD, never-called
+            // build_graph_partial, not this path.)
+            //
+            // SPATIAL bounding for the encode (the author's original "4-frame groups blow up at
+            // full spatial" concern) comes for FREE from composition, exactly as for decode: when
+            // spatial tiling is enabled (LONGCAT_VAE_ENCODE_REL_TILE / vae_tiling_params), the
+            // encode() wrapper (vae.hpp:131) spatial-tiles via tiled_compute -> _compute(tile),
+            // so this temporal stream runs PER SPATIAL TILE (<=4 frames x one tile). No inner
+            // spatial tiling of the chunk is needed (it would double-tile). Encode at 1280x704
+            // therefore requires spatial tiling to be on (the failing IT/vid_gen paths already
+            // have it firing); without it a 4-frame full-spatial group can still OOM at high res.
+            if (chunk >= 1 && src.dim() == 5 && src.shape()[2] > 1) {
+                sd::Tensor<float> result = decode_graph
+                                               ? decode_temporal_streaming(n_threads, src, chunk)
+                                               : encode_temporal_streaming(n_threads, src);
+                if (!result.empty()) {
+                    result = restore_trailing_singleton_dims(std::move(result), out_dim);
+                    if (z.dim() == 4) {
+                        result.squeeze_(2);
+                    }
+                    return result;
+                }
+                LOG_WARN("wan_vae temporal streaming produced no output; falling back to full-frame path");
+            }
+
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(src, decode_graph);
+            };
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true),
+                                                          out_dim);
+            if (!result.empty() && z.dim() == 4) {
+                result.squeeze_(2);
+            }
+            return result;
         }
 
         void test() {

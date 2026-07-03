@@ -9,11 +9,15 @@
 #include "model/common/rope.hpp"
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/model.hpp"
+#include "model/diffusion/wan_sla.hpp"
 #include "model_loader.h"
 
 namespace WAN {
 
-    constexpr int WAN_GRAPH_SIZE = 10240;
+    // 20480: the S2V causal block graph holds the noisy block forward + the cond/sink
+    // prefill (a FULL ref forward through all 40 blocks: norm1+mod+self-attn+cross+ffn)
+    // + 40 layers of K/V graph outputs. That overflows the old 10240 node budget.
+    constexpr int WAN_GRAPH_SIZE = 20480;
 
     struct WanConfig {
         std::string model_type                 = "t2v";
@@ -131,18 +135,207 @@ namespace WAN {
 
             auto q = q_proj->forward(ctx, x);
             q      = norm_q->forward(ctx, q);
-            auto k = k_proj->forward(ctx, x);
+            // WAN_ATTN_KV_SR half (1) — default OFF => byte-identical. Under the F16 residual
+            // stream (WAN_DIT_F16) the K/V nvfp4 linears store-round their output to F16 at the
+            // GEMM, and (with WAN_ROPE_F16) K stays F16 through RoPE — so K/V reach the flash
+            // kernel already F16, and that rounding bias is rope-phase-locked and sums COHERENTLY
+            // over the temporal axis (the frame-count grid). Feed the K/V projections an F32
+            // activation so the mm_dst gate (ggml_extend.hpp: F16-dst only when x is F16) emits an
+            // F32 dst — the exact nvfp4 path used when WAN_DIT_F16 is off — keeping K/V full
+            // precision into build_kqv, where the same env applies stochastic rounding to F16.
+            // Q is left F16 (per-query; it does not accumulate across keys). Only the K/V
+            // projection INPUT is widened (a local F32 transient), not the whole residual stream.
+            static const bool wan_attn_kv_sr = (std::getenv("WAN_ATTN_KV_SR") != nullptr);
+            ggml_tensor* x_kv = x;
+            if (wan_attn_kv_sr && x->type == GGML_TYPE_F16) {
+                x_kv = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
+            auto k = k_proj->forward(ctx, x_kv);
             k      = norm_k->forward(ctx, k);
-            auto v = v_proj->forward(ctx, x);  // [N, n_token, n_head*d_head]
+            auto v = v_proj->forward(ctx, x_kv);  // [N, n_token, n_head*d_head]
+
+            // WAN_DIT_F16: under the F16 residual stream the q/k/v Linears emit F16, but
+            // the fast fused RoPE (ggml_rope_pe) is F32-only (rope.hpp:953) — an F16 q
+            // would fall back to the slow cont+repeat+mul+add chain (big intermediates,
+            // the lap-08b smell). Upcast q/k to F32 here so the fused RoPE fires; this is
+            // the F32-cast LTX applies for the same reason. The cuDNN flash kernel casts
+            // q→F16 internally and, with GGML_CUDNN_ATTN_F16_OUT, stores an F16 output
+            // that feeds the F16 o_proj. v is re-cast to F16 inside ggml_ext_attention_ext
+            // (build_kqv), so leave it F16. Self-gated on the F16 type → no-op in the
+            // default F32 path (byte-identical).
+            // WAN_ROPE_F16 (opt-in, default OFF): under WAN_DIT_F16 keep q/k F16 through
+            // the fused RoPE instead of upcasting to F32. The fused ggml_rope_pe kernel now
+            // has an F16 path (rope-pe.cu) that computes the rotation in F32 and rounds the
+            // store to F16 — bit-identical to the F32-rope-then-cast-to-F16 that this path
+            // did downstream anyway (k via ggml_cast to F16 for flash, q via cuDNN's internal
+            // pool cast). The win is memory: the two full-size F32 rope tensors (2x1237 MB at
+            // 1280x704x65f) never enter the compute buffer, and the redundant k->F16 copy is
+            // dropped (flash's cast is a no-op on already-F16 k). cuDNN flash accepts F16 Q
+            // directly (fattn-cudnn.cu:213; fattn.cu:446 selects on K/V type only). Requires
+            // GGML_CUDNN_ATTN (prod always on) — native ggml flash asserts F32 Q. Self-gated on
+            // the F16 type; default path unchanged (byte-identical). Owner eye-test is the gate.
+            static const bool wan_rope_f16 = (std::getenv("WAN_ROPE_F16") != nullptr);
+            if (q->type == GGML_TYPE_F16 && !wan_rope_f16) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+                k = ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_F32);
+            }
+
+            // WAN SLA (Stage 0): the selector block exports mean-pooled (64-block),
+            // RoPE'd, head-kept Q and smooth-K so the host can build the next step's
+            // content-based skip bitmap (src/model/diffusion/wan_sla.hpp). Faithful to
+            // lightx2v sla_util.get_block_map: smooth-k = k - mean_token(k); pool = mean
+            // over each 64-token block; both AFTER RoPE (the attention input). Tiny
+            // ([d_head, n_blk, n_head]); written into persistent dsts, read back post-step.
+            // q/k here are F32 (the upcast above), so the fused RoPE fires. Default OFF.
+            if (ctx->sla_capture_now && ctx->sla_pooled_q_dst != nullptr &&
+                ctx->sla_pooled_k_dst != nullptr && ctx->gf != nullptr && N == 1) {
+                auto    gc   = ctx->ggml_ctx;
+                const int blk = ctx->sla_blk;
+                const int64_t nqb = (n_token + blk - 1) / blk;
+                // RoPE q/k as [d_head, n_head, n_token, 1] → [d_head, n_token, n_head].
+                auto q4 = ggml_reshape_4d(gc, q, head_dim, num_heads, n_token, 1);
+                auto k4 = ggml_reshape_4d(gc, k, head_dim, num_heads, n_token, 1);
+                auto qr = Rope::apply_rope(gc, q4, pe, true, ctx->allow_fused_rope);  // [d_head, n_token, n_head]
+                auto kr = Rope::apply_rope(gc, k4, pe, true, ctx->allow_fused_rope);
+                // smooth-k: kr - mean over tokens (per d_head, per head).
+                auto kperm = ggml_cont(gc, ggml_permute(gc, kr, 1, 0, 2, 3));        // [n_token, d_head, n_head]
+                auto kmean = ggml_mean(gc, kperm);                                   // [1, d_head, n_head]
+                kmean      = ggml_reshape_3d(gc, kmean, head_dim, num_heads, 1);      // [d_head, n_head, 1]
+                kmean      = ggml_cont(gc, ggml_permute(gc, kmean, 0, 2, 1, 3));      // [d_head, 1, n_head]
+                auto ksm   = ggml_sub(gc, kr, kmean);                                // broadcast over tokens
+                // mean-pool over 64-token blocks (pad the tail block with zeros).
+                auto pool = [&](ggml_tensor* t) -> ggml_tensor* {
+                    t = ggml_cont(gc, t);                                            // RoPE/sub output → ensure contiguous
+                    int64_t pad = nqb * blk - n_token;
+                    if (pad > 0) t = ggml_pad(gc, t, 0, (int)pad, 0, 0);             // [d_head, nqb*blk, n_head]
+                    t = ggml_reshape_4d(gc, t, head_dim, blk, nqb, num_heads);       // [d_head, blk, nqb, n_head]
+                    t = ggml_cont(gc, ggml_permute(gc, t, 1, 0, 2, 3));              // [blk, d_head, nqb, n_head]
+                    t = ggml_mean(gc, t);                                            // [1, d_head, nqb, n_head]
+                    return ggml_reshape_3d(gc, t, head_dim, nqb, num_heads);         // [d_head, nqb, n_head]
+                };
+                auto wq = ggml_cpy(gc, pool(qr),  ctx->sla_pooled_q_dst);
+                auto wk = ggml_cpy(gc, pool(ksm), ctx->sla_pooled_k_dst);
+                // CRITICAL: the graph-cut/offload executor only runs nodes backward-reachable
+                // from a subcut-MARKED tensor or the final output — it ignores GGML_TENSOR_FLAG_OUTPUT.
+                // These off-residual pooled-export cpys feed neither, so without a mark they belong
+                // to NO segment and never execute → persistent pooled_q/k stay zero → selector scores
+                // all-equal → a fixed content-independent block selection (the "coherent-but-wrong"
+                // SLA bug). Share the selector block's existing "wan.blocks.<sel>" group (line ~921)
+                // so they become extra outputs of that segment — no new segment. Mirrors the proven
+                // avatar cond-K/V write (longcat_avatar.hpp mark_graph_cut). wq is a view of the
+                // persistent pooled_q dst, so the cpy lands in the buffer update_from_pooled reads.
+                const std::string sla_grp = "wan.blocks." + std::to_string(ctx->sla_selector_block);
+                sd::ggml_graph_cut::mark_graph_cut(wq, sla_grp, "sla_pooled_q");
+                sd::ggml_graph_cut::mark_graph_cut(wk, sla_grp, "sla_pooled_k");
+                ggml_build_forward_expand(ctx->gf, wq);
+                ggml_build_forward_expand(ctx->gf, wk);
+            }
 
             q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, n_token, N);  // [N, n_token, n_head, d_head]
 
-            x = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_token, dim]
+            // flash_skip_kv_pad when there's no real mask: the legacy L_k->256 pad otherwise
+            // synthesizes a [L_k_pad x L_q] -inf mask (O(n_token^2): ~22 GB at 1280x704x81),
+            // which the modern CUDA flash kernel doesn't need (it handles unpadded L_k).
+            x = Rope::attention(ctx, q, k, v, pe, mask, /*kv_scale=*/1.0f, /*rope_interleaved=*/true,
+                                /*flash_attn=*/true, /*flash_skip_kv_pad=*/mask == nullptr);  // [N, n_token, dim]
 
             x = o_proj->forward(ctx, x);  // [N, n_token, dim]
             return x;
+        }
+
+        // Causal KV-cache self-attention (LiveAvatar streaming). Projects x's tokens,
+        // RoPE-applies q/k with `pe` (this block's grid), then attends over the
+        // concatenated [prev ++ cur ++ cond] keys/values. Exports the current block's
+        // RoPE'd K and raw V (both [d_head, L, n_head]) via new_kc/new_vc so the caller
+        // can persist them in a host rolling cache. prev_*/cond_* may be null.
+        ggml_tensor* forward_kv_cache(GGMLRunnerContext* ctx,
+                                      ggml_tensor* x,        // [1, L_blk, dim]
+                                      ggml_tensor* pe,       // RoPE for L_blk tokens
+                                      ggml_tensor* prev_kc,  // [d_head, L_prev, n_head] or null
+                                      ggml_tensor* prev_vc,
+                                      ggml_tensor* cond_kc,  // [d_head, L_cond, n_head] or null
+                                      ggml_tensor* cond_vc,
+                                      ggml_tensor*& new_kc,
+                                      ggml_tensor*& new_vc) {
+            int64_t L_blk = x->ne[1];
+            auto q_proj = std::dynamic_pointer_cast<Linear>(blocks["q"]);
+            auto k_proj = std::dynamic_pointer_cast<Linear>(blocks["k"]);
+            auto v_proj = std::dynamic_pointer_cast<Linear>(blocks["v"]);
+            auto o_proj = std::dynamic_pointer_cast<Linear>(blocks["o"]);
+            auto norm_q = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_q"]);
+            auto norm_k = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_k"]);
+
+            auto q = norm_q->forward(ctx, q_proj->forward(ctx, x));
+            auto k = norm_k->forward(ctx, k_proj->forward(ctx, x));
+            auto v = v_proj->forward(ctx, x);
+            q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, L_blk, 1);
+            k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L_blk, 1);
+            v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L_blk, 1);
+
+            auto q_roped = Rope::apply_rope(ctx->ggml_ctx, q, pe, true, ctx->allow_fused_rope);  // [d_head, L_blk, n_head]
+            auto k_roped = Rope::apply_rope(ctx->ggml_ctx, k, pe, true, ctx->allow_fused_rope);  // [d_head, L_blk, n_head]
+            auto v_flat  = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));  // [d_head, L_blk, n_head]
+
+            new_kc = k_roped;
+            new_vc = v_flat;
+
+            ggml_tensor* k_all = k_roped;
+            ggml_tensor* v_all = v_flat;
+            // Lever 1 (S2V): the host rolling/cond caches are F16. Cast back to F32
+            // (lossless) before concat so the in-graph attention math is unchanged.
+            // ggml_concat requires matching dtypes; k_roped/v_flat are F32.
+            auto to_f32 = [&](ggml_tensor* t) -> ggml_tensor* {
+                return (t != nullptr && t->type != GGML_TYPE_F32)
+                           ? ggml_cast(ctx->ggml_ctx, t, GGML_TYPE_F32)
+                           : t;
+            };
+            if (prev_kc != nullptr) {
+                k_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_kc), k_all, 1);
+                v_all = ggml_concat(ctx->ggml_ctx, to_f32(prev_vc), v_all, 1);
+            }
+            if (cond_kc != nullptr) {
+                k_all = ggml_concat(ctx->ggml_ctx, k_all, to_f32(cond_kc), 1);
+                v_all = ggml_concat(ctx->ggml_ctx, v_all, to_f32(cond_vc), 1);
+            }
+            int64_t L_k = k_all->ne[1];
+
+            auto vv = ggml_reshape_4d(ctx->ggml_ctx,
+                                      ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v_all, 0, 2, 1, 3)),
+                                      head_dim, num_heads, L_k, 1);  // [d_head, n_head, L_k, 1]
+            // Flash-attention over the [prev ++ cur ++ cond] cache. With FA OFF the
+            // L_blk x L_k scores tensor is materialized — at 480x832 (L_blk~4680,
+            // L_k grows to ~9k) that is several GB and is THE causal compute-buffer
+            // peak (measured 5.5 GB), which blocks keeping the Q4_K weights resident
+            // on the 12 GB card. FA streams the scores so the buffer drops to a few
+            // hundred MB. No causal mask: each block attends ALL cached keys (full
+            // attention over the rolling cache), so mask=nullptr is correct. The
+            // wrapper pads L_k->256 internally. Gated by the runner's flash flag so
+            // S2V_NO_FLASH=1 still selects the exact (FA-off) path for A/B.
+            auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend,
+                                               q_roped, k_all, vv, num_heads, nullptr,
+                                               /*skip_reshape=*/true,
+                                               /*flash_attn=*/ctx->flash_attn_enabled);  // [1, L_blk, dim]
+            attn = o_proj->forward(ctx, attn);
+            return attn;
+        }
+
+        // Cond-prefill: just compute (and export) RoPE'd K + raw V for the ref/cond
+        // tokens x [1, L_cond, dim] using cond RoPE `pe_cond`. No attention output is
+        // consumed (the sink only fills the cond cache).
+        void prefill_cond_kv(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* pe_cond,
+                             ggml_tensor*& kc, ggml_tensor*& vc) {
+            int64_t L = x->ne[1];
+            auto k_proj = std::dynamic_pointer_cast<Linear>(blocks["k"]);
+            auto v_proj = std::dynamic_pointer_cast<Linear>(blocks["v"]);
+            auto norm_k = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm_k"]);
+            auto k = norm_k->forward(ctx, k_proj->forward(ctx, x));
+            auto v = v_proj->forward(ctx, x);
+            k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L, 1);
+            v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L, 1);
+            kc = Rope::apply_rope(ctx->ggml_ctx, k, pe_cond, true, ctx->allow_fused_rope);  // [d_head, L, n_head]
+            vc = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));      // [d_head, L, n_head]
         }
     };
 
@@ -265,6 +458,12 @@ namespace WAN {
     static ggml_tensor* modulate_add(ggml_context* ctx, ggml_tensor* x, ggml_tensor* e) {
         // x: [N, n_token, dim]
         // e: [N, 1, dim] or [N, T, 1, dim]
+        // WAN_DIT_F16=0 (F32 residual) guard: the general F32 binbcast asserts nb10 % 4 == 0
+        // (binbcast.cu). Normalize the broadcast gate to a fresh 4-aligned F32 buffer under the
+        // F32 stream; gated on x being F32 so the prod F16 path is byte-identical (no cont node).
+        if (x->type == GGML_TYPE_F32) {
+            e = ggml_cont(ctx, e);
+        }
         if (ggml_n_dims(e) == 3) {
             int64_t T = e->ne[2];
             x         = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / T, T, x->ne[2]);  // [N, T, n_token/T, dim]
@@ -279,6 +478,11 @@ namespace WAN {
     static ggml_tensor* modulate_mul(ggml_context* ctx, ggml_tensor* x, ggml_tensor* e) {
         // x: [N, n_token, dim]
         // e: [N, 1, dim] or [N, T, 1, dim]
+        // WAN_DIT_F16=0 guard (see modulate_add): normalize the F32 broadcast gate to a
+        // 4-aligned buffer; no-op/byte-identical on the prod F16 stream.
+        if (x->type == GGML_TYPE_F32) {
+            e = ggml_cont(ctx, e);
+        }
         if (ggml_n_dims(e) == 3) {
             int64_t T = e->ne[2];
             x         = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / T, T, x->ne[2]);  // [N, T, n_token/T, dim]
@@ -341,6 +545,21 @@ namespace WAN {
 
             auto modulation = params["modulation"];
             e               = ggml_add(ctx->ggml_ctx, e, modulation);  // [N, 6, dim] or [N, T, 6, dim]
+            // WAN_DIT_F16_MOD (opt-in, default OFF): under the F16 residual stream
+            // (WAN_DIT_F16) carry the adaLN modulation gates (the scale/shift/gate es[*]
+            // chunks below) in F16 too, so modulate_mul/modulate_add against the F16
+            // residual become uniform F16xF16 instead of F16(x)xF32(gate). With the gates
+            // F16 the broadcast mul+add fold fires natively in F16 (mul_add_bcast MOD=__half,
+            // matcher accepts an F16 gate when the big operand is F16 + GGML_CUDA_F16_BCAST_FUSE
+            // is on). The modulation ADD above stays F32 (tiny [6*dim], byte-identical); only
+            // the chunked gates are downcast — one small F32->F16 cast per block. Self-gated
+            // on x being F16 so the default F32 path and the WAN_DIT_F16-without-this path are
+            // unchanged. NOT bit-identical vs F32 gates (F16 modulate arithmetic) — eye-tested.
+            // Range-safe: adaLN scale/shift/gate are O(1), well inside F16's 65504 (no overflow).
+            static const bool wan_dit_f16_mod = (std::getenv("WAN_DIT_F16_MOD") != nullptr);
+            if (wan_dit_f16_mod && x->type == GGML_TYPE_F16) {
+                e = ggml_cast(ctx->ggml_ctx, e, GGML_TYPE_F16);
+            }
             auto es         = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);  // ([N, 1, dim], ...) or [N, T, 1, dim]
 
             auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
@@ -369,9 +588,42 @@ namespace WAN {
             y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
             y = modulate_add(ctx->ggml_ctx, y, es[3]);
 
-            y = ffn_0->forward(ctx, y);
-            y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
-            y = ffn_2->forward(ctx, y);
+            // Token-tiled FFN (env LONGCAT_FFN_TILE_TOKENS=N, N>0): the FFN is position-wise
+            // (ffn_0 Linear -> GELU -> ffn_2 Linear, no token mixing), so process tokens in
+            // chunks of N to cap the [ffn_dim, tokens] intermediate — the dominant DiT
+            // activation at long video lengths (e.g. 1671 MB at [13824, 63360] f16) — to
+            // [ffn_dim, N]. Lossless (same math, concatenated in chunk order), no extra FLOPs
+            // (only a few more kernel launches). Off by default (N<=0) so every other path is
+            // byte-identical. Only the simple 2D case (single batch) is tiled; anything else
+            // falls through to the original path. Mirrors FeedForward::forward in
+            // src/model/common/block.hpp. WanAttentionBlock::forward is reused by
+            // VaceWanAttentionBlock, so the vace path is covered too.
+            int64_t ffn_tile = 0;
+            if (const char* env = getenv("LONGCAT_FFN_TILE_TOKENS")) {
+                ffn_tile = atoll(env);
+            }
+            const int64_t n_tok = y->ne[1];
+            if (ffn_tile > 0 && n_tok > ffn_tile && y->ne[2] == 1 && y->ne[3] == 1) {
+                // Growing-concat accumulate: lower peak VRAM than a preallocated [dim,n_tok]
+                // scatter (gallocr reuses the chunk buffers; the scatter kept a full-size `out`
+                // + a head-concat temp resident = +1.3 GB, a bad trade under the <=11.5GB cap).
+                // Same math, same chunk order -> byte-identical.
+                ggml_tensor* out = nullptr;
+                for (int64_t c = 0; c < n_tok; c += ffn_tile) {
+                    const int64_t len = (n_tok - c < ffn_tile) ? (n_tok - c) : ffn_tile;
+                    ggml_tensor* yc = ggml_view_2d(ctx->ggml_ctx, y, y->ne[0], len, y->nb[1], (size_t)c * y->nb[1]);
+                    yc              = ggml_cont(ctx->ggml_ctx, yc);
+                    yc              = ffn_0->forward(ctx, yc);  // [ffn_dim, len]
+                    yc              = ggml_ext_gelu(ctx->ggml_ctx, yc, true);
+                    yc              = ffn_2->forward(ctx, yc);  // [dim, len]
+                    out             = (out == nullptr) ? yc : ggml_concat(ctx->ggml_ctx, out, yc, 1);
+                }
+                y = out;
+            } else {
+                y = ffn_0->forward(ctx, y);
+                y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
+                y = ffn_2->forward(ctx, y);
+            }
 
             x = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
 
@@ -418,7 +670,13 @@ namespace WAN {
                 auto before_proj = std::dynamic_pointer_cast<Linear>(blocks["before_proj"]);
 
                 c = before_proj->forward(ctx, c);
-                c = ggml_add(ctx->ggml_ctx, c, x);
+                // Under WAN_DIT_F16 the main residual stream `x` (== x_orig) is F16 while the vace
+                // side-stream `c` stays F32. binbcast's <float,float,float> branch (F32 src0/dst)
+                // rejects an F16 src1 (nb10 % 4 != 0 -> binbcast.cu:261 assert), so upcast x to F32
+                // for this add. No-op when x is already F32 (default path = byte-identical); keeps
+                // the vace side-stream in F32 (only the big main stream gets the F16 win).
+                ggml_tensor* x_add = (x->type == GGML_TYPE_F16) ? ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32) : x;
+                c = ggml_add(ctx->ggml_ctx, c, x_add);
             }
 
             auto after_proj = std::dynamic_pointer_cast<Linear>(blocks["after_proj"]);
@@ -664,8 +922,101 @@ namespace WAN {
 
             // patch_embedding
             x = patch_embedding->forward(ctx, x);                                                    // [N*dim, t_len, h_len, w_len]
+            // WAN_DUMP_BLOCKS (grid-divergence detector): capture the DiT token-grid dims from
+            // the patch-embed output ([w_len, h_len, t_len, N*dim]) BEFORE the flatten below, so
+            // the per-block dump hook can slice one representative frame's [w_len,h_len] plane.
+            // Default OFF => these are just read into locals, never used (byte-identical prod).
+            const int64_t wan_dump_w_len = x->ne[0];
+            const int64_t wan_dump_h_len = x->ne[1];
+            const int64_t wan_dump_t_len = x->ne[2];
             x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
             x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
+
+            // WAN_DIT_F16 (default OFF, prod byte-identical when unset): run the DiT
+            // residual stream in F16 to halve the per-block glue/copy/cast HBM traffic
+            // (the nsys wall of k_bin_bcast<op_add> 5754-call residual adds, the
+            // <op_mul> AdaLN modulates, the convert_unary<half,float> casts) and to feed
+            // the cuDNN F16 attention output (GGML_CUDNN_ATTN_F16_OUT) straight into the
+            // next Linear with no re-upcast. Mirrors LTX_DIT_F16 (ltxv.hpp:1738). The
+            // NVFP4 Linears emit F16 here (cuBLASLt FP4 GEMM: F32 accumulate, F16 store —
+            // supports_op gate ggml-cuda.cu:6046, mm_dst gate ggml_extend.hpp:1149);
+            // e0/context/pe stay F32 and broadcast into the F16 stream via the
+            // F16,F32->F16 binbcast combos (binbcast.cu:378). Cast back to F32 before the
+            // head (below) so the model output / sampler / VAE path is unchanged.
+            // Only the residual `x` is cast; e0/context stay F32 and mix into x through
+            // adds whose F16 `x` is src0 (dst type = F16). VACE is excluded: the VACE
+            // block's `ggml_add(c, x_orig)` would mix an F32 `c` (src0) with the F16
+            // x_orig (src1) → the <float,float,float> binbcast branch on an F16 src1 =
+            // the binbcast.cu:261 stride assert. The prod i2v/t2v path has vace_layers==0,
+            // so this just scopes F16 to the supported (and target) path.
+            static const bool wan_dit_f16 = (std::getenv("WAN_DIT_F16") != nullptr);
+            // VACE is now supported: the before_proj add site (above) upcasts the F16 main stream
+            // to F32 for the one collision, so the F16 residual win applies to the main stream of
+            // both i2v/t2v (vace_layers==0) AND VACE continuation.
+            const bool use_dit_f16        = wan_dit_f16;
+            if (use_dit_f16 && x->type == GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
+            }
+
+            // ── WAN_DUMP_BLOCKS: per-block grid-divergence detector ─────────────────────────
+            // Default OFF (env unset) => dump_plane is a no-op that adds ZERO graph nodes, so
+            // prod is byte-identical. When WAN_DUMP_BLOCKS=<dir> is set, after each transformer
+            // block (and at the DiT input + head, to bracket the whole DiT) we slice ONE
+            // representative frame from the residual token grid, channel-mean it to a compact
+            // [w_len,h_len] F32 plane, and register it as a debug tap. The tap is snapshotted +
+            // read back after graph compute by the existing capture_tensor/debug_tensors path
+            // (ggml_extend.hpp), which writes each plane to <dir>/<name>.bin (int64 ndim, then
+            // ndim int64 dims in ggml ne order [w_len,h_len], then f32 data, w fastest).
+            // tools/grid_divergence.py FFTs the planes to pinpoint the block that injects the
+            // mesh. One [w_len,h_len] plane per block (a few KB) so 40 blocks x steps can't OOM.
+            // Optional WAN_DUMP_FRAME=<t> picks the frame (default = middle; negative = from end).
+            static const bool wan_dump_blocks = (std::getenv("WAN_DUMP_BLOCKS") != nullptr);
+            static int wan_dump_call_counter  = 0;
+            const int wan_dump_step           = wan_dump_blocks ? wan_dump_call_counter++ : 0;
+            auto wan_pad = [](int v, int width) {
+                std::string s = std::to_string(v);
+                while ((int)s.size() < width) s = "0" + s;
+                return s;
+            };
+            // cut_group: the graph-cut segment group this plane rides in. Under offload the
+            // DiT graph is SPLIT into segments (compute_with_graph_cuts), and build_segment_graph
+            // rebuilds each segment from ONLY its cut-marked output nodes (ggml_graph_cut.cpp) —
+            // a plain output-flagged tap is dropped from every segment graph, so the per-segment
+            // dump never sees it (the "0 .bin files" bug). We therefore mark each plane as an
+            // extra cut-output of a segment. Block planes reuse the block's OWN existing cut group
+            // ("wan.blocks.<i>", see below) so they add ZERO segments; input/head get tiny own
+            // groups. Non-segmented runs ignore the mark and dump from the full graph as before.
+            auto dump_plane = [&](ggml_tensor* h, const std::string& tag, const std::string& cut_group) {
+                if (!wan_dump_blocks || h == nullptr || ctx->debug_tensors == nullptr) return;
+                if (wan_dump_h_len <= 0 || wan_dump_w_len <= 0 || wan_dump_t_len <= 0) return;
+                const int64_t hw = wan_dump_h_len * wan_dump_w_len;  // tokens per frame
+                if (h->ne[1] < hw) return;                           // token axis < one frame => skip (safety)
+                ggml_tensor* hc = ggml_is_contiguous(h) ? h : ggml_cont(ctx->ggml_ctx, h);
+                int64_t t0 = wan_dump_t_len / 2;                     // representative middle frame
+                if (const char* fenv = std::getenv("WAN_DUMP_FRAME")) {
+                    long v = std::atol(fenv);
+                    t0     = (v < 0) ? (wan_dump_t_len + v) : v;     // negative counts from the end
+                }
+                if (t0 < 0) t0 = 0;
+                if (t0 >= wan_dump_t_len) t0 = wan_dump_t_len - 1;
+                // One frame's tokens form a contiguous slab [dim, hw] (token layout: w fastest,
+                // h next, t outermost). View it, cast to F32 (CUDA mean is F32+contiguous only),
+                // channel-mean over dim -> [1, hw], reshape to the [w_len, h_len] image plane.
+                ggml_tensor* frame = ggml_view_2d(ctx->ggml_ctx, hc, hc->ne[0], hw,
+                                                  hc->nb[1], (size_t)(t0 * hw) * hc->nb[1]);
+                frame              = ggml_cast(ctx->ggml_ctx, frame, GGML_TYPE_F32);
+                ggml_tensor* plane = ggml_mean(ctx->ggml_ctx, frame);  // [1, hw]
+                plane              = ggml_reshape_2d(ctx->ggml_ctx, plane, wan_dump_w_len, wan_dump_h_len);
+                // Concrete output node + cut-mark so it survives segment rebuild; register it in
+                // the runner's debug_tensors so the post-compute dump (ggml_extend.hpp, gated on
+                // WAN_DUMP_BLOCKS as the output dir) writes <dir>/<tag>_step_SSSS.bin.
+                ggml_tensor* snap = ggml_cont(ctx->ggml_ctx, plane);
+                ggml_set_output(snap);
+                sd::ggml_graph_cut::mark_graph_cut(snap, cut_group, "gridplane");
+                ctx->debug_tensors->push_back({snap, tag + "_step_" + wan_pad(wan_dump_step, 4)});
+            };
+            // DiT input plane (post patch-embed, i.e. block-0 input) — the low bracket.
+            dump_plane(x, "input", "wan.dumpblocks.input");
 
             // time_embedding
             auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
@@ -693,15 +1044,51 @@ namespace WAN {
             }
 
             // vace_patch_embedding
-            ggml_tensor* c = nullptr;
+            ggml_tensor* c     = nullptr;
+            int64_t vace_t_len = 0;  // temporal latent-frame count of the vace control (drives the per-frame ramp)
             if (config.vace_layers > 0) {
                 auto vace_patch_embedding = std::dynamic_pointer_cast<Conv3d>(blocks["vace_patch_embedding"]);
 
-                c = vace_patch_embedding->forward(ctx, vace_context);                                    // [N*dim, t_len, h_len, w_len]
+                c = vace_patch_embedding->forward(ctx, vace_context);                                    // [N*dim, t_len, h_len, w_len]  (ggml ne=[w_len,h_len,t_len,N*dim])
+                vace_t_len = c->ne[2];                                                                    // temporal latent frames (slowest-varying token block after flatten)
                 c = ggml_reshape_3d(ctx->ggml_ctx, c, c->ne[0] * c->ne[1] * c->ne[2], c->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
+                // Under WAN_DIT_F16 the main stream `x` is F16, and (with nvfp4 weights) every main-
+                // block Linear already emits F16 — but the VACE control stream `c` was left F32, so
+                // the vace_blocks' FFN/QKV outputs (the [ffn_dim, T] intermediate is the single
+                // biggest activation) stayed F32 and PINNED the compute-buffer peak. Casting `c` to
+                // F16 here lets before_proj + the vace-block Linears emit F16 too (nvfp4 weight +
+                // F16 input -> F16 dst), halving the vace-stream activations. Self-gated: no-op
+                // unless WAN_DIT_F16 made x F16, so the default F32 path is byte-identical.
+                if (use_dit_f16 && c->type == GGML_TYPE_F32) {
+                    c = ggml_cast(ctx->ggml_ctx, c, GGML_TYPE_F16);
+                }
             }
-            sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            // VRAM levers (both default OFF => byte-identical to prod; env-gated for A/B).
+            //   WAN_VACE_SPLIT           — Lever 1: split each vace-mapped block so the
+            //                              main-block attention frees before the vace-block
+            //                              attention allocates (peak segment 6268->~3174MB).
+            //   WAN_VACE_XORIG_RECOMPUTE — Lever 2: drop the prelude-x graph-cut cache so
+            //                              x_orig is retraced (patch_embedding->reshape->cast)
+            //                              per vace segment instead of held resident the whole
+            //                              DiT (-618MB cache).
+            static const bool wan_vace_split = []{
+                const char* s = getenv("WAN_VACE_SPLIT");
+                return s && s[0] == '1';
+            }();
+            static const bool wan_vace_xorig_recompute = []{
+                const char* s = getenv("WAN_VACE_XORIG_RECOMPUTE");
+                return s && s[0] == '1';
+            }();
+            // Lever 2: the prelude x (== x_orig) is consumed ONLY by the vace blocks (and
+            // block 0's main forward). Marking it here pins its F16 618MB tensor in the
+            // graph-cut cache for the ENTIRE DiT. When WAN_VACE_XORIG_RECOMPUTE is set we
+            // drop the mark so each consuming segment retraces the cheap Conv3d patch
+            // embedding from the resident raw-latent leaf instead. Byte-identical
+            // (deterministic Conv3d), -618MB cache; default keeps the prelude-x cut.
+            if (!wan_vace_xorig_recompute) {
+                sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            }
             // sd::ggml_graph_cut::mark_graph_cut(e, "wan.prelude", "e");
             // sd::ggml_graph_cut::mark_graph_cut(e0, "wan.prelude", "e0");
             // sd::ggml_graph_cut::mark_graph_cut(context, "wan.prelude", "context");
@@ -711,13 +1098,101 @@ namespace WAN {
 
             auto x_orig = x;
 
+            // VACE_SKIP_BLOCKS: comma-separated vace-block indices whose control residual is
+            // NOT added into the main stream. Kijai's documented 2.2-VACE-Fun fix: the PAI
+            // adapter's block 0 injects a mis-scaled residual that "flashes"/ripples at full
+            // strength + few steps; dropping its add (while still threading c to downstream
+            // vace blocks) removes the artifact and keeps the rest of the control intact.
+            std::vector<int> vace_skip;
+            if (const char* vs = getenv("VACE_SKIP_BLOCKS")) {
+                for (const char* p = vs; *p;) {
+                    vace_skip.push_back(std::atoi(p));
+                    while (*p && *p != ',') ++p;
+                    while (*p == ',') ++p;
+                }
+            }
+
+            // VACE per-latent-frame strength RAMP (default OFF => byte-identical scalar path).
+            // Root cause: past the K-frame motion prior the control_video is gray (0.5) = no
+            // valid signal, yet every mapped vace_block still synthesizes a residual from that
+            // gray control and ADDS it UNIFORMLY to all temporal tokens (including the fast-limb
+            // tokens of the free frames), dragging them toward a frozen/gray target => directional
+            // smear, worst farthest from the prior. Identity is anchored by the prepended
+            // reference-image latent slot + the c_concat prior injection, NOT by this per-frame
+            // gray residual — so attenuating the residual on the free-motion TAIL frames while
+            // holding the leading ANCHOR frames at full strength releases the smear and keeps
+            // identity. The global VACE_STRENGTH scalar can't do this (it weakens the anchored
+            // frames too); a per-frame ramp is the distinction. Companion knobs (consumed here
+            // via getenv, mirroring the VACE_SKIP_BLOCKS pattern just above):
+            //   VACE_STRENGTH_TAIL          — strength floor for the LAST latent frame. Unset (or
+            //                                 == VACE_STRENGTH) => ramp OFF => scalar path => prod byte-identical.
+            //   VACE_STRENGTH_ANCHOR_FRAMES — leading latent frames held at FULL VACE_STRENGTH
+            //                                 before the ramp begins (default 2 = ref slot t=0 + first prior frame).
+            ggml_tensor* vace_ramp = nullptr;  // [1,1,t_len,1] per-frame scale; null => use the scalar vace_strength path
+            if (c != nullptr && vace_t_len > 0) {
+                float tail    = vace_strength;
+                bool tail_set = false;
+                if (const char* ts = getenv("VACE_STRENGTH_TAIL")) {
+                    tail     = (float)atof(ts);
+                    tail_set = true;
+                }
+                int64_t anchor = 2;  // default covers the ref-image latent slot (t=0) + the leading prior latent frame
+                if (const char* as = getenv("VACE_STRENGTH_ANCHOR_FRAMES")) {
+                    anchor = (int64_t)std::atoi(as);
+                }
+                if (anchor < 0) anchor = 0;
+                const int64_t denom = vace_t_len - 1 - anchor;  // # ramp steps; last frame lands exactly on tail
+                // Only ramp when a DIFFERENT tail is requested AND a tail region exists to ramp over;
+                // otherwise fall through to the exact existing scalar path => bit-identical to prod.
+                const bool ramp_active = tail_set && (tail != vace_strength) && (anchor < vace_t_len) && (denom > 0);
+                if (ramp_active) {
+                    // s(t) = strength + (tail - strength) * clamp((t - anchor) / denom, 0, 1)
+                    //   t <  anchor  : (t-anchor)<0 -> clamp 0 -> s = strength  (anchored identity frames untouched)
+                    //   t == t_len-1 : clamp 1       -> s = tail                (free-motion tail attenuated)
+                    auto s    = ggml_arange(ctx->ggml_ctx, -(float)anchor, (float)vace_t_len - (float)anchor, 1.0f);  // [t_len] = (t - anchor)
+                    s         = ggml_scale(ctx->ggml_ctx, s, 1.0f / (float)denom);                                   // (t-anchor)/denom
+                    s         = ggml_clamp(ctx->ggml_ctx, s, 0.0f, 1.0f);                                            // frac in [0,1]
+                    s         = ggml_scale(ctx->ggml_ctx, s, tail - vace_strength);                                  // (tail-strength)*frac
+                    auto base = ggml_ext_full(ctx->ggml_ctx, vace_strength, vace_t_len, 1, 1, 1);                    // [t_len] const = strength
+                    s         = ggml_add(ctx->ggml_ctx, s, base);                                                    // + strength
+                    vace_ramp = ggml_reshape_4d(ctx->ggml_ctx, s, 1, 1, vace_t_len, 1);                             // [1,1,t_len,1] broadcast scale
+                    static bool logged_ramp = false;
+                    if (!logged_ramp) {
+                        logged_ramp = true;
+                        LOG_INFO("VACE per-frame strength ramp: anchor %lld frames @%.3f, ramp to %.3f over %lld frames (t_len=%lld)",
+                                 (long long)anchor, (double)vace_strength, (double)tail,
+                                 (long long)(vace_t_len - anchor), (long long)vace_t_len);
+                    }
+                }
+            }
+
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
 
+                // WAN SLA: only the configured selector block exports pooled Q/K.
+                ctx->sla_capture_now =
+                    (ctx->sla_pooled_q_dst != nullptr) && (i == ctx->sla_selector_block);
+
                 x = block->forward(ctx, x, e0, pe, context, context_img_len);
+                ctx->sla_capture_now = false;  // don't leak into VACE / later blocks
 
                 auto iter = config.vace_layers_mapping.find(i);
                 if (iter != config.vace_layers_mapping.end()) {
+                    // Lever 1 (WAN_VACE_SPLIT): cut the main-block output x into its OWN
+                    // graph-cut segment so the main-block attention working set completes
+                    // and is freed BEFORE the vace-block attention allocates. Without this,
+                    // the vace-mapped block is one segment holding BOTH attention working
+                    // sets live at once (~6268MB = ~2x a plain block's ~3174MB), which is the
+                    // DiT VRAM peak. main-x then crosses into the vace segment (the
+                    // `x = x + c_skip` residual add below) as an INPUT_PREVIOUS_CUT, exactly
+                    // like the other cross-segment tensors — the cache stays at 3 live tensors
+                    // (main-x replaces the previous block's x; x_orig + c are the other two).
+                    // Byte-identical: a graph-cut boundary only re-partitions the graph for
+                    // per-segment memory reservation; every arithmetic node, and the
+                    // `x = x + c_skip` residual add and its order, is unchanged.
+                    if (wan_vace_split && c != nullptr) {
+                        sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i) + ".main", "x");
+                    }
                     int n = iter->second;
 
                     auto vace_block = std::dynamic_pointer_cast<VaceWanAttentionBlock>(blocks["vace_blocks." + std::to_string(n)]);
@@ -725,16 +1200,51 @@ namespace WAN {
                     auto result = vace_block->forward(ctx, c, x_orig, e0, pe, context, context_img_len);
                     auto c_skip = result.first;
                     c           = result.second;
-                    c_skip      = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
-                    x           = ggml_add(ctx->ggml_ctx, x, c_skip);
+                    // Drop this vace block's residual injection if listed (keeps c threaded).
+                    if (std::find(vace_skip.begin(), vace_skip.end(), n) == vace_skip.end()) {
+                        if (vace_ramp != nullptr) {
+                            // Per-latent-frame ramp: broadcast-multiply the control residual by s[t].
+                            // c_skip is [N, t_len*hw, dim] (ggml ne=[dim, t_len*hw, N]); the token axis
+                            // is temporal-OUTERMOST (flat tok = hw_idx + t*hw, so frame t is the slow
+                            // block of `hw` tokens). Split that axis into [hw, t_len] (hw innermost,
+                            // matching the layout) and multiply by vace_ramp ne=[1,1,t_len,1], which
+                            // broadcasts over dim, hw and N so every token of frame t is scaled by s[t];
+                            // then reshape back to the flat token layout. Applies to EVERY mapped block.
+                            if (!ggml_is_contiguous(c_skip)) {
+                                c_skip = ggml_cont(ctx->ggml_ctx, c_skip);
+                            }
+                            const int64_t dim = c_skip->ne[0];
+                            const int64_t hw  = c_skip->ne[1] / vace_t_len;  // h_len*w_len tokens per frame
+                            const int64_t Nb  = c_skip->ne[2];
+                            auto c4 = ggml_reshape_4d(ctx->ggml_ctx, c_skip, dim, hw, vace_t_len, Nb);  // [dim, hw, t_len, N]
+                            c4      = ggml_mul(ctx->ggml_ctx, c4, vace_ramp);                           // per-frame attenuation
+                            c_skip  = ggml_reshape_3d(ctx->ggml_ctx, c4, dim, vace_t_len * hw, Nb);     // back to [dim, tok, N]
+                        } else {
+                            c_skip = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
+                        }
+                        x = ggml_add(ctx->ggml_ctx, x, c_skip);
+                    }
                 }
                 sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i), "x");
                 if (c != nullptr) {
                     sd::ggml_graph_cut::mark_graph_cut(c, "wan.blocks." + std::to_string(i), "c");
                 }
+                // WAN_DUMP_BLOCKS: capture this block's post-residual (incl. any VACE inject) plane.
+                // Ride the block's OWN cut group ("wan.blocks.<i>", marked just above) so the plane
+                // joins this block's segment and adds no extra segment.
+                dump_plane(x, "block_" + wan_pad(i, 2), "wan.blocks." + std::to_string(i));
             }
 
+            // WAN_DIT_F16: bring the residual stream back to F32 before the head so the
+            // norm_out/modulate/proj_out tail + unpatchify + VAE run exactly as in prod
+            // (the head Linear then sees an F32 activation → F32 dst, unchanged output).
+            if (use_dit_f16 && x->type != GGML_TYPE_F32) {
+                x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+            }
             x = head->forward(ctx, x, e);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
+
+            // WAN_DUMP_BLOCKS: DiT output plane (post final norm/head) — the high bracket.
+            dump_plane(x, "head", "wan.dumpblocks.head");
 
             return x;
         }
@@ -797,6 +1307,8 @@ namespace WAN {
         Wan wan;
         std::vector<float> pe_vec;
         SDVersion version;
+        // WAN SLA (lightx2v sparse-attention port). Default OFF (WAN_SLA unset).
+        sd::WanSlaState sla;
 
         WanRunner(ggml_backend_t backend,
                   ggml_backend_t params_backend,
@@ -871,6 +1383,14 @@ namespace WAN {
 
             wan = Wan(config);
             wan.init(params_ctx, tensor_storage_map, prefix);
+
+            sla.cfg = sd::WanSlaConfig::from_env();
+            if (sla.cfg.enabled) {
+                LOG_INFO("[WAN-SLA] enabled: sparsity=%.2f (keep top %.0f%%), selector_block=%d, mode=%s%s, warmup=%d",
+                         sla.cfg.sparsity, 100.0f * (1.0f - sla.cfg.sparsity), sla.cfg.selector_block,
+                         sla.cfg.current_step ? "current-step(2-pass)" : "stale",
+                         sla.cfg.per_head ? "+per-head" : "+shared-heads", sla.cfg.warmup_steps);
+            }
         }
 
         std::string get_desc() override {
@@ -921,6 +1441,23 @@ namespace WAN {
             }
 
             auto runner_ctx = get_context();
+            runner_ctx.gf   = gf;
+
+            // WAN SLA: size the per-render selector state to this self-attn sequence
+            // (pos_len == the blocks' n_token), register the persistent export/bitmap
+            // tensors, and thread the capture dsts into the selector block. The device
+            // bitmap itself is (re)applied per step in compute(), before graph exec.
+            if (sla.cfg.enabled) {
+                const int dh = (int)(config.dim / config.num_heads);
+                sla.ensure(runtime_backend, (int64_t)pos_len, (int)config.num_heads, dh);
+                register_persistent_tensor(sla.pooled_q);
+                register_persistent_tensor(sla.pooled_k);
+                register_persistent_tensor(sla.bitmap);
+                runner_ctx.sla_pooled_q_dst  = sla.pooled_q;
+                runner_ctx.sla_pooled_k_dst  = sla.pooled_k;
+                runner_ctx.sla_selector_block = sla.cfg.selector_block;
+                runner_ctx.sla_blk            = sd::WAN_SLA_BLK;
+            }
 
             ggml_tensor* out = wan.forward(&runner_ctx,
                                            x,
@@ -950,7 +1487,40 @@ namespace WAN {
                 return build_graph(x, timesteps, context, clip_fea, c_concat, time_dim_concat, vace_context, vace_strength);
             };
 
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+            // WAN SLA Stage 1 — CURRENT-STEP (the ghosting fix): two passes per step.
+            // Pass 1 runs DENSE (bitmap cleared) and harvests THIS step's pooled Q/K
+            // from the selector block; the host builds the bitmap (per-head if enabled);
+            // pass 2 reruns SPARSE with it. Block-`sel`'s Q/K are a pure function of x
+            // (unchanged between passes), so the selection is exactly this step's — no
+            // one-step-stale echo. Speed/VRAM are irrelevant here (quality validation).
+            if (sla.cfg.enabled && sla.cfg.current_step) {
+                sla.apply_device_sparse(false);                                  // pass 1: dense
+                (void)GGMLRunner::compute<float>(get_graph, n_threads, false);   // harvest pooled
+                sla.update_from_pooled();                                        // build CURRENT-step bitmap
+                sla.apply_device_sparse(true);                                   // pass 2: sparse
+                auto out = restore_trailing_singleton_dims(
+                    GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+                LOG_INFO("[WAN-SLA] step %d (current-step%s): live=%.1f%% (target keep %.0f%%), n_blk=%d",
+                         sla.step - 1, sla.cfg.per_head ? ",per-head" : "",
+                         100.0 * sla.last_live_frac, 100.0f * (1.0f - sla.cfg.sparsity), sla.n_blk);
+                sla.apply_device_sparse(false);  // leave device clean for the next model/op
+                return out;
+            }
+
+            // WAN SLA Stage 0 — one-step-STALE: push the previous step's bitmap before
+            // this step's graph, harvest pooled after for the next step. Default OFF.
+            if (sla.cfg.enabled) sla.apply_device_sparse(sla.sparse_now());
+
+            auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
+
+            if (sla.cfg.enabled) {
+                sla.update_from_pooled();
+                LOG_INFO("[WAN-SLA] step %d: bitmap live=%.1f%% (target keep %.0f%%), n_blk=%d sparse_next=%d",
+                         sla.step - 1, 100.0 * sla.last_live_frac, 100.0f * (1.0f - sla.cfg.sparsity),
+                         sla.n_blk, (int)sla.sparse_now());
+            }
+
+            return out;
         }
 
         sd::Tensor<float> compute(int n_threads,

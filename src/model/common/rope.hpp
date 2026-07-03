@@ -696,6 +696,16 @@ namespace Rope {
         std::vector<std::vector<float>> vid_ids(t_len * h_len * w_len, std::vector<float>(3, 0.0));
 
         std::vector<float> t_ids = linspace<float>(1.f * t_offset, 1.f * t_len - 1 + t_offset, t_len);
+        // WAN_ZERO_T_ROPE (diagnostic, default OFF => byte-identical): collapse every temporal
+        // rope position to 0 so the (t,h,w) rope loses all temporal phase, while full 3D
+        // self-attention still runs over all T frames. Splits rope-structure vs attention:
+        // if a T-scaling spatial grid survives this, the temporal rope is exonerated and the
+        // grid is pure attention accumulation over more keys; if it vanishes, the temporal
+        // rope is implicated. Only the temporal ids are zeroed; h/w ids are unchanged.
+        static const bool wan_zero_t_rope = (getenv("WAN_ZERO_T_ROPE") != nullptr);
+        if (wan_zero_t_rope) {
+            std::fill(t_ids.begin(), t_ids.end(), 0.f);
+        }
         std::vector<float> h_ids = linspace<float>(1.f * h_offset, 1.f * h_len - 1 + h_offset, h_len);
         std::vector<float> w_ids = linspace<float>(1.f * w_offset, 1.f * w_len - 1 + w_offset, w_len);
 
@@ -948,9 +958,13 @@ namespace Rope {
         // per-segment gallocr view-output bug that lap-18 worked around by forcing
         // chain-RoPE on offload is fixed in ggml-alloc). See
         // GGMLRunnerContext::allow_fused_rope + PERF.md lap 20.
+        // x may be F32 (default) or F16 (the *_DIT_F16 stream feeds F16 q/k so the
+        // fused kernel emits F16 directly — no F32 rope tensors materialized; the
+        // F16 kernel computes the rotation in F32 and rounds the store to F16, which
+        // is bit-identical to F32-rope-then-cast-to-F16 that the F16 path did anyway).
         if (allow_fused && pe->ne[0] == 2 && pe->ne[1] == 2 &&
             pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
-            x->type == GGML_TYPE_F32 && pe->type == GGML_TYPE_F32 &&
+            (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) && pe->type == GGML_TYPE_F32 &&
             getenv("LONGCAT_NO_FUSED_ROPE") == nullptr) {
             // Fused RoPE op: one CUDA kernel reads x + pe and writes the rotated
             // output, with NO cont+permute+repeat intermediates. The non-interleaved
@@ -1001,16 +1015,17 @@ namespace Rope {
                                              ggml_tensor* v,
                                              ggml_tensor* pe,
                                              ggml_tensor* mask,
-                                             float kv_scale        = 1.0f,
-                                             bool rope_interleaved = true,
-                                             bool flash_attn       = true) {
+                                             float kv_scale         = 1.0f,
+                                             bool rope_interleaved  = true,
+                                             bool flash_attn        = true,
+                                             bool flash_skip_kv_pad = false) {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
         q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved, ctx->allow_fused_rope);  // [N*n_head, L, d_head]
         k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved, ctx->allow_fused_rope);  // [N*n_head, L, d_head]
 
-        auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, flash_attn && ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
+        auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, flash_attn && ctx->flash_attn_enabled, kv_scale, flash_skip_kv_pad);  // [N, L, n_head*d_head]
         return x;
     }
 };  // namespace Rope
