@@ -236,6 +236,15 @@ public:
     std::set<std::string> te_reload_ignore_tensors;
     bool te_reload_use_mmap = false;
 
+    // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED): reload state so the video + audio VAE params can be
+    // brought back for the final decode after being freed to make VRAM headroom during the stage-2
+    // DiT forward. Mirrors the umT5 te_reload pattern: free_params_buffer() nulls the tensors' data
+    // pointers, and a retained ModelLoader + load_tensors() re-materializes the weights from disk
+    // (~0.1s for the ~1.4GB VAE with a warm page cache). Captured only for LTXAV + no-mmap (mmap'd
+    // weights are never freed, so there is neither VRAM to reclaim nor a reload to do).
+    std::shared_ptr<ModelLoader> resident_reload_loader;
+    bool                          resident_reload_use_mmap = false;
+
     // Dual-DiT (base/edit) hot-swap state. The flags mirror the boot mmap
     // config (sd_ctx_params isn't retained); the store holds the mmap of the
     // CURRENTLY-SWAPPED DiT so its file-backed pages stay alive. Reassigned on
@@ -1271,6 +1280,15 @@ public:
             }
         }
 
+        // FIX 3: capture a loader copy so the video/audio VAE can be reloaded after being freed for
+        // the stage-2 DiT forward (LTXAV two-stage relip). model_loader already holds every model
+        // file's converted tensor metadata; reload re-reads the weights from disk. Skip under mmap
+        // (weights are never freed => no VRAM reclaimed, no reload needed).
+        if (free_params_immediately && version == VERSION_LTXAV && !sd_ctx_params->enable_mmap) {
+            resident_reload_loader   = std::make_shared<ModelLoader>(model_loader);
+            resident_reload_use_mmap = sd_ctx_params->enable_mmap;
+        }
+
         // Skip the eager DiT alloc when deferred (avatar umT5-on-GPU loads it later in
         // finalize_deferred_dit_load); otherwise alloc now and surface failure (upstream).
         if (diffusion_model && !dit_load_deferred && !diffusion_model->alloc_params_buffer()) {
@@ -1617,6 +1635,60 @@ public:
         }
         LOG_INFO("text-encoder reloaded for prompt change, taking %.2fs",
                  (ggml_time_ms() - t0) * 1.0f / 1000);
+        return true;
+    }
+
+    // FIX 3 helpers: re-materialize a VAE whose params were freed for the stage-2 DiT forward.
+    // No-op (returns true) when the params are still resident, so callers can invoke unconditionally
+    // before the decode. Rebuilds the tensor map from the live model (params_ctx tensor structs
+    // survive free_params_buffer(); only their data pointers were nulled), allocs a fresh params
+    // buffer, and reloads the weights via the retained loader — exactly the reload_cond_stage_model
+    // path proven for umT5.
+    bool reload_first_stage_model() {
+        if (!first_stage_model) {
+            return false;
+        }
+        if (first_stage_model->get_params_buffer_size() != 0) {
+            return true;  // still resident
+        }
+        if (!resident_reload_loader) {
+            LOG_ERROR("video VAE reload requested but no reload state captured");
+            return false;
+        }
+        int64_t t0 = ggml_time_ms();
+        first_stage_model->alloc_params_buffer();
+        std::map<std::string, ggml_tensor*> t;
+        first_stage_model->get_param_tensors(t, "first_stage_model");
+        std::set<std::string> ignore;
+        if (!resident_reload_loader->load_tensors(t, ignore, n_threads, resident_reload_use_mmap)) {
+            LOG_ERROR("video VAE reload failed");
+            return false;
+        }
+        LOG_INFO("video VAE reloaded for decode, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
+        return true;
+    }
+
+    bool reload_audio_vae_model() {
+        if (!audio_vae_model) {
+            return false;
+        }
+        if (audio_vae_model->get_params_buffer_size() != 0) {
+            return true;  // still resident
+        }
+        if (!resident_reload_loader) {
+            LOG_ERROR("audio VAE reload requested but no reload state captured");
+            return false;
+        }
+        int64_t t0 = ggml_time_ms();
+        audio_vae_model->alloc_params_buffer();
+        std::map<std::string, ggml_tensor*> t;
+        audio_vae_model->get_param_tensors(t, "");
+        std::set<std::string> ignore;
+        if (!resident_reload_loader->load_tensors(t, ignore, n_threads, resident_reload_use_mmap)) {
+            LOG_ERROR("audio VAE reload failed");
+            return false;
+        }
+        LOG_INFO("audio VAE reloaded for decode, taking %.2fs", (ggml_time_ms() - t0) * 1.0f / 1000);
         return true;
     }
 
@@ -2396,7 +2468,8 @@ public:
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
                              const sd::Tensor<float>& video_positions = {},
-                             bool ltxav_audio_fixed                    = false) {
+                             bool ltxav_audio_fixed                    = false,
+                             const sd::Tensor<float>& video_reference  = {}) {
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
         float cfg_scale     = guidance.txt_cfg;
         float img_cfg_scale = guidance.img_cfg;
@@ -2465,6 +2538,33 @@ public:
             cond_noise_rng = std::make_shared<MT19937RNG>(0x10ec0de5ULL);
             LOG_INFO("LTXAV cond-noise: image_cond_noise_scale=%.4f (timestep-dependent noise on hard-conditioning frames)",
                      cond_noise_scale);
+        }
+
+        // LTXAV A2V (audio-to-video) modality guidance — drives lip-sync on the distilled model.
+        // The DiT is an audio-video model but the video won't track a *frozen* driving-audio
+        // latent on its own (the strong reference dominates). LTX-2's MultiModalGuider fixes this
+        // with a modality term: pred = cond + (scale-1)*(cond - mod), where the "mod" forward has
+        // the audio<->video cross-attention severed (the video as if the audio were absent).
+        // Extrapolating away from it amplifies how strongly the mouth follows the audio. It
+        // perturbs the AUDIO modality (not text), so unlike text CFG it needs no negative prompt
+        // and survives distillation. Costs a 2nd forward/step. Off by default (1.0).
+        float a2v_guidance_scale = 1.0f;
+        if (const char* e = std::getenv("LTXAV_A2V_GUIDANCE")) {
+            a2v_guidance_scale = (float)atof(e);
+        }
+        // A2V schedule: ramp the guidance across the denoise trajectory (the official guider
+        // varies its params by sigma; a constant scale over-drives the LOW-sigma detail steps
+        // and smears the lips). LTXAV_A2V_RAMP_END = the fraction of (scale-1) kept at the LAST
+        // (lowest-sigma) step: 1.0 = constant [default]; 0.0 = ramp to OFF so late steps refine
+        // a clean mouth; 0.5 = ramp to half. Interpolated linearly in sigma between sigmas[0]
+        // (full strength) and ~0 (ramp_end strength).
+        float a2v_ramp_end = 1.0f;
+        if (const char* e = std::getenv("LTXAV_A2V_RAMP_END")) {
+            a2v_ramp_end = std::clamp((float)atof(e), 0.0f, 1.0f);
+        }
+        if (a2v_guidance_scale != 1.0f && sd_version_is_ltxav(version)) {
+            LOG_INFO("LTXAV A2V (audio->video) modality guidance scale=%.2f ramp_end=%.2f (lip-sync; +1 audio-skipped forward/step)",
+                     a2v_guidance_scale, a2v_ramp_end);
         }
 
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
@@ -2569,7 +2669,8 @@ public:
             auto run_condition = [&](const SDCondition& condition,
                                      const sd::Tensor<float>* c_concat_override                 = nullptr,
                                      const std::vector<int>* local_skip_layers                  = nullptr,
-                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr) -> sd::Tensor<float> {
+                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
+                                     bool skip_a2v_pass                                         = false) -> sd::Tensor<float> {
                 diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
                 diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
                 diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
@@ -2601,7 +2702,9 @@ public:
                         audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
                         audio_length,
                         frame_rate,
-                        video_positions.empty() ? nullptr : &video_positions};
+                        video_positions.empty() ? nullptr : &video_positions,
+                        skip_a2v_pass,
+                        video_reference.empty() ? nullptr : &video_reference};
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};  // cond-frame K/V cache (lap-26)
                 } else {
@@ -2666,6 +2769,31 @@ public:
                 };
                 scan(noised_input, "in ");
                 scan(cond_out, "out");
+            }
+
+            // A2V modality guidance: re-run the DiT with audio<->video cross-attn severed (the
+            // "mod" pass) and extrapolate cond away from it to amplify lip-sync. Only meaningful
+            // when a driving audio is held fixed. pred = cond + (eff_scale-1)*(cond - mod), where
+            // eff_scale ramps from the full scale at sigmas[0] to scale-ramped at sigma~0 so the
+            // detail (low-sigma) steps don't over-drive and smear the lips.
+            if (a2v_guidance_scale != 1.0f && sd_version_is_ltxav(version) && ltxav_audio_fixed) {
+                float eff_scale = a2v_guidance_scale;
+                if (a2v_ramp_end < 1.0f && !sigmas.empty() && sigmas[0] > 0.0f) {
+                    float frac = std::clamp(1.0f - sigma / sigmas[0], 0.0f, 1.0f);  // 0 at high sigma -> 1 at low
+                    float w    = 1.0f + (a2v_ramp_end - 1.0f) * frac;               // 1.0 -> a2v_ramp_end
+                    eff_scale  = 1.0f + (a2v_guidance_scale - 1.0f) * w;
+                }
+                // Skip the (expensive) 2nd forward once the scheduled scale is negligible — with a
+                // ramp-to-off this drops the audio-severed pass on the low-sigma detail steps, so
+                // the schedule buys back compute, not just cleaner lips.
+                if (std::fabs(eff_scale - 1.0f) > 0.02f) {
+                    sd::Tensor<float> mod_out =
+                        run_condition(*positive_condition, c_concat_override, nullptr, nullptr, /*skip_a2v_pass=*/true);
+                    if (mod_out.empty()) {
+                        return {};
+                    }
+                    cond_out = cond_out + (cond_out - mod_out) * (eff_scale - 1.0f);
+                }
             }
 
             if (!uncond.empty()) {
@@ -2884,6 +3012,11 @@ public:
     }
 
     sd::Tensor<float> encode_to_vae_latents(const sd::Tensor<float>& x) {
+        // Mirror decode_first_stage: enable temporal tiling on the encoder too, else a
+        // long clip (e.g. the LTXAV relip reference video) is encoded in ONE buffer and
+        // OOMs at full res (1x1 spatial). The decode path set this; the encode path did
+        // not, so --temporal-tiling silently had no effect on encode.
+        first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
         auto latents = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
         if (latents.empty()) {
             return {};
@@ -4203,6 +4336,10 @@ struct ImageGenerationLatents {
     sd::Tensor<float> img_uncond_concat_latent;
     sd::Tensor<float> audio_latent;
     sd::Tensor<float> video_positions;
+    // FIX A2 separable half-res relip reference (LTXAV_RELIP_REF_DOWNSCALE>1): the [W/N,H/N,ref,C]
+    // reference latent fed to the DiT as a separate token block (NOT concatenated into init_latent).
+    // Empty on every other path (incl. N==1 full-res concat) => legacy behaviour untouched.
+    sd::Tensor<float> video_reference;
     sd::Tensor<float> control_image;
     std::vector<sd::Tensor<float>> ref_images;
     std::vector<sd::Tensor<float>> ref_latents;
@@ -4214,6 +4351,13 @@ struct ImageGenerationLatents {
     int64_t video_target_frame_count       = 0;
     int audio_length                       = 0;
     bool audio_fixed                       = false;  // LTXAV: hold audio latent fixed (drive lip-sync to a given wav)
+    // Two-stage lipdub relip (LTXAV_RELIP_TWOSTAGE=1): stage-1 ran at half res from-noise; the
+    // hires latent-upscale stage-2 must RE-APPLY the relip reference at full res (Change B in
+    // apply_ltxv_refine_image_conditioning). These carry the stage-1 setup forward so stage-2 can
+    // re-encode the reference at the upscaled resolution. relip_twostage=false on every other path.
+    bool relip_twostage                    = false;
+    int relip_ref_downscale                = 1;  // reference_downscale_factor (spatial), per LoRA / env
+    int relip_ref_tstride                  = 1;  // temporal subsample stride, per env
 };
 
 static float ltxv_latent_corner_to_pixel_frame(int64_t corner_index,
@@ -4294,6 +4438,122 @@ static sd::Tensor<float> build_ltxv_video_positions(int64_t width,
     }
 
     return positions;
+}
+
+// LTX-2.3 V2V LIPDUB RELIP positions. The appended reference-clip tokens occupy the SAME
+// timeline coordinates as the target tokens (1:1 frame overlap; reference_downscale_factor=1
+// and reference_temporal_scale=1 per the lipdub-0.9 IC-LoRA metadata), so the model copies the
+// reference appearance + motion per-frame while the frozen driving-audio latent moves the mouth.
+// Both the target and reference blocks use the identical causal corner mapping; with equal frame
+// counts the reference token positions exactly mirror the target token positions. This differs
+// from build_ltxv_video_positions, whose keyframe block offsets the guide onto a separate
+// (past/future) timeline for continuation.
+// ref_width/ref_height/ref_spatial_scale default to the target grid's values (-1 sentinel),
+// which makes the reference block IDENTICAL to the target block (full-res concat path, N==1,
+// byte-identical to the original two-equal-block builder). For the separable half-res path
+// (LTXAV_RELIP_REF_DOWNSCALE=N>1) the reference is encoded at W/N x H/N, so its block uses
+// ref_width=W/N, ref_height=H/N, ref_spatial_scale=spatial_scale*N — the *N keeps each half-res
+// reference latent cell spanning the SAME pixel extent on the shared timeline as a full-res cell.
+static sd::Tensor<float> build_ltxv_relip_video_positions(int64_t width,
+                                                          int64_t height,
+                                                          int64_t target_latent_frames,
+                                                          int64_t reference_latent_frames,
+                                                          int fps,
+                                                          int spatial_scale,
+                                                          int temporal_scale,
+                                                          bool causal_temporal_positioning,
+                                                          int64_t ref_width        = -1,
+                                                          int64_t ref_height       = -1,
+                                                          int ref_spatial_scale    = -1,
+                                                          int ref_temporal_stride  = 1) {
+    if (ref_width < 0) ref_width = width;
+    if (ref_height < 0) ref_height = height;
+    if (ref_spatial_scale < 0) ref_spatial_scale = spatial_scale;
+    if (ref_temporal_stride < 1) ref_temporal_stride = 1;
+    GGML_ASSERT(width > 0 && height > 0 && target_latent_frames > 0 && reference_latent_frames > 0);
+    GGML_ASSERT(ref_width > 0 && ref_height > 0);
+    GGML_ASSERT(fps > 0);
+
+    int64_t total_tokens = width * height * target_latent_frames + ref_width * ref_height * reference_latent_frames;
+    sd::Tensor<float> positions({2, 3, total_tokens, 1});
+    int64_t token = 0;
+
+    // tstride = the original-latent-frame step between successive emitted reference frames
+    // (LTXAV_RELIP_REF_TSTRIDE). The j-th subsampled reference frame represents original latent
+    // frame j*tstride, so it must carry THAT frame's temporal coordinate (a single-frame extent
+    // [corner(j*tstride), corner(j*tstride+1)]) to stay timeline-aligned with the target. tstride=1
+    // (target block, and ref when no temporal subsampling) = the original per-frame coordinates.
+    auto emit_block = [&](int64_t bw, int64_t bh, int bscale, int btstride, int64_t frames) {
+        for (int64_t t = 0; t < frames; t++) {
+            int64_t src_corner = t * btstride;
+            float t_start = ltxv_latent_corner_to_pixel_frame(src_corner, temporal_scale, causal_temporal_positioning) / static_cast<float>(fps);
+            float t_end   = ltxv_latent_corner_to_pixel_frame(src_corner + 1, temporal_scale, causal_temporal_positioning) / static_cast<float>(fps);
+            for (int64_t h = 0; h < bh; h++) {
+                float h_start = static_cast<float>(h * bscale);
+                float h_end   = static_cast<float>((h + 1) * bscale);
+                for (int64_t w = 0; w < bw; w++) {
+                    float w_start = static_cast<float>(w * bscale);
+                    float w_end   = static_cast<float>((w + 1) * bscale);
+                    set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
+                }
+            }
+        }
+    };
+
+    emit_block(width, height, spatial_scale, 1, target_latent_frames);                            // target (denoised) tokens
+    emit_block(ref_width, ref_height, ref_spatial_scale, ref_temporal_stride, reference_latent_frames);  // reference (frozen) tokens
+
+    return positions;
+}
+
+// FIX 1 (VRAM) — host-level TEMPORAL-CHUNKED reference encode. The LTX video-VAE encode builds a
+// SINGLE graph for the whole clip: temporal-tiled streaming is DECODE-only (gated on decode_graph
+// @ ltx_vae.hpp:1449; there is no encode_tiled_chunk), so the encode compute buffer scales with
+// frame count (~2.6 GB @193f, temporal-dominated) and OOMs before stage-2 sampling. This slices
+// the PIXEL reference into causal 8k+1-aligned temporal groups, encodes each with the caller's
+// already-set spatial tiling, and concats the latent frames — bounding the buffer to ~(8*G+1)
+// frames of activations regardless of clip length. The LTX VAE is causal (temporal compression 8:
+// F=8k+1 -> k+1 latent frames; latent 0 = 1-frame seed, latent i>=1 = an 8-pixel-frame chunk).
+// Groups after the first are prefixed with a 1-frame causal seed (the previous group's last pixel
+// frame) whose latent is dropped; that seed under-provides causal history vs a full-clip encode
+// (the decode path uses a multi-feature cache we lack on the encoder) — a small boundary
+// approximation, harmless for a FROZEN conditioning reference. The full latent frame count is
+// preserved, so this composes with the TSTRIDE latent-subsample downstream (TSTRIDE-independent).
+// group_latent_chunks (G) = LTXAV_RELIP_ENCODE_TFRAMES; the helper is skipped unless that env is
+// set (default path = one monolithic encode, byte-identical).
+static sd::Tensor<float> encode_relip_reference_temporal_chunked(sd_ctx_t* sd_ctx,
+                                                                 const sd::Tensor<float>& ref_video,
+                                                                 int group_latent_chunks) {
+    const int64_t F = ref_video.shape()[2];   // pixel frames (already snapped to 8k+1)
+    const int64_t k = (F - 1) / 8;             // 8-frame chunks (=> k+1 latent frames)
+    const int G     = std::max(1, group_latent_chunks);
+    if (F <= 1 || k < 1 || static_cast<int64_t>(G) >= k) {
+        // Trivial clip or group covers the whole clip => single monolithic encode (no benefit).
+        return sd_ctx->sd->encode_first_stage(ref_video);
+    }
+    // Group 0: pixel [0, 8*g0+1) -> keeps latent [0, g0] (seed frame + g0 chunks).
+    const int64_t g0      = std::min<int64_t>(G, k);
+    sd::Tensor<float> out = sd_ctx->sd->encode_first_stage(sd::ops::slice(ref_video, 2, 0, 8 * g0 + 1));
+    if (out.empty()) {
+        return {};
+    }
+    int64_t done = g0;   // chunk latent frames produced so far (excluding seed latent 0)
+    while (done < k) {
+        const int64_t g       = std::min<int64_t>(G, k - done);
+        const int64_t seed_px = 8 * done;   // last pixel frame already covered = causal seed (sub-clip frame 0)
+        auto sub              = sd::ops::slice(ref_video, 2, seed_px, seed_px + 8 * g + 1);  // seed + 8g frames = 8g+1
+        auto lat              = sd_ctx->sd->encode_first_stage(sub);                          // seed + g chunks = g+1 latent
+        if (lat.empty() || lat.shape()[2] < g + 1) {
+            LOG_WARN("LTXAV relip temporal-chunked encode: unexpected chunk latent frames %lld (want >= %lld); falling back to monolithic encode",
+                     lat.empty() ? -1LL : (long long)lat.shape()[2], (long long)(g + 1));
+            return sd_ctx->sd->encode_first_stage(ref_video);
+        }
+        out = sd::ops::concat(out, sd::ops::slice(lat, 2, 1, g + 1), 2);   // drop seed latent frame 0
+        done += g;
+    }
+    LOG_INFO("LTXAV relip: temporal-chunked reference encode G=%d -> %lld latent frames (buffer bounded to ~%lld-frame groups)",
+             G, (long long)out.shape()[2], (long long)(8 * G + 1));
+    return out;
 }
 
 static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<float>& video_latent,
@@ -4486,6 +4746,66 @@ static bool apply_ltxav_video_guide_by_keyframe_index(ImageGenerationLatents* la
                                                           spatial_scale,
                                                           8,
                                                           true);
+    return true;
+}
+
+// LTX-2.3 V2V LIPDUB RELIP (IC-LoRA). Append the FULL reference clip's VAE latents as EXTRA
+// CLEAN tokens at the tail of the sequence, occupying the SAME timeline positions as the target
+// frames (1:1 overlap). The reference tokens are held FROZEN (denoise mask 0) so the lipdub
+// IC-LoRA copies the reference appearance + motion per-frame while the frozen driving-audio
+// latent (--drive-audio, audio_fixed) drives the mouth. The appended tokens are cropped off the
+// output after sampling (video_conditioning_frame_count). Reuses the continuation machinery
+// (concat tail, frozen mask, crop) but with timeline-ALIGNED positions instead of an offset.
+static bool apply_ltxav_video_relip_reference(ImageGenerationLatents* latents,
+                                              const sd::Tensor<float>& reference,
+                                              int fps,
+                                              int spatial_scale) {
+    if (latents == nullptr || latents->init_latent.empty() || latents->denoise_mask.empty() || reference.empty()) {
+        return false;
+    }
+    if (reference.shape()[0] != latents->init_latent.shape()[0] ||
+        reference.shape()[1] != latents->init_latent.shape()[1] ||
+        reference.shape()[3] != latents->init_latent.shape()[3]) {
+        LOG_ERROR("invalid LTXAV relip reference latent shape");
+        return false;
+    }
+    int64_t reference_frames                = reference.shape()[2];
+    latents->video_target_frame_count       = latents->init_latent.shape()[2];
+    latents->video_conditioning_frame_count = reference_frames;
+    if (reference_frames != latents->video_target_frame_count) {
+        // Not fatal — positions still align per-index — but 1:1 relip wants equal counts.
+        LOG_WARN("LTXAV relip: reference latent frames %lld != target %lld (expect 1:1 overlap)",
+                 (long long)reference_frames, (long long)latents->video_target_frame_count);
+    }
+    latents->init_latent = sd::ops::concat(latents->init_latent, reference, 2);
+
+    // Reference conditioning strength (the official IC-LoRA `reference_strength`, default 1.0):
+    // denoise mask = 1 - strength. strength 1.0 = fully frozen crisp reference — faithful but,
+    // in our SINGLE full-res from-noise pass (the official runs a two-stage half-res→refine),
+    // it pins every frame to its source pixels at the same spacetime coord: that clamps the
+    // mouth shut (a2v can't overpower it) and smears moving content into a temporal echo.
+    // Lowering strength (~0.7-0.9) renoises the reference tokens a little each step so the lock
+    // loosens — the audio can open the mouth and the double-exposure eases, at some cost to
+    // identity/scene fidelity. Env LTXAV_RELIP_REF_STRENGTH (default 1.0 = legacy frozen).
+    float ref_strength = 1.0f;
+    if (const char* e = std::getenv("LTXAV_RELIP_REF_STRENGTH")) {
+        ref_strength = std::clamp((float)atof(e), 0.0f, 1.0f);
+    }
+    float ref_mask_val = 1.0f - ref_strength;
+    if (ref_strength != 1.0f) {
+        LOG_INFO("LTXAV relip: reference_strength=%.2f (reference denoise mask=%.2f; <1 loosens the frozen reference)",
+                 ref_strength, ref_mask_val);
+    }
+    auto reference_mask   = sd::full<float>({reference.shape()[0], reference.shape()[1], reference_frames, 1, 1}, ref_mask_val);
+    latents->denoise_mask = sd::ops::concat(latents->denoise_mask, reference_mask, 2);
+    latents->video_positions = build_ltxv_relip_video_positions(latents->init_latent.shape()[0],
+                                                                latents->init_latent.shape()[1],
+                                                                latents->video_target_frame_count,
+                                                                reference_frames,
+                                                                fps,
+                                                                spatial_scale,
+                                                                8,
+                                                                true);
     return true;
 }
 
@@ -5620,6 +5940,20 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
+        // LTX-2.3 V2V lipdub relip (control_frames) requires an 8k+1 frame count (VAE temporal
+        // stride 8). Snap here — before the audio length is derived — so the reference clip,
+        // target latent, and audio all agree. Gated on control_frames so every other LTXAV path
+        // (i2v, t2v, continuation, --drive-audio without control_frames) is byte-identical.
+        if (sd_vid_gen_params->control_frames_size > 0) {
+            int snapped = ((request->frames - 1) / 8) * 8 + 1;
+            if (snapped < 1) {
+                snapped = 1;
+            }
+            if (snapped != request->frames) {
+                LOG_INFO("LTXAV relip: snapping frames %d -> %d (8k+1)", request->frames, snapped);
+                request->frames = snapped;
+            }
+        }
         latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
         const char* drive_wav = SAFE_STR(sd_vid_gen_params->drive_audio_path);
         if (strlen(drive_wav) > 0) {
@@ -5637,11 +5971,278 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
         if (sd_vid_gen_params->control_frames_size > 0) {
-            LOG_ERROR("LTXAV control_frames are not implemented");
-            return std::nullopt;
-        }
+            // LTX-2.3 V2V LIPDUB RELIP: the control_frames are an existing video clip (e.g. a
+            // Wan2.2 render). Encode the WHOLE clip to video latents and append it as a frozen,
+            // timeline-aligned IC-LoRA reference (apply_ltxav_video_relip_reference). With the
+            // lipdub IC-LoRA loaded (--lora) + a frozen driving-audio latent (--drive-audio), the
+            // model preserves the input video and only re-lips the mouth. Off-switch:
+            // LTXAV_RELIP_DISABLE restores the legacy "not implemented" rejection for A/B.
+            if (std::getenv("LTXAV_RELIP_DISABLE") != nullptr) {
+                LOG_ERROR("LTXAV control_frames (relip) disabled via LTXAV_RELIP_DISABLE");
+                return std::nullopt;
+            }
+            if (sd_ctx->sd->vae_decode_only) {
+                LOG_ERROR("LTXAV relip (control_frames) requires VAE encoder weights; create the context with vae_decode_only=false");
+                return std::nullopt;
+            }
 
-        if (!start_image.empty() || !end_image.empty()) {
+            int64_t t1      = ggml_time_ms();
+            int64_t cf_size = sd_vid_gen_params->control_frames_size;
+            if (cf_size < request->frames) {
+                LOG_WARN("LTXAV relip: %lld control_frames < %d target frames; holding the last frame for the remainder",
+                         (long long)cf_size, request->frames);
+            }
+
+            // FIX A2 (env LTXAV_RELIP_REF_DOWNSCALE, default 1 = full-res reference, the prod
+            // path; N>1 = separable half-res reference): the lipdub-0.9 IC-LoRA carries
+            // reference_downscale_factor and was trained with a HALF-resolution reference.
+            // The reference currently DOUBLES the DiT video-token count (L_q=L_k ~= 44000) and
+            // is the binding driver of the 4524 MiB DiT compute buffer that OOMs at 193 frames
+            // (render-proven: --max-vram / *_RESIDENT / TE-free all still OOM at the SAME alloc).
+            //
+            // N==1 (default/prod): UNCHANGED. Reference encoded at full res and grid-concatenated
+            //   into the sampler latent (apply_ltxav_video_relip_reference) — byte-identical.
+            // N>1 (opt-in): reference encoded at W/N x H/N and kept as a SEPARATE latent grid
+            //   (latents.video_reference). It is NOT in the sampler grid (that stays target-only,
+            //   denoise_mask all-ones). The DiT patchifies it on its own and appends its (N^2
+            //   fewer) tokens to the video sequence; positions for the ref block come from the
+            //   half-res emit_block of build_ltxv_relip_video_positions; per-token ref timesteps
+            //   are appended as frozen t=0 inside build_graph; the ref tokens are sliced off
+            //   before unpatchify so the output is target-only (crop becomes a no-op).
+            //
+            // FIX A2t (env LTXAV_RELIP_REF_TSTRIDE, default 1): TEMPORAL subsample — keep FULL
+            // spatial resolution (face identity intact) but emit only every T-th reference latent
+            // frame. ref tokens drop by ~T with NO spatial loss. Composes with DOWNSCALE (both
+            // shrink the ref token block); either >1 forces the same separable-token path (a
+            // shorter/lower-res reference can't grid-concat onto the full target). The subsampled
+            // ref frames keep their TRUE timeline coordinates (frame j -> original frame j*T) via
+            // ref_temporal_stride in build_ltxv_relip_video_positions, so each still maps to the
+            // right target time.
+            int relip_ref_downscale = 1;
+            if (const char* e = std::getenv("LTXAV_RELIP_REF_DOWNSCALE")) {
+                int v = std::atoi(e);
+                if (v >= 1) {
+                    relip_ref_downscale = v;
+                }
+            }
+            int relip_ref_tstride = 1;
+            if (const char* e = std::getenv("LTXAV_RELIP_REF_TSTRIDE")) {
+                int v = std::atoi(e);
+                if (v >= 1) {
+                    relip_ref_tstride = v;
+                }
+            }
+            const int ref_ds = relip_ref_downscale;
+            // Reference encode dims. N==1 => full target res (prod path, byte-identical). N>1:
+            // encode the reference at the OFFICIAL aspect-preserving downscale (content =
+            // width/N x height/N; iclora_utils.py:108-109) — NOT floored to a VAE-scale multiple.
+            // The old floor `(dim/N/vsf)*vsf` anisotropically squished the face (e.g. 352->160
+            // instead of 176) AND dropped a latent row, so the reference RoPE span (ref_lat*vsf*N)
+            // undershot the target extent and identity failed to bind. Our VAE derives latent dims
+            // by floor division (vae.hpp:145), so we PAD the content (neutral gray, bottom/right) up
+            // to the next VAE-scale multiple before encoding => ceil(content/vsf) rows, matching the
+            // official VAE's internal padding; the pad lands in extra ref tokens whose positions
+            // extend just past the target (the official overhang).
+            int64_t ref_content_w = request->width;
+            int64_t ref_content_h = request->height;
+            int64_t ref_enc_w     = request->width;
+            int64_t ref_enc_h     = request->height;
+            if (ref_ds > 1) {
+                int64_t vsf = std::max<int64_t>(1, request->vae_scale_factor);
+                int64_t cw  = request->width / ref_ds;
+                int64_t ch  = request->height / ref_ds;
+                if (cw >= vsf && ch >= vsf) {
+                    ref_content_w = cw;
+                    ref_content_h = ch;
+                    ref_enc_w     = ((cw + vsf - 1) / vsf) * vsf;
+                    ref_enc_h     = ((ch + vsf - 1) / vsf) * vsf;
+                    LOG_INFO("LTXAV relip: SEPARABLE half-res reference, downscale=%d -> resize ref to %lldx%lld (aspect-preserving) + pad to %lldx%lld for encode (target %dx%d)",
+                             ref_ds, (long long)ref_content_w, (long long)ref_content_h,
+                             (long long)ref_enc_w, (long long)ref_enc_h, request->width, request->height);
+                } else {
+                    LOG_WARN("LTXAV relip: LTXAV_RELIP_REF_DOWNSCALE=%d too large for %dx%d (vae_scale %lld); using full-res reference",
+                             ref_ds, request->width, request->height, (long long)vsf);
+                    relip_ref_downscale = 1;
+                }
+            }
+            // Two-stage lipdub (LTXAV_RELIP_TWOSTAGE=1, set up in generate_video which already
+            // halved request->w/h for stage-1): force the separable token path in stage-1 so the
+            // reference is a separate block (matching the official, and so stage-2 can re-apply it
+            // the same way). Recorded on latents so the hires refine (Change B) re-encodes the
+            // reference at the upscaled full res.
+            const bool relip_twostage = (std::getenv("LTXAV_RELIP_TWOSTAGE") != nullptr &&
+                                         std::string(std::getenv("LTXAV_RELIP_TWOSTAGE")) != "0");
+            const bool relip_separable = (relip_ref_downscale > 1) || (relip_ref_tstride > 1) || relip_twostage;
+            if (relip_twostage) {
+                latents.relip_twostage   = true;
+                latents.relip_ref_downscale = relip_ref_downscale;
+                latents.relip_ref_tstride   = relip_ref_tstride;
+                LOG_INFO("LTXAV two-stage: stage1 %dx%d from-noise (relip separable ref, downscale=%d tstride=%d)",
+                         request->width, request->height, relip_ref_downscale, relip_ref_tstride);
+            }
+            // Assemble the reference clip as [Wenc, Henc, frames, 3, 1] (same layout the VACE/i2v
+            // encode paths use), then VAE-encode it directly (no -0.5; LTX feeds image tensors
+            // straight to the encoder). Clamp index past the supplied frames to hold the last.
+            sd::Tensor<float> ref_video = sd::full<float>({ref_content_w, ref_content_h, request->frames, 3, 1}, 0.5f);
+            for (int64_t i = 0; i < request->frames; ++i) {
+                int64_t src       = std::min<int64_t>(i, cf_size - 1);
+                auto reference_fr = sd_image_to_tensor(sd_vid_gen_params->control_frames[src], ref_content_w, ref_content_h);
+                sd::ops::slice_assign(&ref_video, 2, i, i + 1, reference_fr.unsqueeze(2));
+            }
+            // Neutral-gray PAD (bottom/right) up to the VAE-scale-aligned encode dims so the VAE's
+            // floor-division latent sizing yields ceil(content/vsf) rows without squishing the face.
+            if (ref_enc_h > ref_content_h) {
+                ref_video = sd::ops::concat(ref_video,
+                                            sd::full<float>({ref_content_w, ref_enc_h - ref_content_h, request->frames, 3, 1}, 0.5f),
+                                            1);
+            }
+            if (ref_enc_w > ref_content_w) {
+                ref_video = sd::ops::concat(ref_video,
+                                            sd::full<float>({ref_enc_w - ref_content_w, ref_enc_h, request->frames, 3, 1}, 0.5f),
+                                            0);
+            }
+
+            // RELIP REFERENCE ENCODE — VRAM lever. The VAE encoder builds ONE graph for the
+            // whole clip, so the compute buffer holds every frame's activations at once
+            // (~12GB @25f, ~40GB @81f at full res) and OOMs on long clips. Spatially tile the
+            // ENCODE aggressively so each tile's buffer is small (16 tiles @0.25 fit 81f),
+            // while keeping the output DECODE at the caller's tile (prod 1x1 = no seam) by
+            // saving/restoring the params. The reference is a frozen conditioning signal (the
+            // relip regenerates pixels at decode), so spatial tile-blend in it is harmless.
+            // Tune via LTXAV_RELIP_ENCODE_TILE (default 0.25; 1.0 = old whole-frame behaviour).
+            // (A streaming temporal encode would be cleaner, but this is the cheap lever.)
+            sd_tiling_params_t relip_saved_tiling = sd_ctx->sd->vae_tiling_params;
+            // Hoisted to outer scope: extra_tiling_args is a const char*, so the backing string
+            // must outlive the encode_first_stage() call below (which parses it).
+            std::string relip_enc_tiling_args;
+            {
+                float enc_tile = 0.25f;
+                if (const char* e = getenv("LTXAV_RELIP_ENCODE_TILE")) {
+                    float v = (float)atof(e);
+                    if (v > 0.f && v <= 1.f) enc_tile = v;
+                }
+                sd_ctx->sd->vae_tiling_params.enabled    = true;
+                sd_ctx->sd->vae_tiling_params.rel_size_x = enc_tile;
+                sd_ctx->sd->vae_tiling_params.rel_size_y = enc_tile;
+                // NOTE: the LTX VAE temporal_tile_frames arg is DECODE-ONLY (the streaming path is
+                // gated on decode_graph @ ltx_vae.hpp:1449; there is no encode_tiled_chunk), so it is
+                // INERT for this encode — the encoder builds one whole-clip graph and the compute
+                // buffer scales with frame count (~2.6 GB @193f). The temporal buffer bound now comes
+                // from the host-level chunked encode below (encode_relip_reference_temporal_chunked,
+                // FIX 1), driven by LTXAV_RELIP_ENCODE_TFRAMES. We still set the (harmless) arg for
+                // parity with the decode tiling config; spatial tiling (LTXAV_RELIP_ENCODE_TILE) is
+                // the only VAE-level tiling that actually reduces the encode buffer.
+                int enc_tframes = 1;
+                if (const char* e = getenv("LTXAV_RELIP_ENCODE_TFRAMES")) {
+                    int v = atoi(e);
+                    if (v >= 1) enc_tframes = v;
+                }
+                relip_enc_tiling_args = "temporal_tile_frames=" + std::to_string(enc_tframes) + ",temporal_tile_overlap=0";
+                sd_ctx->sd->vae_tiling_params.temporal_tiling   = true;
+                sd_ctx->sd->vae_tiling_params.extra_tiling_args = relip_enc_tiling_args.c_str();
+                LOG_INFO("LTXAV relip: encoding reference with spatial tile %.2f (temporal buffer bound via host-chunked encode, TFRAMES=%d)",
+                         enc_tile, enc_tframes);
+            }
+            sd::Tensor<float> reference_latent;
+            if (const char* e = getenv("LTXAV_RELIP_ENCODE_TFRAMES")) {
+                // FIX 1: host-level temporal-chunked encode (bounds the encode buffer at high frame
+                // counts). Default (env unset) keeps the monolithic single-graph encode.
+                reference_latent = encode_relip_reference_temporal_chunked(sd_ctx, ref_video, atoi(e));
+            } else {
+                reference_latent = sd_ctx->sd->encode_first_stage(ref_video);  // [Wl, Hl, Tl, Cl, 1]
+            }
+            sd_ctx->sd->vae_tiling_params = relip_saved_tiling;                 // restore for the output decode
+            if (reference_latent.empty()) {
+                LOG_ERROR("failed to encode LTXAV relip reference video");
+                return std::nullopt;
+            }
+            // Free the video-VAE encode compute buffer NOW. The text-encoder (gemma) runs next
+            // and its graph-cut weights would otherwise co-reside with this ~4.4 GB encode buffer
+            // for one transient spike (measured 15.2 GB peak vs an 11.3 GB steady state at
+            // 1280x704). The VAE compute buffer re-allocates lazily at the output decode, so this
+            // costs nothing but drops the relip's peak under the prod VRAM ceiling.
+            sd_ctx->sd->first_stage_model->free_compute_buffer();
+
+            // Target = full-length video noise + fully-denoised mask (the whole frame is
+            // re-generated; the reference + lipdub LoRA constrain it to the input clip).
+            latents.init_latent  = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+
+            LOG_INFO("LTXAV LIPDUB RELIP: reference %lld latent frames over %lld target frames",
+                     (long long)reference_latent.shape()[2], (long long)latents.init_latent.shape()[2]);
+            if (relip_separable) {
+                // SEPARABLE path (half-res via DOWNSCALE and/or temporal-subsampled via TSTRIDE).
+                // Keep the sampler grid = target only (already set above: full-length noise +
+                // all-ones denoise_mask). Hand the reference latent to the DiT as a separate token
+                // block (latents.video_reference) with combined target+ref RoPE positions; the DiT
+                // slices the ref tokens off before unpatchify so the output is target-only => the
+                // post-sampling crop is a no-op (video_conditioning_frame_count left 0).
+                if (reference_latent.shape()[3] != latents.init_latent.shape()[3]) {
+                    LOG_ERROR("LTXAV relip separable: reference channels %lld != target %lld",
+                              (long long)reference_latent.shape()[3], (long long)latents.init_latent.shape()[3]);
+                    return std::nullopt;
+                }
+                // TEMPORAL subsample (LTXAV_RELIP_REF_TSTRIDE>1): keep every T-th reference LATENT
+                // frame at full spatial resolution. The kept frames retain their original-frame
+                // identity; their true timeline coordinate (frame j -> original j*T) is restored
+                // via ref_temporal_stride in the position builder below.
+                if (relip_ref_tstride > 1 && reference_latent.shape()[2] > 1) {
+                    int64_t orig_f = reference_latent.shape()[2];
+                    int64_t n_sub  = (orig_f + relip_ref_tstride - 1) / relip_ref_tstride;
+                    std::vector<int64_t> sub_shape = reference_latent.shape();
+                    sub_shape[2]                   = n_sub;
+                    sd::Tensor<float> sub(sub_shape);
+                    int64_t j = 0;
+                    for (int64_t f = 0; f < orig_f; f += relip_ref_tstride) {
+                        sd::ops::slice_assign(&sub, 2, j, j + 1, sd::ops::slice(reference_latent, 2, f, f + 1));
+                        ++j;
+                    }
+                    reference_latent = std::move(sub);
+                    LOG_INFO("LTXAV relip: TEMPORAL subsample tstride=%d -> %lld of %lld ref latent frames (FULL spatial res)",
+                             relip_ref_tstride, (long long)n_sub, (long long)orig_f);
+                }
+                int64_t target_lat_frames = latents.init_latent.shape()[2];
+                int64_t ref_lat_frames    = reference_latent.shape()[2];
+                int64_t target_lat_w      = latents.init_latent.shape()[0];
+                int64_t target_lat_h      = latents.init_latent.shape()[1];
+                int64_t ref_lat_w         = reference_latent.shape()[0];
+                int64_t ref_lat_h         = reference_latent.shape()[1];
+                LOG_INFO("LTXAV two-stage: stage1 ref encode %lldx%lld px -> ref latent grid %lldx%lld x %lld frames (downscale=%d); target latent %lldx%lld",
+                         (long long)ref_enc_w, (long long)ref_enc_h,
+                         (long long)ref_lat_w, (long long)ref_lat_h, (long long)reference_latent.shape()[2],
+                         relip_ref_downscale, (long long)target_lat_w, (long long)target_lat_h);
+                latents.video_reference   = reference_latent;  // [Wl/N, Hl/N, ceil(ref/T), Cl]
+                latents.video_target_frame_count       = target_lat_frames;
+                latents.video_conditioning_frame_count = 0;  // output already target-only => crop no-op
+                // Combined positions: target block at spatial_scale=vae_scale_factor; ref block at
+                // vae_scale_factor*N (each half-res cell spans the same pixel extent) with
+                // ref_temporal_stride=T so each subsampled ref frame j carries original frame j*T's
+                // timeline coordinate.
+                latents.video_positions = build_ltxv_relip_video_positions(target_lat_w,
+                                                                           target_lat_h,
+                                                                           target_lat_frames,
+                                                                           ref_lat_frames,
+                                                                           request->fps,
+                                                                           request->vae_scale_factor,
+                                                                           8,
+                                                                           true,
+                                                                           ref_lat_w,
+                                                                           ref_lat_h,
+                                                                           request->vae_scale_factor * relip_ref_downscale,
+                                                                           relip_ref_tstride);
+                LOG_INFO("LTXAV relip separable: target tokens %lld + ref tokens %lld (downscale=%d tstride=%d) = %lld (vs %lld at full-res concat)",
+                         (long long)(target_lat_w * target_lat_h * target_lat_frames),
+                         (long long)(ref_lat_w * ref_lat_h * ref_lat_frames),
+                         relip_ref_downscale,
+                         relip_ref_tstride,
+                         (long long)(target_lat_w * target_lat_h * target_lat_frames + ref_lat_w * ref_lat_h * ref_lat_frames),
+                         (long long)(target_lat_w * target_lat_h * (target_lat_frames + ref_lat_frames)));
+            } else if (!apply_ltxav_video_relip_reference(&latents, reference_latent, request->fps, request->vae_scale_factor)) {
+                return std::nullopt;
+            }
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("encode_first_stage (relip reference) completed, taking %" PRId64 " ms", t2 - t1);
+        } else if (!start_image.empty() || !end_image.empty()) {
             if (sd_ctx->sd->vae_decode_only) {
                 LOG_ERROR("LTXAV image conditioning requires VAE encoder weights; create the context with vae_decode_only=false");
                 return std::nullopt;
@@ -6248,6 +6849,42 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
+    // FIX A3 (env LTXAV_FREE_TE_COMPUTE, default ON; set "0" to disable): the gemma-3-12b
+    // text-encoder leaves a large encode compute buffer (~2.9GB) resident after the
+    // conditioning above. embeds.cond/.uncond are now fully-materialized CPU-owned
+    // sd::Tensors (c_crossattn), so the encode compute buffer is no longer aliased and
+    // can be freed before the DiT compute buffer (4524 MiB @193f) is allocated — this is
+    // the direct unblock for the COLD-run OOM (warm prod worker pays this once). Params
+    // buffer is left intact (freed separately below if applicable) so a resident TE can
+    // re-encode the next segment's prompt without a reload.
+    {
+        const char* free_te_env = std::getenv("LTXAV_FREE_TE_COMPUTE");
+        bool free_te_compute    = (free_te_env == nullptr) || (std::string(free_te_env) != "0");
+        if (free_te_compute && sd_ctx->sd->cond_stage_model) {
+            sd_ctx->sd->cond_stage_model->free_compute_buffer();
+        }
+    }
+
+    // FIX A3b (env LTXAV_FREE_TE_PARAMS, default OFF): release the text-encoder PARAMS
+    // (gemma ~3840 MB + text-projection/embeddings-connector ~2205 MB ≈ 6 GB) before the DiT
+    // compute buffer (4524 MiB @193f) is allocated. The normal gate below SKIPS the param
+    // free whenever keep_diffusion_model_resident is set — which is TRUE for the relip path
+    // (avatar_resident = (longcat_avatar || LTXAV) && keep_diffusion_model_resident), so the
+    // ~6 GB of TE params stay resident through the DiT phase to allow per-chain-segment
+    // re-encode. For a SINGLE relip render that residency is pure waste and is the dominant
+    // term in the 193f OOM (profiled). embeds.cond/.uncond are already CPU-owned sd::Tensors
+    // (same A3 invariant — not aliasing the params), so freeing here is safe; if a later
+    // chain segment needs a different prompt, reload_cond_stage_model() re-allocs + refills
+    // the TE params on demand (one reload per segment, the existing umT5 mechanism). Default
+    // OFF preserves the chain residency behaviour; opt in for single/long renders that OOM.
+    if (sd_ctx->sd->cond_stage_model && std::getenv("LTXAV_FREE_TE_PARAMS") != nullptr &&
+        std::string(std::getenv("LTXAV_FREE_TE_PARAMS")) != "0") {
+        if (sd_ctx->sd->cond_stage_model->get_params_buffer_size() != 0) {
+            sd_ctx->sd->cond_stage_model->free_params_buffer();
+            LOG_INFO("LTXAV: freed TE params (gemma+projection) before DiT, ~6GB (LTXAV_FREE_TE_PARAMS=1)");
+        }
+    }
+
     // !keep_diffusion_model_resident: an in-process chain with PER-SEGMENT prompts must re-encode
     // the text encoder every segment, so it cannot be freed after seg0 (the avatar dodges this by
     // caching one cond). In --offload-to-cpu mode the TE param buffer is host RAM (mmap), not VRAM,
@@ -6442,17 +7079,200 @@ static sd::Tensor<float> upscale_ltx_spatial_video_latent(sd_ctx_t* sd_ctx,
     return upscaled;
 }
 
+// Two-stage lipdub (Change B helper): encode the relip reference video at `out_w x out_h`
+// (already the full target res / reference_downscale_factor), tile-encoded exactly like the
+// stage-1 relip encode block, then temporally subsampled by `ref_tstride`. Returns the
+// reference latent [Wl, Hl, ceil(Tl/T), Cl] (empty on failure). Standalone (does not touch the
+// stage-1 encode block) so the default single-stage path stays byte-identical.
+static sd::Tensor<float> encode_ltxav_relip_reference_latent(sd_ctx_t* sd_ctx,
+                                                             const sd_vid_gen_params_t* sd_vid_gen_params,
+                                                             int64_t content_w,
+                                                             int64_t content_h,
+                                                             int frames,
+                                                             int ref_tstride) {
+    int64_t cf_size = sd_vid_gen_params->control_frames_size;
+    if (cf_size <= 0 || content_w <= 0 || content_h <= 0 || frames <= 0) {
+        return {};
+    }
+    // content_w/h = OFFICIAL aspect-preserving downscale (full/scale). Resize the reference frames
+    // to those dims (no squish), then neutral-gray PAD (bottom/right) up to the next VAE-scale
+    // multiple: encode_first_stage derives latent dims by floor division (vae.hpp:145), so padding
+    // (not resizing) yields ceil(content/vsf) latent rows — matching the official VAE's internal
+    // padding so the ref RoPE span covers the full target extent.
+    int64_t vsf   = std::max<int64_t>(1, sd_ctx->sd->get_vae_scale_factor());
+    int64_t enc_w = ((content_w + vsf - 1) / vsf) * vsf;
+    int64_t enc_h = ((content_h + vsf - 1) / vsf) * vsf;
+    sd::Tensor<float> ref_video = sd::full<float>({content_w, content_h, frames, 3, 1}, 0.5f);
+    for (int64_t i = 0; i < frames; ++i) {
+        int64_t src       = std::min<int64_t>(i, cf_size - 1);
+        auto reference_fr = sd_image_to_tensor(sd_vid_gen_params->control_frames[src], content_w, content_h);
+        sd::ops::slice_assign(&ref_video, 2, i, i + 1, reference_fr.unsqueeze(2));
+    }
+    if (enc_h > content_h) {
+        ref_video = sd::ops::concat(ref_video,
+                                    sd::full<float>({content_w, enc_h - content_h, frames, 3, 1}, 0.5f), 1);
+    }
+    if (enc_w > content_w) {
+        ref_video = sd::ops::concat(ref_video,
+                                    sd::full<float>({enc_w - content_w, enc_h, frames, 3, 1}, 0.5f), 0);
+    }
+    LOG_INFO("LTXAV two-stage: stage2 ref encode content %lldx%lld -> padded %lldx%lld px",
+             (long long)content_w, (long long)content_h, (long long)enc_w, (long long)enc_h);
+    sd_tiling_params_t relip_saved_tiling = sd_ctx->sd->vae_tiling_params;
+    std::string relip_enc_tiling_args;
+    {
+        float enc_tile = 0.25f;
+        if (const char* e = getenv("LTXAV_RELIP_ENCODE_TILE")) {
+            float v = (float)atof(e);
+            if (v > 0.f && v <= 1.f) enc_tile = v;
+        }
+        sd_ctx->sd->vae_tiling_params.enabled    = true;
+        sd_ctx->sd->vae_tiling_params.rel_size_x = enc_tile;
+        sd_ctx->sd->vae_tiling_params.rel_size_y = enc_tile;
+        int enc_tframes = 1;
+        if (const char* e = getenv("LTXAV_RELIP_ENCODE_TFRAMES")) {
+            int v = atoi(e);
+            if (v >= 1) enc_tframes = v;
+        }
+        relip_enc_tiling_args = "temporal_tile_frames=" + std::to_string(enc_tframes) + ",temporal_tile_overlap=0";
+        sd_ctx->sd->vae_tiling_params.temporal_tiling   = true;
+        sd_ctx->sd->vae_tiling_params.extra_tiling_args = relip_enc_tiling_args.c_str();
+    }
+    sd::Tensor<float> reference_latent;
+    if (const char* e = getenv("LTXAV_RELIP_ENCODE_TFRAMES")) {
+        // FIX 1: host-level temporal-chunked encode (bounds the full-res stage-2 encode buffer,
+        // the 193f OOM). Default (env unset) keeps the monolithic single-graph encode.
+        reference_latent = encode_relip_reference_temporal_chunked(sd_ctx, ref_video, atoi(e));
+    } else {
+        reference_latent = sd_ctx->sd->encode_first_stage(ref_video);
+    }
+    sd_ctx->sd->vae_tiling_params = relip_saved_tiling;
+    if (reference_latent.empty()) {
+        return {};
+    }
+    // Free the VAE-encode compute buffer NOW, before the stage-2 DiT alloc (mirrors :5963 / the
+    // stage-1 encode). The decode re-allocates lazily.
+    sd_ctx->sd->first_stage_model->free_compute_buffer();
+
+    if (ref_tstride > 1 && reference_latent.shape()[2] > 1) {
+        int64_t orig_f = reference_latent.shape()[2];
+        int64_t n_sub  = (orig_f + ref_tstride - 1) / ref_tstride;
+        std::vector<int64_t> sub_shape = reference_latent.shape();
+        sub_shape[2]                   = n_sub;
+        sd::Tensor<float> sub(sub_shape);
+        int64_t j = 0;
+        for (int64_t f = 0; f < orig_f; f += ref_tstride) {
+            sd::ops::slice_assign(&sub, 2, j, j + 1, sd::ops::slice(reference_latent, 2, f, f + 1));
+            ++j;
+        }
+        reference_latent = std::move(sub);
+    }
+    return reference_latent;
+}
+
 static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
                                                  const sd_vid_gen_params_t* sd_vid_gen_params,
                                                  const GenerationRequest& request,
                                                  const ImageGenerationLatents& latents,
                                                  sd::Tensor<float>* latent,
                                                  sd::Tensor<float>* denoise_mask,
-                                                 sd::Tensor<float>* video_positions) {
+                                                 sd::Tensor<float>* video_positions,
+                                                 sd::Tensor<float>* video_reference_out = nullptr) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_vid_gen_params == nullptr ||
         latent == nullptr || latent->empty() || denoise_mask == nullptr || video_positions == nullptr) {
         return true;
     }
+
+    // Change B — Two-stage lipdub: RE-APPLY the relip reference at the upscaled full res. The
+    // *latent here is the upscaled stage-1 latent (target-only grid); the reference is encoded
+    // fresh at full-res / reference_downscale_factor and handed to stage-2 as a SEPARATE token
+    // block (video_reference_out) with combined target+ref positions — NEVER grid-concatenated
+    // (that would be the 2L-token OOM). denoise_mask stays all-ones target. Stage-2 then refines
+    // the target while attending to the (downscaled) full-res reference, sharpening identity.
+    if (latents.relip_twostage) {
+        if (sd_ctx->sd->vae_decode_only) {
+            LOG_ERROR("LTXV two-stage relip refine requires VAE encoder weights");
+            return false;
+        }
+        if (video_reference_out == nullptr) {
+            LOG_ERROR("LTXV two-stage relip refine requires a video_reference output");
+            return false;
+        }
+        int lat_ch       = sd_ctx->sd->get_latent_channel();
+        sd::Tensor<float> video_latent = *latent;
+        sd::Tensor<float> audio_latent;
+        if (latent->shape()[3] > lat_ch) {
+            video_latent = sd::ops::slice(*latent, 3, 0, lat_ch);
+            audio_latent = unpack_ltxav_audio_latent(*latent, latents.audio_length, lat_ch);
+        }
+        int64_t target_lat_w   = video_latent.shape()[0];
+        int64_t target_lat_h   = video_latent.shape()[1];
+        int64_t target_lat_f   = video_latent.shape()[2];
+        int full_w             = static_cast<int>(target_lat_w) * request.vae_scale_factor;
+        int full_h             = static_cast<int>(target_lat_h) * request.vae_scale_factor;
+        int ds                 = std::max(1, latents.relip_ref_downscale);
+        int64_t vsf            = std::max<int64_t>(1, request.vae_scale_factor);
+        // Aspect-preserving content dims (official: full/scale). The encode helper resizes to these
+        // (no squish) then pads up to a VAE-scale multiple internally (ceil rows). At full res
+        // full/ds is usually already a vsf multiple (e.g. 704/2=352), so the pad is a no-op here;
+        // the fix matters most at the half-res stage-1 (e.g. 352/2=176 -> pad to 192).
+        int64_t content_w      = full_w / ds;
+        int64_t content_h      = full_h / ds;
+        if (ds > 1 && (content_w < vsf || content_h < vsf)) {
+            LOG_WARN("LTXV two-stage relip: downscale=%d too large for %dx%d; using full-res reference in stage-2", ds, full_w, full_h);
+            ds        = 1;
+            content_w = full_w;
+            content_h = full_h;
+        }
+        sd::Tensor<float> reference_latent = encode_ltxav_relip_reference_latent(sd_ctx,
+                                                                                sd_vid_gen_params,
+                                                                                content_w,
+                                                                                content_h,
+                                                                                request.frames,
+                                                                                latents.relip_ref_tstride);
+        if (reference_latent.empty() || reference_latent.shape()[3] != video_latent.shape()[3]) {
+            LOG_ERROR("LTXV two-stage relip: stage-2 reference encode failed (or channel mismatch)");
+            return false;
+        }
+        int64_t ref_lat_w = reference_latent.shape()[0];
+        int64_t ref_lat_h = reference_latent.shape()[1];
+        int64_t ref_lat_f = reference_latent.shape()[2];
+        *video_reference_out = reference_latent;
+        *video_positions     = build_ltxv_relip_video_positions(target_lat_w,
+                                                            target_lat_h,
+                                                            target_lat_f,
+                                                            ref_lat_f,
+                                                            request.fps,
+                                                            request.vae_scale_factor,
+                                                            8,
+                                                            true,
+                                                            ref_lat_w,
+                                                            ref_lat_h,
+                                                            request.vae_scale_factor * ds,
+                                                            latents.relip_ref_tstride);
+        // Target grid stays as-is (upscaled), denoise_mask all-ones (the target is fully refined;
+        // the reference is a separate frozen token block handled in the DiT).
+        sd::Tensor<float> video_mask = make_ltxav_video_denoise_mask(video_latent, 1.f);
+        if (!audio_latent.empty()) {
+            *latent       = pack_ltxav_audio_and_video_latents(video_latent, audio_latent);
+            // Freeze the (driven) audio slot when audio_fixed, mirroring stage-1 (:6543-6546):
+            // audio_mask_value 0 = pinned every step, 1 = generated.
+            *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent,
+                                                                    latents.audio_fixed ? 0.0f : 1.0f);
+        } else {
+            *latent       = std::move(video_latent);
+            *denoise_mask = std::move(video_mask);
+        }
+        LOG_INFO("LTXAV two-stage: stage2 %dx%d refine, ref content %lldx%lld -> ref latent grid %lldx%lld x %lld frames (downscale=%d tstride=%d); target latent %lldx%lld: target tokens %lld + ref tokens %lld = %lld",
+                 full_w, full_h, (long long)content_w, (long long)content_h,
+                 (long long)ref_lat_w, (long long)ref_lat_h, (long long)ref_lat_f, ds, latents.relip_ref_tstride,
+                 (long long)target_lat_w, (long long)target_lat_h,
+                 (long long)(target_lat_w * target_lat_h * target_lat_f),
+                 (long long)(ref_lat_w * ref_lat_h * ref_lat_f),
+                 (long long)(target_lat_w * target_lat_h * target_lat_f + ref_lat_w * ref_lat_h * ref_lat_f));
+        return true;
+    }
+
     if (sd_vid_gen_params->init_image.data == nullptr &&
         sd_vid_gen_params->end_image.data == nullptr) {
         return true;
@@ -6604,6 +7424,70 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // (so clips come out viewable WITH sound, no manual ffmpeg).
     std::vector<float> avatar_input_wav;
     GenerationRequest request(sd_ctx, sd_vid_gen_params);
+
+    // Change A — Two-stage lipdub relip (LTXAV_RELIP_TWOSTAGE=1). Port of the official
+    // ltx_pipelines/lipdub.py two-stage: stage-1 renders the relip at HALF resolution
+    // from-noise (cheap, tiny DiT buffer), then the existing LTX latent-upscale path
+    // upsamples the latent 2x and stage-2 REFINES at full res with the reference re-applied
+    // (Change B) at a low-noise schedule (Change D). This is the only configuration that fits
+    // 193f at full identity: stage-2 is a 1.25L-token refine of an already-faithful upscaled
+    // latent, not a 2L-token from-noise generation. Default OFF => byte-identical single-stage.
+    // Requires the caller to also pass the LTX latent upsampler (--hires-model); we cannot
+    // synthesize that path. Sets up the hires latent-upscale BEFORE latent_upscale_enabled /
+    // hires_request are read below.
+    bool relip_twostage = false;
+    if (std::getenv("LTXAV_RELIP_TWOSTAGE") != nullptr &&
+        std::string(std::getenv("LTXAV_RELIP_TWOSTAGE")) != "0" &&
+        sd_version_is_ltxav(sd_ctx->sd->version) &&
+        sd_vid_gen_params->control_frames_size > 0) {
+        if (strlen(SAFE_STR(request.hires.model_path)) == 0) {
+            LOG_ERROR("LTXAV_RELIP_TWOSTAGE=1 requires the LTX latent upsampler model (pass --hires-model <spatial_upsampler.safetensors>)");
+            return false;
+        }
+        // Two-stage needs full W,H divisible by 64 so the half-res stage-1 is latent-aligned
+        // (half divisible by 32 >= vae_scale_factor) and the 2x upscale returns exactly to W,H.
+        if (request.width % 64 != 0 || request.height % 64 != 0) {
+            LOG_ERROR("LTXAV_RELIP_TWOSTAGE requires width/height divisible by 64 (got %dx%d); two-stage needs a latent-aligned half-res stage-1",
+                      request.width, request.height);
+            return false;
+        }
+        // Hardening: at REFDS>1 the half-res stage-1 reference is downscaled again, to
+        // (W/2)/REFDS x (H/2)/REFDS. When that isn't a VAE-scale multiple it gets neutral-gray
+        // padded up to one (handled correctly in prepare_video_generation_latents) — log it so the
+        // extra padded ref row in the render log isn't mistaken for a regression. Divisible dims
+        // (full W,H % (2*REFDS*vae_scale_factor) == 0) need no padding.
+        if (const char* e = std::getenv("LTXAV_RELIP_REF_DOWNSCALE")) {
+            int refds   = std::atoi(e);
+            int vsf     = std::max(1, sd_ctx->sd->get_vae_scale_factor());
+            int align   = refds * vsf;
+            if (refds > 1 && ((request.width / 2) % align != 0 || (request.height / 2) % align != 0)) {
+                LOG_WARN("LTXAV_RELIP_TWOSTAGE: half-res stage-1 dims %dx%d are not divisible by REFDS*vae_scale (%d); "
+                         "the downscaled reference will be neutral-gray padded to the next %d-multiple before encode "
+                         "(use full W,H divisible by %d for an exact downscale)",
+                         request.width / 2, request.height / 2, align, vsf, 2 * align);
+            }
+        }
+        int full_w = request.width;
+        int full_h = request.height;
+        relip_twostage         = true;
+        request.hires.enabled  = true;
+        request.hires.upscaler = SD_HIRES_UPSCALER_MODEL;  // LTX learned latent upsampler (model_path)
+        request.hires.scale    = 2.0f;
+        // Change D — default stage-2 sigmas = official STAGE_2_DISTILLED_SIGMAS (3-step refine,
+        // sigma0=0.909375 = the noise added to the upscaled latent), unless the caller passed
+        // --hires-sigmas. Static backing array => valid for the lifetime of the request.
+        if (request.hires.custom_sigmas_count <= 0 || request.hires.custom_sigmas == nullptr) {
+            static float kStage2DistilledSigmas[] = {0.909375f, 0.725f, 0.421875f, 0.0f};
+            request.hires.custom_sigmas       = kStage2DistilledSigmas;
+            request.hires.custom_sigmas_count = 4;
+        }
+        // Stage-1 at HALF the final resolution (the relip block below renders at request.w/h).
+        request.width  = full_w / 2;
+        request.height = full_h / 2;
+        LOG_INFO("LTXAV two-stage: stage1 %dx%d from-noise (half-res) -> latent-upscale 2x -> stage2 %dx%d refine",
+                 request.width, request.height, full_w, full_h);
+    }
+
     bool latent_upscale_enabled     = request.hires.enabled;
     GenerationRequest hires_request = request;
     if (latent_upscale_enabled) {
@@ -6826,7 +7710,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                         static_cast<float>(request.fps),
                                                         request.cache_params,
                                                         latents.video_positions,
-                                                        latents.audio_fixed);
+                                                        latents.audio_fixed,
+                                                        latents.video_reference);
     }
 
     int64_t sampling_end = ggml_time_ms();
@@ -6915,21 +7800,70 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                      request.hires.target_width,
                      request.hires.target_height);
         }
+        // FIX 2 (LTXAV_TWOSTAGE_FREE_STAGE1, default on): the stage-1 setup on `latents` (half-res
+        // init latent + the stage-1 relip reference token block + its positions) is dead once the
+        // upscaled latent is in x_t — stage-2 rebuilds all of it (hires_* + a freshly re-encoded
+        // full-res reference). Release those host tensors and free the stage-1 DiT/VAE compute
+        // buffers BEFORE the stage-2 reference VAE encode (inside apply_ltxv_refine_image_conditioning)
+        // so that encode buffer does not co-reside with stage-1's working set (the ~441 MB that OOM'd
+        // the 193f transition). Two-stage path only; gated so it can be A/B'd.
+        if (latents.relip_twostage) {
+            bool free_stage1 = true;
+            if (const char* e = std::getenv("LTXAV_TWOSTAGE_FREE_STAGE1")) {
+                free_stage1 = std::string(e) != "0";
+            }
+            if (free_stage1) {
+                latents.video_reference = {};  // stage-1 half-res ref block (replaced by hires_video_reference)
+                latents.init_latent     = {};  // stage-1 init latent (replaced by x_t = upscaled)
+                latents.video_positions = {};  // stage-1 positions (replaced by hires_video_positions)
+                if (sd_ctx->sd->diffusion_model) {
+                    sd_ctx->sd->diffusion_model->free_compute_buffer();
+                }
+                sd_ctx->sd->first_stage_model->free_compute_buffer();
+                LOG_INFO("LTXAV two-stage: freed stage-1 latents + DiT/VAE compute buffers before stage-2 reference encode");
+            }
+        }
         sd::Tensor<float> hires_denoise_mask;
         sd::Tensor<float> hires_video_positions;
+        sd::Tensor<float> hires_video_reference;  // Change B/C: stage-2 re-applied relip reference
         if (!apply_ltxv_refine_image_conditioning(sd_ctx,
                                                   sd_vid_gen_params,
                                                   hires_request,
                                                   latents,
                                                   &x_t,
                                                   &hires_denoise_mask,
-                                                  &hires_video_positions)) {
+                                                  &hires_video_positions,
+                                                  &hires_video_reference)) {
             if (sd_ctx->sd->free_params_immediately) {
                 sd_ctx->sd->diffusion_model->free_params_buffer();
             }
             return false;
         }
         noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+
+        // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
+        // done and the stage-2 DiT forward (below) does NOT touch the video/audio VAE — those only
+        // run at the final decode. Free their resident params (video VAE ~1385 MB + audio VAE
+        // ~823 MB) to make ~2.2 GB of headroom for the forward; reload_{first_stage,audio_vae}_model()
+        // re-materializes them before their decodes (~0.1s). Gated + two-stage only + reload-loader
+        // required (only captured for LTXAV no-mmap), so the default single-stage path is untouched
+        // and the free never happens without a proven reload path.
+        if (latents.relip_twostage && sd_ctx->sd->resident_reload_loader) {
+            bool free_unused = true;
+            if (const char* e = std::getenv("LTXAV_TWOSTAGE_FREE_UNUSED")) {
+                free_unused = std::string(e) != "0";
+            }
+            if (free_unused) {
+                size_t before = sd_ctx->sd->first_stage_model->get_params_buffer_size();
+                sd_ctx->sd->first_stage_model->free_params_buffer();
+                if (sd_ctx->sd->audio_vae_model) {
+                    before += sd_ctx->sd->audio_vae_model->get_params_buffer_size();
+                    sd_ctx->sd->audio_vae_model->free_params_buffer();
+                }
+                LOG_INFO("LTXAV two-stage: freed video+audio VAE params (~%.0f MB) before stage-2 forward; reload at decode",
+                         before / (1024.f * 1024.f));
+            }
+        }
 
         W                                   = hires_request.width / hires_request.vae_scale_factor;
         H                                   = hires_request.height / hires_request.vae_scale_factor;
@@ -6981,7 +7915,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                             latents.audio_length,
                                             static_cast<float>(hires_request.fps),
                                             hires_request.cache_params,
-                                            hires_video_positions);
+                                            hires_video_positions,
+                                            latents.audio_fixed,
+                                            hires_video_reference);
         sampling_end   = ggml_time_ms();
         if (sd_ctx->sd->free_params_immediately) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
@@ -7005,6 +7941,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         latents.audio_length > 0 &&
         sd_ctx->sd->audio_vae_model != nullptr) {
         int64_t audio_latent_decode_start = ggml_time_ms();
+
+        // FIX 3: bring the audio VAE back if it was freed for the stage-2 forward (no-op if resident).
+        sd_ctx->sd->reload_audio_vae_model();
 
         auto audio_latent = unpack_ltxav_audio_latent(final_latent,
                                                       latents.audio_length,
@@ -7100,6 +8039,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
+    // FIX 3: bring the video VAE back if it was freed for the stage-2 forward (no-op if resident).
+    sd_ctx->sd->reload_first_stage_model();
     auto result = decode_video_outputs(sd_ctx, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
     if (result == nullptr) {
         free_sd_audio(generated_audio);

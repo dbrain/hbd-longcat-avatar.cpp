@@ -47,6 +47,14 @@ struct LTXAVDiffusionExtra {
     int audio_length                         = 0;
     float frame_rate                         = 24.f;
     const sd::Tensor<float>* video_positions = nullptr;
+    bool skip_a2v                            = false;  // A2V modality-guidance "mod" pass: skip audio<->video cross-attn
+    // FIX A2 separable half-res relip reference (LTXAV_RELIP_REF_DOWNSCALE>1). When set, the
+    // reference clip is a SEPARATE [W/N,H/N,ref,C] latent grid (NOT concatenated into the
+    // sampler grid). The DiT patchifies it on its own and appends its tokens to the video
+    // token sequence (positions for the ref block come from video_positions; its per-token
+    // timesteps are appended as frozen t=0 inside build_graph), then slices them off before
+    // unpatchify. nullptr / empty = legacy full-res concat path (N==1, byte-identical).
+    const sd::Tensor<float>* video_reference = nullptr;
 };
 
 struct LongCatAvatarDiffusionExtra {

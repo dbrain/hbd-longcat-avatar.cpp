@@ -123,6 +123,13 @@ public:
     // Default no-op; only the offload-capable LLMEmbedder honours it.
     virtual void set_keep_params_resident(bool keep) {}
     virtual void set_stream_layers_enabled(bool enabled) {}
+    // FIX A3 (LTXAV_FREE_TE_COMPUTE): release the text encoder's compute buffer
+    // (activations) and restore any offloaded params back to host, AFTER the cond
+    // tensors have been materialized to CPU. Frees the lingering gemma-3-12b encode
+    // compute buffer (~2.9GB) so it doesn't coexist with the DiT compute buffer at
+    // 193-frame relip (the COLD-CLI OOM). Default no-op; only the offload-capable
+    // encoders (LTXAVEmbedder) forward to their inner runners.
+    virtual void free_compute_buffer() {}
     virtual void set_flash_attention_enabled(bool enabled) = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
 };
@@ -2235,6 +2242,19 @@ struct LTXAVEmbedder : public Conditioner {
     void free_params_buffer() override {
         llm->free_params_buffer();
         projector->free_params_buffer();
+    }
+
+    // FIX A3 (LTXAV_FREE_TE_COMPUTE): free the gemma-3-12b + projector compute
+    // buffers (and restore any offloaded/streamed params to host). Called by the
+    // engine right after get_learned_condition() materializes the cond to a
+    // CPU-owned sd::Tensor, so the ~2.9GB encode compute buffer does not linger
+    // into the DiT phase. Idempotent: GGMLRunner::free_compute_buffer() no-ops
+    // when compute_allocr is already null. Params buffer is left untouched
+    // (free_params_buffer handles that separately) so a resident/cached TE can
+    // re-encode the next prompt without a reload.
+    void free_compute_buffer() override {
+        llm->free_compute_buffer();
+        projector->free_compute_buffer();
     }
 
     size_t get_params_buffer_size() override {

@@ -1940,6 +1940,12 @@ struct GGMLRunnerContext {
     // nullptr ⇒ no collapse (per-token modulation computed directly, the old path).
     ggml_tensor* ltx_video_token_sel       = nullptr;
 
+    // LTXAV A2V (audio-to-video) modality guidance: when true, skip the audio->video (and
+    // video->audio) cross-attention in every block so this forward predicts the video as if it
+    // ignored the driving audio. The sampler extrapolates cond away from this "mod" pass to
+    // amplify lip-sync. Default false = audio cross-attn runs normally (legacy behavior).
+    bool ltx_skip_a2v                      = false;
+
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
             return;

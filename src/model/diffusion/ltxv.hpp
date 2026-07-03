@@ -1328,8 +1328,12 @@ namespace LTXV {
             auto a_table = params["audio_scale_shift_table"];
 
             bool run_ax  = ax != nullptr && ggml_nelements(ax) > 0 && ax->ne[1] > 0;
-            bool run_a2v = run_ax;
-            bool run_v2a = run_ax;
+            // A2V modality-guidance "mod" pass: drop the audio<->video cross-attention so the
+            // video is predicted as if it ignored the driving audio (ctx->ltx_skip_a2v). The
+            // audio self/cross stack (audio_attn1/2) still runs so the frozen audio stays valid;
+            // only the coupling into/out of the video stream is severed.
+            bool run_a2v = run_ax && !ctx->ltx_skip_a2v;
+            bool run_v2a = run_ax && !ctx->ltx_skip_a2v;
 
             auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
             ggml_tensor* v_norm = nullptr;
@@ -1698,7 +1702,8 @@ namespace LTXV {
                                                       ggml_tensor* v_cross_pe,
                                                       ggml_tensor* a_cross_pe,
                                                       ggml_tensor* video_connector_pe,
-                                                      ggml_tensor* audio_connector_pe) {
+                                                      ggml_tensor* audio_connector_pe,
+                                                      ggml_tensor* vx_ref = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1716,7 +1721,21 @@ namespace LTXV {
             int64_t audio_time = ax != nullptr ? ax->ne[1] : 0;
 
             vx = patchify_video(ctx, vx, n);
-            vx = patchify_proj->forward(ctx, vx);
+            vx = patchify_proj->forward(ctx, vx);  // [hidden, target_tokens, n]
+            // FIX A2 separable half-res relip reference: patchify the SEPARATE [W/N,H/N,ref,C]
+            // reference grid with the SAME patchify_proj and append its tokens to the video
+            // sequence (token axis = ne[1]). The combined sequence then flows through the blocks
+            // with the combined video_pe / per-token timesteps (built in build_graph); the ref
+            // tokens are sliced back off before unpatchify_video below. vx_ref==nullptr (every
+            // non-separable path, incl. N==1 full-res concat) leaves vx exactly as before.
+            const int64_t target_token_count = width * height * frames;
+            if (vx_ref != nullptr) {
+                GGML_ASSERT(vx_ref->ne[3] % config.in_channels == 0);
+                int64_t n_ref = vx_ref->ne[3] / config.in_channels;
+                auto rx       = patchify_video(ctx, vx_ref, n_ref);
+                rx            = patchify_proj->forward(ctx, rx);  // [hidden, ref_tokens, n]
+                vx            = ggml_concat(ctx->ggml_ctx, vx, rx, 1);
+            }
             if (ax != nullptr && ggml_nelements(ax) > 0 && audio_time > 0) {
                 ax = patchify_audio(ctx, ax);
                 ax = audio_patchify_proj->forward(ctx, ax);
@@ -1883,7 +1902,17 @@ namespace LTXV {
             auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, ctx->ltx_video_token_sel);
             vx                 = norm_out->forward(ctx, vx);
             vx                 = modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
-            vx                 = proj_out->forward(ctx, vx);
+            vx                 = proj_out->forward(ctx, vx);  // [out_dim, total_tokens, n]
+            // FIX A2 separable relip: drop the appended reference tokens, keeping only the
+            // target tokens, so unpatchify reconstructs the target [W,H,frames] grid (the output
+            // is already target-only => the post-sampling frame crop is a no-op). No-op when no
+            // reference was appended (target_token_count == total tokens).
+            if (vx_ref != nullptr && vx->ne[1] != target_token_count) {
+                vx = ggml_cont(ctx->ggml_ctx,
+                               ggml_view_3d(ctx->ggml_ctx, vx,
+                                            vx->ne[0], target_token_count, vx->ne[2],
+                                            vx->nb[1], vx->nb[2], 0));
+            }
             vx                 = unpatchify_video(ctx, vx, width, height, frames);
 
             if (ax != nullptr && audio_time > 0) {
@@ -1912,12 +1941,18 @@ namespace LTXV {
         std::vector<float> audio_connector_pe_vec;
         sd::Tensor<float> vx_input_cache;
         sd::Tensor<float> ax_input_cache;
+        // FIX A2 separable half-res relip reference: the [W/N,H/N,ref,C] reference grid fed as a
+        // separate DiT token block. Held as a member so its data survives until the backend
+        // reads it (same lifetime contract as vx_input_cache). Empty unless N>1 relip.
+        sd::Tensor<float> vx_ref_input_cache;
+        sd::Tensor<float> v_timestep_combined_cache;  // target per-token ts ++ ref frozen t=0 (separable relip)
         // Modulation token-collapse (VRAM win). The conditioned video timestep is per-token
         // but has only a few UNIQUE values; we feed the blocks the compact unique set and a
         // per-token selector so get_ada_values gathers each compact chunk back per-token.
         // These persist as members (the backend reads their data after build_graph returns).
         sd::Tensor<float> v_timestep_compact_cache;  // [U] unique video timesteps
         std::vector<int32_t> v_token_sel_vec;        // [L_video] token -> unique-column index
+        bool skip_a2v_cross_attn_ = false;           // A2V modality-guidance "mod" pass (set per compute)
 
         LTXAVRunner(ggml_backend_t backend,
                     ggml_backend_t params_backend,
@@ -2005,7 +2040,8 @@ namespace LTXV {
                                  const sd::Tensor<float>& audio_timesteps_tensor = {},
                                  int audio_length                                = 0,
                                  float frame_rate                                = 24.f,
-                                 const sd::Tensor<float>& video_positions_tensor = {}) {
+                                 const sd::Tensor<float>& video_positions_tensor = {},
+                                 const sd::Tensor<float>& video_reference_tensor = {}) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -2016,6 +2052,19 @@ namespace LTXV {
 
             ggml_tensor* vx         = make_input(vx_input_cache);
             ggml_tensor* ax         = make_optional_input(ax_input_cache);
+
+            // FIX A2 separable half-res relip reference: a non-empty video_reference_tensor is a
+            // SEPARATE [W/N,H/N,ref,C] grid that the DiT patchifies on its own and appends to the
+            // video token sequence (see forward()). Its per-token timesteps are appended here as
+            // frozen t=0 so the combined timestep vector matches the combined token count.
+            ggml_tensor* vx_ref     = nullptr;
+            int64_t ref_token_count = 0;
+            if (!video_reference_tensor.empty()) {
+                vx_ref_input_cache = video_reference_tensor;
+                vx_ref             = make_input(vx_ref_input_cache);
+                GGML_ASSERT(vx_ref->ne[3] % config.in_channels == 0);
+                ref_token_count = vx_ref->ne[0] * vx_ref->ne[1] * vx_ref->ne[2];
+            }
 
             // --- Modulation token-collapse (VRAM win; ports avatar 98e8d16 to LTX) ---
             // The conditioned video timestep is per-token (len = video_token_count) but holds
@@ -2036,9 +2085,21 @@ namespace LTXV {
                 collapse_env = e[0] != '0';
             }
             bool no_dedup = std::getenv("LTX_MOD_NO_DEDUP") != nullptr;
-            int64_t n_ts  = static_cast<int64_t>(timesteps_tensor.numel());
+            // FIX A2 separable relip: append `ref_token_count` frozen (t=0) per-token timesteps
+            // for the appended reference token block. The reference is a clean conditioning
+            // signal (no noise), so t=0 is correct and dedups to a single extra unique value in
+            // the modulation collapse. When ref_token_count==0 the effective timesteps ARE the
+            // original tensor (no copy) => N==1 path byte-identical.
+            const sd::Tensor<float>* eff_ts = &timesteps_tensor;
+            if (ref_token_count > 0 && timesteps_tensor.numel() > 0) {
+                std::vector<float> combined(timesteps_tensor.data(), timesteps_tensor.data() + timesteps_tensor.numel());
+                combined.insert(combined.end(), static_cast<size_t>(ref_token_count), 0.0f);
+                v_timestep_combined_cache = sd::Tensor<float>({static_cast<int64_t>(combined.size())}, combined);
+                eff_ts                    = &v_timestep_combined_cache;
+            }
+            int64_t n_ts  = static_cast<int64_t>(eff_ts->numel());
             if (collapse_env && n_ts > 1) {
-                const float* td = timesteps_tensor.data();
+                const float* td = eff_ts->data();
                 std::vector<float> uniq;
                 v_token_sel_vec.resize(static_cast<size_t>(n_ts));
                 for (int64_t i = 0; i < n_ts; ++i) {
@@ -2065,7 +2126,7 @@ namespace LTXV {
                 set_backend_tensor_data(v_token_sel_input, v_token_sel_vec.data());
                 LOG_DEBUG("ltxav modulation collapse: %lld video tokens -> %zu unique timesteps", (long long)n_ts, uniq.size());
             } else {
-                timesteps = make_input(timesteps_tensor);
+                timesteps = make_input(*eff_ts);
             }
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
             ggml_tensor* context    = make_optional_input(context_tensor);
@@ -2073,7 +2134,11 @@ namespace LTXV {
             ggml_cgraph* gf = new_graph_custom(LTXAV_GRAPH_SIZE);
 
             float video_frame_rate    = frame_rate > 0.f ? frame_rate : 24.f;
-            int64_t video_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2];
+            // Separable relip: the DiT sequence is target tokens (vx grid) + reference tokens
+            // (vx_ref grid). All PE/positions/token-sel are sized for the COMBINED count; the
+            // reference tokens are sliced off in forward() before unpatchify. ref_token_count==0
+            // (no vx_ref) => count is the plain target grid (legacy, byte-identical).
+            int64_t video_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2] + ref_token_count;
             bool has_video_positions  = !video_positions_tensor.empty();
             if (has_video_positions) {
                 GGML_ASSERT(video_positions_tensor.shape()[2] == video_token_count);
@@ -2195,6 +2260,7 @@ namespace LTXV {
 
             auto runner_ctx                 = get_context();
             runner_ctx.ltx_video_token_sel  = v_token_sel_input;  // null unless modulation collapse active
+            runner_ctx.ltx_skip_a2v         = skip_a2v_cross_attn_;  // A2V modality-guidance "mod" pass
             auto out_pair                   = model.forward(&runner_ctx,
                                             vx,
                                             ax,
@@ -2206,7 +2272,8 @@ namespace LTXV {
                                             video_cross_pe,
                                             audio_cross_pe,
                                             video_connector_pe,
-                                            audio_connector_pe);
+                                            audio_connector_pe,
+                                            vx_ref);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
@@ -2220,9 +2287,10 @@ namespace LTXV {
                                   const sd::Tensor<float>& audio_timesteps = {},
                                   int audio_length                         = 0,
                                   float frame_rate                         = 24.f,
-                                  const sd::Tensor<float>& video_positions = {}) {
+                                  const sd::Tensor<float>& video_positions = {},
+                                  const sd::Tensor<float>& video_reference = {}) {
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions);
+                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions, video_reference);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
             return out;
@@ -2232,7 +2300,8 @@ namespace LTXV {
                                   const DiffusionParams& diffusion_params) override {
             GGML_ASSERT(diffusion_params.x != nullptr);
             GGML_ASSERT(diffusion_params.timesteps != nullptr);
-            const auto* extra = diffusion_extra_as<LTXAVDiffusionExtra>(diffusion_params);
+            const auto* extra   = diffusion_extra_as<LTXAVDiffusionExtra>(diffusion_params);
+            skip_a2v_cross_attn_ = extra->skip_a2v;  // consumed by build_graph -> runner_ctx.ltx_skip_a2v
             return compute(n_threads,
                            *diffusion_params.x,
                            *diffusion_params.timesteps,
@@ -2241,7 +2310,8 @@ namespace LTXV {
                            tensor_or_empty(extra->audio_timesteps),
                            extra->audio_length,
                            extra->frame_rate,
-                           tensor_or_empty(extra->video_positions));
+                           tensor_or_empty(extra->video_positions),
+                           tensor_or_empty(extra->video_reference));
         }
 
         void test(const std::string& x_path,
