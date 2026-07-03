@@ -900,6 +900,9 @@ int main(int argc, const char* argv[]) {
             if (gen_params.audio_lowpass > 0.0f) {
                 setenv("LONGCAT_AUDIO_LOWPASS", std::to_string(gen_params.audio_lowpass).c_str(), 1);
             }
+            // LTXAV relip knobs -> runtime env (a2v guidance / ramp / ref-tstride). A2-safe bridge
+            // so --a2v-guidance / JSON fields work identically to the warm server.
+            gen_params.apply_ltx_relip_env();
 
             int n_segments = std::max(1, gen_params.segments);
             if (gen_params.ltx_chain_segments > 0) {

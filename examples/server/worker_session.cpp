@@ -566,6 +566,9 @@ int run_worker_loop(int fd, int argc, const char** argv) {
                     send_frame(fd, WorkerFrame::RENDER_RESP, hdr.req_id, resp);
                     break;
                 }
+                // A2-safe per-render bridge: honour this request's a2v / ramp / ref-tstride so a
+                // prior warm-worker render's value never bleeds into this single render.
+                gen_params.apply_ltx_relip_env();
                 // Output format default is webm (the koblem consumer).
                 json req_extra;
                 try { req_extra = json::parse(gen_json); } catch (...) {}

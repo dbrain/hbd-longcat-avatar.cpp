@@ -408,6 +408,9 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         error_message = "invalid generation parameters (resolve_and_validate)";
         return false;
     }
+    // A2-safe per-render bridge: honour this request's a2v / ramp / ref-tstride, overwriting any
+    // stale value from a prior warm-worker render (the whole chain shares one a2v via process env).
+    gen_params.apply_ltx_relip_env();
 
     int n_segments = std::max(1, gen_params.ltx_chain_segments);
 

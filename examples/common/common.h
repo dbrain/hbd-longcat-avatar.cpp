@@ -234,6 +234,12 @@ struct SDGenerationParams {
     std::string cont_anchor_path;               // LTXAV appearance anchor: latent whose frame0 = original char (anti-drift)
     int cont_ref_img_index               = 10;  // continuation ref-anchor temporal grid position (generate_avc default)
     int cont_mask_frame_range            = 3;   // continuation noise-near-ref attention carve-out half-width
+    // LTXAV relip (lip-dub) RUNTIME knobs — bridged to the shared engine via env EVERY render
+    // (apply_ltx_relip_env), so the warm resident worker honours per-request values and never
+    // bleeds a prior render's value (the sticky-setenv bug). Defaults == the engine defaults.
+    float a2v_guidance                   = 1.0f; // audio->video modality guidance (1=faithful/fast; owner up to 3)
+    float a2v_ramp_end                   = 1.0f; // a2v guidance ramp: fraction of (scale-1) kept at lowest-sigma step
+    int   relip_ref_tstride              = 1;    // temporal subsample of the relip reference (identity-safe token cut)
     // LongCat-Avatar mouth-exaggeration knobs (RUNTIME).
     float audio_mouth_scale              = 1.0f; // scale the audio->face residual (1.0 = unchanged)
     float audio_lowpass                  = 0.0f; // input-wav low-pass cutoff Hz (0 = off)
@@ -302,6 +308,10 @@ struct SDGenerationParams {
                               const std::string& lora_model_dir,
                               const std::string& hires_upscalers_dir,
                               bool strict = false);
+    // A2-safe env bridge: setenv the LTXAV relip knobs (a2v_guidance / a2v_ramp_end /
+    // relip_ref_tstride) to THIS request's values, overwriting any stale value from a prior
+    // warm-worker render. Call once per render before generate_video(_chain). Inert for non-LTX.
+    void apply_ltx_relip_env() const;
     sd_img_gen_params_t to_sd_img_gen_params_t();
     sd_vid_gen_params_t to_sd_vid_gen_params_t();
     std::string to_string() const;

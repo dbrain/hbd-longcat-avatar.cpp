@@ -1021,6 +1021,16 @@ ArgOptions SDGenerationParams::get_options() {
          "encode, softening viseme-spiking transients. 0 = off (default), try ~3000",
          &audio_lowpass},
         {"",
+         "--a2v-guidance",
+         "LTXAV relip: audio->video modality guidance (articulation amount). 1.0 = faithful/fast "
+         "(default), >1 (e.g. 3) = bigger mouth on loud singing (+1 forward/step)",
+         &a2v_guidance},
+        {"",
+         "--a2v-ramp-end",
+         "LTXAV relip: a2v guidance ramp — fraction of (scale-1) kept at the lowest-sigma step. "
+         "1.0 = constant (default), 0.0 = ramp to off so late steps refine a clean mouth",
+         &a2v_ramp_end},
+        {"",
          "--cfg-scale",
          "unconditional guidance scale: (default: 7.0)",
          &sample_params.guidance.txt_cfg},
@@ -1795,6 +1805,9 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("audio_path", audio_path);
     load_if_exists("audio_mouth_scale", audio_mouth_scale);
     load_if_exists("audio_lowpass", audio_lowpass);
+    load_if_exists("a2v_guidance", a2v_guidance);
+    load_if_exists("a2v_ramp_end", a2v_ramp_end);
+    load_if_exists("relip_ref_tstride", relip_ref_tstride);
     if (j.contains("audio_lowpass_hz") && j["audio_lowpass_hz"].is_number()) {
         audio_lowpass = j["audio_lowpass_hz"];
     }
@@ -2312,6 +2325,17 @@ bool SDGenerationParams::validate(SDMode mode) {
     }
 
     return true;
+}
+
+void SDGenerationParams::apply_ltx_relip_env() const {
+    // A2-safe: ALWAYS setenv to THIS request's value (overwrite=1) so the warm resident worker
+    // can never inherit a prior render's value (the sticky-setenv bug that skips-when-default).
+    // The shared engine reads these per-render (LTXAV_A2V_GUIDANCE @ stable-diffusion.cpp,
+    // LTXAV_A2V_RAMP_END, LTXAV_RELIP_REF_TSTRIDE); all default to inert values so setting them
+    // on a non-relip / non-LTX render is a harmless no-op.
+    setenv("LTXAV_A2V_GUIDANCE", std::to_string(a2v_guidance).c_str(), 1);
+    setenv("LTXAV_A2V_RAMP_END", std::to_string(a2v_ramp_end).c_str(), 1);
+    setenv("LTXAV_RELIP_REF_TSTRIDE", std::to_string(relip_ref_tstride).c_str(), 1);
 }
 
 bool SDGenerationParams::resolve_and_validate(SDMode mode,
