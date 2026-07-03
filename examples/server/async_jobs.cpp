@@ -395,6 +395,11 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         return false;
     }
 
+    // Engine select: the wan route stamps "engine":"wan" so the SAME chain job path drives the
+    // Wan2.2-VACE continuation (generate_wan_vace_chain) instead of the LTXAV chain. Everything
+    // else — param parse, prompt list, job dir, per-window webm banking — is shared.
+    const bool wan_mode = body.value("engine", std::string()) == "wan";
+
     // Base per-segment generation params: defaults + request JSON (loads inline base64
     // init_image, W/H/fps/steps/cfg/sampler/scheduler/seed/negative, and the chain knobs
     // ltx_chain_segments + cont_latent_frames).
@@ -482,7 +487,9 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     sd_audio_t* audio       = nullptr;
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
-        bool chain_ok = generate_video_chain(runtime.sd_ctx, &base, &chain, &frames, &frame_count, &audio);
+        bool chain_ok = wan_mode
+                            ? generate_wan_vace_chain(runtime.sd_ctx, &base, &chain, &frames, &frame_count, &audio)
+                            : generate_video_chain(runtime.sd_ctx, &base, &chain, &frames, &frame_count, &audio);
         if (seg_writer) {
             seg_writer->finish();  // drain pending seg webms before reporting outcome
         }

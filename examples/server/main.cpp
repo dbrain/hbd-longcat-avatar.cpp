@@ -198,8 +198,8 @@ int main(int argc, const char** argv) {
         // /ltx/v1/generate submit route, and routes each chain render to the CUDA child
         // (which runs generate_video_chain). /v1/admin/unload SIGKILLs the child → true-0
         // VRAM. Same worker-subprocess shape as the avatar/flux paths; gated on its own env.
-        if (env_truthy("LTX_VIDEO_ISOLATION")) {
-            LOG_INFO("worker-isolation: LTXAV video-chain mode (ltx routes, CUDA-free parent)\n");
+        if (env_truthy("LTX_VIDEO_ISOLATION") || env_truthy("WAN_VIDEO_ISOLATION")) {
+            LOG_INFO("worker-isolation: video-chain mode (ltx + wan routes, CUDA-free parent)\n");
 
             std::mutex                 sd_ctx_mutex;  // unused in parent (compute is in the child)
             std::vector<LoraEntry>     lora_cache;
@@ -227,9 +227,10 @@ int main(int argc, const char** argv) {
 
             register_sdcpp_api_endpoints(svr, runtime);    // capabilities + jobs/{id} + cancel
             register_sdcpp_admin_endpoints(svr, runtime);  // /health + drain/unload/load
-            register_ltx_video_endpoints(svr, runtime);    // POST /ltx/v1/generate
+            register_ltx_video_endpoints(svr, runtime);    // POST /ltx/v1/generate + GET jobs/{id}/media
+            register_wan_video_endpoints(svr, runtime);    // POST /wan/v1/generate (engine=wan chain)
 
-            LOG_INFO("listening on: http://%s:%d (worker-isolation, LTXAV video chain)\n",
+            LOG_INFO("listening on: http://%s:%d (worker-isolation, video chain)\n",
                      svr_params.listen_ip.c_str(), svr_params.listen_port);
             svr.listen(svr_params.listen_ip, svr_params.listen_port);
 

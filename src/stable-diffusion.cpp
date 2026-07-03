@@ -7363,12 +7363,33 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         // directly. Composes with VACE_CONT_FRAMES (which sets mask=0 on those slots);
         // unset => the re-encoded pixel path above is untouched (byte-identical default).
         if (vace_cont_frames > 0) {
-            if (const char* lp = getenv("VACE_CONT_LATENT"); lp != nullptr && lp[0] != '\0') {
+            // Prior-window latent source. The warm Wan-VACE server hands the FULL prior-window
+            // diffusion latent IN MEMORY (sd_vid_gen_params->cont_latent, cont_latent_frames =
+            // its temporal length), which takes precedence over the disk file the shell chain
+            // uses (VACE_CONT_LATENT=path). Either way we slice the last K latent frames and
+            // inject them into the inactive head, bypassing the lossy pixel decode->re-encode.
+            // The in-memory path is what kills the cont_bank/*.bin round-trip.
+            const bool  vace_mem_cont =
+                sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0;
+            const char* lp = getenv("VACE_CONT_LATENT");
+            if (vace_mem_cont || (lp != nullptr && lp[0] != '\0')) {
                 int64_t klat = std::min<int64_t>(
                     (std::min<int64_t>(vace_cont_frames, request->frames) - 1) / 4 + 1,
                     inactive.shape()[2]);
                 try {
-                    auto cont_full = sd::load_tensor_from_file_as_tensor<float>(lp);
+                    sd::Tensor<float> cont_full;
+                    if (vace_mem_cont) {
+                        // Rebuild the prior latent [Wl,Hl,Tprev,Cl,1] from the in-memory tail.
+                        // Geometry comes from `inactive` (same W/H/C = same res + VAE), so the
+                        // downstream shape check + slice_assign match exactly as the file path.
+                        int64_t Tmem = sd_vid_gen_params->cont_latent_frames;
+                        cont_full    = sd::Tensor<float>(
+                            {inactive.shape()[0], inactive.shape()[1], Tmem, inactive.shape()[3], 1});
+                        std::memcpy(cont_full.data(), sd_vid_gen_params->cont_latent,
+                                    (size_t)cont_full.numel() * sizeof(float));
+                    } else {
+                        cont_full = sd::load_tensor_from_file_as_tensor<float>(lp);
+                    }
                     int64_t Tprev  = cont_full.shape()[2];
                     // Discard-last-frames at the CONDITIONING level (companion to the stitch-level
                     // discard in the chain harness): the prior segment's TERMINAL latent frames are
@@ -7441,11 +7462,12 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                         cont_tail.reshape_(tgt);
                         sd::ops::slice_assign(&inactive, 2, 0, K, cont_tail);
                         LOG_INFO("VACE_CONT_LATENT: injected %lld tail latent frames (of %lld) into "
-                                 "inactive head, bypassing pixel re-encode",
-                                 (long long)K, (long long)Tprev);
+                                 "inactive head, bypassing pixel re-encode (%s)",
+                                 (long long)K, (long long)Tprev, vace_mem_cont ? "in-memory" : "disk");
                     }
                 } catch (const std::exception& e) {
-                    LOG_ERROR("VACE_CONT_LATENT: failed to load %s: %s (keeping re-encoded pixels)", lp, e.what());
+                    LOG_ERROR("VACE_CONT_LATENT: failed to load %s: %s (keeping re-encoded pixels)",
+                              vace_mem_cont ? "<in-memory>" : lp, e.what());
                 }
             }
         }
@@ -8523,7 +8545,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         int64_t sampling_end          = ggml_time_ms();
         if (x_t_sampled.empty()) {
             LOG_ERROR("sampling(high noise) failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
-            if (sd_ctx->sd->free_params_immediately) {
+            // On a warm resident worker (keep_diffusion_model_resident, the Wan2.2 dual-MoE chain)
+            // the high-noise expert must SURVIVE across renders exactly like the low-noise model:
+            // there is no per-render DiT reload, and free_params_buffer() nulls the tensor pointers,
+            // so freeing it here would fault the NEXT render's high-noise phase (GGML_ASSERT(buffer)
+            // null). Mirror the low-noise guard below (free only when not resident).
+            if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
                 sd_ctx->sd->high_noise_diffusion_model->free_params_buffer();
             }
             return false;
@@ -8532,7 +8559,11 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         x_t   = std::move(x_t_sampled);
         noise = {};
         LOG_INFO("sampling(high noise) completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
-        if (sd_ctx->sd->free_params_immediately) {
+        // Resident warm worker: keep the high-noise expert's params buffer alive across renders
+        // (mirrors the low-noise diffusion_model's resident-guarded free after the main sample).
+        // The per-window GPU residency is reclaimed by release_chain_segment_gpu_residency(); the
+        // host params copy stays so the next window/render re-offloads without a reload.
+        if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
             sd_ctx->sd->high_noise_diffusion_model->free_params_buffer();
         }
     }
@@ -9647,6 +9678,358 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     } else {
         free_sd_audio(chain_audio);
     }
+    return true;
+}
+
+// Deep-copy one decoded frame (owns a fresh .data). Used to keep a window's pixel tail
+// (the next window's --control-video) alive after the window's frames are handed to the
+// stitched timeline.
+static sd_image_t wan_copy_frame(const sd_image_t& s) {
+    sd_image_t c = s;
+    size_t     sz = (size_t)s.width * s.height * s.channel;
+    c.data        = (uint8_t*)malloc(sz);
+    if (c.data != nullptr && s.data != nullptr) {
+        std::memcpy(c.data, s.data, sz);
+    }
+    return c;
+}
+
+// Per-window VACE env (A2-safe: always setenv/unsetenv so a warm resident worker can never
+// inherit a prior render's ramp). VACE_SKIP_BLOCKS=0 is correct on EVERY window (the Kijai
+// block-0 flash/grid fix). The strength ramp (VACE_STRENGTH_TAIL + ANCHOR_FRAMES) is only
+// correct on continuation windows — on the pure base window it would wrongly attenuate a
+// t2v tail (wan.hpp gates the ramp on a live control residual, but a base window carrying an
+// i2v ref would still be affected), so it is UNSET there. Defaults (0.2 / 2) are the owner's
+// production pick; WAN_VACE_STRENGTH_TAIL / WAN_VACE_STRENGTH_ANCHOR_FRAMES override for tuning.
+static void apply_wan_vace_env(bool is_cont_window) {
+    setenv("VACE_SKIP_BLOCKS", "0", 1);
+    if (is_cont_window) {
+        const char* tail   = getenv("WAN_VACE_STRENGTH_TAIL");
+        const char* anchor = getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES");
+        setenv("VACE_STRENGTH_TAIL", (tail != nullptr && tail[0] != '\0') ? tail : "0.2", 1);
+        setenv("VACE_STRENGTH_ANCHOR_FRAMES", (anchor != nullptr && anchor[0] != '\0') ? anchor : "2", 1);
+    } else {
+        unsetenv("VACE_STRENGTH_TAIL");
+        unsetenv("VACE_STRENGTH_ANCHOR_FRAMES");
+    }
+}
+
+SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
+                                    const sd_vid_gen_params_t*   base_params,
+                                    const sd_vid_chain_params_t* chain_params,
+                                    sd_image_t**                 frames_out,
+                                    int*                         num_frames_out,
+                                    sd_audio_t**                 audio_out) {
+    if (frames_out != nullptr) {
+        *frames_out = nullptr;
+    }
+    if (num_frames_out != nullptr) {
+        *num_frames_out = 0;
+    }
+    if (audio_out != nullptr) {
+        *audio_out = nullptr;  // wan2.2-VACE t2v carries no audio track
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || base_params == nullptr || chain_params == nullptr ||
+        frames_out == nullptr || num_frames_out == nullptr) {
+        LOG_ERROR("generate_wan_vace_chain: null argument");
+        return false;
+    }
+
+    const int n_chain = chain_params->n_segments;
+    if (n_chain < 1) {
+        LOG_ERROR("generate_wan_vace_chain: n_segments must be >= 1 (got %d)", n_chain);
+        return false;
+    }
+
+    // Continuation knobs — the ground-truth wan chain recipe (chain_long.sh / render_shot.sh):
+    //   K       = pixel overlap frames carried between windows (--control-video tail length).
+    //   discard = degraded terminal PIXEL frames dropped from each continuation window.
+    //   droplat = degraded terminal LATENT frames dropped when rolling the latent forward.
+    auto env_int = [](const char* k, int dflt) {
+        const char* e = getenv(k);
+        if (e != nullptr && e[0] != '\0') {
+            int v = atoi(e);
+            if (v > 0) {
+                return v;
+            }
+        }
+        return dflt;
+    };
+    int K       = env_int("WAN_CHAIN_K", 5);
+    int discard = env_int("WAN_CHAIN_DISCARD", 4);
+    int droplat = env_int("WAN_CHAIN_DROPLAT", 1);
+
+    // Mode signal: an init image on the template = i2v / ref-anchored (window 0 uses it, and
+    // continuation windows re-carry it as the VACE identity anchor). No init image = pure t2v
+    // (window 0 renders VACE_STRENGTH=0 clean, the render_shot base window).
+    const bool is_t2v = (base_params->init_image.data == nullptr);
+    LOG_INFO("generate_wan_vace_chain: %d windows, K=%d overlap px, discard=%d, droplat=%d, mode=%s",
+             n_chain, K, discard, droplat, is_t2v ? "t2v" : "i2v/ref");
+
+    // Keep the dual-MoE DiT weights warm across windows, and reclaim the transient GPU working
+    // set (activations + offloaded params + cache buffers) BETWEEN windows so window 2's compute
+    // buffer doesn't stack on window 1's — the shell gets this clean slate for free by running
+    // each window in a fresh process. Freed buffers return to the ggml VMM pool for the next
+    // window to reuse; we deliberately do NOT trim the pool to the OS (real cuMemUnmap), because
+    // that invalidates the resident cublas handle's workspace and faults the next GEMM. The peak
+    // lever is --max-vram (the graph-cut sizes the compute buffer to the budget): the wan chain
+    // recipe uses a low budget (chain_long.sh: --max-vram 3) so the per-window buffer is small
+    // enough that two windows coexist. (No text-cond precompute: umT5 re-encodes per window
+    // cheaply and the LTXAV precompute path is gemma-specific.)
+    //
+    // Keep the DiT weights resident across windows (default; mirrors the LTXAV chain). This is
+    // the architecturally-correct intent: the weights stay warm and each window re-streams them.
+    //
+    // FIXED (2026-07-04): the Wan2.2 DUAL-MoE + --offload-to-cpu warm worker used to fault on a
+    //   SECOND in-process render (window 2, or a second single-window job). Root cause was a
+    //   residency ASYMMETRY between the two experts in generate_video_ex: the low-noise
+    //   diffusion_model's post-sample free is guarded by (free_params_immediately &&
+    //   !keep_diffusion_model_resident) so a warm chain KEEPS it, but the high-noise expert's
+    //   free was guarded by free_params_immediately ALONE — so on a warm resident chain window 1
+    //   still called high_noise_diffusion_model->free_params_buffer(), which nulls the param
+    //   tensor pointers. There is no per-render DiT reload, so window 2's high-noise phase read
+    //   the nulled buffer -> GGML_ASSERT(buffer). The high-noise free now mirrors the low-noise
+    //   resident guard (both sites in the plan.high_noise_sample_steps>0 block), so both experts
+    //   survive across windows; release_chain_segment_gpu_residency() still reclaims their GPU
+    //   working set between windows. The in-memory cont-latent hand-off already worked.
+    //   WAN_CHAIN_RESIDENT=0 forces per-window free (for A/B of that path).
+    const bool wan_chain_resident =
+        !(getenv("WAN_CHAIN_RESIDENT") != nullptr && getenv("WAN_CHAIN_RESIDENT")[0] == '0');
+    sd_ctx_keep_diffusion_model_resident(sd_ctx, wan_chain_resident);
+
+    std::vector<sd_image_t> stitched;       // the output timeline (adopts each kept frame's .data)
+    std::vector<sd_image_t> control_tail;   // last K kept px frames -> next window --control-video (owned)
+    std::vector<float>      prior_latent;   // full prior-window diffusion latent (owned)
+    int                     pl_w = 0, pl_h = 0, pl_t = 0, pl_c = 0;
+
+    auto free_control_tail = [&]() {
+        for (auto& f : control_tail) {
+            free(f.data);
+        }
+        control_tail.clear();
+    };
+
+    // ── Resume: rebuild the banked prefix [0, resume_from) from save_dir/seg_<i>.bin ──
+    int start_seg = 0;
+    if (chain_params->resume_from > 0 && chain_params->save_dir != nullptr &&
+        chain_params->save_dir[0] != '\0') {
+        const int         resume_k = std::min(chain_params->resume_from, n_chain - 1);
+        const std::string sd_dir   = chain_params->save_dir;
+        LOG_INFO("generate_wan_vace_chain: RESUME from window %d/%d (reloading banked prefix from %s)",
+                 resume_k, n_chain, sd_dir.c_str());
+        bool ok = true;
+        for (int seg = 0; seg < resume_k && ok; ++seg) {
+            std::string       p   = sd_dir + "/seg_" + std::to_string(seg) + ".bin";
+            int               cnt = 0;
+            sd_image_t*       fr  = decode_banked_video_latent(sd_ctx, p, &cnt);
+            if (fr == nullptr || cnt <= 0) {
+                free(fr);
+                ok = false;
+                break;
+            }
+            int drop_head = (seg == 0) ? 0 : std::min(K, cnt);
+            int keep      = (seg == 0) ? cnt : std::max(0, cnt - discard);
+            // The LAST prefix window seeds the resumed continuation: its full latent (prior_latent)
+            // and its kept pixel tail (control_tail) must survive the frame hand-off, so copy first.
+            if (seg == resume_k - 1) {
+                try {
+                    sd::Tensor<float> lat = sd::load_tensor_from_file_as_tensor<float>(p);
+                    pl_w = (int)lat.shape()[0];
+                    pl_h = (int)lat.shape()[1];
+                    pl_t = (int)lat.shape()[2];
+                    pl_c = (int)(lat.dim() > 3 ? lat.shape()[3] : 1);
+                    prior_latent.assign(lat.data(), lat.data() + lat.numel());
+                } catch (const std::exception& e) {
+                    LOG_ERROR("generate_wan_vace_chain: resume latent load failed (%s): %s", p.c_str(), e.what());
+                    ok = false;
+                }
+                int tstart = std::max(drop_head, keep - K);
+                free_control_tail();
+                for (int i = tstart; i < keep; ++i) {
+                    control_tail.push_back(wan_copy_frame(fr[i]));
+                }
+            }
+            for (int i = 0; i < cnt; ++i) {
+                if (i >= drop_head && i < keep) {
+                    stitched.push_back(fr[i]);
+                } else {
+                    free(fr[i].data);
+                }
+            }
+            free(fr);
+        }
+        if (ok && !prior_latent.empty()) {
+            start_seg = resume_k;
+        } else {
+            LOG_WARN("generate_wan_vace_chain: resume failed — falling back to a fresh full render");
+            for (auto& f : stitched) {
+                free(f.data);
+            }
+            stitched.clear();
+            free_control_tail();
+            prior_latent.clear();
+            start_seg = 0;
+        }
+    }
+
+    for (int seg = start_seg; seg < n_chain; ++seg) {
+        const bool          is_cont = (seg > 0);
+        sd_vid_gen_params_t vp      = *base_params;
+        vp.seed                     = (base_params->seed < 0) ? base_params->seed : base_params->seed + seg;
+
+        if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[seg] != nullptr) {
+            vp.prompt = chain_params->segment_prompts[seg];
+        }
+
+        // Per-window VACE env + prior-window in-memory hand-off.
+        apply_wan_vace_env(is_cont);
+        unsetenv("VACE_CONT_LATENT");  // never let a stale disk path shadow the in-memory tail
+        if (!is_cont) {
+            vp.control_frames      = nullptr;
+            vp.control_frames_size = 0;
+            vp.cont_latent         = nullptr;
+            vp.cont_latent_frames  = 0;
+            unsetenv("VACE_CONT_FRAMES");
+            unsetenv("VACE_CONT_LATENT_DROP_TAIL");
+            if (is_t2v) {
+                setenv("VACE_STRENGTH", "0", 1);  // clean base t2v (no control residual)
+            } else {
+                unsetenv("VACE_STRENGTH");  // i2v: full VACE ref-anchor strength
+            }
+        } else {
+            vp.control_frames      = control_tail.data();
+            vp.control_frames_size = (int)control_tail.size();
+            vp.cont_latent         = prior_latent.data();
+            vp.cont_latent_frames  = pl_t;  // FULL prior-window latent T (last K sliced in-engine)
+            setenv("VACE_CONT_FRAMES", std::to_string(K).c_str(), 1);
+            setenv("VACE_CONT_LATENT_DROP_TAIL", std::to_string(droplat).c_str(), 1);
+            unsetenv("VACE_STRENGTH");  // full strength; the tail ramp attenuates the seam
+        }
+
+        LOG_INFO("=== generate_wan_vace_chain window %d/%d [%s] ===",
+                 seg + 1, n_chain, is_cont ? "vace-cont" : (is_t2v ? "t2v-base" : "i2v-base"));
+
+        sd_image_t* seg_video   = nullptr;
+        int         seg_count   = 0;
+        sd_audio_t* seg_audio   = nullptr;
+        float*      lat_out     = nullptr;
+        int         lw = 0, lh = 0, lt = 0, lc = 0;
+        const bool  want_latent = (seg + 1 < n_chain);
+        if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
+                               want_latent ? &lat_out : nullptr,
+                               want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
+                               want_latent ? &lt : nullptr, want_latent ? &lc : nullptr) ||
+            seg_video == nullptr || seg_count <= 0) {
+            LOG_ERROR("generate_wan_vace_chain window %d failed", seg + 1);
+            free_sd_audio(seg_audio);
+            free(seg_video);
+            free(lat_out);
+            free_control_tail();
+            for (auto& f : stitched) {
+                free(f.data);
+            }
+            return false;
+        }
+        free_sd_audio(seg_audio);
+
+        // Carry this window's full latent forward (the VACE_CONT_LATENT-equivalent, in memory).
+        if (want_latent && lat_out != nullptr) {
+            prior_latent.assign(lat_out, lat_out + (size_t)lw * lh * lt * lc);
+            pl_w = lw;
+            pl_h = lh;
+            pl_t = lt;
+            pl_c = lc;
+        }
+        free(lat_out);
+
+        // Bank the full latent so a failed chain can resume from the last completed window.
+        if (want_latent && chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0' &&
+            !prior_latent.empty()) {
+            try {
+                sd::Tensor<float> lt_save({pl_w, pl_h, pl_t, pl_c, 1});
+                std::memcpy(lt_save.data(), prior_latent.data(), (size_t)lt_save.numel() * sizeof(float));
+                sd::save_tensor_to_file<float>(
+                    std::string(chain_params->save_dir) + "/seg_" + std::to_string(seg) + ".bin",
+                    lt_save, "wan_vace_video_latent");
+            } catch (const std::exception& e) {
+                LOG_WARN("generate_wan_vace_chain: bank latent seg %d failed: %s", seg, e.what());
+            }
+        }
+
+        // Stitch: window 0 keeps every frame; a continuation drops the re-rendered overlap head
+        // (first K px, the held context) and the degraded discard tail. keep = seg_count-discard.
+        const int drop_head = is_cont ? std::min(K, seg_count) : 0;
+        const int keep      = is_cont ? std::max(0, seg_count - discard) : seg_count;
+
+        // Build the next window's --control-video BEFORE handing frames to the timeline: the
+        // last K frames of [0, keep) (chain_long.sh: last K of the kept, pre-overlap-drop).
+        if (want_latent) {
+            const int tstart = std::max(drop_head, keep - K);
+            free_control_tail();
+            for (int i = tstart; i < keep; ++i) {
+                control_tail.push_back(wan_copy_frame(seg_video[i]));
+            }
+        }
+
+        // Seam continuity: tone-match this window's kept frames to the prior tail (no cross-fade;
+        // the python colour-lock post-pass is a further quality refinement, tracked separately).
+        if (is_cont && !stitched.empty() && keep - drop_head > 0) {
+            ltxav_exposure_match(stitched.data(), (int)stitched.size(),
+                                 seg_video + drop_head, keep - drop_head);
+        }
+
+        const size_t kept_start = stitched.size();
+        for (int i = 0; i < seg_count; ++i) {
+            if (i >= drop_head && i < keep) {
+                stitched.push_back(seg_video[i]);  // adopt ownership
+            } else {
+                free(seg_video[i].data);
+            }
+        }
+        free(seg_video);
+
+        // Hand the kept frames to the server so it can bank a viewable per-window webm preview.
+        const int kept_n = (int)(stitched.size() - kept_start);
+        if (chain_params->on_segment != nullptr && kept_n > 0) {
+            chain_params->on_segment(seg, stitched.data() + kept_start, kept_n, chain_params->on_segment_user);
+        }
+
+        // Reclaim the per-window GPU working set before the next window's footprint stacks on
+        // top (only meaningful on the resident chain; the default per-window free+reload already
+        // returns to a clean slate). WAN_NO_CHAIN_GPU_RECLAIM=1 disables for A/B.
+        if (wan_chain_resident && seg + 1 < n_chain && getenv("WAN_NO_CHAIN_GPU_RECLAIM") == nullptr) {
+            sd_ctx->sd->release_chain_segment_gpu_residency();
+        }
+    }
+
+    free_control_tail();
+
+    // A2-safety: don't let the per-window VACE ramp/continuation env leak into a later render.
+    unsetenv("VACE_STRENGTH_TAIL");
+    unsetenv("VACE_STRENGTH_ANCHOR_FRAMES");
+    unsetenv("VACE_CONT_FRAMES");
+    unsetenv("VACE_CONT_LATENT_DROP_TAIL");
+    unsetenv("VACE_STRENGTH");
+
+    const int total = (int)stitched.size();
+    if (total <= 0) {
+        LOG_ERROR("generate_wan_vace_chain: no frames produced");
+        return false;
+    }
+    sd_image_t* out = (sd_image_t*)malloc((size_t)total * sizeof(sd_image_t));
+    if (out == nullptr) {
+        for (auto& f : stitched) {
+            free(f.data);
+        }
+        LOG_ERROR("generate_wan_vace_chain: out-of-memory allocating result array");
+        return false;
+    }
+    for (int i = 0; i < total; ++i) {
+        out[i] = stitched[i];
+    }
+    *frames_out     = out;
+    *num_frames_out = total;
+    LOG_INFO("generate_wan_vace_chain: stitched %d windows -> %d frames", n_chain, total);
     return true;
 }
 

@@ -576,6 +576,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  int*                         num_frames_out,
                                  sd_audio_t**                 audio_out);
 
+// Render + stitch a Wan2.2-VACE multi-window continuation chain (the warm-server wan path).
+// Window 0 is the base (t2v clean = VACE_STRENGTH 0, or i2v/ref-anchored via base_params->
+// init_image); windows 1..N-1 are VACE continuations fed the prior window's kept pixel tail
+// (the --control-video equivalent) + its full diffusion latent (the VACE_CONT_LATENT
+// equivalent) entirely IN MEMORY — no cont_bank/*.bin or cont_tail/ disk round-trip. The
+// per-window VACE env is injected here: VACE_SKIP_BLOCKS=0 always, VACE_STRENGTH_TAIL /
+// VACE_STRENGTH_ANCHOR_FRAMES on continuation windows only. Overlap/discard knobs are read
+// from env (WAN_CHAIN_K=5, WAN_CHAIN_DISCARD=4, WAN_CHAIN_DROPLAT=1 by default). Output
+// ownership matches generate_video_chain. Returns false on any window failure.
+SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
+                                    const sd_vid_gen_params_t*   base_params,
+                                    const sd_vid_chain_params_t* chain_params,
+                                    sd_image_t**                 frames_out,
+                                    int*                         num_frames_out,
+                                    sd_audio_t**                 audio_out);
+
 // Keep the diffusion (and whisper) model params resident across back-to-back
 // generate_video[_ex] calls — required for LongCat-Avatar continuation chaining so
 // later segments don't render against freed GPU memory.

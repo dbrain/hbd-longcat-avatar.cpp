@@ -29,3 +29,10 @@ void register_sdcpp_admin_endpoints(httplib::Server& svr, ServerRuntime& rt);
 // for lip-sync). Enqueues a VidGen job carrying the chain request JSON; poll/cancel reuse
 // the /sdcpp/v1/jobs/{id} endpoints. Registered in LTX_VIDEO_ISOLATION mode.
 void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt);
+
+// POST /wan/v1/generate — Wan2.2-VACE multi-window continuation submit (async). Accepts a
+// multipart body (a `request` JSON part with mode/segments/width/height/fps/frames/seed +
+// optional `init_image` / `ref_image` file parts) and enqueues a VidGen chain job stamped
+// engine=wan so run_vid_chain_job drives generate_wan_vace_chain. Poll/cancel/media reuse the
+// /sdcpp/v1/jobs/{id} endpoints. Registered alongside the LTX chain routes in video isolation.
+void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt);
