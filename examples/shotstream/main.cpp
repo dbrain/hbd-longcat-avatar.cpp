@@ -574,6 +574,12 @@ int main(int argc, char** argv) {
         vae->get_param_tensors(tensors, "first_stage_model");
         if (!loader.load_tensors(tensors)) { printf("ERROR: VAE tensor load failed\n"); return 1; }
         vae->set_flash_attention_enabled(true);
+        // GGML_CUDNN_CONV=1: VAE 2D convs via conv2d-cudnn (F32-accumulate implicit-GEMM,
+        // im2col-free) — faster + lower-VRAM than ggml_conv_2d's im2col, and it makes
+        // WAN_VAE_RESAMPLE_TSPLIT unnecessary (no im2col to bound). Mirrors main VAE-decode
+        // path + src/stable-diffusion.cpp:1076. Needs a cuDNN conv engine for the arch
+        // (present on sm_86/sm120); harmlessly a no-op on the ggml_conv_2d path otherwise.
+        if (getenv("GGML_CUDNN_CONV")) vae->set_conv2d_direct_enabled(true);
         vae->set_temporal_tiling_enabled(vae_temporal_tiling);
         printf("VAE loaded (%zu tensors)\n", tensors.size());
     } else {
