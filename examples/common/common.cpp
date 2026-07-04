@@ -1032,6 +1032,25 @@ ArgOptions SDGenerationParams::get_options() {
          "1.0 = constant (default), 0.0 = ramp to off so late steps refine a clean mouth",
          &a2v_ramp_end},
         {"",
+         "--nag-scale",
+         "LTXAV NAG (normalized attention guidance) scale on the video text cross-attn. 0 = OFF "
+         "(default). Denoise-AI workflow uses 14 (see CPP-CHANGES.md scale-convention note). +1 "
+         "cross-attn/step while gated on; requires a negative prompt.",
+         &nag_scale},
+        {"",
+         "--nag-alpha",
+         "LTXAV NAG blend weight alpha (default 0.35): z_out = alpha*z_nag + (1-alpha)*z_pos",
+         &nag_alpha},
+        {"",
+         "--nag-tau",
+         "LTXAV NAG per-token norm-clamp ceiling tau (default 2.5): ||z_ext|| clamped to tau*||z_pos||",
+         &nag_tau},
+        {"",
+         "--nag-until-sigma",
+         "LTXAV NAG sigma gate: apply NAG only while sigma >= this (default 0.9), limiting it to the "
+         "early/high-noise steps (the workflow's S1-only application). 0 = every step.",
+         &nag_until_sigma},
+        {"",
          "--cfg-scale",
          "unconditional guidance scale: (default: 7.0)",
          &sample_params.guidance.txt_cfg},
@@ -1314,6 +1333,18 @@ ArgOptions SDGenerationParams::get_options() {
         return parse_sigmas_arg(argv[index], &hires_custom_sigmas, "--hires-sigmas");
     };
 
+    // FEATURE 1 (--hires-lora): stash the raw spec string; it is parsed + path-resolved later in
+    // resolve() (which has lora_model_dir), mirroring how the base prompt LoRAs are resolved via
+    // extract_and_remove_lora. Accepts "<lora:name:strength>" and/or bare "name:strength", comma-
+    // or whitespace-separated, e.g. --hires-lora "distill:0.8,ltx-2-19b-ic-lora-detailer:0.7".
+    auto on_hires_lora_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        hires_lora_spec = argv_to_utf8(index, argv);
+        return 1;
+    };
+
     auto on_ref_image_arg = [&](int argc, const char** argv, int index) {
         if (++index >= argc) {
             return -1;
@@ -1465,6 +1496,11 @@ ArgOptions SDGenerationParams::get_options() {
          "--hires-sigmas",
          "custom sigma values for the highres fix second pass, comma-separated (e.g., \"0.85,0.725,0.421875,0.0\").",
          on_hires_sigmas_arg},
+        {"",
+         "--hires-lora",
+         "LoRA(s) applied ONLY on the hires/refine pass (video), e.g. \"distill:0.8,ltx-2-19b-ic-lora-detailer:0.7\" "
+         "or \"<lora:distill:0.8>\". Lets the refine use a different distill/detailer strength than the base pass.",
+         on_hires_lora_arg},
         {"",
          "--skip-layers",
          "layers to skip for SLG steps (default: [7,8,9])",
@@ -1838,6 +1874,10 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("audio_lowpass", audio_lowpass);
     load_if_exists("a2v_guidance", a2v_guidance);
     load_if_exists("a2v_ramp_end", a2v_ramp_end);
+    load_if_exists("nag_scale", nag_scale);
+    load_if_exists("nag_alpha", nag_alpha);
+    load_if_exists("nag_tau", nag_tau);
+    load_if_exists("nag_until_sigma", nag_until_sigma);
     load_if_exists("relip_ref_tstride", relip_ref_tstride);
     if (j.contains("audio_lowpass_hz") && j["audio_lowpass_hz"].is_number()) {
         audio_lowpass = j["audio_lowpass_hz"];
@@ -1877,6 +1917,14 @@ bool SDGenerationParams::from_json_str(
         }
         if (hires_json.contains("custom_sigmas") && hires_json["custom_sigmas"].is_array()) {
             hires_custom_sigmas = hires_json["custom_sigmas"].get<std::vector<float>>();
+        }
+        // FEATURE 1 (--hires-lora): JSON accepts the same spec string as the CLI flag under
+        // hires.loras (e.g. "distill:0.8,ltx-2-19b-ic-lora-detailer:0.7"). Path resolution happens
+        // later in resolve(). NOTE: unlike the top-level "loras" JSON field (which uses a resolver
+        // + array/object schema, parse_lora_json_field), this is a flat spec string to mirror the
+        // --hires-lora CLI 1:1; documented in CPP-CHANGES.md.
+        if (hires_json.contains("loras") && hires_json["loras"].is_string()) {
+            hires_lora_spec = hires_json["loras"].get<std::string>();
         }
         if (hires_json.contains("upscale_tile_size") && hires_json["upscale_tile_size"].is_number_integer()) {
             hires_upscale_tile_size = hires_json["upscale_tile_size"];
@@ -2253,6 +2301,85 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
     if (!lora_model_dir.empty()) {
         extract_and_remove_lora(lora_model_dir);
     }
+
+    // FEATURE 1 (--hires-lora): parse the raw spec into hires_lora_map (resolved-path -> strength).
+    // Accepts entries "<lora:name:strength>" or bare "name:strength", separated by comma/space/
+    // semicolon. Path resolution mirrors extract_and_remove_lora: absolute paths used as-is,
+    // otherwise joined onto lora_model_dir and probed with the known extensions. A name that can't
+    // be resolved is warned + skipped (fails safe to "no hires lora" rather than aborting).
+    hires_lora_map.clear();
+    if (!hires_lora_spec.empty() && !lora_model_dir.empty()) {
+        static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt"};
+        std::string spec = hires_lora_spec;
+        // strip any <lora: ... > wrappers to bare "name:strength" tokens
+        for (char& c : spec) {
+            if (c == '<' || c == '>' || c == '\n' || c == '\t' || c == ';') {
+                c = ',';
+            }
+        }
+        // the wrapper form is "<lora:name:strength>" -> after the above it is "lora:name:strength";
+        // handle both "lora:name:strength" (3 fields) and "name:strength" (2 fields).
+        std::stringstream ss(spec);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            // trim surrounding whitespace
+            size_t b = token.find_first_not_of(" \t\r");
+            size_t e = token.find_last_not_of(" \t\r");
+            if (b == std::string::npos) {
+                continue;
+            }
+            token = token.substr(b, e - b + 1);
+            if (token.empty()) {
+                continue;
+            }
+            // split on ':' -> last field is strength, the field(s) before it are the name
+            size_t last_colon = token.rfind(':');
+            if (last_colon == std::string::npos) {
+                LOG_WARN("--hires-lora: skipping '%s' (expected name:strength)", token.c_str());
+                continue;
+            }
+            std::string name_part = token.substr(0, last_colon);
+            std::string mul_part  = token.substr(last_colon + 1);
+            // drop an optional leading "lora:" tag left over from the "<lora:...>" wrapper form
+            if (name_part.rfind("lora:", 0) == 0) {
+                name_part = name_part.substr(5);
+            }
+            float mul = 0.f;
+            try {
+                mul = std::stof(mul_part);
+            } catch (...) {
+                LOG_WARN("--hires-lora: bad strength in '%s', skipping", token.c_str());
+                continue;
+            }
+
+            // NOTE: no |high_noise| support on the hires pass (that is a Wan-MoE concept; the LTX
+            // refine has a single DiT). All hires LoRAs flatten to is_high_noise=false.
+            fs::path final_path;
+            if (is_absolute_path(name_part)) {
+                final_path = name_part;
+            } else {
+                final_path = fs::path(lora_model_dir) / name_part;
+            }
+            if (!fs::exists(final_path)) {
+                bool found = false;
+                for (const auto& ext : valid_ext) {
+                    fs::path try_path = final_path;
+                    try_path += ext;
+                    if (fs::exists(try_path)) {
+                        final_path = try_path;
+                        found      = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    LOG_WARN("--hires-lora: can not find lora %s, skipping",
+                             final_path.lexically_normal().string().c_str());
+                    continue;
+                }
+            }
+            hires_lora_map[final_path.lexically_normal().string()] += mul;
+        }
+    }
     return true;
 }
 
@@ -2367,6 +2494,13 @@ void SDGenerationParams::apply_ltx_relip_env() const {
     setenv("LTXAV_A2V_GUIDANCE", std::to_string(a2v_guidance).c_str(), 1);
     setenv("LTXAV_A2V_RAMP_END", std::to_string(a2v_ramp_end).c_str(), 1);
     setenv("LTXAV_RELIP_REF_TSTRIDE", std::to_string(relip_ref_tstride).c_str(), 1);
+    // FEATURE 2 (NAG): bridge the per-render NAG knobs to the engine (read in sample() @
+    // stable-diffusion.cpp and in GenerationRequest::resolve to force use_uncond). scale 0 = OFF,
+    // an inert default, so setting these on a non-NAG / non-LTX render is a harmless no-op.
+    setenv("LTXAV_NAG_SCALE", std::to_string(nag_scale).c_str(), 1);
+    setenv("LTXAV_NAG_ALPHA", std::to_string(nag_alpha).c_str(), 1);
+    setenv("LTXAV_NAG_TAU", std::to_string(nag_tau).c_str(), 1);
+    setenv("LTXAV_NAG_UNTIL_SIGMA", std::to_string(nag_until_sigma).c_str(), 1);
 }
 
 bool SDGenerationParams::resolve_and_validate(SDMode mode,
@@ -2540,6 +2674,17 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    // FEATURE 1 (--hires-lora): flatten the resolved hires_lora_map into the sd_lora_t backing
+    // vector and hand it to the C-API hires params. The engine (generate_video) re-applies these
+    // just before the refine sample(), diffing from the base pass's lora state. hires_lora_vec is
+    // a member so its .data()/.c_str() pointers outlive this call (same contract as lora_vec).
+    hires_lora_vec.clear();
+    hires_lora_vec.reserve(hires_lora_map.size());
+    for (const auto& kv : hires_lora_map) {
+        hires_lora_vec.push_back({false, kv.second, kv.first.c_str()});
+    }
+    params.hires.loras      = hires_lora_vec.empty() ? nullptr : hires_lora_vec.data();
+    params.hires.lora_count = static_cast<uint32_t>(hires_lora_vec.size());
     return params;
 }
 

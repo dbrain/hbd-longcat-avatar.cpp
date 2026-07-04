@@ -346,6 +346,13 @@ typedef struct {
     int upscale_tile_size;
     float* custom_sigmas;
     int custom_sigmas_count;
+    // FEATURE 1 (--hires-lora): optional per-phase LoRA set applied only on the hires/refine pass
+    // (video path). NULL/0 = reuse the base pass's LoRA state (legacy behavior). Consumed by
+    // generate_video, which calls apply_loras(loras, lora_count) just before the refine sample();
+    // because apply_loras diffs against curr_lora_state, passing the FULL refine set transitions
+    // cleanly from the base set. Backing storage is owned by the caller (SDGenerationParams).
+    const sd_lora_t* loras;
+    uint32_t lora_count;
 } sd_hires_params_t;
 
 typedef struct {

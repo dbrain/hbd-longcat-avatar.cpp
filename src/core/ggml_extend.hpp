@@ -2144,6 +2144,14 @@ struct GGMLRunnerContext {
     // amplify lip-sync. Default false = audio cross-attn runs normally (legacy behavior).
     bool ltx_skip_a2v                      = false;
 
+    // NAG (Normalized Attention Guidance) params, carried from LTXAVRunner::build_graph to the LTX
+    // CrossAttention. When ltx_nag_scale != 0 AND a nag_context is threaded to the video text
+    // cross-attn, that attn computes the negative attention output and NAG-blends it. Default 0 =>
+    // NAG off (byte-identical). See src/model/diffusion/ltxv.hpp CrossAttention::forward.
+    float ltx_nag_scale                    = 0.0f;
+    float ltx_nag_alpha                    = 0.35f;
+    float ltx_nag_tau                      = 2.5f;
+
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
             return;

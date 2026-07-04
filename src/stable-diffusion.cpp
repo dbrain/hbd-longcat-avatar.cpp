@@ -2663,6 +2663,32 @@ public:
                      a2v_guidance_scale, a2v_ramp_end);
         }
 
+        // NAG (Normalized Attention Guidance) — attention-space negative guidance on the video text
+        // cross-attn (Denoise-AI workflow: scale 14, alpha 0.35, tau 2.5, applied on the high-noise
+        // preview sub-stage only). Read per-render from env (mirrors the A2V knob above so the warm
+        // resident worker never bleeds a prior render's value). scale == 0 => OFF (default).
+        //   LTXAV_NAG_SCALE / LTXAV_NAG_ALPHA / LTXAV_NAG_TAU / LTXAV_NAG_UNTIL_SIGMA
+        // The sigma gate (apply NAG only while sigma >= until_sigma, default 0.9) faithfully limits
+        // NAG to the early/high-noise steps (the workflow's S1-only application) AND lets us ablate.
+        float nag_scale       = 0.0f;
+        float nag_alpha       = 0.35f;
+        float nag_tau         = 2.5f;
+        float nag_until_sigma = 0.9f;
+        if (const char* e = std::getenv("LTXAV_NAG_SCALE"))       { nag_scale = (float)atof(e); }
+        if (const char* e = std::getenv("LTXAV_NAG_ALPHA"))       { nag_alpha = (float)atof(e); }
+        if (const char* e = std::getenv("LTXAV_NAG_TAU"))         { nag_tau = (float)atof(e); }
+        if (const char* e = std::getenv("LTXAV_NAG_UNTIL_SIGMA")) { nag_until_sigma = (float)atof(e); }
+        const bool nag_enabled = (nag_scale != 0.0f) && sd_version_is_ltxav(version);
+        // NAG supplies negative guidance in attention space, so it REPLACES output-level CFG. When
+        // enabled at cfg<=1 we skip the separate uncond forward (its cfg-1 combine is a no-op) and
+        // instead feed the negative context INTO the single cond forward. The negative embedding is
+        // materialized because generate_video forces use_uncond when NAG is on (see resolve()).
+        const bool nag_owns_guidance = nag_enabled && cfg_scale <= 1.0f;
+        if (nag_enabled) {
+            LOG_INFO("LTXAV NAG (normalized attention guidance) scale=%.2f alpha=%.2f tau=%.2f until_sigma=%.3f (video text cross-attn; +1 cross-attn/step while gated on)",
+                     nag_scale, nag_alpha, nag_tau, nag_until_sigma);
+        }
+
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             // Cooperative cancel: client disconnected mid-render. Bail before launching
             // this step's DiT compute. An empty pred makes sample_k_diffusion yield an
@@ -2766,7 +2792,8 @@ public:
                                      const sd::Tensor<float>* c_concat_override                 = nullptr,
                                      const std::vector<int>* local_skip_layers                  = nullptr,
                                      const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
-                                     bool skip_a2v_pass                                         = false) -> sd::Tensor<float> {
+                                     bool skip_a2v_pass                                         = false,
+                                     bool nag_pass                                              = false) -> sd::Tensor<float> {
                 diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
                 diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
                 diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
@@ -2793,7 +2820,7 @@ public:
                         condition.c_vinput_mask.empty() ? nullptr : &condition.c_vinput_mask,
                         condition.c_image_embeds.empty() ? nullptr : &condition.c_image_embeds};
                 } else if (sd_version_is_ltxav(version)) {
-                    diffusion_params.extra = LTXAVDiffusionExtra{
+                    LTXAVDiffusionExtra ltx_extra{
                         nullptr,
                         audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
                         audio_length,
@@ -2801,6 +2828,16 @@ public:
                         video_positions.empty() ? nullptr : &video_positions,
                         skip_a2v_pass,
                         video_reference.empty() ? nullptr : &video_reference};
+                    // NAG: only on the primary cond forward (nag_pass), only while sigma is high
+                    // enough (the workflow applies NAG to the high-noise sub-stage), and only when a
+                    // negative context is actually available. Otherwise NAG stays off (legacy).
+                    if (nag_pass && nag_enabled && sigma >= nag_until_sigma && !uncond.c_crossattn.empty()) {
+                        ltx_extra.nag_context = &uncond.c_crossattn;
+                        ltx_extra.nag_scale   = nag_scale;
+                        ltx_extra.nag_alpha   = nag_alpha;
+                        ltx_extra.nag_tau     = nag_tau;
+                    }
+                    diffusion_params.extra = ltx_extra;
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};  // cond-frame K/V cache (lap-26)
                 } else {
@@ -2835,7 +2872,7 @@ public:
                 }
             }
 
-            cond_out = run_condition(*positive_condition, c_concat_override);
+            cond_out = run_condition(*positive_condition, c_concat_override, nullptr, nullptr, false, /*nag_pass=*/true);
             if (cond_out.empty()) {
                 return {};
             }
@@ -2892,7 +2929,11 @@ public:
                 }
             }
 
-            if (!uncond.empty()) {
+            // NAG owns guidance in attention space (cfg<=1): skip the redundant output-level uncond
+            // forward. The negative context was already consumed inside the cond forward above; its
+            // cfg-1 CFG combine would be a numeric no-op anyway. (When cfg>1 the user wants BOTH
+            // NAG and CFG, so the uncond forward still runs.)
+            if (!uncond.empty() && !nag_owns_guidance) {
                 if (!step_cache.is_step_skipped()) {
                     compute_sample_controls(control_image,
                                             noised_input,
@@ -3585,6 +3626,8 @@ void sd_hires_params_init(sd_hires_params_t* hires_params) {
     hires_params->upscale_tile_size   = 128;
     hires_params->custom_sigmas       = nullptr;
     hires_params->custom_sigmas_count = 0;
+    hires_params->loras               = nullptr;  // FEATURE 1 (--hires-lora): default = reuse base pass LoRAs
+    hires_params->lora_count          = 0;
 }
 
 void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
@@ -4385,6 +4428,19 @@ struct GenerationRequest {
         seed = resolve_seed(seed);
 
         resolve_guidance(sd_ctx, &guidance, &use_uncond, &use_img_uncond, has_ref_images, sample_method);
+        // NAG needs the NEGATIVE text context materialized even at cfg=1 (where use_uncond would
+        // otherwise be false and the negative prompt never encoded). Force it on so
+        // prepare_video_generation_embeds encodes embeds.uncond and generate_video passes it into
+        // sample() as the `uncond` carrier; the sampler then feeds uncond.c_crossattn into the
+        // single cond forward as the NAG negative context (and suppresses the redundant cfg-1 uncond
+        // forward). Gated on the same per-render env the sampler reads, so it can't get sticky.
+        if (sd_version_is_ltxav(sd_ctx->sd->version)) {
+            if (const char* e = std::getenv("LTXAV_NAG_SCALE")) {
+                if ((float)atof(e) != 0.0f) {
+                    use_uncond = true;
+                }
+            }
+        }
         if (sd_ctx->sd->high_noise_diffusion_model) {
             resolve_guidance(sd_ctx,
                              &high_noise_guidance,
@@ -9019,6 +9075,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             if (e == nullptr || std::string(e) != "0") {
                 ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
             }
+        }
+
+        // FEATURE 1 (--hires-lora): swap in the per-phase refine LoRA set immediately before the
+        // refine sample(). apply_loras diffs against curr_lora_state (set by the up-front base
+        // apply_loras at :8390), so passing the FULL refine set (e.g. distill@0.8 [+detailer@0.7])
+        // transitions cleanly from the base set (e.g. distill@0.65). For quantized (nvfp4) bases
+        // this is the cheap runtime-multiplier swap (apply_loras_at_runtime) — no re-fold, same
+        // VRAM/step-time as prod. No teardown needed: the next chained generate_video re-asserts
+        // the base set via its own up-front apply_loras. Detailer tensors that don't dim-match are
+        // skipped inside load_lora_model_from_file (fails safe to distill-only on the refine).
+        if (request.hires.lora_count > 0 && request.hires.loras != nullptr) {
+            LOG_INFO("hires: applying %u per-phase refine LoRA(s) before the refine sample", request.hires.lora_count);
+            sd_ctx->sd->apply_loras(request.hires.loras, request.hires.lora_count);
         }
 
         sampling_start = ggml_time_ms();

@@ -244,6 +244,13 @@ struct SDGenerationParams {
     float a2v_guidance                   = 1.0f; // audio->video modality guidance (1=faithful/fast; owner up to 3)
     float a2v_ramp_end                   = 1.0f; // a2v guidance ramp: fraction of (scale-1) kept at lowest-sigma step
     int   relip_ref_tstride              = 1;    // temporal subsample of the relip reference (identity-safe token cut)
+    // FEATURE 2 (NAG — Normalized Attention Guidance) RUNTIME knobs, bridged to the engine via env
+    // (apply_ltx_relip_env). Attention-space negative guidance on the LTX video text cross-attn.
+    // Default OFF (scale 0). Workflow values: scale 14, alpha 0.35, tau 2.5.
+    float nag_scale                      = 0.0f; // 0 = NAG OFF; Denoise-AI workflow uses 14 (see CPP-CHANGES.md scale-convention note)
+    float nag_alpha                      = 0.35f;// blend weight of the NAG-guided output vs positive
+    float nag_tau                        = 2.5f; // per-token L2-norm clamp ceiling (z_ext norm <= tau*||z_pos||)
+    float nag_until_sigma                = 0.9f; // apply NAG only while sigma >= this (early/high-noise steps; workflow S1-only)
     // LongCat-Avatar mouth-exaggeration knobs (RUNTIME).
     float audio_mouth_scale              = 1.0f; // scale the audio->face residual (1.0 = unchanged)
     float audio_lowpass                  = 0.0f; // input-wav low-pass cutoff Hz (0 = off)
@@ -269,6 +276,14 @@ struct SDGenerationParams {
     float hires_denoising_strength = 0.7f;
     int hires_upscale_tile_size    = 128;
     std::vector<float> hires_custom_sigmas;
+    // FEATURE 1 (--hires-lora): a SECOND LoRA set applied only on the hires/refine pass, so the
+    // refine can run a different distillation/detailer strength than the base pass (Denoise-AI
+    // workflow: distill@0.65 base -> distill@0.8 + detailer@0.7 refine). `hires_lora_spec` is the
+    // raw CLI/JSON spec ("<lora:name:strength>[,name:strength...]"); it is parsed + path-resolved
+    // in resolve() (needs lora_model_dir) into `hires_lora_map` (resolved-path -> strength), then
+    // flattened into `hires_lora_vec` (the sd_lora_t backing storage) in to_sd_vid_gen_params_t().
+    std::string hires_lora_spec;
+    std::map<std::string, float> hires_lora_map;
 
     std::map<std::string, float> lora_map;
     std::map<std::string, float> high_noise_lora_map;
@@ -276,6 +291,7 @@ struct SDGenerationParams {
     // Derived and normalized fields.
     std::string prompt_with_lora;  // for metadata record only
     std::vector<sd_lora_t> lora_vec;
+    std::vector<sd_lora_t> hires_lora_vec;  // FEATURE 1: backing storage for params.hires.loras
     sd_hires_upscaler_t resolved_hires_upscaler;
 
     // Owned execution payload.
