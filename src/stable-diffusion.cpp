@@ -9917,6 +9917,34 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             setenv("VACE_CONT_LATENT_DROP_TAIL", std::to_string(this_drop).c_str(), 1);
             unsetenv("VACE_STRENGTH");  // full strength; the tail ramp attenuates the seam
 
+            // ANCHOR the FULL injected-context region at full VACE strength — ramp ONLY the
+            // genuinely-free frames. The prior-window tail is injected into the first
+            //   klat = (min(K, frames) - 1)/4 + 1   (Wan VAE temporal factor 4)
+            // latent frames (mask=0); those carry the anti-drift motion/identity prior and must
+            // stay at full strength. The ramp's ANCHOR_FRAMES default (apply_wan_vace_env) is a
+            // STATIC 2 — correct only when klat==2, i.e. the OLD K=5. The recipe raised K to 13
+            // (klat=4), so 2 of the 4 context frames fell INSIDE the ramp's attenuation zone,
+            // weakening the anchor exactly at the context->free seam. Two consequences, both
+            // compounding once the prior tail is itself a degraded continuation (seg>=2, where the
+            // second seam lives): (1) the under-anchored boundary lets striping bleed through
+            // (first seam clean because window 0's tail is pristine); (2) the continuation no
+            // longer faithfully re-plays the K overlap it is meant to reproduce, so motion "runs
+            // ahead" inside the dropped head and the kept frames start further along each cut ->
+            // the chain drifts progressively faster. Tracking the anchor to klat (+1 for the i2v
+            // ref slot, which occupies latent t=0) keeps the whole injected context at full
+            // strength regardless of K. Only widens the anchored region (never removes the
+            // free-frame ramp), so it is a strict anti-drift improvement; user override still wins.
+            const bool keep_ref =
+                getenv("WAN_CHAIN_KEEP_REF") != nullptr && getenv("WAN_CHAIN_KEEP_REF")[0] == '1';
+            if (!(getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES") != nullptr &&
+                  getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES")[0] != '\0')) {
+                const int  frames      = std::max(1, base_params->video_frames);
+                const int  klat        = (std::min(K, frames) - 1) / 4 + 1;
+                const bool ref_on_cont = keep_ref && base_params->init_image.data != nullptr;
+                const int  anchor      = klat + (ref_on_cont ? 1 : 0);
+                setenv("VACE_STRENGTH_ANCHOR_FRAMES", std::to_string(anchor).c_str(), 1);
+            }
+
             // REFERENCE-IMAGE CONFLICT FIX — the "window-1-appears-as-a-hat" continuation bug.
             // render_shot.sh:224 gates --init-img to i2v mode ONLY: a t2v continuation window passes
             // NO reference image and is driven PURELY by --control-video (the kept K-frame pixel tail)
@@ -9932,7 +9960,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             // hand-off's own design intent. WAN_CHAIN_KEEP_REF=1 restores the old re-fed-ref behaviour
             // for A/B (e.g. to mimic render_shot i2v, which re-anchors each window with a CLEAN
             // identity still rather than a busy full-scene frame).
-            if (!(getenv("WAN_CHAIN_KEEP_REF") != nullptr && getenv("WAN_CHAIN_KEEP_REF")[0] == '1')) {
+            if (!keep_ref) {
                 vp.init_image.data = nullptr;  // skip the VACE reference-image path this window
             }
         }
