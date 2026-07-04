@@ -68,6 +68,24 @@ round-trip + its sync on every persist forward.
 | parity | **latent BIT-IDENTICAL** (chunks=2 A/B) |
 Kept the per-chunk resident buffers (did not need E4's contiguous-buffer refactor first).
 
+## Post-E5 nsys — the 3060 DiT is at its practical floor
+DiT-only chunks=3, resident + E5 (`shotstream_out/nsys_e5`). Kernel GPU time 15.33 s vs real
+(non-nsys) DiT wall ~15.7 s → **GPU ~97% saturated** (no launch-bound idle → CUDA graphs give ~nothing).
+| kernel | % | verdict |
+|---|---|---|
+| `flash_attn_ext_f16` (attention) | 36.8% | Ampere floor (occupancy-bound MMA, register-capped by design) |
+| `ampere_h1688gemm` ×2 (FFN/proj/cross) | 24.7% | cuBLAS roofline |
+| `convert_unary` F16↔F32 casts | 10.5% | WAN_DIT_F16 recovers only ~2% on the causal path (native FA2 needs F32 KQV → attention boundary keeps the casts) |
+| E5 `cpy_scalar` (K/V append) | 3.4% | replaced the worse host round-trip |
+| `concat_T_cont_4d` (KV concat, E4) | 2.7% | too small to justify E4's strided-buffer refactor |
+| norms/adds/rope/glue | ~13% | GPU-executing, not launch-idle |
+
+**Conclusion:** attention (floor) + GEMM (roofline) = 62% at hardware limits; the rest is GPU-bound glue.
+E4 (2.7%, risky), WAN_DIT_F16 (2%, approximation), CUDA graphs (~0, GPU saturated), custom attention
+kernel (weeks, kernel already at its occupancy ceiling — cuDNN gives it free on Blackwell). **The 3060
+DiT is floored. The −26% wall this session (fast VAE + E5 + last-chunk skip, all bit-exact) is the 3060
+result; the next big step is the 5060 (2× compute + free cuDNN SDPA + FP4 + 16 GB).**
+
 ## Remaining levers (see tasks / perf-ideas.md)
 - **E4** fixed contiguous resident KV buffers (kill per-forward concat, launch-bound ~5-7% DiT) → **E5**
   in-graph K/V append (remove host round-trip, ~4-5% DiT). Meatier exact DiT levers.
