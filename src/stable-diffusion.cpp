@@ -9902,8 +9902,35 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_latent         = prior_latent.data();
             vp.cont_latent_frames  = pl_t;  // FULL prior-window latent T (last K sliced in-engine)
             setenv("VACE_CONT_FRAMES", std::to_string(K).c_str(), 1);
-            setenv("VACE_CONT_LATENT_DROP_TAIL", std::to_string(droplat).c_str(), 1);
+            // DROP_TAIL alignment (render_shot.sh:205 vs :238): the FIRST continuation rolls forward
+            // from the pristine BASE window (window 0), whose latent tail is clean, so PRIOR_DROP=0;
+            // only LATER continuations (prior window is itself a continuation, hence striping-
+            // degraded) drop the terminal latent frame (DROPLAT). We were dropping droplat on EVERY
+            // continuation incl. the first, discarding one clean base-tail latent frame at seam 1.
+            // prior-window index == seg-1, so the prior is the pristine base iff seg==1 (holds on
+            // resume too: window 0 is always the base). Match the shell: 0 on the first cut, droplat after.
+            const int this_drop = (seg == 1) ? 0 : droplat;
+            setenv("VACE_CONT_LATENT_DROP_TAIL", std::to_string(this_drop).c_str(), 1);
             unsetenv("VACE_STRENGTH");  // full strength; the tail ramp attenuates the seam
+
+            // REFERENCE-IMAGE CONFLICT FIX — the "window-1-appears-as-a-hat" continuation bug.
+            // render_shot.sh:224 gates --init-img to i2v mode ONLY: a t2v continuation window passes
+            // NO reference image and is driven PURELY by --control-video (the kept K-frame pixel tail)
+            // + VACE_CONT_LATENT (the prior window's diffusion-latent tail). In this warm single-
+            // VACE-model server the prior window's identity+motion is ALREADY carried losslessly by
+            // the in-memory cont_latent, so re-feeding the request's init/reference image into the
+            // VACE reference-image slot on a continuation window is redundant AND actively harmful:
+            // the VACE ref path (stable-diffusion.cpp:7222-7231 encode + 7482-7513 prepend) composites
+            // that full frame as a small MISPLACED spatial reference object ("hat") that fights the
+            // control continuation and pulls the generated identity off the prior window. Keep the
+            // reference only on window 0 (identity/scene establishment) and let cont_latent+control
+            // carry every continuation — this matches the render_shot t2v recipe and the in-memory
+            // hand-off's own design intent. WAN_CHAIN_KEEP_REF=1 restores the old re-fed-ref behaviour
+            // for A/B (e.g. to mimic render_shot i2v, which re-anchors each window with a CLEAN
+            // identity still rather than a busy full-scene frame).
+            if (!(getenv("WAN_CHAIN_KEEP_REF") != nullptr && getenv("WAN_CHAIN_KEEP_REF")[0] == '1')) {
+                vp.init_image.data = nullptr;  // skip the VACE reference-image path this window
+            }
         }
 
         LOG_INFO("=== generate_wan_vace_chain window %d/%d [%s] ===",
