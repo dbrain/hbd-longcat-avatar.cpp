@@ -333,6 +333,11 @@ int main(int argc, char** argv) {
           std::map<std::string, ggml_tensor*> tensors; vae1->get_param_tensors(tensors, "first_stage_model");
           if (!loader.load_tensors(tensors)) { printf("ERROR: VAE tensor load\n"); return 1; } }
         vae1->set_flash_attention_enabled(true);
+        // GGML_CUDNN_CONV=1: route VAE 2D convs through GGML_OP_CONV_2D (conv2d-cudnn.cu,
+        // F32-accumulate implicit-GEMM, im2col-free) instead of ggml_conv_2d's im2col.
+        // Mirrors src/stable-diffusion.cpp:1076 for this VAE-only A/B path. Resample.1's
+        // F32 input cast (wan_vae.hpp) makes dst F32 too, passing the cuDNN dtype gate.
+        if (getenv("GGML_CUDNN_CONV")) vae1->set_conv2d_direct_enabled(true);
         vae1->set_temporal_tiling_enabled(vae_temporal_tiling);
         sd_tiling_params_t dt = {};
         dt.enabled = vae_tiling; dt.temporal_tiling = vae_temporal_tiling;
