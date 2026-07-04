@@ -126,6 +126,12 @@ public:
     // DiT is offloaded to the GPU at once → OOM on the LTX vid_gen path. Wrappers with
     // nested runners (avatar, hidream) still override to delegate to the inner runner.
     virtual void set_circular_axes(bool /*cx*/, bool /*cy*/) {}
+
+    // LTXAV: whether this checkpoint has the audio+video (LTX-2) stream. Video-only classic
+    // LTX-Video 0.9.x checkpoints return false so the pipeline does NOT synthesize an audio
+    // latent (there are no audio tensors to process — doing so null-derefs the DiT). Default
+    // true keeps every existing LTXAV/audio model unchanged.
+    virtual bool has_audio_stream() const { return true; }
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes) { GGMLRunner::set_max_graph_vram_bytes(max_vram_bytes); }
     virtual void set_flash_attention_enabled(bool enabled) { GGMLRunner::set_flash_attention_enabled(enabled); }
 

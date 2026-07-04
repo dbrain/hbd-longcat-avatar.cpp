@@ -1248,6 +1248,9 @@ struct T5CLIPEmbedder : public Conditioner {
     bool use_mask    = false;
     int mask_pad     = 0;
     bool is_umt5     = false;
+    // Trim the trailing padding tokens from the returned context so a DiT that cross-attends
+    // WITHOUT an attention mask (e.g. the LTX-Video path) is not diluted by ~500 pad tokens.
+    bool trim_to_valid = false;
 
     T5CLIPEmbedder(ggml_backend_t backend,
                    ggml_backend_t params_backend,
@@ -1438,6 +1441,29 @@ struct T5CLIPEmbedder : public Conditioner {
         }
 
         modify_mask_to_attend_padding(&t5_attn_mask, static_cast<int>(t5_attn_mask.numel()), mask_pad);
+
+        // Slice off trailing padding tokens (valid tokens are contiguous at the front; the T5
+        // tokenizer right-pads). Equivalent to a cross-attention mask for a DiT that ignores it.
+        if (trim_to_valid && !hidden_states.empty()) {
+            int64_t valid = 0;
+            for (float m : t5_attn_mask_vec) {
+                if (m > -1.0e30f) {
+                    valid++;
+                }
+            }
+            if (const char* e = std::getenv("LTX_T5_TRIM"); e != nullptr) {
+                long v = std::atol(e);
+                if (v > 0) {
+                    valid = v;  // manual override for A/B (0/unset = auto valid-count)
+                }
+            }
+            if (valid > 0 && valid < hidden_states.shape()[1]) {
+                hidden_states = sd::ops::slice(hidden_states, 1, 0, valid);
+            }
+            LOG_INFO("T5 LTX cond: trimmed to %lld valid tokens (from %lld), c_crossattn [%lld x %lld]",
+                     (long long)valid, (long long)t5_attn_mask_vec.size(),
+                     (long long)hidden_states.shape()[0], (long long)hidden_states.shape()[1]);
+        }
 
         SDCondition result;
         result.c_crossattn = std::move(hidden_states);

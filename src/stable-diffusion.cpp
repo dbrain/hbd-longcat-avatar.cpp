@@ -752,9 +752,32 @@ public:
                                                                      version,
                                                                      sd_ctx_params->chroma_use_dit_mask);
             } else if (sd_version_is_ltxav(version)) {
-                cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
+                // Classic LTX-Video 0.9.x checkpoints carry an in-DiT PixArt caption_projection
+                // that consumes RAW T5-XXL (4096-dim) embeddings, and have NO Gemma text encoder /
+                // text_embedding_projection / connector tensors. Detect that signature and use the
+                // reusable T5-XXL conditioner instead of the LTX-2 Gemma path. (LTX-2 has no in-DiT
+                // caption_projection, so this branch never fires for it.)
+                bool ltxv_t5_caption =
+                    tensor_storage_map.find("model.diffusion_model.caption_projection.linear_1.weight") != tensor_storage_map.end() &&
+                    tensor_storage_map.find("text_embedding_projection.linear_1.weight") == tensor_storage_map.end() &&
+                    tensor_storage_map.find("text_encoders.llm.model.embed_tokens.weight") == tensor_storage_map.end();
+                if (ltxv_t5_caption) {
+                    LOG_INFO("LTX-Video 0.9.x checkpoint detected (in-DiT T5-XXL caption_projection); using T5-XXL text encoder");
+                    auto ltx_t5 = std::make_shared<T5CLIPEmbedder>(backend_for(SDBackendModule::TE),
                                                                    params_backend_for(SDBackendModule::TE),
-                                                                   tensor_storage_map);
+                                                                   tensor_storage_map,
+                                                                   /*use_mask=*/false,
+                                                                   /*mask_pad=*/0,
+                                                                   /*is_umt5=*/false);
+                    // The LTX DiT cross-attends without a padding mask; trim the ~500 pad tokens
+                    // so the real prompt tokens are not drowned out (was → washed-out output).
+                    ltx_t5->trim_to_valid = true;
+                    cond_stage_model      = ltx_t5;
+                } else {
+                    cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
+                                                                       params_backend_for(SDBackendModule::TE),
+                                                                       tensor_storage_map);
+                }
                 diffusion_model  = std::make_shared<LTXV::LTXAVRunner>(backend_for(SDBackendModule::DIFFUSION),
                                                                       params_backend_for(SDBackendModule::DIFFUSION),
                                                                       tensor_storage_map,
@@ -6170,18 +6193,25 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                 request->frames = snapped;
             }
         }
-        latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
-        const char* drive_wav = SAFE_STR(sd_vid_gen_params->drive_audio_path);
-        if (strlen(drive_wav) > 0) {
-            auto driven = encode_ltxav_drive_audio(sd_ctx, drive_wav, latents.audio_length);
-            if (!driven.empty()) {
-                latents.audio_latent = driven;       // lip-sync to THIS audio
-                latents.audio_fixed  = true;         // hold it fixed through the denoise loop
+        // Video-only classic LTX-Video 0.9.x checkpoints have no audio stream — synthesizing an
+        // audio latent here would feed the DiT an audio stream it has no tensors for (null deref).
+        bool ltxav_has_audio = sd_ctx->sd->diffusion_model == nullptr || sd_ctx->sd->diffusion_model->has_audio_stream();
+        if (ltxav_has_audio) {
+            latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
+            const char* drive_wav = SAFE_STR(sd_vid_gen_params->drive_audio_path);
+            if (strlen(drive_wav) > 0) {
+                auto driven = encode_ltxav_drive_audio(sd_ctx, drive_wav, latents.audio_length);
+                if (!driven.empty()) {
+                    latents.audio_latent = driven;       // lip-sync to THIS audio
+                    latents.audio_fixed  = true;         // hold it fixed through the denoise loop
+                } else {
+                    latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+                }
             } else {
                 latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
             }
         } else {
-            latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+            latents.audio_length = 0;
         }
     }
 
