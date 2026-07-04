@@ -949,6 +949,29 @@ int main(int argc, char** argv) {
         printf("shot %d decode: %.1fs\n", k, (tdec1 - tdec0) / 1000.0);
         dump_stats("decoded rgb", rgb);
         if (rgb.empty() || rgb.dim() < 4) { printf("ERROR: shot %d decode empty\n", k); return 1; }
+
+        // ---- return the decode's transient CUDA pool high-water to the driver ----
+        // The whole-frame VAE decode (NO_VAE_TILE=1 + WAN_VAE_F16 + GGML_CUDNN_CONV) drives the
+        // shared ggml-cuda VMM scratch pool (im2col/cuDNN-conv3d half buffers) to a much higher
+        // committed high-water than a tiled decode does. decode()'s free_compute_buffer() only
+        // releases the ~8 GB gallocr COMPUTE buffer (the VRAM drop to ~5 GB at the shot boundary);
+        // the VMM pool is a monotonic bump allocator (ggml-cuda.cu ggml_cuda_pool_vmm: pool_size
+        // only grows, never shrinks on free — physical pages stay committed until the pool object
+        // is destroyed). So the decode's high-water pages sit RESIDENT through the next shot's DiT,
+        // stacking ~600 MB of idle-but-committed pool onto shot k+1's DiT working set and tipping a
+        // 2-shot whole-frame chain from ~10.9 GB (fits) to ~11.5 GB (OOM at the last DiT chunk).
+        // Trimming here destroys the pool (real cuMemUnmap + cuMemAddressFree) so shot k+1's DiT
+        // rebuilds it lazily and only commits to the DiT's own (smaller) high-water — killing the
+        // fragmentation with no peak/output change. Cost is a single cudaDeviceSynchronize + a
+        // handful of cuMem* calls ONCE per shot boundary (the pool is untouched across the 7 DiT
+        // chunks WITHIN a shot), i.e. sub-ms against a ~29 s decode + multi-second DiT — no per-chunk
+        // overhead, no decode/DiT speed regression. Nothing is in flight here (decode is complete
+        // and its buffer freed; DiT KV caches were reset above), so the unmap is safe. Peak-neutral
+        // on the default tiled path (its pool high-water is already small). SHOTSTREAM_NO_POOL_TRIM=1
+        // opts out for A/B.
+        if (on_gpu && getenv("SHOTSTREAM_NO_POOL_TRIM") == nullptr) {
+            ggml_backend_cuda_trim_pools(backend);
+        }
         char tag[64]; snprintf(tag, sizeof(tag), "shot%02d", k);
         write_video(rgb, tag);
         shot_pixels.push_back(std::move(rgb));
