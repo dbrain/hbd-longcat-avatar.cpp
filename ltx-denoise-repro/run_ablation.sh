@@ -29,6 +29,7 @@ WT=/home/dbrain/dev/longcat-avatar-ltxdenoise          # worktree (binary lives 
 MAIN=/home/dbrain/dev/longcat-avatar.cpp; LTX2="$MAIN/models/ltx2"
 BUILDER="longcat-avatar-dev:builder-cudnn-ff"; BIN=/src/build-cudnn/bin/sd-cli
 EYE=/home/dbrain/dev/longcat-avatar-wan22/perf_out/ltx_denoise; CLIPS="$EYE/clips"
+RES="$EYE/results_s${SCN}_${MODE}.csv"; PAGE="$EYE/ablation_s${SCN}_${MODE}.html"   # per scenario/mode (so runs don't overwrite each other)
 OUTROOT="$WT/_ablation_out"; mkdir -p "$CLIPS" "$OUTROOT"
 UPDIR=/ltx2/latent_upscale_models; UPSCALER=ltx-2.3-spatial-upscaler-x2-1.1
 LADDER_SIGMAS="1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0.0"   # base pass (full schedule; low-res)
@@ -106,7 +107,7 @@ render() { # render TAG MODEL WBASE HBASE STEPS SIGMAS "HIRES" "HIRESLORA" "NAG"
   if [ -f "$od/out.webm" ]; then
     ffmpeg -y -i "$od/out.webm" -c:v libx264 -crf 18 -pix_fmt yuv420p -c:a aac "$CLIPS/$TAG.mp4" -loglevel error 2>/dev/null && echo "  -> $CLIPS/$TAG.mp4  (${wall}s, peak ${peak}MiB, rc=$rc)"
   else echo "  [FAIL $TAG] no webm (rc=$rc):"; grep -aiE "out of memory|error|abort|assert" "$od/log"|grep -aviE 0x|tail -3; fi
-  echo "$TAG,$MODEL,${W}x${H}$([ -n "$HIRES" ]&&echo '->x2'),$FR,$FPSR,$STEPS,$wall,$peak,$rc" >> "$EYE/results.csv"
+  echo "$TAG,$MODEL,${W}x${H}$([ -n "$HIRES" ]&&echo '->x2'),$FR,$FPSR,$STEPS,$wall,$peak,$rc" >> "$RES"
 }
 
 LAD="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-steps 2 --hires-sigmas $HIRES_SIGMAS"
@@ -117,7 +118,7 @@ NAG4="--nag-scale 13 --nag-alpha 0.35 --nag-tau 2.5 --nag-until-sigma 0.9"   # n
 
 echo "scenario,mode=$SCN,$MODE seed=$SEED"
 # only reset the results table on a fresh batch (row 0 present); otherwise append/refresh
-case " $ROWS " in *" 0 "*) : > "$EYE/results.csv" ;; esac
+case " $ROWS " in *" 0 "*) : > "$RES" ;; esac
 for R in $ROWS; do case "$R" in
   0) render "s${SCN}_${MODE}_r0_baseline"  nvfp4-CLEAN.gguf         1280 704 8 "$FULL_SIGMAS"   ""     ""        "" ;;
   1) render "s${SCN}_${MODE}_r1_fold050"   nvfp4-CLEAN-dev050.gguf  1280 704 8 "$FULL_SIGMAS"   ""     ""        "" ;;
@@ -144,12 +145,12 @@ LBL=( ["0"]="r0 baseline (current prod nvfp4-CLEAN, single pass)" ["1"]="r1 fold
   while IFS=, read -r tag model res fr fps steps wall peak rc; do
     st="ok"; [ "${rc:-1}" != 0 ] && st="FAIL"
     echo "<tr><td>${tag##*_r}</td><td>${model%.gguf}</td><td>$res</td><td>$fr</td><td>$fps</td><td>$steps</td><td>${wall}s</td><td>${peak}MiB</td><td class=\"$([ $st = ok ]&&echo ok||echo bad)\">$st</td></tr>"
-  done < "$EYE/results.csv"
+  done < "$RES"
   echo "</table><h2>clips (play in motion — mush shows in motion, not stills; 🔊 = has audio)</h2><div class=grid>"
   for f in $(cd "$CLIPS" && ls s${SCN}_${MODE}_r*.mp4 2>/dev/null | sort); do
     R=$(echo "$f" | sed -E 's/.*_r([0-9]+)_.*/\1/')
     echo "<figure><video src=\"clips/$f\" controls loop playsinline></video><figcaption>${LBL[$R]:-$f}</figcaption></figure>"
   done
   echo "</div>"
-} > "$EYE/ablation.html"
+} > "$PAGE"
 echo "@@@ ablation done. clips: $CLIPS  |  page: http://10.0.0.208:8077/ltx_denoise/ablation.html @@@"
