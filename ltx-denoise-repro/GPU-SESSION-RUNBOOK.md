@@ -34,43 +34,56 @@ semantic, not compile, risks — they surface as wrong output, not build errors)
 NAG-off is gated byte-identical (`nag_context==null` short-circuit), so a broken NAG can't taint the
 non-NAG A/B runs — safe to build and run steps 2.1–2.2 even if NAG needs more work.
 
-## STEP 2 — THE ABLATION LADDER (busy clip, hold everything else fixed)
-**Fixed clip** = the "LTX poison" case: distant characters + high motion, **1280×704, 193 frames**.
-Same init image / prompt / seed across all runs. Driver = `run_denoise_workflow.sh` (update its model +
-flags per row; it already has the base→x2→refine ladder, audio, chain, and eye-test surfacing wired).
+## STEP 2 — RUN THE ABLATION (turnkey — `run_ablation.sh` does everything)
+The whole ladder (baseline → fold → +ladder → +hires-lora/detailer → +NAG → 24fps) is encapsulated in
+`run_ablation.sh`: fixed prompt+seed per scenario, real `sd-cli` invocation (worktree binary in the
+`builder-cudnn-ff` runtime), AV-webm → mp4 (keeps audio), auto-surfaced to the eye-test page + a results
+table. GPU-idle preflight + flock built in. Copy-paste:
 
-| # | Run | Model | Key flags | Needs |
-|---|---|---|---|---|
-| 0 | **Baseline** (current prod) | `nvfp4-CLEAN.gguf` | current single-pass, **48 fps** | build-free |
-| 1 | **Fold only** | `nvfp4-CLEAN-dev050.gguf` | same single-pass, 48 fps | build-free |
-| 2 | **+ ladder** (low-res base→x2→refine) | dev050 | `--sigmas` base + `--hires --hires-upscaler ltx-2.3-spatial-upscaler-x2-1.1 --hires-sigmas 0.421875,0.0` | build-free |
-| 3 | **+ per-phase LoRA + detailer** | dev065 base | `--hires-lora "ltx-2.3-22b-distilled-lora-384-1.1:0.15,<detailer>:0.8"` (bumps refine toward 0.8 + adds detailer) | **build** |
-| 4 | **+ NAG** | winner of 2/3 | `--nag-scale 13 --nag-alpha 0.35 --nag-tau 2.5 --nag-until-sigma 0.9` (and a scale sweep 8/13/16) | **build** |
-| 5 | **24 fps** re-run of the best | winner | drop to `--fps 24` (workflow's own default) | as above |
+```
+cd ltx-denoise-repro
+# --- t2v, scenario 3 (static-cam distant crossing = purest poison) — the first run ---
+bash run_ablation.sh 3 t2v "0 1 2 3"          # baseline, fold, +ladder, +hires-lora/detailer
+# --- t2v with supplied audio (music) ---
+AUDIO=/home/dbrain/dev/longcat-avatar.cpp/models/ltx2/_drive/song.wav bash run_ablation.sh 3 t2v "2 3"
+# --- i2v: FIRST flux the distant start frame, then animate it ---
+bash gen_i2v_stills.sh                          # writes models/ltx2/_inputs/i2v_start_{crossing,crowd}_*.png
+INIT=/home/dbrain/dev/longcat-avatar.cpp/models/ltx2/_inputs/i2v_start_crossing_seed42.png \
+  bash run_ablation.sh 3 i2v "0 1 2 3"
+# scenario 1 i2v uses the neon still by default (no gen_i2v needed): bash run_ablation.sh 1 i2v "0 1 2 3"
+# --- after eyeballing 0-3, pick the winner model then add NAG + the 24fps test ---
+NAGMODEL=nvfp4-CLEAN-dev050.gguf bash run_ablation.sh 3 t2v 4        # NAG (+ sweep: edit --nag-scale 8/13/16)
+WINMODEL=nvfp4-CLEAN-dev050.gguf FR=97 bash run_ablation.sh 3 t2v 5  # 24fps, half the frames = 50%-less-work test
+```
+Row semantics (each isolates ONE lever): 0 current prod · 1 de-distill fold only · 2 +low-res→x2→refine
+ladder · 3 +hires-lora(distill@0.8)+detailer on refine · 4 +NAG(scale13, S1-only sigma gate) · 5 24fps.
+**Speech audio = `voice_teen.wav`, music = `song.wav`** (voice_16k dropped; auto-resampled to 16k mono).
+**No verdict on LTX until row 4 (NAG) is in the eval.** NAG scale: workflow "14" ≈ our `--nag-scale 13`.
 
-Notes:
-- Row 3's `--hires-lora` strength is **incremental over the folded base**: dev065 already bakes 0.65, so
-  adding the distill LoRA at +0.15 on the refine pass ≈ effective 0.8 there (verify sign/convention on build).
-- Rows 2–5 each isolate one lever ⇒ we read off its exact contribution. **No verdict on LTX until row 4/5.**
-- Detailer file: `ltx-2-19b-ic-lora-detailer` (Agent B confirmed 480/480 dim-compatible with our 22B trunk).
-- fps=24 default comes straight from the workflow (all 3 versions run 24). Row 5 is the "50% less work" test.
+## STEP 3 — JUDGE ON THE PAGE
+`run_ablation.sh` auto-builds **http://10.0.0.208:8077/ltx_denoise/ablation.html** (clips side-by-side +
+wall/VRAM table). Judge in motion (mush shows in motion, not stills): distant-face fidelity, contrast-on-
+motion, does 24fps hold. Win = clean **and** not slower than baseline (ideally faster — fewer full-res steps)
+and usable faster than the wan2.2+lipdub fallback. Input vetting page: `…/ltx_denoise/index.html`.
 
-## STEP 3 — SURFACE + JUDGE
-Each clip → webm→mp4 (keep audio) → eye-test dir → regen page (driver does this;
-pattern from `gen_eyetest.sh`, owner's LAN page). Compare in motion (mush shows in motion, not stills):
-distant-character faces, contrast-on-motion, and whether 24 fps holds up. Also log wall-time per run —
-the win condition is "clean **and** not slower than baseline" (ideally faster: fewer full-res steps),
-and "usable faster than the wan2.2+lipdub fallback".
-
-## Usage modes (all wired in the driver, `--mode`)
-`i2v_audio` (`--init-img` + `--drive-audio <16kHz wav>` + `--audio-vae ...-ENC-f16.gguf`),
-`t2v_audio`, `t2v_genaudio` (omit `--drive-audio` → native AV), `chain` (native
-`--ltx-chain-segments N --ltx-chain-prompts <file> --ltx-chain-audio-dir <dir>` for same-character continuation).
+## Usage modes (all wired in `run_ablation.sh` / the driver)
+t2v (native AV), t2v+`AUDIO=`(supplied `--drive-audio`), i2v (`INIT=`), and chain continuation (native
+`--ltx-chain-segments N --ltx-chain-prompts <file> --ltx-chain-audio-dir <dir>` — see `run_denoise_workflow.sh`).
 
 ## Pointers
+- **`run_ablation.sh`** — THE turnkey runner (all rows, auto-surface). Start here on GPU day.
+- **`gen_i2v_stills.sh`** — flux.2 the busy/distant i2v start frames (scenarios 2 & 3). GPU.
+- `PROMPTS.md` — LTX-2.3 prompting cheat-sheet + the 3 fixed pain-point prompts (t2v+i2v).
 - `REPRODUCE.md` — node-exact spec of all 3 workflows + minimize/ablation rationale (v2 = reference).
 - `CPP-CHANGES.md` — every C++ edit + flags + BUILD-VERIFICATION CHECKLIST.
 - `CPP-IMPLEMENTATION-PLAN.md` — the design the edits were built from.
 - `COMPAT-REPORT.md` — distill-LoRA bijection + detailer compat facts.
-- `run_denoise_workflow.sh` — the driver (update model/flags per ablation row).
+- `run_denoise_workflow.sh` — earlier hand-driver (superseded by run_ablation.sh; kept for the chain mode).
+
+## Pre-GPU status (what's still cooking)
+- Folded models `nvfp4-CLEAN-dev050.gguf` (rows 1–2) + `dev065.gguf` (row 3) are **re-folding cleanly now**
+  (~1 h each, CPU — the first run got RAM-starved by the concurrent build and was scrapped). Rows 0–2 only
+  need dev050; row 3 needs dev065. `run_ablation.sh` skips any row whose model isn't present yet, so you can
+  start rows 0–2 the moment dev050 lands even if dev065 is still folding.
+- LoRAs for row 3 are symlinked into `models/ltx2/loras/` (distill-384-1.1 + detailer) for `--lora-model-dir`.
 - `tools/fold_distill_lora.py` — the strength-parameterized fold (re-run for other strengths).
