@@ -85,6 +85,68 @@ namespace WAN {
         return on;
     }
 
+    // WAN_VAE_RMS_CF (default OFF; VALUE-identical, committed graph byte-identical when unset):
+    // cut the #1 decode data-movement cost — the plain F16->F16 `cpy_scalar` copies (nsys: 25.7%
+    // of the whole-frame decode). Their dominant source is RMS_norm: it normalizes over the
+    // channel dim, which in the [W,H,T,C] activation layout is ne[3]. ggml_rms_norm only reduces
+    // over ne[0], so RMS_norm does permute(C->dim0)+CONT, rms, mul(gamma), then permute-back+CONT
+    // — TWO ggml_cont materializations per call. There are ~30 RMS_norm per decoded latent frame
+    // (every ResidualBlock has 2, plus the heads), so at ~21 frames that permute-back CONT alone
+    // is ~600 of the ~1800 cpy_scalar instances.
+    //
+    // The permute-back CONT (call it CONT#2) is redundant: RMS_norm is ALWAYS followed by SiLU
+    // (residual.1/residual.4, head.1), an elementwise op whose result is independent of memory
+    // layout, and SiLU is ALWAYS followed by a CausalConv3d whose first op (ggml_pad / ggml_concat
+    // for the causal cache) reads its src BY STRIDES (pad.cu / concat.cu non-contiguous path) and
+    // writes a fresh contiguous buffer. So we can keep the RMS_norm result in its channels-first
+    // [C,W,H,T] contiguous layout, run SiLU there (identical values), then hand the conv a
+    // zero-copy permuted [W,H,T,C] VIEW — the conv's pad/concat materializes it exactly as CONT#2
+    // used to, but ONCE instead of twice. No new kernels, no dtype change: the numbers are
+    // bit-identical to the gate-off path; only ~one cont per RMS->SiLU->conv chain disappears.
+    //
+    // Scoped to the DECODE phase (g_ext_vae_phase_encode==false) so the F32/tiled encode graph is
+    // literally untouched. RMS_norm feeding an AttentionBlock (norm) is left on the plain path
+    // (its consumer is a cont'd permute, not SiLU), so attention is unaffected.
+    inline bool wan_vae_rms_cf_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("WAN_VAE_RMS_CF");
+            return e != nullptr && atoi(e) != 0;  // default OFF; "1" enables
+        }();
+        return on;
+    }
+
+    // WAN_VAE_SLICE_NOCOPY (default OFF; committed graph byte-identical when unset): the per-frame
+    // decode loop slices one latent frame `in = slice(x, dim=2, i, i+1)` and ggml_ext_slice conts
+    // it by default. That cont is redundant: `in`'s only consumer is decoder conv1, a CausalConv3d
+    // whose first op (ggml_pad when historyless, else ggml_concat with the causal cache) reads its
+    // src by strides and writes contiguous. Passing the strided view (cont=false) lets that pad/
+    // concat do the single materialization. Values identical; saves one small cont per frame.
+    inline bool wan_vae_slice_nocopy_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("WAN_VAE_SLICE_NOCOPY");
+            return e != nullptr && atoi(e) != 0;  // default OFF; "1" enables
+        }();
+        return on;
+    }
+
+    // WAN_VAE_RMS_KERNEL (default OFF; committed graph byte-identical when unset): the real fix for
+    // the RMS_norm data-movement cost. RMS_norm normalizes over the CHANNEL dim, which is ne[3] in
+    // the [W,H,T,C] activation layout; ggml_rms_norm only reduces over ne[0], so the committed path
+    // does permute(C->ne0)+CONT, rms, mul(gamma), permute-back+CONT — 2 conts + a separate mul per
+    // RMS_norm (~30/decoded-frame, the #1 `cpy_scalar` source). This routes RMS_norm to the custom
+    // ggml_rms_norm_channels op (ggml-cuda/norm.cu): ONE coalesced kernel that reduces over ne[3]
+    // and folds gamma in place, reading [W,H,T,C] natively. Both conts AND the mul disappear —
+    // unlike WAN_VAE_RMS_CF (which only relocated CONT#2 into SiLU), this removes the work. Formula-
+    // identical (float reduction, invisible at 8-bit). Decode-only; AttentionBlock RMS and the
+    // F32/tiled encode stay on the plain ggml_rms_norm. Takes precedence over WAN_VAE_RMS_CF.
+    inline bool wan_vae_rms_kernel_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("WAN_VAE_RMS_KERNEL");
+            return e != nullptr && atoi(e) != 0;  // default OFF; "1" enables
+        }();
+        return on;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -178,16 +240,41 @@ namespace WAN {
         RMS_norm(int64_t dim)
             : dim(dim) {}
 
+        // Channels-first result [N*IC, IW, IH, ID] i.e. ggml ne=[C, W, H, T], contiguous. This is
+        // exactly `forward()` minus the final permute-back+CONT. rms_norm/mul are unchanged, so the
+        // VALUES are identical to forward()'s output re-laid-out; only the layout differs. See
+        // WAN_VAE_RMS_CF: the caller runs the (layout-agnostic) SiLU here, then hands the conv the
+        // zero-copy view from channels_first_to_whtc_view() so the conv's pad/concat does the one
+        // materialization that forward()'s CONT would have done.
+        ggml_tensor* forward_channels_first(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            ggml_tensor* w = params["gamma"];
+            w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
+            auto h         = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 3, 0, 1, 2));  // [C, W, H, T]
+            h              = ggml_rms_norm(ctx->ggml_ctx, h, 1e-12f);
+            h              = ggml_mul(ctx->ggml_ctx, h, w);
+            return h;  // [C, W, H, T] contiguous (channels-first)
+        }
+
+        // Zero-copy inverse of forward_channels_first's leading permute: [C,W,H,T] -> a strided
+        // [W,H,T,C] view (no cont). The downstream CausalConv3d's pad/concat reads it by strides.
+        static ggml_tensor* channels_first_to_whtc_view(GGMLRunnerContext* ctx, ggml_tensor* h) {
+            return ggml_ext_torch_permute(ctx->ggml_ctx, h, 1, 2, 3, 0);
+        }
+
+        // WAN_VAE_RMS_KERNEL: single-op channels-last RMS over ne[3] with gamma folded in — no
+        // transpose, no cont, no separate mul. Returns [W,H,T,C] contiguous, same as forward().
+        ggml_tensor* forward_channels_kernel(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            ggml_tensor* w = params["gamma"];  // [C], F32
+            w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
+            return ggml_rms_norm_channels(ctx->ggml_ctx, x, w, 1e-12f);  // normalize over ne[3], fold gamma
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             // x: [N*IC, ID, IH, IW], IC == dim
             // assert N == 1
 
-            ggml_tensor* w = params["gamma"];
-            w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
-            auto h         = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 3, 0, 1, 2));  // [ID, IH, IW, N*IC]
-            h              = ggml_rms_norm(ctx->ggml_ctx, h, 1e-12f);
-            h              = ggml_mul(ctx->ggml_ctx, h, w);
-            h              = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, h, 1, 2, 3, 0));
+            auto h = forward_channels_first(ctx, x);
+            h      = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, h, 1, 2, 3, 0));
 
             return h;
         }
@@ -490,13 +577,37 @@ namespace WAN {
                 h = shortcut->forward(ctx, x);
             }
 
+            // WAN_VAE_RMS_CF (decode only): keep the RMS_norm result channels-first [C,W,H,T]
+            // (drops RMS's permute-back CONT), then let the SiLU that ALWAYS follows absorb the
+            // transpose — SiLU reads the zero-copy permuted [W,H,T,C] view and writes it back
+            // CONTIGUOUS (ggml-cuda unary strided path). The conv then gets a normal contiguous
+            // [W,H,T,C] tensor, so the causal-cache ggml_concat (which requires dim-0-contiguous
+            // inputs) and the pad both work. Net: one fewer cont per RMS->SiLU->conv chain, and
+            // ggml_concat is never handed a non-contiguous tensor. Value-identical to plain path.
+            // `x_is_cf` == x is currently channels-first [C,W,H,T].
+            // WAN_VAE_RMS_KERNEL (primary) folds the whole RMS into one channels-last op -> x stays
+            // [W,H,T,C] contiguous, no cf machinery. WAN_VAE_RMS_CF (fallback) is the older SiLU-
+            // absorb path. Both decode-only.
+            const bool rms_kernel = wan_vae_rms_kernel_enabled() && !g_ext_vae_phase_encode;
+            const bool rms_cf     = !rms_kernel && wan_vae_rms_cf_enabled() && !g_ext_vae_phase_encode;
+            bool x_is_cf          = false;
+
             for (int i = 0; i < 7; i++) {
                 if (i == 0 || i == 3) {  // RMS_norm
                     auto layer = std::dynamic_pointer_cast<RMS_norm>(blocks["residual." + std::to_string(i)]);
-                    x          = layer->forward(ctx, x);
+                    if (rms_kernel) {
+                        x = layer->forward_channels_kernel(ctx, x);  // [W,H,T,C] contiguous, single op
+                    } else if (rms_cf) {
+                        x        = layer->forward_channels_first(ctx, x);  // [C,W,H,T] contiguous, no permute-back CONT
+                        x_is_cf  = true;
+                    } else {
+                        x = layer->forward(ctx, x);
+                    }
                 } else if (i == 2 || i == 6) {  // CausalConv3d
                     auto layer = std::dynamic_pointer_cast<CausalConv3d>(blocks["residual." + std::to_string(i)]);
 
+                    // x is already contiguous [W,H,T,C] here (SiLU de-transposed it), so the cache
+                    // concat/pad below get contiguous inputs.
                     if (feat_cache.size() > 0) {
                         int idx      = feat_idx;
                         auto cache_x = ggml_ext_slice(ctx->ggml_ctx, x, 2, -CACHE_T, x->ne[2]);
@@ -513,7 +624,13 @@ namespace WAN {
                         feat_idx += 1;
                     }
                 } else if (i == 1 || i == 4) {
-                    x = ggml_silu(ctx->ggml_ctx, x);
+                    // SiLU absorbs the RMS permute-back: read the [C,W,H,T] channels-first result as
+                    // a zero-copy [W,H,T,C] view, write it CONTIGUOUS. Plain elementwise otherwise.
+                    if (x_is_cf) {
+                        x       = RMS_norm::channels_first_to_whtc_view(ctx, x);  // strided [W,H,T,C] view
+                        x_is_cf = false;
+                    }
+                    x = ggml_silu(ctx->ggml_ctx, x);  // strided-in -> contiguous-out (ggml-cuda unary)
                 } else {  // i == 5
                     // nn.Dropout(), ignore
                 }
@@ -1037,8 +1154,22 @@ namespace WAN {
             }
 
             // head
-            x = head_0->forward(ctx, x);
-            x = ggml_silu(ctx->ggml_ctx, x);
+            // WAN_VAE_RMS_CF: same channels-first RMS->SiLU->conv fusion as ResidualBlock — head.0
+            // stays channels-first, SiLU reads the zero-copy [W,H,T,C] view and writes it CONTIGUOUS
+            // (absorbing the permute-back), so head.2 gets a contiguous tensor. Value-identical.
+            const bool rms_kernel = wan_vae_rms_kernel_enabled() && !g_ext_vae_phase_encode;
+            const bool rms_cf     = !rms_kernel && wan_vae_rms_cf_enabled() && !g_ext_vae_phase_encode;
+            if (rms_kernel) {
+                x = head_0->forward_channels_kernel(ctx, x);  // [W,H,T,C] contiguous, single op
+                x = ggml_silu(ctx->ggml_ctx, x);
+            } else if (rms_cf) {
+                x = head_0->forward_channels_first(ctx, x);         // [C,W,H,T] contiguous
+                x = RMS_norm::channels_first_to_whtc_view(ctx, x);  // zero-copy [W,H,T,C] view
+                x = ggml_silu(ctx->ggml_ctx, x);                    // strided-in -> contiguous-out
+            } else {
+                x = head_0->forward(ctx, x);
+                x = ggml_silu(ctx->ggml_ctx, x);
+            }
             if (feat_cache.size() > 0) {
                 int idx      = feat_idx;
                 auto cache_x = ggml_ext_slice(ctx->ggml_ctx, x, 2, -CACHE_T, x->ne[2]);
@@ -1232,7 +1363,7 @@ namespace WAN {
             ggml_tensor* out = nullptr;
             for (int i = 0; i < iter_; i++) {
                 _conv_idx = 0;
-                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1);  // [b*c, 1, h, w]
+                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1, /*cont=*/!wan_vae_slice_nocopy_enabled());  // [b*c, 1, h, w]
                 auto out_ = decoder->forward(ctx, in, b, _feat_map, _conv_idx, i);
                 // WAN_VAE_F16 (wan2.1 only): head.2 is force_f32, so each decoded frame comes
                 // back F32; the accumulator therefore grows as a large F32 buffer (all decoded
@@ -1270,7 +1401,7 @@ namespace WAN {
 
             auto x = conv2->forward(ctx, z);
             // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.decode_partial.prelude", "x");
-            auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1);  // [b*c, 1, h, w]
+            auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1, /*cont=*/!wan_vae_slice_nocopy_enabled());  // [b*c, 1, h, w]
             _conv_idx = 0;
             auto out  = decoder->forward(ctx, in, b, _feat_map, _conv_idx, i);
             if (wan2_2) {
@@ -1316,7 +1447,7 @@ namespace WAN {
             ggml_tensor* out = nullptr;
             for (int64_t k = 0; k < n_chunk; k++) {
                 _conv_idx = 0;
-                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, k, k + 1);  // [b*c, 1, h, w]
+                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, k, k + 1, /*cont=*/!wan_vae_slice_nocopy_enabled());  // [b*c, 1, h, w]
                 int gi    = frame_base + static_cast<int>(k);
                 auto out_ = decoder->forward(ctx, in, b, _feat_map, _conv_idx, gi);
                 out       = (out == nullptr) ? out_ : ggml_concat(ctx->ggml_ctx, out, out_, 2);
