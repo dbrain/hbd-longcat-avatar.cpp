@@ -10,14 +10,22 @@ actionable sequence; the other docs are the detail (see **Pointers** at the bott
   - `models/ltx2/nvfp4-CLEAN-dev065.gguf`  = dev + distill@0.65 (matches workflow v1 base stage)
   - Caveat: the fold de-distills the 1344 nvfp4 Linears; 316 bf16 modulation/adaln/audio tensors are
     left at full-distill (copied verbatim). Likely minor; eye-test gates. Can extend the fold to bf16 later.
-- **C++ implemented but UNBUILT** (8 files, +404/−41 — `git diff`): `--hires-lora`, NAG, and the flags below.
-  Untested — expect compile fixups from the checklist in `CPP-CHANGES.md`.
+- **C++ BUILT ✅** (8 files, +404/−41): `--hires-lora`, NAG, base `--sigmas`. **Compiled clean** (no source
+  fixups) into `build-cudnn/bin/sd-cli` (arch 120/Blackwell, cuDNN+FA+NCCL, Release). All new CLI flags
+  verified present in the binary: `--nag-scale/-alpha/-tau/-until-sigma`, `--hires-lora`, `--sigmas`.
+  NOTE: binary is root-owned (built in the `longcat-avatar-dev:builder-cudnn` container) — run it via that
+  container (mount worktree at `/src`, `/src/build-cudnn/bin/sd-cli`), same as `iter_seg2.sh`.
 
-## STEP 1 — BUILD (compile the C++ change; no GPU needed for the compile itself)
-Build the way prod does — docker container, source mounted at `/src`, into `build-cudnn`
-(CUDA arch **120**/Blackwell, `GGML_CUDNN=ON`, `GGML_CUDA_FA=ON`, `GGML_CUDA_NCCL=ON`, Release).
-Point the build at THIS worktree's source. Then work the **BUILD-VERIFICATION CHECKLIST** in
-`CPP-CHANGES.md` — the top 3 risks to expect:
+## STEP 1 — BUILD ✅ DONE (compiled clean; the compile needed no GPU)
+Rebuild command (worktree source, ccache-backed, incremental) if you touch the C++ again:
+```
+docker run --rm -v /home/dbrain/dev/longcat-avatar-ltxdenoise:/src \
+  -v longcat-avatar-iter-ccache:/root/.ccache -w /src longcat-avatar-dev:builder-cudnn \
+  bash -lc "cmake --build /src/build-cudnn -j\$(nproc) --target sd-cli"
+```
+(Worktree submodules were initialized — `git submodule update --init --recursive` — required once.)
+The runtime **BUILD-VERIFICATION CHECKLIST** in `CPP-CHANGES.md` still applies at EVAL time (these are
+semantic, not compile, risks — they surface as wrong output, not build errors):
 1. **NAG scale convention**: agent used `scale` as the extrapolation coeff; ComfyUI likely uses `scale−1`
    ⇒ workflow "14" ≈ our **`--nag-scale 13`**. Confirm at eval.
 2. **pos/neg context length must match** (neg reuses the positive connector RoPE pe sizing).
