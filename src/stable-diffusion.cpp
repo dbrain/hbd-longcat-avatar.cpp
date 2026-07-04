@@ -9696,14 +9696,16 @@ static sd_image_t wan_copy_frame(const sd_image_t& s) {
 
 // Per-window VACE env (A2-safe: always setenv/unsetenv so a warm resident worker can never
 // inherit a prior render's ramp). VACE_SKIP_BLOCKS=0 is correct on EVERY window (the Kijai
-// block-0 flash/grid fix). The strength ramp (VACE_STRENGTH_TAIL + ANCHOR_FRAMES) is only
-// correct on continuation windows — on the pure base window it would wrongly attenuate a
-// t2v tail (wan.hpp gates the ramp on a live control residual, but a base window carrying an
-// i2v ref would still be affected), so it is UNSET there. Defaults (0.2 / 2) are the owner's
-// production pick; WAN_VACE_STRENGTH_TAIL / WAN_VACE_STRENGTH_ANCHOR_FRAMES override for tuning.
-static void apply_wan_vace_env(bool is_cont_window) {
+// block-0 flash/grid fix). The strength ramp (VACE_STRENGTH_TAIL + ANCHOR_FRAMES) is correct
+// whenever there is a live control residual to attenuate toward the tail — i.e. a continuation
+// window (overlap-frame anchor) OR an i2v render (init-image ref anchor). Without the ramp, an
+// i2v ref over-constrains every frame uniformly → vertical striping on the moving parts (hands).
+// Only a PURE base t2v (no control at all) must skip it (VACE_STRENGTH=0 there anyway). Defaults
+// (0.2 / 2) are the owner's production pick; WAN_VACE_STRENGTH_TAIL / WAN_VACE_STRENGTH_ANCHOR_FRAMES
+// override for tuning.
+static void apply_wan_vace_env(bool has_control_residual) {
     setenv("VACE_SKIP_BLOCKS", "0", 1);
-    if (is_cont_window) {
+    if (has_control_residual) {
         const char* tail   = getenv("WAN_VACE_STRENGTH_TAIL");
         const char* anchor = getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES");
         setenv("VACE_STRENGTH_TAIL", (tail != nullptr && tail[0] != '\0') ? tail : "0.2", 1);
@@ -9881,8 +9883,10 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             vp.prompt = chain_params->segment_prompts[seg];
         }
 
-        // Per-window VACE env + prior-window in-memory hand-off.
-        apply_wan_vace_env(is_cont);
+        // Per-window VACE env + prior-window in-memory hand-off. The tail ramp applies wherever
+        // there's a control residual: a continuation window (is_cont) OR an i2v render (!is_t2v,
+        // init-image ref). Only a pure base t2v window skips it. Fixes i2v hand-striping.
+        apply_wan_vace_env(is_cont || !is_t2v);
         unsetenv("VACE_CONT_LATENT");  // never let a stale disk path shadow the in-memory tail
         if (!is_cont) {
             vp.control_frames      = nullptr;
