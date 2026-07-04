@@ -759,13 +759,15 @@ namespace LTXV {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
-                             ggml_tensor* context = nullptr,
-                             ggml_tensor* mask    = nullptr,
-                             ggml_tensor* pe      = nullptr,
-                             ggml_tensor* k_pe    = nullptr) {
+                             ggml_tensor* context     = nullptr,
+                             ggml_tensor* mask        = nullptr,
+                             ggml_tensor* pe          = nullptr,
+                             ggml_tensor* k_pe        = nullptr,
+                             ggml_tensor* nag_context = nullptr) {
             if (context == nullptr) {
                 context = x;
             }
+            auto gc = ctx->ggml_ctx;
 
             auto to_q     = std::dynamic_pointer_cast<Linear>(blocks["to_q"]);
             auto to_k     = std::dynamic_pointer_cast<Linear>(blocks["to_k"]);
@@ -775,18 +777,9 @@ namespace LTXV {
             auto to_out_0 = std::dynamic_pointer_cast<Linear>(blocks["to_out.0"]);
 
             auto q = to_q->forward(ctx, x);
-            auto k = to_k->forward(ctx, context);
-            auto v = to_v->forward(ctx, context);
-
-            q = q_norm->forward(ctx, q);
-            k = k_norm->forward(ctx, k);
-
+            q      = q_norm->forward(ctx, q);
             if (pe != nullptr) {
-                if (k_pe == nullptr) {
-                    k_pe = pe;
-                }
-                q = apply_hidden_rope(ctx->ggml_ctx, q, pe, heads, dim_head, rope_interleaved);
-                k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
+                q = apply_hidden_rope(gc, q, pe, heads, dim_head, rope_interleaved);
             }
 
             // Protective kv_scale: with flash-attn, K/V are cast to F16. On deep-chain cont latents
@@ -809,7 +802,22 @@ namespace LTXV {
             // mask is zeros), and it skips building+casting the tensor (faster). A real
             // mask (cross-attn) keeps the legacy path.
             const bool skip_kv_pad = (mask == nullptr);
-            auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
+            if (k_pe == nullptr) {
+                k_pe = pe;
+            }
+
+            // Run one attention with the shared (roped, normed) q against the K/V projected from a
+            // given context. Factored out so NAG can run it twice (positive + negative context)
+            // with the SAME q. When nag_context is null (the default for every caller except the
+            // video text cross-attn on a NAG step) this collapses to exactly the legacy single pass.
+            auto attend = [&](ggml_tensor* kv_context) -> ggml_tensor* {
+                auto k = to_k->forward(ctx, kv_context);
+                auto v = to_v->forward(ctx, kv_context);
+                k      = k_norm->forward(ctx, k);
+                if (pe != nullptr) {
+                    k = apply_hidden_rope(gc, k, k_pe, heads, dim_head, rope_interleaved);
+                }
+                return ggml_ext_attention_ext(gc,
                                               ctx->backend,
                                               q,
                                               k,
@@ -820,18 +828,60 @@ namespace LTXV {
                                               ctx->flash_attn_enabled,
                                               kv_scale,
                                               skip_kv_pad);
+            };
 
-            if (blocks.count("to_gate_logits") > 0) {
+            // Apply the optional gated-attention gate (LTX cross_attention_gated / self_attention
+            // _gated). The gate is a function of x (the query hidden) only, so it is IDENTICAL for
+            // the positive and negative attention outputs and is applied to each.
+            auto apply_gate_if_any = [&](ggml_tensor* out) -> ggml_tensor* {
+                if (blocks.count("to_gate_logits") == 0) {
+                    return out;
+                }
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
                 auto gate_logits    = to_gate_logits->forward(ctx, x);
-                auto gates          = ggml_sigmoid(ctx->ggml_ctx, gate_logits);
-                gates               = ggml_ext_scale(ctx->ggml_ctx, gates, 2.0f, true);
-                gates               = ggml_reshape_4d(ctx->ggml_ctx, gates, 1, heads, gate_logits->ne[1], gate_logits->ne[2]);
+                auto gates          = ggml_sigmoid(gc, gate_logits);
+                gates               = ggml_ext_scale(gc, gates, 2.0f, true);
+                gates               = ggml_reshape_4d(gc, gates, 1, heads, gate_logits->ne[1], gate_logits->ne[2]);
+                auto out4           = ggml_reshape_4d(gc, out, dim_head, heads, out->ne[1], out->ne[2]);
+                gates               = ggml_repeat(gc, gates, out4);
+                out4                = ggml_mul(gc, out4, gates);
+                return ggml_reshape_3d(gc, out4, heads * dim_head, out4->ne[2], out4->ne[3]);
+            };
 
-                auto out4 = ggml_reshape_4d(ctx->ggml_ctx, out, dim_head, heads, out->ne[1], out->ne[2]);
-                gates     = ggml_repeat(ctx->ggml_ctx, gates, out4);
-                out4      = ggml_mul(ctx->ggml_ctx, out4, gates);
-                out       = ggml_reshape_3d(ctx->ggml_ctx, out4, heads * dim_head, out4->ne[2], out4->ne[3]);
+            auto out = apply_gate_if_any(attend(context));
+
+            // ── NAG (Normalized Attention Guidance) ────────────────────────────────────────────
+            // Only fires when a negative context is supplied AND NAG is enabled on the runner ctx
+            // (ltx_nag_scale != 0). Attention-space negative guidance: extrapolate the positive
+            // attention output away from the negative one, clamp the per-token L2-norm growth to
+            // tau*||z_pos||, then mix by alpha. Everything is post-`to_out.0` (final hidden space),
+            // matching the NAG reference processor (to_out is linear; the norm-clamp is not, so the
+            // space it is computed in matters — we use the projected space).
+            if (nag_context != nullptr && ctx->ltx_nag_scale != 0.0f) {
+                float nag_scale = ctx->ltx_nag_scale;
+                float nag_alpha = ctx->ltx_nag_alpha;
+                float nag_tau   = ctx->ltx_nag_tau;
+
+                auto out_neg = apply_gate_if_any(attend(nag_context));
+                auto z_pos   = to_out_0->forward(ctx, out);      // [query_dim, tokens, batch]
+                auto z_neg   = to_out_0->forward(ctx, out_neg);
+
+                // z_ext = z_pos + scale * (z_pos - z_neg)   (extrapolate in feature space)
+                auto z_ext = ggml_add(gc, z_pos, ggml_scale(gc, ggml_sub(gc, z_pos, z_neg), nag_scale));
+
+                // per-token (per-row over the feature dim ne[0]) L2 norms -> [1, tokens, batch]
+                auto l2norm_rows = [&](ggml_tensor* z) -> ggml_tensor* {
+                    return ggml_sqrt(gc, ggml_sum_rows(gc, ggml_sqr(gc, z)));
+                };
+                auto n_pos = l2norm_rows(z_pos);
+                auto n_ext = l2norm_rows(z_ext);
+                // eps-guard the denominator so an all-zero z_ext token can't NaN the ratio.
+                n_ext      = ggml_clamp(gc, n_ext, 1e-6f, 3.0e38f);
+                // factor = min(1, tau * ||z_pos|| / ||z_ext||)   (clamp the extrapolated norm to <= tau*||z_pos||)
+                auto factor = ggml_clamp(gc, ggml_div(gc, ggml_scale(gc, n_pos, nag_tau), n_ext), 0.0f, 1.0f);
+                auto z_nag  = ggml_mul(gc, z_ext, factor);  // factor [1,tok,b] broadcasts over feature dim
+                // z_out = alpha * z_nag + (1 - alpha) * z_pos
+                return ggml_add(gc, ggml_scale(gc, z_nag, nag_alpha), ggml_scale(gc, z_pos, 1.0f - nag_alpha));
             }
 
             return to_out_0->forward(ctx, out);
@@ -1329,7 +1379,12 @@ namespace LTXV {
                                                 ggml_tensor* prompt_timestep,
                                                 int64_t dim,
                                                 ggml_tensor* attention_mask,
-                                                ggml_tensor* expand_sel = nullptr) {
+                                                ggml_tensor* expand_sel   = nullptr,
+                                                ggml_tensor* context_neg   = nullptr) {
+            // NAG: when context_neg is supplied it is the NEGATIVE text context. It must receive the
+            // SAME prompt-token modulation (prompt_scale_shift) as the positive context before being
+            // handed to CrossAttention as the nag_context (which projects its own K/V from it and
+            // NAG-blends against the positive attention output). nullptr = no NAG (legacy).
             if (cross_attention_adaln) {
                 auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, expand_sel);
                 ggml_tensor* q   = nullptr;
@@ -1339,17 +1394,21 @@ namespace LTXV {
                     q = rms_norm(ctx->ggml_ctx, x);
                     q = modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
                 }
-                auto context_mod = context;
+                auto context_mod     = context;
+                auto context_neg_mod = context_neg;
                 if (prompt_timestep != nullptr && prompt_table != nullptr) {
                     auto p_mods = get_ada_values(ctx, prompt_table, prompt_timestep, dim, 2);
                     context_mod = modulate(ctx->ggml_ctx, context_mod, p_mods[0], p_mods[1]);
+                    if (context_neg_mod != nullptr) {
+                        context_neg_mod = modulate(ctx->ggml_ctx, context_neg_mod, p_mods[0], p_mods[1]);
+                    }
                 }
-                auto out = attn->forward(ctx, q, context_mod, attention_mask, nullptr, nullptr);
+                auto out = attn->forward(ctx, q, context_mod, attention_mask, nullptr, nullptr, context_neg_mod);
                 return apply_gate(ctx->ggml_ctx, out, q_mods[2]);
             }
 
             auto q = rms_norm(ctx->ggml_ctx, x);
-            return attn->forward(ctx, q, context, attention_mask, nullptr, nullptr);
+            return attn->forward(ctx, q, context, attention_mask, nullptr, nullptr, context_neg);
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
@@ -1370,7 +1429,8 @@ namespace LTXV {
                                                       ggml_tensor* a_cross_gate_timestep,
                                                       ggml_tensor* v_prompt_timestep,
                                                       ggml_tensor* a_prompt_timestep,
-                                                      ggml_tensor* self_attention_mask = nullptr) {
+                                                      ggml_tensor* self_attention_mask = nullptr,
+                                                      ggml_tensor* v_context_neg       = nullptr) {
             auto attn1               = std::dynamic_pointer_cast<CrossAttention>(blocks["attn1"]);
             auto audio_attn1         = std::dynamic_pointer_cast<CrossAttention>(blocks["audio_attn1"]);
             auto attn2               = std::dynamic_pointer_cast<CrossAttention>(blocks["attn2"]);
@@ -1414,7 +1474,8 @@ namespace LTXV {
                                                      v_prompt_timestep,
                                                      v_dim,
                                                      attention_mask,
-                                                     ctx->ltx_video_token_sel);
+                                                     ctx->ltx_video_token_sel,
+                                                     v_context_neg);  // NAG negative video text context (null unless a NAG step)
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
             if (stop_at_subop == 1) {
                 return {vx, ax};  // truncate after video text cross-attn (attn2)
@@ -1773,7 +1834,8 @@ namespace LTXV {
                                                       ggml_tensor* a_cross_pe,
                                                       ggml_tensor* video_connector_pe,
                                                       ggml_tensor* audio_connector_pe,
-                                                      ggml_tensor* vx_ref = nullptr) {
+                                                      ggml_tensor* vx_ref      = nullptr,
+                                                      ggml_tensor* nag_context = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1840,6 +1902,18 @@ namespace LTXV {
             auto a_context = contexts.second != nullptr ? contexts.second : contexts.first;
             if (contexts.second != nullptr) {
                 a_context = ggml_cont(ctx->ggml_ctx, a_context);
+            }
+
+            // NAG: preprocess the NEGATIVE text context through the SAME caption_projection +
+            // connector as the positive VIDEO context (video branch only — NAG steers video text
+            // cross-attn). Reuses video_connector_pe, which is sized for the positive context's
+            // sequence length in build_graph — so the negative context MUST be encoded/padded to
+            // that same length (the Gemma TE path pads both prompts to a fixed max_len, so this
+            // holds; see CPP-CHANGES.md build-verification checklist). Only runs on NAG steps.
+            ggml_tensor* v_context_neg = nullptr;
+            if (nag_context != nullptr && ctx->ltx_nag_scale != 0.0f) {
+                auto neg_contexts = preprocess_contexts(ctx, nag_context, video_connector_pe, audio_connector_pe, false);
+                v_context_neg     = neg_contexts.first;
             }
 
             auto v_timestep_scaled = ggml_ext_scale(ctx->ggml_ctx, timestep, config.timestep_scale_multiplier);
@@ -1957,7 +2031,9 @@ namespace LTXV {
                                             av_ca_a2v_gate_noise_timestep,
                                             av_ca_v2a_gate_noise_timestep,
                                             v_prompt_timestep_mod,
-                                            a_prompt_timestep_mod);
+                                            a_prompt_timestep_mod,
+                                            nullptr,          // self_attention_mask (unused on AV path)
+                                            v_context_neg);   // NAG negative video text context (null unless a NAG step)
                 vx         = out.first;
                 ax         = out.second;
                 // LTX_BLOCK_NAN: capture a small slice of each block's vx/ax for the post-compute
@@ -2037,6 +2113,11 @@ namespace LTXV {
         sd::Tensor<float> v_timestep_compact_cache;  // [U] unique video timesteps
         std::vector<int32_t> v_token_sel_vec;        // [L_video] token -> unique-column index
         bool skip_a2v_cross_attn_ = false;           // A2V modality-guidance "mod" pass (set per compute)
+        // NAG (Normalized Attention Guidance) params, set per-compute from LTXAVDiffusionExtra and
+        // forwarded to the runner ctx in build_graph. nag_scale_ == 0 => NAG off (default).
+        float nag_scale_ = 0.0f;
+        float nag_alpha_ = 0.35f;
+        float nag_tau_   = 2.5f;
 
         LTXAVRunner(ggml_backend_t backend,
                     ggml_backend_t params_backend,
@@ -2129,7 +2210,8 @@ namespace LTXV {
                                  int audio_length                                = 0,
                                  float frame_rate                                = 24.f,
                                  const sd::Tensor<float>& video_positions_tensor = {},
-                                 const sd::Tensor<float>& video_reference_tensor = {}) {
+                                 const sd::Tensor<float>& video_reference_tensor = {},
+                                 const sd::Tensor<float>& nag_context_tensor     = {}) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -2218,6 +2300,9 @@ namespace LTXV {
             }
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
             ggml_tensor* context    = make_optional_input(context_tensor);
+            // NAG negative text context (null unless a NAG step). Same lifetime contract as
+            // `context` (its data lives on the DiffusionParams/extra across the compute call).
+            ggml_tensor* nag_context = make_optional_input(nag_context_tensor);
 
             ggml_cgraph* gf = new_graph_custom(LTXAV_GRAPH_SIZE);
 
@@ -2349,6 +2434,12 @@ namespace LTXV {
             auto runner_ctx                 = get_context();
             runner_ctx.ltx_video_token_sel  = v_token_sel_input;  // null unless modulation collapse active
             runner_ctx.ltx_skip_a2v         = skip_a2v_cross_attn_;  // A2V modality-guidance "mod" pass
+            // NAG (Normalized Attention Guidance): carry the scale/alpha/tau to the cross-attn.
+            // nag_context is null (and these unused) on every non-NAG forward, so the block-level
+            // gate `nag_context != nullptr && ctx->ltx_nag_scale != 0` keeps legacy byte-identical.
+            runner_ctx.ltx_nag_scale        = nag_scale_;
+            runner_ctx.ltx_nag_alpha        = nag_alpha_;
+            runner_ctx.ltx_nag_tau          = nag_tau_;
             auto out_pair                   = model.forward(&runner_ctx,
                                             vx,
                                             ax,
@@ -2361,7 +2452,8 @@ namespace LTXV {
                                             audio_cross_pe,
                                             video_connector_pe,
                                             audio_connector_pe,
-                                            vx_ref);
+                                            vx_ref,
+                                            nag_context);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
@@ -2376,9 +2468,10 @@ namespace LTXV {
                                   int audio_length                         = 0,
                                   float frame_rate                         = 24.f,
                                   const sd::Tensor<float>& video_positions = {},
-                                  const sd::Tensor<float>& video_reference = {}) {
+                                  const sd::Tensor<float>& video_reference = {},
+                                  const sd::Tensor<float>& nag_context     = {}) {
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions, video_reference);
+                return build_graph(x, timesteps, context, audio_x, audio_timesteps, audio_length, frame_rate, video_positions, video_reference, nag_context);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
             return out;
@@ -2390,6 +2483,11 @@ namespace LTXV {
             GGML_ASSERT(diffusion_params.timesteps != nullptr);
             const auto* extra   = diffusion_extra_as<LTXAVDiffusionExtra>(diffusion_params);
             skip_a2v_cross_attn_ = extra->skip_a2v;  // consumed by build_graph -> runner_ctx.ltx_skip_a2v
+            // NAG: pull the per-step scale/alpha/tau + negative context off the extra. nag_context
+            // is null (nag_scale 0) on every non-NAG step, so this is a no-op then.
+            nag_scale_ = extra->nag_scale;
+            nag_alpha_ = extra->nag_alpha;
+            nag_tau_   = extra->nag_tau;
             return compute(n_threads,
                            *diffusion_params.x,
                            *diffusion_params.timesteps,
@@ -2399,7 +2497,8 @@ namespace LTXV {
                            extra->audio_length,
                            extra->frame_rate,
                            tensor_or_empty(extra->video_positions),
-                           tensor_or_empty(extra->video_reference));
+                           tensor_or_empty(extra->video_reference),
+                           tensor_or_empty(extra->nag_context));
         }
 
         void test(const std::string& x_path,

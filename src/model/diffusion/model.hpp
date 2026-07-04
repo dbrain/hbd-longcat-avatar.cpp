@@ -55,6 +55,16 @@ struct LTXAVDiffusionExtra {
     // timesteps are appended as frozen t=0 inside build_graph), then slices them off before
     // unpatchify. nullptr / empty = legacy full-res concat path (N==1, byte-identical).
     const sd::Tensor<float>* video_reference = nullptr;
+    // NAG (Normalized Attention Guidance) — attention-space negative guidance on the VIDEO text
+    // cross-attn. nag_context is the encoded NEGATIVE text context (same layout/length as the
+    // positive `context`); it is projected to its own K/V inside CrossAttention and blended against
+    // the positive attention output. nag_scale == 0 (default) OR nag_context == nullptr => NAG OFF
+    // (byte-identical to legacy). The sampler sets these only on the primary cond forward and only
+    // while sigma >= nag_until_sigma (see the denoise lambda in stable-diffusion.cpp).
+    const sd::Tensor<float>* nag_context = nullptr;
+    float nag_scale                      = 0.0f;
+    float nag_alpha                      = 0.35f;
+    float nag_tau                        = 2.5f;
 };
 
 struct LongCatAvatarDiffusionExtra {

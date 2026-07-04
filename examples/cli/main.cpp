@@ -915,6 +915,15 @@ int main(int argc, const char* argv[]) {
             if (gen_params.relip_ref_tstride != 1) {
                 setenv("LTXAV_RELIP_REF_TSTRIDE", std::to_string(gen_params.relip_ref_tstride).c_str(), 1);
             }
+            // FEATURE 2 (NAG) -> runtime env. Bridge only when NAG is actually enabled (--nag-scale
+            // != 0) so a harness that sets LTXAV_NAG_* directly still wins on default runs. When on,
+            // bridge all four so the engine (sample() + resolve use_uncond force) sees a coherent set.
+            if (gen_params.nag_scale != 0.0f) {
+                setenv("LTXAV_NAG_SCALE", std::to_string(gen_params.nag_scale).c_str(), 1);
+                setenv("LTXAV_NAG_ALPHA", std::to_string(gen_params.nag_alpha).c_str(), 1);
+                setenv("LTXAV_NAG_TAU", std::to_string(gen_params.nag_tau).c_str(), 1);
+                setenv("LTXAV_NAG_UNTIL_SIGMA", std::to_string(gen_params.nag_until_sigma).c_str(), 1);
+            }
 
             int n_segments = std::max(1, gen_params.segments);
             if (gen_params.ltx_chain_segments > 0) {
