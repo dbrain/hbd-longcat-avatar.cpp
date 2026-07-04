@@ -9,12 +9,12 @@ BUILDER="${BUILDER:-longcat-avatar-dev:builder-cudnn-ff}"
 SRC=/home/dbrain/dev/longcat-avatar-shotstream
 MODELS=/home/dbrain/dev/longcat-avatar.cpp/models
 TAG="${TAG:-chain_timed}"; OUT="shotstream_out/$TAG"; mkdir -p "$SRC/$OUT"
-DIT=/models/shotstream-1.3b-dit-f16.gguf
+DIT=${DIT:-/models/shotstream-1.3b-dit-nvfp4.gguf}
 VAE=/models/longcat-wan-vae-f16.gguf
 UMT5=/models/longcat-umt5-xxl-q8_0.gguf
 W=832; H=480; FPS=16; SEED=${SEED:-42}; SHOTS=${SHOTS:-3}; CHUNKS="${CHUNKS:-0}"
 CHUNK_FLAG=(); [ "$CHUNKS" != "0" ] && CHUNK_FLAG=(--chunks "$CHUNKS")
-PROMPT="a red fox trotting through a snowy pine forest at dawn, volumetric morning light, cinematic, photorealistic"
+PROMPT="${PROMPT:-a red fox trotting through a snowy pine forest at dawn, volumetric morning light, cinematic, photorealistic}"
 
 # Fast recipe: base fusion + cuDNN attn/conv3d + FFN tile + resident DiT + K/V-skip,
 # + FAST VAE tiling (0.57x0.57 / overlap 0.15 = 4 tiles, seam-safe, ~39s vs 67s).

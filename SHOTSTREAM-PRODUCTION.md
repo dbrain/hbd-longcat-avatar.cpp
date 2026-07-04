@@ -1,7 +1,18 @@
-# ShotStream — Production Recipe (RTX 3060, 12 GB)
+# ShotStream — Production Recipe (RTX 3060 12 GB / RTX 5060 Ti 16 GB)
 
 **The go-to reference so we stop losing this.** Streaming multi-shot text→video,
-Wan2.1-T2V-1.3B causal-distilled fork, C++/ggml port. Last verified 2026-07-04.
+Wan2.1-T2V-1.3B causal-distilled fork, C++/ggml port. Last verified 2026-07-05.
+
+> **STATUS: BANKED, NOT PRODUCTIONISED (2026-07-05).** The pipeline is fast (see perf below) but the
+> 4-step distilled model is **inherently low/bad-motion** — subjects barely move, and when they do it's
+> distorted. It's a tech win (nvfp4 + cuDNN attn + custom kernels, all reusable on a better model), not a
+> shippable toy. The **nvfp4 DiT is the live model** (f16 deleted). All perf learnings recorded below.
+>
+> **5060 Ti (nvfp4) = ~49 s/shot** (DiT 35 s + decode 14 s), DiT 827 MB, peak 9.7 GB — 1.9× the 3060.
+> Levers: cuDNN SDPA attention (optimal, −26% DiT), nvfp4 FP4/FP8 GEMM (−1.8 GB, ~8%), `WAN_DIT_F16`
+> (~6% conversion churn). Dead ends: FP8 flash attention (cuDNN F16 already faster), FP4 *activation*
+> (the "worm/blob"). Add to the recipe for the 5060: `GGML_NVFP4_CUBLASLT=1 GGML_NVFP4_QUANT_TWOLEVEL=1
+> GGML_FP8_FFN=1 GGML_FP8_LAYERS=blocks. WAN_DIT_F16=1`.
 
 ## Git provenance (both on master)
 - **shotstream** (`dbrain/hbd-longcat-avatar.cpp`): `14c855b`
@@ -11,9 +22,11 @@ Wan2.1-T2V-1.3B causal-distilled fork, C++/ggml port. Last verified 2026-07-04.
 ## Models (`/models/`)
 | role | file |
 |---|---|
-| DiT | `shotstream-1.3b-dit-f16.gguf` |
+| DiT | `shotstream-1.3b-dit-nvfp4.gguf` (866 MB — **the live model**; f16 deleted) |
 | text encoder | `longcat-umt5-xxl-q8_0.gguf` (runs on CPU / host RAM) |
 | VAE | `longcat-wan-vae-f16.gguf` |
+
+To re-make the nvfp4 gguf from an f16 source (if ever needed): `sd-cli -M convert -m <f16>.gguf --type nvfp4 --tensor-type-rules 'modulation=f32,time_projection=f32,head\.=f32' -o <out>.gguf`.
 
 ## Output config
 832×480, 16 fps, **7 chunks/shot** = 21 latent frames = **81 pixel frames/shot**.

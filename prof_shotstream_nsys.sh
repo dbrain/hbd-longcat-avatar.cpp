@@ -31,7 +31,7 @@ ENV_FLAGS=(); for e in "${ENVV[@]}"; do ENV_FLAGS+=(-e "$e"); done
 rm -f "$SRC/$OUT/${TAG}.nsys-rep" "$SRC/$OUT/${TAG}.qdstrm"
 
 echo ">> nsys profile: shots=$SHOTS chunks=$CHUNKS KV_HOST=${SHOTSTREAM_KV_HOST:-1} $(date +%T)"
-docker run --rm --gpus '"device=0"' --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
+docker run --rm --gpus "\"device=${DEVICE:-0}\"" --cap-add SYS_ADMIN --security-opt seccomp=unconfined \
   "${ENV_FLAGS[@]}" -v "$SRC:/src" -v "$MODELS:/models" -w /src "$BUILDER" bash -lc '
     # standalone Nsight Systems (its nsys writes a readable .nsys-rep; install if not baked in)
     NSYS=$(ls /opt/nvidia/nsight-systems/*/target-linux-x64/nsys 2>/dev/null | head -1)
@@ -46,7 +46,7 @@ docker run --rm --gpus '"device=0"' --cap-add SYS_ADMIN --security-opt seccomp=u
     "$NSYS" profile --trace=cuda,cudnn,cublas --sample=none --cpuctxsw=none --force-overwrite true \
       -o /src/'"$OUT"'/'"$TAG"' \
       /src/build/bin/sd-shotstream \
-        --dit /models/shotstream-1.3b-dit-f16.gguf --t5xxl /models/longcat-umt5-xxl-q8_0.gguf \
+        --dit ${DIT:-/models/shotstream-1.3b-dit-f16.gguf} --t5xxl /models/longcat-umt5-xxl-q8_0.gguf \
         --vae /models/longcat-wan-vae-f16.gguf \
         --shots '"$SHOTS"' --chunks '"$CHUNKS"' --W 832 --H 480 --fps 16 --seed 42 \
         -p "'"$PROMPT"'" '"$TILEFLAG"' '"$VAEFLAG"' \
