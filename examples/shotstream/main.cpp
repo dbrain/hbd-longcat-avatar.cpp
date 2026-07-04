@@ -516,6 +516,20 @@ int main(int argc, char** argv) {
         printf("[perf] chunks capped to %d (frames_per_shot=%d)\n", chunks_override, dit->ss.frames_per_shot);
     }
 
+    // perf-ideas #8 (QUALITY-RISK): cap the LOCAL attention cache to a sliding window of
+    // SHOTSTREAM_LOCAL_WINDOW chunks (default 7 = the shipped no-eviction config = full 21
+    // latent frames). Smaller windows shrink L_k for the deep chunks (cuts the 37% attention)
+    // but the model then forgets the earliest frames within a shot — motion-eye-test required.
+    // The eviction machinery already exists (forward_block window clamp); this just un-pins it.
+    if (const char* w = std::getenv("SHOTSTREAM_LOCAL_WINDOW")) {
+        int wc = atoi(w);
+        if (wc > 0) {
+            dit->ss.local_attn_size = wc * dit->ss.num_frame_per_block;
+            printf("[perf] LOCAL attention window capped to %d chunks (%d latent frames) — QUALITY-RISK, eye-test\n",
+                   wc, dit->ss.local_attn_size);
+        }
+    }
+
     // The DiT is a LATENT-space model: --W/--H are PIXEL resolution; the DiT (+ its
     // causal KV caches / RoPE grid) operate on the Wan2.1 VAE latent (8x spatial, 16ch).
     const int VAE_SPATIAL = 8;
