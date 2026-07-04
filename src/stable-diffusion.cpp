@@ -8568,6 +8568,26 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
+    // LTXAV relip VRAM (pre-sample pool trim, default on): the phases that ran just before
+    // the DiT sample loop — the relip reference VAE encode (a multi-GB tiled encode compute
+    // buffer) and, on the two-stage path, the latent upscaler (~950 MB params + its compute)
+    // — reserve large scratch blocks in the ggml CUDA VMM pool. ggml frees those blocks but
+    // the pool RETAINS them as committed high-water, so they co-reside with the DiT forward's
+    // own resident+partial weights and inflate the sampling-peak driver_used by ~1.7 GB
+    // (two-stage stage-2) to ~4 GB. Return the pool high-water to the OS here, before the
+    // forward reserves its (smaller) compute buffer, so the sampling peak reflects only the
+    // genuine DiT working set. Nothing is in flight at this point (encode/upscale done, no DiT
+    // compute buffer live yet) and the offloaded DiT params live in real backend buffers, not
+    // the pool — so this only drops freed scratch. The pool rebuilds lazily on the next alloc.
+    // All SD modules resolve to the one CUDA device backend, so trimming DIFFUSION trims the
+    // shared device pool (VAE + upscaler included). Opt out with LTXAV_PRE_SAMPLE_POOL_TRIM=0.
+    if (sd_version_is_ltxav(sd_ctx->sd->version)) {
+        const char* e = getenv("LTXAV_PRE_SAMPLE_POOL_TRIM");
+        if (e == nullptr || std::string(e) != "0") {
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+        }
+    }
+
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
     int64_t sampling_start = ggml_time_ms();
     sd::Tensor<float> final_latent;
@@ -8801,6 +8821,18 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                  sampling_methods_str[hires_sample_method],
                  hires_sigma_sched.size(),
                  request.hires.custom_sigmas_count > 0 ? ", custom_sigmas=true" : "");
+
+        // Pre-sample pool trim for the two-stage stage-2 refine (see the same trim before the
+        // stage-1 / single-stage sample above). The latent upscaler (~950 MB offload) and the
+        // full-res stage-2 reference VAE encode both just ran; their freed scratch is still
+        // committed in the CUDA VMM pool and would otherwise inflate this refine's peak. Trim it
+        // back before the refine reserves its compute buffer. Gated by LTXAV_PRE_SAMPLE_POOL_TRIM.
+        if (sd_version_is_ltxav(sd_ctx->sd->version)) {
+            const char* e = getenv("LTXAV_PRE_SAMPLE_POOL_TRIM");
+            if (e == nullptr || std::string(e) != "0") {
+                ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+            }
+        }
 
         sampling_start = ggml_time_ms();
         final_latent   = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
