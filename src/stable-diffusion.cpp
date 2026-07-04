@@ -9732,16 +9732,43 @@ static sd_image_t wan_copy_frame(const sd_image_t& s) {
 // whenever there is a live control residual to attenuate toward the tail — i.e. a continuation
 // window (overlap-frame anchor) OR an i2v render (init-image ref anchor). Without the ramp, an
 // i2v ref over-constrains every frame uniformly → vertical striping on the moving parts (hands).
-// Only a PURE base t2v (no control at all) must skip it (VACE_STRENGTH=0 there anyway). Defaults
-// (0.2 / 2) are the owner's production pick; WAN_VACE_STRENGTH_TAIL / WAN_VACE_STRENGTH_ANCHOR_FRAMES
-// override for tuning.
-static void apply_wan_vace_env(bool has_control_residual) {
+// Only a PURE base t2v (no control at all) must skip it (VACE_STRENGTH=0 there anyway).
+//
+// PER-MODE ramp (fixes the i2v identity loss): continuation and i2v want DIFFERENT curves.
+//  - Continuation: the injected prior-window latent carries identity+motion at full strength on
+//    the anchor frames, so the tail can drop hard (0.2) to loosen the seam. Floor 0.2 / anchor 2
+//    (anchor later re-tracked to klat in the is_cont block).
+//  - i2v base: the ONLY identity anchor is the VACE reference-image slot at latent t=0; its
+//    influence on later frames rides the SAME control residual the ramp attenuates. A hard 0.2
+//    tail therefore starves identity through the second half of the clip (a bearded male init
+//    drifted female / lost the beard). Use a MILDER, higher-floor ramp (0.5) + a longer full-
+//    strength anchor (3 = ref slot + 2 leading frames) so the reference holds across the whole
+//    clip while STILL halving the uniform gray-residual on the moving tail (the hand-striping the
+//    ramp was added to relieve). This is the striping<->identity balance: lower floor = cleaner
+//    hands but weaker identity, higher = stronger identity but more striping; 0.5/3 is the eye-
+//    test midpoint start. WAN_VACE_STRENGTH_TAIL/_ANCHOR_FRAMES override the cont curve;
+//    WAN_VACE_I2V_STRENGTH_TAIL/_ANCHOR_FRAMES override the i2v curve.
+static void apply_wan_vace_env(bool has_control_residual, bool is_cont_window) {
     setenv("VACE_SKIP_BLOCKS", "0", 1);
     if (has_control_residual) {
-        const char* tail   = getenv("WAN_VACE_STRENGTH_TAIL");
-        const char* anchor = getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES");
-        setenv("VACE_STRENGTH_TAIL", (tail != nullptr && tail[0] != '\0') ? tail : "0.2", 1);
-        setenv("VACE_STRENGTH_ANCHOR_FRAMES", (anchor != nullptr && anchor[0] != '\0') ? anchor : "2", 1);
+        const char* tail;
+        const char* anchor;
+        const char* tail_dflt;
+        const char* anchor_dflt;
+        if (is_cont_window) {
+            tail        = getenv("WAN_VACE_STRENGTH_TAIL");
+            anchor      = getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES");
+            tail_dflt   = "0.2";
+            anchor_dflt = "2";
+        } else {
+            // i2v base: milder, higher-floor ramp so the init-image reference holds identity.
+            tail        = getenv("WAN_VACE_I2V_STRENGTH_TAIL");
+            anchor      = getenv("WAN_VACE_I2V_STRENGTH_ANCHOR_FRAMES");
+            tail_dflt   = "0.5";
+            anchor_dflt = "3";
+        }
+        setenv("VACE_STRENGTH_TAIL", (tail != nullptr && tail[0] != '\0') ? tail : tail_dflt, 1);
+        setenv("VACE_STRENGTH_ANCHOR_FRAMES", (anchor != nullptr && anchor[0] != '\0') ? anchor : anchor_dflt, 1);
     } else {
         unsetenv("VACE_STRENGTH_TAIL");
         unsetenv("VACE_STRENGTH_ANCHOR_FRAMES");
@@ -9836,6 +9863,32 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
     std::vector<float>      prior_latent;   // full prior-window diffusion latent (owned)
     int                     pl_w = 0, pl_h = 0, pl_t = 0, pl_c = 0;
 
+    // ── Continuation contrast/std-ratchet corrector (fixes the chain "speeds up" percept) ──
+    // The distilled few-step DiT inflates the output latent's per-channel mean+std a little every
+    // window; contrast-normalised motion is flat across windows but raw brightness/contrast
+    // ratchet MONOTONICALLY (measured brightness 58->61->67, std 45->48 over 3 windows), and the
+    // pixel exposure-match only aligns each seam to the prior (already-drifted) tail so the intra-
+    // window slope COMPOUNDS — the higher contrast makes the same motion "pop" (reads as speed-up)
+    // and amplifies the tail gray-residual striping. WAN_CONT_OUTPUT_AGC anchors each window's
+    // WHOLE output latent to window-0's per-channel mean+std BEFORE decode/bank (stops the ratchet
+    // at source: the regraded latent is also what feeds the next window). It previously read a ref
+    // FILE the warm in-memory chain never wrote, so it was a dead no-op in prod; here we bank
+    // window-0's latent to a one-shot ref file and point the corrector at it. Default ON for a
+    // multi-window chain; WAN_CHAIN_NO_OUTPUT_AGC=1 (or WAN_CONT_OUTPUT_AGC=0) disables.
+    const bool chain_output_agc =
+        n_chain > 1 &&
+        !(getenv("WAN_CHAIN_NO_OUTPUT_AGC") != nullptr && getenv("WAN_CHAIN_NO_OUTPUT_AGC")[0] == '1') &&
+        !(getenv("WAN_CONT_OUTPUT_AGC") != nullptr && getenv("WAN_CONT_OUTPUT_AGC")[0] == '0');
+    std::string agc_ref_path;  // one-shot window-0 latent ref file (removed at chain end)
+    auto cleanup_output_agc = [&]() {
+        unsetenv("WAN_CONT_OUTPUT_AGC");
+        unsetenv("WAN_CONT_AGC_REF");
+        if (!agc_ref_path.empty()) {
+            std::remove(agc_ref_path.c_str());
+            agc_ref_path.clear();
+        }
+    };
+
     auto free_control_tail = [&]() {
         for (auto& f : control_tail) {
             free(f.data);
@@ -9918,7 +9971,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
         // Per-window VACE env + prior-window in-memory hand-off. The tail ramp applies wherever
         // there's a control residual: a continuation window (is_cont) OR an i2v render (!is_t2v,
         // init-image ref). Only a pure base t2v window skips it. Fixes i2v hand-striping.
-        apply_wan_vace_env(is_cont || !is_t2v);
+        apply_wan_vace_env(is_cont || !is_t2v, is_cont);
         unsetenv("VACE_CONT_LATENT");  // never let a stale disk path shadow the in-memory tail
         if (!is_cont) {
             vp.control_frames      = nullptr;
@@ -9997,6 +10050,16 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             }
         }
 
+        // Output-AGC (contrast/std de-ratchet): regrade THIS continuation window's output latent
+        // to window-0's per-channel mean+std before decode/bank. Window 0 establishes the ref and
+        // must NEVER be regraded (it IS the reference). A2-safe: set/unset every window.
+        if (chain_output_agc && is_cont && !agc_ref_path.empty()) {
+            setenv("WAN_CONT_OUTPUT_AGC", "1", 1);
+            setenv("WAN_CONT_AGC_REF", agc_ref_path.c_str(), 1);
+        } else {
+            unsetenv("WAN_CONT_OUTPUT_AGC");
+        }
+
         LOG_INFO("=== generate_wan_vace_chain window %d/%d [%s] ===",
                  seg + 1, n_chain, is_cont ? "vace-cont" : (is_t2v ? "t2v-base" : "i2v-base"));
 
@@ -10016,6 +10079,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             free(seg_video);
             free(lat_out);
             free_control_tail();
+            cleanup_output_agc();
             for (auto& f : stitched) {
                 free(f.data);
             }
@@ -10032,6 +10096,29 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
             pl_c = lc;
         }
         free(lat_out);
+
+        // Bank window-0's pristine output latent ONCE as the output-AGC reference, so every
+        // later window anchors its per-channel mean+std to it and the contrast ratchet stops at
+        // source. Uses save_dir when banking is on, else a temp file (removed at chain end).
+        if (chain_output_agc && seg == 0 && want_latent && !prior_latent.empty()) {
+            const bool have_save_dir =
+                chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0';
+            const char* td   = getenv("TMPDIR");
+            std::string base = have_save_dir
+                                   ? std::string(chain_params->save_dir)
+                                   : std::string(td != nullptr && td[0] != '\0' ? td : "/tmp");
+            agc_ref_path = base + "/wan_agc_ref_seg0_" + std::to_string((long long)ggml_time_ms()) + ".bin";
+            try {
+                sd::Tensor<float> ref_save({pl_w, pl_h, pl_t, pl_c, 1});
+                std::memcpy(ref_save.data(), prior_latent.data(), (size_t)ref_save.numel() * sizeof(float));
+                sd::save_tensor_to_file<float>(agc_ref_path, ref_save, "wan_agc_ref");
+                LOG_INFO("generate_wan_vace_chain: banked window-0 output-AGC ref -> %s", agc_ref_path.c_str());
+            } catch (const std::exception& e) {
+                LOG_WARN("generate_wan_vace_chain: output-AGC ref bank failed: %s (de-ratchet disabled)",
+                         e.what());
+                agc_ref_path.clear();
+            }
+        }
 
         // Bank the full latent so a failed chain can resume from the last completed window.
         if (want_latent && chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0' &&
@@ -10101,6 +10188,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
     unsetenv("VACE_CONT_FRAMES");
     unsetenv("VACE_CONT_LATENT_DROP_TAIL");
     unsetenv("VACE_STRENGTH");
+    cleanup_output_agc();
 
     const int total = (int)stitched.size();
     if (total <= 0) {
