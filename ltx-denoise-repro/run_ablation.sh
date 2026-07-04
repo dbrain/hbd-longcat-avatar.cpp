@@ -94,7 +94,7 @@ render() { # render TAG MODEL WBASE HBASE STEPS SIGMAS "HIRES" "HIRESLORA" "NAG"
     --llm /ltx2/gemma-3-12b-it-UD-Q4_K_XL.gguf \
     --embeddings-connectors /ltx2/text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors \
     --lora-model-dir /ltx2/loras \
-    -p "$PROMPT" $NAG $INIT_ARG $DRIVE_ARG \
+    -p "$PROMPT" $NAG ${NEGP:+-n "$NEGP"} $INIT_ARG $DRIVE_ARG \
     -W "$W" -H "$H" --video-frames "$FR" --fps "$FPSR" \
     --sampling-method euler --steps "$STEPS" --cfg-scale 1.0 --diffusion-fa \
     --vae-tiling --vae-relative-tile-size 1x1 --temporal-tiling --extra-tiling-args temporal_tile_frames=4,temporal_tile_overlap=1 \
@@ -110,16 +110,20 @@ render() { # render TAG MODEL WBASE HBASE STEPS SIGMAS "HIRES" "HIRESLORA" "NAG"
 }
 
 LAD="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-steps 2 --hires-sigmas $HIRES_SIGMAS"
-HLORA3="--hires-lora ltx-2.3-22b-distilled-lora-384-1.1:0.15,ltx-2-19b-ic-lora-detailer:0.8"
-NAG4="--nag-scale 13 --nag-alpha 0.35 --nag-tau 2.5 --nag-until-sigma 0.9 -n \"$NEG_DEFAULT\""
+# detailer-only by default: the rank-384 distill LoRA (7.6 GB) runtime-applied on the hires pass
+# OOMs the 16 GB card (dev065 already bakes 0.65). Override HLORA3 to add it if you fold headroom.
+HLORA3="${HLORA3:---hires-lora ltx-2-19b-ic-lora-detailer:0.8}"
+NAG4="--nag-scale 13 --nag-alpha 0.35 --nag-tau 2.5 --nag-until-sigma 0.9"   # neg prompt passed via NEGP (proper quoting)
 
-echo "scenario,mode=$SCN,$MODE seed=$SEED" ; : > "$EYE/results.csv"
+echo "scenario,mode=$SCN,$MODE seed=$SEED"
+# only reset the results table on a fresh batch (row 0 present); otherwise append/refresh
+case " $ROWS " in *" 0 "*) : > "$EYE/results.csv" ;; esac
 for R in $ROWS; do case "$R" in
   0) render "s${SCN}_${MODE}_r0_baseline"  nvfp4-CLEAN.gguf         1280 704 8 "$FULL_SIGMAS"   ""     ""        "" ;;
   1) render "s${SCN}_${MODE}_r1_fold050"   nvfp4-CLEAN-dev050.gguf  1280 704 8 "$FULL_SIGMAS"   ""     ""        "" ;;
   2) render "s${SCN}_${MODE}_r2_ladder"    nvfp4-CLEAN-dev050.gguf   640 352 8 "$LADDER_SIGMAS" "$LAD" ""        "" ;;
   3) render "s${SCN}_${MODE}_r3_hireslora" nvfp4-CLEAN-dev065.gguf   640 352 8 "$LADDER_SIGMAS" "$LAD" "$HLORA3" "" ;;
-  4) render "s${SCN}_${MODE}_r4_nag"       "${NAGMODEL:-nvfp4-CLEAN-dev050.gguf}" 640 352 8 "$LADDER_SIGMAS" "$LAD" "" "$NAG4" ;;
+  4) NEGP="$NEG_DEFAULT" render "s${SCN}_${MODE}_r4_nag" "${NAGMODEL:-nvfp4-CLEAN-dev050.gguf}" 640 352 8 "$LADDER_SIGMAS" "$LAD" "" "$NAG4" ;;
   5) render "s${SCN}_${MODE}_r5_24fps"     "${WINMODEL:-nvfp4-CLEAN-dev050.gguf}" 640 352 8 "$LADDER_SIGMAS" "$LAD" "" "" 24 ;;  # FR override below
   *) echo "unknown row $R";; esac
 done
@@ -142,9 +146,9 @@ LBL=( ["0"]="r0 baseline (current prod nvfp4-CLEAN, single pass)" ["1"]="r1 fold
     echo "<tr><td>${tag##*_r}</td><td>${model%.gguf}</td><td>$res</td><td>$fr</td><td>$fps</td><td>$steps</td><td>${wall}s</td><td>${peak}MiB</td><td class=\"$([ $st = ok ]&&echo ok||echo bad)\">$st</td></tr>"
   done < "$EYE/results.csv"
   echo "</table><h2>clips (play in motion — mush shows in motion, not stills; 🔊 = has audio)</h2><div class=grid>"
-  for R in $ROWS; do t="s${SCN}_${MODE}_r${R}_"; f=$(cd "$CLIPS" && ls ${t}*.mp4 2>/dev/null|head -1)
-    if [ -n "$f" ]; then echo "<figure><video src=\"clips/$f\" controls loop playsinline></video><figcaption>${LBL[$R]}</figcaption></figure>"
-    else echo "<figure><figcaption class=bad>${LBL[$R]} — no clip (render failed/skipped)</figcaption></figure>"; fi
+  for f in $(cd "$CLIPS" && ls s${SCN}_${MODE}_r*.mp4 2>/dev/null | sort); do
+    R=$(echo "$f" | sed -E 's/.*_r([0-9]+)_.*/\1/')
+    echo "<figure><video src=\"clips/$f\" controls loop playsinline></video><figcaption>${LBL[$R]:-$f}</figcaption></figure>"
   done
   echo "</div>"
 } > "$EYE/ablation.html"
