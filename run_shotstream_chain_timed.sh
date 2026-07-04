@@ -37,10 +37,11 @@ for kv in ${EXTRA_ENV:-}; do ENVV+=( "$kv" ); done
 ENV_FLAGS=(); for e in "${ENVV[@]}"; do ENV_FLAGS+=(-e "$e"); done
 
 # timestamped VRAM sampler (ms since epoch, MiB used) so peaks attribute per shot
-( while true; do printf '%s %s\n' "$(date +%s.%N)" "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null)"; sleep 0.25; done ) > "$SRC/$OUT/vram.trace" &
+( while true; do printf '%s %s\n' "$(date +%s.%N)" "$(nvidia-smi -i "${DEVICE:-0}" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null)"; sleep 0.25; done ) > "$SRC/$OUT/vram.trace" &
 SAMP=$!
-echo ">> CHAIN TIMED device=0 shots=$SHOTS FULL-7-chunk  $(date +%T)"
-docker run --rm --gpus '"device=0"' "${ENV_FLAGS[@]}" \
+DEVICE="${DEVICE:-0}"
+echo ">> CHAIN TIMED device=$DEVICE shots=$SHOTS FULL-7-chunk  $(date +%T)"
+docker run --rm --gpus "\"device=$DEVICE\"" "${ENV_FLAGS[@]}" \
   -v "$SRC:/src" -v "$MODELS:/models" -w /src "$BUILDER" \
   /src/build/bin/sd-shotstream \
     --dit "$DIT" --t5xxl "$UMT5" --vae "$VAE" \

@@ -901,6 +901,16 @@ int main(int argc, char** argv) {
         dump_stats("shot latent", lat);
         { char p[256]; snprintf(p, sizeof(p), "%s/shot%02d_latent.bin", out_dir.c_str(), k); write_bin(p, lat, "shot_latent"); }
         dit->free_compute_buffer();  // release DiT compute before the VAE decode buffer
+        // VRAM: this shot's resident KV caches (local ~21f + global ~6f, F16, ~6-8 GB on the
+        // 3060) are DEAD during the VAE decode and are fully rebuilt next shot (prefill_context
+        // rebuilds the global cache from the decoded-pixel round-trip; run_shot resets the local
+        // cache). Freeing them here lets the ~3.5 GB VAE compute buffer fit beside the resident
+        // DiT weights on the 12 GB 3060 — the at-the-edge chunks=7 chain OOM'd here otherwise
+        // (the resident-KV + VAE-decode buffers together exceed 12 GB). Env opt-out for A/B.
+        if (getenv("SHOTSTREAM_KEEP_KV_FOR_DECODE") == nullptr) {
+            dit->reset_local_cache();
+            dit->reset_global_cache();
+        }
 
         if (!have_vae) { continue; }  // latents only
 

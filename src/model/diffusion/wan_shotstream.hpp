@@ -516,15 +516,41 @@ namespace WAN_SHOTSTREAM {
         // then persist its CLEAN K/V into the local cache (§3.3). Returns x0.
         sd::Tensor<float> run_chunk(int n_threads, int t_offset, int shot_idx,
                                     const sd::Tensor<float>& noise_chunk,
-                                    const sd::Tensor<float>& context) {
+                                    const sd::Tensor<float>& context,
+                                    bool is_last_chunk = false) {
             sd::Tensor<float> x = noise_chunk;  // σ = 1.0 at step 0
             sd::Tensor<float> x0;
+            // EXACT lever: the LAST chunk of a shot persists clean K/V that are NEVER read —
+            // no next chunk in this shot, and the next shot resets the local cache (prefill
+            // rebuilds the global cache from decoded pixels); decode consumes the latent x0,
+            // not the K/V. So skipping the last chunk's clean rewrite is BIT-IDENTICAL in
+            // output and drops 1 forward/shot AND removes the biggest-cache (chunk-6) rewrite
+            // alloc that fragments the pool + OOMs after the fast VAE decode. Env opt-out.
+            static const bool keep_last_rewrite = (std::getenv("SHOTSTREAM_LASTCHUNK_REWRITE") != nullptr);
+            const bool skip_last_rewrite = is_last_chunk && !keep_last_rewrite;
+            // LEVER A (env SHOTSTREAM_SKIP_CLEAN_REWRITE): drop the extra t=0 "clean rewrite"
+            // forward (1 of 5 forwards/chunk ≈ 20% of DiT) and persist the LAST denoise step's
+            // K/V into the local cache instead. The last denoise step runs at σ=0.737 (~74% noise),
+            // so its K/V are NOT the clean-x0 K/V — an APPROXIMATION.
+            // REJECTED (2026-07-04): −19% DiT but the background flashes / re-renders / re-sharpens
+            // across the chain (motion eye-test). The clean rewrite is load-bearing for temporal
+            // consistency (caches CLEAN K/V = a stable memory for later chunks). Kept env-gated OFF
+            // for reproducibility only; do NOT enable in production.
+            static const bool skip_clean = (std::getenv("SHOTSTREAM_SKIP_CLEAN_REWRITE") != nullptr);
             for (int i = 0; i < ss.n_steps; ++i) {
                 float t = SHOTSTREAM_WARPED_TS[i];
                 float sigma = t / 1000.0f;
-                // denoise-step forwards read caches but do NOT persist (snapshot-free).
+                bool last = (i == ss.n_steps - 1);
+                // On the last step, if skipping the clean rewrite, persist THIS forward's K/V.
+                // persist_local=true only adds the K/V export/readback; the flow output (→ x0)
+                // is bit-identical to persist_local=false, so the denoise result is unchanged.
+                // Under Lever A the last DENOISE step persists (stand-in for the clean rewrite),
+                // BUT on the last chunk of a shot those K/V are dead (never read — same argument
+                // as skip_last_rewrite), so don't persist there either: exact + avoids the biggest
+                // chunk-6 persist alloc that OOMs after the fast VAE decode.
+                bool persist_here = skip_clean && last && !skip_last_rewrite;
                 auto flow = forward_block(n_threads, t_offset, shot_idx, x, t, context,
-                                          /*persist_local=*/false, /*store_into_global=*/false);
+                                          /*persist_local=*/persist_here, /*store_into_global=*/false);
                 if (flow.empty()) return {};
                 to_x0(x, flow, sigma, x0);
                 if (i < ss.n_steps - 1) {
@@ -532,9 +558,11 @@ namespace WAN_SHOTSTREAM {
                     add_noise(x0, sigma_next, x);  // re-noise to the next timestep
                 }
             }
-            // clean rewrite at t=0: overwrites this chunk's local-cache slot with clean K/V.
-            (void)forward_block(n_threads, t_offset, shot_idx, x0, 0.0f, context,
-                                /*persist_local=*/true, /*store_into_global=*/false);
+            if (!skip_clean && !skip_last_rewrite) {
+                // clean rewrite at t=0: overwrites this chunk's local-cache slot with clean K/V.
+                (void)forward_block(n_threads, t_offset, shot_idx, x0, 0.0f, context,
+                                    /*persist_local=*/true, /*store_into_global=*/false);
+            }
             return x0;
         }
 
@@ -588,7 +616,8 @@ namespace WAN_SHOTSTREAM {
                 int t_off = f0 + ss.condition_start_frame;
                 auto noise = randn_chunk(W, H, nfb);
                 int64_t tc0 = ggml_time_ms();
-                auto x0 = run_chunk(n_threads, t_off, shot_idx, noise, context);
+                auto x0 = run_chunk(n_threads, t_off, shot_idx, noise, context,
+                                    /*is_last_chunk=*/(b == n_chunks - 1));
                 int64_t tc1 = ggml_time_ms();
                 if (x0.empty()) { printf("ERROR: shot %d chunk %d empty\n", shot_idx, b); return {}; }
                 int64_t local_tokens = local_cache_tokens();
