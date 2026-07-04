@@ -862,9 +862,14 @@ namespace LTXV {
                 float nag_alpha = ctx->ltx_nag_alpha;
                 float nag_tau   = ctx->ltx_nag_tau;
 
-                auto out_neg = apply_gate_if_any(attend(nag_context));
-                auto z_pos   = to_out_0->forward(ctx, out);      // [query_dim, tokens, batch]
-                auto z_neg   = to_out_0->forward(ctx, out_neg);
+                auto out_neg     = apply_gate_if_any(attend(nag_context));
+                auto z_pos_o     = to_out_0->forward(ctx, out);      // [query_dim, tokens, batch]
+                auto z_neg_o     = to_out_0->forward(ctx, out_neg);
+                ggml_type z_dtype = z_pos_o->type;
+                // The whole NAG blend runs in F32: ggml_sum_rows requires F32, and it keeps every
+                // op same-typed (mixed F16/F32 mul/div assert). Cast the result back at the end.
+                auto z_pos = z_pos_o->type == GGML_TYPE_F32 ? z_pos_o : ggml_cast(gc, z_pos_o, GGML_TYPE_F32);
+                auto z_neg = z_neg_o->type == GGML_TYPE_F32 ? z_neg_o : ggml_cast(gc, z_neg_o, GGML_TYPE_F32);
 
                 // z_ext = z_pos + scale * (z_pos - z_neg)   (extrapolate in feature space)
                 auto z_ext = ggml_add(gc, z_pos, ggml_scale(gc, ggml_sub(gc, z_pos, z_neg), nag_scale));
@@ -881,7 +886,8 @@ namespace LTXV {
                 auto factor = ggml_clamp(gc, ggml_div(gc, ggml_scale(gc, n_pos, nag_tau), n_ext), 0.0f, 1.0f);
                 auto z_nag  = ggml_mul(gc, z_ext, factor);  // factor [1,tok,b] broadcasts over feature dim
                 // z_out = alpha * z_nag + (1 - alpha) * z_pos
-                return ggml_add(gc, ggml_scale(gc, z_nag, nag_alpha), ggml_scale(gc, z_pos, 1.0f - nag_alpha));
+                auto z_out  = ggml_add(gc, ggml_scale(gc, z_nag, nag_alpha), ggml_scale(gc, z_pos, 1.0f - nag_alpha));
+                return z_dtype == GGML_TYPE_F32 ? z_out : ggml_cast(gc, z_out, z_dtype);
             }
 
             return to_out_0->forward(ctx, out);
