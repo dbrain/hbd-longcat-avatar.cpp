@@ -57,6 +57,17 @@ Clip: `perf_leverA_2shot.mp4` on the page (marked ❌).
   pure overhead from the K/V D2H readback + host re-upload + sync → the target for exact lever **E5**.
 - last-chunk skip verified live (last chunk runs 4 forwards, no 5th).
 
+### 5. E5 — in-graph K/V append — EXACT (default on under SHOTSTREAM_NO_OFFLOAD; opt-out `SHOTSTREAM_INGRAPH_KV=0`)
+Persist the fresh K/V by an in-graph `ggml_cpy` straight into a pre-allocated persistent chunk buffer,
+instead of exporting them as graph outputs → D2H readback → host re-upload. Removes the GPU→host→GPU
+round-trip + its sync on every persist forward.
+| | value |
+|---|---|
+| persist forward | **1.42 → 0.88 s** (= a denoise forward; the +0.54 s round-trip gone) |
+| per shot | ~3.8 s (6 clean-rewrites + 1 prefill × 0.54 s) — ~4.5% DiT |
+| parity | **latent BIT-IDENTICAL** (chunks=2 A/B) |
+Kept the per-chunk resident buffers (did not need E4's contiguous-buffer refactor first).
+
 ## Remaining levers (see tasks / perf-ideas.md)
 - **E4** fixed contiguous resident KV buffers (kill per-forward concat, launch-bound ~5-7% DiT) → **E5**
   in-graph K/V append (remove host round-trip, ~4-5% DiT). Meatier exact DiT levers.

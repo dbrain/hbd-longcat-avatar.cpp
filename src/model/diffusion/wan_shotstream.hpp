@@ -230,33 +230,43 @@ namespace WAN_SHOTSTREAM {
         // need_kv path) into a fresh persistent GPU buffer and append it to `cache`.
         // Layout [d_head, L, n_head] matches read_named() and the host-path tensors, so
         // the resident bytes are identical to what the legacy cache would have held.
-        void push_kv_chunk(std::vector<KVChunk>& cache,
-                           std::vector<sd::Tensor<ggml_fp16_t>>& nk,
-                           std::vector<sd::Tensor<ggml_fp16_t>>& nv) {
-            int nL       = config.num_layers;
-            int d_head   = (int)(config.dim / config.num_heads);
-            int n_head   = (int)config.num_heads;
+        // Allocate one empty resident chunk: per-layer [d_head, L, n_head] F16 tensors in
+        // their OWN persistent GPU buffer (registered so the offload executor keeps them
+        // intact between segments). Data left uninitialised — the caller fills it either by
+        // host upload (push_kv_chunk) or by an in-graph ggml_cpy (E5 SHOTSTREAM_INGRAPH_KV).
+        KVChunk alloc_kv_chunk(int64_t L) {
+            int nL     = config.num_layers;
+            int d_head = (int)(config.dim / config.num_heads);
+            int n_head = (int)config.num_heads;
             KVChunk c;
-            c.L = nk.empty() ? 0 : nk[0].shape()[1];
+            c.L = L;
             ggml_init_params p = { ggml_tensor_overhead() * (size_t)(2 * nL + 8), nullptr, /*no_alloc=*/true };
             c.ctx = ggml_init(p);
             GGML_ASSERT(c.ctx != nullptr);
             c.k.resize(nL); c.v.resize(nL);
             for (int i = 0; i < nL; i++) {
-                c.k[i] = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, d_head, c.L, n_head);
-                c.v[i] = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, d_head, c.L, n_head);
+                c.k[i] = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, d_head, L, n_head);
+                c.v[i] = ggml_new_tensor_3d(c.ctx, GGML_TYPE_F16, d_head, L, n_head);
                 ggml_set_name(c.k[i], ("shotstream.reskv.k." + std::to_string(i)).c_str());
                 ggml_set_name(c.v[i], ("shotstream.reskv.v." + std::to_string(i)).c_str());
             }
             c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, runtime_backend);
             GGML_ASSERT(c.buf != nullptr);
             for (int i = 0; i < nL; i++) {
-                ggml_backend_tensor_set(c.k[i], nk[i].data(), 0, ggml_nbytes(c.k[i]));
-                ggml_backend_tensor_set(c.v[i], nv[i].data(), 0, ggml_nbytes(c.v[i]));
-                // Register as runner-persistent so reset_segment_runtime_tensors (offload
-                // path) leaves their buffer/data pointers intact between segments.
                 register_persistent_tensor(c.k[i]);
                 register_persistent_tensor(c.v[i]);
+            }
+            return c;
+        }
+
+        void push_kv_chunk(std::vector<KVChunk>& cache,
+                           std::vector<sd::Tensor<ggml_fp16_t>>& nk,
+                           std::vector<sd::Tensor<ggml_fp16_t>>& nv) {
+            int nL = config.num_layers;
+            KVChunk c = alloc_kv_chunk(nk.empty() ? 0 : nk[0].shape()[1]);
+            for (int i = 0; i < nL; i++) {
+                ggml_backend_tensor_set(c.k[i], nk[i].data(), 0, ggml_nbytes(c.k[i]));
+                ggml_backend_tensor_set(c.v[i], nv[i].data(), 0, ggml_nbytes(c.v[i]));
             }
             cache.push_back(std::move(c));
         }
@@ -339,6 +349,24 @@ namespace WAN_SHOTSTREAM {
             // marking them as graph outputs / reading them back when unused.
             const bool need_kv = persist_local || store_into_global;
 
+            // E5 (env SHOTSTREAM_INGRAPH_KV, resident mode only): persist the fresh K/V by an
+            // IN-GRAPH ggml_cpy straight into a pre-allocated persistent chunk buffer, instead
+            // of exporting them as graph outputs → D2H readback (read_named) → host re-upload
+            // (push_kv_chunk). Removes the GPU→host→GPU round-trip + the sync it forces on every
+            // persist forward (profiled: persist forward 1.41s vs 0.87s denoise — the +0.54s is
+            // this round-trip). Byte-identical: the same F16-cast K/V land in the same buffer,
+            // just copied GPU→GPU in-graph. Default OFF (host path). Only in resident mode.
+            // Default ON in the resident whole-graph (SHOTSTREAM_NO_OFFLOAD) path — the shotstream
+            // prod path — where it is validated bit-identical + faster (persist forward 1.42→0.88s).
+            // OFF by default under the segmented offload executor (cross-segment in-graph writes to
+            // persistent buffers untested there) and in host-KV mode. Force with SHOTSTREAM_INGRAPH_KV=0/1.
+            static const bool no_offload = (std::getenv("SHOTSTREAM_NO_OFFLOAD") != nullptr);
+            static const char* ingraph_env = std::getenv("SHOTSTREAM_INGRAPH_KV");
+            const bool ingraph_kv_on = ingraph_env ? (std::atoi(ingraph_env) != 0) : no_offload;
+            const bool ingraph = ingraph_kv_on && need_kv && !kv_host_mode;
+            KVChunk pending;  // pre-allocated dst for the in-graph append (ingraph path only)
+            if (ingraph) pending = alloc_kv_chunk(L_blk);
+
             auto get_graph = [&]() -> ggml_cgraph* {
                 ggml_cgraph* gf = new_graph_custom(WAN::WAN_GRAPH_SIZE);
 
@@ -384,7 +412,23 @@ namespace WAN_SHOTSTREAM {
                 // Export each layer's fresh K/V (F16) as cut-marked, per-segment-readable
                 // outputs (matches the S2V rolling-cache readback pattern) — ONLY when this
                 // forward persists them (skip on the discarded denoise-step forwards).
-                if (need_kv) {
+                if (need_kv && ingraph) {
+                    // E5: cast the fresh K/V to F16 and ggml_cpy them straight into the pre-
+                    // allocated persistent chunk buffer (GPU→GPU, in-graph). No graph output,
+                    // no host readback. The cpy dst lives in pending.ctx (own backend buffer),
+                    // so gallocr treats it as a pre-allocated leaf and writes through it.
+                    for (int i = 0; i < nL; i++) {
+                        ggml_tensor* nk1 = ggml_cast(rctx.ggml_ctx, new_kc[i], GGML_TYPE_F16);
+                        ggml_tensor* nv1 = ggml_cast(rctx.ggml_ctx, new_vc[i], GGML_TYPE_F16);
+                        ggml_tensor* ck  = ggml_cpy(rctx.ggml_ctx, nk1, pending.k[i]);
+                        ggml_tensor* cv  = ggml_cpy(rctx.ggml_ctx, nv1, pending.v[i]);
+                        ggml_build_forward_expand(gf, ck);
+                        ggml_build_forward_expand(gf, cv);
+                    }
+                } else if (need_kv) {
+                    // Export each layer's fresh K/V (F16) as cut-marked, per-segment-readable
+                    // outputs (matches the S2V rolling-cache readback pattern) — ONLY when this
+                    // forward persists them (skip on the discarded denoise-step forwards).
                     for (int i = 0; i < nL; i++) {
                         ggml_tensor* nk1 = ggml_cast(rctx.ggml_ctx, new_kc[i], GGML_TYPE_F16);
                         ggml_tensor* nv1 = ggml_cast(rctx.ggml_ctx, new_vc[i], GGML_TYPE_F16);
@@ -419,7 +463,7 @@ namespace WAN_SHOTSTREAM {
                 }
                 return false;
             };
-            if (need_kv) {
+            if (need_kv && !ingraph) {
                 segment_readback_hook_ = [&](ggml_cgraph* sg) {
                     for (int i = 0; i < nL; i++) {
                         std::string g = "shotstream.blocks." + std::to_string(i) + ".out";
@@ -453,6 +497,8 @@ namespace WAN_SHOTSTREAM {
                             ctx_v[i] = sd::ops::concat(ctx_v[i], nv[i], 1);
                         }
                     }
+                } else if (ingraph) {
+                    res_ctx.push_back(std::move(pending));  // E5: already filled in-graph
                 } else {
                     push_kv_chunk(res_ctx, nk, nv);  // resident: append one persistent chunk
                 }
@@ -477,7 +523,8 @@ namespace WAN_SHOTSTREAM {
                         }
                     }
                 } else {
-                    push_kv_chunk(res_local, nk, nv);  // resident: append one persistent chunk
+                    if (ingraph) res_local.push_back(std::move(pending));  // E5: filled in-graph
+                    else push_kv_chunk(res_local, nk, nv);                 // host round-trip
                     // Window bound: same safety clamp as the host path, applied at chunk
                     // granularity. Shipped config = 7 chunks == local_attn_size (21 frames),
                     // so this never fires; if it did, drop the oldest resident chunk(s).
