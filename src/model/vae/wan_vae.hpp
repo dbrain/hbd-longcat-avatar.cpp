@@ -70,6 +70,21 @@ namespace WAN {
         return on;
     }
 
+    // WAN_VAE_RESAMPLE_TSPLIT (default OFF; byte-identical committed graph when unset): run each
+    // upsample/downsample `resample.1` Conv2d one temporal frame at a time instead of as a single
+    // ne[3]-batched conv. resample.1 is per-frame independent, so this is numerically identical
+    // but bounds the live im2col column buffer (the whole-frame decode's peak transient, ~1.4 GB
+    // F32 at the final 480x832 upsample) to a single frame — cutting the compute-buffer peak by
+    // ~(T-1)/T of the im2col at no precision cost. Correct+fast alternative to conv2d-direct
+    // (which overflows in F16 and hits the naive kernel in this build).
+    inline bool wan_vae_resample_tsplit_enabled() {
+        static const bool on = [] {
+            const char* e = std::getenv("WAN_VAE_RESAMPLE_TSPLIT");
+            return e != nullptr && atoi(e) != 0;  // default OFF; "1" enables
+        }();
+        return on;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -279,15 +294,38 @@ namespace WAN {
                 } else if (mode == "downsample3d") {
                     x = ggml_ext_pad(ctx->ggml_ctx, x, 1, 1, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
                 }
-                // WAN_VAE_F16 F32 island for resample.1 (Conv2d): ggml im2col asserts an F32
-                // src1 (im2col.cu:87) and ggml_mul_mat emits F32, so cast the conv input to
-                // F32 here. The output is restored to F16 by the cast at the function tail.
-                // (The heavy temporal-upsample tensors above — time_conv + the doubling cont —
-                // already ran F16; this island only widens the spatial conv input.)
-                if (stream_f16 && x->type == GGML_TYPE_F16) {
-                    x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+                // resample.1 (Conv2d) is the whole-frame decode's peak transient. It goes through
+                // ggml_conv_2d = im2col (asserts F32 src1, im2col.cu:87) + mul_mat (F32), so under
+                // WAN_VAE_F16 the input is widened to F32 and the im2col column buffer (IC*9 x
+                // spatial x the temporal-batch ne[3]) is the single largest F32 buffer in the
+                // decode — ~1.4 GB at the final 480x832 upsample where ne[3] is the full ~4-frame
+                // temporal batch. resample.1 is a 2D conv (batched over ne[3], per-frame
+                // INDEPENDENT), so looping it one temporal frame at a time is numerically IDENTICAL
+                // yet caps the live im2col to a SINGLE frame — gallocr reuses that scratch across
+                // the loop, cutting the peak by ~(T-1)/T of the im2col (~1 GB at the last upsample)
+                // with no precision change. WAN_VAE_RESAMPLE_TSPLIT gates it (default OFF ->
+                // committed graph byte-identical). The per-frame F32 widen keeps the F32-accumulate
+                // im2col (no F16 conv overflow).
+                if (wan_vae_resample_tsplit_enabled() && x->ne[3] > 1) {
+                    const int64_t T = x->ne[3];
+                    ggml_tensor* acc = nullptr;
+                    for (int64_t k = 0; k < T; k++) {
+                        ggml_tensor* xf = ggml_ext_slice(ctx->ggml_ctx, x, 3, k, k + 1);  // [w,h,c,1]
+                        if (stream_f16 && xf->type == GGML_TYPE_F16) {
+                            xf = ggml_cast(ctx->ggml_ctx, xf, GGML_TYPE_F32);  // widen + make contiguous
+                        } else if (xf->view_src != nullptr || !ggml_is_contiguous(xf)) {
+                            xf = ggml_ext_cont(ctx->ggml_ctx, xf);
+                        }
+                        xf  = resample_1->forward(ctx, xf);
+                        acc = (acc == nullptr) ? xf : ggml_concat(ctx->ggml_ctx, acc, xf, 3);
+                    }
+                    x = acc;
+                } else {
+                    if (stream_f16 && x->type == GGML_TYPE_F16) {
+                        x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32);
+                    }
+                    x = resample_1->forward(ctx, x);
                 }
-                x = resample_1->forward(ctx, x);
                 x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 0, 1, 3, 2));  // (c, t, h, w)
             }
 
@@ -1191,17 +1229,22 @@ namespace WAN {
             int64_t iter_ = z->ne[2];
             auto x        = conv2->forward(ctx, z);
             // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.decode.prelude", "x");
-            ggml_tensor* out;
+            ggml_tensor* out = nullptr;
             for (int i = 0; i < iter_; i++) {
                 _conv_idx = 0;
-                if (i == 0) {
-                    auto in = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1);  // [b*c, 1, h, w]
-                    out     = decoder->forward(ctx, in, b, _feat_map, _conv_idx, i);
-                } else {
-                    auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1);  // [b*c, 1, h, w]
-                    auto out_ = decoder->forward(ctx, in, b, _feat_map, _conv_idx, i);
-                    out       = ggml_concat(ctx->ggml_ctx, out, out_, 2);
+                auto in   = ggml_ext_slice(ctx->ggml_ctx, x, 2, i, i + 1);  // [b*c, 1, h, w]
+                auto out_ = decoder->forward(ctx, in, b, _feat_map, _conv_idx, i);
+                // WAN_VAE_F16 (wan2.1 only): head.2 is force_f32, so each decoded frame comes
+                // back F32; the accumulator therefore grows as a large F32 buffer (all decoded
+                // pixel frames held live through the whole per-frame loop). Cast each frame to
+                // F16 before accumulating so the resident output buffer is halved during the
+                // loop's memory peak; the final cast below restores F32 for host read-back. Only
+                // for wan2.1 (direct RGB head, no unpatchify): the wan2.2 path must keep its 12ch
+                // head output F32 through unpatchify or the per-channel fp16 grid returns.
+                if (dec_f16 && !wan2_2 && out_->type != GGML_TYPE_F16) {
+                    out_ = ggml_cast(ctx->ggml_ctx, out_, GGML_TYPE_F16);
                 }
+                out = (out == nullptr) ? out_ : ggml_concat(ctx->ggml_ctx, out, out_, 2);
             }
             if (wan2_2) {
                 out = unpatchify(ctx->ggml_ctx, out, 2, b);

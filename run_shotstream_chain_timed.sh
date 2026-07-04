@@ -12,7 +12,7 @@ TAG="${TAG:-chain_timed}"; OUT="shotstream_out/$TAG"; mkdir -p "$SRC/$OUT"
 DIT=/models/shotstream-1.3b-dit-f16.gguf
 VAE=/models/longcat-wan-vae-f16.gguf
 UMT5=/models/longcat-umt5-xxl-q8_0.gguf
-W=832; H=480; FPS=16; SEED=42; SHOTS=${SHOTS:-3}; CHUNKS="${CHUNKS:-0}"
+W=832; H=480; FPS=16; SEED=${SEED:-42}; SHOTS=${SHOTS:-3}; CHUNKS="${CHUNKS:-0}"
 CHUNK_FLAG=(); [ "$CHUNKS" != "0" ] && CHUNK_FLAG=(--chunks "$CHUNKS")
 PROMPT="a red fox trotting through a snowy pine forest at dawn, volumetric morning light, cinematic, photorealistic"
 
@@ -40,13 +40,17 @@ ENV_FLAGS=(); for e in "${ENVV[@]}"; do ENV_FLAGS+=(-e "$e"); done
 ( while true; do printf '%s %s\n' "$(date +%s.%N)" "$(nvidia-smi -i "${DEVICE:-0}" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null)"; sleep 0.25; done ) > "$SRC/$OUT/vram.trace" &
 SAMP=$!
 DEVICE="${DEVICE:-0}"
+# NO_VAE_TILE=1 → whole-frame VAE decode (needs WAN_VAE_F16 + WAN_VAE_RESAMPLE_TSPLIT in EXTRA_ENV
+# to fit; im2col-free, no tile seams, ~33s vs the 4-tile ~39s and peak ~8.4GB vs ~11.3GB).
+VAE_TILE_FLAG=(--vae-relative-tile-size "$VAE_REL")
+[ "${NO_VAE_TILE:-0}" = "1" ] && VAE_TILE_FLAG=(--no-vae-tiling)
 echo ">> CHAIN TIMED device=$DEVICE shots=$SHOTS FULL-7-chunk  $(date +%T)"
 docker run --rm --gpus "\"device=$DEVICE\"" "${ENV_FLAGS[@]}" \
   -v "$SRC:/src" -v "$MODELS:/models" -w /src "$BUILDER" \
   /src/build/bin/sd-shotstream \
     --dit "$DIT" --t5xxl "$UMT5" --vae "$VAE" \
     --shots "$SHOTS" "${CHUNK_FLAG[@]}" --W "$W" --H "$H" --fps "$FPS" --seed "$SEED" \
-    -p "$PROMPT" --vae-relative-tile-size "$VAE_REL" \
+    -p "$PROMPT" "${VAE_TILE_FLAG[@]}" \
     --out "/src/$OUT" 2>&1 | tee "$SRC/$OUT/run.log"
 kill $SAMP 2>/dev/null; wait $SAMP 2>/dev/null
 echo ">> overall peak VRAM: $(awk '{print $2}' "$SRC/$OUT/vram.trace" | sort -n | tail -1) MiB"
