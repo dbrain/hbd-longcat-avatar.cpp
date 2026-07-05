@@ -1701,7 +1701,7 @@ struct LTXVideoVAE : public VAE {
         if (decode_graph && input.dim() >= 4 && input.shape()[2] > 1 &&
             getenv("LTX_VAE_TEMPORAL_BLEND") != nullptr) {
             const int T = wholeframe_env_int("LTX_VAE_TBLEND_FRAMES", DEFAULT_TEMPORAL_TILE_FRAMES);
-            const int O = wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 1);  // O1 locked 2026-07-05: owner eye-tested seam-free on hard-motion (whip-pan+hummingbird); -41% decode vs O3
+            const int O = wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 2);  // O2 locked 2026-07-06: O1 had a localized background glow at tile boundaries (owner eye + per-block detector); O2 is clean (owner: "same as O3 maybe cleaner") and still -24% decode vs O3
             LOG_INFO("LTX VAE temporal-blend decode: tile=%d overlap=%d latent frames (whole-spatial, feathered)", T, O);
             return decode_temporal_blend(n_threads, input, expected_dim, T, O);
         }
