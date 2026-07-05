@@ -16,10 +16,28 @@
 
 namespace LTXVAE {
 
+    // LTX_VAE_DECODE_F16 (default OFF; F32 byte-identical when unset): run the decode activation
+    // stream in F16 so the largest post-upsample feature maps (the ~14.7GB full-res floor that
+    // conv3d W/H-tiling can't shrink) halve, letting single-graph 97f@1216x704 fit <=11.5GB.
+    // The VAE weights are already F16; only the activations were F32. Precision-safe here: f16==f32
+    // for this decode was already proven (head-f32/full-f32 both scored identically). The latent is
+    // cast to F16 at the decode entry and back to F32 before host read-back; conv3d outputs (im2col
+    // +mul_mat emits F32) are cast back to F16 in ggml_ext_conv_3d; norm/silu/upsample/concat/add
+    // are F16-native, and apply_scale_shift + the conv bias-add cast their small F32 operands to
+    // the activation dtype so no unsafe mixed-dtype binbcast forms.
+    static inline bool decode_f16_enabled() {
+        static const bool on = (std::getenv("LTX_VAE_DECODE_F16") != nullptr);
+        return on;
+    }
+
     static inline ggml_tensor* apply_scale_shift(ggml_context* ctx,
                                                  ggml_tensor* x,
                                                  ggml_tensor* scale,
                                                  ggml_tensor* shift) {
+        // Keep the per-channel modulation in the activation dtype (F16 decode stream) so the
+        // mul/add don't form a mixed-dtype binbcast with the F32 scale_shift_table-derived tensors.
+        if (scale->type != x->type) { scale = ggml_cast(ctx, scale, x->type); }
+        if (shift->type != x->type) { shift = ggml_cast(ctx, shift, x->type); }
         x = ggml_add(ctx, x, ggml_mul(ctx, x, scale));
         x = ggml_add(ctx, x, shift);
         return x;
@@ -73,6 +91,16 @@ namespace LTXVAE {
         }
 
         return x;
+    }
+
+    // LTX final patch-unpack. VERIFIED (buffer-level numpy against the diffusers
+    // AutoencoderKLLTXVideo reference rearrange `b (c pw ph) f h w -> b c f (h ph)(w pw)`):
+    // WAN::WanVAE::unpatchify with NO channel swap already reproduces that mapping EXACTLY.
+    // The 8px "mesh" is therefore NOT a patch-interleave error; it is numerical (the fp16
+    // head conv quantizes the pre-unpatchify feature and the 4x pixel-shuffle magnifies the
+    // per-channel fp16 step into the grid — see LTX_VAE_HEAD_F32 on the conv_out head).
+    static inline ggml_tensor* ltx_unpatchify(ggml_context* ctx, ggml_tensor* x, int64_t patch_size, int64_t b = 1) {
+        return WAN::WanVAE::unpatchify(ctx, x, patch_size, b);
     }
 
     static inline ggml_tensor* patchify(ggml_context* ctx,
@@ -908,6 +936,23 @@ namespace LTXVAE {
 
             blocks["conv_in"] = std::make_shared<CausalConv3d>(in_channels, channels, 3);
 
+            // LTX 0.9.5+ VAE decoder up-blocks carry a parameter-free pixel-shuffle RESIDUAL
+            // skip (config upsample_residual=(True,True,True), upsample_factor=(2,2,2)). The
+            // residual is weightless so it cannot be inferred from tensor shapes and must come
+            // from config. Omitting it leaves the conv-only branch, whose per-sub-pixel DC offset
+            // forms a 2px checkerboard at quarter-res that the final 4x unpatch magnifies into the
+            // fixed 8px "mesh" (verified against the diffusers oracle: meshscore 52.7 -> 12.1).
+            // Default keys off timestep_conditioning: every 0.9.5+ residual VAE is also
+            // timestep-conditioned (has decoder.timestep_scale_multiplier), while the old 0.9.0
+            // no-residual VAE is not — a weight-detectable proxy. Override either way with
+            // LTX_VAE_UPSAMPLE_RESIDUAL=0/1 (e.g. if a future LTX-2 VAE config differs).
+            const bool up_residual = [timestep_conditioning] {
+                const char* s = getenv("LTX_VAE_UPSAMPLE_RESIDUAL");
+                if (s != nullptr && (s[0] == '0' || s[0] == '1')) {
+                    return s[0] == '1';
+                }
+                return timestep_conditioning;
+            }();
             for (int block_idx = 0; block_idx < static_cast<int>(cfg.blocks.size()); ++block_idx) {
                 const auto& block = cfg.blocks[block_idx];
                 if (block.type == "res_x") {
@@ -919,21 +964,21 @@ namespace LTXVAE {
                                                                                                               2,
                                                                                                               2,
                                                                                                               block.multiplier,
-                                                                                                              false);
+                                                                                                              up_residual);
                     channels /= block.multiplier;
                 } else if (block.type == "compress_time") {
                     blocks["up_blocks." + std::to_string(block_idx)] = std::make_shared<DepthToSpaceUpsample>(channels,
                                                                                                               2,
                                                                                                               1,
                                                                                                               block.multiplier,
-                                                                                                              false);
+                                                                                                              up_residual);
                     channels /= block.multiplier;
                 } else if (block.type == "compress_space") {
                     blocks["up_blocks." + std::to_string(block_idx)] = std::make_shared<DepthToSpaceUpsample>(channels,
                                                                                                               1,
                                                                                                               2,
                                                                                                               block.multiplier,
-                                                                                                              false);
+                                                                                                              up_residual);
                     channels /= block.multiplier;
                 } else {
                     GGML_ABORT("Unsupported LTX VAE decoder block");
@@ -942,7 +987,16 @@ namespace LTXVAE {
 
             hidden_channels         = channels;
             blocks["conv_norm_out"] = std::make_shared<PixelNorm3D>();
-            blocks["conv_out"]      = std::make_shared<CausalConv3d>(hidden_channels, 3 * patch_size * patch_size, 3);
+            // LTX_VAE_HEAD_F32 (default OFF): force the final head conv to F32-precision matmul.
+            // The head conv (hidden -> 3*patch^2) with f16 weights accumulates in f16 by default,
+            // quantizing the pre-unpatchify feature -> the unpatchify (4x pixel-shuffle) magnifies
+            // that per-channel fp16 step into a fixed 8px screen-door grid over the whole frame.
+            // Full-F32 accumulation on this one conv removes the quantization (same idea as the
+            // wan-vace WAN_VAE_HEAD_F32 / cuDNN head.2 fix, but via ggml's im2col+PREC_F32 path so
+            // it needs no cuDNN and is cheap: the head is tiny [128->48ch]).
+            const bool head_f32 = [] { const char* s = getenv("LTX_VAE_HEAD_F32"); return s && s[0] == '1'; }();
+            blocks["conv_out"]      = std::make_shared<CausalConv3d>(hidden_channels, 3 * patch_size * patch_size, 3,
+                                                                     std::tuple<int, int, int>{1, 1, 1}, 1, true, head_f32);
             if (timestep_conditioning) {
                 blocks["last_time_embedder"] = std::make_shared<PixArtAlphaCombinedTimestepSizeEmbeddings>(hidden_channels * 2);
             }
@@ -955,6 +1009,15 @@ namespace LTXVAE {
             auto conv_norm_out = std::dynamic_pointer_cast<PixelNorm3D>(blocks["conv_norm_out"]);
             auto conv_out      = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv_out"]);
 
+            // LTX_VAE_DUMP_STAGES: capture each decoder stage output as a debug tap so the
+            // main thread can diff it against the diffusers LTXVideoDecoder3d stage outputs and
+            // localise the residual mesh (set LONGCAT_DUMP_DIR to write <name>.bin per tap).
+            // Non-tiled decode only (one graph) — decode oracle_latent WITHOUT LTX_VAE_WHOLEFRAME.
+            static const bool dump_stages = [] {
+                const char* s = getenv("LTX_VAE_DUMP_STAGES");
+                return s && s[0] == '1';
+            }();
+
             ggml_tensor* scaled_timestep = timestep;
             if (timestep_conditioning) {
                 auto multiplier = ggml_ext_backend_tensor_get_f32(params["timestep_scale_multiplier"]);
@@ -962,6 +1025,9 @@ namespace LTXVAE {
             }
 
             x = conv_in->forward(ctx, x, causal_decoder);
+            if (dump_stages) {
+                ctx->capture_tensor("dec_conv_in", x);
+            }
 
             int block_idx = 0;
             while (blocks.find("up_blocks." + std::to_string(block_idx)) != blocks.end()) {
@@ -972,10 +1038,18 @@ namespace LTXVAE {
                     auto upsample = std::dynamic_pointer_cast<DepthToSpaceUpsample>(blocks["up_blocks." + std::to_string(block_idx)]);
                     x             = upsample->forward(ctx, x, causal_decoder);
                 }
+                if (dump_stages) {
+                    char tag[32];
+                    snprintf(tag, sizeof(tag), "dec_up_%02d", block_idx);
+                    ctx->capture_tensor(tag, x);
+                }
                 block_idx++;
             }
 
             x = conv_norm_out->forward(ctx, x);
+            if (dump_stages) {
+                ctx->capture_tensor("dec_norm_out", x);
+            }
             if (timestep_conditioning) {
                 auto last_time_embedder = std::dynamic_pointer_cast<PixArtAlphaCombinedTimestepSizeEmbeddings>(blocks["last_time_embedder"]);
                 auto timestep_embed     = last_time_embedder->forward(ctx, scaled_timestep);
@@ -985,9 +1059,15 @@ namespace LTXVAE {
                                                           hidden_channels,
                                                           2);
                 x                       = apply_scale_shift(ctx->ggml_ctx, x, scale, shift);
+                if (dump_stages) {
+                    ctx->capture_tensor("dec_scale_shift", x);
+                }
             }
             x = ggml_silu_inplace(ctx->ggml_ctx, x);
             x = conv_out->forward(ctx, x, causal_decoder);
+            if (dump_stages) {
+                ctx->capture_tensor("dec_conv_out", x);  // pre-unpatch head output [W,H,f,3*P*P]
+            }
             return x;
         }
 
@@ -1089,8 +1169,21 @@ namespace LTXVAE {
             auto decoder   = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
             auto processor = std::dynamic_pointer_cast<PerChannelStatistics>(blocks["per_channel_statistics"]);
             auto latents   = processor->un_normalize(ctx, z);
+            // LTX_VAE_DECODE_F16: cast the (un-normalized, F32) latent to F16 at the decode entry so
+            // the whole decoder activation stream runs F16 (halving the full-res feature-map floor);
+            // conv3d outputs are re-cast to F16 in ggml_ext_conv_3d, the rest is F16-native.
+            const bool f16 = decode_f16_enabled();
+            if (f16) { latents = ggml_cast(ctx->ggml_ctx, latents, GGML_TYPE_F16); }
             auto out       = decoder->forward(ctx, latents, timestep);
-            out            = WAN::WanVAE::unpatchify(ctx->ggml_ctx, out, patch_size, 1);
+            out            = ltx_unpatchify(ctx->ggml_ctx, out, patch_size, 1);
+            if (f16 && out->type != GGML_TYPE_F32) { out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32); }
+            static const bool dump_stages = [] {
+                const char* s = getenv("LTX_VAE_DUMP_STAGES");
+                return s && s[0] == '1';
+            }();
+            if (dump_stages) {
+                ctx->capture_tensor("dec_unpatch", out);  // final RGB [W*P,H*P,f,3], pre color-convert
+            }
             return out;
         }
 
@@ -1110,7 +1203,7 @@ namespace LTXVAE {
             const int64_t T = z->ne[2];
             if (T <= 1) {
                 auto out = decoder->forward(ctx, latents, timestep);
-                return WAN::WanVAE::unpatchify(ctx->ggml_ctx, out, patch_size, 1);
+                return ltx_unpatchify(ctx->ggml_ctx, out, patch_size, 1);
             }
 
             // feat_map holds ggml_tensor* nodes (contiguous copies at each conv layer).
@@ -1156,7 +1249,7 @@ namespace LTXVAE {
                 out = (out == nullptr) ? out_chunk : ggml_concat(ctx->ggml_ctx, out, out_chunk, 2);
             }
 
-            return WAN::WanVAE::unpatchify(ctx->ggml_ctx, out, patch_size, 1);
+            return ltx_unpatchify(ctx->ggml_ctx, out, patch_size, 1);
         }
 
         ggml_tensor* decode_tiled_chunk(GGMLRunnerContext* ctx,
@@ -1177,7 +1270,7 @@ namespace LTXVAE {
             if (chunk_overlap > 0) {
                 out_chunk = ggml_ext_slice(ctx->ggml_ctx, out_chunk, 2, 0, out_chunk->ne[2] - chunk_overlap);
             }
-            return WAN::WanVAE::unpatchify(ctx->ggml_ctx, out_chunk, patch_size, 1);
+            return ltx_unpatchify(ctx->ggml_ctx, out_chunk, patch_size, 1);
         }
 
         ggml_tensor* encode(GGMLRunnerContext* ctx,
@@ -1211,6 +1304,32 @@ namespace LTXVAE {
 struct LTXVideoVAE : public VAE {
     static constexpr int DEFAULT_TEMPORAL_TILE_FRAMES  = 4;
     static constexpr int DEFAULT_TEMPORAL_TILE_OVERLAP = 1;
+
+    // LTX_VAE_WHOLEFRAME (default OFF; the 0.9.x-distilled prod path is untouched when unset):
+    // decode the clip WHOLE-SPATIAL (no spatial tiles -> no screen-door / grid-cross seams) by
+    // driving the existing SEAM-FREE temporal-streaming decode (decode_temporal_tiled_streaming)
+    // directly, bounding only the FRAME count per graph so the whole-spatial activation +
+    // im2col-free cuDNN conv3d workspace fit in budget. This is orthogonal to the spatial
+    // --vae-tiling machinery and to the input rank (the prod temporal path is gated on 5D input;
+    // the t2v latent here is 4D [W,H,T,C]). Pair with GGML_CUDNN_CONV3D=1 (im2col-free conv3d)
+    // and, if a chunk's conv3d workspace exceeds the cap, GGML_CUDNN_CONV3D_WS_MB.
+    //   LTX_VAE_WHOLEFRAME_FRAMES  : latent frames per graph (default 2). Smaller = less VRAM.
+    //   LTX_VAE_WHOLEFRAME_OVERLAP : temporal overlap frames for causal context (default 1).
+    static bool wholeframe_enabled() {
+        static const bool en = [] {
+            const char* s = getenv("LTX_VAE_WHOLEFRAME");
+            return s && s[0] == '1';
+        }();
+        return en;
+    }
+    static int wholeframe_env_int(const char* name, int dflt) {
+        const char* s = getenv(name);
+        if (s == nullptr) {
+            return dflt;
+        }
+        int v = atoi(s);
+        return v > 0 ? v : dflt;
+    }
 
     bool decode_only;
     bool temporal_tiling_enabled = false;
@@ -1311,7 +1430,10 @@ struct LTXVideoVAE : public VAE {
     }
 
     ggml_cgraph* build_graph(const sd::Tensor<float>& z_tensor, bool decode_graph) {
-        ggml_cgraph* gf       = new_graph_custom(20480);
+        // Larger node budget (well under MAX_GRAPH_SIZE=327680): the whole-spatial single-graph
+        // decode with conv3d W/H-tiling (LTX_VAE_CONV3D_WTILES/_HTILES) emits many extra
+        // slice/im2col/concat nodes per tiled conv, so high tile counts overflow the old 20480 cap.
+        ggml_cgraph* gf       = new_graph_custom(131072);
         ggml_tensor* z        = make_input(z_tensor);
         ggml_tensor* timestep = nullptr;
         if (timestep_conditioning) {
@@ -1329,7 +1451,9 @@ struct LTXVideoVAE : public VAE {
     ggml_cgraph* build_temporal_tile_graph(const sd::Tensor<float>& z_chunk_tensor,
                                            int chunk_idx,
                                            int chunk_overlap) {
-        ggml_cgraph* gf       = new_graph_custom(20480);
+        // Larger node budget (see build_graph): a per-tile decode with conv3d W/H-tiling emits many
+        // slice/im2col/concat nodes, so high WTILES/HTILES would overflow the old 20480 cap.
+        ggml_cgraph* gf       = new_graph_custom(131072);
         ggml_tensor* z        = make_input(z_chunk_tensor);
         ggml_tensor* timestep = nullptr;
         if (timestep_conditioning) {
@@ -1411,6 +1535,111 @@ struct LTXVideoVAE : public VAE {
         return output;
     }
 
+    // LTX_VAE_TEMPORAL_BLEND: length-independent decode that bounds the activation FLOOR by
+    // decoding the latent in INDEPENDENT temporal tiles (each a fresh single-graph decode, so the
+    // dominant full-res feature maps only ever span a T-frame tile, not the whole 97-frame clip)
+    // and stitching them with an OVERLAP + quintic-smootherstep feather on the time axis. The blend
+    // is a normalized weighted average (weights per output frame divided out), so each tile-edge
+    // frame -- where the non-causal decoder faked its cross-tile temporal context -- fades out as
+    // the neighbouring tile's interior (real-context) frame fades in, removing the hard seam. Tiles
+    // are decoded independently (feat cache cleared each tile), so this sidesteps the offload
+    // feat_map-cache issue entirely. Only the first tile drop_first-trims (chunk_idx==0), so mid
+    // tiles = f*8 frames and tile0 = f*8-7 (3 temporal upsamples each drop 1); the cumulative
+    // placement uses ACTUAL tile lengths so it self-corrects for that.
+    sd::Tensor<float> decode_temporal_blend(const int n_threads,
+                                            const sd::Tensor<float>& input,
+                                            size_t expected_dim,
+                                            int T, int O) {
+        const int64_t total = input.shape()[2];
+        if (T < 1) { T = 1; }
+        if (O < 1) { O = 1; }
+        if (O >= T) { O = T - 1; }
+        const int64_t stride = std::max<int64_t>(1, (int64_t)T - O);
+
+        struct Tile { sd::Tensor<float> out; int64_t lat_start; int64_t lat_frames; };
+        std::vector<Tile> tiles;
+        for (int64_t start = 0;; start += stride) {
+            const int64_t end = std::min<int64_t>(total, start + T);
+            auto z_tile       = sd::ops::slice(input, 2, start, end);
+            // Independent tile: clear the streamed feat cache (no cross-tile context leak);
+            // chunk_overlap=0 -> decode_tiled_chunk returns the FULL tile (no trim). chunk_idx=start
+            // so drop_first fires only on the true first tile (start==0).
+            free_cache_ctx_and_buffer();
+            cache_tensor_map.clear();
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_temporal_tile_graph(z_tile, static_cast<int>(start), 0);
+            };
+            auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+            if (out.empty()) {
+                free_cache_ctx_and_buffer();
+                cache_tensor_map.clear();
+                return {};
+            }
+            LOG_DEBUG("LTX VAE temporal-blend tile: latent [%lld,%lld) -> %lld out frames",
+                      (long long)start, (long long)end, (long long)out.shape()[2]);
+            tiles.push_back({std::move(out), start, end - start});
+            if (end >= total) { break; }
+        }
+        free_cache_ctx_and_buffer();
+        cache_tensor_map.clear();
+
+        if (tiles.size() == 1) { return std::move(tiles[0].out); }
+
+        // Geometry. factor (temporal upsample, 8) from any non-first tile (no drop => L = f*factor).
+        const auto oshape0    = tiles[0].out.shape();
+        const int64_t plane   = oshape0[0] * oshape0[1];  // W*H (dim0 fastest)
+        const int64_t factor  = tiles[1].out.shape()[2] / tiles[1].lat_frames;
+        const int64_t Ob      = (int64_t)O * factor;       // output-frame overlap band
+
+        std::vector<int64_t> offs(tiles.size(), 0);
+        for (size_t i = 1; i < tiles.size(); ++i) {
+            offs[i] = offs[i - 1] + tiles[i - 1].out.shape()[2] - Ob;
+        }
+        const int64_t G = offs.back() + tiles.back().out.shape()[2];
+
+        auto oshape = oshape0;
+        oshape[2]   = G;
+        sd::Tensor<float> out(oshape);
+        out.fill_(0.0f);
+        const int64_t Cfull = out.numel() / (plane * G);  // channels*batch (dims after frames)
+        std::vector<double> wsum(static_cast<size_t>(G), 0.0);
+
+        auto smoother = [](double x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return x * x * x * (x * (6.0 * x - 15.0) + 10.0); };
+
+        float* dst = out.data();
+        for (size_t i = 0; i < tiles.size(); ++i) {
+            const int64_t L    = tiles[i].out.shape()[2];
+            const bool first   = (i == 0);
+            const bool last    = (i + 1 == tiles.size());
+            const float* src   = tiles[i].out.data();
+            for (int64_t lf = 0; lf < L; ++lf) {
+                const int64_t gf = offs[i] + lf;
+                if (gf < 0 || gf >= G) { continue; }
+                const double lin_in  = first ? 1.0 : (double)lf / (double)Ob;
+                const double lin_out = last ? 1.0 : (double)(L - 1 - lf) / (double)Ob;
+                const double w       = smoother(std::min(std::min(lin_in, lin_out), 1.0));
+                if (w <= 0.0) { continue; }
+                wsum[static_cast<size_t>(gf)] += w;
+                for (int64_t c = 0; c < Cfull; ++c) {
+                    const float* sp = src + plane * lf + plane * L * c;
+                    float* dp       = dst + plane * gf + plane * G * c;
+                    for (int64_t p = 0; p < plane; ++p) { dp[p] += (float)w * sp[p]; }
+                }
+            }
+        }
+        // Normalize each output frame by its accumulated blend weight (proper weighted average).
+        for (int64_t gf = 0; gf < G; ++gf) {
+            const double ws = wsum[static_cast<size_t>(gf)];
+            if (ws <= 1e-9) { continue; }
+            const float inv = (float)(1.0 / ws);
+            for (int64_t c = 0; c < Cfull; ++c) {
+                float* dp = dst + plane * gf + plane * G * c;
+                for (int64_t p = 0; p < plane; ++p) { dp[p] *= inv; }
+            }
+        }
+        return out;
+    }
+
     ggml_cgraph* build_latent_statistics_graph(const sd::Tensor<float>& z_tensor, bool normalize) {
         ggml_cgraph* gf = new_graph_custom(1024);
         ggml_tensor* z  = make_input(z_tensor);
@@ -1445,6 +1674,30 @@ struct LTXVideoVAE : public VAE {
             if (cropped_t != input.shape()[2]) {
                 input = sd::ops::slice(input, 2, 0, cropped_t);
             }
+        }
+        // LTX_VAE_TEMPORAL_BLEND: length-independent, seam-free decode. Decode the latent in
+        // INDEPENDENT temporal tiles (bounds the full-res feature-map floor to a T-frame tile) and
+        // overlap+smootherstep-blend them on the time axis (no hard seam). Tile/overlap in LATENT
+        // frames via LTX_VAE_TBLEND_FRAMES/_OVERLAP (default 4/2). Whole-spatial (pair with
+        // LTX_VAE_CONV3D_WTILES/_HTILES to bound the per-tile im2col). Takes priority over the
+        // whole-frame / temporal-tiling streaming paths.
+        if (decode_graph && input.dim() >= 4 && input.shape()[2] > 1 &&
+            getenv("LTX_VAE_TEMPORAL_BLEND") != nullptr) {
+            const int T = wholeframe_env_int("LTX_VAE_TBLEND_FRAMES", DEFAULT_TEMPORAL_TILE_FRAMES);
+            const int O = wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 2);
+            LOG_INFO("LTX VAE temporal-blend decode: tile=%d overlap=%d latent frames (whole-spatial, feathered)", T, O);
+            return decode_temporal_blend(n_threads, input, expected_dim, T, O);
+        }
+        // Whole-spatial, seam-free decode: force the temporal-streaming path regardless of the
+        // spatial-tiling flag or input rank so the full frame is decoded in one spatial piece
+        // (no seams), with only the frame count bounded per graph. Overrides the tile-frames /
+        // overlap from env for VRAM tuning.
+        if (decode_graph && wholeframe_enabled() && input.dim() >= 4 && input.shape()[2] > 1) {
+            temporal_tile_frames  = wholeframe_env_int("LTX_VAE_WHOLEFRAME_FRAMES", 2);
+            temporal_tile_overlap = wholeframe_env_int("LTX_VAE_WHOLEFRAME_OVERLAP", DEFAULT_TEMPORAL_TILE_OVERLAP);
+            LOG_INFO("LTX VAE whole-spatial decode: temporal_tile_frames=%d overlap=%d (seam-free, no spatial tiles)",
+                     temporal_tile_frames, temporal_tile_overlap);
+            return decode_temporal_tiled_streaming(n_threads, input, expected_dim);
         }
         if (decode_graph && temporal_tiling_enabled && input.dim() == 5 && input.shape()[2] > 1) {
             return decode_temporal_tiled_streaming(n_threads, input, expected_dim);

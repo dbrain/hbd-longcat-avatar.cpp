@@ -1313,38 +1313,104 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                                                 int d2              = 1,
                                                 bool force_prec_f32 = false,
                                                 bool cudnn_hi_prec  = false) {
-    if (force_prec_f32) {
-        ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
+    // One conv call, parameterized on the input and its WIDTH/HEIGHT padding (in ggml_conv_3d's
+    // arg order p0=width/ne0, p1=height/ne1, p2=depth-temporal/ne2), so the same math runs whether
+    // we convolve the whole frame once or one spatial tile at a time.
+    auto conv_once = [&](ggml_tensor* xin, int p0u, int p1u) -> ggml_tensor* {
+        if (force_prec_f32) {
+            ggml_tensor* im2col = ggml_im2col_3d(ctx, w, xin, IC, s0, s1, s2, p0u, p1u, p2, d0, d1, d2, w->type);
+            int64_t OC = w->ne[3] / IC;
+            int64_t N  = xin->ne[3] / IC;
+            ggml_tensor* r = ggml_mul_mat(ctx,
+                                          ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
+                                          ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1] * w->ne[2] * IC, OC));
+            ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+            int64_t OD = im2col->ne[3] / N;
+            r          = ggml_reshape_4d(ctx, r, im2col->ne[1] * im2col->ne[2], OD, N, OC);
+            r          = ggml_cont(ctx, ggml_permute(ctx, r, 0, 1, 3, 2));
+            r          = ggml_reshape_4d(ctx, r, im2col->ne[1], im2col->ne[2], OD, OC * N);
+            return r;
+        } else if (ext_cudnn_conv3d_active() &&
+                   s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1) {
+            // Route to the single-op ggml_conv_3d_direct (GGML_OP_CONV_3D) so the env-gated
+            // cuDNN implicit-GEMM 3D conv (ggml-cuda/conv3d-cudnn.cu) can take it on Blackwell,
+            // skipping the im2col_3d IC*27 HBM blowup. Restricted to stride/dilation 1 (the LTX
+            // VAE CausalConv3d profile, where the cuDNN path is validated cosine 1.0).
+            int64_t OC = w->ne[3] / IC;
+            int64_t N  = xin->ne[3] / IC;
+            return ggml_conv_3d_direct(ctx, w, xin, s0, s1, s2, p0u, p1u, p2, d0, d1, d2, (int)IC, (int)N, (int)OC, cudnn_hi_prec ? 1 : 0);
+        } else {
+            ggml_tensor* r = ggml_conv_3d(ctx, w, xin, IC, s0, s1, s2, p0u, p1u, p2, d0, d1, d2);
+            // conv_3d (im2col + mul_mat) hardcodes an F32 dst; when the activation stream is F16
+            // (LTX_VAE_DECODE_F16), cast each conv output back to F16 so the large feature map is
+            // F16 (for the tiled path this fires per-tile, before the concat, so no F32 full map is
+            // ever materialized). F32 stream (default) is untouched: xin is F32, no cast.
+            if (xin->type == GGML_TYPE_F16 && r->type != GGML_TYPE_F16) {
+                r = ggml_cast(ctx, r, GGML_TYPE_F16);
+            }
+            return r;
+        }
+    };
 
-        int64_t OC = w->ne[3] / IC;
-        int64_t N  = x->ne[3] / IC;
-        x          = ggml_mul_mat(ctx,
-                                  ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[3] * im2col->ne[2] * im2col->ne[1]),
-                                  ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1] * w->ne[2] * IC, OC));
-        ggml_mul_mat_set_prec(x, GGML_PREC_F32);
-
-        int64_t OD = im2col->ne[3] / N;
-        x          = ggml_reshape_4d(ctx, x, im2col->ne[1] * im2col->ne[2], OD, N, OC);
-        x          = ggml_cont(ctx, ggml_permute(ctx, x, 0, 1, 3, 2));
-        x          = ggml_reshape_4d(ctx, x, im2col->ne[1], im2col->ne[2], OD, OC * N);
-    } else if (ext_cudnn_conv3d_active() &&
-               s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1) {
-        // Route to the single-op ggml_conv_3d_direct (GGML_OP_CONV_3D) so the env-gated
-        // cuDNN implicit-GEMM 3D conv (ggml-cuda/conv3d-cudnn.cu) can take it on Blackwell,
-        // skipping the im2col_3d IC*27 HBM blowup. Restricted to stride/dilation 1 (the LTX
-        // VAE CausalConv3d profile, where the cuDNN path is validated cosine 1.0). On a
-        // non-CUDA backend / unsupported shape this op falls back to the CPU conv_3d.
-        int64_t OC = w->ne[3] / IC;
-        int64_t N  = x->ne[3] / IC;
-        // cudnn_hi_prec (WAN_VAE_HEAD_F32 head.2): force an F32 result + F32-IO cuDNN plan so the
-        // conv output isn't fp16-quantized (the unpatchify grid). No im2col, so no IC*27 blowup.
-        x = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC, cudnn_hi_prec ? 1 : 0);
+    // LTX_VAE_CONV3D_WTILES / _HTILES (default 0 = off): bound a whole-spatial conv3d's memory by
+    // tiling the WIDTH (ne0, pad p0) and/or HEIGHT (ne1, pad p1) dims. The im2col column volume
+    // (IC*KW*KH*KD * OD*OH*OW) is what OOMs a single-graph 1216x704 decode (~47 GB); tiling W by
+    // TW and H by TH shrinks the LIVE column buffer to ~1/(TW*TH) — the allocator reuses each
+    // tile's im2col, and the tile outputs are just the normal conv output (a running concat holds
+    // only two operands at a time, so peak stays flat as tile count grows). For the cuDNN path each
+    // tile is a SMALLER shape/workspace too, so shapes the whole-frame conv can't support/fit pass.
+    // Bit-exact to the untiled conv (numpy-verified): zero-pad the tiled dim by its padding ONCE,
+    // then convolve each output tile from the padded slice [t0, t1+K-1) with that dim's padding 0
+    // (identical per-output-pixel column math); concat W tiles along ne0, H tile-rows along ne1.
+    // Stride/dilation-1 only.
+    static const int conv3d_wtiles = [] { const char* e = getenv("LTX_VAE_CONV3D_WTILES"); return e ? atoi(e) : 0; }();
+    static const int conv3d_htiles = [] { const char* e = getenv("LTX_VAE_CONV3D_HTILES"); return e ? atoi(e) : 0; }();
+    const int64_t KW = w->ne[0];  // width kernel
+    const int64_t KH = w->ne[1];  // height kernel
+    const bool s1d1 = (s0 == 1 && s1 == 1 && s2 == 1 && d0 == 1 && d1 == 1 && d2 == 1);
+    const bool tile_w = s1d1 && conv3d_wtiles > 1 && x->ne[0] > (int64_t)conv3d_wtiles * KW;
+    const bool tile_h = s1d1 && conv3d_htiles > 1 && x->ne[1] > (int64_t)conv3d_htiles * KH;
+    if (tile_w || tile_h) {
+        ggml_tensor* xp = x;
+        if (tile_w) xp = ggml_ext_pad_ext(ctx, xp, p0, p0, 0, 0, 0, 0, 0, 0);  // zero-pad WIDTH
+        if (tile_h) xp = ggml_ext_pad_ext(ctx, xp, 0, 0, p1, p1, 0, 0, 0, 0);  // zero-pad HEIGHT
+        const int p0e = tile_w ? 0 : p0;  // per-tile conv padding for a tiled dim is 0 (pre-padded)
+        const int p1e = tile_h ? 0 : p1;
+        const int64_t OH    = tile_h ? (xp->ne[1] - (KH - 1)) : 0;
+        const int64_t hstep = tile_h ? (OH + conv3d_htiles - 1) / conv3d_htiles : 0;
+        ggml_tensor* col    = nullptr;
+        int64_t oh0 = 0;
+        do {
+            int64_t oh1;
+            ggml_tensor* xh;
+            if (tile_h) { oh1 = std::min(OH, oh0 + hstep); xh = ggml_ext_slice(ctx, xp, 1, oh0, oh1 + KH - 1); }
+            else        { oh1 = 0; xh = xp; }
+            const int64_t OW    = tile_w ? (xh->ne[0] - (KW - 1)) : 0;
+            const int64_t wstep = tile_w ? (OW + conv3d_wtiles - 1) / conv3d_wtiles : 0;
+            ggml_tensor* row    = nullptr;
+            int64_t ow0 = 0;
+            do {
+                int64_t ow1;
+                ggml_tensor* xt;
+                if (tile_w) { ow1 = std::min(OW, ow0 + wstep); xt = ggml_ext_slice(ctx, xh, 0, ow0, ow1 + KW - 1); }
+                else        { ow1 = 0; xt = xh; }
+                ggml_tensor* yt = conv_once(xt, p0e, p1e);
+                row = (row == nullptr) ? yt : ggml_concat(ctx, row, yt, 0);  // W tiles along ne0
+                ow0 = ow1;
+            } while (tile_w && ow0 < OW);
+            col = (col == nullptr) ? row : ggml_concat(ctx, col, row, 1);  // H tile-rows along ne1
+            oh0 = oh1;
+        } while (tile_h && oh0 < OH);
+        x = col;
     } else {
-        x = ggml_conv_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2);
+        x = conv_once(x, p0, p1);
     }
 
     if (b != nullptr) {
         b = ggml_reshape_4d(ctx, b, 1, 1, 1, b->ne[0]);  // [OC, 1, 1, 1]
+        // F16 activation stream: match the bias to the (F16) conv output so the broadcast add stays
+        // same-dtype. Only when x is F16 -> the F32 path keeps its exact original add(F32 x, F16 b).
+        if (x->type == GGML_TYPE_F16 && b->type != x->type) { b = ggml_cast(ctx, b, x->type); }
         x = ggml_add_inplace(ctx, x, b);
     }
     return x;
