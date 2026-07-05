@@ -1543,9 +1543,17 @@ struct LTXVideoVAE : public VAE {
     // frame -- where the non-causal decoder faked its cross-tile temporal context -- fades out as
     // the neighbouring tile's interior (real-context) frame fades in, removing the hard seam. Tiles
     // are decoded independently (feat cache cleared each tile), so this sidesteps the offload
-    // feat_map-cache issue entirely. Only the first tile drop_first-trims (chunk_idx==0), so mid
-    // tiles = f*8 frames and tile0 = f*8-7 (3 temporal upsamples each drop 1); the cumulative
-    // placement uses ACTUAL tile lengths so it self-corrects for that.
+    // feat_map-cache issue entirely.
+    //
+    // STRUCTURE-AGNOSTIC frame math (works for any LTX VAE, e.g. 0.9.8's 3 compress_all upsamples
+    // AND the LTX-2.3 22B's compress_all x2 + compress_time + compress_space): the temporal upsample
+    // FACTOR is auto-DERIVED from a decoded mid tile (factor = its out-frames / its latent-frames),
+    // and every placement offset uses the ACTUAL returned tile length. drop_first (chunk_idx==0)
+    // drops one frame per TEMPORAL upsample so tile0 is a few frames shorter than the mid tiles
+    // (0.9.8 & 22B: mid = f*8, tile0 = f*8-7 from 3 temporal upsamples) -- the cumulative-length
+    // placement self-corrects for whatever that shortfall is, so nothing is hardcoded to 8x/3-drops.
+    // (Numpy-verified: exact coverage / total-frame count / identity reconstruction for 8x/3-drop
+    // AND hypothetical 16x/4-drop and mixed-factor structures.)
     sd::Tensor<float> decode_temporal_blend(const int n_threads,
                                             const sd::Tensor<float>& input,
                                             size_t expected_dim,
@@ -1585,7 +1593,8 @@ struct LTXVideoVAE : public VAE {
 
         if (tiles.size() == 1) { return std::move(tiles[0].out); }
 
-        // Geometry. factor (temporal upsample, 8) from any non-first tile (no drop => L = f*factor).
+        // Geometry. factor = temporal upsample, AUTO-DERIVED from any non-first tile (chunk_idx>0
+        // so no drop_first => out-frames == latent-frames * factor). Correct for any VAE structure.
         const auto oshape0    = tiles[0].out.shape();
         const int64_t plane   = oshape0[0] * oshape0[1];  // W*H (dim0 fastest)
         const int64_t factor  = tiles[1].out.shape()[2] / tiles[1].lat_frames;
@@ -1684,7 +1693,7 @@ struct LTXVideoVAE : public VAE {
         if (decode_graph && input.dim() >= 4 && input.shape()[2] > 1 &&
             getenv("LTX_VAE_TEMPORAL_BLEND") != nullptr) {
             const int T = wholeframe_env_int("LTX_VAE_TBLEND_FRAMES", DEFAULT_TEMPORAL_TILE_FRAMES);
-            const int O = wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 2);
+            const int O = wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 1);  // O1 locked 2026-07-05: owner eye-tested seam-free on hard-motion (whip-pan+hummingbird); -41% decode vs O3
             LOG_INFO("LTX VAE temporal-blend decode: tile=%d overlap=%d latent frames (whole-spatial, feathered)", T, O);
             return decode_temporal_blend(n_threads, input, expected_dim, T, O);
         }
