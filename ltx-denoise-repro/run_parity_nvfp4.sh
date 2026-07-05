@@ -38,11 +38,13 @@ OUTROOT="$WT/_ablation_out"; mkdir -p "$OUTROOT"
 RES="${RES:-parity}"
 case "$RES" in
   parity) WBASE=960; HBASE=544 ;;   # -> x2 -> 1920x1088 (Comfy)
-  speed)  WBASE=640; HBASE=352 ;;   # -> x2 -> 1280x704  (our current, ~speed-neutral)
+  mid)    WBASE=832; HBASE=480 ;;   # -> x2 -> 1664x960 (middle)
+  speed)  WBASE=640; HBASE=352 ;;   # -> x2 -> 1280x704  (our current)
   *) echo "RES must be parity|speed"; exit 2 ;;
 esac
 FR="${FR:-121}"; FPS="${FPS:-24}"; SEED="${SEED:-42}"; DEVICE="${DEVICE:-1}"; MAXV="${MAXV:-11}"
 DIT="${DIT:-nvfp4-CLEAN-dev050.gguf}"
+TBF="${TBF:-3}"; TBO="${TBO:-2}"; VWT="${VWT:-16}"; VHT="${VHT:-8}"   # VAE decode tuning levers
 
 # --- schedules: EXACT from wf_comfy_s3_t2v.json ---
 BASE_SIGMAS="1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0.0"   # node 4984, 8 steps
@@ -62,7 +64,7 @@ PRODENV=( -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FF
   -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_PREFETCH_POOL=1
   -e LONGCAT_SHARED_RESIDENT=1 -e LONGCAT_VAE_KEEP_RESIDENT=1 -e LONGCAT_FFN_TILE_TOKENS=4096 -e LONGCAT_ENCODE_MAX_VRAM=6.5 -e LONGCAT_DIT_NO_MMAP=0
   -e LTXAV_END_RENDER_RECLAIM=1 -e LTXAV_CHAIN_POOL_TRIM=1
-  -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_TEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=3 -e LTX_VAE_TBLEND_OVERLAP=2 -e LTX_VAE_CONV3D_WTILES=16 -e LTX_VAE_CONV3D_HTILES=8 -e LTX_VAE_DECODE_F16=1 )
+  -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_TEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=$TBF -e LTX_VAE_TBLEND_OVERLAP=$TBO -e LTX_VAE_CONV3D_WTILES=$VWT -e LTX_VAE_CONV3D_HTILES=$VHT -e LTX_VAE_DECODE_F16=1 )
 
 HIRES="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-steps $REFINE_STEPS --hires-sigmas $REFINE_SIGMAS"
 
