@@ -1262,6 +1262,12 @@ namespace LTXVAE {
             auto decoder   = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
             auto processor = std::dynamic_pointer_cast<PerChannelStatistics>(blocks["per_channel_statistics"]);
             auto latents   = processor->un_normalize(ctx, z);
+            // LTX_VAE_DECODE_F16: same F16 activation-stream cast as the non-tiled decode() (which the
+            // temporal-blend/tiled path never runs). Halves the per-tile feature-map floor (the big
+            // [W,H,f,128] f32 CONCAT buffers) AND feeds F16 into ggml_conv_3d_direct so the cuDNN NDHWC
+            // transpose buffers are F16 too. Cast the output back to F32 before host read-back.
+            const bool f16 = decode_f16_enabled();
+            if (f16) { latents = ggml_cast(ctx->ggml_ctx, latents, GGML_TYPE_F16); }
 
             feat_idx          = 0;
             int chunk_overlap = temporal_tile_overlap;  // modified by forward_tiled_frame temporal inflation
@@ -1270,7 +1276,9 @@ namespace LTXVAE {
             if (chunk_overlap > 0) {
                 out_chunk = ggml_ext_slice(ctx->ggml_ctx, out_chunk, 2, 0, out_chunk->ne[2] - chunk_overlap);
             }
-            return ltx_unpatchify(ctx->ggml_ctx, out_chunk, patch_size, 1);
+            auto out = ltx_unpatchify(ctx->ggml_ctx, out_chunk, patch_size, 1);
+            if (f16 && out->type != GGML_TYPE_F32) { out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32); }
+            return out;
         }
 
         ggml_tensor* encode(GGMLRunnerContext* ctx,
