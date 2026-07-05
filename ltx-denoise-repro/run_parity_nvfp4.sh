@@ -61,7 +61,8 @@ PRODENV=( -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FF
   -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1
   -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_PREFETCH_POOL=1
   -e LONGCAT_SHARED_RESIDENT=1 -e LONGCAT_VAE_KEEP_RESIDENT=1 -e LONGCAT_FFN_TILE_TOKENS=4096 -e LONGCAT_ENCODE_MAX_VRAM=6.5 -e LONGCAT_DIT_NO_MMAP=0
-  -e LTXAV_END_RENDER_RECLAIM=1 -e LTXAV_CHAIN_POOL_TRIM=1 )
+  -e LTXAV_END_RENDER_RECLAIM=1 -e LTXAV_CHAIN_POOL_TRIM=1
+  -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_TEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=3 -e LTX_VAE_TBLEND_OVERLAP=2 -e LTX_VAE_CONV3D_WTILES=16 -e LTX_VAE_CONV3D_HTILES=8 -e LTX_VAE_DECODE_F16=1 )
 
 HIRES="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-steps $REFINE_STEPS --hires-sigmas $REFINE_SIGMAS"
 
@@ -70,7 +71,7 @@ HIRES="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-s
 #   Comfy target = spatial 2x2 tiles, overlap 6, NO temporal tiling.
 #   Current prod (temporal_tile_frames=4) is the coherence-risk to replace.
 #   Leave the line below until TILING-FIX lands its exact flags, then swap it.
-VAE_DECODE="--vae-tiling --vae-relative-tile-size 1x1 --temporal-tiling --extra-tiling-args temporal_tile_frames=4,temporal_tile_overlap=1"
+VAE_DECODE="--vae-tiling --vae-relative-tile-size 1x1"
 # ===========================================================================
 
 echo "=== PARITY nvfp4 ($RES): $DIT ${WBASE}x${HBASE} -> x2  ${FR}f@${FPS}  base=${BASE_STEPS}st refine=${REFINE_STEPS}st ==="
