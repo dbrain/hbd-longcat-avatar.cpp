@@ -667,6 +667,21 @@ void async_job_worker(ServerRuntime& runtime) {
                     output_frame_count     = r.frame_count;
                     output_fps             = r.fps;
                 }
+                // FIX (back-to-back worker collision, 2026-07-07): reap the resident CUDA child
+                // after each chain render so the NEXT render re-forks cold. The warm-reuse fast
+                // path (worker_session ensure_loaded) keeps DiT/VAE resident across renders and
+                // the success path never reaps it, so render N+1 stacks its offload buffers on
+                // N's retained set and the OOM-killer SIGKILLs the child mid-hires — the observed
+                // every-other-render "VIDGEN_CHAIN_RESP recv failed: peer closed cleanly". shutdown()
+                // is idempotent (a dead child is a no-op). Cost: cold weight reload per chain render
+                // (~seconds on a minutes-long render). Env-gated default-ON; LTX_REAP_CHILD_AFTER_RENDER=0
+                // restores the (currently fatal) warm-reuse path. See WORKER-ISOLATION-BACKTOBACK-BUG.md.
+                {
+                    const char * reap = getenv("LTX_REAP_CHILD_AFTER_RENDER");
+                    if ((!reap || reap[0] != '0') && runtime.worker) {
+                        runtime.worker->shutdown();
+                    }
+                }
             } else {
                 // flux2 image-isolation parent has no sd_ctx and isn't an LTX video server.
                 error_message = "vid_gen not supported under flux2 image isolation";
