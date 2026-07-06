@@ -9327,6 +9327,28 @@ static void ltxav_exposure_match(const sd_image_t* prev_tail, int n_prev,
     }
 }
 
+// Seam cross-dissolve (env LTXAV_SEAM_CROSSFADE=<W frames>, default 0=off). The auto-trim leaves a
+// residual "skip" at the join (seg N+1's re-rendered overlap phase-shifts from seg N's tail). Instead
+// of a hard cut, fade the last W frames of `stitched` (seg N's tail) toward seg N+1's re-rendered
+// overlap frames [drop-W, drop) — which cover the SAME timeline window and are about to be discarded —
+// with a smootherstep alpha 0->1. Turns the content skip into a short dissolve. Frames must match dims.
+static void ltxav_seam_crossfade(std::vector<sd_image_t>& stitched, const sd_image_t* seg_video,
+                                 int drop, int W) {
+    if (W <= 0 || seg_video == nullptr || (int)stitched.size() < W || drop < W) { return; }
+    for (int j = 0; j < W; ++j) {
+        sd_image_t&       dst = stitched[stitched.size() - (size_t)W + j];
+        const sd_image_t& src = seg_video[drop - W + j];
+        if (dst.data == nullptr || src.data == nullptr ||
+            dst.width != src.width || dst.height != src.height || dst.channel != src.channel) { continue; }
+        double x = (double)(j + 1) / (double)(W + 1);
+        double a = x * x * x * (x * (6.0 * x - 15.0) + 10.0);  // smootherstep 0->1
+        size_t n = (size_t)dst.width * dst.height * dst.channel;
+        for (size_t p = 0; p < n; ++p) {
+            dst.data[p] = (uint8_t)std::lround((1.0 - a) * (double)dst.data[p] + a * (double)src.data[p]);
+        }
+    }
+}
+
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,
                                  const sd_vid_chain_params_t* chain_params,
@@ -9660,6 +9682,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (seg > 0 && !stitched.empty() && seg_count - drop > 0) {
             ltxav_exposure_match(stitched.data(), (int)stitched.size(),
                                  seg_video + drop, seg_count - drop);
+        }
+        // Seam cross-dissolve (opt-in): fade stitched's tail toward this segment's re-rendered overlap
+        // so the join dissolves instead of hard-cutting. Runs AFTER exposure-match, BEFORE the discard.
+        if (const char* e = getenv("LTXAV_SEAM_CROSSFADE"); e != nullptr && seg > 0 && !stitched.empty()) {
+            ltxav_seam_crossfade(stitched, seg_video, drop, atoi(e));
         }
         for (int i = 0; i < seg_count; ++i) {
             if (i < drop) {
