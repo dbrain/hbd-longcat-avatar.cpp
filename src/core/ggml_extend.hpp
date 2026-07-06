@@ -4392,6 +4392,13 @@ protected:
 public:
     void release_streaming_residency() {
         restore_resident_params();
+        // FIX (1080p chain seg-2 crash): reset the monotonic streaming budget so a later COLD
+        // re-offload (e.g. the next chain segment, after LTXAV_DIT_FREE_DURING_DECODE freed the DiT)
+        // re-plans the graph cut against REAL free VRAM — not the inflated budget this runner credited
+        // to itself while resident. A stale budget over-plans the cut -> board overrun -> silent child
+        // death at seg-2 base. Only the free_params_buffer() path reset this before; a warm chain never
+        // calls it. See CONTINUATION-1080P-HIRES-CRASH.md.
+        observed_max_effective_budget_ = 0;
     }
 
     template <typename T>
@@ -4766,6 +4773,9 @@ public:
         // (restore_resident_params already zeroed resident_state_token / resident_param_set).
         cached_shared_resident_set_.clear();
         cached_shared_resident_sig_ = 0;
+        // FIX (1080p chain seg-2 crash): drop the stale monotonic streaming budget too, so the next
+        // cold re-offload re-plans against real free VRAM (see release_streaming_residency).
+        observed_max_effective_budget_ = 0;
     }
 
     // True when the params live on a DIFFERENT backend than compute (i.e. --offload-to-cpu):
