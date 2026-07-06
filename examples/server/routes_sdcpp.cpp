@@ -746,6 +746,14 @@ static void sdcpp_handle_unload(ServerRuntime& rt, const httplib::Request& req, 
         rt.worker->shutdown();
         if (swap) {
             swap->loaded.store(false);
+            // Clear the drain flag: the child is dead and VRAM is reclaimed, so drain
+            // has served its purpose (hold new jobs until in-flight finished ahead of
+            // the unload). Leaving it set wedges the service — the generate guards
+            // (routes_ltx:96, routes_wan:66, sdcpp:466) hard-503 while draining, which
+            // blocks the very request that would lazily re-spawn the child. The gate
+            // does drain->unload but never /load, so nothing else clears it. Mirrors
+            // sdcpp_handle_load().
+            swap->draining.store(false);
         }
         res.set_content(json({
                                 {"status",   was_loaded ? "unloaded" : "idle"},
@@ -767,7 +775,8 @@ static void sdcpp_handle_unload(ServerRuntime& rt, const httplib::Request& req, 
         sd_ctx_free_diffusion_model(rt.sd_ctx);
     }
     if (swap) {
-        swap->loaded.store(false);  // next render forces a reload of loaded_variant
+        swap->loaded.store(false);     // next render forces a reload of loaded_variant
+        swap->draining.store(false);   // reopen for lazy reload (see worker branch above)
     }
     res.set_content(json({
                             {"status",   was_loaded ? "unloaded" : "idle"},

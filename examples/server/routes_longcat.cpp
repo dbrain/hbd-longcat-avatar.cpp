@@ -426,6 +426,12 @@ static void handle_unload(const httplib::Request& req, httplib::Response& res,
     if (ctx.worker) {
         ctx.worker->shutdown();
     }
+    // Clear the drain flag now the worker is dead + VRAM reclaimed: drain's job was to
+    // hold new renders until in-flight finished ahead of the unload. Leaving it set
+    // wedges the service — the generate guard (:153) hard-503s while draining, blocking
+    // the request that would re-spawn the worker. The gate does drain->unload but never
+    // /load, so nothing else clears it. Mirrors handle_load().
+    ctx.state.draining.store(false);
     res.set_content(json({
         {"status", was_loaded ? "unloaded" : "idle"},
         {"unloaded", was_loaded},
