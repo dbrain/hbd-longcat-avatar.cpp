@@ -8432,6 +8432,25 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
 
     if (sd_vid_gen_params->init_image.data == nullptr &&
         sd_vid_gen_params->end_image.data == nullptr) {
+        // No image conditioning to re-apply in the refine. For an AUDIO-DRIVEN LTXAV render
+        // (latents.audio_fixed) the stage-2 refine must still PIN the driving-audio slot
+        // (mask=0) every step, exactly like stage-1 (:7793-7801) and the relip stage-2 path
+        // (:8417) — otherwise the empty hires denoise_mask lets stage-2 re-denoise the driving
+        // audio and washes out the lip-sync stage-1 established. Build a full-generated video
+        // mask (1.0) + audio-pinned mask when a packed audio slot is present. Gated on
+        // audio_fixed so t2v/i2v and no-drive LTXAV renders keep the empty-mask path (unchanged).
+        if (sd_version_is_ltxav(sd_ctx->sd->version) && latents.audio_fixed) {
+            int lat_ch = sd_ctx->sd->get_latent_channel();
+            if (latent->shape()[3] > lat_ch) {
+                sd::Tensor<float> video_latent = sd::ops::slice(*latent, 3, 0, lat_ch);
+                sd::Tensor<float> audio_latent = unpack_ltxav_audio_latent(*latent, latents.audio_length, lat_ch);
+                if (!audio_latent.empty()) {
+                    sd::Tensor<float> video_mask = make_ltxav_video_denoise_mask(video_latent, 1.f);
+                    *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent,
+                                                                           latents.audio_fixed ? 0.0f : 1.0f);
+                }
+            }
+        }
         return true;
     }
     if (sd_ctx->sd->vae_decode_only) {
@@ -8515,7 +8534,11 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
 
     if (!audio_latent.empty()) {
         *latent       = pack_ltxav_audio_and_video_latents(video_latent, audio_latent);
-        *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent);
+        // Pin the driving-audio slot (mask=0) when audio_fixed, mirroring stage-1 (:7800) and the
+        // relip stage-2 path (:8417); the default 1.0 (generated) let the refine denoise the driving
+        // audio and drop lip-sync. No-drive renders have audio_fixed=false -> 1.0 = unchanged.
+        *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent,
+                                                                latents.audio_fixed ? 0.0f : 1.0f);
     } else {
         *latent       = std::move(video_latent);
         *denoise_mask = std::move(video_mask);
