@@ -75,8 +75,8 @@ cat <<'VAEAB'
 <p class=sub>Both clean in a STILL; the difference is IN MOTION. <b>temporal</b> = our old default (97f chopped into 11 time-tiles → ghosting on crowds/pans). <b>spatial</b> = comfy-style feathered spatial tiles, ALL frames per tile, NO temporal chop (seam-free). <b>2×2 + F16</b> is the candidate lock-in: fastest tiling (316s) + offload eviction (VAE freed during sampling, DiT freed during decode) + conv3d 32×16 → peak <b>11670MB, under the 11.5GB cap</b>. Watch background crowds / the far cars for phase/ghost, and compare 2×2 vs 4×4 for any spatial-tile seam.</p>
 <div class=row>
  <figure><video src="clips/AB_imatrix_matched_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>temporal tiling</b> (old)</figcaption></figure>
- <figure class=win><video src="clips/AB_imatrix_spatial_2x2_ov4_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 2×2 ov4</b> (283s · 11164MB · seam?)</figcaption></figure>
- <figure class=win><video src="clips/AB_imatrix_spatial_2x2_f16_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 2×2 conv32×16 ov6</b> (316s · 11670MB)</figcaption></figure>
+ <figure class=win style="border-color:#3a8a3a;border-width:2px"><video src="clips/AB_imatrix_spatial_2x2_ov4_s3_42.mp4" controls loop playsinline muted></video><figcaption>✅ <b>LOCKED — spatial 2×2 ov4</b> (283s · 11164MB · seam-free)</figcaption></figure>
+ <figure class=win><video src="clips/AB_imatrix_spatial_2x2_f16_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 2×2 conv32×16 ov6</b> (316s · 11670MB · fallback)</figcaption></figure>
  <figure class=win><video src="clips/AB_imatrix_spatial_f16_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 4×4 + F16</b> (more tiles)</figcaption></figure>
  <figure class=win><video src="clips/AB_imatrix_spatial_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 4×4</b> F32 (older)</figcaption></figure>
  <figure class=ref><video src="clips/COMFY_s3_seed101.mp4" controls loop playsinline muted></video><figcaption>comfy (ref)</figcaption></figure>
