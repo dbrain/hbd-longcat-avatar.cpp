@@ -382,6 +382,16 @@ typedef struct {
     int clip_skip;
     sd_image_t init_image;
     sd_image_t end_image;
+    // LTXAV MULTI-KEYFRAME conditioning: arbitrary (image, video-frame-index) guide pairs
+    // pinned as frozen 1-frame conditioning frames on the target timeline. Generalises the
+    // single start/end i2v pins (init_image @ frame 0, end_image @ frames-1) to N caller-placed
+    // keyframes: keyframes[i] is applied at keyframe_frame_indices[i], a VIDEO (pixel) frame
+    // index in [0, video_frames) — the same unit end_image uses. Only consumed on the LTXAV
+    // path; a size of 0 (the default) leaves the single-image i2v / t2v / continuation paths
+    // byte-identical.
+    sd_image_t* keyframes;
+    int*        keyframe_frame_indices;
+    int         keyframes_size;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;

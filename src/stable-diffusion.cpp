@@ -3868,6 +3868,9 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_anchor_path                      = nullptr;
     sd_vid_gen_params->cont_latent                           = nullptr;
     sd_vid_gen_params->cont_latent_frames                    = 0;
+    sd_vid_gen_params->keyframes                             = nullptr;
+    sd_vid_gen_params->keyframe_frame_indices                = nullptr;
+    sd_vid_gen_params->keyframes_size                        = 0;
     sd_vid_gen_params->audio_frame_offset                    = 0;
     sd_vid_gen_params->cont_ref_latent                       = nullptr;
     sd_vid_gen_params->cont_ref_img_index                    = 10;
@@ -4663,6 +4666,62 @@ static sd::Tensor<float> build_ltxv_video_positions(int64_t width,
         if (keyframe_pixel_frames == 1) {
             t_end = t_start + 1.f;
         }
+        t_start /= static_cast<float>(fps);
+        t_end /= static_cast<float>(fps);
+        for (int64_t h = 0; h < height; h++) {
+            float h_start = static_cast<float>(h * spatial_scale);
+            float h_end   = static_cast<float>((h + 1) * spatial_scale);
+            for (int64_t w = 0; w < width; w++) {
+                float w_start = static_cast<float>(w * spatial_scale);
+                float w_end   = static_cast<float>((w + 1) * spatial_scale);
+                set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
+            }
+        }
+    }
+
+    return positions;
+}
+
+// LTX-2.3 MULTI-KEYFRAME positions. Generalises build_ltxv_video_positions (target block + a
+// single keyframe block) to N single-latent-frame keyframe blocks, each pinned at its own target
+// latent frame index. Token order is: the full target (denoised) block first, then one 1-frame
+// keyframe block per conditioning image in keyframe_frame_indices order — matching the init_latent
+// concat order in the caller so positions line up token-for-token. Each keyframe uses a single
+// pixel-frame temporal extent ([idx, idx+1)/fps), identical to build_ltxv_video_positions' keyframe
+// block with keyframe_pixel_frames==1.
+static sd::Tensor<float> build_ltxv_multi_keyframe_video_positions(int64_t width,
+                                                                   int64_t height,
+                                                                   int64_t target_latent_frames,
+                                                                   const std::vector<int>& keyframe_frame_indices,
+                                                                   int fps,
+                                                                   int spatial_scale,
+                                                                   int temporal_scale,
+                                                                   bool causal_temporal_positioning) {
+    GGML_ASSERT(width > 0 && height > 0 && target_latent_frames > 0);
+    GGML_ASSERT(fps > 0);
+
+    int64_t n_keyframes  = static_cast<int64_t>(keyframe_frame_indices.size());
+    int64_t total_tokens = width * height * (target_latent_frames + n_keyframes);
+    sd::Tensor<float> positions({2, 3, total_tokens, 1});
+    int64_t token = 0;
+
+    for (int64_t t = 0; t < target_latent_frames; t++) {
+        float t_start = ltxv_latent_corner_to_pixel_frame(t, temporal_scale, causal_temporal_positioning) / static_cast<float>(fps);
+        float t_end   = ltxv_latent_corner_to_pixel_frame(t + 1, temporal_scale, causal_temporal_positioning) / static_cast<float>(fps);
+        for (int64_t h = 0; h < height; h++) {
+            float h_start = static_cast<float>(h * spatial_scale);
+            float h_end   = static_cast<float>((h + 1) * spatial_scale);
+            for (int64_t w = 0; w < width; w++) {
+                float w_start = static_cast<float>(w * spatial_scale);
+                float w_end   = static_cast<float>((w + 1) * spatial_scale);
+                set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
+            }
+        }
+    }
+
+    for (int64_t k = 0; k < n_keyframes; k++) {
+        float t_start = static_cast<float>(keyframe_frame_indices[k]);
+        float t_end   = t_start + 1.f;  // single pixel-frame extent (keyframe_pixel_frames == 1)
         t_start /= static_cast<float>(fps);
         t_end /= static_cast<float>(fps);
         for (int64_t h = 0; h < height; h++) {
@@ -6488,6 +6547,89 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             }
             int64_t t2 = ggml_time_ms();
             LOG_INFO("encode_first_stage (relip reference) completed, taking %" PRId64 " ms", t2 - t1);
+        } else if (sd_vid_gen_params->keyframes != nullptr && sd_vid_gen_params->keyframes_size > 0) {
+            // LTXAV MULTI-KEYFRAME conditioning: arbitrary (image, latent-frame-index) pairs pinned
+            // as frozen 1-frame guides on the target timeline. Generalises the start/end i2v path
+            // (one image at latent idx 0, optionally one at frames-1) to N caller-placed images.
+            // Each keyframe is VAE-encoded to a 1-frame latent, appended after the target block,
+            // held via the denoise mask, and given its own frame_idx RoPE position; the DiT
+            // interpolates the generated (denoised) frames between the pinned keyframes. Placed
+            // BEFORE the single start/end branch so keyframes_size==0 leaves i2v/t2v untouched.
+            if (sd_ctx->sd->vae_decode_only) {
+                LOG_ERROR("LTXAV keyframe conditioning requires VAE encoder weights; create the context with vae_decode_only=false");
+                return std::nullopt;
+            }
+
+            int64_t t1          = ggml_time_ms();
+            latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+
+            float conditioning_strength = std::clamp(request->strength, 0.f, 1.f);
+            float conditioned_mask      = 1.0f - conditioning_strength;
+            latents.denoise_mask        = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+
+            int64_t target_lat_frames        = latents.init_latent.shape()[2];
+            latents.video_target_frame_count = target_lat_frames;
+
+            // frame_idx is a VIDEO (pixel) frame index on the shared timeline — the SAME unit the
+            // end-image i2v path uses (it pins at request->frames - 1) and the unit
+            // build_ltxv_video_positions expects for keyframe_frame_idx (added to pixel-corner
+            // values, then /fps). Validate against the pixel frame count, not the latent count.
+            std::vector<int> keyframe_positions;  // one entry per appended keyframe latent frame
+            int64_t          appended_frames = 0;
+            for (int i = 0; i < sd_vid_gen_params->keyframes_size; ++i) {
+                int frame_idx = sd_vid_gen_params->keyframe_frame_indices != nullptr
+                                    ? sd_vid_gen_params->keyframe_frame_indices[i]
+                                    : 0;
+                if (frame_idx < 0 || frame_idx >= request->frames) {
+                    LOG_ERROR("LTXAV keyframe %d frame index %d out of range [0, %d) video frames",
+                              i, frame_idx, request->frames);
+                    return std::nullopt;
+                }
+                if (sd_vid_gen_params->keyframes[i].data == nullptr) {
+                    LOG_ERROR("LTXAV keyframe %d has null image data", i);
+                    return std::nullopt;
+                }
+                sd::Tensor<float> kf_image = sd_image_to_tensor(sd_vid_gen_params->keyframes[i], request->width, request->height);
+                auto kf_latent = encode_ltxav_condition_image(sd_ctx, kf_image, "keyframe");
+                if (kf_latent.empty()) {
+                    return std::nullopt;
+                }
+                if (kf_latent.shape()[0] != latents.init_latent.shape()[0] ||
+                    kf_latent.shape()[1] != latents.init_latent.shape()[1] ||
+                    kf_latent.shape()[3] != latents.init_latent.shape()[3]) {
+                    LOG_ERROR("invalid LTXAV keyframe %d latent shape", i);
+                    return std::nullopt;
+                }
+                int64_t kf_frames    = kf_latent.shape()[2];
+                latents.init_latent  = sd::ops::concat(latents.init_latent, kf_latent, 2);
+                auto kf_mask         = sd::full<float>({kf_latent.shape()[0],
+                                                        kf_latent.shape()[1],
+                                                        kf_frames,
+                                                        1,
+                                                        1},
+                                               conditioned_mask);
+                latents.denoise_mask = sd::ops::concat(latents.denoise_mask, kf_mask, 2);
+                for (int64_t f = 0; f < kf_frames; ++f) {
+                    keyframe_positions.push_back(frame_idx);
+                }
+                appended_frames += kf_frames;
+                LOG_INFO("LTXAV keyframe %d/%d pinned at video frame %d (%lld latent frame(s), strength=%.2f)",
+                         i + 1, sd_vid_gen_params->keyframes_size, frame_idx, (long long)kf_frames, conditioning_strength);
+            }
+
+            latents.video_conditioning_frame_count = appended_frames;
+            latents.video_positions = build_ltxv_multi_keyframe_video_positions(latents.init_latent.shape()[0],
+                                                                                latents.init_latent.shape()[1],
+                                                                                target_lat_frames,
+                                                                                keyframe_positions,
+                                                                                request->fps,
+                                                                                request->vae_scale_factor,
+                                                                                8,
+                                                                                true);
+
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("encode_first_stage (%d keyframes) completed, taking %" PRId64 " ms",
+                     sd_vid_gen_params->keyframes_size, t2 - t1);
         } else if (!start_image.empty() || !end_image.empty()) {
             if (sd_ctx->sd->vae_decode_only) {
                 LOG_ERROR("LTXAV image conditioning requires VAE encoder weights; create the context with vae_decode_only=false");
@@ -9349,6 +9491,88 @@ static void ltxav_seam_crossfade(std::vector<sd_image_t>& stitched, const sd_ima
     }
 }
 
+// LATENT-SPACE per-channel affine continuity-match (anti-drift, pixel-free). The in-process
+// chain carries a video-latent tail (cont_buf) from segment to segment; over a long chain the
+// tail's per-channel colour/exposure statistics drift, and because each segment conditions on the
+// PRIOR tail the drift compounds. These two helpers capture SEG-0's per-channel mean/std as the
+// reference and remap each later segment's tail back onto those stats BEFORE it conditions the
+// next segment, so drift can't accumulate — the latent analogue of continuity_match_segment
+// (examples/cli/main.cpp), but on the 128 latent channels instead of RGB pixels (no VAE decode/
+// re-encode). The tail layout is [Wl, Hl, Kf, Cv] contiguous (W fastest, channel slowest), so
+// channel c occupies the contiguous block [c*Wl*Hl*Kf, (c+1)*Wl*Hl*Kf).
+static void ltxav_compute_latent_channel_stats(const float*        buf,
+                                               int                 Wl,
+                                               int                 Hl,
+                                               int                 Kf,
+                                               int                 Cv,
+                                               std::vector<float>& mean,
+                                               std::vector<float>& std_out) {
+    mean.assign(Cv, 0.f);
+    std_out.assign(Cv, 0.f);
+    const size_t block = (size_t)Wl * (size_t)Hl * (size_t)Kf;  // elements per channel
+    if (block == 0) {
+        return;
+    }
+    for (int c = 0; c < Cv; ++c) {
+        const float* p = buf + (size_t)c * block;
+        double       s = 0.0, s2 = 0.0;
+        for (size_t i = 0; i < block; ++i) {
+            double x = p[i];
+            s += x;
+            s2 += x * x;
+        }
+        double m   = s / (double)block;
+        double var = s2 / (double)block - m * m;
+        mean[c]    = (float)m;
+        // Guard std with an epsilon (latents are unbounded; mirror the pixel version's shape).
+        std_out[c] = (float)(var > 1e-8 ? std::sqrt(var) : 1e-4);
+    }
+}
+
+static void ltxav_latent_channel_affine_match(float*                    tail,
+                                              int                       Wl,
+                                              int                       Hl,
+                                              int                       Kf,
+                                              int                       Cv,
+                                              const std::vector<float>& ref_mean,
+                                              const std::vector<float>& ref_std,
+                                              float                     strength) {
+    const size_t block = (size_t)Wl * (size_t)Hl * (size_t)Kf;  // elements per channel
+    if (block == 0 || (int)ref_mean.size() < Cv || (int)ref_std.size() < Cv) {
+        return;
+    }
+    float g0 = 0.f, b0 = 0.f;  // channel-0 sample for logging
+    for (int c = 0; c < Cv; ++c) {
+        float* p = tail + (size_t)c * block;
+        // this segment's tail stats for channel c
+        double s = 0.0, s2 = 0.0;
+        for (size_t i = 0; i < block; ++i) {
+            double x = p[i];
+            s += x;
+            s2 += x * x;
+        }
+        double tm  = s / (double)block;
+        double tvar = s2 / (double)block - tm * tm;
+        double tstd = tvar > 1e-8 ? std::sqrt(tvar) : 1e-4;
+        // affine map onto the reference: out = ref_mean + (x - tail_mean)*(ref_std/tail_std),
+        // blended toward identity by `strength` (mirrors continuity_match_segment exactly).
+        double gain_raw = (double)ref_std[c] / tstd;
+        double bias_raw = (double)ref_mean[c] - tm * gain_raw;
+        double gain     = 1.0 + (double)strength * (gain_raw - 1.0);
+        double bias     = (double)strength * bias_raw;
+        if (c == 0) {
+            g0 = (float)gain;
+            b0 = (float)bias;
+        }
+        // No clamping: latents are unbounded (unlike uint8 pixels).
+        for (size_t i = 0; i < block; ++i) {
+            p[i] = (float)((double)p[i] * gain + bias);
+        }
+    }
+    LOG_INFO("generate_video_chain: latent channel-affine continuity-match applied (strength=%.2f, ch0 gain=%.4f bias=%.4f)",
+             strength, g0, b0);
+}
+
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,
                                  const sd_vid_chain_params_t* chain_params,
@@ -9422,8 +9646,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // Prior segment's captured video-channel-only latent tail, ggml-ne order
     // [Wl, Hl, K, Cv] contiguous (W fastest, channel slowest), fed as cont_latent.
     std::vector<float>      cont_buf;
+    int                     cont_Wl = 0, cont_Hl = 0, cont_Cv = 0;  // cont_buf spatial dims + channel count
     std::vector<sd_image_t> stitched;   // adopts each kept frame's .data
     ChainAudioAcc           audio_acc;  // per-segment audio stitched onto one timeline
+
+    // FEATURE A — latent-space per-channel affine continuity-match (anti-drift, opt-in). Capture
+    // SEG-0's per-channel latent mean/std as the reference, then remap every later segment's tail
+    // onto those stats before it conditions the next segment so colour/exposure drift can't
+    // compound over a long chain. Purely in latent space (no VAE roundtrip). Default OFF; enable
+    // with LTXAV_CONT_LATENT_MATCH, blend strength via LTXAV_CONT_MATCH_STRENGTH (0..1, default 1).
+    std::vector<float>       ref_mean, ref_std;
+    bool                     ref_ready       = false;
+    static const bool        latent_match_on = getenv("LTXAV_CONT_LATENT_MATCH") != nullptr;
+    float                    latent_match_strength = 1.0f;
+    if (const char* e = getenv("LTXAV_CONT_MATCH_STRENGTH")) {
+        latent_match_strength = std::clamp((float)atof(e), 0.f, 1.f);
+    }
 
     // ── Resume: skip segments [0, resume_from) by reloading their banked artifacts ──
     // Rebuild the prefix frames by VAE-decoding the banked seg_<i>.bin latents (cheap, no
@@ -9495,6 +9733,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                         std::memcpy(dst, src, plane * sizeof(float));
                     }
                 }
+                cont_Wl = lw;
+                cont_Hl = lh;
+                cont_Cv = cv;
                 K         = keep;
                 start_seg = resume_k;
             } catch (const std::exception& e) {
@@ -9606,6 +9847,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                     }
                 }
                 free(reenc);
+                cont_Wl    = rlw;
+                cont_Hl    = rlh;
+                cont_Cv    = cv;
                 K          = keep;
                 reencoded  = true;
                 LOG_INFO("generate_video_chain: cont via VAE RE-ENCODE of last %d px frames -> %d cond latents (drift sink)",
@@ -9639,9 +9883,30 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                     std::memcpy(dst, src, plane * sizeof(float));
                 }
             }
+            cont_Wl = lw;
+            cont_Hl = lh;
+            cont_Cv = cv;
             K = keep;  // K passed to the next segment must equal the frames actually captured
         }
         free(lat_out);
+
+        // FEATURE A: capture SEG-0's per-channel latent stats as the anti-drift reference, and
+        // (seg>0) remap this segment's freshly-captured tail onto them BEFORE it conditions the
+        // next segment at the top of the following iteration. Runs only when the tail was actually
+        // (re)filled this segment (want_latent) and the dims are known.
+        if (want_latent && !cont_buf.empty() && cont_Wl > 0 && cont_Hl > 0 && cont_Cv > 0 && K > 0) {
+            if (seg == 0 && !ref_ready) {
+                ltxav_compute_latent_channel_stats(cont_buf.data(), cont_Wl, cont_Hl, K, cont_Cv, ref_mean, ref_std);
+                ref_ready = true;
+                if (latent_match_on) {
+                    LOG_INFO("generate_video_chain: captured seg-0 latent channel reference stats (%d channels) for continuity-match",
+                             cont_Cv);
+                }
+            } else if (seg > 0 && ref_ready && latent_match_on) {
+                ltxav_latent_channel_affine_match(cont_buf.data(), cont_Wl, cont_Hl, K, cont_Cv,
+                                                  ref_mean, ref_std, latent_match_strength);
+            }
+        }
 
         // Stitch: seg0 keeps all frames. For seg>0 the LEGACY head-placement path re-renders
         // the overlap at the head and must drop it (overlap_px); the keyframe-append path

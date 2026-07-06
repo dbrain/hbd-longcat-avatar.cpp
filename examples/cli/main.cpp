@@ -745,6 +745,18 @@ int main(int argc, const char* argv[]) {
         }
     }
 
+    if (gen_params.keyframe_paths.size() > 0) {
+        vae_decode_only = false;
+        gen_params.keyframe_images.clear();
+        for (auto& path : gen_params.keyframe_paths) {
+            SDImageOwner kf_image({0, 0, 3, nullptr});
+            if (!load_image_and_update_size(path, kf_image)) {
+                return 1;
+            }
+            gen_params.keyframe_images.push_back(std::move(kf_image));
+        }
+    }
+
     if (gen_params.ref_image_paths.size() > 0) {
         vae_decode_only = false;
         gen_params.ref_images.clear();

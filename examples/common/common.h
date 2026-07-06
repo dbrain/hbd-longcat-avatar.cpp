@@ -202,6 +202,10 @@ struct SDGenerationParams {
     std::string mask_image_path;
     std::string control_image_path;
     std::vector<std::string> ref_image_paths;
+    // LTXAV multi-keyframe conditioning (--keyframe PATH@FRAME, repeatable): image paths and their
+    // VIDEO (pixel) frame indices in [0, video_frames), applied as frozen 1-frame guides.
+    std::vector<std::string> keyframe_paths;
+    std::vector<int>         keyframe_indices;
     std::string control_video_path;
     std::string audio_path;  // LongCat-Avatar audio-driven lip-sync (16kHz mono wav)
     std::string drive_audio_path;  // LTX-2.3 audio-driven lip-sync (16kHz wav, needs encoder -ENC audio-vae)
@@ -277,6 +281,7 @@ struct SDGenerationParams {
     // Owned execution payload.
     SDImageOwner init_image;
     SDImageOwner end_image;
+    std::vector<SDImageOwner> keyframe_images;  // LTXAV multi-keyframe owned images
     std::vector<SDImageOwner> ref_images;
     SDImageOwner mask_image;
     SDImageOwner control_image;
@@ -287,6 +292,7 @@ struct SDGenerationParams {
     std::vector<sd_image_t> ref_image_views;
     std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
+    std::vector<sd_image_t> keyframe_views;  // backing storage for sd_vid_gen_params_t.keyframes
 
     SDGenerationParams();
     SDGenerationParams(const SDGenerationParams& other)                = default;

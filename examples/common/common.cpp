@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -1321,6 +1322,31 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_keyframe_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        // Format: PATH@FRAME — the '@FRAME' suffix (target latent frame index) is required.
+        std::string arg = argv[index];
+        size_t at = arg.rfind('@');
+        if (at == std::string::npos || at == 0 || at + 1 >= arg.size()) {
+            fprintf(stderr, "error: --keyframe expects PATH@FRAME (e.g. face.png@12); got '%s'\n", arg.c_str());
+            return -1;
+        }
+        std::string path = arg.substr(0, at);
+        std::string frame_str = arg.substr(at + 1);
+        errno = 0;
+        char* endp = nullptr;
+        long frame = std::strtol(frame_str.c_str(), &endp, 10);
+        if (endp == frame_str.c_str() || *endp != '\0' || errno != 0 || frame < 0) {
+            fprintf(stderr, "error: --keyframe frame index must be a non-negative integer; got '%s'\n", frame_str.c_str());
+            return -1;
+        }
+        keyframe_paths.push_back(path);
+        keyframe_indices.push_back((int)frame);
+        return 1;
+    };
+
     auto on_cache_mode_arg = [&](int argc, const char** argv, int index) {
         if (++index >= argc) {
             return -1;
@@ -1451,6 +1477,11 @@ ArgOptions SDGenerationParams::get_options() {
          "--ref-image",
          "reference image for Flux Kontext models (can be used multiple times)",
          on_ref_image_arg},
+        {"",
+         "--keyframe",
+         "LTXAV multi-keyframe conditioning: PATH@FRAME pins an image at VIDEO frame index FRAME "
+         "(0-based, < --video-frames) as a frozen guide (repeatable). e.g. --keyframe a.png@0 --keyframe b.png@48",
+         on_keyframe_arg},
         {"",
          "--cache-mode",
          "caching method: 'easycache' (DiT), 'ucache' (UNET), 'dbcache'/'taylorseer'/'cache-dit' (DiT block-level), 'spectrum' (UNET/DiT Chebyshev+Taylor forecasting)",
@@ -2450,6 +2481,12 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
         control_frame_views.push_back(frame.get());
     }
 
+    keyframe_views.clear();
+    keyframe_views.reserve(keyframe_images.size());
+    for (auto& kf : keyframe_images) {
+        keyframe_views.push_back(kf.get());
+    }
+
     sample_params.guidance.slg.layers                 = skip_layers.empty() ? nullptr : skip_layers.data();
     sample_params.guidance.slg.layer_count            = skip_layers.size();
     high_noise_sample_params.guidance.slg.layers      = high_noise_skip_layers.empty() ? nullptr : high_noise_skip_layers.data();
@@ -2468,6 +2505,9 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.clip_skip                 = clip_skip;
     params.init_image                = init_image.get();
     params.end_image                 = end_image.get();
+    params.keyframes                 = keyframe_views.empty() ? nullptr : keyframe_views.data();
+    params.keyframe_frame_indices    = keyframe_indices.empty() ? nullptr : keyframe_indices.data();
+    params.keyframes_size            = static_cast<int>(keyframe_views.size());
     params.control_frames            = control_frame_views.empty() ? nullptr : control_frame_views.data();
     params.control_frames_size       = static_cast<int>(control_frame_views.size());
     params.width                     = get_resolved_width();
