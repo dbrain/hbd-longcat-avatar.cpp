@@ -4702,6 +4702,19 @@ public:
         return 0;
     }
 
+    // Actual GPU-resident footprint (bytes) of THIS runner on the CUDA board — the offload runtime
+    // buffers, NOT params_buffer (which is the CPU/mmap home under --offload-to-cpu). For attributing
+    // the [VRAM] board total across ALL models at a given moment (e.g. the DiT refine peak).
+    size_t gpu_footprint_bytes() {
+        auto b = [](ggml_backend_buffer_t x) -> size_t { return x ? ggml_backend_buffer_get_size(x) : 0; };
+        size_t s = b(runtime_params_buffer) + b(resident_runtime_params_buffer)
+                 + b(partial_runtime_params_buffer) + b(prefetched_state_.buf) + b(cache_buffer);
+        for (ggml_backend_buffer_t x : prefetch_buf_pool_) s += b(x);
+        // if params live directly on the GPU (no offload), params_buffer IS the footprint
+        if (params_backend == runtime_backend) s += b(params_buffer);
+        return s;
+    }
+
     void free_cache_ctx_and_buffer() {
         free_cache_buffer();
         free_cache_ctx();
@@ -4728,6 +4741,40 @@ public:
             restore_all_params();
         }
     }
+
+    // Genuinely release EVERY GPU-resident param buffer this runner holds back to the driver, while
+    // leaving the CPU/mmap-backed home (params_buffer / params_ctx tensors) intact so the next
+    // execute_graph re-uploads. This is the eviction set_keep_params_resident(false) FAILS to fully
+    // perform under the prod offload recipe: that path calls only restore_all_params() (frees
+    // runtime_params_buffer), which leaves the CROSS-STEP shared-resident payload
+    // (resident_runtime_params_buffer, offloaded once via offload_resident_params() under
+    // LONGCAT_SHARED_RESIDENT and deliberately kept pinned across sampling steps / VAE tiles / warm
+    // renders) squatting on the GPU. For the LTX VAE the shared set is ~all its conv weights (~1385
+    // MB) and for the DiT it is the whole ~5471 MB payload — so that buffer, not runtime_params_buffer,
+    // is what the VRAM-ATTR dumps still see resident. free_params_buffer() doesn't free it either (and
+    // additionally NULLs the home, breaking re-offload). Only restore_resident_params() releases it;
+    // this method funnels all three offload buffers (resident + partial + runtime) through their real
+    // freers (each ggml_backend_buffer_free -> cudaFree) and clears the cross-step residency token +
+    // cache so a later compute_with_graph_cuts re-offloads cleanly. No-op when params live directly on
+    // the runtime backend (params_offloaded_to_host() == false). NOT abort-safe on its own for the
+    // no-offload regime — callers gate on params_offloaded_to_host().
+    void release_all_gpu_param_residency() {
+        keep_params_resident_ = false;
+        restore_resident_params();  // frees resident_runtime_params_buffer (the shared-resident squat)
+        restore_all_params();       // frees runtime_params_buffer (also does restore_partial_params)
+        // Drop the cross-step shared-resident cache so the next segloop re-derives + re-offloads it
+        // (restore_resident_params already zeroed resident_state_token / resident_param_set).
+        cached_shared_resident_set_.clear();
+        cached_shared_resident_sig_ = 0;
+    }
+
+    // True when the params live on a DIFFERENT backend than compute (i.e. --offload-to-cpu):
+    // they are uploaded to the runtime (GPU) backend per-compute by offload_all_params() and
+    // can be released from VRAM via set_keep_params_resident(false)/restore_all_params() while
+    // the home copy (on params_backend, possibly mmap-backed) survives for the next compute to
+    // re-upload. When false, params live directly on the runtime backend (no offload): the only
+    // way to reclaim their VRAM is free_params_buffer() + a reload before the next use.
+    bool params_offloaded_to_host() const { return params_backend != runtime_backend; }
 
     // do copy after alloc graph
     void set_backend_tensor_data(ggml_tensor* tensor, const void* data) {

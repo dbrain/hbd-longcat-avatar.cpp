@@ -72,11 +72,19 @@ echo " <figure class=win><video src=\"clips/SWEEP_imatrix_s3.mp4\" controls loop
 echo "</div>"
 cat <<'VAEAB'
 <h2>🎬 VAE A/B — temporal-tiling vs comfy-style feathered SPATIAL tiling (imatrix, seed 42, 1920×1088×97f)</h2>
-<p class=sub>Both clean in a STILL; the difference is IN MOTION. <b>temporal</b> = our current (97f chopped into 11 time-tiles → ghosting on crowds/pans). <b>spatial 4×4</b> = comfy-style feathered spatial tiles, ALL frames per tile, NO temporal chop (seam-free, 15.4GB peak — needs 5×5/6×6 to hit ≤11.5). Watch background crowds / the far cars for phase/ghost.</p>
+<p class=sub>Both clean in a STILL; the difference is IN MOTION. <b>temporal</b> = our old default (97f chopped into 11 time-tiles → ghosting on crowds/pans). <b>spatial</b> = comfy-style feathered spatial tiles, ALL frames per tile, NO temporal chop (seam-free). <b>2×2 + F16</b> is the candidate lock-in: fastest tiling (316s) + offload eviction (VAE freed during sampling, DiT freed during decode) + conv3d 32×16 → peak <b>11670MB, under the 11.5GB cap</b>. Watch background crowds / the far cars for phase/ghost, and compare 2×2 vs 4×4 for any spatial-tile seam.</p>
 <div class=row>
- <figure><video src="clips/AB_imatrix_matched_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>temporal tiling</b> (current)</figcaption></figure>
- <figure class=win><video src="clips/AB_imatrix_spatial_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 4×4 feathered</b> (no temporal chop)</figcaption></figure>
+ <figure><video src="clips/AB_imatrix_matched_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>temporal tiling</b> (old)</figcaption></figure>
+ <figure class=win><video src="clips/AB_imatrix_spatial_2x2_ov4_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 2×2 ov4</b> (283s · 11164MB · seam?)</figcaption></figure>
+ <figure class=win><video src="clips/AB_imatrix_spatial_2x2_f16_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 2×2 conv32×16 ov6</b> (316s · 11670MB)</figcaption></figure>
+ <figure class=win><video src="clips/AB_imatrix_spatial_f16_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 4×4 + F16</b> (more tiles)</figcaption></figure>
+ <figure class=win><video src="clips/AB_imatrix_spatial_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>spatial 4×4</b> F32 (older)</figcaption></figure>
  <figure class=ref><video src="clips/COMFY_s3_seed101.mp4" controls loop playsinline muted></video><figcaption>comfy (ref)</figcaption></figure>
+</div>
+<p class=sub>👁️ <b>Where the 2×2 seams would be</b> (red = tile boundaries): a vertical line down frame-centre (x≈960) and a horizontal line across frame-centre (y≈544). In the <b>ov4</b> clip, watch for a faint brightness step / texture discontinuity along these lines — worst in smooth areas (sky, wet pavement reflections) and as the woman / background cars cross the centre. Clean = no visible line there.</p>
+<div class=row>
+ <figure style="width:520px"><img src="clips/SEAMGUIDE_2x2_ov4.png" style="width:100%;border-radius:4px"><figcaption>ov4 frame — <b>red lines = the two 2×2 tile edges</b> (look here)</figcaption></figure>
+ <figure style="width:520px"><img src="clips/SEAMGUIDE_2x2_ov4_clean.png" style="width:100%;border-radius:4px"><figcaption>same frame, unmarked — is the centre cross visible?</figcaption></figure>
 </div>
 VAEAB
 cat <<'AB'

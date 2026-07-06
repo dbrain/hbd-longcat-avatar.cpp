@@ -2578,6 +2578,12 @@ public:
                              const sd::Tensor<float>& video_positions = {},
                              bool ltxav_audio_fixed                    = false,
                              const sd::Tensor<float>& video_reference  = {}) {
+        if (getenv("LONGCAT_VRAM_BREAKDOWN") != nullptr) {
+            double dit = work_diffusion_model ? work_diffusion_model->gpu_footprint_bytes()/1048576.0 : 0.0;
+            double vae = first_stage_model ? first_stage_model->gpu_footprint_bytes()/1048576.0 : 0.0;
+            double avae = audio_vae_model ? audio_vae_model->gpu_footprint_bytes()/1048576.0 : 0.0;
+            LOG_INFO("[VRAM-ATTR sample-entry] DiT_gpu=%.0f MB  VAE_gpu=%.0f MB  audioVAE_gpu=%.0f MB", dit, vae, avae);
+        }
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
         float cfg_scale     = guidance.txt_cfg;
         float img_cfg_scale = guidance.img_cfg;
@@ -3249,6 +3255,12 @@ public:
     }
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
+        if (getenv("LONGCAT_VRAM_BREAKDOWN") != nullptr) {
+            double dit = diffusion_model ? diffusion_model->gpu_footprint_bytes()/1048576.0 : 0.0;
+            double vae = first_stage_model ? first_stage_model->gpu_footprint_bytes()/1048576.0 : 0.0;
+            double avae = audio_vae_model ? audio_vae_model->gpu_footprint_bytes()/1048576.0 : 0.0;
+            LOG_INFO("[VRAM-ATTR decode-entry] DiT_gpu=%.0f MB  VAE_gpu=%.0f MB  audioVAE_gpu=%.0f MB (DiT should be ~0 here)", dit, vae, avae);
+        }
         // GGML_F8_DBG: report the post-sampling latent magnitude entering the VAE. Saturated
         // (max|latent| >> ~10) => the DiT produced garbage (upstream/fp8 GEMM); reasonable
         // (~O(1-5)) => the DiT is fine and any white is a DECODE issue.
@@ -8693,6 +8705,78 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         LOG_INFO("WAN_VAE_FREE_DURING_DIT: freed VAE params for the DiT sample loop");
     }
 
+    // LTXAV_VAE_LAZY: on an LTXAV render the video VAE (~1385 MB) + audio VAE (~353 MB) sit on
+    // the GPU but are UNUSED between here and the final decode — they squat ~1.7 GB through the
+    // DiT sample AND the (latent-upscale) refine, whose reserve is the binding [VRAM] peak
+    // (~11.9 GB). All VAE ENCODING (ref/control/init latents) finished inside the
+    // prepare_video_generation_* calls above, so release both VAEs' GPU VRAM now for the whole
+    // sample+refine and re-establish it for decode. Two residency regimes, handled separately:
+    //
+    //  (A) --offload-to-cpu (our prod recipe, incl. --mmap): the params' home lives on the CPU
+    //      params_backend and is UPLOADED to a GPU runtime buffer per-compute (the log line
+    //      "ltx_video_vae offload params (1385 MB) to runtime backend (CUDA0)"). That GPU copy is
+    //      what squats. set_keep_params_resident(false) -> restore_all_params() frees the GPU copy
+    //      while the CPU/mmap-backed home survives; the decode's execute_graph re-runs
+    //      offload_all_params() to re-upload from that home (the SAME mechanism that loaded it).
+    //      No reload loader needed and mmap-safe — the reload path is proven-present (params_buffer
+    //      still allocated + execute_graph always re-offloads before compute).
+    //
+    //  (B) params directly on the GPU (no offload): restore_all_params() is a no-op, so free the
+    //      buffers and reload from disk before decode via resident_reload_loader (captured for
+    //      every LTXAV no-mmap ctx, :1335). reload_first_stage_model() (:9128, unconditional) and
+    //      reload_audio_vae_model() (:9027, audio-decode block) re-materialize them (~0.1s each).
+    //      Gated on that loader's presence so the free never happens without a proven reload path;
+    //      absent (e.g. --mmap WITHOUT offload = params file-backed on GPU) it is skipped.
+    //
+    // NOT engaged on the relip two-stage path: its stage-2 reference re-encode
+    // (apply_ltxv_refine_image_conditioning, relip only) still needs the video VAE AFTER the base
+    // sample, so FIX-3 (LTXAV_TWOSTAGE_FREE_UNUSED) frees it at the correct later point (:8907).
+    // Opt-in, default off, so no measured baseline shifts.
+    static const bool ltxav_vae_lazy = [] {
+        const char* s = getenv("LTXAV_VAE_LAZY");
+        return s && s[0] == '1';
+    }();
+    if (ltxav_vae_lazy && !relip_twostage &&
+        sd_version_is_ltxav(sd_ctx->sd->version) &&
+        sd_ctx->sd->first_stage_model) {
+        auto& vvae = sd_ctx->sd->first_stage_model;
+        auto& avae = sd_ctx->sd->audio_vae_model;
+        if (vvae->params_offloaded_to_host()) {
+            // Regime (A): release the offloaded GPU copies; CPU/mmap home survives, decode
+            // re-offloads. Harmless (no-op) on a VAE that isn't currently offload-resident.
+            //
+            // FIX: set_keep_params_resident(false) alone does NOT free the VAE's GPU squat under the
+            // prod recipe (LONGCAT_SHARED_RESIDENT=1). It calls only restore_all_params(), which frees
+            // runtime_params_buffer — but the VAE's ~1385 MB lives in resident_runtime_params_buffer
+            // (offload_resident_params(), the cross-step shared payload that is deliberately kept pinned
+            // across the tiled-decode segments and warm renders). Only restore_resident_params() frees
+            // that. release_all_gpu_param_residency() funnels resident + partial + runtime buffers
+            // through their real freers (-> cudaFree) and drops the cross-step token/cache so the decode
+            // re-offloads from the CPU/mmap home. (This is why the earlier restore_all_params()+pool-trim
+            // left VAE_gpu at 1385 — the trim can't reclaim a still-referenced resident buffer.)
+            vvae->release_all_gpu_param_residency();
+            if (avae) {
+                avae->release_all_gpu_param_residency();
+            }
+            // Trim the VAE backend's pool so the freed VRAM actually leaves the board and becomes
+            // real headroom for the sample/refine. Mirrors the pre-sample DIFFUSION-pool trim (:~8957).
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
+            LOG_INFO("LTXAV_VAE_LAZY: released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool before DiT sample+refine; re-offload from host at decode");
+        } else if (sd_ctx->sd->resident_reload_loader) {
+            // Regime (B): free the GPU-resident buffers; reload from disk before decode.
+            size_t freed = vvae->get_params_buffer_size();
+            vvae->free_params_buffer();
+            if (avae) {
+                freed += avae->get_params_buffer_size();
+                avae->free_params_buffer();
+            }
+            LOG_INFO("LTXAV_VAE_LAZY: freed resident video+audio VAE params (~%.0f MB) before DiT sample+refine; reload from disk at decode",
+                     freed / (1024.f * 1024.f));
+        } else {
+            LOG_INFO("LTXAV_VAE_LAZY: VAE params are neither host-offloaded nor reloadable (e.g. --mmap without --offload-to-cpu); skipping to stay abort-safe");
+        }
+    }
+
     int64_t latent_start = ggml_time_ms();
     int W                = request.width / request.vae_scale_factor;
     int H                = request.height / request.vae_scale_factor;
@@ -9113,6 +9197,29 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             sd_ctx->sd->apply_loras(request.hires.loras, request.hires.lora_count);
         }
 
+        // LTXAV_VAE_LAZY (2nd eviction — the two-stage refine): the render is TWO passes (base
+        // sample -> latent x2 upscale -> this hires/refine sample). The pre-BASE eviction at :8615
+        // frees the VAE, but the offload pipeline RE-OFFLOADS the video VAE (1385 MB) between the two
+        // samples ("ltx_video_vae offload params (1385.02 MB, ...) to runtime backend (CUDA0)" at the
+        // hires stage), so by the refine VAE_gpu is back to 1385 and the refine (DiT 5471 + VAE 1385 +
+        // compute ~2767) is the ~11913 MB binding peak. The plain t2v two-stage refine is a pure latent
+        // denoise — it does NOT touch the video/audio VAE (only the final decode does, which re-offloads
+        // it: decode-entry correctly shows VAE_gpu=1385). So release both VAEs' GPU residency again here.
+        // Gated identically to regime A (:8597): !relip_twostage (relip's stage-2 reference re-encode
+        // DOES need the VAE during refine — freed later by LTXAV_TWOSTAGE_FREE_UNUSED) +
+        // params_offloaded_to_host() (re-offloadable, mmap-safe). Opt-in via LTXAV_VAE_LAZY; default off.
+        if (ltxav_vae_lazy && !relip_twostage &&
+            sd_version_is_ltxav(sd_ctx->sd->version) &&
+            sd_ctx->sd->first_stage_model &&
+            sd_ctx->sd->first_stage_model->params_offloaded_to_host()) {
+            sd_ctx->sd->first_stage_model->release_all_gpu_param_residency();
+            if (sd_ctx->sd->audio_vae_model) {
+                sd_ctx->sd->audio_vae_model->release_all_gpu_param_residency();
+            }
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
+            LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool before the hires/refine sample; re-offload from host at decode");
+        }
+
         sampling_start = ggml_time_ms();
         final_latent   = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                             true,
@@ -9158,6 +9265,36 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 
     int64_t latent_end = ggml_time_ms();
     LOG_INFO("generating latent video completed, taking %.2fs", (latent_end - latent_start) * 1.0f / 1000);
+
+    // LTXAV_DIT_FREE_DURING_DECODE (opt-in, default off): symmetric counterpart to LTXAV_VAE_LAZY.
+    // All DiT sampling (base + latent-upscale refine) is now done; nothing below — the audio-VAE
+    // decode, the continuation-latent copy, and the video-VAE decode_video_outputs — touches the
+    // diffusion model. Yet on a warm resident chain (keep_diffusion_model_resident) the DiT free at
+    // :9089/:9097 is intentionally skipped, so its ~5471 MB stays GPU-resident and squats through the
+    // VAE decode — the render's TRUE VRAM peak. That resident weight lives in the DiT's cross-step
+    // shared-resident buffer (LONGCAT_SHARED_RESIDENT), which neither set_keep_params_resident(false)
+    // nor free_params_buffer() releases. release_all_gpu_param_residency() genuinely frees it (runtime +
+    // shared-resident -> cudaFree) while leaving the CPU/mmap home intact, so a chained next generate's
+    // sample() re-offloads it via execute_graph — no reload loader, mmap-safe. Gated on the DiT being
+    // host-offloaded (params_offloaded_to_host); if params live directly on the GPU there is no
+    // re-offload path, so we skip to stay abort-safe (the DiT is not needed for decode either way).
+    static const bool ltxav_dit_free_during_decode = [] {
+        const char* s = getenv("LTXAV_DIT_FREE_DURING_DECODE");
+        return s && s[0] == '1';
+    }();
+    if (ltxav_dit_free_during_decode &&
+        sd_version_is_ltxav(sd_ctx->sd->version) &&
+        sd_ctx->sd->diffusion_model) {
+        if (sd_ctx->sd->diffusion_model->params_offloaded_to_host()) {
+            sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
+            // Trim the DIFFUSION backend pool so the freed VRAM leaves the board as real headroom for
+            // the VAE decode peak (mirrors the pre-sample DIFFUSION trim + the LTXAV_VAE_LAZY VAE trim).
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+            LOG_INFO("LTXAV_DIT_FREE_DURING_DECODE: released offloaded DiT GPU params (runtime + shared-resident) + trimmed DIFFUSION pool before decode; a chained next generate re-offloads from host");
+        } else {
+            LOG_INFO("LTXAV_DIT_FREE_DURING_DECODE: DiT params live on the runtime backend (no host offload); skipping to stay abort-safe");
+        }
+    }
 
     sd_audio_t* generated_audio = nullptr;
     if (sd_version_is_ltxav(sd_ctx->sd->version) &&
