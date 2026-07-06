@@ -44,7 +44,8 @@ case "$RES" in
 esac
 FR="${FR:-121}"; FPS="${FPS:-24}"; SEED="${SEED:-42}"; DEVICE="${DEVICE:-1}"; MAXV="${MAXV:-11}"
 DIT="${DIT:-nvfp4-CLEAN-dev050.gguf}"
-TBF="${TBF:-3}"; TBO="${TBO:-2}"; VWT="${VWT:-16}"; VHT="${VHT:-8}"   # VAE decode tuning levers
+TBF="${TBF:-3}"; TBO="${TBO:-2}"; VWT="${VWT:-16}"; VHT="${VHT:-8}"; DF16="${DF16:-1}"   # VAE decode tuning levers
+if [ "${NATIVE_FA:-0}" = 1 ]; then CUDNN_ATTN_FLAGS=""; else CUDNN_ATTN_FLAGS="-e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1"; fi   # NATIVE_FA=1 -> deterministic MMA flash-attn
 
 # --- schedules: EXACT from wf_comfy_s3_t2v.json ---
 BASE_SIGMAS="1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0.0"   # node 4984, 8 steps
@@ -60,20 +61,29 @@ TAG="${TAG:-parity_nvfp4_${RES}}"; od="$OUTROOT/$TAG"; rm -rf "$od"; mkdir -p "$
 
 PRODENV=( -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FFN=1 -e GGML_FP8_LAYERS=transformer_blocks -e LTX_DIT_F16=1
   -e GGML_CUDA_BIAS_GELU_FUSE=1 -e GGML_CUDA_BIAS_RMS_FUSE=1 -e GGML_CUDA_F16_BCAST_FUSE=1 -e GGML_CUDA_RMS_MOD_FUSE=1
-  -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1
+  ${CUDNN_ATTN_FLAGS} -e GGML_CUDNN_CONV3D=1
   -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_PREFETCH_POOL=1
   -e LONGCAT_SHARED_RESIDENT=1 -e LONGCAT_VAE_KEEP_RESIDENT=1 -e LONGCAT_FFN_TILE_TOKENS=4096 -e LONGCAT_ENCODE_MAX_VRAM=6.5 -e LONGCAT_DIT_NO_MMAP=0
   -e LTXAV_END_RENDER_RECLAIM=1 -e LTXAV_CHAIN_POOL_TRIM=1
-  -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_TEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=$TBF -e LTX_VAE_TBLEND_OVERLAP=$TBO -e LTX_VAE_CONV3D_WTILES=$VWT -e LTX_VAE_CONV3D_HTILES=$VHT -e LTX_VAE_DECODE_F16=1 )
+  -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_CONV3D_WTILES=$VWT -e LTX_VAE_CONV3D_HTILES=$VHT )
+# SPATIAL_TILES=NxM -> comfy-style feathered spatial tiling (all frames, NO temporal chop); else temporal-blend.
+if [ -n "${SPATIAL_TILES:-}" ]; then
+  PRODENV+=( -e LTX_VAE_SPATIAL_TILES=$SPATIAL_TILES -e LTX_VAE_SPATIAL_OVERLAP=${SPATIAL_OVERLAP:-6} )
+else
+  PRODENV+=( -e LTX_VAE_TEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=$TBF -e LTX_VAE_TBLEND_OVERLAP=$TBO )
+fi
+[ "${DF16:-1}" = 1 ] && PRODENV+=(-e LTX_VAE_DECODE_F16=1)   # presence-gated: omit entirely to force F32 decode
+[ -n "${XE:-}" ] && PRODENV+=($XE)   # extra -e passthrough for determinism/ablation probes
 
-HIRES="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-steps $REFINE_STEPS --hires-sigmas $REFINE_SIGMAS"
+if [ "${NOHIRES:-0}" = 1 ]; then HIRES=""; else HIRES="--hires --hires-upscaler $UPSCALER --hires-upscalers-dir $UPDIR --hires-steps $REFINE_STEPS --hires-sigmas $REFINE_SIGMAS"; fi
 
 # ===========================================================================
 # {{ VAE_DECODE_FLAGS }} — SUPPLIED BY TILING-FIX.md (separate agent).
 #   Comfy target = spatial 2x2 tiles, overlap 6, NO temporal tiling.
 #   Current prod (temporal_tile_frames=4) is the coherence-risk to replace.
 #   Leave the line below until TILING-FIX lands its exact flags, then swap it.
-VAE_DECODE="--vae-tiling --vae-relative-tile-size 1x1"
+# SPATIAL_TILES routes through _compute directly (feathered spatial path), so --vae-tiling MUST be off.
+if [ -n "${SPATIAL_TILES:-}" ]; then VAE_DECODE=""; else VAE_DECODE="--vae-tiling --vae-relative-tile-size 1x1"; fi
 # ===========================================================================
 
 echo "=== PARITY nvfp4 ($RES): $DIT ${WBASE}x${HBASE} -> x2  ${FR}f@${FPS}  base=${BASE_STEPS}st refine=${REFINE_STEPS}st ==="
@@ -88,7 +98,7 @@ docker run --rm --gpus "\"device=$DEVICE\"" "${PRODENV[@]}" -e "LTX_CUSTOM_SIGMA
   --lora-model-dir /ltx2/loras \
   -p "$PROMPT" \
   -W "$WBASE" -H "$HBASE" --video-frames "$FR" --fps "$FPS" \
-  --sampling-method euler --steps "$BASE_STEPS" --cfg-scale 1.0 --diffusion-fa \
+  --sampling-method ${SAMP:-euler} --steps "$BASE_STEPS" --cfg-scale 1.0 --diffusion-fa \
   $VAE_DECODE \
   $HIRES \
   --offload-to-cpu --mmap --max-vram "$MAXV" -s "$SEED" -v \
