@@ -2240,6 +2240,16 @@ protected:
     std::vector<ggml_tensor*> cached_shared_resident_set_;
     uint64_t cached_shared_resident_sig_ = 0;
 
+    // Fix B (1080p chain seg-2 cold-stream): topology-independent safety floor. The
+    // last HEALTHY shared-resident set + its byte size for THIS loaded model, kept
+    // across residency teardown (release_all_gpu_param_residency) and across chain
+    // segments so a degenerate per-segment re-derivation (e.g. the keyframe-append
+    // continuation graph localizing the DiT payload → 0 pinned → cold-stream) can be
+    // backstopped by carrying the prior segment's pointer-stable set forward. Cleared
+    // in free_params_ctx() on model unload/reload so we never carry dangling pointers.
+    std::vector<ggml_tensor*> last_shared_resident_set_;
+    size_t last_shared_resident_bytes_ = 0;
+
     size_t max_graph_vram_bytes           = 0;
     bool stream_layers_enabled            = false;
     size_t observed_max_effective_budget_ = 0;
@@ -2426,6 +2436,11 @@ protected:
             params_ctx = nullptr;
         }
         params_tensor_set_.clear();
+        // Fix B: the carried shared-resident set points into params_ctx tensors; drop it
+        // on model unload/reload so a later chain segment can never carry dangling (or
+        // address-reused) pointers forward.
+        last_shared_resident_set_.clear();
+        last_shared_resident_bytes_ = 0;
         if (offload_ctx != nullptr) {
             ggml_free(offload_ctx);
             offload_ctx = nullptr;
@@ -2988,6 +3003,24 @@ protected:
             return v < 2 ? 2 : v;
         }();
         return n;
+    }
+
+    // Fix A (1080p chain seg-2 cold-stream): derive the shared-resident set from the
+    // BASE (un-merged) cached graph-cut plan instead of the resolved MERGED plan. The
+    // ">=2 of N segments" reuse rule self-zeros as the budget merge coarsens the plan
+    // (seg-2 continuation: 50 base → 3 merged ⇒ the DiT payload is no longer INPUT_PARAM
+    // -shared across ≥2 MERGED segments ⇒ 0 pinned ⇒ DiT cold-streams at 4× ⇒ SIGKILL).
+    // The base plan keeps the fine per-block granularity so a payload read by ≥2 base
+    // cut-segments is still detected — restoring seg-2 to seg-1's ~306/5471 MB pinned.
+    // Same gf + same param tensors; only the counting granularity changes. Default ON;
+    // set LTXAV_SHARED_RESIDENT_BASE_PLAN=0 to A/B against the legacy merged-plan
+    // derivation.
+    static bool shared_resident_base_plan_enabled() {
+        static const bool en = []{
+            const char* s = getenv("LTXAV_SHARED_RESIDENT_BASE_PLAN");
+            return !(s != nullptr && s[0] == '0');
+        }();
+        return en;
     }
 
     // LongCat lap-C: keep the shared-resident payload pinned ACROSS sampling steps
@@ -4206,9 +4239,73 @@ protected:
             // Task 2: recompute the shared set only when the plan changes (cached
             // across steps via a cheap plan signature); the per-segment node walk is
             // otherwise redundant — the set is identical for every step of a render.
-            uint64_t sig = plan_signature(plan);
+            //
+            // Fix A: derive from the BASE (un-merged) cached plan when available/valid —
+            // the ">=2 of N" reuse rule self-zeros as the merge coarsens the plan. The
+            // base plan (graph_cut_plan_cache_.graph_cut_plan, the same object
+            // annotate_residency uses below) keeps per-block granularity so a cross-block
+            // -shared payload is still detected. Falls back to the resolved `plan` when the
+            // base plan is unavailable/stale or the gate is off. Keyed on the DERIVATION
+            // plan's signature so it recomputes when the base plan changes (seg-1
+            // no-continuation vs seg-2 keyframe-append) yet stays cached across steps.
+            const sd::ggml_graph_cut::Plan* derive_plan = &plan;
+            if (shared_resident_base_plan_enabled() &&
+                graph_cut_plan_cache_.graph_cut_plan.available &&
+                graph_cut_plan_cache_.graph_cut_plan.has_cuts &&
+                graph_cut_plan_cache_.graph_cut_plan.segments.size() > 1 &&
+                sd::ggml_graph_cut::plan_matches_graph(gf, graph_cut_plan_cache_.graph_cut_plan)) {
+                derive_plan = &graph_cut_plan_cache_.graph_cut_plan;
+            }
+            uint64_t sig = plan_signature(*derive_plan);
             if (sig != cached_shared_resident_sig_ || cached_shared_resident_set_.empty()) {
-                cached_shared_resident_set_ = compute_shared_resident_set(gf, plan);
+                std::vector<ggml_tensor*> fresh = compute_shared_resident_set(gf, *derive_plan);
+                size_t fresh_bytes = 0;
+                for (ggml_tensor* t : fresh) {
+                    if (t != nullptr) fresh_bytes += ggml_nbytes(t);
+                }
+                // Only a large OFFLOADED model can cold-stream; a resident model or a
+                // small one legitimately needs no shared pin.
+                const bool large_offloaded = params_backend != runtime_backend &&
+                                             total_params_bytes_ >= ring_min_model_bytes();
+                // Fix C: loud warn on a degenerate derivation for a large offloaded model
+                // — turns a silent 4× cold-stream + child SIGKILL into one obvious line.
+                if (large_offloaded && fresh_bytes * 8 < total_params_bytes_) {
+                    LOG_WARN("%s shared-resident derivation degenerate: only %zu params "
+                             "(%.0f MB) shared for a %.0f MB offloaded model over %zu "
+                             "segments — DiT will cold-stream unless a prior resident set "
+                             "is carried forward",
+                             get_desc().c_str(), fresh.size(), fresh_bytes / 1048576.0,
+                             total_params_bytes_ / 1048576.0, derive_plan->segments.size());
+                }
+                // Fix B: topology-independent safety floor. If the fresh derivation
+                // collapses (< half the last HEALTHY set) for a large offloaded model,
+                // carry the prior chain segment's pointer-stable set forward instead of
+                // un-pinning the DiT mid-chain. Filter to tensors still present as params
+                // (guards a model reload / address reuse); an empty carry falls through to
+                // the fresh set.
+                std::vector<ggml_tensor*> carry;
+                if (large_offloaded && !last_shared_resident_set_.empty() &&
+                    fresh_bytes * 2 < last_shared_resident_bytes_) {
+                    for (ggml_tensor* t : last_shared_resident_set_) {
+                        if (t != nullptr && params_tensor_set_.find(t) != params_tensor_set_.end()) {
+                            carry.push_back(t);
+                        }
+                    }
+                }
+                if (!carry.empty()) {
+                    LOG_WARN("%s shared-resident: carrying prior segment's set forward "
+                             "(%.0f MB, %zu params); this segment's fresh derivation found "
+                             "only %.0f MB",
+                             get_desc().c_str(), last_shared_resident_bytes_ / 1048576.0,
+                             carry.size(), fresh_bytes / 1048576.0);
+                    cached_shared_resident_set_ = std::move(carry);
+                } else {
+                    cached_shared_resident_set_ = fresh;
+                    if (fresh_bytes > 0) {
+                        last_shared_resident_set_   = std::move(fresh);
+                        last_shared_resident_bytes_ = fresh_bytes;
+                    }
+                }
                 cached_shared_resident_sig_ = sig;
             }
             const std::vector<ggml_tensor*>& shared = cached_shared_resident_set_;
