@@ -87,6 +87,15 @@ cat <<'VAEAB'
  <figure style="width:520px"><img src="clips/SEAMGUIDE_2x2_ov4_clean.png" style="width:100%;border-radius:4px"><figcaption>same frame, unmarked — is the centre cross visible?</figcaption></figure>
 </div>
 VAEAB
+cat <<'RESAB'
+<h2>📐 Resolution call — 720p vs 1080p, SAME locked recipe (2×2 ov4, seed 42) → "good enough" or worth a 1.5× upscaler?</h2>
+<p class=sub>Both use the identical locked pipeline; only the base/output res differs. <b>1080p</b> (960×544→x2→1920×1088) = 283s, peak 11164MB. <b>720p</b> (640×352→x2→1280×704) = <b>161s (43% faster)</b>, peak 10630MB (bound by the text encoder, not the video — so it fits with room). Player scales both to the same box, so judge <b>detail / softness / fine texture</b> (faces, the zebra crossing lines, distant traffic). If 720p holds up → ship it, skip the upscaler. If it's too soft → the 1.5× upscaler path (render a higher base, upscale less) is worth building.</p>
+<div class=row>
+ <figure class=win><video src="clips/AB_720p_2x2_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>720p</b> 1280×704 · 161s · 10630MB</figcaption></figure>
+ <figure class=win style="border-color:#3a8a3a;border-width:2px"><video src="clips/AB_imatrix_spatial_2x2_ov4_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>1080p</b> 1920×1088 · 283s · 11164MB (locked)</figcaption></figure>
+ <figure class=ref><video src="clips/COMFY_s3_seed101.mp4" controls loop playsinline muted></video><figcaption>comfy 1080p (ref)</figcaption></figure>
+</div>
+RESAB
 cat <<'AB'
 <h2>⚖️ CLEAN A/B — fp8 vs imatrix, IDENTICAL pipeline (same script/settings/seed 42, only the weights differ)</h2>
 <p class=sub>Both via run_parity, RES=parity 1920×1088×97f, TBF=3 VWT=16 VHT=8, seed 42. Same VAE tiling. <b>imatrix-fp4 is crisp; our fp8 is dotty/ghosty</b> (26MB vs 8MB h264 = the dot-noise). So the fuzz is NOT the tiling — it's fp8-specific: our GEMM quantizes ACTIVATIONS to e4m3 too, noisier than nvfp4's two-level. Higher-precision-weights via this fp8 path = WORSE, not better. Play in motion.</p>

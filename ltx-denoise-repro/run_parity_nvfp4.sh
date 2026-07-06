@@ -42,7 +42,7 @@ case "$RES" in
   speed)  WBASE=640; HBASE=352 ;;   # -> x2 -> 1280x704  (our current)
   *) echo "RES must be parity|speed"; exit 2 ;;
 esac
-FR="${FR:-121}"; FPS="${FPS:-24}"; SEED="${SEED:-42}"; DEVICE="${DEVICE:-1}"; MAXV="${MAXV:-11}"
+FR="${FR:-121}"; FPS="${FPS:-24}"; SEED="${SEED:-42}"; DEVICE="${DEVICE:-1}"; MAXV="${MAXV:-7}"   # LOCKED: MAXV=7 (11 inflates offload partial+prefetch buffers ~8.7GB -> 15GB)
 DIT="${DIT:-nvfp4-CLEAN-dev050.gguf}"
 TBF="${TBF:-3}"; TBO="${TBO:-2}"; VWT="${VWT:-16}"; VHT="${VHT:-8}"; DF16="${DF16:-1}"   # VAE decode tuning levers
 # LOCKED VAE recipe (2026-07-06): 2x2 feathered SPATIAL tiling, overlap 4, F16 decode + offload eviction
