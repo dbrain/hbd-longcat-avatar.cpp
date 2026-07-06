@@ -417,6 +417,38 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // stale value from a prior warm-worker render (the whole chain shares one a2v via process env).
     gen_params.apply_ltx_relip_env();
 
+    // FLUX-style dual-DiT variant swap for the video chain (LTX/Wan). An explicit
+    // top-level {"model":"base"|"edit"} selects which DiT must be resident before the
+    // chain renders — the LTX lipdub relip path sends {"model":"edit"} to load the
+    // merged lipdub GGUF (--diffusion-model-edit). Absent/"base" keeps the base DiT,
+    // so every existing non-relip render is byte-identical (ensure_variant_loaded with
+    // an empty target keeps the currently-loaded variant). This mirrors the FLUX image
+    // path (parse in routes_sdcpp.cpp:392-406 -> ensure_variant_loaded at IMG_GEN_REQ /
+    // async_jobs.cpp:650). It MUST run here — inside run_vid_chain_job, which executes in
+    // the CUDA-owning process (the worker child's VIDGEN_CHAIN_REQ handler, or the
+    // in-process path) — and BEFORE the generate_video_chain sd_ctx_mutex lock below,
+    // because ensure_variant_loaded takes that same mutex internally. koblem calls
+    // /v1/admin/unload before the edit render, so the swap re-forks/loads the edit DiT
+    // fresh. Validation mirrors the FLUX route so the error text matches.
+    {
+        std::string want_variant;  // empty = keep whatever DiT is loaded (base) — byte-identical
+        if (body.contains("model") && body["model"].is_string()) {
+            want_variant = body["model"].get<std::string>();
+            if (want_variant != "base" && want_variant != "edit") {
+                error_message = "invalid model variant, must be \"base\" or \"edit\"";
+                return false;
+            }
+            if (want_variant == "edit" && runtime.model_swap &&
+                runtime.model_swap->edit_path.empty()) {
+                error_message = "edit model not available (server started without --diffusion-model-edit)";
+                return false;
+            }
+        }
+        if (!ensure_variant_loaded(runtime, want_variant, error_message)) {
+            return false;  // error_message set by ensure_variant_loaded
+        }
+    }
+
     int n_segments = std::max(1, gen_params.ltx_chain_segments);
 
     // Per-segment prompts (the director layer): a JSON array. Fewer than n_segments reuses
