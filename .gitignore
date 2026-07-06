@@ -41,3 +41,5 @@ spike_cutlass_fp4/gg_*
 /mvp_out/
 /tools/LightX2V/
 /tools/lightx2v-test/out/
+_ablation_out/
+ltx-denoise-repro/_imatrix/_collect.webm

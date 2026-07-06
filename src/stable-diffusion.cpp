@@ -1435,6 +1435,7 @@ public:
                     continue;
                 }
                 const std::string& pfx = leg.second;
+                const bool f8_dbg = (getenv("GGML_F8_DBG") != nullptr && atoi(getenv("GGML_F8_DBG")) != 0);
                 size_t n_reg = 0;
                 for (auto& kv : tensors) {
                     const std::string& full = kv.first;
@@ -1444,7 +1445,18 @@ public:
                     const std::string bare = full.substr(pfx.size());
                     auto it = wglobals.find(bare + ".wglobal");
                     if (it != wglobals.end()) {
+                        // Register under BOTH the graph tensor's actual ->name (what src0->name is
+                        // at GEMM time) AND the map-key `full` AND the bare name — belt-and-
+                        // suspenders so the FP8/FP4 GEMM's nvfp4_weight_global_for(src0->name) lookup
+                        // hits regardless of whether the offload/mmap path leaves src0->name as the
+                        // prefixed, bare, or ggml-set name. Extra keys are harmless (same value).
                         ggml_cuda_nvfp4_register_weight_global(kv.second->name, it->second);
+                        ggml_cuda_nvfp4_register_weight_global(full.c_str(), it->second);
+                        ggml_cuda_nvfp4_register_weight_global(bare.c_str(), it->second);
+                        if (f8_dbg && n_reg < 8) {
+                            LOG_INFO("[F8_DBG] register wglobal=%.8g  ggml_name='%s'  map_key='%s'  bare='%s'",
+                                     it->second, kv.second->name, full.c_str(), bare.c_str());
+                        }
                         ++n_reg;
                     }
                 }
@@ -3237,6 +3249,17 @@ public:
     }
 
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
+        // GGML_F8_DBG: report the post-sampling latent magnitude entering the VAE. Saturated
+        // (max|latent| >> ~10) => the DiT produced garbage (upstream/fp8 GEMM); reasonable
+        // (~O(1-5)) => the DiT is fine and any white is a DECODE issue.
+        if (getenv("GGML_F8_DBG") != nullptr && atoi(getenv("GGML_F8_DBG")) != 0) {
+            const float* d = x.data();
+            const size_t n = x.numel();
+            float mx = 0.f, sum = 0.f;
+            for (size_t i = 0; i < n; ++i) { const float a = std::fabs(d[i]); if (a > mx) mx = a; sum += a; }
+            LOG_INFO("[F8_DBG] pre-VAE latent: numel=%zu  max|latent|=%.6g  mean|latent|=%.6g",
+                     n, mx, n ? sum / (float)n : 0.f);
+        }
         if (sd_version_is_pid(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
         }

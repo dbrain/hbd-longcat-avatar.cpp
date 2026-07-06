@@ -1158,9 +1158,16 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     // safe (same class as the shipped nvfp4 F16-dst above) but NOT byte-identical, hence the
     // env gate so the main thread can A/B it. Default OFF ⇒ byte-identical to today.
     static const bool wan_f16_dst = getenv("WAN_F16_DST") != nullptr;
+    // GGML_F8_F32_DST (opt-in, default OFF): emit an F32 dst for NATIVE F8_E4M3 weights instead of
+    // F16. The native comfy e4m3 codes are ±448-range (scale ~1e-3), so a large-K GEMM (e.g. the
+    // FFN down-proj, K=16384) can produce an F32 result that overflows the F16 store -> Inf -> NaN.
+    // (nvfp4's per-16-block scales keep code magnitudes tiny, so its F16 dst never overflows.) F32
+    // dst avoids the store-overflow; the fp8 cuBLASLt GEMM already supports an F32 dst. nvfp4 dst
+    // and the default (env unset) are byte-identical to before.
+    static const bool f8_f32_dst = getenv("GGML_F8_F32_DST") != nullptr;
     ggml_type mm_dst = GGML_TYPE_F32;
     if (!force_prec_f32 && x->type == GGML_TYPE_F16) {
-        if (w->type == GGML_TYPE_NVFP4) {
+        if (w->type == GGML_TYPE_NVFP4 || (w->type == GGML_TYPE_F8_E4M3 && !f8_f32_dst)) {
             mm_dst = GGML_TYPE_F16;
         } else if (wan_f16_dst && w->type == GGML_TYPE_F16) {
             mm_dst = GGML_TYPE_F16;
@@ -1740,6 +1747,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             if (mask_in->type != GGML_TYPE_F16) {
                 mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
             }
+        }
+
+        // F16-attention Q overflow guard (LTX_ATTN_QCLAMP_F16): unlike K/V, Q is NOT scaled
+        // by kv_scale — it enters the flash kernel at full magnitude and every F16 attention
+        // backend (cuDNN SDPA and the native MMA/WMMA/tile/vec tensor-core paths) casts Q to
+        // F16 internally. A faithful (fp8 / F16-weight) DiT can produce Q outliers > 65504
+        // (F16 max) -> the internal cast overflows to +-inf -> QK^T inf -> softmax NaN -> the
+        // whole DiT output goes NaN (observed: fp8 dev model white; the lossy nvfp4 quant keeps
+        // Q smaller so it never overflowed, which is why nvfp4 "worked"). Clamping Q to the F16
+        // range is IDENTITY for any Q already representable in F16 (so byte-identical for
+        // nvfp4/flux2/prod where Q fits), and only bounds the rare overflowing outliers (which
+        // dominate their softmax row either way). Env-gated, default OFF so prod is untouched.
+        static const bool q_clamp_f16 = getenv("LTX_ATTN_QCLAMP_F16") != nullptr && atoi(getenv("LTX_ATTN_QCLAMP_F16")) != 0;
+        if (q_clamp_f16 && kv_cast_type == GGML_TYPE_F16) {
+            q_in = ggml_clamp(ctx, q_in, -65504.0f, 65504.0f);
         }
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
