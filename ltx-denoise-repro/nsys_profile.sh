@@ -18,7 +18,7 @@ OUT=$WT/_ablation_out/nsys_prof; MODE=${MODE:-capture}
 SEGMENTS=${SEGMENTS:-2}; STEPS=${STEPS:-2}; REFSTEPS=${REFSTEPS:-1}   # reduced steps: shapes built, small trace
 mkdir -p "$OUT"
 
-INSTALL_STD='apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq cuda-nsight-systems-13-0 >/dev/null 2>&1; NSYS=$(ls /opt/nvidia/nsight-systems/*/target-linux-x64/nsys | head -1)'
+INSTALL_STD='apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq cuda-nsight-systems-13-0 sqlite3 >/dev/null 2>&1; NSYS=$(ls /opt/nvidia/nsight-systems/*/target-linux-x64/nsys | head -1)'
 
 if [ "$MODE" = analyze ]; then
   REP=${REP:-$OUT/prof.nsys-rep}
@@ -27,7 +27,85 @@ if [ "$MODE" = analyze ]; then
     echo '=== GPU MemOps by size ==='; \$NSYS stats --report cuda_gpu_mem_size_sum --format table $(basename "$REP")
     echo '=== CUDA API (malloc/cuMem/cudnn) ==='; \$NSYS stats --report cuda_api_sum --format table $(basename "$REP") | grep -iE 'Malloc|MemCreate|MemAlloc|cudnn|Name'
     echo '=== export sqlite for unfreed-alloc query ==='; \$NSYS export --type sqlite --force-overwrite true -o prof.sqlite $(basename "$REP") 2>&1 | tail -1
-    echo '  then query CUDA_GPU_MEMORY_USAGE_EVENTS: allocations (bytes>500MB) with no matching free = the reserve'
+    if command -v sqlite3 >/dev/null 2>&1; then
+      echo '=== CUDA library loads (kernel-code residency) ==='
+      sqlite3 prof.sqlite \"
+        SELECT s.value, COUNT(*) AS n
+        FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+        JOIN StringIds s ON s.id = r.nameId
+        WHERE s.value IN ('cuLibraryLoadData', 'cuLibraryUnload')
+        GROUP BY s.value
+        ORDER BY s.value;\"
+      echo '=== cuLibraryLoadData timeline buckets ==='
+      sqlite3 prof.sqlite \"
+        WITH first AS (
+          SELECT MIN(r.start) s
+          FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+          JOIN StringIds s ON s.id = r.nameId
+          WHERE s.value='cuLibraryLoadData'
+        )
+        SELECT printf('%.1f-%.1fs', (r.start-f.s)/1000000000.0, (r.start-f.s)/1000000000.0+30.0) AS bucket,
+               COUNT(*) AS loads
+        FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+        JOIN StringIds s ON s.id = r.nameId,
+             first f
+        WHERE s.value='cuLibraryLoadData'
+        GROUP BY CAST((r.start-f.s)/30000000000 AS INT)
+        ORDER BY MIN(r.start);\"
+      if sqlite3 prof.sqlite \".tables\" | grep -q NVTX_EVENTS; then
+        echo '=== cuDNN op NVTX ranges with cuLibraryLoadData inside ==='
+        sqlite3 prof.sqlite \"
+          WITH ranges AS (
+            SELECT n.start, n.end, COALESCE(n.text, s.value) AS label
+            FROM NVTX_EVENTS n
+            LEFT JOIN StringIds s ON s.id = n.textId
+            WHERE COALESCE(n.text, s.value) LIKE 'cudnn-op%'
+              AND n.end IS NOT NULL
+          ),
+          loads AS (
+            SELECT r.start
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+            JOIN StringIds s ON s.id = r.nameId
+            WHERE s.value='cuLibraryLoadData'
+          )
+          SELECT substr(r.label, 1, 220) AS cudnn_op,
+                 COUNT(l.start) AS library_loads
+          FROM ranges r
+          LEFT JOIN loads l ON l.start BETWEEN r.start AND r.end
+          GROUP BY r.start, r.end, r.label
+          HAVING library_loads > 0
+          ORDER BY r.start
+          LIMIT 200;\"
+        echo '=== cuLibraryLoadData nearest cuDNN op range ==='
+        sqlite3 prof.sqlite \"
+          WITH ranges AS (
+            SELECT n.start, n.end, COALESCE(n.text, s.value) AS label
+            FROM NVTX_EVENTS n
+            LEFT JOIN StringIds s ON s.id = n.textId
+            WHERE COALESCE(n.text, s.value) LIKE 'cudnn-op%'
+              AND n.end IS NOT NULL
+          ),
+          loads AS (
+            SELECT r.start
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+            JOIN StringIds s ON s.id = r.nameId
+            WHERE s.value='cuLibraryLoadData'
+          )
+          SELECT printf('%.3fs', (l.start - (SELECT MIN(start) FROM loads))/1000000000.0) AS t,
+                 COALESCE(substr((SELECT label FROM ranges rr
+                                  WHERE l.start BETWEEN rr.start AND rr.end
+                                  ORDER BY rr.start DESC LIMIT 1), 1, 220),
+                          substr((SELECT label FROM ranges rr
+                                  WHERE rr.start <= l.start
+                                  ORDER BY rr.start DESC LIMIT 1), 1, 220),
+                          '<no cudnn-op range>') AS op
+          FROM loads l
+          ORDER BY l.start
+          LIMIT 200;\"
+      fi
+    fi
+    echo '  allocation query: CUDA_GPU_MEMORY_USAGE_EVENTS allocations with no matching free'
+    echo '  code query: CUPTI_ACTIVITY_KIND_RUNTIME cuLibraryLoadData minus cuLibraryUnload = resident kernel libraries'
   "
   exit 0
 fi
@@ -42,7 +120,7 @@ PRODENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D
   -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_CONV3D_WTILES=16 -e LTX_VAE_CONV3D_HTILES=8 -e LTX_VAE_DECODE_F16=1
   -e LTX_VAE_SPATIAL_TILES=2x2 -e LTX_VAE_SPATIAL_OVERLAP=4 )
 INNER="$NSYS_SETUP
-\"\$NSYS\" profile --trace=cuda,cudnn --cuda-memory-usage=true --backtrace=dwarf --sample=none --cpuctxsw=none \
+\"\$NSYS\" profile --trace=cuda,cudnn,nvtx --cuda-memory-usage=true --backtrace=dwarf --sample=none --cpuctxsw=none \
   --force-overwrite=true -o /src/_ablation_out/nsys_prof/prof \
   stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --vae /ltx2/vae/ltx-2.3-22b-distilled_video_vae.safetensors --audio-vae /ltx2/vae/ltx-2.3-22b-distilled_audio_vae-ENC-f16.gguf \
