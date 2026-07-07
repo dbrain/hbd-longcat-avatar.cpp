@@ -9160,6 +9160,56 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
             return false;
         }
+
+        // LTX_REFINE_CONTEXT_FRAMES=N (default unset = byte-identical): "refine only the surviving
+        // frames" knob. A continuation segment appends the prior-segment guide as K extra TAIL tokens
+        // (video_conditioning_frame_count) whose RoPE lands at the segment start; the base pass samples
+        // the full [target(T), guide(K)] sequence for coherence, but those K guide tokens are CROPPED off
+        // the latent (:9439) BEFORE decode — the hires/refine sample() spends compute+VRAM on frames that
+        // are thrown away. This slices the upscaled latent to [target(T) + last N guide tokens] before the
+        // refine so it denoises only the surviving target frames plus N tail-context frames (the guide
+        // tokens closest to the surviving set — the seam-adjacent context to refine against). N=0 drops the
+        // whole guide (max VRAM save, max seam risk); N>=K = full refine = unchanged. The retained context
+        // frames sit at tensor indices [T, T+N) and are discarded by the SAME crop at :9439 (slice start=0,
+        // len=video_target_frame_count=T), so NO downstream reassembly/bookkeeping change is needed; the
+        // surviving target tokens keep their exact (head) positions so the empty-positions default RoPE is
+        // unchanged for them — only the trailing context set they attend to shrinks. chain_base_latent (the
+        // next-segment seed, captured pre-upscale at :9057) is unaffected. GUARDED to the plain-continuation
+        // refine: LTXAV, no packed audio (audio_length==0 — audio is packed as frame-count-keyed extra
+        // CHANNELS, so slicing frames would misalign it), no relip two-stage, no init/end image (those build
+        // real refine positions/masks that ARE frame-coupled), empty refine positions, and the exact
+        // [T+K] layout. Any other path is a no-op (byte-identical). Sweepable to find the minimal context
+        // that holds the seam.
+        if (const char* ctx_env = std::getenv("LTX_REFINE_CONTEXT_FRAMES")) {
+            int ctx_n = atoi(ctx_env);
+            int64_t T_tgt  = latents.video_target_frame_count;
+            int64_t K_cond = latents.video_conditioning_frame_count;
+            bool eligible =
+                ctx_n >= 0 &&
+                sd_version_is_ltxav(sd_ctx->sd->version) &&
+                T_tgt > 0 && K_cond > 0 &&
+                latents.audio_length == 0 &&
+                !latents.relip_twostage &&
+                sd_vid_gen_params->init_image.data == nullptr &&
+                sd_vid_gen_params->end_image.data == nullptr &&
+                hires_video_positions.empty() &&
+                hires_denoise_mask.empty() &&
+                hires_video_reference.empty() &&
+                x_t.shape()[2] == T_tgt + K_cond;
+            if (eligible) {
+                int64_t keep = std::min<int64_t>(ctx_n, K_cond);
+                if (keep < K_cond) {
+                    x_t = sd::ops::slice(x_t, 2, 0, T_tgt + keep);
+                    LOG_INFO("LTX_REFINE_CONTEXT_FRAMES=%d: refine sliced to %lld surviving + %lld guide-context frames "
+                             "(dropped %lld of %lld throwaway guide tokens from the refine)",
+                             ctx_n, (long long)T_tgt, (long long)keep, (long long)(K_cond - keep), (long long)K_cond);
+                }
+            } else {
+                LOG_INFO("LTX_REFINE_CONTEXT_FRAMES set but this refine is not an eligible plain-continuation "
+                         "LTXAV refine (audio/relip/image/positions coupling) — refining all frames unchanged");
+            }
+        }
+
         noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
 
         // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
