@@ -3379,6 +3379,24 @@ public:
             ggml_backend_cuda_trim_pools(backend_for(SDBackendModule::VAE));
             ggml_backend_cuda_trim_pools(backend_for(SDBackendModule::TE));
         }
+
+        // LTXAV_CHAIN_CUDNN_RESET (opt-in, default off = byte-identical): with cuDNN
+        // enabled (GGML_CUDNN_ATTN / GGML_CUDNN_CONV3D — the prod continuation recipe),
+        // the SDPA + conv3d execution-plan caches are process-global, keyed by shape,
+        // and pin cuDNN-backend device memory that is NEVER returned to the driver and
+        // that ggml_backend_cuda_trim_pools cannot reach (it lives outside the ggml VMM
+        // pool). A continuation segment's LONGER base pass (e.g. 16 latent frames = 13
+        // gen + 3 keyframe) and the first segment's VAE decode each build a bigger plan
+        // whose reservation then squats through EVERY later phase — measured as a uniform
+        // ~+1.7 GB reserve-time high-water on seg-2's refine AND decode vs seg-1 (which
+        // ran before those plans existed). Dropping the plan caches at the segment
+        // boundary returns that memory to the driver; the next segment rebuilds only the
+        // plans it actually needs (one-time build, not per-step → the refine/decode is
+        // not slowed). Nothing is in flight here (all segment compute has completed and
+        // synced). No-op on non-cuDNN builds.
+        if (getenv("LTXAV_CHAIN_CUDNN_RESET") != nullptr) {
+            ggml_backend_cuda_release_cudnn_plans();
+        }
     }
 
     void set_flow_shift(float flow_shift = INFINITY) {
