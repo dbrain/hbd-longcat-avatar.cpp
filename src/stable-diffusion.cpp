@@ -3343,6 +3343,13 @@ public:
             runner->release_streaming_residency();    // drop any cross-step shared-resident payload
             runner->free_compute_buffer();            // restore offloaded params to host + free activations
             runner->free_cache_ctx_and_buffer();      // free the temporal/causal-conv cache buffer
+            // Diagnostic (b): param-buffer state right after the between-segment reclaim's
+            // free_compute_buffer (which runs restore_partial/all_params). If the DiT
+            // buffer is NULL here despite keep_diffusion_model_resident=true, the reclaim
+            // (not a later step) is where it goes null.
+            if (getenv("LTXAV_PARAM_BUF_TRACE") == nullptr || getenv("LTXAV_PARAM_BUF_TRACE")[0] != '0') {
+                runner->log_param_buffer_state("release_chain_segment_gpu_residency:after-free-compute");
+            }
         };
         reclaim(diffusion_model);
         reclaim(high_noise_diffusion_model);

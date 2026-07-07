@@ -3727,6 +3727,13 @@ protected:
         GGML_ASSERT(plan_out != nullptr);
         GGML_ASSERT(gf != nullptr);
 
+        // Diagnostic (c): param-buffer state at the top of the plan build. If the DiT
+        // weights are already bufferless here, the buffer went null BEFORE compute (in the
+        // prior segment's teardown), not during the cut.
+        if (params_offloaded_to_host() && (getenv("LTXAV_PARAM_BUF_TRACE") == nullptr || getenv("LTXAV_PARAM_BUF_TRACE")[0] != '0')) {
+            log_param_buffer_state("resolve_graph_cut_plan:top");
+        }
+
         // Defensive: the graph-cut plan classifies weight leaves as INPUT_PARAM purely by
         // params_tensor_set_ membership (ggml_graph_cut.cpp:199). If that set is ever
         // transiently empty at plan-build time (e.g. a free_params_buffer() that cleared it
@@ -4239,6 +4246,29 @@ protected:
         std::unordered_map<ggml_tensor*, PersistentExternalBinding> persistent_externals;
         snapshot_persistent_externals(plan, gf, persistent_externals);
 
+        // Fix (1080p chain seg-2 cold-stream, iter-4): materialize the DiT params before
+        // the shared-resident derivation + pin. Live evidence: at seg-2 the DiT weights
+        // enter compute with NULL buffers (a flood of ggml_graph_cut.cpp:410 "param input
+        // without buffer" during the shared set walk), so the derivation counts 0 and
+        // offload_resident_params can't pin — the DiT then cold-streams (36 s/it) and dies.
+        // free_compute_buffer() above already ran restore_partial_params()+restore_all_params(),
+        // but restore_all_params() is skipped when keep_params_resident_ is set and neither
+        // reloads a genuinely freed buffer — so if the params are still bufferless here, try
+        // the restores directly (un-swap a dangling partial/full offload). No-op when buffers
+        // are already present → single-render path byte-identical. If they remain null the
+        // pin is guarded below (never hand a null-buffer tensor to offload_resident_params)
+        // and the diagnostics at (a)/(b)/(c) pinpoint where the buffer went null.
+        if (params_offloaded_to_host() && params_lack_buffers()) {
+            LOG_WARN("%s shared-resident: DiT params have NULL buffers at compute entry — "
+                     "attempting restore before derivation (keep_params_resident_=%d, "
+                     "params_on_runtime_backend=%d)",
+                     get_desc().c_str(), (int)keep_params_resident_, (int)params_on_runtime_backend);
+            restore_partial_params();
+            restore_all_params();
+            LOG_INFO("%s shared-resident: after restore, params_lack_buffers=%d",
+                     get_desc().c_str(), (int)params_lack_buffers());
+        }
+
         // LongCat lap-B: pin the cross-segment-shared param payload resident for the
         // whole segloop (offload_partial_params / the prefetch then stream only the
         // block-unique remainder). Must be set up BEFORE the pipelining bootstrap so
@@ -4353,7 +4383,30 @@ protected:
                 }
                 cached_shared_resident_sig_ = sig;
             }
-            const std::vector<ggml_tensor*>& shared = cached_shared_resident_set_;
+            // Safety: offload_resident_params -> ggml_backend_tensor_copy GGML_ASSERTs on a
+            // null source buffer. If the materialize-before-derive restore above did not
+            // recover every carried/derived param (e.g. a genuinely freed weight awaiting a
+            // reload), drop the still-bufferless ones so we degrade to a cold-stream instead
+            // of a hard abort. Cheap and normally a no-op (all params buffered).
+            std::vector<ggml_tensor*> shared_buffered;
+            {
+                size_t dropped = 0;
+                shared_buffered.reserve(cached_shared_resident_set_.size());
+                for (ggml_tensor* t : cached_shared_resident_set_) {
+                    if (t != nullptr && sd::ggml_graph_cut::tensor_buffer(t) != nullptr) {
+                        shared_buffered.push_back(t);
+                    } else {
+                        ++dropped;
+                    }
+                }
+                if (dropped > 0) {
+                    LOG_WARN("%s shared-resident: dropped %zu/%zu params without a materialized "
+                             "buffer before pin (would assert) — pinning %zu, streaming the rest",
+                             get_desc().c_str(), dropped, cached_shared_resident_set_.size(),
+                             shared_buffered.size());
+                }
+            }
+            const std::vector<ggml_tensor*>& shared = shared_buffered;
             // Residency token from the set's (step-stable) tensor pointers — mirrors
             // compute_streaming_segments so "is my resident set still valid" is a
             // pointer-XOR compare, not a re-offload.
@@ -4510,6 +4563,12 @@ protected:
         backend_tensor_data_map.clear();
         free_cache_ctx_and_buffer();
         free_compute_ctx();
+        // Diagnostic (a): param-buffer state at the end of this segment's sample. Compare
+        // against (b) chain-reclaim and (c) next-segment plan-top to localize where the
+        // buffer goes null.
+        if (params_offloaded_to_host() && (getenv("LTXAV_PARAM_BUF_TRACE") == nullptr || getenv("LTXAV_PARAM_BUF_TRACE")[0] != '0')) {
+            log_param_buffer_state("compute_with_graph_cuts:end-of-sample");
+        }
         if (getenv("LONGCAT_OFFLOAD_PROFILE") != nullptr) {
             int64_t segloop_total_ms = ggml_time_ms() - t_segloop_begin;
             // Capture any non-execute_graph segment-loop overhead (reset_segment,
@@ -4927,6 +4986,44 @@ public:
     // re-upload. When false, params live directly on the runtime backend (no offload): the only
     // way to reclaim their VRAM is free_params_buffer() + a reload before the next use.
     bool params_offloaded_to_host() const { return params_backend != runtime_backend; }
+
+    // True when the DiT/model param tensors currently have NO materialized backend buffer
+    // (tensor_buffer()==nullptr for a representative weight). Under the offload streaming
+    // path the graph-cut shared-resident derivation (runtime_param_tensors ->
+    // ggml_graph_cut.cpp:410) SKIPS bufferless params, and offload_resident_params ->
+    // ggml_backend_tensor_copy ASSERTS on a null source buffer — so a chain segment that
+    // enters compute with its params un-materialized derives 0 shared and can't pin.
+    // Cheap: checks the first non-view params_ctx tensor.
+    bool params_lack_buffers() const {
+        if (params_ctx == nullptr) {
+            return false;
+        }
+        for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr;
+             t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
+            return sd::ggml_graph_cut::tensor_buffer(t) == nullptr;
+        }
+        return false;
+    }
+
+    // Diagnostics (1080p chain seg-2 cold-stream): report the param-buffer state at a
+    // named lifecycle point so we can see exactly WHERE the DiT weights lose their buffer
+    // between chain segments (despite keep_diffusion_model_resident=true). Reports a
+    // representative weight's buffer presence + params_tensor_set_ size + params_ctx aliveness.
+    void log_param_buffer_state(const char* where) {
+        ggml_tensor* t =
+            (params_ctx != nullptr) ? ggml_get_tensor(params_ctx, "model.diffusion_model.patchify_proj.weight")
+                                    : nullptr;
+        const char* buf_state = (t == nullptr) ? "TENSOR_MISSING"
+                                               : (sd::ggml_graph_cut::tensor_buffer(t) != nullptr ? "present" : "NULL");
+        LOG_INFO("%s [param-buf-trace @ %s] patchify_proj.weight buffer=%s | params_tensor_set=%zu "
+                 "params_ctx=%s params_on_runtime_backend=%d keep_params_resident_=%d offloaded_to_host=%d",
+                 get_desc().c_str(), where, buf_state, params_tensor_set_.size(),
+                 params_ctx != nullptr ? "alive" : "null", (int)params_on_runtime_backend,
+                 (int)keep_params_resident_, (int)params_offloaded_to_host());
+    }
 
     // do copy after alloc graph
     void set_backend_tensor_data(ggml_tensor* tensor, const void* data) {
