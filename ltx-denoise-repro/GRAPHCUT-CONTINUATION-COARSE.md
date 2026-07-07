@@ -175,6 +175,39 @@ Non-chain / single-render path is unchanged: the whole block is gated on
 `shared_resident_active() && plan.segments.size()>1`; with no merge the base plan equals
 the merged plan (identical set); Fix B/C are inert unless the set is degenerate.
 
+## 4c. FOLLOW-UP (commit 2) — Fix A insufficient, Fix B wasn't firing
+
+Live validation of commit 1: SEG-1 `306 params (5471 MB)` resident, 22→10 s/it, GOOD.
+SEG-2 with Fix A active derived over the **50-segment BASE plan** yet STILL got
+`0 params read by >=2 of 50 segments` → Fix C warned, but the DiT stayed un-pinned
+(`resident=0`, 36 s/it, died). So Fix A alone can't save seg-2 (the continuation
+keyframe-append graph presents the DiT weights as read-by-exactly-one cut-segment even
+in the fine base plan), and the carry-forward (Fix B) is the necessary path — but it
+did not fire. Two robustness bugs fixed:
+
+- **Carry filter used `params_tensor_set_`** (`compute_with_graph_cuts`), which
+  `free_params_buffer()` transiently clears (`ggml_extend.hpp:4798`). Now the carry is
+  validated against a live walk of the `params_ctx` tensor structs — those keep stable
+  addresses across every between-segment teardown (`release_chain_segment_gpu_residency`
+  → `release_streaming_residency`; `LTXAV_DIT_FREE_DURING_DECODE` →
+  `release_all_gpu_param_residency`), only a real model reload frees them (which also
+  clears `last_shared_resident_set_` via `free_params_ctx`). `generate_video_chain`
+  (`stable-diffusion.cpp:10010`) is a single-process loop over the persistent
+  `diffusion_model`, so `last_shared_resident_set_` genuinely survives seg-0→seg-1.
+
+- **Defensive `params_tensor_set_` rebuild** in `resolve_graph_cut_plan` before the plan
+  is built: if the set is ever empty at plan-build time, EVERY DiT weight is
+  misclassified `INPUT_EXTERNAL` → 0 param bytes → both seg-2 symptoms (0 shared + coarse
+  merge). Rebuilding from live `params_ctx` (idempotent; no-op when populated → single
+  render byte-identical) fixes Fix A directly in that case.
+
+- **Fix C** now reports the prior-healthy-set size + live-params count, so a future
+  regression says whether the carry *source* or the *filter* was the gap.
+
+Expected seg-2 log now: `shared-resident carry-forward: prior healthy set 306 params
+(5471 MB), N live in params_ctx -> carrying 306 forward …` and the reserve line shows
+`resident=5471` / ~10 s/it like seg-1.
+
 ## 5. File:line index
 
 - `ggml_extend.hpp:4211` — shared set computed over the **merged** `plan` (root of the

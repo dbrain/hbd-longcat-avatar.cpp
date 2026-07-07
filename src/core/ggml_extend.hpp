@@ -3727,6 +3727,20 @@ protected:
         GGML_ASSERT(plan_out != nullptr);
         GGML_ASSERT(gf != nullptr);
 
+        // Defensive: the graph-cut plan classifies weight leaves as INPUT_PARAM purely by
+        // params_tensor_set_ membership (ggml_graph_cut.cpp:199). If that set is ever
+        // transiently empty at plan-build time (e.g. a free_params_buffer() that cleared it
+        // at ggml_extend.hpp:4798 without a rebuild before this compute), EVERY DiT weight
+        // is misclassified INPUT_EXTERNAL → the base plan carries 0 param bytes → the
+        // shared-resident derivation returns 0 AND the budget merge collapses (both the
+        // seg-2 symptoms). Rebuild from the live params_ctx structs (idempotent; a no-op
+        // when already populated → single-render path byte-identical) so the plan is always
+        // built against the real params.
+        if (params_tensor_set_.empty() && params_ctx != nullptr &&
+            ggml_get_first_tensor(params_ctx) != nullptr) {
+            rebuild_params_tensor_set();
+        }
+
         // Keep the plan and resident params under the same live-VRAM cap.
         // Add back our own resident buffer so we don't see chunk-K's
         // allocation as "taken" VRAM and shrink the budget on every step.
@@ -4267,37 +4281,68 @@ protected:
                 // small one legitimately needs no shared pin.
                 const bool large_offloaded = params_backend != runtime_backend &&
                                              total_params_bytes_ >= ring_min_model_bytes();
-                // Fix C: loud warn on a degenerate derivation for a large offloaded model
-                // — turns a silent 4× cold-stream + child SIGKILL into one obvious line.
-                if (large_offloaded && fresh_bytes * 8 < total_params_bytes_) {
-                    LOG_WARN("%s shared-resident derivation degenerate: only %zu params "
-                             "(%.0f MB) shared for a %.0f MB offloaded model over %zu "
-                             "segments — DiT will cold-stream unless a prior resident set "
-                             "is carried forward",
-                             get_desc().c_str(), fresh.size(), fresh_bytes / 1048576.0,
-                             total_params_bytes_ / 1048576.0, derive_plan->segments.size());
-                }
-                // Fix B: topology-independent safety floor. If the fresh derivation
-                // collapses (< half the last HEALTHY set) for a large offloaded model,
-                // carry the prior chain segment's pointer-stable set forward instead of
-                // un-pinning the DiT mid-chain. Filter to tensors still present as params
-                // (guards a model reload / address reuse); an empty carry falls through to
-                // the fresh set.
+
+                // Fix B: topology-independent safety floor. The continuation
+                // (keyframe-append) graph presents the DiT weights as read-by-exactly-one
+                // cut-segment even over the fine BASE plan, so BOTH the merged- and
+                // base-plan derivations collapse to 0 shared on chain seg>0 — Fix A alone
+                // can't save it (confirmed live: seg-2 "0 params read by >=2 of 50
+                // segments"). Carry the last HEALTHY set (seg-0's ~306/5471 MB the box
+                // proved fits) forward. generate_video_chain() is a single-process loop
+                // over the persistent diffusion_model runner, so last_shared_resident_set_
+                // survives the between-segment reclaim (release_chain_segment_gpu_residency
+                // → release_streaming_residency and LTXAV_DIT_FREE_DURING_DECODE →
+                // release_all_gpu_param_residency both drop only GPU residency + caches, NOT
+                // params_ctx / last_shared_resident_set_).
+                //
+                // Validate the carried tensors against the LIVE params_ctx structs, NOT
+                // params_tensor_set_ (which free_params_buffer() transiently clears at
+                // ggml_extend.hpp:4798) nor current GPU residency (always cleared between
+                // segments). The ggml_tensor structs in params_ctx keep stable addresses
+                // across every teardown short of a real model reload (which frees params_ctx
+                // and, via free_params_ctx(), also clears last_shared_resident_set_). This
+                // is why the previous params_tensor_set_-based filter dropped the carry.
                 std::vector<ggml_tensor*> carry;
+                size_t live_param_count = 0;
                 if (large_offloaded && !last_shared_resident_set_.empty() &&
                     fresh_bytes * 2 < last_shared_resident_bytes_) {
+                    std::unordered_set<const ggml_tensor*> live_params;
+                    for (ggml_tensor* t = (params_ctx != nullptr ? ggml_get_first_tensor(params_ctx) : nullptr);
+                         t != nullptr; t = ggml_get_next_tensor(params_ctx, t)) {
+                        live_params.insert(t);
+                    }
+                    live_param_count = live_params.size();
                     for (ggml_tensor* t : last_shared_resident_set_) {
-                        if (t != nullptr && params_tensor_set_.find(t) != params_tensor_set_.end()) {
+                        if (t != nullptr && live_params.find(t) != live_params.end()) {
                             carry.push_back(t);
                         }
                     }
+                    LOG_INFO("%s shared-resident carry-forward: prior healthy set %zu params "
+                             "(%.0f MB), %zu live in params_ctx -> carrying %zu forward (this "
+                             "segment's own derivation found only %.0f MB over %zu segments)",
+                             get_desc().c_str(), last_shared_resident_set_.size(),
+                             last_shared_resident_bytes_ / 1048576.0, live_param_count,
+                             carry.size(), fresh_bytes / 1048576.0, derive_plan->segments.size());
                 }
+
+                // Fix C: loud warn when a large offloaded model ends up with (near-)nothing
+                // pinned and no carry is available — a silent 4× cold-stream + child SIGKILL
+                // becomes one obvious line that also reports the prior-set size (so a future
+                // regression tells us whether the carry source or the filter was the gap).
+                if (large_offloaded && carry.empty() && fresh_bytes * 8 < total_params_bytes_) {
+                    LOG_WARN("%s shared-resident degenerate + NO carry: fresh %zu params "
+                             "(%.0f MB) for a %.0f MB offloaded model over %zu segments; prior "
+                             "healthy set = %zu params (%.0f MB), %zu live in params_ctx — DiT "
+                             "WILL cold-stream this segment",
+                             get_desc().c_str(), fresh.size(), fresh_bytes / 1048576.0,
+                             total_params_bytes_ / 1048576.0, derive_plan->segments.size(),
+                             last_shared_resident_set_.size(),
+                             last_shared_resident_bytes_ / 1048576.0, live_param_count);
+                }
+
                 if (!carry.empty()) {
-                    LOG_WARN("%s shared-resident: carrying prior segment's set forward "
-                             "(%.0f MB, %zu params); this segment's fresh derivation found "
-                             "only %.0f MB",
-                             get_desc().c_str(), last_shared_resident_bytes_ / 1048576.0,
-                             carry.size(), fresh_bytes / 1048576.0);
+                    // Pin the carried healthy set; keep last_shared_resident_* as the
+                    // canonical set (do NOT overwrite it with the degenerate fresh set).
                     cached_shared_resident_set_ = std::move(carry);
                 } else {
                     cached_shared_resident_set_ = fresh;
