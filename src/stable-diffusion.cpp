@@ -9271,6 +9271,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool before the hires/refine sample; re-offload from host at decode");
         }
 
+        // Refine-scoped resident byte cap (LONGCAT_SHARED_RESIDENT_MAX_MB): engage the
+        // cap ONLY for this 3-step hires/refine sample so it pins just the hottest ~4 GB
+        // (fits ≤11776 on the 97f 1080p continuation) while the 8-step base above keeps
+        // its full pin for speed. No-op when the cap env is unset (byte-identical).
+        if (sd_ctx->sd->diffusion_model) {
+            sd_ctx->sd->diffusion_model->set_refine_resident_scope(true);
+        }
         sampling_start = ggml_time_ms();
         final_latent   = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                             true,
@@ -9300,6 +9307,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                             latents.audio_fixed,
                                             hires_video_reference);
         sampling_end   = ggml_time_ms();
+        if (sd_ctx->sd->diffusion_model) {
+            sd_ctx->sd->diffusion_model->set_refine_resident_scope(false);
+        }
         // FIX (1080p hires chain seg-2 crash): this hires/latent-upscale success-path free was
         // gated ONLY on free_params_immediately, missing the !keep_diffusion_model_resident
         // guard the non-hires branch below (:9292) has. On a warm N-segment chain

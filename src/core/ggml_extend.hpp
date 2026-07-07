@@ -3014,6 +3014,30 @@ protected:
         return n;
     }
 
+    // Byte budget for the shared-resident pin. 0 (default / unset) = unlimited =
+    // the current uncapped behavior (byte-identical: no sort, no truncation). When
+    // >0 the derived resident set is sorted hottest-first and, IN THE REFINE SCOPE
+    // ONLY (see refine_resident_scope_), truncated to this many MB — the coldest
+    // tail then streams through the existing partial/prefetch path (it simply isn't
+    // in resident_param_set, which offload_partial_params already skips). Lets the
+    // 3-step hires refine pin only the hottest ~4 GB (fits ≤11776) while the 8-step
+    // base keeps its full pin for speed.
+    static size_t shared_resident_max_bytes() {
+        static const size_t b = []{
+            const char* s = getenv("LONGCAT_SHARED_RESIDENT_MAX_MB");
+            double mb = (s != nullptr && s[0] != '\0') ? atof(s) : 0.0;
+            if (mb <= 0.0) return (size_t)0;  // 0 = unlimited (current behavior)
+            return (size_t)(mb * 1024.0 * 1024.0);
+        }();
+        return b;
+    }
+
+    // Refine-scoped gate for the byte cap above. generate_video_ex flips this true
+    // immediately before the hires/refine sample() and false after, so the cap
+    // truncates the resident pin ONLY for the refine (the base pass keeps full pin).
+    bool refine_resident_scope_ = false;
+    void set_refine_resident_scope(bool on) { refine_resident_scope_ = on; }
+
     // Fix A (1080p chain seg-2 cold-stream): derive the shared-resident set from the
     // BASE (un-merged) cached graph-cut plan instead of the resolved MERGED plan. The
     // ">=2 of N segments" reuse rule self-zeros as the budget merge coarsens the plan
@@ -3080,6 +3104,24 @@ protected:
                 shared.push_back(kv.first);
                 shared_bytes += ggml_nbytes(kv.first);
             }
+        }
+        // Byte-cap ordering: only when LONGCAT_SHARED_RESIDENT_MAX_MB is set, put the
+        // set in a DETERMINISTIC hottest-first order so a downstream prefix-truncate at
+        // the cap keeps the most-reused params and streams the coldest tail. Ordering
+        // is inert for pinning (offload is order-independent) so the full base pin is
+        // unchanged; the carry-forward preserves this order into the refine. When the
+        // cap is unset we leave the set exactly as-is → default is byte-identical.
+        // Key: seg reuse count desc, then nbytes asc, then tensor name asc (a strict
+        // total order → reproducible across runs; raw pointer order is not stable).
+        if (shared_resident_max_bytes() > 0 && shared.size() > 1) {
+            std::sort(shared.begin(), shared.end(),
+                      [&](ggml_tensor* a, ggml_tensor* b) {
+                          const int ca = seg_count[a], cb = seg_count[b];
+                          if (ca != cb) return ca > cb;
+                          const size_t na = ggml_nbytes(a), nb = ggml_nbytes(b);
+                          if (na != nb) return na < nb;
+                          return strcmp(a->name, b->name) < 0;
+                      });
         }
         LOG_INFO("%s shared-resident set: %zu params (%.0f MB) read by >=%d of %zu segments",
                  get_desc().c_str(), shared.size(), shared_bytes / 1048576.0,
@@ -4430,7 +4472,33 @@ protected:
                              shared_buffered.size());
                 }
             }
-            const std::vector<ggml_tensor*>& shared = shared_buffered;
+            // Byte-capped refine-scoped pin. When LONGCAT_SHARED_RESIDENT_MAX_MB>0 AND
+            // generate_video_ex has flagged the refine scope, keep only the hottest
+            // params up to the cap and let the coldest tail stream (it's simply absent
+            // from resident_param_set → offload_partial_params / the prefetch stream it).
+            // The set is hotness-sorted (compute_shared_resident_set orders it when the
+            // cap env is set; the carry-forward preserves that order), so truncate by
+            // prefix — deterministic. cap==0 or non-refine → full set (byte-identical to
+            // the pre-cap path). Catches BOTH the fresh derivation and the seg>0 carry.
+            std::vector<ggml_tensor*> shared_capped;
+            const std::vector<ggml_tensor*>* shared_sel = &shared_buffered;
+            const size_t resident_cap_bytes = shared_resident_max_bytes();
+            if (resident_cap_bytes > 0 && refine_resident_scope_) {
+                size_t acc = 0, kept_bytes = 0;
+                shared_capped.reserve(shared_buffered.size());
+                for (ggml_tensor* t : shared_buffered) {
+                    const size_t nb = ggml_nbytes(t);
+                    if (!shared_capped.empty() && acc + nb > resident_cap_bytes) break;
+                    acc += nb;
+                    kept_bytes += nb;
+                    shared_capped.push_back(t);
+                }
+                LOG_INFO("%s shared-resident set (capped): %zu params (%.0f MB) [cap=%.0f MB, streamed %zu params]",
+                         get_desc().c_str(), shared_capped.size(), kept_bytes / 1048576.0,
+                         resident_cap_bytes / 1048576.0, shared_buffered.size() - shared_capped.size());
+                shared_sel = &shared_capped;
+            }
+            const std::vector<ggml_tensor*>& shared = *shared_sel;
             // Residency token from the set's (step-stable) tensor pointers — mirrors
             // compute_streaming_segments so "is my resident set still valid" is a
             // pointer-XOR compare, not a re-offload.
