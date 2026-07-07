@@ -4619,7 +4619,7 @@ protected:
             offload_profile_.graphprep_ms += ggml_time_ms() - t_prep_begin;
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
-                                                   true,
+                                                   false,
                                                    sd::ggml_graph_cut::runtime_param_tensors(gf, segment, get_desc().c_str()),
                                                    true,
                                                    !is_last_segment || no_return,
@@ -4656,6 +4656,9 @@ protected:
 
         backend_tensor_data_map.clear();
         free_cache_ctx_and_buffer();
+        if (free_compute_buffer_immediately) {
+            free_compute_buffer();
+        }
         free_compute_ctx();
         // Diagnostic (a): param-buffer state at the end of this segment's sample. Compare
         // against (b) chain-reclaim and (c) next-segment plan-top to localize where the
@@ -4809,7 +4812,7 @@ public:
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
-                                                   /*free_compute_buffer_immediately=*/true,
+                                                   /*free_compute_buffer_immediately=*/false,
                                                    sd::ggml_graph_cut::runtime_param_tensors(gf, segment, get_desc().c_str()),
                                                    /*preserve_backend_tensor_data_map=*/true,
                                                    /*no_return=*/!is_last || no_return,
@@ -4831,6 +4834,9 @@ public:
 
         backend_tensor_data_map.clear();
         free_cache_ctx_and_buffer();
+        if (free_compute_buffer_immediately) {
+            free_compute_buffer();
+        }
         free_compute_ctx();
         return output;
     }
