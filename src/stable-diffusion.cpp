@@ -9279,7 +9279,15 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                             latents.audio_fixed,
                                             hires_video_reference);
         sampling_end   = ggml_time_ms();
-        if (sd_ctx->sd->free_params_immediately) {
+        // FIX (1080p hires chain seg-2 crash): this hires/latent-upscale success-path free was
+        // gated ONLY on free_params_immediately, missing the !keep_diffusion_model_resident
+        // guard the non-hires branch below (:9292) has. On a warm N-segment chain
+        // (keep_diffusion_model_resident=true) it nulled every non-resident DiT param
+        // (data=null for ~4138/4444 tensors: the per-block attn/ff/scale_shift weights), so the
+        // NEXT segment's forward read freed weights -> segfault ("peer closed cleanly"). 720p-flat
+        // never hit it (no hires -> takes the correctly-gated :9292 branch), which is why only the
+        // hires path died. Keep the DiT host-resident across the seam like the non-hires path.
+        if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         if (final_latent.empty()) {
