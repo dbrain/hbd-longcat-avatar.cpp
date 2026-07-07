@@ -9328,7 +9328,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // Trim the DIFFUSION backend pool so the freed VRAM leaves the board as real headroom for
             // the VAE decode peak (mirrors the pre-sample DIFFUSION trim + the LTXAV_VAE_LAZY VAE trim).
             ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
-            LOG_INFO("LTXAV_DIT_FREE_DURING_DECODE: released offloaded DiT GPU params (runtime + shared-resident) + trimmed DIFFUSION pool before decode; a chained next generate re-offloads from host");
+            // FIX 2 (belt-and-suspenders): also trim the VAE backend's pool. On the single-GPU default
+            // recipe VAE and DIFFUSION resolve to the same cached cuda0 backend, so this is a no-op
+            // (the pool was just trimmed); if a recipe ever splits the VAE onto its own backend it
+            // reclaims that pool's committed high-water (e.g. the continuation reference-encode /
+            // prior-segment decode scratch) which the DIFFUSION-only trim can't reach. Harmless +
+            // byte-identical either way.
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
+            LOG_INFO("LTXAV_DIT_FREE_DURING_DECODE: released offloaded DiT GPU params (runtime + shared-resident + streaming/prefetch buffers) + trimmed DIFFUSION+VAE pools before decode; a chained next generate re-offloads from host");
         } else {
             LOG_INFO("LTXAV_DIT_FREE_DURING_DECODE: DiT params live on the runtime backend (no host offload); skipping to stay abort-safe");
         }

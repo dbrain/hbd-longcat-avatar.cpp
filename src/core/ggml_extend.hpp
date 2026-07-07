@@ -4997,6 +4997,31 @@ public:
         keep_params_resident_ = false;
         restore_resident_params();  // frees resident_runtime_params_buffer (the shared-resident squat)
         restore_all_params();       // frees runtime_params_buffer (also does restore_partial_params)
+        // FIX 1 (97f continuation decode VRAM): restore_partial_params() ROUTES the partial buffer
+        // back into prefetch_buf_pool_ (pool_return_partial_buffer, NOT a cudaFree), and neither
+        // restore path touches prefetched_state_.buf (the unconsumed "+1 segment" prefetch) or the
+        // temporal cache_buffer. Those DiT streaming buffers (~partial 209 + prefetched 209 + up to
+        // kPrefetchPoolCap pooled = ~420-627 MB) then squat OUTSIDE the ggml_cuda_pool that
+        // ggml_backend_cuda_trim_pools reclaims, inflating the seg-2 VAE-decode overhead by that
+        // much. This method is a full GPU-residency teardown (the DIT_FREE_DURING_DECODE caller runs
+        // it right before decode; the next segment's stream rebuilds all of this lazily), so funnel
+        // them through their real freers here. free_prefetch_buffer_pool() cudaFrees every pooled
+        // buffer + clears the vector; prefetched_state_ is freed directly (not pool-returned — we're
+        // tearing the pool down); free_cache_ctx_and_buffer() drops the temporal cache ctx+buffer
+        // together (freeing the buffer alone would dangle cache_ctx). All are no-ops when empty →
+        // single-render / 720p-flat (which never populate the offload/stream buffers) byte-identical.
+        if (prefetched_state_.buf != nullptr) {
+            ggml_backend_buffer_free(prefetched_state_.buf);
+            prefetched_state_.buf = nullptr;
+        }
+        if (prefetched_state_.ctx != nullptr) {
+            ggml_free(prefetched_state_.ctx);
+            prefetched_state_.ctx = nullptr;
+        }
+        prefetched_state_.pairs.clear();
+        prefetched_state_.event_recorded = false;
+        free_prefetch_buffer_pool();
+        free_cache_ctx_and_buffer();
         // Drop the cross-step shared-resident cache so the next segloop re-derives + re-offloads it
         // (restore_resident_params already zeroed resident_state_token / resident_param_set).
         cached_shared_resident_set_.clear();
