@@ -2250,6 +2250,15 @@ protected:
     std::vector<ggml_tensor*> last_shared_resident_set_;
     size_t last_shared_resident_bytes_ = 0;
 
+    // Fix (1080p chain seg-2 a2v crash): CPU buffer objects we created to wrap a param
+    // tensor that entered a chain segment with valid host DATA but a null buffer OBJECT
+    // (e.g. block-47 audio<->video weights the :410-skip cycle left un-streamed). Wrapping
+    // gives runtime_param_tensors a non-null buffer so the weight is streamed instead of
+    // skipped and the forward never reads a null buffer. These buffers do NOT own the data
+    // (ggml_backend_cpu_buffer_from_ptr), so freeing them leaves the params_ctx data intact.
+    // Freed on model unload (free_params_buffer / destructor).
+    std::vector<std::pair<ggml_tensor*, ggml_backend_buffer_t>> materialized_param_buffers_;
+
     size_t max_graph_vram_bytes           = 0;
     bool stream_layers_enabled            = false;
     size_t observed_max_effective_budget_ = 0;
@@ -4258,20 +4267,29 @@ protected:
         // are already present → single-render path byte-identical. If they remain null the
         // pin is guarded below (never hand a null-buffer tensor to offload_resident_params)
         // and the diagnostics at (a)/(b)/(c) pinpoint where the buffer went null.
-        if (params_offloaded_to_host() && params_lack_buffers()) {
-            LOG_WARN("%s shared-resident: DiT params have NULL buffers at compute entry — "
-                     "attempting restore before derivation (keep_params_resident_=%d, "
-                     "params_on_runtime_backend=%d)",
-                     get_desc().c_str(), (int)keep_params_resident_, (int)params_on_runtime_backend);
-            restore_partial_params();
-            restore_all_params();
-            LOG_INFO("%s shared-resident: after restore, params_lack_buffers=%d",
-                     get_desc().c_str(), (int)params_lack_buffers());
-            // Decisive: if ANY param is still bufferless after the restore, the forward may
-            // read a null buffer (segfault). Dump the offenders + their data-validity so the
-            // next rebuild pinpoints the fix (re-wrap valid-data weights vs reload freed ones).
+        if (params_offloaded_to_host()) {
+            // (1) If the DiT params entered this chain segment bufferless because a prior
+            // offload swap was left un-restored, un-swap them (no-op when already restored;
+            // free_compute_buffer above ran the restores unless keep_params_resident_).
+            if (params_lack_buffers()) {
+                LOG_WARN("%s shared-resident: DiT params have NULL buffers at compute entry — "
+                         "restore before derivation (keep_params_resident_=%d, "
+                         "params_on_runtime_backend=%d)",
+                         get_desc().c_str(), (int)keep_params_resident_, (int)params_on_runtime_backend);
+                restore_partial_params();
+                restore_all_params();
+            }
+            // (2) Wrap any params that are STILL bufferless but hold valid host DATA — e.g.
+            // block-47 audio<->video weights that the :410-skip cycle left un-streamed (the
+            // no-audio forward still reads them via the empty-ax run_ax=true path). Giving
+            // them a CPU buffer over their existing data lets runtime_param_tensors stream
+            // them instead of skipping, so the forward never reads a null buffer. No-op when
+            // all params are already buffered → single-render / 720p-flat byte-identical.
+            materialize_bufferless_params();
+            // Diagnostic: anything STILL bufferless here has NULL data (genuinely freed) and
+            // needs the reload path — dump_bufferless_params flags it by name + data-validity.
             if (getenv("LTXAV_PARAM_BUF_TRACE") == nullptr || getenv("LTXAV_PARAM_BUF_TRACE")[0] != '0') {
-                dump_bufferless_params("post-restore/pre-derive");
+                dump_bufferless_params("post-materialize/pre-derive");
             }
         }
 
@@ -4877,6 +4895,9 @@ public:
     }
 
     void free_params_buffer() {
+        // Drop any CPU wrapper buffers we created over param data before that data is
+        // released/nulled below (else the wrappers dangle and leak).
+        free_materialized_param_buffers();
         // If the params are currently swapped onto the runtime backend (offload), bring
         // them back first so params_buffer (and the params_ctx tensors that reference it)
         // are the ones we free, and offload_ctx is left clean.
@@ -5012,6 +5033,65 @@ public:
             return sd::ggml_graph_cut::tensor_buffer(t) == nullptr;
         }
         return false;
+    }
+
+    void free_materialized_param_buffers() {
+        for (auto& pr : materialized_param_buffers_) {
+            ggml_tensor* t          = pr.first;
+            ggml_backend_buffer_t b = pr.second;
+            // Revert the tensor to its natural bufferless state only if it still points at
+            // OUR wrapper (a later real (re)load may have replaced it).
+            if (t != nullptr && t->buffer == b) {
+                t->buffer = nullptr;
+            }
+            if (b != nullptr) {
+                ggml_backend_buffer_free(b);  // frees the wrapper only; NOT the wrapped data
+            }
+        }
+        materialized_param_buffers_.clear();
+    }
+
+    // Fix (1080p chain seg-2 a2v crash): give a backend buffer to any params_ctx weight that
+    // has valid host DATA but a null buffer OBJECT, so runtime_param_tensors (ggml_graph_cut
+    // .cpp:410) no longer skips it and the forward doesn't read a null buffer. Only wraps
+    // tensors whose data is non-null (a genuinely freed weight — data==null — is left for the
+    // reload path and flagged by dump_bufferless_params). The wrapper references the existing
+    // host data (ggml_backend_cpu_buffer_from_ptr), so it's a transport shim, not a copy.
+    // Idempotent: skips already-buffered tensors, so it wraps once and the shim persists
+    // across steps/segments. No-op when every param is already buffered → single-render /
+    // 720p-flat paths byte-identical. Returns the number newly wrapped.
+    size_t materialize_bufferless_params() {
+        if (params_ctx == nullptr || !params_offloaded_to_host()) {
+            return 0;
+        }
+        size_t wrapped = 0, skipped_no_data = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr;
+             t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
+            if (sd::ggml_graph_cut::tensor_buffer(t) != nullptr) {
+                continue;  // already materialized
+            }
+            if (t->data == nullptr) {
+                ++skipped_no_data;  // genuinely freed — needs a reload, not a wrap
+                continue;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(t->data, ggml_nbytes(t));
+            if (buf == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            t->buffer = buf;
+            materialized_param_buffers_.push_back({t, buf});
+            ++wrapped;
+        }
+        if (wrapped > 0 || skipped_no_data > 0) {
+            LOG_INFO("%s materialize: wrapped %zu bufferless-but-valid-data params in CPU buffers "
+                     "(streamable now); left %zu with NULL data for the reload path",
+                     get_desc().c_str(), wrapped, skipped_no_data);
+        }
+        return wrapped;
     }
 
     // Decisive diagnostic (iter-5): dump EVERY params_ctx tensor that lacks a materialized
