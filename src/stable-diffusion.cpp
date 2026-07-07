@@ -3383,13 +3383,13 @@ public:
         // LTXAV_CHAIN_CUDNN_RESET (opt-in, default off = byte-identical): with cuDNN
         // enabled (GGML_CUDNN_ATTN / GGML_CUDNN_CONV3D — the prod continuation recipe),
         // the SDPA + conv3d execution-plan caches are process-global, keyed by shape.
-        // Current cuDNN also appears to keep large internal device reservations attached
-        // to the thread-local cudnnHandle_t after the frontend graphs are destroyed; that
-        // memory is outside the ggml VMM pool, so ggml_backend_cuda_trim_pools cannot
-        // reclaim it. Reset both the graph caches and this CUDA worker thread's handles
-        // at the segment boundary. The next segment recreates handles/plans lazily and
-        // rebuilds only the plans it actually needs. Nothing is in flight here (all
-        // segment compute has completed and synced). No-op on non-cuDNN builds.
+        // Current cuDNN/CUDA can keep freed internal allocations in CUDA's async
+        // mempool after frontend graphs/handles are destroyed; that memory is outside
+        // the ggml VMM pool, so ggml_backend_cuda_trim_pools cannot reclaim it. Reset
+        // the graph caches, this CUDA worker thread's handles, and CUDA mempools at the
+        // segment boundary. The next segment recreates handles/plans lazily and rebuilds
+        // only what it needs. Nothing is in flight here (all segment compute has
+        // completed and synced). No-op on non-cuDNN builds.
         if (getenv("LTXAV_CHAIN_CUDNN_RESET") != nullptr) {
             ggml_backend_cuda_release_cudnn_plans();
         }
