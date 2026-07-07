@@ -3342,6 +3342,15 @@ public:
             }
             runner->release_streaming_residency();    // drop any cross-step shared-resident payload
             runner->free_compute_buffer();            // restore offloaded params to host + free activations
+            // SEAM FIX (97f continuation refine VRAM): free_compute_buffer's restore_partial_params
+            // RETURNS the partial buffer to prefetch_buf_pool_ (pool_return, not cudaFree) and leaves
+            // prefetched_state_.buf, so seg-1's ~420-627 MB of idle DiT streaming scratch would carry
+            // into seg-2 and squat through its base+refine SAMPLING peak (the true 97f ceiling) —
+            // ggml_backend_cuda_trim_pools can't reach these (they're backend buffers outside the
+            // ggml_cuda_pool). Free them at the boundary; the next segment's stream re-creates them
+            // lazily (one-time buffer alloc, no weight re-stream). Must run AFTER free_compute_buffer
+            // (which repopulates the pool). No-op when empty → single-render byte-identical.
+            runner->free_streaming_scratch_buffers();
             runner->free_cache_ctx_and_buffer();      // free the temporal/causal-conv cache buffer
             // Diagnostic (b): param-buffer state right after the between-segment reclaim's
             // free_compute_buffer (which runs restore_partial/all_params). If the DiT
@@ -9211,6 +9220,18 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             const char* e = getenv("LTXAV_PRE_SAMPLE_POOL_TRIM");
             if (e == nullptr || std::string(e) != "0") {
                 ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+                // REFINE-PEAK FIX (97f continuation): the trim above reclaims the VMM pool
+                // high-water, but the DiT's idle param-streaming buffers (prefetch_buf_pool_ +
+                // the last prefetched_state_.buf, ~420-627 MB left by the just-finished base
+                // sample) live OUTSIDE that pool and squat through the refine — the true 97f
+                // ceiling. Nothing is in flight here (base sample + upscale done, refine buffer
+                // not reserved yet; the trim already synced), so free them before the refine
+                // reserves its compute buffer. The refine's own stream re-creates them lazily
+                // (one-time buffer alloc, NOT a weight re-stream → no slowdown). No-op when empty
+                // → single-render / 720p-flat byte-identical.
+                if (sd_ctx->sd->diffusion_model) {
+                    sd_ctx->sd->diffusion_model->free_streaming_scratch_buffers();
+                }
             }
         }
 

@@ -4993,6 +4993,30 @@ public:
     // cache so a later compute_with_graph_cuts re-offloads cleanly. No-op when params live directly on
     // the runtime backend (params_offloaded_to_host() == false). NOT abort-safe on its own for the
     // no-offload regime — callers gate on params_offloaded_to_host().
+    // Release the DiT param-STREAMING scratch that lives OUTSIDE the ggml_cuda_pool (so
+    // ggml_backend_cuda_trim_pools / the LTXAV_PRE_SAMPLE_POOL_TRIM cannot reclaim it): the
+    // idle best-fit prefetch_buf_pool_ (up to kPrefetchPoolCap buffers that restore_partial_params
+    // returns via pool_return_partial_buffer) + the last unconsumed prefetched_state_.buf (the
+    // "+1 segment" that the final sampling step staged). These are cudaMalloc'd backend buffers,
+    // each ~one cut-segment's params (~209 MB seen at 1080p), so up to ~420-627 MB can squat idle
+    // between/inside segments. The next stream re-creates them lazily via pool_alloc_ctx_tensors /
+    // kick_off_prefetch (a one-time buffer alloc, NOT a weight re-stream), so freeing here never
+    // re-streams weights or slows sampling. No-op when empty → single-render / 720p-flat (which
+    // never populate the offload/stream buffers) byte-identical.
+    void free_streaming_scratch_buffers() {
+        if (prefetched_state_.buf != nullptr) {
+            ggml_backend_buffer_free(prefetched_state_.buf);
+            prefetched_state_.buf = nullptr;
+        }
+        if (prefetched_state_.ctx != nullptr) {
+            ggml_free(prefetched_state_.ctx);
+            prefetched_state_.ctx = nullptr;
+        }
+        prefetched_state_.pairs.clear();
+        prefetched_state_.event_recorded = false;
+        free_prefetch_buffer_pool();
+    }
+
     void release_all_gpu_param_residency() {
         keep_params_resident_ = false;
         restore_resident_params();  // frees resident_runtime_params_buffer (the shared-resident squat)
@@ -5005,22 +5029,10 @@ public:
         // ggml_backend_cuda_trim_pools reclaims, inflating the seg-2 VAE-decode overhead by that
         // much. This method is a full GPU-residency teardown (the DIT_FREE_DURING_DECODE caller runs
         // it right before decode; the next segment's stream rebuilds all of this lazily), so funnel
-        // them through their real freers here. free_prefetch_buffer_pool() cudaFrees every pooled
-        // buffer + clears the vector; prefetched_state_ is freed directly (not pool-returned — we're
-        // tearing the pool down); free_cache_ctx_and_buffer() drops the temporal cache ctx+buffer
-        // together (freeing the buffer alone would dangle cache_ctx). All are no-ops when empty →
-        // single-render / 720p-flat (which never populate the offload/stream buffers) byte-identical.
-        if (prefetched_state_.buf != nullptr) {
-            ggml_backend_buffer_free(prefetched_state_.buf);
-            prefetched_state_.buf = nullptr;
-        }
-        if (prefetched_state_.ctx != nullptr) {
-            ggml_free(prefetched_state_.ctx);
-            prefetched_state_.ctx = nullptr;
-        }
-        prefetched_state_.pairs.clear();
-        prefetched_state_.event_recorded = false;
-        free_prefetch_buffer_pool();
+        // the streaming scratch through its real freers, and free_cache_ctx_and_buffer() drops the
+        // temporal cache ctx+buffer together (freeing the buffer alone would dangle cache_ctx). All
+        // no-ops when empty → single-render / 720p-flat byte-identical.
+        free_streaming_scratch_buffers();
         free_cache_ctx_and_buffer();
         // Drop the cross-step shared-resident cache so the next segloop re-derives + re-offloads it
         // (restore_resident_params already zeroed resident_state_token / resident_param_set).
