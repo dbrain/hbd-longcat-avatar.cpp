@@ -1822,15 +1822,38 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         }
 
         if (can_use_flash_attn) {
-            kqv = build_kqv(q, k, v, mask);
+            static const int64_t ltx_attn_qtile =
+                (getenv("LTX_ATTN_QTILE") != nullptr && atoll(getenv("LTX_ATTN_QTILE")) > 0)
+                    ? atoll(getenv("LTX_ATTN_QTILE"))
+                    : 0;
+            const bool qtile_enabled = ltx_attn_qtile > 0 && mask == nullptr && kv_pad == 0 && N == 1 && L_q > ltx_attn_qtile;
+            if (qtile_enabled) {
+                // Query-row tiling is exact for unmasked attention: each query row attends the
+                // full shared K/V and is independent of other query rows. This bounds cuDNN SDPA's
+                // per-dispatch sequence length for hires LTX refine without changing K/V or math.
+                for (int64_t off = 0; off < L_q; off += ltx_attn_qtile) {
+                    const int64_t len = std::min<int64_t>(ltx_attn_qtile, L_q - off);
+                    auto q_t = ggml_view_3d(ctx, q, q->ne[0], len, q->ne[2],
+                                            q->nb[1], q->nb[2], q->nb[1] * off);
+                    q_t = ggml_cont(ctx, q_t);
+                    auto out_t = build_kqv(q_t, k, v, nullptr);
+                    out_t = ggml_view_3d(ctx, out_t, d_head, n_head, len, out_t->nb[1], out_t->nb[2], 0);
+                    kqv = kqv == nullptr ? out_t : ggml_concat(ctx, kqv, out_t, 2);
+                }
+            } else {
+                kqv = build_kqv(q, k, v, mask);
+            }
             if (!ggml_backend_supports_op(backend, kqv)) {
                 LOG_DEBUG("FA2DBG: supports_op=FALSE L_q=%ld L_k=%ld n_head=%ld d_head=%ld N=%ld kv_pad=%d mask=%s",
                           (long)L_q, (long)L_k, (long)n_head, (long)d_head, (long)N, kv_pad,
                           mask ? "yes" : "null");
                 kqv = nullptr;
             } else {
-                LOG_DEBUG("FA2DBG: flash ENGAGED L_q=%ld L_k=%ld d_head=%ld", (long)L_q, (long)L_k, (long)d_head);
-                kqv = ggml_view_3d(ctx, kqv, d_head, n_head, L_q, kqv->nb[1], kqv->nb[2], 0);
+                LOG_DEBUG("FA2DBG: flash ENGAGED L_q=%ld L_k=%ld d_head=%ld qtile=%ld",
+                          (long)L_q, (long)L_k, (long)d_head, qtile_enabled ? (long)ltx_attn_qtile : 0L);
+                if (!qtile_enabled) {
+                    kqv = ggml_view_3d(ctx, kqv, d_head, n_head, L_q, kqv->nb[1], kqv->nb[2], 0);
+                }
             }
         } else {
             LOG_DEBUG("FA2DBG: can_use_flash_attn=FALSE (mask->ne[3]!=1?)");
