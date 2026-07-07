@@ -70,11 +70,22 @@ x_t = sd::ops::slice(x_t, 2, 0, T_tgt + keep);   // keep = min(N, K)
   chains identically. VERIFIED.
 - `noise` is `randn_like(x_t)` *after* the slice → matches the reduced shape.
 
-### Guards (any miss → no-op, byte-identical)
+### Guards (any miss → no-op, byte-identical; the failing guard is logged)
 
 LTXAV · `video_target_frame_count>0` · `video_conditioning_frame_count>0` ·
-**`audio_length==0`** · `!relip_twostage` · no init/end image · empty refine
-positions/mask/reference · `x_t.T == T+K`. Unset env or `keep>=K` → no slice.
+`!relip_twostage` · no init/end image · **empty `hires_video_positions`** · **empty
+`hires_video_reference`** · `x_t.T == T+K`. Unset env or `keep>=K` → no slice.
+
+**Audio IS handled** (this is the deployed lipdub/driven-audio continuation): audio is packed
+as frame-count-keyed extra channels, so the packed frame dim can't be sliced directly. Instead
+the knob unpacks the audio (`unpack_ltxav_audio_latent` returns `{16, audio_length, 8}`,
+independent of video T), slices the **video** frames only, repacks the **same** audio latent,
+and rebuilds the audio-pinned `hires_denoise_mask` for the sliced video. `audio_length` is
+unchanged so the post-refine audio decode (:9384) and crop (:9439) are unaffected.
+
+Only `hires_video_positions`/`hires_video_reference` non-empty forces a no-op — those arise
+**exclusively** from the relip-two-stage (sd:8414) or FLF2V end-image (sd:8538) branches, which
+build frame-coupled positions/reference token blocks (a separate follow-up).
 
 ## Frame counts / expected VRAM — K=3, T=13 (97f 1080p continuation)
 
@@ -101,25 +112,31 @@ is O(tokens²) so the true curve is slightly convex; treat as a guide, measure o
 - **Stitch/decode fixed frame count: OK.** The crop at 9439 uses `video_target_frame_count`
   (absolute T), not `total − K`, so feeding fewer trailing frames still yields exactly T. Decode
   consumes the post-crop T frames. No index assumes T+K.
-- **Audio pin / save-for-next-chain: HANDLED BY GUARD.** Audio is packed as **extra channels**
-  whose count = `ceil(audio_values / (W·H·frames))` (`pack_ltxav_audio_and_video_latents`,
-  sd:4964) — **frame-count-keyed**, so slicing video frames misaligns the packed audio and the
-  audio pin. The knob is therefore **guarded to `audio_length==0`** (t2v/i2v-no-audio
-  continuation) and no-ops on lipdub/driven-audio renders. `chain_base_latent` is pre-upscale →
-  refine subset can't affect the chain seed.
+- **Audio pin / save-for-next-chain: HANDLED (unpack → slice video → repack).** Audio is packed
+  as **extra channels** whose count = `ceil(audio_values / (W·H·frames))`
+  (`pack_ltxav_audio_and_video_latents`, sd:4964) — frame-count-keyed. The audio latent itself is
+  a segment-global timeline (`{16, audio_length, 8}`) **independent of the video guide frames**, so
+  the knob unpacks it, slices only the video frames, and repacks the *same* audio (with the
+  audio-pinned mask rebuilt for the sliced video). `audio_length` is unchanged, so both the audio
+  decode (:9384) and the crop (:9439) behave as before. `chain_base_latent` is pre-upscale → the
+  refine subset can't affect the next-segment chain seed. **Verified by construction; needs a GPU
+  A/B (audio identical, seam) to confirm.**
 
-## Hard coupling that keeps the general (audio) case OUT of scope
+## Root cause of the first no-op (corrected)
 
-The **primary** VRAM-pain continuation (LTX-2.3 lipdub / driven audio) carries a packed audio
-slot whose channel count depends on the video frame count and whose slot is pinned every refine
-step. Slicing video frames for the refine would require unpack → resize audio to the sliced
-count → repack → refine → resize back → repack for decode, altering the audio and adding
-frame-coupled bookkeeping across sd:9088-9114 / 8551-8557 / 9384. That is well past the clean
-~60-line bar and can't be GPU-validated here, so the implemented knob deliberately no-ops there.
-Extending to audio is a follow-up (unpack/repack the audio around the slice, or refine video-only
-and re-pin audio separately).
+The v1 knob required `audio_length==0` and empty `hires_denoise_mask`, so it no-op'd on the
+deployed continuation — which is **audio-driven** (talking-head), giving `audio_length>0` and a
+non-empty audio-pinned mask. (`hires_video_positions` is *empty* on that path: the plain-cont
+refine's `audio_fixed` branch, sd:8458, sets only the mask, never positions — positions come
+solely from relip/end-image.) v2 handles the audio+mask directly, so it now fires on the
+audio-driven keyframe-append continuation. The remaining no-op paths are relip-two-stage and
+FLF2V end-image (non-empty `hires_video_positions`/`hires_video_reference`), a separate follow-up.
 
 ## Status
 
-**IMPLEMENTED** env-gated for the plain no-audio LTXAV continuation refine (byte-identical when
-unset or on any guarded-out path); audio (lipdub) case documented as a follow-up plan above.
+**IMPLEMENTED (v2)** env-gated for the LTXAV keyframe-append continuation refine including the
+audio-driven case (byte-identical when unset or on a guarded-out path; the specific failing guard
+is logged). Relip-two-stage / FLF2V end-image refines still no-op (frame-coupled positions).
+**Not yet compiled/GPU-validated** (no build per active-bench constraint) — needs `make` + a
+seg-2 A/B at N=0/1/2 vs default to confirm it fires (refine T=13 → ~10.5 GB) and holds the seam +
+audio.

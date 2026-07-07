@@ -9162,51 +9162,82 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
 
         // LTX_REFINE_CONTEXT_FRAMES=N (default unset = byte-identical): "refine only the surviving
-        // frames" knob. A continuation segment appends the prior-segment guide as K extra TAIL tokens
-        // (video_conditioning_frame_count) whose RoPE lands at the segment start; the base pass samples
-        // the full [target(T), guide(K)] sequence for coherence, but those K guide tokens are CROPPED off
-        // the latent (:9439) BEFORE decode — the hires/refine sample() spends compute+VRAM on frames that
-        // are thrown away. This slices the upscaled latent to [target(T) + last N guide tokens] before the
-        // refine so it denoises only the surviving target frames plus N tail-context frames (the guide
-        // tokens closest to the surviving set — the seam-adjacent context to refine against). N=0 drops the
-        // whole guide (max VRAM save, max seam risk); N>=K = full refine = unchanged. The retained context
-        // frames sit at tensor indices [T, T+N) and are discarded by the SAME crop at :9439 (slice start=0,
-        // len=video_target_frame_count=T), so NO downstream reassembly/bookkeeping change is needed; the
-        // surviving target tokens keep their exact (head) positions so the empty-positions default RoPE is
-        // unchanged for them — only the trailing context set they attend to shrinks. chain_base_latent (the
-        // next-segment seed, captured pre-upscale at :9057) is unaffected. GUARDED to the plain-continuation
-        // refine: LTXAV, no packed audio (audio_length==0 — audio is packed as frame-count-keyed extra
-        // CHANNELS, so slicing frames would misalign it), no relip two-stage, no init/end image (those build
-        // real refine positions/masks that ARE frame-coupled), empty refine positions, and the exact
-        // [T+K] layout. Any other path is a no-op (byte-identical). Sweepable to find the minimal context
-        // that holds the seam.
+        // frames" knob. A continuation segment appends the prior-segment guide as K extra TAIL frames
+        // (video_conditioning_frame_count, sd:5138/6774) whose RoPE lands at the segment start; the base
+        // pass samples the full [target(T), guide(K)] sequence for coherence, but those K guide frames are
+        // CROPPED off the latent (:9439) BEFORE decode — the hires/refine sample() spends compute+VRAM on
+        // frames that are thrown away (measured: seg-1 13f refine = 10531 MiB vs seg-2 16f refine = 12995,
+        // purely the K=3 guide frames; 13f fits ≤11.5). This slices the upscaled latent to [target(T) + the
+        // N guide frames NEAREST the surviving set] before the refine so it denoises only the surviving
+        // target frames plus N seam-context frames. N=0 drops the whole guide (max VRAM save, max seam
+        // risk); N>=K = full refine = unchanged. Retained context frames sit at tensor indices [T, T+N) and
+        // are discarded by the SAME crop at :9439 (slice start=0, len=video_target_frame_count=T), so NO
+        // downstream reassembly is needed; the surviving target frames keep their exact HEAD positions so
+        // the (empty) refine positions' default RoPE is identical for them — only the trailing context set
+        // they attend to shrinks. chain_base_latent (next-seg seed, captured pre-upscale at :9057) is
+        // unaffected.
+        //
+        // AUDIO (the deployed lipdub/driven-audio continuation): audio is packed as frame-count-keyed extra
+        // CHANNELS (pack_ltxav_audio_and_video_latents, sd:4964), so we CANNOT slice the packed frame dim
+        // directly (that shears the flat audio blob). Instead unpack -> slice the VIDEO frames only ->
+        // repack the SAME audio latent (audio is a segment-global timeline, independent of the video guide
+        // frames; unpack returns {16, audio_length, 8} regardless of video T) -> rebuild the audio-pinned
+        // denoise_mask for the sliced video. audio_length is unchanged so the post-refine audio decode
+        // (:9384) and crop (:9439) behave exactly as with the full frame count.
+        //
+        // GUARDED to the continuation refine whose refine positions are empty (default RoPE rebuilt by
+        // sample from the latent shape): LTXAV, K>0, T>0, the exact [T+K] video-frame layout, no relip
+        // two-stage, no init/end image, and empty hires_video_positions (non-empty positions ONLY arise
+        // from the relip/end-image branches, sd:8414/8538, which are frame-coupled and separately handled).
+        // audio_length>0 and a non-empty audio-pinned mask are BOTH handled. Any other path is a no-op
+        // (byte-identical), with the specific failing guard logged.
         if (const char* ctx_env = std::getenv("LTX_REFINE_CONTEXT_FRAMES")) {
-            int ctx_n = atoi(ctx_env);
-            int64_t T_tgt  = latents.video_target_frame_count;
-            int64_t K_cond = latents.video_conditioning_frame_count;
-            bool eligible =
-                ctx_n >= 0 &&
-                sd_version_is_ltxav(sd_ctx->sd->version) &&
-                T_tgt > 0 && K_cond > 0 &&
-                latents.audio_length == 0 &&
-                !latents.relip_twostage &&
-                sd_vid_gen_params->init_image.data == nullptr &&
-                sd_vid_gen_params->end_image.data == nullptr &&
-                hires_video_positions.empty() &&
-                hires_denoise_mask.empty() &&
-                hires_video_reference.empty() &&
-                x_t.shape()[2] == T_tgt + K_cond;
+            int ctx_n         = atoi(ctx_env);
+            int64_t T_tgt     = latents.video_target_frame_count;
+            int64_t K_cond    = latents.video_conditioning_frame_count;
+            int64_t x_frames  = x_t.dim() > 2 ? x_t.shape()[2] : 0;
+            int64_t lat_ch    = sd_ctx->sd->get_latent_channel();
+            bool has_audio    = latents.audio_length > 0 && x_t.shape()[3] > lat_ch;
+            bool ltxav        = sd_version_is_ltxav(sd_ctx->sd->version);
+            bool no_image     = sd_vid_gen_params->init_image.data == nullptr &&
+                                sd_vid_gen_params->end_image.data == nullptr;
+            bool pos_ok       = hires_video_positions.empty();     // non-empty => relip/end-image (frame-coupled)
+            bool ref_ok       = hires_video_reference.empty();     // non-empty => relip two-stage
+            bool layout_ok    = (x_frames == T_tgt + K_cond);
+            bool eligible     = ctx_n >= 0 && ltxav && T_tgt > 0 && K_cond > 0 &&
+                                !latents.relip_twostage && no_image && pos_ok && ref_ok && layout_ok;
             if (eligible) {
                 int64_t keep = std::min<int64_t>(ctx_n, K_cond);
                 if (keep < K_cond) {
-                    x_t = sd::ops::slice(x_t, 2, 0, T_tgt + keep);
+                    int64_t refine_frames = T_tgt + keep;
+                    if (has_audio) {
+                        // unpack -> slice video frames -> repack (audio + audio-pinned mask preserved)
+                        sd::Tensor<float> video_latent = sd::ops::slice(x_t, 3, 0, lat_ch);
+                        sd::Tensor<float> audio_latent = unpack_ltxav_audio_latent(x_t, latents.audio_length, (int)lat_ch);
+                        video_latent                   = sd::ops::slice(video_latent, 2, 0, refine_frames);
+                        x_t = pack_ltxav_audio_and_video_latents(video_latent, audio_latent);
+                        if (!hires_denoise_mask.empty()) {
+                            // rebuild the audio-pinned mask for the sliced video (mirror apply_ltxv_refine :8464/8433)
+                            sd::Tensor<float> video_mask = make_ltxav_video_denoise_mask(video_latent, 1.f);
+                            hires_denoise_mask = pack_ltxav_audio_and_video_denoise_mask(
+                                video_mask, video_latent, audio_latent, latents.audio_fixed ? 0.0f : 1.0f);
+                        }
+                    } else {
+                        x_t = sd::ops::slice(x_t, 2, 0, refine_frames);
+                    }
                     LOG_INFO("LTX_REFINE_CONTEXT_FRAMES=%d: refine sliced to %lld surviving + %lld guide-context frames "
-                             "(dropped %lld of %lld throwaway guide tokens from the refine)",
-                             ctx_n, (long long)T_tgt, (long long)keep, (long long)(K_cond - keep), (long long)K_cond);
+                             "(dropped %lld of %lld throwaway guide frames from the refine; audio=%s) -> refine T=%lld",
+                             ctx_n, (long long)T_tgt, (long long)keep, (long long)(K_cond - keep),
+                             (long long)K_cond, has_audio ? "preserved" : "none", (long long)refine_frames);
+                } else {
+                    LOG_INFO("LTX_REFINE_CONTEXT_FRAMES=%d >= guide frames %lld: refining all frames (no slice)",
+                             ctx_n, (long long)K_cond);
                 }
             } else {
-                LOG_INFO("LTX_REFINE_CONTEXT_FRAMES set but this refine is not an eligible plain-continuation "
-                         "LTXAV refine (audio/relip/image/positions coupling) — refining all frames unchanged");
+                LOG_INFO("LTX_REFINE_CONTEXT_FRAMES set but refine ineligible -> refining all %lld frames unchanged "
+                         "(n=%d ltxav=%d T_tgt=%lld K_cond=%lld layout_ok=%d relip=%d img=%d pos_empty=%d ref_empty=%d audio_len=%d)",
+                         (long long)x_frames, ctx_n, (int)ltxav, (long long)T_tgt, (long long)K_cond, (int)layout_ok,
+                         (int)latents.relip_twostage, (int)!no_image, (int)pos_ok, (int)ref_ok, latents.audio_length);
             }
         }
 
