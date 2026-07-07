@@ -4267,6 +4267,12 @@ protected:
             restore_all_params();
             LOG_INFO("%s shared-resident: after restore, params_lack_buffers=%d",
                      get_desc().c_str(), (int)params_lack_buffers());
+            // Decisive: if ANY param is still bufferless after the restore, the forward may
+            // read a null buffer (segfault). Dump the offenders + their data-validity so the
+            // next rebuild pinpoints the fix (re-wrap valid-data weights vs reload freed ones).
+            if (getenv("LTXAV_PARAM_BUF_TRACE") == nullptr || getenv("LTXAV_PARAM_BUF_TRACE")[0] != '0') {
+                dump_bufferless_params("post-restore/pre-derive");
+            }
         }
 
         // LongCat lap-B: pin the cross-segment-shared param payload resident for the
@@ -5006,6 +5012,51 @@ public:
             return sd::ggml_graph_cut::tensor_buffer(t) == nullptr;
         }
         return false;
+    }
+
+    // Decisive diagnostic (iter-5): dump EVERY params_ctx tensor that lacks a materialized
+    // backend buffer, with its DATA validity (t->data != null). This distinguishes the two
+    // fixes: buffer==null but data!=null => the ggml buffer OBJECT was lost (e.g. mmap
+    // fast-path / an un-restored swap) and the weight can be re-wrapped/streamed; both null
+    // => the weight was genuinely freed and needs a reload. Returns the bufferless count.
+    // Names the offenders (capped) so we see if the block-47 a2v/ff weights are among them
+    // and whether they still hold data. Gated on LTXAV_PARAM_BUF_TRACE (default on).
+    size_t dump_bufferless_params(const char* where) {
+        if (params_ctx == nullptr) {
+            return 0;
+        }
+        size_t total = 0, bufferless = 0, bufferless_with_data = 0, bufferless_no_data = 0;
+        std::string sample_names;
+        int named = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(params_ctx); t != nullptr;
+             t = ggml_get_next_tensor(params_ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue;
+            }
+            ++total;
+            if (sd::ggml_graph_cut::tensor_buffer(t) != nullptr) {
+                continue;
+            }
+            ++bufferless;
+            if (t->data != nullptr) {
+                ++bufferless_with_data;
+            } else {
+                ++bufferless_no_data;
+            }
+            if (named < 24) {
+                sample_names += sd_format("%s%s[buf=null,data=%s]",
+                                          named == 0 ? "" : " ",
+                                          t->name,
+                                          t->data != nullptr ? "VALID" : "null");
+                ++named;
+            }
+        }
+        LOG_INFO("%s [bufferless-param-dump @ %s] %zu/%zu params bufferless "
+                 "(%zu WITH-data, %zu no-data). First offenders: %s",
+                 get_desc().c_str(), where, bufferless, total,
+                 bufferless_with_data, bufferless_no_data,
+                 sample_names.empty() ? "(none)" : sample_names.c_str());
+        return bufferless;
     }
 
     // Diagnostics (1080p chain seg-2 cold-stream): report the param-buffer state at a
