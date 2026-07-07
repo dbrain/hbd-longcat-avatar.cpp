@@ -3036,7 +3036,9 @@ protected:
     // immediately before the hires/refine sample() and false after, so the cap
     // truncates the resident pin ONLY for the refine (the base pass keeps full pin).
     bool refine_resident_scope_ = false;
+public:
     void set_refine_resident_scope(bool on) { refine_resident_scope_ = on; }
+protected:
 
     // Fix A (1080p chain seg-2 cold-stream): derive the shared-resident set from the
     // BASE (un-merged) cached graph-cut plan instead of the resolved MERGED plan. The
