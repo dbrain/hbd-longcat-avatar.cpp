@@ -54,3 +54,25 @@ INNER="$NSYS_SETUP
 docker run --rm --gpus '"device=1"' --cap-add=SYS_ADMIN "${PRODENV[@]}" -e LTX_CUSTOM_SIGMAS='1.0,0.5,0.0' \
   -v "$WT:/src" -v "$LTX2:/ltx2" -v /mnt/ssd/models:/mnt/ssd/models:ro -w /src "$BUILDER" bash -c "$INNER"
 echo "rc=$?  report: $OUT/prof.nsys-rep  (analyze: MODE=analyze REP=$OUT/prof.nsys-rep bash nsys_profile.sh)"
+
+# ============================================================================
+# THE IMPORTER FIX (the whole recurring pain): the builder's bundled nsys 2026.2
+# (under /opt/nvidia/nsight-compute/2026.2.0/host/) captures RICH data (full 2-seg)
+# but its QdstrmImporter fails with "unknown error" — because the minimal container
+# is missing ONE lib: libdw.so.1. Install libdw1 and the SAME-VERSION importer works
+# on the ORIGINAL .qdstrm (no regenerate, no version mismatch):
+#   docker run --rm -v $WT:/src -w /src/_ablation_out/nsys_prof \
+#     --entrypoint bash longcat-avatar-dev:builder-cudnn-ff -c '
+#       apt-get update -qq && apt-get install -y libdw1 sqlite3
+#       IMP=/opt/nvidia/nsight-compute/2026.2.0/host/linux-desktop-glibc_2_11_3-x64/QdstrmImporter
+#       "$IMP" --input-file prof.qdstrm          # -> prof.nsys-rep
+#       nsys export --type sqlite --force-overwrite true -o prof.sqlite prof.nsys-rep
+#       # the analysis (memory table = CUDA_GPU_MEMORY_USAGE_EVENTS; oper 0=alloc 1=free):
+#       sqlite3 prof.sqlite "SELECT (a.bytes/1048576) MB,count(*) n FROM CUDA_GPU_MEMORY_USAGE_EVENTS a
+#         WHERE a.memoryOperationType=0 AND a.bytes>100*1048576 AND NOT EXISTS
+#         (SELECT 1 FROM CUDA_GPU_MEMORY_USAGE_EVENTS f WHERE f.memoryOperationType=1
+#          AND f.address=a.address AND f.start>a.start) GROUP BY a.bytes ORDER BY MB DESC;"
+#     '
+# RESULT (2026-07-07): unfreed >100MB = 216x2 + 151 + 108x2 = ~799MB, pc=0 (no ggml stack)
+# => the +800 reserve is cuDNN-INTERNAL cached workspace. Not ggml, not the mempool, not a leak.
+# ============================================================================
