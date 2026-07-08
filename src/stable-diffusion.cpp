@@ -8814,7 +8814,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // Trim the VAE backend's pool so the freed VRAM actually leaves the board and becomes
             // real headroom for the sample/refine. Mirrors the pre-sample DIFFUSION-pool trim (:~8957).
             ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
-            LOG_INFO("LTXAV_VAE_LAZY: released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool before DiT sample+refine; re-offload from host at decode");
+            // The VAE params just moved (re-offloaded to host); their device pointers are now
+            // stale, so the cuDNN conv3d weight-reorder cache (raw cudaMalloc, keyed by weight
+            // ptr) holds orphaned buffers from the prior segment. Free them now or they leak
+            // ~1.4 GB/segment on a continuation. Zero perf cost (they re-reorder at decode anyway).
+            ggml_backend_cuda_release_cudnn_conv3d_weights();
+            LOG_INFO("LTXAV_VAE_LAZY: released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv3d reorder weights before DiT sample+refine; re-offload from host at decode");
         } else if (sd_ctx->sd->resident_reload_loader) {
             // Regime (B): free the GPU-resident buffers; reload from disk before decode.
             size_t freed = vvae->get_params_buffer_size();
@@ -9363,7 +9368,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 sd_ctx->sd->audio_vae_model->release_all_gpu_param_residency();
             }
             ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
-            LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool before the hires/refine sample; re-offload from host at decode");
+            // Same reason as the first eviction: VAE param pointers are now stale, so free the
+            // cuDNN conv3d reorder-weight buffers keyed by those pointers (else ~1.4 GB/segment leak).
+            ggml_backend_cuda_release_cudnn_conv3d_weights();
+            LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv3d reorder weights before the hires/refine sample; re-offload from host at decode");
         }
 
         // Refine-scoped resident byte cap (LONGCAT_SHARED_RESIDENT_MAX_MB): engage the
