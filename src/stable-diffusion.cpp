@@ -9260,6 +9260,22 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
         }
 
+        // LTX_REFINE_CONST_SEED (chain identity-stability): the chain gives each segment a DISTINCT
+        // seed (base+seg, sd:10183) for base-motion variety, but the stage-2 refine INHERITS that
+        // per-segment RNG -> each segment's refine adds DIFFERENT noise -> re-denoises the face/skin
+        // differently -> a skin-tone/identity "flash" at every seam. Re-seeding the refine noise to a
+        // CONSTANT (seg-independent) makes the re-roll consistent across segments so identity holds,
+        // while the base sampling keeps its per-segment variety. Value is arbitrary (only consistency
+        // matters); default 42 when the toggle is "1". Off by default = byte-identical.
+        if (const char* e = std::getenv("LTX_REFINE_CONST_SEED"); e != nullptr && e[0] != '\0' && std::string(e) != "0") {
+            uint64_t rseed = std::strtoull(e, nullptr, 10);
+            if (rseed <= 1) {
+                rseed = 42;
+            }
+            sd_ctx->sd->rng->manual_seed(rseed);
+            LOG_INFO("LTX_REFINE_CONST_SEED: refine noise re-seeded to constant %llu (identity-stable across chain segments)",
+                     (unsigned long long)rseed);
+        }
         noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
 
         // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
