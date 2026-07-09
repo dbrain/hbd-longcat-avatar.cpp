@@ -59,6 +59,9 @@
 #   LONGCAT_PERSIST_GRAPH_INPUTS=1
 #                      keep repeated graph-cut external inputs resident for the duration of each
 #                      graph-cut call. Quality-neutral copy avoidance; set 0 to disable.
+#   LONGCAT_ATTN_TILES=2
+#                      split large self-attention noise queries into exact row tiles. Quality-neutral
+#                      and validated flat across the 3-segment MAXV=9 path; set 1 to disable.
 #   LTXAV_CHAIN_CUDNN_RESET=1
 #                      A/B cuDNN plan-cache release between chain segments. Quality-neutral; may
 #                      trade lower cross-segment VRAM for plan rebuild cost.
@@ -105,6 +108,7 @@ REFINE_CONST_SEED=${REFINE_CONST_SEED:-0}
 SKIP_AUDIO_DECODE=${SKIP_AUDIO_DECODE:-1}
 VAE_SPATIAL_TILES=${VAE_SPATIAL_TILES:-2x2}
 LONGCAT_PERSIST_GRAPH_INPUTS=${LONGCAT_PERSIST_GRAPH_INPUTS:-1}
+LONGCAT_ATTN_TILES=${LONGCAT_ATTN_TILES:-2}
 OUT_NAME=${OUT_NAME:-singing_clip.webm}
 OUTDIR=${OUTDIR:-$WT/ltx-denoise-repro/_singing_out}
 F=97; FPS=24
@@ -146,7 +150,7 @@ ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -
 [ "$REFINE_CONST_SEED" != 0 ] && ENV+=( -e LTX_REFINE_CONST_SEED=$REFINE_CONST_SEED )
 [ "$USE_HIRES_STRENGTH" != 0 ] && ENV+=( -e LTXAV_TWOSTAGE_USE_HIRES_STRENGTH=$USE_HIRES_STRENGTH )
 [ "$SKIP_AUDIO_DECODE" != 0 ] && ENV+=( -e LTXAV_SKIP_AUDIO_DECODE=1 )
-for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LONGCAT_CONT_PROF LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LONGCAT_PERSIST_GRAPH_INPUTS; do
+for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LONGCAT_CONT_PROF LONGCAT_ATTN_TILES LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LONGCAT_PERSIST_GRAPH_INPUTS; do
   if [ "${!passthrough+x}" = x ]; then
     ENV+=( -e "$passthrough=${!passthrough}" )
   fi
@@ -162,7 +166,7 @@ INNER="stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
 
 LOG="$OUTDIR/render.log"
 VRAM_LOG="$OUTDIR/vram.log"
-echo "[render] DIT=$DIT MAXV=$MAXV REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS HIRES=$HIRES WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS"
+echo "[render] DIT=$DIT MAXV=$MAXV REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS HIRES=$HIRES WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS attn_tiles=$LONGCAT_ATTN_TILES"
 rm -f "$LOG" "$VRAM_LOG"
 : > "$VRAM_LOG"
 ( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" 2>/dev/null >> "$VRAM_LOG"; sleep 1; done ) &
