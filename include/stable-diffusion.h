@@ -618,13 +618,15 @@ SD_API void sd_ctx_keep_diffusion_model_resident(sd_ctx_t* sd_ctx, bool keep);
 // encoder residency window (avatar/LTXAV resident chains only). Populates an internal
 // prompt-keyed cache so the per-segment renders all hit it, letting the resident DiT run
 // as one uninterrupted phase with no gemma encode interleaved between segments. The
-// negative prompt is constant across the chain (its uncond is encoded once and shared).
+// negative prompt is constant across the chain; when needed, its uncond is encoded once
+// and shared.
 // Call once, after sd_ctx_keep_diffusion_model_resident(true), before the segment loop.
 SD_API void sd_ctx_precompute_chain_text_conds(sd_ctx_t*    sd_ctx,
                                                const char** prompts,
                                                int          n_prompts,
                                                const char*  negative_prompt,
-                                               int          clip_skip);
+                                               int          clip_skip,
+                                               bool         need_uncond);
 
 // Hot-swap the diffusion (DiT) model weights in place from a different gguf,
 // reusing the existing backend + the resident VAE/text-encoder. Intended for the

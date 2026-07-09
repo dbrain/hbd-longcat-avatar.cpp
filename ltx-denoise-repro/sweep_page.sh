@@ -88,11 +88,14 @@ cat <<'VAEAB'
 </div>
 VAEAB
 cat <<'RESAB'
-<h2>📐 Resolution call — 720p vs 1080p, SAME locked recipe (2×2 ov4, seed 42) → "good enough" or worth a 1.5× upscaler?</h2>
-<p class=sub>Both use the identical locked pipeline; only the base/output res differs. <b>1080p</b> (960×544→x2→1920×1088) = 283s, peak 11164MB. <b>720p</b> (640×352→x2→1280×704) = <b>161s (43% faster)</b>, peak 10630MB (bound by the text encoder, not the video — so it fits with room). Player scales both to the same box, so judge <b>detail / softness / fine texture</b> (faces, the zebra crossing lines, distant traffic). If 720p holds up → ship it, skip the upscaler. If it's too soft → the 1.5× upscaler path (render a higher base, upscale less) is worth building.</p>
+<h2>📐 Resolution / upscaler call — face quality vs speed, SAME locked recipe (2×2 ov4, seed 42)</h2>
+<p class=sub>720p×2 faces were "loud" soft — the x2 upscale from a tiny 640×352 base loses face detail. <b>720p ×1.5</b> renders a 1.84× bigger base (864×480) and upscales gentler → should sharpen faces at ~same output size. <b>mid</b> = more native res again; <b>1080p</b> = reference quality. Player scales all to one box, so judge <b>faces / zebra lines / distant traffic</b>. Cheapest that looks good enough wins.</p>
 <div class=row>
- <figure class=win><video src="clips/AB_720p_2x2_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>720p</b> 1280×704 · 161s · 10630MB</figcaption></figure>
- <figure class=win style="border-color:#3a8a3a;border-width:2px"><video src="clips/AB_imatrix_spatial_2x2_ov4_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>1080p</b> 1920×1088 · 283s · 11164MB (locked)</figcaption></figure>
+ <figure><video src="clips/AB_720p_2x2_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>720p ×2</b> 1280×704 · 161s · 10630MB <span class=m>(soft faces)</span></figcaption></figure>
+ <figure class=win style="border-color:#3a8a3a;border-width:2px"><video src="clips/AB_720p_x15_2x2_s3_42.mp4" controls loop playsinline muted></video><figcaption>✨ <b>720p ×1.5</b> 1312×736 · 180s · 8698MB <span class=m>(higher base — faces?)</span></figcaption></figure>
+ <figure class=win><video src="clips/AB_mid_1664_2x2_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>mid ×2</b> 1664×960 · 223s · 9720MB</figcaption></figure>
+ <figure class=win style="border-color:#c9a13a;border-width:2px"><video src="clips/AB_x15hi_1920x1056_s3_42.mp4" controls loop playsinline muted></video><figcaption>🔬 <b>1280 base ×1.5</b> 1920×1056 · 345s · 13264MB <span class=m>(best faces? over 11.5 cap — transient spike)</span></figcaption></figure>
+ <figure class=win><video src="clips/AB_imatrix_spatial_2x2_ov4_s3_42.mp4" controls loop playsinline muted></video><figcaption><b>1080p ×2</b> 1920×1088 · 283s · 11164MB</figcaption></figure>
  <figure class=ref><video src="clips/COMFY_s3_seed101.mp4" controls loop playsinline muted></video><figcaption>comfy 1080p (ref)</figcaption></figure>
 </div>
 RESAB

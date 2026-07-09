@@ -22,16 +22,50 @@
 # KNOBS (env vars, all optional):
 #   SEGMENTS=2         number of chain segments (2 = fast, 1 seam; 8 = full song)
 #   HIRES=1            1 = 1080p (x2 upscale + refine); 0 = base 960x544 (fast, no refine)
+#   WIDTH=960 HEIGHT=544
+#                      base render size. With HIRES=1 this is the pre-upscale size; with HIRES=0
+#                      this is the final output size.
+#   MAXV=9             --max-vram budget. 9 is the current locked speed/VRAM point; 10 was faster
+#                      but exceeded the old <=11.5GB co-resident target in the single-segment sweep.
 #   DROP=24            overlap frames dropped per seam (pins the advance; must match slicing)
 #   STEPS=8 REFSTEPS=3 base / hires-refine sampling steps
+#   SAMPLING_METHOD=euler_a
+#                      locked sampler for base + hires/refine. Explicit so this prod example does
+#                      not depend on model defaults.
 #   REFINE_SIGMAS="0.909375,0.725,0.421875,0.0"
 #                      hires refine sigma schedule. 0.909=official/sharp but re-rolls the
 #                      face per segment (identity flash). LOWER sigma0 (e.g. 0.4,0.28,0.15,0.0)
 #                      = gentler, more identity-stable, faster. This is the KNOB to sweep for
 #                      the identity issue (also exposed per-request as hires.custom_sigmas).
+#                      Set REFINE_SIGMAS="" to omit --hires-sigmas and use the generated hires
+#                      schedule path; combine with USE_HIRES_STRENGTH=1 for two-stage LTX tests.
+#   REFINE_DENOISING_STRENGTH=0.7
+#                      highres denoising strength used by the generated schedule path.
+#   USE_HIRES_STRENGTH=1
+#                      diagnostic: in two-stage LTX, do not inject the official custom sigma
+#                      vector, so REFINE_DENOISING_STRENGTH actually controls schedule trimming.
 #   REFINE_CONST_SEED=1  pin refine noise to a constant across segments (halves the identity
 #                      flash — the per-segment base+seg seed was ~half the cause; opt-in engine
 #                      flag LTX_REFINE_CONST_SEED, needs the build with commit 7b13cf0+).
+#   SKIP_AUDIO_DECODE=1 skip generated audio latent decode. This harness muxes the original
+#                      continuous song at the end, so decoded per-segment model audio is unused.
+#   VAE_SPATIAL_TILES=2x2
+#                      video VAE decode spatial tiling. 2x2 is the locked conservative default;
+#                      2x1/1x2 are quality-neutral candidates to validate for fewer tile passes
+#                      if VRAM allows.
+#   LONGCAT_OFFLOAD_PROFILE=1
+#                      emit aggregated graph-cut offload/copy/compute timings. Adds syncs, so use
+#                      for profiling rather than headline wall comparisons.
+#   LONGCAT_PERSIST_GRAPH_INPUTS=1
+#                      keep repeated graph-cut external inputs resident for the duration of each
+#                      graph-cut call. Quality-neutral copy avoidance; set 0 to disable.
+#   LTXAV_CHAIN_CUDNN_RESET=1
+#                      A/B cuDNN plan-cache release between chain segments. Quality-neutral; may
+#                      trade lower cross-segment VRAM for plan rebuild cost.
+#   LTXAV_REFINE_MAX_VRAM=10
+#                      use a different graph budget only for the hires/refine denoise. This keeps
+#                      base sampling at MAXV while testing whether a fatter refine graph cut is a
+#                      speed win without raising the whole render's peak VRAM.
 #   OUT_NAME=singing_clip.webm     output filename
 #   OUTDIR=<repo>/ltx-denoise-repro/_singing_out
 #
@@ -53,14 +87,24 @@ LTX2=${LTX2:-/home/dbrain/dev/longcat-avatar.cpp/models/ltx2}
 SONG=${SONG:-$LTX2/_drive/music_video/song.wav}        # 30s stereo 48k
 BUILDER=${BUILDER:-longcat-avatar-dev:builder-cudnn-ff}
 BIN=/src/build-cudnn/bin/sd-cli
-DIT=${DIT:-nvfp4-CLEAN.gguf}
+DIT=${DIT:-nvfp4-imatrix-dev050.gguf}
 FFMPEG=${FFMPEG:-linuxserver/ffmpeg}
 GPU=${GPU:-1}                                          # device index (5060 Ti = 1)
 
 SEGMENTS=${SEGMENTS:-2}; HIRES=${HIRES:-1}; DROP=${DROP:-24}
+WIDTH=${WIDTH:-960}; HEIGHT=${HEIGHT:-544}
+MAXV=${MAXV:-9}
 STEPS=${STEPS:-8}; REFSTEPS=${REFSTEPS:-3}
-REFINE_SIGMAS=${REFINE_SIGMAS:-0.909375,0.725,0.421875,0.0}
+SAMPLING_METHOD=${SAMPLING_METHOD:-euler_a}
+if [ "${REFINE_SIGMAS+x}" != x ]; then
+  REFINE_SIGMAS=0.909375,0.725,0.421875,0.0
+fi
+REFINE_DENOISING_STRENGTH=${REFINE_DENOISING_STRENGTH:-0.7}
+USE_HIRES_STRENGTH=${USE_HIRES_STRENGTH:-0}
 REFINE_CONST_SEED=${REFINE_CONST_SEED:-0}
+SKIP_AUDIO_DECODE=${SKIP_AUDIO_DECODE:-1}
+VAE_SPATIAL_TILES=${VAE_SPATIAL_TILES:-2x2}
+LONGCAT_PERSIST_GRAPH_INPUTS=${LONGCAT_PERSIST_GRAPH_INPUTS:-1}
 OUT_NAME=${OUT_NAME:-singing_clip.webm}
 OUTDIR=${OUTDIR:-$WT/ltx-denoise-repro/_singing_out}
 F=97; FPS=24
@@ -83,7 +127,10 @@ docker run --rm -v "$(dirname "$SONG"):/s" -v "$OUTDIR:/o" --entrypoint ffmpeg "
 
 # ---- hires args --------------------------------------------------------------
 HIRES_ARGS=""
-[ "$HIRES" = 1 ] && HIRES_ARGS="--hires --hires-upscaler ltx-2.3-spatial-upscaler-x2-1.1 --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-sigmas $REFINE_SIGMAS"
+if [ "$HIRES" = 1 ]; then
+  HIRES_ARGS="--hires --hires-upscaler ltx-2.3-spatial-upscaler-x2-1.1 --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-denoising-strength $REFINE_DENOISING_STRENGTH"
+  [ -n "$REFINE_SIGMAS" ] && HIRES_ARGS="$HIRES_ARGS --hires-sigmas $REFINE_SIGMAS"
+fi
 
 # ---- prod engine env (the beat-comfy nvfp4/fp8/cuDNN stack + leak-fix eviction) ----
 ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -e LTX_DIT_F16=1
@@ -93,23 +140,50 @@ ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -
   -e LONGCAT_NO_PREFETCH_POOL=1 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_DIT_NO_MMAP=0
   -e LTXAV_VAE_LAZY=1 -e LTXAV_DIT_FREE_DURING_DECODE=1 -e LONGCAT_VRAM_BREAKDOWN=1
   -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_CONV3D_WTILES=16 -e LTX_VAE_CONV3D_HTILES=8 -e LTX_VAE_DECODE_F16=1
-  -e LTX_VAE_SPATIAL_TILES=2x2 -e LTX_VAE_SPATIAL_OVERLAP=4
+  -e LTX_VAE_SPATIAL_TILES=$VAE_SPATIAL_TILES -e LTX_VAE_SPATIAL_OVERLAP=4
   -e LTX_CUSTOM_SIGMAS=1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0.0
   -e LTXAV_CHAIN_OVERLAP_DROP=$DROP )
 [ "$REFINE_CONST_SEED" != 0 ] && ENV+=( -e LTX_REFINE_CONST_SEED=$REFINE_CONST_SEED )
+[ "$USE_HIRES_STRENGTH" != 0 ] && ENV+=( -e LTXAV_TWOSTAGE_USE_HIRES_STRENGTH=$USE_HIRES_STRENGTH )
+[ "$SKIP_AUDIO_DECODE" != 0 ] && ENV+=( -e LTXAV_SKIP_AUDIO_DECODE=1 )
+for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LONGCAT_PERSIST_GRAPH_INPUTS; do
+  if [ "${!passthrough+x}" = x ]; then
+    ENV+=( -e "$passthrough=${!passthrough}" )
+  fi
+done
 
 INNER="stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --vae /ltx2/vae/ltx-2.3-22b-distilled_video_vae.safetensors --audio-vae /ltx2/vae/ltx-2.3-22b-distilled_audio_vae-ENC-f16.gguf \
   --llm /ltx2/gemma-3-12b-it-UD-Q4_K_XL.gguf --embeddings-connectors /ltx2/text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors \
   --lora-model-dir /ltx2/loras \
   --ltx-chain-segments $SEGMENTS --ltx-chain-prompts /work/prompt.txt --ltx-chain-audio-dir /work/adir --cont-latent-frames 3 \
-  -W 960 -H 544 --video-frames $F --fps $FPS --steps $STEPS --cfg-scale 1.0 --diffusion-fa \
-  $HIRES_ARGS --offload-to-cpu --mmap --max-vram 7 -s 42 -v -o /work/_raw_$OUT_NAME"
+  -W $WIDTH -H $HEIGHT --video-frames $F --fps $FPS --steps $STEPS --sampling-method $SAMPLING_METHOD --cfg-scale 1.0 --diffusion-fa \
+  $HIRES_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s 42 -v -o /work/_raw_$OUT_NAME"
 
-echo "[render] SEGMENTS=$SEGMENTS HIRES=$HIRES DROP=$DROP sigmas=$REFINE_SIGMAS const_seed=$REFINE_CONST_SEED"
+LOG="$OUTDIR/render.log"
+VRAM_LOG="$OUTDIR/vram.log"
+echo "[render] DIT=$DIT MAXV=$MAXV REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS HIRES=$HIRES WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS"
+rm -f "$LOG" "$VRAM_LOG"
+: > "$VRAM_LOG"
+( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" 2>/dev/null >> "$VRAM_LOG"; sleep 1; done ) &
+VRAM_PID=$!
+T0=$(date +%s)
+set +e
 docker run --rm --gpus "\"device=$GPU\"" "${ENV[@]}" \
   -v "$WT:/src" -v "$LTX2:/ltx2" -v "$OUTDIR:/work" -v /mnt/ssd/models:/mnt/ssd/models:ro -w /src \
-  "$BUILDER" bash -c "$INNER"
+  "$BUILDER" bash -c "$INNER" 2>&1 | tee "$LOG"
+RC=${PIPESTATUS[0]}
+set -e
+T1=$(date +%s)
+kill "$VRAM_PID" 2>/dev/null || true
+WALL=$((T1-T0))
+PEAK_DRIVER=$(perl -ne 'while(/driver_used=(\d+) MB/g){$m=$1 if $1>$m} END{print $m || 0}' "$LOG")
+PEAK_CUDNN=$(perl -ne 'while(/used ([0-9.]+) MB/g){$m=$1 if $1>$m} END{print $m || 0}' "$LOG")
+PEAK_SMI=$(sort -n "$VRAM_LOG" 2>/dev/null | tail -1)
+echo "[metrics] render_rc=$RC wall=${WALL}s peak_driver=${PEAK_DRIVER:-0}MB peak_cudnn=${PEAK_CUDNN:-0}MB peak_smi=${PEAK_SMI:-0}MiB log=$LOG"
+if [ "$RC" != 0 ]; then
+  exit "$RC"
+fi
 
 # ---- mux the ORIGINAL continuous song onto the stitched video ----------------
 docker run --rm -v "$OUTDIR:/w" --entrypoint ffmpeg "$FFMPEG" -y -v error \

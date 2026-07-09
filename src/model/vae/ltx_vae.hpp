@@ -2,6 +2,7 @@
 #define __SD_MODEL_VAE_LTX_VAE_HPP__
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -1458,7 +1459,8 @@ struct LTXVideoVAE : public VAE {
 
     ggml_cgraph* build_temporal_tile_graph(const sd::Tensor<float>& z_chunk_tensor,
                                            int chunk_idx,
-                                           int chunk_overlap) {
+                                           int chunk_overlap,
+                                           bool cache_temporal_feats = true) {
         // Larger node budget (see build_graph): a per-tile decode with conv3d W/H-tiling emits many
         // slice/im2col/concat nodes, so high WTILES/HTILES would overflow the old 20480 cap.
         ggml_cgraph* gf       = new_graph_custom(131072);
@@ -1468,9 +1470,11 @@ struct LTXVideoVAE : public VAE {
             timestep = make_input(decode_timestep_tensor);
         }
 
-        std::vector<ggml_tensor*> feat_map(128, nullptr);
-        for (size_t feat_idx = 0; feat_idx < feat_map.size(); ++feat_idx) {
-            feat_map[feat_idx] = get_cache_tensor_by_name(temporal_feat_cache_name(feat_idx));
+        std::vector<ggml_tensor*> feat_map(cache_temporal_feats ? 128 : 0, nullptr);
+        if (cache_temporal_feats) {
+            for (size_t feat_idx = 0; feat_idx < feat_map.size(); ++feat_idx) {
+                feat_map[feat_idx] = get_cache_tensor_by_name(temporal_feat_cache_name(feat_idx));
+            }
         }
 
         auto runner_ctx  = get_context();
@@ -1483,11 +1487,13 @@ struct LTXVideoVAE : public VAE {
                                                   chunk_overlap,
                                                   feat_count);
 
-        for (int feat_idx = 0; feat_idx < feat_count && feat_idx < static_cast<int>(feat_map.size()); ++feat_idx) {
-            ggml_tensor* feat_cache = feat_map[static_cast<size_t>(feat_idx)];
-            if (feat_cache != nullptr) {
-                cache(temporal_feat_cache_name(static_cast<size_t>(feat_idx)), feat_cache);
-                ggml_build_forward_expand(gf, feat_cache);
+        if (cache_temporal_feats) {
+            for (int feat_idx = 0; feat_idx < feat_count && feat_idx < static_cast<int>(feat_map.size()); ++feat_idx) {
+                ggml_tensor* feat_cache = feat_map[static_cast<size_t>(feat_idx)];
+                if (feat_cache != nullptr) {
+                    cache(temporal_feat_cache_name(static_cast<size_t>(feat_idx)), feat_cache);
+                    ggml_build_forward_expand(gf, feat_cache);
+                }
             }
         }
 
@@ -1582,8 +1588,11 @@ struct LTXVideoVAE : public VAE {
             // so drop_first fires only on the true first tile (start==0).
             free_cache_ctx_and_buffer();
             cache_tensor_map.clear();
+            // Independent temporal-blend tiles do not carry causal feature state into the next
+            // tile; blending handles the boundary. Avoid exporting dead feat-cache side outputs.
+            const bool export_temporal_cache = false;
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_temporal_tile_graph(z_tile, static_cast<int>(start), 0);
+                return build_temporal_tile_graph(z_tile, static_cast<int>(start), 0, export_temporal_cache);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
             if (out.empty()) {
@@ -1673,6 +1682,7 @@ struct LTXVideoVAE : public VAE {
                                            const sd::Tensor<float>& input,
                                            size_t expected_dim,
                                            int NX, int NY, int O) {
+        const int64_t total_start_ms = ggml_time_ms();
         const int64_t Wl = input.shape()[0];
         const int64_t Hl = input.shape()[1];
         if (NX < 1) { NX = 1; }
@@ -1700,6 +1710,10 @@ struct LTXVideoVAE : public VAE {
         // LONGCAT_VAE_KEEP_RESIDENT recipe) -> leave them resident for the caller.
         const bool prev_keep_resident = keep_params_resident_;
         set_keep_params_resident(true);
+        const bool tile_profile = getenv("LTX_VAE_TILE_PROFILE") != nullptr;
+        double tile_runner_s    = 0.0;
+        double tile_graph_s     = 0.0;
+        double tile_blend_s     = 0.0;
 
         for (int ty = 0; ty < NY; ++ty) {
             const int64_t cy0 = static_cast<int64_t>(ty) * coreH;
@@ -1728,9 +1742,22 @@ struct LTXVideoVAE : public VAE {
                 // ONE chunk (idx 0, overlap 0) -> NO temporal chop. chunk_idx==0 makes the causal
                 // drop-first trim fire identically for every spatial tile, so all tiles share the
                 // same output frame count (f*8-7 = full clip length).
-                auto get_graph = [&]() -> ggml_cgraph* { return build_temporal_tile_graph(z_tile, 0, 0); };
+                int64_t tile_runner_start = ggml_time_ms();
+                double tile_graph_local_s = 0.0;
+                // Spatial tiles contain the full temporal clip and have no following temporal
+                // chunk, so the causal feat-cache tensors are never consumed.
+                const bool export_temporal_cache = false;
+                auto get_graph = [&]() -> ggml_cgraph* {
+                    int64_t graph_start = ggml_time_ms();
+                    ggml_cgraph* graph  = build_temporal_tile_graph(z_tile, 0, 0, export_temporal_cache);
+                    tile_graph_local_s += (ggml_time_ms() - graph_start) * 1.0 / 1000.0;
+                    return graph;
+                };
                 auto tile      = restore_trailing_singleton_dims(
                     GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                const double tile_runner_local_s = (ggml_time_ms() - tile_runner_start) * 1.0 / 1000.0;
+                tile_runner_s += tile_runner_local_s;
+                tile_graph_s += tile_graph_local_s;
                 if (tile.empty()) {
                     free_cache_ctx_and_buffer();
                     cache_tensor_map.clear();
@@ -1777,6 +1804,7 @@ struct LTXVideoVAE : public VAE {
 
                 const float* sp = tile.data();
                 float* dp       = out.data();
+                int64_t tile_blend_start = ggml_time_ms();
                 for (int64_t fc = 0; fc < FC; ++fc) {
                     const float* spc = sp + tw * th * fc;
                     float* dpc       = dp + Wp * Hp * fc;
@@ -1794,6 +1822,22 @@ struct LTXVideoVAE : public VAE {
                         }
                     }
                 }
+                tile_blend_s += (ggml_time_ms() - tile_blend_start) * 1.0 / 1000.0;
+                if (tile_profile) {
+                    LOG_INFO("LTX VAE spatial tile %d,%d: latent [%lld,%lld)x[%lld,%lld) -> %lldx%lld, "
+                             "runner=%.3fs graph_build=%.3fs blend=%.3fs",
+                             tx,
+                             ty,
+                             (long long)x0,
+                             (long long)x1,
+                             (long long)y0,
+                             (long long)y1,
+                             (long long)tw,
+                             (long long)th,
+                             tile_runner_local_s,
+                             tile_graph_local_s,
+                             (ggml_time_ms() - tile_blend_start) * 1.0 / 1000.0);
+                }
             }
         }
         free_cache_ctx_and_buffer();
@@ -1804,13 +1848,27 @@ struct LTXVideoVAE : public VAE {
         if (out.empty()) { return {}; }
 
         // Normalize each pixel by its accumulated blend weight (proper weighted average).
+        int64_t normalize_start_ms = ggml_time_ms();
+        int64_t normalized_pixels = 0;
         float* dp = out.data();
         for (int64_t p = 0; p < Wp * Hp; ++p) {
             const double ws = wsum[static_cast<size_t>(p)];
             if (ws <= 1e-9) { continue; }
+            if (std::fabs(ws - 1.0) <= 1e-6) { continue; }
             const float inv = static_cast<float>(1.0 / ws);
             for (int64_t fc = 0; fc < FC; ++fc) { dp[p + Wp * Hp * fc] *= inv; }
+            ++normalized_pixels;
         }
+        double normalize_s = (ggml_time_ms() - normalize_start_ms) * 1.0 / 1000.0;
+        LOG_INFO("LTX VAE spatial-blend timings: tile_runner=%.3fs graph_build=%.3fs tile_blend=%.3fs normalize=%.3fs "
+                 "(normalized %lld/%lld pixels) total=%.3fs",
+                 tile_runner_s,
+                 tile_graph_s,
+                 tile_blend_s,
+                 normalize_s,
+                 (long long)normalized_pixels,
+                 (long long)(Wp * Hp),
+                 (ggml_time_ms() - total_start_ms) * 1.0 / 1000.0);
         return out;
     }
 

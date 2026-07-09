@@ -1378,6 +1378,23 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
     const bool tile_w = s1d1 && conv3d_wtiles > 1 && x->ne[0] > (int64_t)conv3d_wtiles * KW;
     const bool tile_h = s1d1 && conv3d_htiles > 1 && x->ne[1] > (int64_t)conv3d_htiles * KH;
     if (tile_w || tile_h) {
+        auto concat_balanced = [&](std::vector<ggml_tensor*> tensors, int dim) {
+            GGML_ASSERT(!tensors.empty());
+            while (tensors.size() > 1) {
+                std::vector<ggml_tensor*> next_level;
+                next_level.reserve((tensors.size() + 1) / 2);
+                for (size_t i = 0; i < tensors.size(); i += 2) {
+                    if (i + 1 < tensors.size()) {
+                        next_level.push_back(ggml_concat(ctx, tensors[i], tensors[i + 1], dim));
+                    } else {
+                        next_level.push_back(tensors[i]);
+                    }
+                }
+                tensors = std::move(next_level);
+            }
+            return tensors[0];
+        };
+
         ggml_tensor* xp = x;
         if (tile_w) xp = ggml_ext_pad_ext(ctx, xp, p0, p0, 0, 0, 0, 0, 0, 0);  // zero-pad WIDTH
         if (tile_h) xp = ggml_ext_pad_ext(ctx, xp, 0, 0, p1, p1, 0, 0, 0, 0);  // zero-pad HEIGHT
@@ -1385,7 +1402,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         const int p1e = tile_h ? 0 : p1;
         const int64_t OH    = tile_h ? (xp->ne[1] - (KH - 1)) : 0;
         const int64_t hstep = tile_h ? (OH + conv3d_htiles - 1) / conv3d_htiles : 0;
-        ggml_tensor* col    = nullptr;
+        std::vector<ggml_tensor*> rows;
+        if (tile_h) {
+            rows.reserve((OH + hstep - 1) / hstep);
+        } else {
+            rows.reserve(1);
+        }
         int64_t oh0 = 0;
         do {
             int64_t oh1;
@@ -1394,7 +1416,12 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
             else        { oh1 = 0; xh = xp; }
             const int64_t OW    = tile_w ? (xh->ne[0] - (KW - 1)) : 0;
             const int64_t wstep = tile_w ? (OW + conv3d_wtiles - 1) / conv3d_wtiles : 0;
-            ggml_tensor* row    = nullptr;
+            std::vector<ggml_tensor*> row_tiles;
+            if (tile_w) {
+                row_tiles.reserve((OW + wstep - 1) / wstep);
+            } else {
+                row_tiles.reserve(1);
+            }
             int64_t ow0 = 0;
             do {
                 int64_t ow1;
@@ -1402,13 +1429,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                 if (tile_w) { ow1 = std::min(OW, ow0 + wstep); xt = ggml_ext_slice(ctx, xh, 0, ow0, ow1 + KW - 1); }
                 else        { ow1 = 0; xt = xh; }
                 ggml_tensor* yt = conv_once(xt, p0e, p1e);
-                row = (row == nullptr) ? yt : ggml_concat(ctx, row, yt, 0);  // W tiles along ne0
+                row_tiles.push_back(yt);
                 ow0 = ow1;
             } while (tile_w && ow0 < OW);
-            col = (col == nullptr) ? row : ggml_concat(ctx, col, row, 1);  // H tile-rows along ne1
+            rows.push_back(concat_balanced(std::move(row_tiles), 0));  // W tiles along ne0
             oh0 = oh1;
         } while (tile_h && oh0 < OH);
-        x = col;
+        x = concat_balanced(std::move(rows), 1);  // H tile-rows along ne1
     } else {
         x = conv_once(x, p0, p1);
     }
@@ -3905,6 +3932,112 @@ protected:
         void* extra                  = nullptr;
     };
 
+    struct PersistentExternalInputSet {
+        ggml_context* ctx = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+
+        ~PersistentExternalInputSet() {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+                buffer = nullptr;
+            }
+            if (ctx != nullptr) {
+                ggml_free(ctx);
+                ctx = nullptr;
+            }
+        }
+    };
+
+    std::unique_ptr<PersistentExternalInputSet> persist_repeated_external_inputs_for_graph_cuts(const sd::ggml_graph_cut::Plan& plan,
+                                                                                                 ggml_cgraph* gf) {
+        const char* enable = getenv("LONGCAT_PERSIST_GRAPH_INPUTS");
+        if (enable == nullptr || enable[0] != '1') {
+            return nullptr;
+        }
+        if (sd_backend_is_cpu(runtime_backend)) {
+            return nullptr;
+        }
+
+        std::unordered_map<ggml_tensor*, int> external_use_count;
+        for (const auto& segment : plan.segments) {
+            for (const auto& input : segment.input_refs) {
+                if (input.type != GraphCutSegment::INPUT_EXTERNAL) {
+                    continue;
+                }
+                ggml_tensor* tensor = sd::ggml_graph_cut::input_tensor(gf, input);
+                if (tensor == nullptr || tensor->view_src != nullptr) {
+                    continue;
+                }
+                if (persistent_tensors_.find(tensor) != persistent_tensors_.end()) {
+                    continue;
+                }
+                if (backend_tensor_data_map.find(tensor) == backend_tensor_data_map.end()) {
+                    continue;
+                }
+                external_use_count[tensor]++;
+            }
+        }
+
+        std::vector<ggml_tensor*> selected;
+        size_t selected_bytes = 0;
+        for (const auto& kv : external_use_count) {
+            ggml_tensor* tensor = kv.first;
+            const int count = kv.second;
+            if (tensor == nullptr || count <= 1) {
+                continue;
+            }
+            selected.push_back(tensor);
+            selected_bytes += ggml_nbytes(tensor);
+        }
+        if (selected.empty()) {
+            return nullptr;
+        }
+
+        auto persisted = std::make_unique<PersistentExternalInputSet>();
+        ggml_init_params params;
+        params.mem_size   = static_cast<size_t>(selected.size() * ggml_tensor_overhead());
+        params.mem_buffer = nullptr;
+        params.no_alloc   = true;
+        persisted->ctx = ggml_init(params);
+        GGML_ASSERT(persisted->ctx != nullptr);
+
+        std::vector<std::pair<ggml_tensor*, ggml_tensor*>> bindings;
+        bindings.reserve(selected.size());
+        for (ggml_tensor* tensor : selected) {
+            ggml_tensor* copy = ggml_dup_tensor(persisted->ctx, tensor);
+            ggml_set_name(copy, tensor->name);
+            bindings.push_back({tensor, copy});
+        }
+
+        persisted->buffer = ggml_backend_alloc_ctx_tensors(persisted->ctx, runtime_backend);
+        if (persisted->buffer == nullptr) {
+            LOG_WARN("%s graph-cut repeated external input persistence failed to allocate %.0f MB; falling back to per-segment copies",
+                     get_desc().c_str(),
+                     selected_bytes / 1048576.0);
+            return nullptr;
+        }
+
+        for (const auto& binding : bindings) {
+            ggml_tensor* original = binding.first;
+            ggml_tensor* copy     = binding.second;
+            auto data_it = backend_tensor_data_map.find(original);
+            if (data_it == backend_tensor_data_map.end() || data_it->second == nullptr) {
+                continue;
+            }
+            ggml_backend_tensor_set(copy, data_it->second, 0, ggml_nbytes(copy));
+            original->buffer = copy->buffer;
+            original->data   = copy->data;
+            original->extra  = copy->extra;
+            backend_tensor_data_map.erase(data_it);
+        }
+
+        LOG_INFO("%s graph-cut persisted %zu repeated external input tensor(s), %.0f MB, avoiding per-segment recopy",
+                 get_desc().c_str(),
+                 bindings.size(),
+                 selected_bytes / 1048576.0);
+        return persisted;
+    }
+
     void snapshot_persistent_externals(const sd::ggml_graph_cut::Plan& plan,
                                        ggml_cgraph* gf,
                                        std::unordered_map<ggml_tensor*, PersistentExternalBinding>& out) {
@@ -4318,6 +4451,8 @@ protected:
         free_cache_ctx_and_buffer();
 
         reset_offload_profile();
+
+        auto persisted_external_inputs = persist_repeated_external_inputs_for_graph_cuts(plan, gf);
 
         std::unordered_map<ggml_tensor*, PersistentExternalBinding> persistent_externals;
         snapshot_persistent_externals(plan, gf, persistent_externals);

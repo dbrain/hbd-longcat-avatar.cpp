@@ -13,17 +13,26 @@ WT=/home/dbrain/dev/longcat-avatar-ltxdenoise
 LTX2=/home/dbrain/dev/longcat-avatar.cpp/models/ltx2
 BUILDER=longcat-avatar-dev:builder-cudnn-ff
 BIN=/src/build-cudnn/bin/sd-cli
-DIT=${DIT:-nvfp4-CLEAN-dev050.gguf}
+DIT=${DIT:-nvfp4-imatrix-dev050.gguf}
 OUT=$WT/_ablation_out/nsys_prof; MODE=${MODE:-capture}
+MAXV=${MAXV:-9}; REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-${REFINE_MAXV:-$MAXV}}
 SEGMENTS=${SEGMENTS:-2}; STEPS=${STEPS:-2}; REFSTEPS=${REFSTEPS:-1}   # reduced steps: shapes built, small trace
+VIDEO_FRAMES=${VIDEO_FRAMES:-97}; WIDTH=${WIDTH:-960}; HEIGHT=${HEIGHT:-544}; FPS=${FPS:-24}
+SAMPLING_METHOD=${SAMPLING_METHOD:-euler_a}
+PROFILE_DIR=${PROFILE_DIR:-/src/ltx-denoise-repro/_singing_perf_s2_imatrix_refinemax10}
+PROMPTS=${PROMPTS:-$PROFILE_DIR/prompt.txt}
+AUDIO_DIR=${AUDIO_DIR:-$PROFILE_DIR/adir}
 mkdir -p "$OUT"
 
 INSTALL_STD='apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq cuda-nsight-systems-13-0 sqlite3 >/dev/null 2>&1; NSYS=$(ls /opt/nvidia/nsight-systems/*/target-linux-x64/nsys | head -1)'
 
 if [ "$MODE" = analyze ]; then
   REP=${REP:-$OUT/prof.nsys-rep}
+  rm -f "$OUT/prof.sqlite"
   docker run --rm -v "$WT:/src" -w /src/_ablation_out/nsys_prof nvidia/cuda:13.3.0-devel-ubuntu24.04 bash -c "
     export DEBIAN_FRONTEND=noninteractive; $INSTALL_STD
+    echo '=== CUDA GPU kernels ==='; \$NSYS stats --report cuda_gpu_kern_sum --format table $(basename "$REP") | head -80
+    echo '=== CUDA API summary ==='; \$NSYS stats --report cuda_api_sum --format table $(basename "$REP") | head -80
     echo '=== GPU MemOps by size ==='; \$NSYS stats --report cuda_gpu_mem_size_sum --format table $(basename "$REP")
     echo '=== CUDA API (malloc/cuMem/cudnn) ==='; \$NSYS stats --report cuda_api_sum --format table $(basename "$REP") | grep -iE 'Malloc|MemCreate|MemAlloc|cudnn|Name'
     echo '=== export sqlite for unfreed-alloc query ==='; \$NSYS export --type sqlite --force-overwrite true -o prof.sqlite $(basename "$REP") 2>&1 | tail -1
@@ -114,11 +123,15 @@ fi
 NSYS_SETUP='NSYS=$(which nsys)'; [ "$MODE" = capture ] && NSYS_SETUP="$INSTALL_STD"
 PRODENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -e LTX_DIT_F16=1
   -e GGML_CUDNN_ATTN_BUCKET="${GGML_CUDNN_ATTN_BUCKET:-}" -e GGML_CUDNN_ATTN_BUCKETS="${GGML_CUDNN_ATTN_BUCKETS:-}"
-  -e LTX_ATTN_QTILE="${LTX_ATTN_QTILE:-}" -e GGML_CUDNN_OP_TRACE="${GGML_CUDNN_OP_TRACE:-}"
+  -e LTX_ATTN_QTILE="${LTX_ATTN_QTILE:-}" -e GGML_CUDNN_OP_TRACE="${GGML_CUDNN_OP_TRACE:-0}"
+    -e LONGCAT_NO_PREFETCH_POOL=1 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_DIT_NO_MMAP=0 -e LTXAV_FREE_TE_PARAMS=0
+    -e LONGCAT_SHARED_RESIDENT_MAX_MB="${LONGCAT_SHARED_RESIDENT_MAX_MB:-0}" -e LTXAV_CHAIN_CUDNN_RESET="${LTXAV_CHAIN_CUDNN_RESET:-}" -e GGML_CUDA_ALLOC_TRACE="${GGML_CUDA_ALLOC_TRACE:-}"
   -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FFN=1 -e GGML_FP8_LAYERS=transformer_blocks
   -e LONGCAT_SHARED_RESIDENT=1 -e LONGCAT_VAE_KEEP_RESIDENT=0 -e LONGCAT_FFN_TILE_TOKENS=4096 -e LONGCAT_ENCODE_MAX_VRAM=6.5
   -e LTXAV_END_RENDER_RECLAIM=1 -e LTXAV_CHAIN_POOL_TRIM=1 -e LONGCAT_VRAM_BREAKDOWN=1
-  -e LTXAV_VAE_LAZY=1 -e LTXAV_DIT_FREE_DURING_DECODE=1
+  -e LTXAV_VAE_LAZY=1 -e LTXAV_DIT_FREE_DURING_DECODE=1 -e LTXAV_SKIP_AUDIO_DECODE=1
+  -e LONGCAT_PERSIST_GRAPH_INPUTS="${LONGCAT_PERSIST_GRAPH_INPUTS:-1}"
+  -e LTXAV_REFINE_MAX_VRAM="$REFINE_MAXV"
   -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_CONV3D_WTILES=16 -e LTX_VAE_CONV3D_HTILES=8 -e LTX_VAE_DECODE_F16=1
   -e LTX_VAE_SPATIAL_TILES=2x2 -e LTX_VAE_SPATIAL_OVERLAP=4 )
 INNER="$NSYS_SETUP
@@ -127,10 +140,11 @@ INNER="$NSYS_SETUP
   stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --vae /ltx2/vae/ltx-2.3-22b-distilled_video_vae.safetensors --audio-vae /ltx2/vae/ltx-2.3-22b-distilled_audio_vae-ENC-f16.gguf \
   --llm /ltx2/gemma-3-12b-it-UD-Q4_K_XL.gguf --embeddings-connectors /ltx2/text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors \
-  --lora-model-dir /ltx2/loras -p 'city street, woman in red raincoat crosses a zebra crossing, overcast' \
-  --ltx-chain-segments $SEGMENTS -W 960 -H 544 --video-frames 121 --fps 24 --steps $STEPS --cfg-scale 1.0 --diffusion-fa \
-  --hires --hires-upscaler ltx-2.3-spatial-upscaler-x2-1.1 --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-sigmas '0.85,0.0' \
-  --offload-to-cpu --mmap --max-vram 7 -s 42 -v -o /src/_ablation_out/nsys_prof/out.webm"
+  --lora-model-dir /ltx2/loras \
+  --ltx-chain-segments $SEGMENTS --ltx-chain-prompts $PROMPTS --ltx-chain-audio-dir $AUDIO_DIR --cont-latent-frames 3 \
+  -W $WIDTH -H $HEIGHT --video-frames $VIDEO_FRAMES --fps $FPS --steps $STEPS --sampling-method $SAMPLING_METHOD --cfg-scale 1.0 --diffusion-fa \
+  --hires --hires-upscaler ltx-2.3-spatial-upscaler-x2-1.1 --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-sigmas '0.909375,0.0' \
+  --offload-to-cpu --mmap --max-vram $MAXV -s 42 -v -o /src/_ablation_out/nsys_prof/out.webm"
 docker run --rm --gpus '"device=1"' --cap-add=SYS_ADMIN "${PRODENV[@]}" -e LTX_CUSTOM_SIGMAS='1.0,0.5,0.0' \
   -v "$WT:/src" -v "$LTX2:/ltx2" -v /mnt/ssd/models:/mnt/ssd/models:ro -w /src "$BUILDER" bash -c "$INNER"
 echo "rc=$?  report: $OUT/prof.nsys-rep  (analyze: MODE=analyze REP=$OUT/prof.nsys-rep bash nsys_profile.sh)"

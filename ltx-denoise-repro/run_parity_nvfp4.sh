@@ -32,7 +32,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 WT=/home/dbrain/dev/longcat-avatar-ltxdenoise
 MAIN=/home/dbrain/dev/longcat-avatar.cpp; LTX2="$MAIN/models/ltx2"
 BUILDER="longcat-avatar-dev:builder-cudnn-ff"; BIN=/src/build-cudnn/bin/sd-cli
-UPDIR=/ltx2/latent_upscale_models; UPSCALER=ltx-2.3-spatial-upscaler-x2-1.1
+UPDIR=/ltx2/latent_upscale_models; UPSCALER="${UPSCALER:-ltx-2.3-spatial-upscaler-x2-1.1}"
 OUTROOT="$WT/_ablation_out"; mkdir -p "$OUTROOT"
 
 RES="${RES:-parity}"
@@ -40,7 +40,9 @@ case "$RES" in
   parity) WBASE=960; HBASE=544 ;;   # -> x2 -> 1920x1088 (Comfy)
   mid)    WBASE=832; HBASE=480 ;;   # -> x2 -> 1664x960 (middle)
   speed)  WBASE=640; HBASE=352 ;;   # -> x2 -> 1280x704  (our current)
-  *) echo "RES must be parity|speed"; exit 2 ;;
+  x15)    WBASE=864; HBASE=480 ;;   # -> x1.5 -> 1296x720 (~720p, but 1.84x the DiT base pixels of speed -> better faces; set UPSCALER=ltx-2.3-spatial-upscaler-x1.5-1.0)
+  x15hi)  WBASE=1280; HBASE=704 ;;  # -> x1.5 -> 1920x1056 (~1080p from a 1280 base = 1.73x parity's base pixels -> best faces; latent-clean 40x22 -> 60x33; set UPSCALER=...x1.5...)
+  *) echo "RES must be parity|mid|speed|x15|x15hi"; exit 2 ;;
 esac
 FR="${FR:-121}"; FPS="${FPS:-24}"; SEED="${SEED:-42}"; DEVICE="${DEVICE:-1}"; MAXV="${MAXV:-7}"   # LOCKED: MAXV=7 (11 inflates offload partial+prefetch buffers ~8.7GB -> 15GB)
 DIT="${DIT:-nvfp4-CLEAN-dev050.gguf}"

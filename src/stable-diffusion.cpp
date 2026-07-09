@@ -281,6 +281,8 @@ public:
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<LTXV::LTXAudioVAERunner> audio_vae_model;
+    std::shared_ptr<LTXVUpsampler::LatentUpsamplerRunner> ltx_latent_upsampler;
+    std::string ltx_latent_upsampler_path;
     std::shared_ptr<LONGCAT_AUDIO::WhisperEncoderRunner> whisper_encoder_model;  // LongCat-Avatar audio
     std::shared_ptr<ControlNet> control_net;
     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
@@ -1811,7 +1813,8 @@ public:
     // chain with a conditioner.
     void precompute_chain_text_conds(const std::vector<std::string>& prompts,
                                      const std::string&              negative_prompt,
-                                     int                             clip_skip) {
+                                     int                             clip_skip,
+                                     bool                            need_uncond) {
         if ((!sd_version_is_longcat_avatar(version) && version != VERSION_LTXAV) ||
             !keep_diffusion_model_resident || !cond_stage_model) {
             return;
@@ -1821,9 +1824,10 @@ public:
             return;
         }
         int64_t t0 = ggml_time_ms();
-        // Constant negative prompt across the chain -> encode its uncond once, share it.
+        // Constant negative prompt across the chain -> encode its uncond once, share it
+        // only when the resolved sampling path will actually consume it.
         SDCondition shared_uncond;
-        {
+        if (need_uncond) {
             ConditionerParams cp;
             cp.clip_skip       = clip_skip;
             cp.zero_out_masked = true;
@@ -1843,13 +1847,14 @@ public:
             CachedTextCond entry;
             entry.cond             = cond_stage_model->get_learned_condition(n_threads, cp);
             entry.uncond           = shared_uncond;
-            entry.has_uncond       = true;
+            entry.has_uncond       = need_uncond;
             avatar_cond_cache[key] = std::move(entry);
             ++encoded;
         }
-        LOG_INFO("LTXAV chain: pre-encoded %d distinct text cond(s) over %zu segment prompt(s) "
+        LOG_INFO("LTXAV chain: pre-encoded %d distinct text cond(s)%s over %zu segment prompt(s) "
                  "in one TE window, taking %.2fs",
-                 encoded, prompts.size(), (ggml_time_ms() - t0) * 1.0f / 1000);
+                 encoded, need_uncond ? " + shared uncond" : "", prompts.size(),
+                 (ggml_time_ms() - t0) * 1.0f / 1000);
         // We now hold every cond; on the deferred GPU-TE path free the TE to give the
         // resident DiT its VRAM back. Skipped under --mmap (weights are not freed).
         if (free_params_immediately && dit_load_deferred) {
@@ -8237,18 +8242,31 @@ static sd::Tensor<float> upscale_ltx_spatial_video_latent(sd_ctx_t* sd_ctx,
         return {};
     }
 
-    std::unique_ptr<LTXVUpsampler::LatentUpsamplerRunner> upsampler =
-        std::make_unique<LTXVUpsampler::LatentUpsamplerRunner>(sd_ctx->sd->backend_for(SDBackendModule::UPSCALER),
-                                                               sd_ctx->sd->params_backend_for(SDBackendModule::UPSCALER));
-    const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(sd_ctx->sd->max_vram);
-    upsampler->set_max_graph_vram_bytes(max_graph_vram_bytes);
-    if (!upsampler->load_from_file(model_path, sd_ctx->sd->n_threads)) {
-        LOG_ERROR("load LTX latent upsampler failed");
-        return {};
+    std::shared_ptr<LTXVUpsampler::LatentUpsamplerRunner> upsampler = sd_ctx->sd->ltx_latent_upsampler;
+    const std::string requested_model_path = SAFE_STR(model_path);
+    if (!upsampler || sd_ctx->sd->ltx_latent_upsampler_path != requested_model_path) {
+        int64_t load_start = ggml_time_ms();
+        upsampler =
+            std::make_shared<LTXVUpsampler::LatentUpsamplerRunner>(sd_ctx->sd->backend_for(SDBackendModule::UPSCALER),
+                                                                   sd_ctx->sd->params_backend_for(SDBackendModule::UPSCALER));
+        const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(sd_ctx->sd->max_vram);
+        upsampler->set_max_graph_vram_bytes(max_graph_vram_bytes);
+        if (!upsampler->load_from_file(model_path, sd_ctx->sd->n_threads)) {
+            sd_ctx->sd->ltx_latent_upsampler.reset();
+            sd_ctx->sd->ltx_latent_upsampler_path.clear();
+            LOG_ERROR("load LTX latent upsampler failed");
+            return {};
+        }
+        sd_ctx->sd->ltx_latent_upsampler      = upsampler;
+        sd_ctx->sd->ltx_latent_upsampler_path = requested_model_path;
+        LOG_INFO("[LTX_PHASE] latent upsampler load/cache fill took %.3fs", (ggml_time_ms() - load_start) * 1.0f / 1000);
+    } else {
+        LOG_INFO("LTX latent upsampler cache hit: %s", requested_model_path.c_str());
     }
 
     sd::Tensor<float> upscaled = upsampler->compute(sd_ctx->sd->n_threads, unnormalized);
-    upsampler.reset();
+    upsampler->free_compute_buffer();
+    upsampler->release_all_gpu_param_residency();
     if (upscaled.empty()) {
         LOG_ERROR("LTX latent spatial upscale failed");
         return {};
@@ -8686,10 +8704,24 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         // Change D — default stage-2 sigmas = official STAGE_2_DISTILLED_SIGMAS (3-step refine,
         // sigma0=0.909375 = the noise added to the upscaled latent), unless the caller passed
         // --hires-sigmas. Static backing array => valid for the lifetime of the request.
-        if (request.hires.custom_sigmas_count <= 0 || request.hires.custom_sigmas == nullptr) {
+        //
+        // LTXAV_TWOSTAGE_USE_HIRES_STRENGTH=1 is an explicit diagnostic path: leave
+        // custom_sigmas empty so make_hires_sigma_schedule() can build/trim the schedule from
+        // hires.denoising_strength. Without this, --hires-denoising-strength is logged but
+        // ignored because the official custom sigma vector returns early from schedule creation.
+        bool use_hires_strength_schedule = false;
+        if (const char* e = std::getenv("LTXAV_TWOSTAGE_USE_HIRES_STRENGTH")) {
+            use_hires_strength_schedule = e[0] != '\0' && std::string(e) != "0";
+        }
+        if (!use_hires_strength_schedule &&
+            (request.hires.custom_sigmas_count <= 0 || request.hires.custom_sigmas == nullptr)) {
             static float kStage2DistilledSigmas[] = {0.909375f, 0.725f, 0.421875f, 0.0f};
             request.hires.custom_sigmas       = kStage2DistilledSigmas;
             request.hires.custom_sigmas_count = 4;
+        } else if (use_hires_strength_schedule &&
+                   (request.hires.custom_sigmas_count <= 0 || request.hires.custom_sigmas == nullptr)) {
+            LOG_INFO("LTXAV_TWOSTAGE_USE_HIRES_STRENGTH=1: using generated hires schedule trimmed by denoising_strength=%.2f",
+                     request.hires.denoising_strength);
         }
         // Stage-1 at HALF the final resolution (the relip block below renders at request.w/h).
         request.width  = full_w / 2;
@@ -8698,18 +8730,24 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                  request.width, request.height, full_w, full_h);
     }
 
-    bool latent_upscale_enabled     = request.hires.enabled;
+    bool same_res_refine_enabled = false;
+    if (const char* e = std::getenv("LTX_REFINE_NO_UPSCALE")) {
+        same_res_refine_enabled = e[0] != '\0' && std::string(e) != "0";
+    }
+    same_res_refine_enabled      = same_res_refine_enabled && request.hires.enabled;
+    bool latent_refine_enabled   = request.hires.enabled;
+    bool latent_upscale_enabled  = latent_refine_enabled && !same_res_refine_enabled;
     GenerationRequest hires_request = request;
-    if (latent_upscale_enabled) {
+    if (latent_refine_enabled) {
         if (!sd_version_is_ltxav(sd_ctx->sd->version)) {
-            LOG_ERROR("LTX latent spatial upscale is only supported for LTX video models");
+            LOG_ERROR("LTX latent refine is only supported for LTX video models");
             return false;
         }
-        if (request.hires.upscaler != SD_HIRES_UPSCALER_MODEL) {
+        if (latent_upscale_enabled && request.hires.upscaler != SD_HIRES_UPSCALER_MODEL) {
             LOG_ERROR("LTX latent spatial upscale currently requires hires upscaler MODEL");
             return false;
         }
-        if (strlen(SAFE_STR(request.hires.model_path)) == 0) {
+        if (latent_upscale_enabled && strlen(SAFE_STR(request.hires.model_path)) == 0) {
             LOG_ERROR("LTX latent spatial upscale is enabled but hires model path was not provided");
             return false;
         }
@@ -8734,6 +8772,11 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                                    latents);
     if (latent_upscale_enabled) {
         LOG_INFO("generate_video %dx%dx%d -> LTX latent spatial upscale",
+                 request.width,
+                 request.height,
+                 request.frames);
+    } else if (latent_refine_enabled) {
+        LOG_INFO("generate_video %dx%dx%d -> LTX same-resolution latent refine",
                  request.width,
                  request.height,
                  request.frames);
@@ -8792,6 +8835,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (ltxav_vae_lazy && !relip_twostage &&
         sd_version_is_ltxav(sd_ctx->sd->version) &&
         sd_ctx->sd->first_stage_model) {
+        int64_t phase_t0 = ggml_time_ms();
         auto& vvae = sd_ctx->sd->first_stage_model;
         auto& avae = sd_ctx->sd->audio_vae_model;
         if (vvae->params_offloaded_to_host()) {
@@ -8833,6 +8877,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         } else {
             LOG_INFO("LTXAV_VAE_LAZY: VAE params are neither host-offloaded nor reloadable (e.g. --mmap without --offload-to-cpu); skipping to stay abort-safe");
         }
+        LOG_INFO("[LTX_PHASE] pre-sample VAE eviction/setup took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
     }
 
     int64_t latent_start = ggml_time_ms();
@@ -9073,15 +9118,24 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // bookkeeping is unchanged. (Deep copy: final_latent is reassigned by the hires pass.)
     sd::Tensor<float> chain_base_latent;
     if (latent_upscale_enabled && final_latent_out != nullptr) {
+        int64_t phase_t0 = ggml_time_ms();
         chain_base_latent = final_latent;
+        LOG_INFO("[LTX_PHASE] chain base latent capture took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
     }
 
-    if (latent_upscale_enabled) {
+    if (latent_refine_enabled) {
+        int64_t refine_total_start = ggml_time_ms();
         int64_t upscale_start             = ggml_time_ms();
-        sd::Tensor<float> upscaled_latent = upscale_ltx_spatial_video_latent(sd_ctx,
-                                                                             request.hires.model_path,
-                                                                             final_latent,
-                                                                             latents.audio_length);
+        sd::Tensor<float> upscaled_latent;
+        if (same_res_refine_enabled) {
+            upscaled_latent = final_latent;
+            LOG_INFO("LTX same-resolution latent refine: skipping spatial upscale");
+        } else {
+            upscaled_latent = upscale_ltx_spatial_video_latent(sd_ctx,
+                                                               request.hires.model_path,
+                                                               final_latent,
+                                                               latents.audio_length);
+        }
         int64_t upscale_end               = ggml_time_ms();
         if (upscaled_latent.empty()) {
             if (sd_ctx->sd->free_params_immediately) {
@@ -9089,8 +9143,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
             return false;
         }
-        LOG_INFO("LTX latent spatial upscale completed, taking %.2fs",
-                 (upscale_end - upscale_start) * 1.0f / 1000);
+        if (!same_res_refine_enabled) {
+            LOG_INFO("LTX latent spatial upscale completed, taking %.2fs",
+                     (upscale_end - upscale_start) * 1.0f / 1000);
+        }
 
         x_t                        = std::move(upscaled_latent);
         hires_request.width        = static_cast<int>(x_t.shape()[0]) * hires_request.vae_scale_factor;
@@ -9132,7 +9188,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 latents.audio_length = target_audio_length;
             }
         }
-        if ((request.hires.target_width > 0 || request.hires.target_height > 0) &&
+        if (!same_res_refine_enabled &&
+            (request.hires.target_width > 0 || request.hires.target_height > 0) &&
             (request.hires.target_width != hires_request.width || request.hires.target_height != hires_request.height)) {
             LOG_WARN("LTX latent spatial upsampler output is %dx%d; ignoring hires target %dx%d",
                      hires_request.width,
@@ -9166,6 +9223,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         sd::Tensor<float> hires_denoise_mask;
         sd::Tensor<float> hires_video_positions;
         sd::Tensor<float> hires_video_reference;  // Change B/C: stage-2 re-applied relip reference
+        int64_t refine_conditioning_start = ggml_time_ms();
         if (!apply_ltxv_refine_image_conditioning(sd_ctx,
                                                   sd_vid_gen_params,
                                                   hires_request,
@@ -9179,6 +9237,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
             return false;
         }
+        LOG_INFO("[LTX_PHASE] refine image/audio conditioning took %.3fs", (ggml_time_ms() - refine_conditioning_start) * 1.0f / 1000);
 
         // LTX_REFINE_CONTEXT_FRAMES=N (default unset = byte-identical): "refine only the surviving
         // frames" knob. A continuation segment appends the prior-segment guide as K extra TAIL frames
@@ -9267,6 +9326,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         // CONSTANT (seg-independent) makes the re-roll consistent across segments so identity holds,
         // while the base sampling keeps its per-segment variety. Value is arbitrary (only consistency
         // matters); default 42 when the toggle is "1". Off by default = byte-identical.
+        int64_t refine_noise_start = ggml_time_ms();
         if (const char* e = std::getenv("LTX_REFINE_CONST_SEED"); e != nullptr && e[0] != '\0' && std::string(e) != "0") {
             uint64_t rseed = std::strtoull(e, nullptr, 10);
             if (rseed <= 1) {
@@ -9277,6 +9337,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                      (unsigned long long)rseed);
         }
         noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+        LOG_INFO("[LTX_PHASE] refine noise tensor setup took %.3fs", (ggml_time_ms() - refine_noise_start) * 1.0f / 1000);
 
         // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
         // done and the stage-2 DiT forward (below) does NOT touch the video/audio VAE — those only
@@ -9307,6 +9368,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         T                                   = static_cast<int>(x_t.shape()[2]);
         sample_method_t hires_sample_method = plan.sample_method;
         int hires_scheduler_steps           = 0;
+        int64_t refine_schedule_start       = ggml_time_ms();
         std::vector<float> hires_sigma_sched =
             make_hires_sigma_schedule(sd_ctx,
                                       request.hires,
@@ -9318,9 +9380,11 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         float hires_eta = resolve_eta(sd_ctx,
                                       sd_vid_gen_params->sample_params.eta,
                                       hires_sample_method);
+        LOG_INFO("[LTX_PHASE] refine sigma/scheduler setup took %.3fs", (ggml_time_ms() - refine_schedule_start) * 1.0f / 1000);
 
-        LOG_DEBUG("sample(latent upscale) %dx%dx%d", W, H, T);
-        LOG_INFO("LTX latent spatial upscale refine: scheduler_steps=%d, denoising_strength=%.2f, sampler=%s, sigma_sched_size=%zu%s",
+        LOG_DEBUG("%s %dx%dx%d", same_res_refine_enabled ? "sample(same-res refine)" : "sample(latent upscale)", W, H, T);
+        LOG_INFO("LTX %s refine: scheduler_steps=%d, denoising_strength=%.2f, sampler=%s, sigma_sched_size=%zu%s",
+                 same_res_refine_enabled ? "same-resolution latent" : "latent spatial upscale",
                  hires_scheduler_steps,
                  request.hires.denoising_strength,
                  sampling_methods_str[hires_sample_method],
@@ -9335,6 +9399,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         if (sd_version_is_ltxav(sd_ctx->sd->version)) {
             const char* e = getenv("LTXAV_PRE_SAMPLE_POOL_TRIM");
             if (e == nullptr || std::string(e) != "0") {
+                int64_t phase_t0 = ggml_time_ms();
                 ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
                 // REFINE-PEAK FIX (97f continuation): the trim above reclaims the VMM pool
                 // high-water, but the DiT's idle param-streaming buffers (prefetch_buf_pool_ +
@@ -9348,6 +9413,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 if (sd_ctx->sd->diffusion_model) {
                     sd_ctx->sd->diffusion_model->free_streaming_scratch_buffers();
                 }
+                LOG_INFO("[LTX_PHASE] pre-refine pool/streaming trim took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
             }
         }
 
@@ -9379,6 +9445,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             sd_version_is_ltxav(sd_ctx->sd->version) &&
             sd_ctx->sd->first_stage_model &&
             sd_ctx->sd->first_stage_model->params_offloaded_to_host()) {
+            int64_t phase_t0 = ggml_time_ms();
             sd_ctx->sd->first_stage_model->release_all_gpu_param_residency();
             if (sd_ctx->sd->audio_vae_model) {
                 sd_ctx->sd->audio_vae_model->release_all_gpu_param_residency();
@@ -9388,15 +9455,34 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // cuDNN conv3d reorder-weight buffers keyed by those pointers (else ~1.4 GB/segment leak).
             ggml_backend_cuda_release_cudnn_conv3d_weights();
             LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv3d reorder weights before the hires/refine sample; re-offload from host at decode");
+            LOG_INFO("[LTX_PHASE] pre-refine VAE re-eviction took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
         }
 
         // Refine-scoped resident byte cap (LONGCAT_SHARED_RESIDENT_MAX_MB): engage the
         // cap ONLY for this 3-step hires/refine sample so it pins just the hottest ~4 GB
         // (fits ≤11776 on the 97f 1080p continuation) while the 8-step base above keeps
         // its full pin for speed. No-op when the cap env is unset (byte-identical).
+        float old_max_vram = sd_ctx->sd->max_vram;
+        bool refine_max_vram_override = false;
+        size_t old_max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(old_max_vram);
+        if (const char* e = std::getenv("LTXAV_REFINE_MAX_VRAM"); e != nullptr && e[0] != '\0') {
+            float refine_max_vram = (float)atof(e);
+            if (refine_max_vram > 0.f && refine_max_vram != old_max_vram) {
+                refine_max_vram_override = true;
+                sd_ctx->sd->max_vram = refine_max_vram;
+                size_t refine_max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(refine_max_vram);
+                if (sd_ctx->sd->diffusion_model) {
+                    sd_ctx->sd->diffusion_model->set_max_graph_vram_bytes(refine_max_graph_vram_bytes);
+                }
+                LOG_INFO("LTXAV_REFINE_MAX_VRAM: using %.2f GiB graph budget for refine sample only (base remains %.2f GiB)",
+                         refine_max_vram,
+                         old_max_vram);
+            }
+        }
         if (sd_ctx->sd->diffusion_model) {
             sd_ctx->sd->diffusion_model->set_refine_resident_scope(true);
         }
+        LOG_INFO("[LTX_PHASE] refine setup total before sample took %.3fs", (ggml_time_ms() - refine_total_start) * 1.0f / 1000);
         sampling_start = ggml_time_ms();
         final_latent   = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                             true,
@@ -9429,6 +9515,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         if (sd_ctx->sd->diffusion_model) {
             sd_ctx->sd->diffusion_model->set_refine_resident_scope(false);
         }
+        if (refine_max_vram_override) {
+            sd_ctx->sd->max_vram = old_max_vram;
+            if (sd_ctx->sd->diffusion_model) {
+                sd_ctx->sd->diffusion_model->set_max_graph_vram_bytes(old_max_graph_vram_bytes);
+            }
+        }
         // FIX (1080p hires chain seg-2 crash): this hires/latent-upscale success-path free was
         // gated ONLY on free_params_immediately, missing the !keep_diffusion_model_resident
         // guard the non-hires branch below (:9292) has. On a warm N-segment chain
@@ -9441,11 +9533,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         if (final_latent.empty()) {
-            LOG_ERROR("sampling(latent upscale) failed after %.2fs",
+            LOG_ERROR("%s failed after %.2fs",
+                      same_res_refine_enabled ? "sampling(same-res refine)" : "sampling(latent upscale)",
                       (sampling_end - sampling_start) * 1.0f / 1000);
             return false;
         }
-        LOG_INFO("sampling(latent upscale) completed, taking %.2fs",
+        LOG_INFO("%s completed, taking %.2fs",
+                 same_res_refine_enabled ? "sampling(same-res refine)" : "sampling(latent upscale)",
                  (sampling_end - sampling_start) * 1.0f / 1000);
     } else if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
@@ -9473,6 +9567,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (ltxav_dit_free_during_decode &&
         sd_version_is_ltxav(sd_ctx->sd->version) &&
         sd_ctx->sd->diffusion_model) {
+        int64_t phase_t0 = ggml_time_ms();
         if (sd_ctx->sd->diffusion_model->params_offloaded_to_host()) {
             sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
             // Trim the DIFFUSION backend pool so the freed VRAM leaves the board as real headroom for
@@ -9489,31 +9584,42 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         } else {
             LOG_INFO("LTXAV_DIT_FREE_DURING_DECODE: DiT params live on the runtime backend (no host offload); skipping to stay abort-safe");
         }
+        LOG_INFO("[LTX_PHASE] pre-decode DiT release took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
     }
 
     sd_audio_t* generated_audio = nullptr;
+    static const bool ltxav_skip_audio_decode = [] {
+        const char* s = getenv("LTXAV_SKIP_AUDIO_DECODE");
+        return s && s[0] == '1';
+    }();
     if (sd_version_is_ltxav(sd_ctx->sd->version) &&
         latents.audio_length > 0 &&
         sd_ctx->sd->audio_vae_model != nullptr) {
         int64_t audio_latent_decode_start = ggml_time_ms();
 
-        // FIX 3: bring the audio VAE back if it was freed for the stage-2 forward (no-op if resident).
-        sd_ctx->sd->reload_audio_vae_model();
+        if (ltxav_skip_audio_decode) {
+            LOG_INFO("LTXAV_SKIP_AUDIO_DECODE=1: skipping generated audio latent decode");
+        } else {
+            int64_t audio_vae_reload_start = ggml_time_ms();
+            // FIX 3: bring the audio VAE back if it was freed for the stage-2 forward (no-op if resident).
+            sd_ctx->sd->reload_audio_vae_model();
+            LOG_INFO("[LTX_PHASE] audio VAE reload before decode took %.3fs", (ggml_time_ms() - audio_vae_reload_start) * 1.0f / 1000);
 
-        auto audio_latent = unpack_ltxav_audio_latent(final_latent,
-                                                      latents.audio_length,
-                                                      sd_ctx->sd->get_latent_channel());
-        if (!audio_latent.empty()) {
-            LOG_DEBUG("decode audio latent %dx%dx%dx%d",
-                      (int)audio_latent.shape()[0],
-                      (int)audio_latent.shape()[1],
-                      (int)audio_latent.shape()[2],
-                      (int)audio_latent.shape()[3]);
-            auto waveform = sd_ctx->sd->decode_ltx_audio_latent(audio_latent);
-            if (!waveform.empty()) {
-                generated_audio = waveform_to_sd_audio(sd_ctx->sd, waveform);
-            } else {
-                LOG_WARN("LTX audio latent decode failed; continuing with silent video output");
+            auto audio_latent = unpack_ltxav_audio_latent(final_latent,
+                                                          latents.audio_length,
+                                                          sd_ctx->sd->get_latent_channel());
+            if (!audio_latent.empty()) {
+                LOG_DEBUG("decode audio latent %dx%dx%dx%d",
+                          (int)audio_latent.shape()[0],
+                          (int)audio_latent.shape()[1],
+                          (int)audio_latent.shape()[2],
+                          (int)audio_latent.shape()[3]);
+                auto waveform = sd_ctx->sd->decode_ltx_audio_latent(audio_latent);
+                if (!waveform.empty()) {
+                    generated_audio = waveform_to_sd_audio(sd_ctx->sd, waveform);
+                } else {
+                    LOG_WARN("LTX audio latent decode failed; continuing with silent video output");
+                }
             }
         }
         int64_t audio_latent_decode_end = ggml_time_ms();
@@ -9578,6 +9684,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // latent (chain_base_latent) so the next segment chains at base resolution.
     const sd::Tensor<float>& cont_latent_src = (!chain_base_latent.empty()) ? chain_base_latent : final_latent;
     if (final_latent_out != nullptr && !cont_latent_src.empty()) {
+        int64_t phase_t0 = ggml_time_ms();
         int64_t Wl = cont_latent_src.shape()[0];
         int64_t Hl = cont_latent_src.shape()[1];
         int64_t Tl = cont_latent_src.shape()[2];
@@ -9592,6 +9699,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             if (latent_frames_out) *latent_frames_out = (int)Tl;
             if (latent_channels_out) *latent_channels_out = (int)Cl;
         }
+        LOG_INFO("[LTX_PHASE] continuation latent host copy took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
     }
 
     // FIX 3 (LTXAV two-stage) / WAN_VAE_FREE_DURING_DIT (CLI lever): bring the video VAE back if it
@@ -9599,16 +9707,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // reload_first_stage_model() dispatches to whichever reload loader was captured. On a genuine
     // reload FAILURE it has alloc'd but not refilled the params buffer, so abort here rather than
     // decode garbage (the pre-merge WAN-lever path checked this; the LTX path did not).
+    int64_t video_vae_reload_start = ggml_time_ms();
     if (!sd_ctx->sd->reload_first_stage_model()) {
         LOG_ERROR("video VAE reload before decode failed");
         free_sd_audio(generated_audio);
         return false;
     }
-    auto result = decode_video_outputs(sd_ctx, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
+    LOG_INFO("[LTX_PHASE] video VAE reload before decode took %.3fs", (ggml_time_ms() - video_vae_reload_start) * 1.0f / 1000);
+    int64_t video_decode_start = ggml_time_ms();
+    auto result = decode_video_outputs(sd_ctx, latent_refine_enabled ? hires_request : request, final_latent, num_frames_out);
     if (result == nullptr) {
         free_sd_audio(generated_audio);
         return false;
     }
+    LOG_INFO("[LTX_PHASE] video decode outputs total took %.3fs", (ggml_time_ms() - video_decode_start) * 1.0f / 1000);
 
     sd_ctx->sd->lora_stat();
 
@@ -10061,10 +10173,14 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         for (const auto& s : eff_prompts) {
             cptrs.push_back(s.c_str());
         }
+        GenerationRequest precompute_request(sd_ctx, base_params);
+        bool need_precomputed_uncond = precompute_request.use_uncond ||
+                                       precompute_request.use_high_noise_uncond;
         sd_ctx_precompute_chain_text_conds(
             sd_ctx, cptrs.data(), (int)cptrs.size(),
             base_params->negative_prompt != nullptr ? base_params->negative_prompt : "",
-            base_params->clip_skip);
+            base_params->clip_skip,
+            need_precomputed_uncond);
     }
 
     // Prior segment's captured video-channel-only latent tail, ggml-ne order
@@ -10983,7 +11099,8 @@ SD_API void sd_ctx_precompute_chain_text_conds(sd_ctx_t*    sd_ctx,
                                                const char** prompts,
                                                int          n_prompts,
                                                const char*  negative_prompt,
-                                               int          clip_skip) {
+                                               int          clip_skip,
+                                               bool         need_uncond) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || prompts == nullptr || n_prompts <= 0) {
         return;
     }
@@ -10992,7 +11109,7 @@ SD_API void sd_ctx_precompute_chain_text_conds(sd_ctx_t*    sd_ctx,
     for (int i = 0; i < n_prompts; ++i) {
         ps.emplace_back(prompts[i] != nullptr ? prompts[i] : "");
     }
-    sd_ctx->sd->precompute_chain_text_conds(ps, negative_prompt != nullptr ? negative_prompt : "", clip_skip);
+    sd_ctx->sd->precompute_chain_text_conds(ps, negative_prompt != nullptr ? negative_prompt : "", clip_skip, need_uncond);
 }
 
 SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path) {
