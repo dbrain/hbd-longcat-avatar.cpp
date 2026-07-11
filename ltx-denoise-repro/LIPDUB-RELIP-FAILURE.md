@@ -1,5 +1,9 @@
 # LTX-2.3 lip-dub (relip) failure — code analysis (no build / no GPU)
 
+> Current continuation: [Lipdub / Relip speed and VRAM handoff](HANDOFF-LIPDUB-RELIP-SPEED-VRAM.md).
+> It supersedes this document's historical "do not route" warning: the target
+> branch Relip crash is fixed, while production speed/VRAM work remains.
+
 ## IMPLEMENTED (root cause #1 fix) — `examples/server/async_jobs.cpp`
 
 Wired the `"model":"edit"` DiT variant swap into the video-chain path, mirroring the FLUX
@@ -149,3 +153,59 @@ wiring `ensure_variant_loaded` into the VIDGEN_CHAIN_REQ / `run_vid_chain_job` p
 dedicated relip server's `--diffusion-model` at the lipdub GGUF). For the exact hard-crash on the
 1280×704 live test, capture the engine log with breakdown on: the base-model name + the
 decode-phase residency lines (candidate 2) will tell #1-vs-#2 apart immediately.
+
+---
+
+## Fresh repro evidence — 2026-07-10
+
+This was rechecked while implementing the LTX continuation identity fix. The new continuation
+transport is explicitly bypassed for `relip_twostage`, so these results are independent of that
+work.
+
+### Target worktree failure
+
+Using `/home/dbrain/dev/longcat-avatar-ltxdenoise/build-sa3/bin/sd-cli`, 25 source frames at
+1280×704, the lipdub IC-LoRA prompt, drive audio, `LTXAV_RELIP_TWOSTAGE=1`, and the established
+low-memory relip settings (`MAXV=7.5`, `LTXAV_RELIP_ENCODE_TILE=0.25`, VAE 1×1):
+
+- native SA3 segfaulted during the stage-1 DiT graph;
+- `GGML_LTX_SA3=0` (cuDNN fallback) segfaulted at the same pre-sampling point;
+- neither run reached stage 2 or video decode.
+
+This rules out the new continuation-reference implementation as the direct cause. Artifacts:
+
+```text
+ltx-denoise-repro/_ablation_out/relip_hiresref_smoke/render.log
+ltx-denoise-repro/_ablation_out/relip_hiresref_smoke_cudnn/render.log
+```
+
+### Working production baseline
+
+The sibling production relip binary, `/home/dbrain/dev/longcat-avatar.cpp/build/bin/sd-cli`, ran
+the same source/audio/LoRA/two-stage recipe with cuDNN successfully:
+
+```text
+generate_video completed in 92.66s
+output: ltx-denoise-repro/_ablation_out/relip_baseline_sibling/relip.webm
+```
+
+This is the current safe production path. Do not route lipdub through the target worktree binary
+until its two-stage relip crash is reproduced under a debugger and fixed. Start by diffing the
+stage-1 relip graph/caching code against the sibling worktree; the target failure occurs after
+`get_learned_condition` and during the first graph-cut execution.
+
+---
+
+## Resolution — 2026-07-11
+
+The failure was the graph-cut compute allocator reuse introduced by commit `205eb40`. That change
+kept the allocator live across graph-cut segments (`free_compute_buffer_immediately=false`). Relip
+has changing stage-1 segment shapes; by the third group it could reuse incompatible allocator
+state and crash before sampling. The same crash occurred with native SA3 disabled, which is why it
+initially looked unrelated to the graph-cut lifetime change.
+
+Restoring the previous per-segment lifetime at both graph-cut `execute_graph` call sites in
+`src/core/ggml_extend.hpp` fixes the failure. With the current `build-sa3` binary, the exact
+lipdub GGUF + IC-LoRA + two-stage recipe completed its full locked 8/3 default pass (25-frame
+smoke) in 90.59 seconds, peak driver VRAM 13,486 MiB. The continuing three-segment singing
+regression uses the same fix and locked `run_singing_clip.sh` environment.

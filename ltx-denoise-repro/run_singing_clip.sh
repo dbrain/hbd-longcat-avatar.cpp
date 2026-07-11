@@ -25,6 +25,9 @@
 #   WIDTH=960 HEIGHT=544
 #                      base render size. With HIRES=1 this is the pre-upscale size; with HIRES=0
 #                      this is the final output size.
+#   HIRES_UPSCALER=ltx-2.3-spatial-upscaler-x2-1.1
+#                      latent spatial-upscale model. Set to ltx-2.3-spatial-upscaler-x1.5-1.0
+#                      for the supported lower-amplification identity/terminal-frame A/B.
 #   MAXV=9             --max-vram budget. 9 is the current locked speed/VRAM point; 10 was faster
 #                      but exceeded the old <=11.5GB co-resident target in the single-segment sweep.
 #   DROP=24            overlap frames dropped per seam (pins the advance; must match slicing)
@@ -68,6 +71,30 @@
 #   LTXAV_CHAIN_CUDNN_RESET=1
 #                      A/B cuDNN plan-cache release between chain segments. Quality-neutral; may
 #                      trade lower cross-segment VRAM for plan rebuild cost.
+#   LTXAV_EXPOSURE_MATCH=1
+#                      opt in to a whole-segment RGB exposure regrade at each seam. Off by
+#                      default: the raw LTX continuation is the quality baseline.
+#   LTXAV_CHAIN_HIRES_REFERENCE=1
+#                      explicit enable (the default for hires chains): carry the prior segment's
+#                      refined VIDEO-only latent tail as frozen guide tokens into the next Stage 2
+#                      pass. Set 0 to recover the old base-only refine path. Stage 1 continues on
+#                      its normal base-grid latent; relip remains untouched.
+#   LTXAV_CHAIN_HIRES_REFERENCE_FRAMES=3
+#                      optional reduced reference-token count (1..cont-latent-frames) for the
+#                      two-resolution transport. Default 3: full identity anchors; their redundant
+#                      base-guide counterparts are removed from stage 2 automatically.
+#   LTX_REFINE_CONTEXT_FRAMES=0
+#                      explicit override for the stage-2 base-guide context. With the refined
+#                      transport active, 0 is the default; use 1..K only for a seam A/B.
+#   GGML_LTX_SA3_DELTA_F16=0
+#                      Use FP32 SA3 delta corrections for a controlled quality comparison.
+#                      The locked run defaults to validated F16 corrections (~0.5 GiB lower VRAM).
+#   GGML_LTX_SA3=1 GGML_LTX_SA3_POLICY=first
+#                      Locked production attention policy: cuDNN on the first denoise step of
+#                      each LTX base/refine sample, native SA3 thereafter. This removes the
+#                      all-SA3 static-crossing FP4-dot artefact while retaining an ~8% x2 gain.
+#                      Use GGML_LTX_SA3=0 for a full-cuDNN control; policies `last` and `middle`
+#                      are diagnostic only.
 #   LTXAV_REFINE_MAX_VRAM=10
 #                      use a different graph budget only for the hires/refine denoise. This keeps
 #                      base sampling at MAXV while testing whether a fatter refine graph cut is a
@@ -92,13 +119,17 @@ WT=${WT:-/home/dbrain/dev/longcat-avatar-ltxdenoise}
 LTX2=${LTX2:-/home/dbrain/dev/longcat-avatar.cpp/models/ltx2}
 SONG=${SONG:-$LTX2/_drive/music_video/song.wav}        # 30s stereo 48k
 BUILDER=${BUILDER:-longcat-avatar-dev:builder-cudnn-ff}
-BIN=/src/build-cudnn/bin/sd-cli
+# The locked production policy uses cuDNN only on the first denoise step of
+# each base/refine stage, then SA3. It removes the all-SA3 crossing artefacts
+# while retaining most of the speed gain. Set GGML_LTX_SA3=0 for full cuDNN.
+BIN=${BIN:-/src/build-sa3/bin/sd-cli}
 DIT=${DIT:-nvfp4-imatrix-dev050.gguf}
 FFMPEG=${FFMPEG:-linuxserver/ffmpeg}
 GPU=${GPU:-1}                                          # device index (5060 Ti = 1)
 
 SEGMENTS=${SEGMENTS:-2}; HIRES=${HIRES:-1}; DROP=${DROP:-24}
 WIDTH=${WIDTH:-960}; HEIGHT=${HEIGHT:-544}
+HIRES_UPSCALER=${HIRES_UPSCALER:-ltx-2.3-spatial-upscaler-x2-1.1}
 MAXV=${MAXV:-9}
 STEPS=${STEPS:-8}; REFSTEPS=${REFSTEPS:-3}
 SAMPLING_METHOD=${SAMPLING_METHOD:-euler_a}
@@ -112,6 +143,11 @@ SKIP_AUDIO_DECODE=${SKIP_AUDIO_DECODE:-1}
 VAE_SPATIAL_TILES=${VAE_SPATIAL_TILES:-2x2}
 LONGCAT_PERSIST_GRAPH_INPUTS=${LONGCAT_PERSIST_GRAPH_INPUTS:-1}
 LONGCAT_ATTN_TILES=${LONGCAT_ATTN_TILES:-2}
+SA3_DELTA_F16=${GGML_LTX_SA3_DELTA_F16:-1}
+SA3_ENABLED=${GGML_LTX_SA3:-1}
+SA3_POLICY=${GGML_LTX_SA3_POLICY:-first}
+PROFILER=${PROFILER:-}
+NCU=${NCU:-0}
 OUT_NAME=${OUT_NAME:-singing_clip.webm}
 OUTDIR=${OUTDIR:-$WT/ltx-denoise-repro/_singing_out}
 F=97; FPS=24
@@ -135,7 +171,7 @@ docker run --rm -v "$(dirname "$SONG"):/s" -v "$OUTDIR:/o" --entrypoint ffmpeg "
 # ---- hires args --------------------------------------------------------------
 HIRES_ARGS=""
 if [ "$HIRES" = 1 ]; then
-  HIRES_ARGS="--hires --hires-upscaler ltx-2.3-spatial-upscaler-x2-1.1 --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-denoising-strength $REFINE_DENOISING_STRENGTH"
+  HIRES_ARGS="--hires --hires-upscaler $HIRES_UPSCALER --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-denoising-strength $REFINE_DENOISING_STRENGTH"
   [ -n "$REFINE_SIGMAS" ] && HIRES_ARGS="$HIRES_ARGS --hires-sigmas $REFINE_SIGMAS"
 fi
 
@@ -143,6 +179,7 @@ fi
 ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -e LTX_DIT_F16=1
   -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FFN=1 -e GGML_FP8_LAYERS=transformer_blocks
   -e GGML_CUDA_F16_BCAST_FUSE=1 -e GGML_CUDA_BIAS_GELU_FUSE=1 -e GGML_CUDA_BIAS_RMS_FUSE=1 -e GGML_CUDA_RMS_MOD_FUSE=1
+  -e GGML_LTX_SA3=$SA3_ENABLED -e GGML_LTX_SA3_POLICY=$SA3_POLICY -e GGML_LTX_SA3_DELTA_F16=$SA3_DELTA_F16
   -e LONGCAT_SHARED_RESIDENT=1 -e LONGCAT_VAE_KEEP_RESIDENT=0 -e LONGCAT_FFN_TILE_TOKENS=8192 -e LONGCAT_ENCODE_MAX_VRAM=6.5
   -e LONGCAT_NO_PREFETCH_POOL=1 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_DIT_NO_MMAP=0
   -e LTXAV_VAE_LAZY=1 -e LTXAV_DIT_FREE_DURING_DECODE=1 -e LONGCAT_VRAM_BREAKDOWN=1
@@ -153,13 +190,15 @@ ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -
 [ "$REFINE_CONST_SEED" != 0 ] && ENV+=( -e LTX_REFINE_CONST_SEED=$REFINE_CONST_SEED )
 [ "$USE_HIRES_STRENGTH" != 0 ] && ENV+=( -e LTXAV_TWOSTAGE_USE_HIRES_STRENGTH=$USE_HIRES_STRENGTH )
 [ "$SKIP_AUDIO_DECODE" != 0 ] && ENV+=( -e LTXAV_SKIP_AUDIO_DECODE=1 )
-for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LONGCAT_CONT_PROF LONGCAT_ATTN_TILES LONGCAT_FFN_TILE_TOKENS LTX_ATTN_QTILE GGML_CUDNN_ATTN_BUCKET GGML_CUDNN_ATTN_BUCKETS GGML_CUDNN_OP_TRACE GGML_CUDNN_ATTN_EXEC_TRACE GGML_FP8_ATTN GGML_FP8_ATTN_BC GGML_FP8_ATTN_LDM LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LONGCAT_PERSIST_GRAPH_INPUTS; do
+for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_OP_PROFILE LONGCAT_OP_PROFILE_MIN LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LONGCAT_CONT_PROF LONGCAT_ATTN_TILES LONGCAT_FFN_TILE_TOKENS LTX_ATTN_QTILE GGML_CUDNN_ATTN_BUCKET GGML_CUDNN_ATTN_BUCKETS GGML_CUDNN_OP_TRACE GGML_CUDNN_ATTN_EXEC_TRACE GGML_CUDNN_ATTN_TIMING GGML_CUDNN_ATTN_TIMING_SKIP GGML_CUDNN_ATTN_TIMING_MIN_LQ GGML_CUDNN_ATTN_BUILD_ALL_PLANS GGML_CUDNN_ATTN_PLAN_INDEX GGML_CUDNN_ATTN_PLAN_MIN_LQ CUDNN_FRONTEND_LOG_INFO CUDNN_FRONTEND_LOG_FILE GGML_FP8_ATTN GGML_FP8_ATTN_BC GGML_FP8_GEMM_EPILOGUE GGML_FP8_GEMM_PROFILE GGML_NVFP4_CUBLASLT_TRACE GGML_LTX_SA3 GGML_LTX_SA3_POLICY GGML_LTX_SA3_TIMING GGML_LTX_SA3_DELTA_F16 CUDA_LAUNCH_BLOCKING LONGCAT_CONT_REENCODE LTXAV_EXPOSURE_MATCH LTXAV_NO_EXPOSURE_MATCH LTXAV_CHAIN_HIRES_REFERENCE LTXAV_CHAIN_HIRES_REFERENCE_FRAMES LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LONGCAT_PERSIST_GRAPH_INPUTS; do
   if [ "${!passthrough+x}" = x ]; then
     ENV+=( -e "$passthrough=${!passthrough}" )
   fi
 done
+[ "${LTX_REFINE_CONTEXT_FRAMES+x}" = x ] && \
+  ENV+=( -e "LTX_REFINE_CONTEXT_FRAMES=$LTX_REFINE_CONTEXT_FRAMES" )
 
-INNER="stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
+INNER="$PROFILER stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --vae /ltx2/vae/ltx-2.3-22b-distilled_video_vae.safetensors --audio-vae /ltx2/vae/ltx-2.3-22b-distilled_audio_vae-ENC-f16.gguf \
   --llm /ltx2/gemma-3-12b-it-UD-Q4_K_XL.gguf --embeddings-connectors /ltx2/text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors \
   --lora-model-dir /ltx2/loras \
@@ -169,14 +208,16 @@ INNER="stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
 
 LOG="$OUTDIR/render.log"
 VRAM_LOG="$OUTDIR/vram.log"
-echo "[render] DIT=$DIT MAXV=$MAXV REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS HIRES=$HIRES WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS attn_tiles=$LONGCAT_ATTN_TILES"
+echo "[render] DIT=$DIT MAXV=$MAXV REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS HIRES=$HIRES hires_upscaler=$HIRES_UPSCALER WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS attn_tiles=$LONGCAT_ATTN_TILES"
 rm -f "$LOG" "$VRAM_LOG"
 : > "$VRAM_LOG"
 ( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" 2>/dev/null >> "$VRAM_LOG"; sleep 1; done ) &
 VRAM_PID=$!
 T0=$(date +%s)
 set +e
-docker run --rm --gpus "\"device=$GPU\"" "${ENV[@]}" \
+DOCKER_ARGS=( --rm --gpus "\"device=$GPU\"" )
+[ "$NCU" != 0 ] && DOCKER_ARGS+=( --cap-add=SYS_ADMIN )
+docker run "${DOCKER_ARGS[@]}" "${ENV[@]}" \
   -v "$WT:/src" -v "$LTX2:/ltx2" -v "$OUTDIR:/work" -v /mnt/ssd/models:/mnt/ssd/models:ro -w /src \
   "$BUILDER" bash -c "$INNER" 2>&1 | tee "$LOG"
 RC=${PIPESTATUS[0]}

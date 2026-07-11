@@ -488,6 +488,46 @@ bool run_vid_chain_job(ServerRuntime& runtime,
 
     sd_vid_gen_params_t base = gen_params.to_sd_vid_gen_params_t();
 
+    // Chained V2V relip accepts one contiguous control_frames array and partitions it into
+    // per-segment source windows. Default is exactly video_frames per segment; callers may pass
+    // relip_control_frame_counts for an explicit partition (useful for a short final window).
+    // Supplying enough frames is intentionally required rather than silently reusing segment 0:
+    // replaying the first source clip on every window is not a V2V chain.
+    std::vector<sd_image_t*> relip_control_starts;
+    std::vector<int>         relip_control_counts;
+    if (n_segments > 1 && !gen_params.control_frame_views.empty()) {
+        std::vector<int> requested_counts;
+        if (body.contains("relip_control_frame_counts") && body["relip_control_frame_counts"].is_array()) {
+            for (const auto& v : body["relip_control_frame_counts"]) {
+                if (!v.is_number_integer() || v.get<int>() <= 0) {
+                    error_message = "relip_control_frame_counts must contain positive integers";
+                    return false;
+                }
+                requested_counts.push_back(v.get<int>());
+            }
+            if ((int)requested_counts.size() != n_segments) {
+                error_message = "relip_control_frame_counts must have one entry per segment";
+                return false;
+            }
+        } else {
+            requested_counts.assign(n_segments, gen_params.video_frames);
+        }
+        size_t offset = 0;
+        relip_control_starts.reserve(n_segments);
+        relip_control_counts.reserve(n_segments);
+        for (int count : requested_counts) {
+            if (offset + (size_t)count > gen_params.control_frame_views.size()) {
+                error_message = "chained relip needs distinct control_frames for every segment";
+                return false;
+            }
+            relip_control_starts.push_back(gen_params.control_frame_views.data() + offset);
+            relip_control_counts.push_back(count);
+            offset += (size_t)count;
+        }
+        LOG_INFO("run_vid_chain_job: chained V2V relip uses %d distinct source windows (%zu control frames)",
+                 n_segments, offset);
+    }
+
     sd_vid_chain_params_t chain = {};
     chain.n_segments         = n_segments;
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
@@ -495,6 +535,8 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
     chain.save_dir           = job_dir.empty() ? nullptr : job_dir.c_str();
     chain.resume_from        = std::max(0, resume_from);
+    chain.segment_control_frames = relip_control_starts.empty() ? nullptr : relip_control_starts.data();
+    chain.segment_control_frame_counts = relip_control_counts.empty() ? nullptr : relip_control_counts.data();
 
     // Bank a viewable per-segment webm as each segment lands (off the GPU thread). On by
     // default when a job dir is set; LTX_BANK_SEG_WEBM=0 disables it (e.g. under tight RAM —

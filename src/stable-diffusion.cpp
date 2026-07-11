@@ -2610,6 +2610,34 @@ public:
         }
 
         size_t steps       = sigmas.size() - 1;
+        // SA3 is FP4 approximate attention.  Its upstream implementation recommends
+        // a hybrid policy for models whose all-step FP4 path is not lossless: run a
+        // precise attention backend at the first and final denoise steps, and SA3 in
+        // the middle.  The CUDA dispatcher reads GGML_LTX_SA3 at each attention call,
+        // so scope the process environment to this sample only.  This is deliberately
+        // opt-in; the unset production default remains cuDNN.
+        const char* sa3_policy_env = std::getenv("GGML_LTX_SA3_POLICY");
+        const std::string sa3_policy = sa3_policy_env != nullptr ? sa3_policy_env : "";
+        const bool sa3_step_policy = sd_version_is_ltxav(version) &&
+                                     (sa3_policy == "first" || sa3_policy == "last" || sa3_policy == "middle");
+        struct SA3EnvRestore {
+            bool active = false;
+            bool had_value = false;
+            std::string value;
+            ~SA3EnvRestore() {
+                if (!active) return;
+                if (had_value) setenv("GGML_LTX_SA3", value.c_str(), 1);
+                else unsetenv("GGML_LTX_SA3");
+            }
+        } sa3_env_restore;
+        if (sa3_step_policy) {
+            if (const char* e = std::getenv("GGML_LTX_SA3")) {
+                sa3_env_restore.had_value = true;
+                sa3_env_restore.value = e;
+            }
+            sa3_env_restore.active = true;
+            LOG_INFO("LTX SA3 policy=%s (%zu total sampler steps)", sa3_policy.c_str(), steps);
+        }
         bool has_skiplayer = (slg_scale != 0.0f || slg_uncond) && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
             has_skiplayer = false;
@@ -2723,6 +2751,16 @@ public:
             }
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
+            }
+
+            if (sa3_step_policy) {
+                const int sample_step = std::abs(step);
+                const bool use_sa3 = sa3_policy == "first" ? sample_step > 1
+                                     : sa3_policy == "last" ? sample_step < (int)steps
+                                                            : sample_step > 1 && sample_step < (int)steps;
+                setenv("GGML_LTX_SA3", use_sa3 ? "1" : "0", 1);
+                LOG_DEBUG("LTX SA3 policy=%s: step %d/%zu -> %s", sa3_policy.c_str(), sample_step, steps,
+                          use_sa3 ? "SA3" : "cuDNN");
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -3981,6 +4019,11 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_anchor_path                      = nullptr;
     sd_vid_gen_params->cont_latent                           = nullptr;
     sd_vid_gen_params->cont_latent_frames                    = 0;
+    sd_vid_gen_params->cont_refine_latent                    = nullptr;
+    sd_vid_gen_params->cont_refine_latent_frames             = 0;
+    sd_vid_gen_params->cont_refine_latent_width              = 0;
+    sd_vid_gen_params->cont_refine_latent_height             = 0;
+    sd_vid_gen_params->cont_refine_latent_channels           = 0;
     sd_vid_gen_params->keyframes                             = nullptr;
     sd_vid_gen_params->keyframe_frame_indices                = nullptr;
     sd_vid_gen_params->keyframes_size                        = 0;
@@ -4978,6 +5021,24 @@ static sd::Tensor<float> encode_relip_reference_temporal_chunked(sd_ctx_t* sd_ct
     LOG_INFO("LTXAV relip: temporal-chunked reference encode G=%d -> %lld latent frames (buffer bounded to ~%lld-frame groups)",
              G, (long long)out.shape()[2], (long long)(8 * G + 1));
     return out;
+}
+
+// Optional small temporal-budget trim for separable relip references. Unlike TSTRIDE this
+// preserves every early adjacent latent frame (and therefore mouth motion) and only omits the
+// final trailing frame(s), whose source appearance is already covered by the preceding causal
+// VAE latent. Unset/default is exactly no-op. It is deliberately applied after TSTRIDE.
+static void limit_relip_reference_latent_frames(sd::Tensor<float>* reference_latent, const char* phase) {
+    if (reference_latent == nullptr || reference_latent->empty() || reference_latent->shape()[2] <= 1) {
+        return;
+    }
+    const char* e = getenv("LTXAV_RELIP_REF_MAX_TFRAMES");
+    const int max_frames = e != nullptr ? atoi(e) : 0;
+    const int64_t have = reference_latent->shape()[2];
+    if (max_frames > 0 && max_frames < have) {
+        *reference_latent = sd::ops::slice(*reference_latent, 2, 0, max_frames);
+        LOG_INFO("LTXAV relip: %s reference temporal budget %lld -> %d latent frames (trailing frame trim)",
+                 phase, (long long)have, max_frames);
+    }
 }
 
 static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<float>& video_latent,
@@ -6632,6 +6693,7 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                     LOG_INFO("LTXAV relip: TEMPORAL subsample tstride=%d -> %lld of %lld ref latent frames (FULL spatial res)",
                              relip_ref_tstride, (long long)n_sub, (long long)orig_f);
                 }
+                limit_relip_reference_latent_frames(&reference_latent, "stage1");
                 int64_t target_lat_frames = latents.init_latent.shape()[2];
                 int64_t ref_lat_frames    = reference_latent.shape()[2];
                 int64_t target_lat_w      = latents.init_latent.shape()[0];
@@ -7941,8 +8003,14 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     if (sd_ctx->sd->cond_stage_model && std::getenv("LTXAV_FREE_TE_PARAMS") != nullptr &&
         std::string(std::getenv("LTXAV_FREE_TE_PARAMS")) != "0") {
         if (sd_ctx->sd->cond_stage_model->get_params_buffer_size() != 0) {
+            // The warm relip worker keeps the TE's shared/runtime GPU residency even after
+            // free_params_buffer(). Release that offloaded copy and trim its shared CUDA pool
+            // first; embeddings are already CPU-owned and reload_cond_stage_model() restores
+            // the TE on the next segment/request.
+            sd_ctx->sd->cond_stage_model->release_all_gpu_param_residency();
             sd_ctx->sd->cond_stage_model->free_params_buffer();
-            LOG_INFO("LTXAV: freed TE params (gemma+projection) before DiT, ~6GB (LTXAV_FREE_TE_PARAMS=1)");
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::TE));
+            LOG_INFO("LTXAV: released+freed TE GPU params (gemma+projection) before DiT, ~6GB (LTXAV_FREE_TE_PARAMS=1)");
         }
     }
 
@@ -8372,6 +8440,7 @@ static sd::Tensor<float> encode_ltxav_relip_reference_latent(sd_ctx_t* sd_ctx,
         }
         reference_latent = std::move(sub);
     }
+    limit_relip_reference_latent_frames(&reference_latent, "stage2");
     return reference_latent;
 }
 
@@ -8604,7 +8673,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* latent_width_out,
                               int* latent_height_out,
                               int* latent_frames_out,
-                              int* latent_channels_out) {
+                              int* latent_channels_out,
+                              float** refined_latent_out,
+                              int* refined_latent_width_out,
+                              int* refined_latent_height_out,
+                              int* refined_latent_frames_out,
+                              int* refined_latent_channels_out) {
     if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
         return false;
     }
@@ -8619,6 +8693,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     if (final_latent_out != nullptr) {
         *final_latent_out = nullptr;
+    }
+    if (refined_latent_out != nullptr) {
+        *refined_latent_out = nullptr;
     }
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
@@ -8824,15 +8901,16 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     //      Gated on that loader's presence so the free never happens without a proven reload path;
     //      absent (e.g. --mmap WITHOUT offload = params file-backed on GPU) it is skipped.
     //
-    // NOT engaged on the relip two-stage path: its stage-2 reference re-encode
-    // (apply_ltxv_refine_image_conditioning, relip only) still needs the video VAE AFTER the base
-    // sample, so FIX-3 (LTXAV_TWOSTAGE_FREE_UNUSED) frees it at the correct later point (:8907).
-    // Opt-in, default off, so no measured baseline shifts.
+    // Two-stage relip also needs the VAE later, but its stage-2 reference encode is itself an
+    // ordinary offloaded compute that re-materializes the GPU copy on demand. Releasing it here
+    // therefore saves the VAE's shared-resident payload through the entire stage-1 sample without
+    // changing the reference; it is re-offloaded just before that stage-2 encode. Opt-in, default
+    // off, so no measured baseline shifts.
     static const bool ltxav_vae_lazy = [] {
         const char* s = getenv("LTXAV_VAE_LAZY");
         return s && s[0] == '1';
     }();
-    if (ltxav_vae_lazy && !relip_twostage &&
+    if (ltxav_vae_lazy &&
         sd_version_is_ltxav(sd_ctx->sd->version) &&
         sd_ctx->sd->first_stage_model) {
         int64_t phase_t0 = ggml_time_ms();
@@ -9044,6 +9122,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
     int64_t sampling_start = ggml_time_ms();
     sd::Tensor<float> final_latent;
+    // Relip's stage-1 is a short (8-step) pass but otherwise pins the same 5.4 GB
+    // cross-segment DiT set as a long continuation. Allow the existing hot-first
+    // resident cap to apply to it too: the separable reference has already reduced
+    // its context, so streaming the cold tail is a useful final VRAM lever. Both
+    // variables are required; every normal render and the locked default are inert.
+    const bool relip_base_resident_cap = latents.relip_twostage &&
+                                         getenv("LTXAV_RELIP_BASE_RESIDENT_CAP") != nullptr &&
+                                         std::string(getenv("LTXAV_RELIP_BASE_RESIDENT_CAP")) != "0" &&
+                                         getenv("LONGCAT_SHARED_RESIDENT_MAX_MB") != nullptr;
+    if (relip_base_resident_cap && sd_ctx->sd->diffusion_model) {
+        sd_ctx->sd->diffusion_model->set_refine_resident_scope(true);
+        LOG_INFO("LTXAV relip: applying LONGCAT_SHARED_RESIDENT_MAX_MB to stage-1 sample");
+    }
     bool final_latent_prestripped = false;
     // LTX latent-reuse harness: skip the (expensive) DiT sampling and load a banked
     // latent so the VAE-tiling quality ladder re-decodes the SAME latent under
@@ -9097,6 +9188,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                         latents.video_positions,
                                                         latents.audio_fixed,
                                                         latents.video_reference);
+    }
+    if (relip_base_resident_cap && sd_ctx->sd->diffusion_model) {
+        sd_ctx->sd->diffusion_model->set_refine_resident_scope(false);
     }
 
     int64_t sampling_end = ggml_time_ms();
@@ -9269,8 +9363,16 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         // from the relip/end-image branches, sd:8414/8538, which are frame-coupled and separately handled).
         // audio_length>0 and a non-empty audio-pinned mask are BOTH handled. Any other path is a no-op
         // (byte-identical), with the specific failing guard logged.
-        if (const char* ctx_env = std::getenv("LTX_REFINE_CONTEXT_FRAMES")) {
-            int ctx_n         = atoi(ctx_env);
+        const char* ctx_env = std::getenv("LTX_REFINE_CONTEXT_FRAMES");
+        const bool default_hires_ref_trim = ctx_env == nullptr &&
+                                            sd_vid_gen_params->cont_refine_latent != nullptr &&
+                                            sd_vid_gen_params->cont_refine_latent_frames > 0;
+        if (ctx_env != nullptr || default_hires_ref_trim) {
+            // Once the separately transported refined guide is present, the appended low-res
+            // base guide is redundant in stage 2 and is cropped from the final output anyway.
+            // Drop it by default; the full-resolution refined guide is attached immediately
+            // below. An explicit environment value still wins for A/B and recovery.
+            int ctx_n         = ctx_env != nullptr ? atoi(ctx_env) : 0;
             int64_t T_tgt     = latents.video_target_frame_count;
             int64_t K_cond    = latents.video_conditioning_frame_count;
             int64_t x_frames  = x_t.dim() > 2 ? x_t.shape()[2] : 0;
@@ -9303,9 +9405,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                     } else {
                         x_t = sd::ops::slice(x_t, 2, 0, refine_frames);
                     }
-                    LOG_INFO("LTX_REFINE_CONTEXT_FRAMES=%d: refine sliced to %lld surviving + %lld guide-context frames "
+                    LOG_INFO("LTX_REFINE_CONTEXT_FRAMES=%d%s: refine sliced to %lld surviving + %lld guide-context frames "
                              "(dropped %lld of %lld throwaway guide frames from the refine; audio=%s) -> refine T=%lld",
-                             ctx_n, (long long)T_tgt, (long long)keep, (long long)(K_cond - keep),
+                             ctx_n, default_hires_ref_trim ? " (default with hires reference)" : "",
+                             (long long)T_tgt, (long long)keep, (long long)(K_cond - keep),
                              (long long)K_cond, has_audio ? "preserved" : "none", (long long)refine_frames);
                 } else {
                     LOG_INFO("LTX_REFINE_CONTEXT_FRAMES=%d >= guide frames %lld: refining all frames (no slice)",
@@ -9316,6 +9419,52 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                          "(n=%d ltxav=%d T_tgt=%lld K_cond=%lld layout_ok=%d relip=%d img=%d pos_empty=%d ref_empty=%d audio_len=%d)",
                          (long long)x_frames, ctx_n, (int)ltxav, (long long)T_tgt, (long long)K_cond, (int)layout_ok,
                          (int)latents.relip_twostage, (int)!no_image, (int)pos_ok, (int)ref_ok, latents.audio_length);
+            }
+        }
+
+        // Dual-resolution continuation: stage 1 already received the prior BASE-grid tail via
+        // cont_latent. Add the prior segment's actual REFINED high-resolution VIDEO tail only
+        // after any optional base-guide context trim above, so the stage-2 target excludes those
+        // otherwise-throwaway base-guide frames while retaining a full-fidelity appearance guide.
+        const char* hires_ref_env = std::getenv("LTXAV_CHAIN_HIRES_REFERENCE");
+        const bool hires_ref_enabled = hires_ref_env == nullptr ||
+                                       (hires_ref_env[0] != '\0' && std::string(hires_ref_env) != "0");
+        if (hires_ref_enabled && !latents.relip_twostage &&
+            sd_vid_gen_params->cont_refine_latent != nullptr &&
+            sd_vid_gen_params->cont_refine_latent_frames > 0) {
+            const int64_t video_ch = sd_ctx->sd->get_latent_channel();
+            const int64_t target_w = x_t.shape()[0];
+            const int64_t target_h = x_t.shape()[1];
+            const int64_t target_t = x_t.shape()[2];
+            const int64_t guide_t  = sd_vid_gen_params->cont_refine_latent_frames;
+            const bool shape_ok = sd_vid_gen_params->cont_refine_latent_width == target_w &&
+                                  sd_vid_gen_params->cont_refine_latent_height == target_h &&
+                                  sd_vid_gen_params->cont_refine_latent_channels == video_ch &&
+                                  guide_t <= target_t &&
+                                  sd_vid_gen_params->init_image.data == nullptr &&
+                                  sd_vid_gen_params->end_image.data == nullptr &&
+                                  hires_video_reference.empty() && hires_video_positions.empty();
+            if (!shape_ok) {
+                LOG_WARN("LTX hires continuation reference skipped: prior [%d,%d,%d,%d] vs target [%lld,%lld,%lld,%lld], image/ref conditioning=%d/%d",
+                         sd_vid_gen_params->cont_refine_latent_width,
+                         sd_vid_gen_params->cont_refine_latent_height,
+                         sd_vid_gen_params->cont_refine_latent_frames,
+                         sd_vid_gen_params->cont_refine_latent_channels,
+                         (long long)target_w, (long long)target_h, (long long)target_t, (long long)video_ch,
+                         (int)!hires_video_reference.empty(), (int)!hires_video_positions.empty());
+            } else {
+                hires_video_reference = sd::Tensor<float>({target_w, target_h, guide_t, video_ch, 1});
+                std::memcpy(hires_video_reference.data(), sd_vid_gen_params->cont_refine_latent,
+                            (size_t)hires_video_reference.numel() * sizeof(float));
+                hires_video_positions = build_ltxv_video_positions(target_w, target_h, target_t, guide_t,
+                                                                     /*keyframe_frame_idx*/ 0,
+                                                                     /*keyframe_pixel_frames*/ 8,
+                                                                     hires_request.fps,
+                                                                     hires_request.vae_scale_factor,
+                                                                     8,
+                                                                     true);
+                LOG_INFO("LTX hires continuation reference: %lld refined VIDEO tail frames as separate guide tokens; target=%lld + guide=%lld frames",
+                         (long long)guide_t, (long long)target_t, (long long)guide_t);
             }
         }
 
@@ -9438,10 +9587,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         // compute ~2767) is the ~11913 MB binding peak. The plain t2v two-stage refine is a pure latent
         // denoise — it does NOT touch the video/audio VAE (only the final decode does, which re-offloads
         // it: decode-entry correctly shows VAE_gpu=1385). So release both VAEs' GPU residency again here.
-        // Gated identically to regime A (:8597): !relip_twostage (relip's stage-2 reference re-encode
-        // DOES need the VAE during refine — freed later by LTXAV_TWOSTAGE_FREE_UNUSED) +
-        // params_offloaded_to_host() (re-offloadable, mmap-safe). Opt-in via LTXAV_VAE_LAZY; default off.
-        if (ltxav_vae_lazy && !relip_twostage &&
+        // Relip has completed its stage-2 reference encode before this point, so it too can release
+        // the VAE before refine and re-offload it lazily for the final decode. The only requirement
+        // is host-offloaded params, which makes the re-offload mmap-safe. Opt-in via LTXAV_VAE_LAZY.
+        if (ltxav_vae_lazy &&
             sd_version_is_ltxav(sd_ctx->sd->version) &&
             sd_ctx->sd->first_stage_model &&
             sd_ctx->sd->first_stage_model->params_offloaded_to_host()) {
@@ -9678,6 +9827,34 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
+    // Return a second, video-only continuation state for the next segment's hires refine.
+    // The ordinary final_latent_out intentionally remains the BASE-grid state, because it is
+    // sampled at base resolution on the next segment. The refined state is only meaningful
+    // when a latent spatial upscale was performed; strip packed audio before exporting it.
+    if (refined_latent_out != nullptr && latent_upscale_enabled && !final_latent.empty()) {
+        const int64_t video_ch = sd_ctx->sd->get_latent_channel();
+        sd::Tensor<float> refined_video = final_latent;
+        if (refined_video.dim() > 3 && refined_video.shape()[3] > video_ch) {
+            refined_video = sd::ops::slice(refined_video, 3, 0, video_ch);
+        }
+        if (refined_video.dim() > 3 && refined_video.shape()[3] == video_ch) {
+            const int64_t Wl = refined_video.shape()[0];
+            const int64_t Hl = refined_video.shape()[1];
+            const int64_t Tl = refined_video.shape()[2];
+            float* buf = (float*)malloc((size_t)refined_video.numel() * sizeof(float));
+            if (buf != nullptr) {
+                std::memcpy(buf, refined_video.data(), (size_t)refined_video.numel() * sizeof(float));
+                *refined_latent_out = buf;
+                if (refined_latent_width_out) *refined_latent_width_out = (int)Wl;
+                if (refined_latent_height_out) *refined_latent_height_out = (int)Hl;
+                if (refined_latent_frames_out) *refined_latent_frames_out = (int)Tl;
+                if (refined_latent_channels_out) *refined_latent_channels_out = (int)video_ch;
+                LOG_INFO("LTX hires continuation: exported refined video latent [%lld,%lld,%lld,%lld]",
+                         (long long)Wl, (long long)Hl, (long long)Tl, (long long)video_ch);
+            }
+        }
+    }
+
     // Continuation chaining: hand the post-sampling diffusion latent back to the
     // caller (before VAE decode) so the tail can condition the next segment without
     // a lossy decode/re-encode roundtrip. With hires on, hand back the BASE pre-upscale
@@ -9743,6 +9920,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            int* num_frames_out,
                            sd_audio_t** audio_out) {
     return generate_video_ex(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out, audio_out,
+                             nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, nullptr);
 }
 
@@ -9940,10 +10118,12 @@ static int ltxav_auto_trim_drop(const sd_image_t& prev_last, const sd_image_t* f
 // Stats: last N kept frames of the accumulated output (pre) vs first N kept frames of the new
 // segment (post). gain = pre_std/post_std clamped [0.9,1.1] (only correct drift, don't regrade);
 // offset = pre_mean - gain*post_mean. Applied in-place to ALL `n_new` frames. Ported from the
-// validated expo_match.py. Default-on for the keyframe path; LTXAV_NO_EXPOSURE_MATCH=1 disables.
+// validated expo_match.py. It is opt-in: a whole-segment RGB regrade can itself be more visible
+// than the seam it attempts to correct. Set LTXAV_EXPOSURE_MATCH=1 for the former behaviour.
 static void ltxav_exposure_match(const sd_image_t* prev_tail, int n_prev,
                                  sd_image_t* new_frames, int n_new) {
-    if (getenv("LTXAV_NO_EXPOSURE_MATCH") != nullptr) return;
+    const char* enabled = getenv("LTXAV_EXPOSURE_MATCH");
+    if (enabled == nullptr || enabled[0] == '\0' || std::string(enabled) == "0") return;
     if (prev_tail == nullptr || new_frames == nullptr || n_prev <= 0 || n_new <= 0) return;
     const int N  = 16;
     const int ch = (int)new_frames[0].channel;
@@ -10136,6 +10316,20 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         return false;
     }
     int K = std::max(1, chain_params->cont_latent_frames);  // overlap latent frames
+    const char* hires_ref_env = std::getenv("LTXAV_CHAIN_HIRES_REFERENCE");
+    const bool chain_hires_reference = hires_ref_env == nullptr ||
+                                       (hires_ref_env[0] != '\0' && std::string(hires_ref_env) != "0");
+    // Three full-resolution refined tail frames preserve identity over repeated seams. The
+    // stage-2 base-guide frames are dropped when this transport is active, keeping the validated
+    // 97-frame x2 chain under the 11.5 GiB envelope. Override for diagnostics/recovery.
+    int hires_ref_K = std::min(3, K);
+    if (const char* e = std::getenv("LTXAV_CHAIN_HIRES_REFERENCE_FRAMES")) {
+        hires_ref_K = std::clamp(atoi(e), 1, K);
+    }
+    if (chain_hires_reference) {
+        LOG_INFO("generate_video_chain: high-res stage-2 reference enabled (%d/%d tail frames)",
+                 hires_ref_K, K);
+    }
 
     // LTX causal-VAE temporal: K latent frames decode to 1+(K-1)*8 pixel frames. That is
     // the head overlap we drop on seg>0 (the prior tail's re-render).
@@ -10187,6 +10381,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // [Wl, Hl, K, Cv] contiguous (W fastest, channel slowest), fed as cont_latent.
     std::vector<float>      cont_buf;
     int                     cont_Wl = 0, cont_Hl = 0, cont_Cv = 0;  // cont_buf spatial dims + channel count
+    // Separate stage-2 appearance tail. Unlike cont_buf this stays on the refined spatial grid
+    // and is never fed to the base sampler or latent-matched with the base transport.
+    std::vector<float>      cont_refine_buf;
+    int                     cont_refine_Wl = 0, cont_refine_Hl = 0, cont_refine_Cv = 0;
     std::vector<sd_image_t> stitched;   // adopts each kept frame's .data
     ChainAudioAcc           audio_acc;  // per-segment audio stitched onto one timeline
 
@@ -10297,10 +10495,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
 
     for (int seg = start_seg; seg < n_chain; ++seg) {
         sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
+        const bool segmented_relip = chain_params->segment_control_frames != nullptr &&
+                                     chain_params->segment_control_frame_counts != nullptr &&
+                                     chain_params->segment_control_frames[seg] != nullptr &&
+                                     chain_params->segment_control_frame_counts[seg] > 0;
+        if (segmented_relip) {
+            vp.control_frames      = chain_params->segment_control_frames[seg];
+            vp.control_frames_size = chain_params->segment_control_frame_counts[seg];
+            LOG_INFO("generate_video_chain seg %d: V2V relip source window (%d frames)",
+                     seg + 1, vp.control_frames_size);
+        }
 
-        if (seg == 0) {
+        if (seg == 0 || segmented_relip) {
             vp.cont_latent        = nullptr;
             vp.cont_latent_frames = 0;
+            vp.cont_refine_latent = nullptr;
+            vp.cont_refine_latent_frames = 0;
             vp.audio_frame_offset = 0;
         } else {
             // Clear the init image for seg>0: prepare_video_generation_latents checks the
@@ -10309,6 +10519,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.init_image.data    = nullptr;
             vp.cont_latent        = cont_buf.data();
             vp.cont_latent_frames = K;
+            vp.cont_refine_latent = cont_refine_buf.empty() ? nullptr : cont_refine_buf.data();
+            vp.cont_refine_latent_frames = cont_refine_buf.empty() ? 0 : hires_ref_K;
+            vp.cont_refine_latent_width = cont_refine_Wl;
+            vp.cont_refine_latent_height = cont_refine_Hl;
+            vp.cont_refine_latent_channels = cont_refine_Cv;
             vp.audio_frame_offset = seg * (base_params->video_frames - overlap_px);
         }
         // distinct seed per segment so the noise frames differ
@@ -10344,15 +10559,23 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         sd_audio_t* seg_audio    = nullptr;
         float*      lat_out      = nullptr;
         int         lw = 0, lh = 0, lt = 0, lc = 0;  // lc = FULL channel count (video + audio)
+        float*      refined_out = nullptr;
+        int         rw = 0, rh = 0, rt = 0, rc = 0;
         bool        want_latent  = (seg + 1 < n_chain);
         if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
                                want_latent ? &lat_out : nullptr,
                                want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
-                               want_latent ? &lt : nullptr, want_latent ? &lc : nullptr)) {
+                               want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
+                               (want_latent && chain_hires_reference) ? &refined_out : nullptr,
+                               (want_latent && chain_hires_reference) ? &rw : nullptr,
+                               (want_latent && chain_hires_reference) ? &rh : nullptr,
+                               (want_latent && chain_hires_reference) ? &rt : nullptr,
+                               (want_latent && chain_hires_reference) ? &rc : nullptr)) {
             LOG_ERROR("generate_video_chain segment %d failed", seg + 1);
             free_sd_audio(seg_audio);
             free(seg_video);
             free(lat_out);
+            free(refined_out);
             // Free everything collected so far (audio_acc frees itself on scope exit).
             for (auto& f : stitched) {
                 free(f.data);
@@ -10367,7 +10590,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // throughout the continuation segment. Decode→re-encode snaps it onto the VAE
         // manifold. Mirrors the main.cpp manual-chain path. Default off (raw latent).
         bool reencoded = false;
-        if (want_latent && getenv("LONGCAT_CONT_REENCODE") != nullptr && seg_video != nullptr && seg_count > 0) {
+        if (want_latent && getenv("LONGCAT_CONT_REENCODE") != nullptr && seg_video != nullptr && seg_count > 0 &&
+            ((int)seg_video[0].width != base_params->width || (int)seg_video[0].height != base_params->height)) {
+            LOG_WARN("generate_video_chain: LONGCAT_CONT_REENCODE is incompatible with LTX hires "
+                     "(%ux%u rendered vs %dx%d base transport); using the raw base latent tail",
+                     seg_video[0].width, seg_video[0].height, base_params->width, base_params->height);
+        } else if (want_latent && getenv("LONGCAT_CONT_REENCODE") != nullptr && seg_video != nullptr && seg_count > 0) {
             int tail = std::min(overlap_px, seg_count);  // pixel frames that re-encode to K latents
             int rlw = 0, rlh = 0, rlt = 0, rlc = 0;
             float* reenc = sd_ctx_encode_video_frames(sd_ctx, seg_video + (seg_count - tail), tail,
@@ -10428,7 +10656,30 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             cont_Cv = cv;
             K = keep;  // K passed to the next segment must equal the frames actually captured
         }
+        if (chain_hires_reference && want_latent && refined_out != nullptr && rw > 0 && rh > 0 && rt > 0 && rc == LTXAV_VIDEO_LATENT_CHANNELS) {
+            const int keep = std::min(hires_ref_K, rt);
+            const size_t plane = (size_t)rw * rh;
+            cont_refine_buf.assign(plane * (size_t)keep * (size_t)rc, 0.f);
+            for (int c = 0; c < rc; ++c) {
+                for (int nf = 0; nf < keep; ++nf) {
+                    const int src_t = rt - keep + nf;
+                    const float* src = refined_out + ((size_t)c * rt + src_t) * plane;
+                    float* dst = cont_refine_buf.data() + ((size_t)c * keep + nf) * plane;
+                    std::memcpy(dst, src, plane * sizeof(float));
+                }
+            }
+            cont_refine_Wl = rw;
+            cont_refine_Hl = rh;
+            cont_refine_Cv = rc;
+            LOG_INFO("generate_video_chain: captured %d high-res refined VIDEO tail frames [%d,%d,%d] for next stage-2 reference",
+                     keep, rw, rh, rc);
+        } else if (chain_hires_reference && want_latent && base_params->hires.enabled) {
+            LOG_WARN("generate_video_chain: missing/invalid high-res refined continuation state; stage-2 will use base-only continuation");
+            cont_refine_buf.clear();
+            cont_refine_Wl = cont_refine_Hl = cont_refine_Cv = 0;
+        }
         free(lat_out);
+        free(refined_out);
 
         // FEATURE A: capture SEG-0's per-channel latent stats as the anti-drift reference, and
         // (seg>0) remap this segment's freshly-captured tail onto them BEFORE it conditions the
@@ -10458,7 +10709,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             legacy_head = atoi(e) != 0;
         }
         int drop;
-        if (seg == 0) {
+        if (seg == 0 || segmented_relip) {
             drop = 0;
         } else if (legacy_head) {
             drop = overlap_px;  // legacy head-placement re-renders + trims the fixed overlap
@@ -10949,7 +11200,8 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
         if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
                                want_latent ? &lat_out : nullptr,
                                want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
-                               want_latent ? &lt : nullptr, want_latent ? &lc : nullptr) ||
+                               want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
+                               nullptr, nullptr, nullptr, nullptr, nullptr) ||
             seg_video == nullptr || seg_count <= 0) {
             LOG_ERROR("generate_wan_vace_chain window %d failed", seg + 1);
             free_sd_audio(seg_audio);

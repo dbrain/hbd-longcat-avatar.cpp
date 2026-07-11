@@ -431,6 +431,18 @@ typedef struct {
     // the global audio timeline so lip-sync continues across segments.
     const float* cont_latent;
     int cont_latent_frames;
+    // LTXAV two-stage continuation: the last refined HIGH-RES VIDEO-only latent frames from
+    // the prior segment. These are not interchangeable with cont_latent: cont_latent carries
+    // the base-grid motion tail into stage 1, while cont_refine_latent is supplied as a frozen
+    // reference token block only to the next segment's stage-2 refine. Layout is ggml-ne
+    // [W_lat, H_lat, frames, video_channels, 1], contiguous f32. NULL/0 is byte-identical to
+    // the pre-existing two-stage path. Audio is intentionally excluded; every segment keeps its
+    // own drive-audio latent/timeline.
+    const float* cont_refine_latent;
+    int cont_refine_latent_frames;
+    int cont_refine_latent_width;
+    int cont_refine_latent_height;
+    int cont_refine_latent_channels;
     // LTXAV LATENT continuation (file-based, CLI-friendly): path to a saved VIDEO latent
     // (LTXAV_SAVE_VIDEO_LATENT output from the prior segment). When set on the LTXAV path,
     // the last cont_latent_frames latent frames are placed at the head of the new segment's
@@ -473,7 +485,9 @@ typedef struct {
 // kept RESIDENT across all of them (no per-segment reload), each segment continuing from
 // the prior segment's video-latent tail (motion carry, in-memory float* — no disk/VAE
 // roundtrip), and stitches them into one continuous clip (dropping the re-rendered
-// overlap head of each segment>0). Per-segment prompts (the "director" layer) are
+// overlap head of each segment>0). A relip caller may instead provide a distinct source-video
+// frame range for every segment: those independent V2V windows are stitched without a generated
+// latent overlap, while still sharing the resident DiT. Per-segment prompts (the "director" layer) are
 // pre-encoded up front in ONE text-encoder window (sd_ctx_precompute_chain_text_conds) so
 // no gemma encode is interleaved between segments. Per-segment lip-sync audio, when
 // present, is read from chain_audio_dir/aud_<i>.wav (16kHz mono, absolute timeline).
@@ -484,6 +498,13 @@ typedef struct {
     const char*  chain_audio_dir;     // dir with aud_<i>.wav per segment, or NULL (no lip-sync)
     const char*  save_dir;            // optional: bank each seg's video latent + webm to save_dir/seg_<i>.{bin,webm}
     int          resume_from;         // resume: skip+reload segments [0, resume_from) from save_dir banked latents (0 = fresh)
+    // Optional per-segment V2V source ranges for chained relip. Both arrays have n_segments
+    // entries; segment_control_frames[i] points at the first frame and the matching count gives
+    // its length. When supplied for a segment, it replaces base_params->control_frames and that
+    // segment deliberately does not receive the generated continuation latent (the source video
+    // itself is the temporal control). NULL preserves ordinary LTX continuation byte-for-byte.
+    sd_image_t* const* segment_control_frames;
+    const int*         segment_control_frame_counts;
     // Optional: invoked once per stitched segment, in order, with that segment's kept frames
     // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
     // (server layer) bank a viewable per-segment webm as it's produced, without the core lib
@@ -577,7 +598,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* latent_width_out,
                               int* latent_height_out,
                               int* latent_frames_out,
-                              int* latent_channels_out);
+                              int* latent_channels_out,
+                              float** refined_latent_out,
+                              int* refined_latent_width_out,
+                              int* refined_latent_height_out,
+                              int* refined_latent_frames_out,
+                              int* refined_latent_channels_out);
 
 // Render + stitch an LTXAV multi-segment chain (see sd_vid_chain_params_t). base_params is
 // the per-segment template; the chain overrides prompt / cont_latent / drive_audio / seed /

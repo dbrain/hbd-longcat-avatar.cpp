@@ -13,10 +13,15 @@
 //     "width","height","fps","steps","cfg_scale","sampling_method","scheduler","seed",
 //     "negative_prompt": "",
 //     "init_image": "<base64|data-uri>",        // optional, seg0 i2v (from_json_str loads it)
+//     "control_frames": ["<base64|data-uri>", ...], // chained V2V relip: N consecutive source windows
+//     "relip_control_frame_counts": [97, ...],    // optional exact source-frame count per window
+//     "model": "edit",                            // selects the lipdub DiT variant
 //     "hires": { ... },                         // optional spatial upscaler
 //     "output_format": "webm" }
 // Per-segment lip-sync wavs (16kHz mono) ride as multipart parts audio_0, audio_1, …; the
-// parent writes them to a shared /tmp dir and passes the dir to the chain.
+// parent writes them to a shared /tmp dir and passes the dir to the chain. For relip every
+// source window is independent (no generated latent carry / overlap trim): provide all source
+// frames in segment order, or an explicit relip_control_frame_counts partition.
 
 #include <algorithm>
 #include <atomic>

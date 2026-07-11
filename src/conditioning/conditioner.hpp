@@ -130,6 +130,9 @@ public:
     // 193-frame relip (the COLD-CLI OOM). Default no-op; only the offload-capable
     // encoders (LTXAVEmbedder) forward to their inner runners.
     virtual void free_compute_buffer() {}
+    // Drop only the GPU runtime/shared residency of an offloaded conditioner. The
+    // CPU/mmap parameter home remains available for a later reload.
+    virtual void release_all_gpu_param_residency() {}
     virtual void set_flash_attention_enabled(bool enabled) = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
 };
@@ -2281,6 +2284,11 @@ struct LTXAVEmbedder : public Conditioner {
     void free_compute_buffer() override {
         llm->free_compute_buffer();
         projector->free_compute_buffer();
+    }
+
+    void release_all_gpu_param_residency() override {
+        llm->release_all_gpu_param_residency();
+        projector->release_all_gpu_param_residency();
     }
 
     size_t get_params_buffer_size() override {
