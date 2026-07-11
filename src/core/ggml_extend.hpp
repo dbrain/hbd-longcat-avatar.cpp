@@ -3072,7 +3072,10 @@ protected:
     // in resident_param_set, which offload_partial_params already skips). Lets the
     // 3-step hires refine pin only the hottest ~4 GB (fits ≤11776) while the 8-step
     // base keeps its full pin for speed.
-    static size_t shared_resident_max_bytes() {
+    size_t shared_resident_max_bytes() const {
+        if (shared_resident_max_bytes_override_ > 0) {
+            return shared_resident_max_bytes_override_;
+        }
         static const size_t b = []{
             const char* s = getenv("LONGCAT_SHARED_RESIDENT_MAX_MB");
             double mb = (s != nullptr && s[0] != '\0') ? atof(s) : 0.0;
@@ -3086,8 +3089,14 @@ protected:
     // immediately before the hires/refine sample() and false after, so the cap
     // truncates the resident pin ONLY for the refine (the base pass keeps full pin).
     bool refine_resident_scope_ = false;
+    size_t shared_resident_max_bytes_override_ = 0;
 public:
     void set_refine_resident_scope(bool on) { refine_resident_scope_ = on; }
+    void set_shared_resident_max_mb_override(float mb) {
+        shared_resident_max_bytes_override_ = mb > 0.f
+                                                ? static_cast<size_t>(mb * 1024.f * 1024.f)
+                                                : 0;
+    }
 protected:
 
     // Fix A (1080p chain seg-2 cold-stream): derive the shared-resident set from the

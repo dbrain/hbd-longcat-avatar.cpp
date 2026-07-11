@@ -47,6 +47,9 @@ struct LTXAVDiffusionExtra {
     int audio_length                         = 0;
     float frame_rate                         = 24.f;
     const sd::Tensor<float>* video_positions = nullptr;
+    // LipDub audio-reference conditioning.  The target audio tokens occupy the
+    // prefix; clean reference tokens are appended with negative RoPE positions.
+    const sd::Tensor<float>* audio_positions = nullptr;
     bool skip_a2v                            = false;  // A2V modality-guidance "mod" pass: skip audio<->video cross-attn
     // FIX A2 separable half-res relip reference (LTXAV_RELIP_REF_DOWNSCALE>1). When set, the
     // reference clip is a SEPARATE [W/N,H/N,ref,C] latent grid (NOT concatenated into the

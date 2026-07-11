@@ -2343,6 +2343,62 @@ public:
         return video_timesteps;
     }
 
+    // LTX-AV's audio stream is packed after the video channels.  For LipDub it
+    // contains `[noisy target | clean reference]`: the reference block is held
+    // by the denoise mask and, just as importantly, must receive timestep zero.
+    // Supplying a uniform noisy timestep makes the clean block look like another
+    // generation target to adaLN/cross-attention, which defeats audio-reference
+    // conditioning even though its waveform latent is present.
+    std::vector<float> process_ltxav_audio_timesteps(const std::vector<float>& timesteps,
+                                                     const sd::Tensor<float>& init_latent,
+                                                     const sd::Tensor<float>& denoise_mask,
+                                                     int audio_length,
+                                                     bool audio_fixed) {
+        if (timesteps.empty() || audio_length <= 0) {
+            return timesteps;
+        }
+        if (audio_fixed) {
+            // Preserve the original direct-drive contract: a single zero is
+            // broadcast across the audio stream.  Per-token timesteps are
+            // needed only for the experimental target/reference layout below;
+            // using them here changed the established LipDub path.
+            return {0.f};
+        }
+        if (denoise_mask.empty() || init_latent.dim() < 4 || denoise_mask.dim() < 4 ||
+            denoise_mask.shape() != init_latent.shape()) {
+            return timesteps;
+        }
+
+        constexpr int64_t kAudioFreqBins = 16;
+        constexpr int64_t kAudioChannels = 8;
+        const int64_t audio_values       = kAudioFreqBins * kAudioChannels * audio_length;
+        const int64_t spatial_size       = init_latent.shape()[0] * init_latent.shape()[1] * init_latent.shape()[2];
+        if (spatial_size <= 0 || audio_values <= 0) {
+            return timesteps;
+        }
+        const int64_t extra_channels = (audio_values + spatial_size - 1) / spatial_size;
+        if (init_latent.shape()[3] < extra_channels) {
+            LOG_WARN("unexpected LTXAV packed latent shape for audio timestep processing");
+            return timesteps;
+        }
+
+        // pack_ltxav_audio_and_video_denoise_mask writes the compact audio mask
+        // at the start of the trailing extra-channel block.  One value per time
+        // index is sufficient: all 16x8 components of an audio latent token use
+        // the same mask value.
+        const int64_t audio_offset = spatial_size * (init_latent.shape()[3] - extra_channels);
+        if (audio_offset + audio_values > denoise_mask.numel()) {
+            LOG_WARN("truncated LTXAV packed audio mask for timestep processing");
+            return timesteps;
+        }
+        std::vector<float> audio_timesteps(static_cast<size_t>(audio_length), timesteps[0]);
+        const float* mask = denoise_mask.data() + audio_offset;
+        for (int t = 0; t < audio_length; ++t) {
+            audio_timesteps[static_cast<size_t>(t)] = mask[static_cast<int64_t>(t) * kAudioFreqBins] * timesteps[0];
+        }
+        return audio_timesteps;
+    }
+
     void preview_image(int step,
                        const sd::Tensor<float>& latents,
                        enum SDVersion version,
@@ -2581,6 +2637,7 @@ public:
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
                              const sd::Tensor<float>& video_positions = {},
+                             const sd::Tensor<float>& audio_positions = {},
                              bool ltxav_audio_fixed                    = false,
                              const sd::Tensor<float>& video_reference  = {}) {
         if (getenv("LONGCAT_VRAM_BREAKDOWN") != nullptr) {
@@ -2774,12 +2831,22 @@ public:
             sd::Tensor<float> audio_timesteps_tensor;
             if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
                 timesteps_vec = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask);
-                // Driven audio is held fixed (clean): tell the model its audio tokens are
-                // at timestep 0, just like i2v zeroes the fixed frame-0 video timesteps.
-                std::vector<float> audio_ts = ltxav_audio_fixed
-                                                  ? std::vector<float>(base_timesteps_vec.size(), 0.0f)
-                                                  : base_timesteps_vec;
-                audio_timesteps_tensor = sd::Tensor<float>({static_cast<int64_t>(audio_ts.size())}, audio_ts);
+                // Per-token audio timesteps mirror the audio denoise mask.  This
+                // matters for LipDub's appended clean reference block, while
+                // retaining the legacy all-fixed behaviour for driven A2V.
+                std::vector<float> audio_ts = process_ltxav_audio_timesteps(base_timesteps_vec,
+                                                                             init_latent,
+                                                                             denoise_mask,
+                                                                             audio_length,
+                                                                             ltxav_audio_fixed);
+                // GGML's audio adaLN treats dim-0 as the scalar/timestep
+                // component and dim-1 as the audio-token axis.  A one-element
+                // vector remains the legacy broadcast scalar; a mixed
+                // LipDub target/reference timeline must therefore be [1, T],
+                // not a flat [T] tensor.
+                audio_timesteps_tensor = audio_ts.size() > 1
+                                             ? sd::Tensor<float>({1, static_cast<int64_t>(audio_ts.size())}, audio_ts)
+                                             : sd::Tensor<float>({1}, audio_ts);
             } else {
                 timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask);
             }
@@ -2887,6 +2954,7 @@ public:
                         audio_length,
                         frame_rate,
                         video_positions.empty() ? nullptr : &video_positions,
+                        audio_positions.empty() ? nullptr : &audio_positions,
                         skip_a2v_pass,
                         video_reference.empty() ? nullptr : &video_reference};
                     // NAG: only on the primary cond forward (nag_pass), only while sigma is high
@@ -4746,6 +4814,7 @@ struct ImageGenerationLatents {
     sd::Tensor<float> concat_latent;
     sd::Tensor<float> img_uncond_concat_latent;
     sd::Tensor<float> audio_latent;
+    sd::Tensor<float> audio_positions;
     sd::Tensor<float> video_positions;
     // FIX A2 separable half-res relip reference (LTXAV_RELIP_REF_DOWNSCALE>1): the [W/N,H/N,ref,C]
     // reference latent fed to the DiT as a separate token block (NOT concatenated into init_latent).
@@ -4761,6 +4830,8 @@ struct ImageGenerationLatents {
     int64_t video_conditioning_frame_count = 0;
     int64_t video_target_frame_count       = 0;
     int audio_length                       = 0;
+    int audio_target_length                = 0;
+    bool audio_reference_conditioning      = false;
     bool audio_fixed                       = false;  // LTXAV: hold audio latent fixed (drive lip-sync to a given wav)
     // Two-stage lipdub relip (LTXAV_RELIP_TWOSTAGE=1): stage-1 ran at half res from-noise; the
     // hires latent-upscale stage-2 must RE-APPLY the relip reference at full res (Change B in
@@ -5076,7 +5147,8 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<flo
 static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
                                                                  const sd::Tensor<float>& video_latent,
                                                                  const sd::Tensor<float>& audio_latent,
-                                                                 float audio_mask_value = 1.f) {
+                                                                 float audio_mask_value = 1.f,
+                                                                 const sd::Tensor<float>* per_audio_mask = nullptr) {
     if (video_mask.empty() || audio_latent.empty()) {
         return video_mask;
     }
@@ -5122,6 +5194,10 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tenso
     // audio_mask_value 1.0 = denoise/generate audio (default); 0.0 = hold audio FIXED
     // (drive lip-sync to the supplied encoded wav, pinned every step via line ~2329).
     auto audio_mask                       = sd::full<float>(audio_mask_shape, audio_mask_value);
+    if (per_audio_mask != nullptr && !per_audio_mask->empty()) {
+        GGML_ASSERT(per_audio_mask->numel() == audio_values);
+        std::copy_n(per_audio_mask->data(), audio_values, audio_mask.data());
+    }
     return sd::ops::concat(video_mask_full, audio_mask, 3);
 }
 
@@ -5351,6 +5427,24 @@ static sd::Tensor<float> make_ltxav_empty_audio_latent(int audio_length) {
     return sd::zeros<float>({kLtxavAudioFrequencyBins, audio_length, kLtxavAudioChannels, 1});
 }
 
+// Official LipDub audio conditioning uses `[target | clean reference]` tokens.
+// Target positions start at zero; the appended reference is shifted into negative
+// time so it is an unambiguous conditioning block rather than a replacement for
+// the target audio timeline.
+static sd::Tensor<float> build_ltxav_lipdub_audio_positions(int target_length, int reference_length) {
+    const int total = target_length + reference_length;
+    if (total <= 0) return {};
+    std::vector<float> positions(static_cast<size_t>(total), 0.f);
+    for (int t = 0; t < target_length; ++t) {
+        positions[static_cast<size_t>(t)] = LTXV::audio_latent_start_time_sec(t);
+    }
+    const float ref_duration = reference_length > 0 ? LTXV::audio_latent_start_time_sec(reference_length - 1) : 0.f;
+    for (int t = 0; t < reference_length; ++t) {
+        positions[static_cast<size_t>(target_length + t)] = LTXV::audio_latent_start_time_sec(t) - ref_duration - 0.04f;
+    }
+    return sd::Tensor<float>({total}, positions);
+}
+
 static sd::Tensor<float> resize_ltxav_audio_latent(const sd::Tensor<float>& audio_latent,
                                                    int target_audio_length) {
     auto resized = make_ltxav_empty_audio_latent(target_audio_length);
@@ -5364,6 +5458,22 @@ static sd::Tensor<float> resize_ltxav_audio_latent(const sd::Tensor<float>& audi
         sd::ops::slice_assign(&resized, 1, 0, copy_length, copied);
     }
     return resized;
+}
+
+static sd::Tensor<float> make_ltxav_lipdub_audio_mask(const sd::Tensor<float>& audio_latent,
+                                                       int target_length,
+                                                       bool freeze_target) {
+    if (audio_latent.empty()) {
+        return {};
+    }
+    auto mask = sd::full<float>(audio_latent.shape(), 1.f);
+    const int64_t target_values = static_cast<int64_t>(std::max(0, target_length)) * 16 * 8;
+    if (freeze_target) {
+        std::fill(mask.data(), mask.data() + mask.numel(), 0.f);
+    } else if (target_values < mask.numel()) {
+        std::fill(mask.data() + target_values, mask.data() + mask.numel(), 0.f);
+    }
+    return mask;
 }
 
 // LTXAV audio-DRIVE: load a 16kHz wav, run it through the audio-VAE encoder, and lay the
@@ -6448,8 +6558,30 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             if (strlen(drive_wav) > 0) {
                 auto driven = encode_ltxav_drive_audio(sd_ctx, drive_wav, latents.audio_length);
                 if (!driven.empty()) {
-                    latents.audio_latent = driven;       // lip-sync to THIS audio
-                    latents.audio_fixed  = true;         // hold it fixed through the denoise loop
+                    // The direct fixed-audio path is the established V2V LipDub
+                    // behaviour: it keeps the supplied waveform latent clean in
+                    // both stages while the IC-LoRA guide preserves the video.
+                    // Retain the official generated-audio-reference layout as an
+                    // explicit experiment only (LTXAV_LIPDUB_AUDIO_MODE=reference).
+                    const char* audio_mode = std::getenv("LTXAV_LIPDUB_AUDIO_MODE");
+                    const bool direct_fixed_audio = audio_mode == nullptr || std::string(audio_mode) != "reference";
+                    if (direct_fixed_audio) {
+                        latents.audio_latent = std::move(driven);
+                        latents.audio_fixed  = true;
+                        LOG_INFO("LTXAV LipDub A/B: using direct fixed driving-audio conditioning");
+                    } else {
+                    // Official LipDub semantics: the dubbed waveform is a CLEAN audio-reference
+                    // block at negative positions, not a frozen replacement for the target audio
+                    // stream.  Stage 1 denoises target audio/video against this reference; stage 2
+                    // later freezes the stage-1 target audio.
+                    const int target_length = latents.audio_length;
+                    latents.audio_target_length           = target_length;
+                    latents.audio_latent                  = sd::ops::concat(make_ltxav_empty_audio_latent(target_length), driven, 1);
+                    latents.audio_positions               = build_ltxav_lipdub_audio_positions(target_length, (int)driven.shape()[1]);
+                    latents.audio_length                  = target_length + (int)driven.shape()[1];
+                    latents.audio_reference_conditioning  = true;
+                    latents.audio_fixed                   = false;
+                    }
                 } else {
                     latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
                 }
@@ -7887,14 +8019,21 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         // Driving audio needs a denoise mask so the audio slot can be pinned (mask=0)
         // every step. If none exists (pure t2v), make a fully-generated video mask (1.0)
         // so only the audio is held fixed.
-        if (latents.audio_fixed && latents.denoise_mask.empty()) {
+        if ((latents.audio_fixed || latents.audio_reference_conditioning) && latents.denoise_mask.empty()) {
             latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
         }
         if (!latents.denoise_mask.empty()) {
+            sd::Tensor<float> audio_ref_mask;
+            if (latents.audio_reference_conditioning) {
+                audio_ref_mask = make_ltxav_lipdub_audio_mask(latents.audio_latent,
+                                                               latents.audio_target_length,
+                                                               false);
+            }
             latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
                                                                            latents.init_latent,
                                                                            latents.audio_latent,
-                                                                           latents.audio_fixed ? 0.0f : 1.0f);
+                                                                           latents.audio_fixed ? 0.0f : 1.0f,
+                                                                           audio_ref_mask.empty() ? nullptr : &audio_ref_mask);
         }
         latents.init_latent = pack_ltxav_audio_and_video_latents(latents.init_latent, latents.audio_latent);
     }
@@ -8479,6 +8618,22 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
             video_latent = sd::ops::slice(*latent, 3, 0, lat_ch);
             audio_latent = unpack_ltxav_audio_latent(*latent, latents.audio_length, lat_ch);
         }
+        // Official LipDub stage 2 freezes the stage-1 target audio and appends that
+        // same clean target as the negative-position audio reference.  Do not carry
+        // the original drive block through this pass: stage 1 has already translated
+        // it into the model's target-audio representation.
+        if (latents.audio_reference_conditioning && !audio_latent.empty()) {
+            const int target_length = latents.audio_target_length;
+            if (target_length <= 0 || audio_latent.shape()[1] < target_length) {
+                LOG_ERROR("LTXAV LipDub stage2: invalid target audio length %d for latent T=%lld",
+                          target_length, (long long)audio_latent.shape()[1]);
+                return false;
+            }
+            auto stage1_target = sd::ops::slice(audio_latent, 1, 0, target_length);
+            audio_latent = sd::ops::concat(stage1_target, stage1_target, 1);
+            LOG_INFO("LTXAV LipDub stage2: froze %d stage1 target-audio tokens and appended them as clean audio reference",
+                     target_length);
+        }
         int64_t target_lat_w   = video_latent.shape()[0];
         int64_t target_lat_h   = video_latent.shape()[1];
         int64_t target_lat_f   = video_latent.shape()[2];
@@ -8531,8 +8686,12 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
             *latent       = pack_ltxav_audio_and_video_latents(video_latent, audio_latent);
             // Freeze the (driven) audio slot when audio_fixed, mirroring stage-1 (:6543-6546):
             // audio_mask_value 0 = pinned every step, 1 = generated.
+            auto audio_mask = latents.audio_reference_conditioning
+                                  ? make_ltxav_lipdub_audio_mask(audio_latent, latents.audio_target_length, true)
+                                  : sd::Tensor<float>();
             *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_latent, audio_latent,
-                                                                    latents.audio_fixed ? 0.0f : 1.0f);
+                                                                    latents.audio_fixed ? 0.0f : 1.0f,
+                                                                    audio_mask.empty() ? nullptr : &audio_mask);
         } else {
             *latent       = std::move(video_latent);
             *denoise_mask = std::move(video_mask);
@@ -9127,7 +9286,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // resident cap to apply to it too: the separable reference has already reduced
     // its context, so streaming the cold tail is a useful final VRAM lever. Both
     // variables are required; every normal render and the locked default are inert.
-    const bool relip_base_resident_cap = latents.relip_twostage &&
+    const bool relip_base_resident_cap = latents.video_conditioning_frame_count > 0 &&
                                          getenv("LTXAV_RELIP_BASE_RESIDENT_CAP") != nullptr &&
                                          std::string(getenv("LTXAV_RELIP_BASE_RESIDENT_CAP")) != "0" &&
                                          getenv("LONGCAT_SHARED_RESIDENT_MAX_MB") != nullptr;
@@ -9186,6 +9345,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                         static_cast<float>(request.fps),
                                                         request.cache_params,
                                                         latents.video_positions,
+                                                        latents.audio_positions,
                                                         latents.audio_fixed,
                                                         latents.video_reference);
     }
@@ -9220,6 +9380,28 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (latent_refine_enabled) {
         int64_t refine_total_start = ggml_time_ms();
         int64_t upscale_start             = ggml_time_ms();
+        // A two-stage Relip pass has finished using the stage-1 DiT before the
+        // latent upsampler runs.  Keeping its streamed/shared GPU residency
+        // through that upsampler makes the upsampler's largest Conv3D overlap
+        // with roughly 2 GB of otherwise-dead DiT weights.  Release it here,
+        // then let the existing stage-2 sample path stream the same weights
+        // back from host.  This is allocation-only: no latent, conditioning or
+        // sampler value changes.  Keep it opt-in so non-Relip and legacy
+        // two-stage callers retain their existing lifetime.
+        const char* relip_free_before_upscale_env = getenv("LTXAV_RELIP_FREE_DIT_BEFORE_UPSCALE");
+        const bool relip_free_dit_before_upscale = latents.relip_twostage &&
+                                                   relip_free_before_upscale_env != nullptr &&
+                                                   std::string(relip_free_before_upscale_env) != "0";
+        if (relip_free_dit_before_upscale && sd_ctx->sd->diffusion_model) {
+            sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
+            sd_ctx->sd->diffusion_model->free_compute_buffer();
+            // release_all_gpu_param_residency returns buffers to the CUDA VMM
+            // pool. Trim that pool before the upsampler asks cuDNN for its
+            // largest Conv3D allocation; otherwise the driver-visible peak is
+            // unchanged even though the DiT is no longer usable here.
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+            LOG_INFO("LTXAV two-stage Relip: released stage-1 DiT residency before latent upscale");
+        }
         sd::Tensor<float> upscaled_latent;
         if (same_res_refine_enabled) {
             upscaled_latent = final_latent;
@@ -9256,7 +9438,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
         if (sd_version_is_ltxav(sd_ctx->sd->version) && latents.audio_length > 0) {
             int target_audio_length = get_ltxav_num_audio_latents(hires_request.frames, hires_request.fps);
-            if (target_audio_length != latents.audio_length) {
+            const int expected_audio_length = latents.audio_reference_conditioning
+                                                  ? target_audio_length * 2
+                                                  : target_audio_length;
+            if (expected_audio_length != latents.audio_length) {
                 int latent_channels            = sd_ctx->sd->get_latent_channel();
                 sd::Tensor<float> video_latent = x_t;
                 sd::Tensor<float> audio_latent = latents.audio_latent;
@@ -9264,11 +9449,23 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                     video_latent = sd::ops::slice(x_t, 3, 0, latent_channels);
                     audio_latent = unpack_ltxav_audio_latent(x_t, latents.audio_length, latent_channels);
                 }
-                audio_latent = resize_ltxav_audio_latent(audio_latent, target_audio_length);
+                if (latents.audio_reference_conditioning) {
+                    // Keep the official `[target | clean reference]` layout through
+                    // spatial upscale. Both halves represent the same timeline.
+                    auto target = sd::ops::slice(audio_latent, 1, 0, latents.audio_target_length);
+                    auto reference = sd::ops::slice(audio_latent, 1, latents.audio_target_length, audio_latent.shape()[1]);
+                    target          = resize_ltxav_audio_latent(target, target_audio_length);
+                    reference       = resize_ltxav_audio_latent(reference, target_audio_length);
+                    audio_latent    = sd::ops::concat(target, reference, 1);
+                    latents.audio_target_length = target_audio_length;
+                    latents.audio_positions = build_ltxav_lipdub_audio_positions(target_audio_length, target_audio_length);
+                } else {
+                    audio_latent = resize_ltxav_audio_latent(audio_latent, target_audio_length);
+                }
                 if (audio_latent.empty()) {
                     LOG_ERROR("failed to resize LTX audio latent for latent upscale: %d -> %d",
                               latents.audio_length,
-                              target_audio_length);
+                              expected_audio_length);
                     if (sd_ctx->sd->free_params_immediately) {
                         sd_ctx->sd->diffusion_model->free_params_buffer();
                     }
@@ -9278,8 +9475,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 latents.audio_latent = std::move(audio_latent);
                 LOG_INFO("LTX audio latent length adjusted for latent upscale: %d -> %d",
                          latents.audio_length,
-                         target_audio_length);
-                latents.audio_length = target_audio_length;
+                         expected_audio_length);
+                latents.audio_length = expected_audio_length;
             }
         }
         if (!same_res_refine_enabled &&
@@ -9629,6 +9826,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
         }
         if (sd_ctx->sd->diffusion_model) {
+            if (const char* e = std::getenv("LTXAV_REFINE_SHARED_RESIDENT_MAX_MB"); e != nullptr && e[0] != '\0') {
+                const float mb = static_cast<float>(std::atof(e));
+                if (mb > 0.f) {
+                    sd_ctx->sd->diffusion_model->set_shared_resident_max_mb_override(mb);
+                    LOG_INFO("LTXAV_REFINE_SHARED_RESIDENT_MAX_MB: using %.0f MB resident cap for refine only", mb);
+                }
+            }
             sd_ctx->sd->diffusion_model->set_refine_resident_scope(true);
         }
         LOG_INFO("[LTX_PHASE] refine setup total before sample took %.3fs", (ggml_time_ms() - refine_total_start) * 1.0f / 1000);
@@ -9658,11 +9862,16 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                             static_cast<float>(hires_request.fps),
                                             hires_request.cache_params,
                                             hires_video_positions,
-                                            latents.audio_fixed,
+                                            latents.audio_positions,
+                                            // LipDub stage 2 freezes both the stage-1 target audio
+                                            // and its appended clean reference.  Mark it fixed here
+                                            // as well so the audio adaLN sees timestep zero.
+                                            latents.audio_fixed || latents.audio_reference_conditioning,
                                             hires_video_reference);
         sampling_end   = ggml_time_ms();
         if (sd_ctx->sd->diffusion_model) {
             sd_ctx->sd->diffusion_model->set_refine_resident_scope(false);
+            sd_ctx->sd->diffusion_model->set_shared_resident_max_mb_override(0.f);
         }
         if (refine_max_vram_override) {
             sd_ctx->sd->max_vram = old_max_vram;
@@ -9755,7 +9964,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             LOG_INFO("[LTX_PHASE] audio VAE reload before decode took %.3fs", (ggml_time_ms() - audio_vae_reload_start) * 1.0f / 1000);
 
             auto audio_latent = unpack_ltxav_audio_latent(final_latent,
-                                                          latents.audio_length,
+                                                          latents.audio_reference_conditioning
+                                                              ? latents.audio_target_length
+                                                              : latents.audio_length,
                                                           sd_ctx->sd->get_latent_channel());
             if (!audio_latent.empty()) {
                 LOG_DEBUG("decode audio latent %dx%dx%dx%d",

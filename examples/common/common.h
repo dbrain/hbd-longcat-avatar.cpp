@@ -243,7 +243,10 @@ struct SDGenerationParams {
     // bleeds a prior render's value (the sticky-setenv bug). Defaults == the engine defaults.
     float a2v_guidance                   = 1.0f; // audio->video modality guidance (1=faithful/fast; owner up to 3)
     float a2v_ramp_end                   = 1.0f; // a2v guidance ramp: fraction of (scale-1) kept at lowest-sigma step
-    int   relip_ref_tstride              = 1;    // temporal subsample of the relip reference (identity-safe token cut)
+    // Production Relip keeps the reference at full spatial resolution for identity, then
+    // retains every fourth latent frame.  This is consumed by the video-worker env bridge;
+    // a request may still explicitly supply another positive stride.
+    int   relip_ref_tstride              = 4;    // temporal subsample of the relip reference (identity-safe token cut)
     // FEATURE 2 (NAG — Normalized Attention Guidance) RUNTIME knobs, bridged to the engine via env
     // (apply_ltx_relip_env). Attention-space negative guidance on the LTX video text cross-attn.
     // Default OFF (scale 0). Workflow values: scale 14, alpha 0.35, tau 2.5.
