@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -27,6 +28,10 @@ struct SDSvrParams {
     // params (--diffusion-model); this is the EDIT DiT (--diffusion-model-edit),
     // swapped in per request. Empty = single-model (back-compat) mode.
     std::string diffusion_model_edit_path;
+    // Additional named base-DiT variants for the per-request "model" selector, beyond
+    // base/edit. Format: "name=path;name=path" (--diffusion-model-variants). Each entry
+    // is a self-contained GGUF (e.g. a LoRA folded into the nvfp4 base). Empty = none.
+    std::string diffusion_model_variants_spec;
     bool normal_exit = false;
     bool verbose     = false;
     bool color       = false;
@@ -58,11 +63,22 @@ struct UpscalerEntry {
 struct ModelSwapState {
     std::string base_path;   // --diffusion-model
     std::string edit_path;   // --diffusion-model-edit (empty = single-model mode)
-    // "base" | "edit"; the variant whose weights are resident in sd_ctx right now.
+    // Every selectable DiT variant name -> its GGUF path. Always contains "base" (and
+    // "edit" when configured); extra entries come from --diffusion-model-variants. The
+    // per-request "model" field is resolved through this map. Populated once at startup.
+    std::map<std::string, std::string> variants;
+    // The variant name whose weights are resident in sd_ctx right now (a key of `variants`).
     std::string loaded_variant = "base";
     std::atomic<bool> loaded{true};       // false after /v1/admin/unload freed VRAM
     std::atomic<bool> draining{false};    // true after /v1/admin/drain
 };
+
+// Parse a "name=path;name=path" spec into a variant map, seeded with base/edit. `base_path`
+// registers as "base"; a non-empty `edit_path` as "edit". Spec entries add/override by name.
+// Blank names/paths and malformed entries are skipped. Defined in runtime.cpp.
+std::map<std::string, std::string> build_model_variants(const std::string& spec,
+                                                        const std::string& base_path,
+                                                        const std::string& edit_path);
 
 struct ServerRuntime {
     sd_ctx_t* sd_ctx;

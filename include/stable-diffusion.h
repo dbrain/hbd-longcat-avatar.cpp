@@ -505,6 +505,14 @@ typedef struct {
     // itself is the temporal control). NULL preserves ordinary LTX continuation byte-for-byte.
     sd_image_t* const* segment_control_frames;
     const int*         segment_control_frame_counts;
+    // Optional per-segment i2v scene image ("Director" multi-scene). n_segments entries; a
+    // non-NULL entry with .data makes that segment START A FRESH SCENE from the image
+    // (like seg-0 i2v) instead of continuing the prior segment's motion. The audio timeline
+    // is untouched — the per-segment aud_<i>.wav still lands on its slot and the scene-cut
+    // segment's stitch drop is 0, so the soundtrack flows unbroken across the cut. Seg-0's
+    // entry is redundant with base_params->init_image (both = the opener). NULL = ordinary
+    // continuation, byte-identical to before.
+    sd_image_t* const* segment_init_images;
     // Optional: invoked once per stitched segment, in order, with that segment's kept frames
     // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
     // (server layer) bank a viewable per-segment webm as it's produced, without the core lib

@@ -426,6 +426,8 @@ int run_worker_loop(int fd, int argc, const char** argv) {
     ModelSwapState             model_swap;
     model_swap.base_path      = ctx_params.diffusion_model_path;
     model_swap.edit_path      = svr_params.diffusion_model_edit_path;
+    model_swap.variants       = build_model_variants(
+        svr_params.diffusion_model_variants_spec, model_swap.base_path, model_swap.edit_path);
     model_swap.loaded_variant = "base";
     model_swap.loaded.store(true);
     model_swap.draining.store(false);

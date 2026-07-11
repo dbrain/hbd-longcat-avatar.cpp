@@ -10717,12 +10717,34 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                      seg + 1, vp.control_frames_size);
         }
 
+        // Director multi-scene: a seg>0 with its own init image starts a FRESH i2v scene here
+        // (a scene cut) rather than continuing the prior motion. Seg-0 already uses the opener
+        // via base_params->init_image, so per-segment images only matter for seg>0.
+        const bool scene_cut = seg > 0 && !segmented_relip &&
+                               chain_params->segment_init_images != nullptr &&
+                               chain_params->segment_init_images[seg] != nullptr &&
+                               chain_params->segment_init_images[seg]->data != nullptr;
+
         if (seg == 0 || segmented_relip) {
             vp.cont_latent        = nullptr;
             vp.cont_latent_frames = 0;
             vp.cont_refine_latent = nullptr;
             vp.cont_refine_latent_frames = 0;
             vp.audio_frame_offset = 0;
+        } else if (scene_cut) {
+            // Fresh scene from this shot's image: i2v start, no continuation latent (nothing to
+            // continue). Audio is deliberately left on its normal per-segment path — aud_<seg>.wav
+            // still drives this segment and drop=0 below keeps it aligned — so the soundtrack runs
+            // unbroken across the cut. audio_frame_offset stays the continuation value (inert for
+            // the LTXAV per-segment-wav path).
+            vp.init_image         = *chain_params->segment_init_images[seg];
+            vp.cont_latent        = nullptr;
+            vp.cont_latent_frames = 0;
+            vp.cont_refine_latent = nullptr;
+            vp.cont_refine_latent_frames = 0;
+            vp.audio_frame_offset = seg * (base_params->video_frames - overlap_px);
+            LOG_INFO("generate_video_chain seg %d: SCENE CUT (fresh i2v from per-segment image %dx%d)",
+                     seg + 1, vp.init_image.width, vp.init_image.height);
         } else {
             // Clear the init image for seg>0: prepare_video_generation_latents checks the
             // start image BEFORE the cont-latent branch, so a lingering init image would
@@ -10897,12 +10919,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // next segment at the top of the following iteration. Runs only when the tail was actually
         // (re)filled this segment (want_latent) and the dims are known.
         if (want_latent && !cont_buf.empty() && cont_Wl > 0 && cont_Hl > 0 && cont_Cv > 0 && K > 0) {
-            if (seg == 0 && !ref_ready) {
+            if ((seg == 0 && !ref_ready) || scene_cut) {
+                // seg-0, or a scene cut, RE-ANCHORS the anti-drift reference to THIS scene's
+                // stats — so the continuation shots that follow match the new scene, not the
+                // one before the cut.
                 ltxav_compute_latent_channel_stats(cont_buf.data(), cont_Wl, cont_Hl, K, cont_Cv, ref_mean, ref_std);
                 ref_ready = true;
                 if (latent_match_on) {
-                    LOG_INFO("generate_video_chain: captured seg-0 latent channel reference stats (%d channels) for continuity-match",
-                             cont_Cv);
+                    LOG_INFO("generate_video_chain: captured %s latent channel reference stats (%d channels) for continuity-match",
+                             scene_cut ? "scene-cut" : "seg-0", cont_Cv);
                 }
             } else if (seg > 0 && ref_ready && latent_match_on) {
                 ltxav_latent_channel_affine_match(cont_buf.data(), cont_Wl, cont_Hl, K, cont_Cv,
@@ -10920,7 +10945,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             legacy_head = atoi(e) != 0;
         }
         int drop;
-        if (seg == 0 || segmented_relip) {
+        if (seg == 0 || segmented_relip || scene_cut) {
+            // A scene cut generates a wholly new scene — nothing to trim against the prior
+            // segment (and drop=0 keeps its audio aligned, like seg-0).
             drop = 0;
         } else if (legacy_head) {
             drop = overlap_px;  // legacy head-placement re-renders + trims the fixed overlap
@@ -10946,7 +10973,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // flattening the ~0.85-luma step at the seam (continuity correction, not a cross-fade). seg0
         // has nothing to match against. Operates on the post-trim kept frames so the matched window
         // lines up with what actually lands in the timeline.
-        if (seg > 0 && !stitched.empty() && seg_count - drop > 0) {
+        if (seg > 0 && !scene_cut && !stitched.empty() && seg_count - drop > 0) {
+            // Skip at a scene cut: the new scene must NOT be tone-graded toward the old one.
             ltxav_exposure_match(stitched.data(), (int)stitched.size(),
                                  seg_video + drop, seg_count - drop);
         }

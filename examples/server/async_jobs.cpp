@@ -434,14 +434,21 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         std::string want_variant;  // empty = keep whatever DiT is loaded (base) — byte-identical
         if (body.contains("model") && body["model"].is_string()) {
             want_variant = body["model"].get<std::string>();
-            if (want_variant != "base" && want_variant != "edit") {
-                error_message = "invalid model variant, must be \"base\" or \"edit\"";
-                return false;
-            }
-            if (want_variant == "edit" && runtime.model_swap &&
-                runtime.model_swap->edit_path.empty()) {
-                error_message = "edit model not available (server started without --diffusion-model-edit)";
-                return false;
+            // Validate against the registered variant map (base/edit + --diffusion-model-variants).
+            if (!want_variant.empty() && runtime.model_swap) {
+                const auto& vars = runtime.model_swap->variants;
+                if (vars.find(want_variant) == vars.end()) {
+                    std::string names;
+                    for (const auto& kv : vars) {
+                        if (!names.empty()) {
+                            names += ", ";
+                        }
+                        names += '"' + kv.first + '"';
+                    }
+                    error_message = "unknown model variant \"" + want_variant +
+                                    "\"; registered: " + (names.empty() ? "(none)" : names);
+                    return false;
+                }
             }
         }
         if (!ensure_variant_loaded(runtime, want_variant, error_message)) {
@@ -528,6 +535,38 @@ bool run_vid_chain_job(ServerRuntime& runtime,
                  n_segments, offset);
     }
 
+    // Director multi-scene: per-segment i2v scene images from body["segments"][i]["init_image"]
+    // (inline base64, resized to the render grid like the top-level init_image). A seg>0 with
+    // one starts a FRESH scene there; seg-0's is the opener and already rides base.init_image.
+    // Owners must outlive generate_video_chain below; seg_img_values is sized once so the
+    // pointers stay stable.
+    std::vector<SDImageOwner> seg_img_owners(n_segments);
+    std::vector<sd_image_t>   seg_img_values(n_segments);          // value-init: data=nullptr
+    std::vector<sd_image_t*>  seg_img_ptrs(n_segments, nullptr);
+    bool                      any_seg_img = false;
+    if (!wan_mode && body.contains("segments") && body["segments"].is_array()) {
+        const auto& segs = body["segments"];
+        for (int seg = 1; seg < n_segments && seg < (int)segs.size(); ++seg) {
+            if (!segs[seg].is_object()) {
+                continue;
+            }
+            auto it = segs[seg].find("init_image");
+            if (it == segs[seg].end() || !it->is_string() || it->get<std::string>().empty()) {
+                continue;
+            }
+            if (!decode_base64_image(it->get<std::string>(), 3, base.width, base.height,
+                                     seg_img_owners[seg])) {
+                error_message = "failed to decode segment " + std::to_string(seg + 1) + " scene image";
+                return false;
+            }
+            seg_img_values[seg] = seg_img_owners[seg].get();
+            seg_img_ptrs[seg]   = &seg_img_values[seg];
+            any_seg_img         = true;
+            LOG_INFO("run_vid_chain_job: segment %d scene image %ux%u (mid-chain i2v scene cut)",
+                     seg + 1, seg_img_values[seg].width, seg_img_values[seg].height);
+        }
+    }
+
     sd_vid_chain_params_t chain = {};
     chain.n_segments         = n_segments;
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
@@ -537,6 +576,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.resume_from        = std::max(0, resume_from);
     chain.segment_control_frames = relip_control_starts.empty() ? nullptr : relip_control_starts.data();
     chain.segment_control_frame_counts = relip_control_counts.empty() ? nullptr : relip_control_counts.data();
+    chain.segment_init_images = any_seg_img ? seg_img_ptrs.data() : nullptr;
 
     // Bank a viewable per-segment webm as each segment lands (off the GPU thread). On by
     // default when a job dir is set; LTX_BANK_SEG_WEBM=0 disables it (e.g. under tight RAM —
@@ -632,8 +672,20 @@ bool ensure_variant_loaded(ServerRuntime& runtime,
         return true;
     }
 
-    // Resolve the gguf path for the wanted variant.
-    std::string path = (want == "edit") ? swap->edit_path : swap->base_path;
+    // Resolve the gguf path for the wanted variant from the startup-built map (seeded with
+    // base/edit + any --diffusion-model-variants). Fall back to base/edit for safety if the
+    // map is somehow unpopulated (single-model in-process paths).
+    std::string path;
+    {
+        auto it = swap->variants.find(want);
+        if (it != swap->variants.end()) {
+            path = it->second;
+        } else if (want == "edit") {
+            path = swap->edit_path;
+        } else {
+            path = swap->base_path;
+        }
+    }
     if (path.empty()) {
         error_message = "no diffusion model path for variant '" + want + "'";
         return false;

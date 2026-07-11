@@ -203,6 +203,12 @@ ArgOptions SDSvrParams::get_options() {
          "img_gen body sets \"model\":\"edit\". The BASE DiT comes from --diffusion-model. "
          "Empty = single-model mode (optional)",
          &diffusion_model_edit_path},
+        {"", "--diffusion-model-variants",
+         "extra named base-DiT variants for the per-request \"model\" selector, beyond "
+         "base/edit. Format: \"name=path;name=path\" (e.g. "
+         "\"audioreactive=/models/x.gguf;lipdub=/models/y.gguf\"). Each is a self-contained "
+         "GGUF, loaded fresh on switch. Empty = none (optional)",
+         &diffusion_model_variants_spec},
     };
 
     options.int_options = {
@@ -258,8 +264,45 @@ std::string SDSvrParams::to_string() const {
         << "  listen_port: \"" << listen_port << "\",\n"
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
         << "  diffusion_model_edit_path: \"" << diffusion_model_edit_path << "\",\n"
+        << "  diffusion_model_variants_spec: \"" << diffusion_model_variants_spec << "\",\n"
         << "}";
     return oss.str();
+}
+
+std::map<std::string, std::string> build_model_variants(const std::string& spec,
+                                                        const std::string& base_path,
+                                                        const std::string& edit_path) {
+    std::map<std::string, std::string> out;
+    if (!base_path.empty()) {
+        out["base"] = base_path;
+    }
+    if (!edit_path.empty()) {
+        out["edit"] = edit_path;
+    }
+    // Parse "name=path;name=path" — ';' separates entries, first '=' splits name/path.
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t sep = spec.find(';', start);
+        std::string entry = spec.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+        size_t eq = entry.find('=');
+        if (eq != std::string::npos) {
+            auto trim = [](std::string s) {
+                size_t a = s.find_first_not_of(" \t\r\n");
+                size_t b = s.find_last_not_of(" \t\r\n");
+                return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+            };
+            std::string name = trim(entry.substr(0, eq));
+            std::string path = trim(entry.substr(eq + 1));
+            if (!name.empty() && !path.empty()) {
+                out[name] = path;
+            }
+        }
+        if (sep == std::string::npos) {
+            break;
+        }
+        start = sep + 1;
+    }
+    return out;
 }
 
 void refresh_lora_cache(ServerRuntime& rt) {
