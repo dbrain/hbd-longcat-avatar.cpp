@@ -173,6 +173,14 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             if (!prompts.empty()) {
                 chain["prompt"] = prompts[0];  // base prompt = seg0 (seg0 / fallback)
             }
+            // Clip length: clients send "frames" (the wan/koblem convention), but the gen-params
+            // parser (SDGenerationParams::from_json_str) reads "video_frames". chain = body already,
+            // yet without this alias the client's requested length is silently dropped and the
+            // render falls back to the server's --video-frames default. Mirror routes_wan.cpp.
+            // The value should be model-valid (8k+1, e.g. 97/257); snapping is the client's job.
+            if (body.contains("frames")) {
+                chain["video_frames"] = body["frames"];
+            }
             std::string output_format = body.value("output_format", std::string("webm"));
 
             // Register the job (assign an id) before touching the filesystem, so a fresh job's
