@@ -10209,19 +10209,22 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (latent_refine_enabled) {
         int64_t refine_total_start = ggml_time_ms();
         int64_t upscale_start             = ggml_time_ms();
-        // A two-stage Relip pass has finished using the stage-1 DiT before the
-        // latent upsampler runs.  Keeping its streamed/shared GPU residency
-        // through that upsampler makes the upsampler's largest Conv3D overlap
-        // with roughly 2 GB of otherwise-dead DiT weights.  Release it here,
-        // then let the existing stage-2 sample path stream the same weights
-        // back from host.  This is allocation-only: no latent, conditioning or
-        // sampler value changes.  Keep it opt-in so non-Relip and legacy
-        // two-stage callers retain their existing lifetime.
+        // The stage-1 DiT has finished before the latent upsampler runs. Keeping
+        // its streamed/shared GPU residency through the upsampler makes the
+        // latter's largest Conv3D allocation overlap with otherwise-dead DiT
+        // weights. On a 45-latent-frame continuation this was the real 13.4 GB
+        // board spike (the VAE decode itself is 11.26 GB). Release it here and
+        // let the stage-2 sample re-stream the exact same weights from host.
+        // This is phase-local allocation lifetime only: no latent, conditioning,
+        // or sampler value changes. It applies only to host-offloaded LTXAV
+        // two-stage renders; legacy/non-LTX callers retain their lifetime.
         const char* relip_free_before_upscale_env = getenv("LTXAV_RELIP_FREE_DIT_BEFORE_UPSCALE");
-        const bool relip_free_dit_before_upscale = latents.relip_twostage &&
-                                                   relip_free_before_upscale_env != nullptr &&
-                                                   std::string(relip_free_before_upscale_env) != "0";
-        if (relip_free_dit_before_upscale && sd_ctx->sd->diffusion_model) {
+        const bool free_dit_before_upscale = sd_version_is_ltxav(sd_ctx->sd->version) &&
+                                             (relip_free_before_upscale_env == nullptr ||
+                                              std::string(relip_free_before_upscale_env) != "0") &&
+                                             sd_ctx->sd->diffusion_model &&
+                                             sd_ctx->sd->diffusion_model->params_offloaded_to_host();
+        if (free_dit_before_upscale) {
             sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
             sd_ctx->sd->diffusion_model->free_compute_buffer();
             // release_all_gpu_param_residency returns buffers to the CUDA VMM
@@ -10229,7 +10232,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // largest Conv3D allocation; otherwise the driver-visible peak is
             // unchanged even though the DiT is no longer usable here.
             ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
-            LOG_INFO("LTXAV two-stage Relip: released stage-1 DiT residency before latent upscale");
+            LOG_INFO("LTXAV two-stage: released stage-1 DiT residency before latent upscale");
         }
         sd::Tensor<float> upscaled_latent;
         if (same_res_refine_enabled) {
