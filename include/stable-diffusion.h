@@ -513,6 +513,17 @@ typedef struct {
     // entry is redundant with base_params->init_image (both = the opener). NULL = ordinary
     // continuation, byte-identical to before.
     sd_image_t* const* segment_init_images;
+    // Optional per-segment KEYFRAMES ("Director" frame-pinned image injection). For segment i,
+    // segment_keyframes[i] is an array of segment_keyframe_counts[i] images pinned at the video
+    // (pixel) frame indices in segment_keyframe_indices[i]. A segment with keyframes renders
+    // FRESH via the LTXAV keyframe branch (i2v-style): frame 0 = scene start, last = end frame,
+    // a middle index = a mid-shot reveal — the DiT interpolates motion between the pins. Takes
+    // precedence over segment_init_images and over continuation for that segment. Each index
+    // must be in [0, video_frames). NULL / count 0 = no keyframes (continuation/scene-cut as
+    // before). (Layering keyframes ON TOP of a flowing continuation is a separate follow-up.)
+    sd_image_t* const* segment_keyframes;
+    const int* const*  segment_keyframe_indices;
+    const int*         segment_keyframe_counts;
     // Optional: invoked once per stitched segment, in order, with that segment's kept frames
     // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
     // (server layer) bank a viewable per-segment webm as it's produced, without the core lib

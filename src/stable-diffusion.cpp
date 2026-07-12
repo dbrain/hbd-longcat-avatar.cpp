@@ -4978,6 +4978,75 @@ static sd::Tensor<float> build_ltxv_multi_keyframe_video_positions(int64_t width
     return positions;
 }
 
+// One appended guide block for the mixed continuation+keyframe path: a run of `latent_frames`
+// latent frames placed starting at pixel-frame `frame_idx`. `pixel_frames==1` gives each frame a
+// single-instant extent (still image / identity keyframe); otherwise each frame spans
+// `temporal_scale` pixel frames (a real motion window, e.g. the continuation overlap tail).
+struct LtxvGuideSpec {
+    int frame_idx;
+    int latent_frames;
+    int pixel_frames;
+};
+
+// LTX-2.3 positions for a target block + N heterogeneous appended guide blocks (Director v2:
+// continuation motion tail AND frozen identity keyframes on the SAME shot). Generalises
+// build_ltxv_video_positions / build_ltxv_multi_keyframe_video_positions to per-guide temporal
+// spans — the motion tail needs `temporal_scale`-wide frames while image keyframes are instants.
+static sd::Tensor<float> build_ltxv_guides_video_positions(int64_t width,
+                                                           int64_t height,
+                                                           int64_t target_latent_frames,
+                                                           const std::vector<LtxvGuideSpec>& guides,
+                                                           int fps,
+                                                           int spatial_scale,
+                                                           int temporal_scale,
+                                                           bool causal_temporal_positioning) {
+    GGML_ASSERT(width > 0 && height > 0 && target_latent_frames > 0 && fps > 0);
+    int64_t guide_frames = 0;
+    for (const auto& g : guides) {
+        guide_frames += g.latent_frames;
+    }
+    int64_t           total_tokens = width * height * (target_latent_frames + guide_frames);
+    sd::Tensor<float> positions({2, 3, total_tokens, 1});
+    int64_t           token = 0;
+
+    for (int64_t t = 0; t < target_latent_frames; t++) {
+        float t_start = ltxv_latent_corner_to_pixel_frame(t, temporal_scale, causal_temporal_positioning) / static_cast<float>(fps);
+        float t_end   = ltxv_latent_corner_to_pixel_frame(t + 1, temporal_scale, causal_temporal_positioning) / static_cast<float>(fps);
+        for (int64_t h = 0; h < height; h++) {
+            float h_start = static_cast<float>(h * spatial_scale);
+            float h_end   = static_cast<float>((h + 1) * spatial_scale);
+            for (int64_t w = 0; w < width; w++) {
+                float w_start = static_cast<float>(w * spatial_scale);
+                float w_end   = static_cast<float>((w + 1) * spatial_scale);
+                set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
+            }
+        }
+    }
+
+    for (const auto& g : guides) {
+        for (int64_t t = 0; t < g.latent_frames; t++) {
+            float t_start = static_cast<float>(g.frame_idx + t * temporal_scale);
+            float t_end   = static_cast<float>(g.frame_idx + (t + 1) * temporal_scale);
+            if (g.pixel_frames == 1) {
+                t_end = t_start + 1.f;
+            }
+            t_start /= static_cast<float>(fps);
+            t_end /= static_cast<float>(fps);
+            for (int64_t h = 0; h < height; h++) {
+                float h_start = static_cast<float>(h * spatial_scale);
+                float h_end   = static_cast<float>((h + 1) * spatial_scale);
+                for (int64_t w = 0; w < width; w++) {
+                    float w_start = static_cast<float>(w * spatial_scale);
+                    float w_end   = static_cast<float>((w + 1) * spatial_scale);
+                    set_ltxv_video_position(&positions, token++, t_start, t_end, h_start, h_end, w_start, w_end);
+                }
+            }
+        }
+    }
+
+    return positions;
+}
+
 // LTX-2.3 V2V LIPDUB RELIP positions. The appended reference-clip tokens occupy the SAME
 // timeline coordinates as the target tokens (1:1 frame overlap; reference_downscale_factor=1
 // and reference_temporal_scale=1 per the lipdub-0.9 IC-LoRA metadata), so the model copies the
@@ -6867,6 +6936,93 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             }
             int64_t t2 = ggml_time_ms();
             LOG_INFO("encode_first_stage (relip reference) completed, taking %" PRId64 " ms", t2 - t1);
+        } else if (sd_vid_gen_params->keyframes != nullptr && sd_vid_gen_params->keyframes_size > 0 &&
+                   sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+            // MERGED (Director v2): a CONTINUATION shot that ALSO pins identity keyframes mid-flow
+            // (a reveal / identity swap without restarting the motion). The prior segment's motion
+            // tail rides as a held guide at frame 0 (temporal_scale-wide), and each keyframe is a
+            // frozen instant at its own frame index; the DiT continues the motion while snapping to
+            // the pinned images. Placed ABOVE the keyframe-only and continuation branches so it only
+            // fires when BOTH are present.
+            if (sd_ctx->sd->vae_decode_only) {
+                LOG_ERROR("LTXAV merged continuation+keyframe conditioning requires VAE encoder weights");
+                return std::nullopt;
+            }
+            int64_t t1                       = ggml_time_ms();
+            latents.init_latent              = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask             = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            int64_t target_lat_frames        = latents.init_latent.shape()[2];
+            latents.video_target_frame_count = target_lat_frames;
+
+            float conditioning_strength = std::clamp(request->strength, 0.f, 1.f);
+            float conditioned_mask      = 1.0f - conditioning_strength;
+
+            int64_t Wl = latents.init_latent.shape()[0];
+            int64_t Hl = latents.init_latent.shape()[1];
+            int64_t Cl = latents.init_latent.shape()[3];
+            int64_t K  = sd_vid_gen_params->cont_latent_frames;
+            if (K > target_lat_frames) {
+                LOG_ERROR("cont latent frames %lld exceed segment latent frames %lld",
+                          (long long)K, (long long)target_lat_frames);
+                return std::nullopt;
+            }
+            float omask = 0.0f;  // motion tail frozen (same env knob as the pure-continuation path)
+            if (const char* e = std::getenv("LTXAV_CONT_OVERLAP_MASK")) {
+                omask = std::clamp((float)atof(e), 0.f, 1.f);
+            }
+
+            std::vector<LtxvGuideSpec> guides;
+            int64_t                    appended = 0;
+
+            // 1. continuation motion tail (held, temporal-window frames) at frame 0.
+            {
+                sd::Tensor<float> cont_tail({Wl, Hl, K, Cl, 1});
+                std::memcpy(cont_tail.data(), sd_vid_gen_params->cont_latent, (size_t)cont_tail.numel() * sizeof(float));
+                latents.init_latent  = sd::ops::concat(latents.init_latent, cont_tail, 2);
+                auto cont_mask       = sd::full<float>({Wl, Hl, K, 1, 1}, omask);
+                latents.denoise_mask = sd::ops::concat(latents.denoise_mask, cont_mask, 2);
+                guides.push_back({0, (int)K, 8});
+                appended += K;
+            }
+
+            // 2. identity keyframes (frozen instants) at their frame indices.
+            for (int i = 0; i < sd_vid_gen_params->keyframes_size; ++i) {
+                int frame_idx = sd_vid_gen_params->keyframe_frame_indices != nullptr
+                                    ? sd_vid_gen_params->keyframe_frame_indices[i]
+                                    : 0;
+                if (frame_idx < 0 || frame_idx >= request->frames) {
+                    LOG_ERROR("LTXAV merged keyframe %d frame index %d out of range [0, %d)", i, frame_idx, request->frames);
+                    return std::nullopt;
+                }
+                if (sd_vid_gen_params->keyframes[i].data == nullptr) {
+                    LOG_ERROR("LTXAV merged keyframe %d has null image data", i);
+                    return std::nullopt;
+                }
+                sd::Tensor<float> kf_image  = sd_image_to_tensor(sd_vid_gen_params->keyframes[i], request->width, request->height);
+                auto              kf_latent = encode_ltxav_condition_image(sd_ctx, kf_image, "keyframe");
+                if (kf_latent.empty()) {
+                    return std::nullopt;
+                }
+                if (kf_latent.shape()[0] != Wl || kf_latent.shape()[1] != Hl || kf_latent.shape()[3] != Cl) {
+                    LOG_ERROR("invalid LTXAV merged keyframe %d latent shape", i);
+                    return std::nullopt;
+                }
+                int64_t kf_frames    = kf_latent.shape()[2];
+                latents.init_latent  = sd::ops::concat(latents.init_latent, kf_latent, 2);
+                auto kf_mask         = sd::full<float>({Wl, Hl, kf_frames, 1, 1}, conditioned_mask);
+                latents.denoise_mask = sd::ops::concat(latents.denoise_mask, kf_mask, 2);
+                guides.push_back({frame_idx, (int)kf_frames, 1});
+                appended += kf_frames;
+                LOG_INFO("LTXAV merged keyframe %d/%d pinned at frame %d (continuation K=%lld held, strength=%.2f)",
+                         i + 1, sd_vid_gen_params->keyframes_size, frame_idx, (long long)K, conditioning_strength);
+            }
+
+            latents.video_conditioning_frame_count = appended;
+            latents.video_positions                = build_ltxv_guides_video_positions(
+                Wl, Hl, target_lat_frames, guides, request->fps, request->vae_scale_factor, 8, true);
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("encode_first_stage (continuation + %d merged keyframes) completed, taking %" PRId64 " ms",
+                     sd_vid_gen_params->keyframes_size, t2 - t1);
         } else if (sd_vid_gen_params->keyframes != nullptr && sd_vid_gen_params->keyframes_size > 0) {
             // LTXAV MULTI-KEYFRAME conditioning: arbitrary (image, latent-frame-index) pairs pinned
             // as frozen 1-frame guides on the target timeline. Generalises the start/end i2v path
@@ -10717,15 +10873,80 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                      seg + 1, vp.control_frames_size);
         }
 
+        // Director keyframes: a shot with per-segment keyframes (image+frame pins) renders FRESH
+        // via the LTXAV keyframe branch — frame 0 = scene start, last = end frame, a middle index
+        // = a mid-shot reveal. Takes precedence over a plain scene-cut image and over continuation
+        // (it's a fresh i2v-style shot, not a continuation of the prior motion).
+        const bool has_keyframes = !segmented_relip &&
+                                   chain_params->segment_keyframes != nullptr &&
+                                   chain_params->segment_keyframe_counts != nullptr &&
+                                   chain_params->segment_keyframe_counts[seg] > 0 &&
+                                   chain_params->segment_keyframes[seg] != nullptr;
+
+        // A keyframe shot with a pin at frame 0 (or seg 0) is FRESH — the pin defines the start.
+        // A seg>0 keyframe shot with NO frame-0 pin CONTINUES the prior motion and injects the pins
+        // mid-flow (Director v2 merged: reveal/identity-swap without restarting the scene).
+        bool kf_frame0 = false;
+        if (has_keyframes) {
+            const int* kidx = chain_params->segment_keyframe_indices != nullptr
+                                  ? chain_params->segment_keyframe_indices[seg]
+                                  : nullptr;
+            int kcnt = chain_params->segment_keyframe_counts[seg];
+            for (int k = 0; kidx != nullptr && k < kcnt; ++k) {
+                if (kidx[k] == 0) {
+                    kf_frame0 = true;
+                    break;
+                }
+            }
+        }
+        const bool kf_cont  = has_keyframes && seg > 0 && !segmented_relip && !kf_frame0;
+        const bool kf_fresh = has_keyframes && !kf_cont;
+
         // Director multi-scene: a seg>0 with its own init image starts a FRESH i2v scene here
         // (a scene cut) rather than continuing the prior motion. Seg-0 already uses the opener
         // via base_params->init_image, so per-segment images only matter for seg>0.
-        const bool scene_cut = seg > 0 && !segmented_relip &&
+        const bool scene_cut = seg > 0 && !segmented_relip && !has_keyframes &&
                                chain_params->segment_init_images != nullptr &&
                                chain_params->segment_init_images[seg] != nullptr &&
                                chain_params->segment_init_images[seg]->data != nullptr;
 
-        if (seg == 0 || segmented_relip) {
+        // A fresh shot does not continue the prior tail; its stitch drop is 0 and it re-anchors the
+        // continuity references. A merged (kf_cont) shot DOES continue, so it is NOT a fresh anchor.
+        const bool fresh_anchor = scene_cut || kf_fresh;
+
+        if (kf_fresh) {
+            // Fresh keyframe shot: pin the caller's images at their frame indices; the keyframe
+            // branch owns conditioning (init_image ignored, no continuation latent). Audio stays
+            // on its normal per-segment path (drop=0 below keeps it aligned).
+            vp.keyframes                 = chain_params->segment_keyframes[seg];
+            vp.keyframe_frame_indices    = const_cast<int*>(chain_params->segment_keyframe_indices[seg]);
+            vp.keyframes_size            = chain_params->segment_keyframe_counts[seg];
+            vp.init_image.data           = nullptr;
+            vp.cont_latent               = nullptr;
+            vp.cont_latent_frames        = 0;
+            vp.cont_refine_latent        = nullptr;
+            vp.cont_refine_latent_frames = 0;
+            vp.audio_frame_offset        = (seg == 0) ? 0 : seg * (base_params->video_frames - overlap_px);
+            LOG_INFO("generate_video_chain seg %d: KEYFRAME shot (%d frame-pinned image(s), fresh)",
+                     seg + 1, vp.keyframes_size);
+        } else if (kf_cont) {
+            // Merged (v2): continue the prior motion tail AND inject the frame pins mid-flow. The
+            // engine's merged branch fires when BOTH keyframes and cont_latent are set.
+            vp.keyframes                 = chain_params->segment_keyframes[seg];
+            vp.keyframe_frame_indices    = const_cast<int*>(chain_params->segment_keyframe_indices[seg]);
+            vp.keyframes_size            = chain_params->segment_keyframe_counts[seg];
+            vp.init_image.data           = nullptr;
+            vp.cont_latent               = cont_buf.data();
+            vp.cont_latent_frames        = K;
+            vp.cont_refine_latent        = cont_refine_buf.empty() ? nullptr : cont_refine_buf.data();
+            vp.cont_refine_latent_frames = cont_refine_buf.empty() ? 0 : hires_ref_K;
+            vp.cont_refine_latent_width  = cont_refine_Wl;
+            vp.cont_refine_latent_height = cont_refine_Hl;
+            vp.cont_refine_latent_channels = cont_refine_Cv;
+            vp.audio_frame_offset        = seg * (base_params->video_frames - overlap_px);
+            LOG_INFO("generate_video_chain seg %d: MERGED continuation + %d keyframe pin(s)",
+                     seg + 1, vp.keyframes_size);
+        } else if (seg == 0 || segmented_relip) {
             vp.cont_latent        = nullptr;
             vp.cont_latent_frames = 0;
             vp.cont_refine_latent = nullptr;
@@ -10919,15 +11140,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // next segment at the top of the following iteration. Runs only when the tail was actually
         // (re)filled this segment (want_latent) and the dims are known.
         if (want_latent && !cont_buf.empty() && cont_Wl > 0 && cont_Hl > 0 && cont_Cv > 0 && K > 0) {
-            if ((seg == 0 && !ref_ready) || scene_cut) {
-                // seg-0, or a scene cut, RE-ANCHORS the anti-drift reference to THIS scene's
-                // stats — so the continuation shots that follow match the new scene, not the
-                // one before the cut.
+            if ((seg == 0 && !ref_ready) || fresh_anchor) {
+                // seg-0, or a fresh shot (scene cut / keyframe shot), RE-ANCHORS the anti-drift
+                // reference to THIS scene's stats — so the continuation shots that follow match
+                // the new scene, not the one before the cut.
                 ltxav_compute_latent_channel_stats(cont_buf.data(), cont_Wl, cont_Hl, K, cont_Cv, ref_mean, ref_std);
                 ref_ready = true;
                 if (latent_match_on) {
                     LOG_INFO("generate_video_chain: captured %s latent channel reference stats (%d channels) for continuity-match",
-                             scene_cut ? "scene-cut" : "seg-0", cont_Cv);
+                             scene_cut ? "scene-cut" : (has_keyframes ? "keyframe" : "seg-0"), cont_Cv);
                 }
             } else if (seg > 0 && ref_ready && latent_match_on) {
                 ltxav_latent_channel_affine_match(cont_buf.data(), cont_Wl, cont_Hl, K, cont_Cv,
@@ -10945,9 +11166,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             legacy_head = atoi(e) != 0;
         }
         int drop;
-        if (seg == 0 || segmented_relip || scene_cut) {
-            // A scene cut generates a wholly new scene — nothing to trim against the prior
-            // segment (and drop=0 keeps its audio aligned, like seg-0).
+        if (seg == 0 || segmented_relip || fresh_anchor) {
+            // A fresh shot (scene cut or keyframe shot) generates a wholly new scene — nothing to
+            // trim against the prior segment (and drop=0 keeps its audio aligned, like seg-0).
             drop = 0;
         } else if (legacy_head) {
             drop = overlap_px;  // legacy head-placement re-renders + trims the fixed overlap
@@ -10973,8 +11194,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // flattening the ~0.85-luma step at the seam (continuity correction, not a cross-fade). seg0
         // has nothing to match against. Operates on the post-trim kept frames so the matched window
         // lines up with what actually lands in the timeline.
-        if (seg > 0 && !scene_cut && !stitched.empty() && seg_count - drop > 0) {
-            // Skip at a scene cut: the new scene must NOT be tone-graded toward the old one.
+        if (seg > 0 && !fresh_anchor && !stitched.empty() && seg_count - drop > 0) {
+            // Skip at a fresh shot: the new scene must NOT be tone-graded toward the old one.
             ltxav_exposure_match(stitched.data(), (int)stitched.size(),
                                  seg_video + drop, seg_count - drop);
         }

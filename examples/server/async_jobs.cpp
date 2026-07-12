@@ -567,6 +567,58 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         }
     }
 
+    // Director keyframes: per-segment frame-pinned images from body["segments"][i]["keyframes"] =
+    // [{"image":"<b64>","frame":<int>}, ...] (inline base64, resized to the render grid). A shot
+    // with keyframes renders fresh (i2v keyframe branch). Owners outlive generate_video_chain;
+    // the value/index vectors are sized once so the per-segment array pointers stay stable.
+    std::vector<std::vector<SDImageOwner>> kf_owners(n_segments);
+    std::vector<std::vector<sd_image_t>>   kf_values(n_segments);
+    std::vector<std::vector<int>>          kf_indices(n_segments);
+    std::vector<sd_image_t*>               kf_img_ptrs(n_segments, nullptr);
+    std::vector<const int*>                kf_idx_ptrs(n_segments, nullptr);
+    std::vector<int>                       kf_counts(n_segments, 0);
+    bool                                   any_kf = false;
+    if (!wan_mode && body.contains("segments") && body["segments"].is_array()) {
+        const auto& segs = body["segments"];
+        for (int seg = 0; seg < n_segments && seg < (int)segs.size(); ++seg) {
+            if (!segs[seg].is_object()) {
+                continue;
+            }
+            auto it = segs[seg].find("keyframes");
+            if (it == segs[seg].end() || !it->is_array() || it->empty()) {
+                continue;
+            }
+            for (const auto& kf : *it) {
+                if (!kf.is_object()) {
+                    continue;
+                }
+                auto img_it = kf.find("image");
+                if (img_it == kf.end() || !img_it->is_string() || img_it->get<std::string>().empty()) {
+                    continue;
+                }
+                SDImageOwner owner;
+                if (!decode_base64_image(img_it->get<std::string>(), 3, base.width, base.height, owner)) {
+                    error_message = "failed to decode segment " + std::to_string(seg + 1) + " keyframe image";
+                    return false;
+                }
+                kf_owners[seg].push_back(std::move(owner));
+                kf_indices[seg].push_back(kf.value("frame", 0));
+            }
+            int cnt = (int)kf_owners[seg].size();
+            if (cnt > 0) {
+                kf_values[seg].resize(cnt);
+                for (int k = 0; k < cnt; ++k) {
+                    kf_values[seg][k] = kf_owners[seg][k].get();
+                }
+                kf_img_ptrs[seg] = kf_values[seg].data();
+                kf_idx_ptrs[seg] = kf_indices[seg].data();
+                kf_counts[seg]   = cnt;
+                any_kf           = true;
+                LOG_INFO("run_vid_chain_job: segment %d has %d keyframe pin(s)", seg + 1, cnt);
+            }
+        }
+    }
+
     sd_vid_chain_params_t chain = {};
     chain.n_segments         = n_segments;
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
@@ -577,6 +629,9 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.segment_control_frames = relip_control_starts.empty() ? nullptr : relip_control_starts.data();
     chain.segment_control_frame_counts = relip_control_counts.empty() ? nullptr : relip_control_counts.data();
     chain.segment_init_images = any_seg_img ? seg_img_ptrs.data() : nullptr;
+    chain.segment_keyframes        = any_kf ? kf_img_ptrs.data() : nullptr;
+    chain.segment_keyframe_indices = any_kf ? kf_idx_ptrs.data() : nullptr;
+    chain.segment_keyframe_counts  = any_kf ? kf_counts.data() : nullptr;
 
     // Bank a viewable per-segment webm as each segment lands (off the GPU thread). On by
     // default when a job dir is set; LTX_BANK_SEG_WEBM=0 disables it (e.g. under tight RAM —
