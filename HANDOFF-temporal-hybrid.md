@@ -82,6 +82,24 @@ continuations memory-complete until that decode co-residency is attributed and r
 
 Output: `ltx-denoise-repro/_window14o4_refine8_chain2x360f_refwindow/singing_clip.webm`.
 
+### Continuation decode investigation, avoid full rerenders
+
+The seg-2 decode log shows `DiT_gpu=0`, `VAE_gpu=0`, and `audioVAE_gpu=0` at decode entry, yet
+the process rises to 13,326 MiB while the VAE tiled decode runs. The active VAE set itself is
+roughly 1,385 MiB weights + 7,243 MiB compute + 520 MiB cache, so roughly 2 GiB is unattributed
+process-global CUDA/cuDNN state. The continuation's high-resolution reference encode creates
+larger conv3d plans immediately before refine, making cuDNN plan/async-pool retention a leading
+hypothesis. There is an existing `ggml_backend_cuda_release_cudnn_plans()` and an
+`LTXAV_CHAIN_CUDNN_RESET` boundary hook; test a *pre-decode* reset carefully, but do not commit it
+without an A/B peak measurement.
+
+Do not repeatedly run a 29s chain to test this. The engine can bank per-segment latents with the
+existing `LTXAV_SAVE_VIDEO_LATENT` path; inspect `generate_video_chain` around the per-segment
+save/continuation logic and use a banked seg-0 tail/refined guide or `LTX_LOAD_LATENTS` to isolate
+the seg-2 refine/decode. A useful test harness should separate: (1) stage-2 continuation reference
+encode, (2) refine, and (3) VAE decode, recording board memory after each. Reuse the exact 45-latent
+frame / 1x2 / VAE-8/2 geometry from the failed seg-2 decode rather than re-running the full chain.
+
 ## Next goal: preserve identity / avoid motion mush
 
 The user observes crisp frames early in a clip but progressive softness and a hair-scale/identity
@@ -110,3 +128,14 @@ do not assume a fixed first-frame identity image.
 Also exercise I2V/reference-image paths when changing temporal/reference logic. The continuation
 guide code intentionally only enables same-grid continuation guides; relip/reference-image grids
 can have different geometry and remain on their pre-existing full path.
+
+## Overnight-agent objective
+
+Keep the single-window duration win intact (20s under 11.5 GiB), then:
+
+1. bring continuation segment-2 decode under 11.5 GiB without changing MAXV=9 or reducing DiT
+   residency as a blanket budget lever;
+2. diagnose and reduce temporal-window mush/identity drift for T2V and I2V, especially motion at
+   a refine boundary;
+3. prefer short latent/reuse or phase-isolated experiments over full 15-30 second rerenders;
+4. commit and push each verified improvement on `ltx-temporal-hybrid`.
