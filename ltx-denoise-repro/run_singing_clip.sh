@@ -200,6 +200,10 @@ NCU=${NCU:-0}
 OUT_NAME=${OUT_NAME:-singing_clip.webm}
 OUTDIR=${OUTDIR:-$WT/ltx-denoise-repro/_singing_out}
 SEED=${SEED:-42}
+# Optional image-to-video/reference smoke input.  The path is interpreted in
+# the render container, so callers normally use INIT_IMG=/work/init.png after
+# placing the image in OUTDIR.
+INIT_IMG=${INIT_IMG:-}
 F=$FRAMES; FPS=24
 mkdir -p "$OUTDIR"
 if [ "${LTX_CHAIN_SAVE_DIR:-}" != "" ] && [[ "$LTX_CHAIN_SAVE_DIR" == /work/* ]]; then
@@ -226,6 +230,11 @@ HIRES_ARGS=""
 if [ "$HIRES" = 1 ]; then
   HIRES_ARGS="--hires --hires-upscaler $HIRES_UPSCALER --hires-upscalers-dir /ltx2/latent_upscale_models --hires-steps $REFSTEPS --hires-denoising-strength $REFINE_DENOISING_STRENGTH"
   [ -n "$REFINE_SIGMAS" ] && HIRES_ARGS="$HIRES_ARGS --hires-sigmas $REFINE_SIGMAS"
+fi
+
+INIT_ARGS=""
+if [ -n "$INIT_IMG" ]; then
+  INIT_ARGS="--init-img $INIT_IMG"
 fi
 
 # ---- prod engine env (the beat-comfy nvfp4/fp8/cuDNN stack + leak-fix eviction) ----
@@ -263,7 +272,7 @@ INNER="$PROFILER stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --lora-model-dir /ltx2/loras \
   --ltx-chain-segments $SEGMENTS --ltx-chain-prompts /work/prompt.txt --ltx-chain-audio-dir /work/adir --cont-latent-frames 3 \
   -W $WIDTH -H $HEIGHT --video-frames $F --fps $FPS --steps $STEPS --sampling-method $SAMPLING_METHOD --cfg-scale 1.0 --diffusion-fa \
-  $HIRES_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s $SEED -v -o /work/_raw_$OUT_NAME"
+  $HIRES_ARGS $INIT_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s $SEED -v -o /work/_raw_$OUT_NAME"
 
 LOG="$OUTDIR/render.log"
 VRAM_LOG="$OUTDIR/vram.log"
