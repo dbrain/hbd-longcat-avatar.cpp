@@ -2661,7 +2661,7 @@ protected:
                      " [params: partial=%.0f prefetched=%.0f pool=%.0f(%zu) runtime=%.0f resident=%.0f]",
                      get_desc().c_str(),
                      (cuda_total - cuda_free) / 1048576.0,
-                     compute_buffer_size / 1048576.0,
+                     ggml_gallocr_get_buffer_size(compute_allocr, 0) / 1048576.0,
                      cuda_free / 1048576.0, cuda_total / 1048576.0,
                      bufmb(partial_runtime_params_buffer), bufmb(prefetched_state_.buf),
                      pool_mb, prefetch_buf_pool_.size(),
@@ -2690,7 +2690,7 @@ protected:
                               [](const auto& a, const auto& b) { return a.first > b.first; });
             LOG_INFO("[TENSORS] %s: %d nodes, sum=%.0f MB, gallocr peak=%.0f MB (reuse x%.1f). top %zu:",
                      get_desc().c_str(), n_nodes, total / 1048576.0,
-                     compute_buffer_size / 1048576.0,
+                     ggml_gallocr_get_buffer_size(compute_allocr, 0) / 1048576.0,
                      compute_buffer_size > 0 ? (double)total / (double)compute_buffer_size : 0.0,
                      topn);
             for (size_t i = 0; i < topn; ++i) {
@@ -4250,6 +4250,36 @@ protected:
                 restore_partial_params();
             }
             return std::nullopt;
+        }
+        // Exact post-allocation board accounting for long-window VRAM work. This
+        // is intentionally after both weight offload and gallocr allocation: it
+        // records the simultaneous live set rather than an idle/pool snapshot.
+        // Both the DiT and LTX video VAE participate in the long-window memory
+        // budget.  Keep this instrumentation opt-in, but include the VAE so a
+        // decode peak can be attributed to live compute/cache/parameter buffers
+        // rather than inferred from the driver's aggregate alone.
+        const bool longcat_live_vram_runner = get_desc() == "ltxav" || get_desc() == "ltx_video_vae";
+        if (getenv("LONGCAT_LIVE_VRAM") != nullptr && longcat_live_vram_runner && !sd_backend_is_cpu(runtime_backend)) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_t device = ggml_backend_get_device(runtime_backend);
+            if (device != nullptr) {
+                ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+            }
+            auto mb = [](ggml_backend_buffer_t buffer) {
+                return buffer != nullptr ? ggml_backend_buffer_get_size(buffer) / 1048576.0 : 0.0;
+            };
+            double pool_mb = 0.0;
+            for (ggml_backend_buffer_t buffer : prefetch_buf_pool_) pool_mb += mb(buffer);
+            LOG_INFO("[VRAM-LIVE] %s used=%.0f MB compute=%.0f partial=%.0f prefetched=%.0f pool=%.0f resident=%.0f runtime=%.0f cache=%.0f",
+                     get_desc().c_str(),
+                     (total_bytes - free_bytes) / 1048576.0,
+                     ggml_gallocr_get_buffer_size(compute_allocr, 0) / 1048576.0,
+                     mb(partial_runtime_params_buffer),
+                     mb(prefetched_state_.buf),
+                     pool_mb,
+                     mb(resident_runtime_params_buffer),
+                     mb(runtime_params_buffer),
+                     mb(cache_buffer));
         }
         int64_t t_alloc_end = ggml_time_ms();
 

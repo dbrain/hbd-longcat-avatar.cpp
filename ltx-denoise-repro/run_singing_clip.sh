@@ -56,6 +56,29 @@
 #                      video VAE decode spatial tiling. 2x2 is the locked conservative default;
 #                      2x1/1x2 are quality-neutral candidates to validate for fewer tile passes
 #                      if VRAM allows.
+#   VAE_SPATIOTEMPORAL_BLEND=1 VAE_SPATIAL_TILES=1x2
+#                      opt-in hybrid decoder: each feathered spatial tile is also decoded in
+#                      independent temporal windows. Pair with VAE_TBLEND_FRAMES=6 and
+#                      VAE_TBLEND_OVERLAP=2 for the first 97f/193f ladder runs.
+#   VAE_TEMPORAL_STREAM=1
+#                      use causal decoder-feature context across temporal windows instead of
+#                      cross-fading two independent mouth motions; recommended for long clips.
+#   UPSCALER_TBLEND_FRAMES=8 UPSCALER_TBLEND_OVERLAP=2
+#                      run the latent spatial upscaler in temporal windows, retaining already
+#                      produced overlap frames rather than blending two outputs. Required when a
+#                      full long-clip upscale exceeds the VRAM cap; unset to keep full-clip mode.
+#   BASE_TBLEND_FRAMES=12 BASE_TBLEND_OVERLAP=4
+#                      sample the audio-driven base DiT in temporal windows using each window's
+#                      matching driving-audio slice. Completed video overlap is frozen as context;
+#                      use this when long single-pass A2V loses lip-sync without raising A2V guidance.
+#   VAE_TEMPORAL_BLEND=1
+#                      whole-spatial temporal-blend control; set VAE_SPATIAL_TILES='' so this
+#                      mode is selected instead of the spatial decoder.
+#   REFINE_TEMPORAL_BLEND=1
+#                      opt-in high-res refine windowing. The full base pass remains coherent;
+#                      only the x2 three-step detail pass runs in overlapping temporal latent
+#                      windows, then blends them. Use REFINE_TBLEND_FRAMES=8 and
+#                      REFINE_TBLEND_OVERLAP=2 with long single segments.
 #   LONGCAT_OFFLOAD_PROFILE=1
 #                      emit aggregated graph-cut offload/copy/compute timings. Adds syncs, so use
 #                      for profiling rather than headline wall comparisons.
@@ -127,7 +150,7 @@ DIT=${DIT:-nvfp4-imatrix-dev050.gguf}
 FFMPEG=${FFMPEG:-linuxserver/ffmpeg}
 GPU=${GPU:-1}                                          # device index (5060 Ti = 1)
 
-SEGMENTS=${SEGMENTS:-2}; HIRES=${HIRES:-1}; DROP=${DROP:-24}
+SEGMENTS=${SEGMENTS:-2}; HIRES=${HIRES:-1}; DROP=${DROP:-24}; FRAMES=${FRAMES:-97}
 WIDTH=${WIDTH:-960}; HEIGHT=${HEIGHT:-544}
 HIRES_UPSCALER=${HIRES_UPSCALER:-ltx-2.3-spatial-upscaler-x2-1.1}
 MAXV=${MAXV:-9}
@@ -140,7 +163,24 @@ REFINE_DENOISING_STRENGTH=${REFINE_DENOISING_STRENGTH:-0.7}
 USE_HIRES_STRENGTH=${USE_HIRES_STRENGTH:-0}
 REFINE_CONST_SEED=${REFINE_CONST_SEED:-0}
 SKIP_AUDIO_DECODE=${SKIP_AUDIO_DECODE:-1}
-VAE_SPATIAL_TILES=${VAE_SPATIAL_TILES:-2x2}
+# The prompt embeddings are materialized on the host before sampling.  Keeping
+# Gemma/projection GPU residency after that is dead weight for a single long
+# window, and can coexist with the refine reserve.  A caller can retain it for
+# multi-prompt chains by explicitly setting this to 0.
+FREE_TE_PARAMS=${LTXAV_FREE_TE_PARAMS:-1}
+VAE_SPATIAL_TILES=${VAE_SPATIAL_TILES-2x2}
+VAE_TEMPORAL_BLEND=${VAE_TEMPORAL_BLEND:-0}
+VAE_SPATIOTEMPORAL_BLEND=${VAE_SPATIOTEMPORAL_BLEND:-0}
+VAE_TEMPORAL_STREAM=${VAE_TEMPORAL_STREAM:-0}
+VAE_TBLEND_FRAMES=${VAE_TBLEND_FRAMES:-6}
+VAE_TBLEND_OVERLAP=${VAE_TBLEND_OVERLAP:-2}
+UPSCALER_TBLEND_FRAMES=${UPSCALER_TBLEND_FRAMES:-}
+UPSCALER_TBLEND_OVERLAP=${UPSCALER_TBLEND_OVERLAP:-2}
+BASE_TBLEND_FRAMES=${BASE_TBLEND_FRAMES:-}
+BASE_TBLEND_OVERLAP=${BASE_TBLEND_OVERLAP:-4}
+REFINE_TEMPORAL_BLEND=${REFINE_TEMPORAL_BLEND:-0}
+REFINE_TBLEND_FRAMES=${REFINE_TBLEND_FRAMES:-8}
+REFINE_TBLEND_OVERLAP=${REFINE_TBLEND_OVERLAP:-2}
 LONGCAT_PERSIST_GRAPH_INPUTS=${LONGCAT_PERSIST_GRAPH_INPUTS:-1}
 LONGCAT_ATTN_TILES=${LONGCAT_ATTN_TILES:-2}
 SA3_DELTA_F16=${GGML_LTX_SA3_DELTA_F16:-1}
@@ -150,7 +190,8 @@ PROFILER=${PROFILER:-}
 NCU=${NCU:-0}
 OUT_NAME=${OUT_NAME:-singing_clip.webm}
 OUTDIR=${OUTDIR:-$WT/ltx-denoise-repro/_singing_out}
-F=97; FPS=24
+SEED=${SEED:-42}
+F=$FRAMES; FPS=24
 mkdir -p "$OUTDIR"
 
 PROMPT="Locked-off medium close-up portrait of a young man with tousled dark brown hair and light stubble, wearing a blue denim jacket over a white t-shirt, centred against a soft warm-lit plain studio background. He looks straight into the camera and sings along to the song with clear, expressive, exaggerated mouth movements, enunciating every word, lips and jaw opening and closing distinctly in time with the vocals. He stays centred and holds his position, only his head, mouth and shoulders moving as he sings. The camera is completely static and locked off — no camera movement, no zoom, no cuts, one continuous take."
@@ -182,15 +223,21 @@ ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -
   -e GGML_LTX_SA3=$SA3_ENABLED -e GGML_LTX_SA3_POLICY=$SA3_POLICY -e GGML_LTX_SA3_DELTA_F16=$SA3_DELTA_F16
   -e LONGCAT_SHARED_RESIDENT=1 -e LONGCAT_VAE_KEEP_RESIDENT=0 -e LONGCAT_FFN_TILE_TOKENS=8192 -e LONGCAT_ENCODE_MAX_VRAM=6.5
   -e LONGCAT_NO_PREFETCH_POOL=1 -e LONGCAT_OFFLOAD_PREFETCH_THREAD=1 -e LONGCAT_NO_OFFLOAD_PIPELINING=0 -e LONGCAT_DIT_NO_MMAP=0
-  -e LTXAV_VAE_LAZY=1 -e LTXAV_DIT_FREE_DURING_DECODE=1 -e LONGCAT_VRAM_BREAKDOWN=1
+  -e LTXAV_VAE_LAZY=1 -e LTXAV_DIT_FREE_DURING_DECODE=1 -e LTXAV_FREE_TE_PARAMS=$FREE_TE_PARAMS -e LONGCAT_VRAM_BREAKDOWN=1
   -e LTX_VAE_HEAD_F32=1 -e LTX_VAE_CONV3D_WTILES=16 -e LTX_VAE_CONV3D_HTILES=8 -e LTX_VAE_DECODE_F16=1
-  -e LTX_VAE_SPATIAL_TILES=$VAE_SPATIAL_TILES -e LTX_VAE_SPATIAL_OVERLAP=4
   -e LTX_CUSTOM_SIGMAS=1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0.0
   -e LTXAV_CHAIN_OVERLAP_DROP=$DROP )
+[ -n "$VAE_SPATIAL_TILES" ] && ENV+=( -e LTX_VAE_SPATIAL_TILES=$VAE_SPATIAL_TILES -e LTX_VAE_SPATIAL_OVERLAP=4 )
+[ "$VAE_TEMPORAL_BLEND" != 0 ] && ENV+=( -e LTX_VAE_TEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=$VAE_TBLEND_FRAMES -e LTX_VAE_TBLEND_OVERLAP=$VAE_TBLEND_OVERLAP )
+[ "$VAE_SPATIOTEMPORAL_BLEND" != 0 ] && ENV+=( -e LTX_VAE_SPATIOTEMPORAL_BLEND=1 -e LTX_VAE_TBLEND_FRAMES=$VAE_TBLEND_FRAMES -e LTX_VAE_TBLEND_OVERLAP=$VAE_TBLEND_OVERLAP )
+[ "$VAE_TEMPORAL_STREAM" != 0 ] && ENV+=( -e LTX_VAE_TEMPORAL_STREAM=1 )
+[ -n "$UPSCALER_TBLEND_FRAMES" ] && ENV+=( -e LTX_UPSCALER_TEMPORAL_WINDOW=$UPSCALER_TBLEND_FRAMES -e LTX_UPSCALER_TEMPORAL_OVERLAP=$UPSCALER_TBLEND_OVERLAP )
+[ -n "$BASE_TBLEND_FRAMES" ] && ENV+=( -e LTX_BASE_TEMPORAL_WINDOW=$BASE_TBLEND_FRAMES -e LTX_BASE_TEMPORAL_OVERLAP=$BASE_TBLEND_OVERLAP )
+[ "$REFINE_TEMPORAL_BLEND" != 0 ] && ENV+=( -e LTX_REFINE_TEMPORAL_BLEND=1 -e LTX_REFINE_TBLEND_FRAMES=$REFINE_TBLEND_FRAMES -e LTX_REFINE_TBLEND_OVERLAP=$REFINE_TBLEND_OVERLAP )
 [ "$REFINE_CONST_SEED" != 0 ] && ENV+=( -e LTX_REFINE_CONST_SEED=$REFINE_CONST_SEED )
 [ "$USE_HIRES_STRENGTH" != 0 ] && ENV+=( -e LTXAV_TWOSTAGE_USE_HIRES_STRENGTH=$USE_HIRES_STRENGTH )
 [ "$SKIP_AUDIO_DECODE" != 0 ] && ENV+=( -e LTXAV_SKIP_AUDIO_DECODE=1 )
-for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_OP_PROFILE LONGCAT_OP_PROFILE_MIN LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LONGCAT_CONT_PROF LONGCAT_ATTN_TILES LONGCAT_FFN_TILE_TOKENS LTX_ATTN_QTILE GGML_CUDNN_ATTN_BUCKET GGML_CUDNN_ATTN_BUCKETS GGML_CUDNN_OP_TRACE GGML_CUDNN_ATTN_EXEC_TRACE GGML_CUDNN_ATTN_TIMING GGML_CUDNN_ATTN_TIMING_SKIP GGML_CUDNN_ATTN_TIMING_MIN_LQ GGML_CUDNN_ATTN_BUILD_ALL_PLANS GGML_CUDNN_ATTN_PLAN_INDEX GGML_CUDNN_ATTN_PLAN_MIN_LQ CUDNN_FRONTEND_LOG_INFO CUDNN_FRONTEND_LOG_FILE GGML_FP8_ATTN GGML_FP8_ATTN_BC GGML_FP8_GEMM_EPILOGUE GGML_FP8_GEMM_PROFILE GGML_NVFP4_CUBLASLT_TRACE GGML_LTX_SA3 GGML_LTX_SA3_POLICY GGML_LTX_SA3_TIMING GGML_LTX_SA3_DELTA_F16 CUDA_LAUNCH_BLOCKING LONGCAT_CONT_REENCODE LTXAV_EXPOSURE_MATCH LTXAV_NO_EXPOSURE_MATCH LTXAV_CHAIN_HIRES_REFERENCE LTXAV_CHAIN_HIRES_REFERENCE_FRAMES LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LONGCAT_PERSIST_GRAPH_INPUTS; do
+for passthrough in LONGCAT_OFFLOAD_PROFILE LONGCAT_PROFILE LONGCAT_OP_PROFILE LONGCAT_OP_PROFILE_MIN LONGCAT_CONCAT_PROFILE LONGCAT_CONCAT_PROFILE_TOP LONGCAT_CONT_PROF LONGCAT_ATTN_TILES LONGCAT_FFN_TILE_TOKENS LTX_ATTN_QTILE GGML_CUDNN_ATTN_BUCKET GGML_CUDNN_ATTN_BUCKETS GGML_CUDNN_OP_TRACE GGML_CUDNN_ATTN_EXEC_TRACE GGML_CUDNN_ATTN_TIMING GGML_CUDNN_ATTN_TIMING_SKIP GGML_CUDNN_ATTN_TIMING_MIN_LQ GGML_CUDNN_ATTN_BUILD_ALL_PLANS GGML_CUDNN_ATTN_PLAN_INDEX GGML_CUDNN_ATTN_PLAN_MIN_LQ CUDNN_FRONTEND_LOG_INFO CUDNN_FRONTEND_LOG_FILE GGML_FP8_ATTN GGML_FP8_ATTN_BC GGML_FP8_GEMM_EPILOGUE GGML_FP8_GEMM_PROFILE GGML_NVFP4_CUBLASLT_TRACE GGML_LTX_SA3 GGML_LTX_SA3_POLICY GGML_LTX_SA3_DELTA_F16 CUDA_LAUNCH_BLOCKING LONGCAT_CONT_REENCODE LTXAV_EXPOSURE_MATCH LTXAV_NO_EXPOSURE_MATCH LTXAV_CHAIN_HIRES_REFERENCE LTXAV_CHAIN_HIRES_REFERENCE_FRAMES LTXAV_CHAIN_CUDNN_RESET LTXAV_CHAIN_POOL_TRIM LTXAV_END_RENDER_RECLAIM LONGCAT_SHARED_RESIDENT_MAX_MB LTXAV_REFINE_MAX_VRAM LTXAV_REFINE_SHARED_RESIDENT_MAX_MB LTXAV_A2V_GUIDANCE LTXAV_A2V_RAMP_END LONGCAT_PERSIST_GRAPH_INPUTS LONGCAT_LIVE_VRAM; do
   if [ "${!passthrough+x}" = x ]; then
     ENV+=( -e "$passthrough=${!passthrough}" )
   fi
@@ -204,11 +251,11 @@ INNER="$PROFILER stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --lora-model-dir /ltx2/loras \
   --ltx-chain-segments $SEGMENTS --ltx-chain-prompts /work/prompt.txt --ltx-chain-audio-dir /work/adir --cont-latent-frames 3 \
   -W $WIDTH -H $HEIGHT --video-frames $F --fps $FPS --steps $STEPS --sampling-method $SAMPLING_METHOD --cfg-scale 1.0 --diffusion-fa \
-  $HIRES_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s 42 -v -o /work/_raw_$OUT_NAME"
+  $HIRES_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s $SEED -v -o /work/_raw_$OUT_NAME"
 
 LOG="$OUTDIR/render.log"
 VRAM_LOG="$OUTDIR/vram.log"
-echo "[render] DIT=$DIT MAXV=$MAXV REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS HIRES=$HIRES hires_upscaler=$HIRES_UPSCALER WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS attn_tiles=$LONGCAT_ATTN_TILES"
+echo "[render] DIT=$DIT MAXV=$MAXV SEED=$SEED REFINE_MAXV=${LTXAV_REFINE_MAX_VRAM:-<same>} SEGMENTS=$SEGMENTS FRAMES=$F HIRES=$HIRES hires_upscaler=$HIRES_UPSCALER WIDTH=$WIDTH HEIGHT=$HEIGHT DROP=$DROP sampler=$SAMPLING_METHOD sigmas=${REFINE_SIGMAS:-<generated>} denoise_strength=$REFINE_DENOISING_STRENGTH use_hires_strength=$USE_HIRES_STRENGTH const_seed=$REFINE_CONST_SEED skip_audio_decode=$SKIP_AUDIO_DECODE vae_tiles=$VAE_SPATIAL_TILES temporal_blend=$VAE_TEMPORAL_BLEND spatiotemporal_blend=$VAE_SPATIOTEMPORAL_BLEND temporal_stream=$VAE_TEMPORAL_STREAM temporal_tile=$VAE_TBLEND_FRAMES/$VAE_TBLEND_OVERLAP base_temporal_tile=${BASE_TBLEND_FRAMES:-<full>}/$BASE_TBLEND_OVERLAP upscaler_temporal_tile=${UPSCALER_TBLEND_FRAMES:-<full>}/$UPSCALER_TBLEND_OVERLAP refine_temporal_blend=$REFINE_TEMPORAL_BLEND refine_tile=$REFINE_TBLEND_FRAMES/$REFINE_TBLEND_OVERLAP persist_graph_inputs=$LONGCAT_PERSIST_GRAPH_INPUTS attn_tiles=$LONGCAT_ATTN_TILES"
 rm -f "$LOG" "$VRAM_LOG"
 : > "$VRAM_LOG"
 ( while :; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU" 2>/dev/null >> "$VRAM_LOG"; sleep 1; done ) &

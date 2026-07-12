@@ -1503,9 +1503,24 @@ struct LTXVideoVAE : public VAE {
 
     sd::Tensor<float> decode_temporal_tiled_streaming(const int n_threads,
                                                       const sd::Tensor<float>& input,
-                                                      size_t expected_dim) {
+                                                      size_t expected_dim,
+                                                      int requested_frames = 0,
+                                                      int requested_overlap = -1) {
         const int64_t total_frames = input.shape()[2];
         TemporalTilePlan plan      = resolve_temporal_tile_plan(total_frames);
+        if (requested_frames > 0) {
+            plan.frames = std::max(1, requested_frames);
+            plan.overlap = std::max(0, requested_overlap);
+            if (plan.overlap >= plan.frames) {
+                plan.overlap = plan.frames - 1;
+            }
+            if (total_frames > 1 && plan.overlap >= total_frames) {
+                plan.overlap = static_cast<int>(total_frames - 1);
+            }
+            plan.stride = std::max(1, plan.frames - plan.overlap);
+            const int64_t tiled_frames = std::max<int64_t>(1, total_frames - plan.overlap);
+            plan.num_tiles = static_cast<int>((tiled_frames + plan.stride - 1) / plan.stride);
+        }
 
         LOG_DEBUG("Using streaming temporal tiling: temporal_tile_frames=%d, temporal_tile_overlap=%d, total latent frames=%lld, resulting in %d tiles",
                   plan.frames,
@@ -1681,7 +1696,11 @@ struct LTXVideoVAE : public VAE {
     sd::Tensor<float> decode_spatial_blend(const int n_threads,
                                            const sd::Tensor<float>& input,
                                            size_t expected_dim,
-                                           int NX, int NY, int O) {
+                                           int NX, int NY, int O,
+                                           bool temporal_blend = false,
+                                           bool temporal_stream = false,
+                                           int temporal_tile_frames = 0,
+                                           int temporal_tile_overlap = 0) {
         const int64_t total_start_ms = ggml_time_ms();
         const int64_t Wl = input.shape()[0];
         const int64_t Hl = input.shape()[1];
@@ -1726,35 +1745,58 @@ struct LTXVideoVAE : public VAE {
                 const int64_t x0  = std::max<int64_t>(0, cx0 - O);
                 const int64_t x1  = std::min<int64_t>(Wl, cx1 + O);
 
-                // Latent tile [x0,x1) x [y0,y1), ALL frames/channels -> whole-temporal decode.
+                // Latent tile [x0,x1) x [y0,y1). The normal path decodes all frames in one
+                // graph; the explicit hybrid path further bounds its activation floor with
+                // temporal windows before this spatial feathering pass.
                 auto z_tile = sd::ops::slice(input, 0, x0, x1);
                 z_tile      = sd::ops::slice(z_tile, 1, y0, y1);
 
-                free_cache_ctx_and_buffer();
-                cache_tensor_map.clear();
-                // Decode this spatial tile through the SAME graph builder decode_temporal_blend
-                // uses (build_temporal_tile_graph -> decode_tiled_chunk -> forward_tiled_frame), so
-                // the conv3d routing matches the proven temporal path. build_graph()/vae.decode()'s
-                // whole-decode conv path hits `im2col.cu GGML_ASSERT(src1->type == F32)` under
-                // LTX_VAE_DECODE_F16=1 + GGML_CUDNN_CONV3D=1 (a stride/dilation-1 conv that the cuDNN
-                // matcher rejects falls back to im2col with an F16 activation); the tiled-frame path
-                // does not. z_tile holds ALL latent frames (we only slice dims 0/1) and is decoded as
-                // ONE chunk (idx 0, overlap 0) -> NO temporal chop. chunk_idx==0 makes the causal
-                // drop-first trim fire identically for every spatial tile, so all tiles share the
-                // same output frame count (f*8-7 = full clip length).
                 int64_t tile_runner_start = ggml_time_ms();
                 double tile_graph_local_s = 0.0;
-                // Spatial tiles contain the full temporal clip and have no following temporal
-                // chunk, so the causal feat-cache tensors are never consumed.
-                const bool export_temporal_cache = false;
-                auto get_graph = [&]() -> ggml_cgraph* {
-                    int64_t graph_start = ggml_time_ms();
-                    ggml_cgraph* graph  = build_temporal_tile_graph(z_tile, 0, 0, export_temporal_cache);
-                    tile_graph_local_s += (ggml_time_ms() - graph_start) * 1.0 / 1000.0;
-                    return graph;
-                };
-                auto tile      = restore_trailing_singleton_dims(
-                    GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                sd::Tensor<float> tile;
+                if (temporal_blend) {
+                    LOG_DEBUG("LTX VAE spatiotemporal %s tile %d,%d: latent [%lld,%lld)x[%lld,%lld), temporal tile=%d overlap=%d",
+                              temporal_stream ? "stream" : "blend",
+                              tx, ty, (long long)x0, (long long)x1, (long long)y0, (long long)y1,
+                              temporal_tile_frames, temporal_tile_overlap);
+                    // A feather blend mixes two independently decoded mouth motions at every
+                    // temporal overlap. For long clips that reads as periodic lip-sync loss.
+                    // The streaming path carries the decoder's causal feature maps forward and
+                    // emits each overlap only once, preserving temporal state instead.
+                    tile = temporal_stream
+                               ? decode_temporal_tiled_streaming(n_threads,
+                                                                 z_tile,
+                                                                 expected_dim,
+                                                                 temporal_tile_frames,
+                                                                 temporal_tile_overlap)
+                               : decode_temporal_blend(n_threads,
+                                                       z_tile,
+                                                       expected_dim,
+                                                       temporal_tile_frames,
+                                                       temporal_tile_overlap);
+                } else {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    // Decode this spatial tile through the SAME graph builder decode_temporal_blend
+                    // uses (build_temporal_tile_graph -> decode_tiled_chunk -> forward_tiled_frame), so
+                    // the conv3d routing matches the proven temporal path. build_graph()/vae.decode()'s
+                    // whole-decode conv path hits `im2col.cu GGML_ASSERT(src1->type == F32)` under
+                    // LTX_VAE_DECODE_F16=1 + GGML_CUDNN_CONV3D=1 (a stride/dilation-1 conv that the cuDNN
+                    // matcher rejects falls back to im2col with an F16 activation); the tiled-frame path
+                    // does not. z_tile holds ALL latent frames (we only slice dims 0/1) and is decoded as
+                    // ONE chunk (idx 0, overlap 0) -> NO temporal chop. chunk_idx==0 makes the causal
+                    // drop-first trim fire identically for every spatial tile, so all tiles share the
+                    // same output frame count (f*8-7 = full clip length).
+                    const bool export_temporal_cache = false;
+                    auto get_graph = [&]() -> ggml_cgraph* {
+                        int64_t graph_start = ggml_time_ms();
+                        ggml_cgraph* graph  = build_temporal_tile_graph(z_tile, 0, 0, export_temporal_cache);
+                        tile_graph_local_s += (ggml_time_ms() - graph_start) * 1.0 / 1000.0;
+                        return graph;
+                    };
+                    tile = restore_trailing_singleton_dims(
+                        GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+                }
                 const double tile_runner_local_s = (ggml_time_ms() - tile_runner_start) * 1.0 / 1000.0;
                 tile_runner_s += tile_runner_local_s;
                 tile_graph_s += tile_graph_local_s;
@@ -1907,9 +1949,9 @@ struct LTXVideoVAE : public VAE {
                 input = sd::ops::slice(input, 2, 0, cropped_t);
             }
         }
-        // LTX_VAE_SPATIAL_TILES=NxM: Comfy-style feathered SPATIAL tiling (all frames per tile, NO
-        // temporal chopping). Highest-priority decode path; additive/gated -> every existing path is
-        // untouched when the env is unset. Overlap in LATENT px via LTX_VAE_SPATIAL_OVERLAP (def 6).
+        // LTX_VAE_SPATIAL_TILES=NxM: Comfy-style feathered SPATIAL tiling. With the explicit
+        // LTX_VAE_SPATIOTEMPORAL_BLEND switch, each spatial tile is independently temporal-blended
+        // too. The switch is deliberately separate so the established spatial-only path is inert.
         if (decode_graph && input.dim() >= 4 && input.shape()[2] >= 1 &&
             getenv("LTX_VAE_SPATIAL_TILES") != nullptr) {
             const std::string spec = getenv("LTX_VAE_SPATIAL_TILES");
@@ -1918,9 +1960,19 @@ struct LTXVideoVAE : public VAE {
             const size_t xpos = spec.find_first_of("xX");
             if (xpos != std::string::npos) { NY = std::max(1, atoi(spec.c_str() + xpos + 1)); }
             const int O = wholeframe_env_int("LTX_VAE_SPATIAL_OVERLAP", 6);
-            LOG_INFO("LTX VAE spatial-blend decode: tiles=%dx%d overlap=%d latent px (all-frames per tile, feathered, no temporal tiling)",
-                     NX, NY, O);
-            return decode_spatial_blend(n_threads, input, expected_dim, NX, NY, O);
+            const bool hybrid = input.shape()[2] > 1 && getenv("LTX_VAE_SPATIOTEMPORAL_BLEND") != nullptr;
+            const bool hybrid_stream = hybrid && getenv("LTX_VAE_TEMPORAL_STREAM") != nullptr;
+            const int T = hybrid ? wholeframe_env_int("LTX_VAE_TBLEND_FRAMES", DEFAULT_TEMPORAL_TILE_FRAMES) : 0;
+            const int TO = hybrid ? wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 2) : 0;
+            if (hybrid) {
+                LOG_INFO("LTX VAE spatiotemporal-%s decode: spatial tiles=%dx%d overlap=%d latent px, temporal tile=%d overlap=%d latent frames",
+                         hybrid_stream ? "stream" : "blend",
+                         NX, NY, O, T, TO);
+            } else {
+                LOG_INFO("LTX VAE spatial-blend decode: tiles=%dx%d overlap=%d latent px (all-frames per tile, feathered, no temporal tiling)",
+                         NX, NY, O);
+            }
+            return decode_spatial_blend(n_threads, input, expected_dim, NX, NY, O, hybrid, hybrid_stream, T, TO);
         }
         // LTX_VAE_TEMPORAL_BLEND: length-independent, seam-free decode. Decode the latent in
         // INDEPENDENT temporal tiles (bounds the full-res feature-map floor to a T-frame tile) and
