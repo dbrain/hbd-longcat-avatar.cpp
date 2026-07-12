@@ -10671,7 +10671,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                         sd::Tensor<float> window_noise,
                                         const sd::Tensor<float>& window_mask,
                                         const sd::Tensor<float>& window_video_positions,
-                                        const sd::Tensor<float>& window_audio_positions) {
+                                        const sd::Tensor<float>& window_audio_positions,
+                                        const sd::Tensor<float>& window_video_reference) {
             return sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                       true,
                                       window_latent,
@@ -10702,7 +10703,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                       // and its appended clean reference.  Mark it fixed here
                                       // as well so the audio adaLN sees timestep zero.
                                       latents.audio_fixed || latents.audio_reference_conditioning,
-                                      hires_video_reference);
+                                      window_video_reference);
         };
 
         // Continuation's high-res guide has the same spatial grid as the
@@ -10726,7 +10727,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                 std::move(noise),
                                                 hires_denoise_mask,
                                                 hires_video_positions,
-                                                latents.audio_positions);
+                                                latents.audio_positions,
+                                                hires_video_reference);
         } else {
             int temporal_window = 8;
             int temporal_overlap = 2;
@@ -10741,6 +10743,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             const int64_t total_frames = x_t.shape()[2];
             const int64_t stride = temporal_window - temporal_overlap;
             const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
+            // A fixed overlap gives a tile motion context but it falls out of the
+            // attention horizon on the following tile.  Keep one model-generated
+            // refined frame as a *separate* reference-token block after the first
+            // tile has established the subject.  This is the same two-memory
+            // pattern used by LTX's looping sampler: short contiguous context for
+            // motion, plus a small non-contiguous appearance anchor for identity.
+            // It is intentionally opt-in: T2V has no reliable subject before the
+            // first tile, and I2V should be able to re-anchor as pose changes.
+            int anchor_frames = 0;
+            int anchor_refresh = 0;
+            if (hires_video_reference.empty()) {
+                if (const char* e = std::getenv("LTX_REFINE_TEMPORAL_ANCHOR_FRAMES"); e != nullptr) {
+                    anchor_frames = std::max(0, std::atoi(e));
+                }
+                if (const char* e = std::getenv("LTX_REFINE_TEMPORAL_ANCHOR_REFRESH"); e != nullptr) {
+                    anchor_refresh = std::max(0, std::atoi(e));
+                }
+            }
+            anchor_frames = std::min<int>(anchor_frames, temporal_window - 1);
             const bool has_audio = latents.audio_length > 0 && x_t.shape()[3] > latent_channels;
             sd::Tensor<float> full_video = sd::ops::slice(x_t, 3, 0, latent_channels);
             sd::Tensor<float> full_noise = sd::ops::slice(noise, 3, 0, latent_channels);
@@ -10775,6 +10796,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 // high-res detail stage receives a real local temporal history.
                 sd::Tensor<float> video_result(full_video.shape());
                 video_result.fill_(0.0f);
+                sd::Tensor<float> appearance_anchor;
+                int64_t            appearance_anchor_start = 0;
                 sd::Tensor<float> refined_audio;
                 int tile_index = 0;
                 int64_t produced_end = 0;
@@ -10831,12 +10854,21 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 
                     LOG_INFO("LTX refine temporal-window tile %d: latent [%lld,%lld), window=%d frozen-overlap=%lld",
                              tile_index, (long long)tile_start, (long long)end, temporal_window, (long long)frozen);
+                    const bool use_appearance_anchor = !appearance_anchor.empty();
                     auto refine_video_positions = refine_reference_windowable
                         ? build_ltxav_window_video_positions_with_reference(video_tile.shape()[0],
                                                                               video_tile.shape()[1],
                                                                               tile_start,
                                                                               length,
                                                                               hires_video_reference.shape()[2],
+                                                                              hires_request.fps,
+                                                                              hires_request.vae_scale_factor)
+                        : use_appearance_anchor
+                        ? build_ltxav_window_video_positions_with_reference(video_tile.shape()[0],
+                                                                              video_tile.shape()[1],
+                                                                              tile_start,
+                                                                              length,
+                                                                              appearance_anchor.shape()[2],
                                                                               hires_request.fps,
                                                                               hires_request.vae_scale_factor)
                         : build_ltxav_window_video_positions(video_tile.shape()[0],
@@ -10849,7 +10881,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                      std::move(packed_noise),
                                                      mask_tile,
                                                      refine_video_positions,
-                                                     refine_audio_positions);
+                                                     refine_audio_positions,
+                                                     use_appearance_anchor ? appearance_anchor : hires_video_reference);
                     if (tile.empty()) {
                         final_latent = {};
                         break;
@@ -10877,6 +10910,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                         }
                     }
                     produced_end = std::max(produced_end, end);
+                    // Establish only after tile 0 has produced a real subject, not
+                    // from an external first-frame portrait.  Periodic re-anchoring
+                    // keeps the reference compatible with evolving hair/pose instead
+                    // of freezing the initial appearance for the entire clip.
+                    const bool establish_anchor = appearance_anchor.empty() && anchor_frames > 0 && tile_index == 0;
+                    const bool refresh_anchor = !appearance_anchor.empty() && anchor_refresh > 0 &&
+                                                tile_index > 0 && tile_index % anchor_refresh == 0;
+                    if (establish_anchor || refresh_anchor) {
+                        const int64_t anchor_end = end;
+                        const int64_t anchor_start = std::max<int64_t>(tile_start + frozen, anchor_end - anchor_frames);
+                        const int64_t count = anchor_end - anchor_start;
+                        if (count > 0) {
+                            appearance_anchor = sd::ops::slice(video_result, 2, anchor_start, anchor_end);
+                            appearance_anchor_start = anchor_start;
+                            LOG_INFO("LTX refine temporal appearance-anchor: %s latent [%lld,%lld) for later tiles",
+                                     establish_anchor ? "established" : "refreshed",
+                                     (long long)appearance_anchor_start, (long long)anchor_end);
+                        }
+                    }
                     if (end == total_frames) {
                         final_latent = has_audio ? pack_ltxav_audio_and_video_latents(video_result, refined_audio) : std::move(video_result);
                         break;
