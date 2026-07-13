@@ -9378,7 +9378,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (std::getenv("LTXAV_RELIP_TWOSTAGE") != nullptr &&
         std::string(std::getenv("LTXAV_RELIP_TWOSTAGE")) != "0" &&
         sd_version_is_ltxav(sd_ctx->sd->version) &&
-        sd_vid_gen_params->control_frames_size > 0) {
+        sd_vid_gen_params->control_frames_size > 0 &&
+        sd_vid_gen_params->v2v_mode == 0) {  // relip (lipdub) ONLY — NOT SDEdit(1)/guide-edit(2),
+                                             // which share control_frames but must not two-stage
+                                             // (else the prod LTXAV_RELIP_TWOSTAGE=1 env breaks all v2v)
         if (strlen(SAFE_STR(request.hires.model_path)) == 0) {
             LOG_ERROR("LTXAV_RELIP_TWOSTAGE=1 requires the LTX latent upsampler model (pass --hires-model <spatial_upsampler.safetensors>)");
             return false;
