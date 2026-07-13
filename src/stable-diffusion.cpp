@@ -3615,6 +3615,7 @@ const char* scheduler_to_str[] = {
     "lcm",
     "bong_tangent",
     "ltx2",
+    "linear_quadratic",
 };
 
 const char* sd_scheduler_name(enum scheduler_t scheduler) {
@@ -4080,6 +4081,8 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->height                                = 512;
     sd_vid_gen_params->strength                              = 0.75f;
     sd_vid_gen_params->v2v_mode                              = 0;
+    sd_vid_gen_params->v2v_guide_strength                    = 1.0f;
+    sd_vid_gen_params->v2v_guide_latent_path                 = nullptr;
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
@@ -4651,6 +4654,12 @@ struct SamplePlan {
     int high_noise_sample_steps                   = 0;
     int total_steps                               = 0;
     float moe_boundary                            = 0.f;
+    // GUIDE-EDIT (sd_vid_gen_params->v2v_mode==2): DEFAULT the source-as-guide edit path to the
+    // `linear_quadratic` schedule (the Director-2 guide schedule; prod LTX_CUSTOM_SIGMAS reproduces
+    // it bit-for-bit) when the request left scheduler unset, running the full step budget. Only a
+    // default — an explicit scheduler / LTX_CUSTOM_SIGMAS / custom_sigmas still win (for GPU A/B).
+    // false on every other path.
+    bool v2v_guide_edit                           = false;
     std::vector<float> sigmas;
 
     SamplePlan(sd_ctx_t* sd_ctx,
@@ -4676,7 +4685,8 @@ struct SamplePlan {
             high_noise_extra_sample_args = sd_vid_gen_params->high_noise_sample_params.extra_sample_args;
             high_noise_eta               = sd_vid_gen_params->high_noise_sample_params.eta;
         }
-        moe_boundary = sd_vid_gen_params->moe_boundary;
+        moe_boundary    = sd_vid_gen_params->moe_boundary;
+        v2v_guide_edit  = (sd_vid_gen_params->v2v_mode == 2);
         resolve(sd_ctx, &request, &sd_vid_gen_params->sample_params);
     }
 
@@ -4733,6 +4743,18 @@ struct SamplePlan {
             scheduler_t scheduler = resolve_scheduler(sd_ctx,
                                                       sample_params->scheduler,
                                                       sample_method);
+            // GUIDE-EDIT defaults to `linear_quadratic` — the schedule the Director-2 workflow uses
+            // for guide-conditioned edits (and what prod LTX_CUSTOM_SIGMAS reproduces bit-for-bit).
+            // It front-loads the mid/low-noise band (σ≈0.4–0.9) that the guide leans on to hold the
+            // source scene, where LTX2's back-loaded flow curve wastes those steps up high. Only
+            // DEFAULTS it (when the request left scheduler unset) so a GPU pass can A/B by naming an
+            // explicit scheduler. (Explicit LTX_CUSTOM_SIGMAS / custom_sigmas above still win.)
+            if (v2v_guide_edit && sd_version_is_ltxav(sd_ctx->sd->version) &&
+                sample_params->scheduler == SCHEDULER_COUNT) {
+                scheduler = LINEAR_QUADRATIC_SCHEDULER;
+                LOG_INFO("LTXAV guide-edit: defaulting to linear_quadratic scheduler (%d full steps; "
+                         "SDEdit truncation by edit strength applied after)", total_steps);
+            }
             int sample_seq_len    = sd_ctx->sd->get_image_seq_len(request->height, request->width);
             if (sd_version_is_ltxav(sd_ctx->sd->version) && request->frames > 0) {
                 int latent_frames = ((request->frames - 1) / 8) + 1;
@@ -6608,11 +6630,15 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
+        // A guide-edit (v2v_mode==2) whose source is a banked latent (path) carries no control_frames
+        // but still needs the 8k+1 target so the target latent lines up 1:1 with the banked guide.
+        const bool ltxav_guide_latent = (sd_vid_gen_params->v2v_mode == 2 &&
+                                         SAFE_STR(sd_vid_gen_params->v2v_guide_latent_path)[0] != '\0');
         // LTX-2.3 V2V lipdub relip (control_frames) requires an 8k+1 frame count (VAE temporal
         // stride 8). Snap here — before the audio length is derived — so the reference clip,
-        // target latent, and audio all agree. Gated on control_frames so every other LTXAV path
-        // (i2v, t2v, continuation, --drive-audio without control_frames) is byte-identical.
-        if (sd_vid_gen_params->control_frames_size > 0) {
+        // target latent, and audio all agree. Gated on control_frames (or a latent-in guide) so
+        // every other LTXAV path (i2v, t2v, continuation, --drive-audio) is byte-identical.
+        if (sd_vid_gen_params->control_frames_size > 0 || ltxav_guide_latent) {
             int snapped = ((request->frames - 1) / 8) * 8 + 1;
             if (snapped < 1) {
                 snapped = 1;
@@ -6667,13 +6693,14 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
-        if (sd_vid_gen_params->control_frames_size > 0 && sd_vid_gen_params->v2v_mode != 1) {
+        if (sd_vid_gen_params->control_frames_size > 0 && sd_vid_gen_params->v2v_mode == 0) {
             // LTX-2.3 V2V LIPDUB RELIP: the control_frames are an existing video clip (e.g. a
             // Wan2.2 render). Encode the WHOLE clip to video latents and append it as a frozen,
             // timeline-aligned IC-LoRA reference (apply_ltxav_video_relip_reference). With the
             // lipdub IC-LoRA loaded (--lora) + a frozen driving-audio latent (--drive-audio), the
             // model preserves the input video and only re-lips the mouth. Off-switch:
             // LTXAV_RELIP_DISABLE restores the legacy "not implemented" rejection for A/B.
+            // (v2v_mode==1 = SDEdit and v2v_mode==2 = guide-edit are handled separately below.)
             if (std::getenv("LTXAV_RELIP_DISABLE") != nullptr) {
                 LOG_ERROR("LTXAV control_frames (relip) disabled via LTXAV_RELIP_DISABLE");
                 return std::nullopt;
@@ -6940,6 +6967,146 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             }
             int64_t t2 = ggml_time_ms();
             LOG_INFO("encode_first_stage (relip reference) completed, taking %" PRId64 " ms", t2 - t1);
+        } else if (sd_vid_gen_params->v2v_mode == 2 &&
+                   (sd_vid_gen_params->control_frames_size > 0 ||
+                    SAFE_STR(sd_vid_gen_params->v2v_guide_latent_path)[0] != '\0')) {
+            // GENERIC V2V GUIDE-EDIT (Director-2 "LTXDirectorGuide"): "keep the scene, add an
+            // element." This is the SAME conditioning primitive as the i2v / keyframe guide
+            // (VAE-encode reference frame(s) -> append them as guide tokens at their timeline
+            // positions -> hold them via denoise_mask = 1 - guide_strength), but applied to the
+            // WHOLE source clip instead of a single image, and run over the FULL schedule. The
+            // target block denoises freely (mask all-ones) and attends to the clean-ish guide
+            // frames at aligned positions, so the source structure is reconstructed where the guide
+            // is strong (guide_strength->1) and the prompt takes over where it is weak.
+            //
+            // It is NOT SDEdit (v2v_mode==1, which seeds the init latent and TRUNCATES the sigma
+            // schedule — a restyle that washes structure out over a deep denoise). And unlike relip
+            // (v2v_mode==0) it needs NO lipdub IC-LoRA and NO frozen drive-audio: the audio channels
+            // stay the plain generated t2v stream (set above; muxed/replaced downstream). The caller
+            // forces the LTX2 scheduler over the FULL step budget for this path (no LTX_CUSTOM_SIGMAS).
+            int64_t t1 = ggml_time_ms();
+
+            // Target = full-length video noise + all-ones denoise mask (every output frame denoises).
+            latents.init_latent              = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask             = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            int64_t target_lat_frames        = latents.init_latent.shape()[2];
+            latents.video_target_frame_count = target_lat_frames;
+            int64_t Wl                       = latents.init_latent.shape()[0];
+            int64_t Hl                       = latents.init_latent.shape()[1];
+            int64_t Cl                       = latents.init_latent.shape()[3];
+
+            // Two ways to obtain the guide latent [Wl,Hl,lf,Cl,1]:
+            //   (A) LATENT-IN (PREFERRED — the source is a shot WE rendered): load the banked
+            //       diffusion VIDEO latent (the seg_<i>.bin the chain already writes) straight from
+            //       v2v_guide_latent_path. NO pixel decode->re-encode roundtrip and its compression
+            //       artifacts — cleaner + faster; the whole point of staying in latent space.
+            //   (B) PIXEL-ENCODE fallback (FOREIGN/uploaded clip, no banked latent): VAE-encode
+            //       control_frames one-graph (like the SDEdit path; long guides can OOM the encode
+            //       buffer — the relip path's encode-tiling knobs could be ported if needed).
+            // Both produce a 5D [Wl,Hl,lf,Cl,1] latent matching the target grid, appended below.
+            sd::Tensor<float> guide_latent;
+            int               lf        = 0;
+            const char*       lat_path  = SAFE_STR(sd_vid_gen_params->v2v_guide_latent_path);
+            const bool        latent_in = (lat_path[0] != '\0');
+            if (latent_in) {
+                sd::Tensor<float> loaded;
+                try {
+                    loaded = sd::load_tensor_from_file_as_tensor<float>(lat_path);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("LTXAV V2V guide-edit: failed to load banked guide latent %s: %s", lat_path, e.what());
+                    return std::nullopt;
+                }
+                if (loaded.empty() || loaded.dim() < 4) {
+                    LOG_ERROR("LTXAV V2V guide-edit: banked guide latent %s empty/malformed", lat_path);
+                    return std::nullopt;
+                }
+                if (loaded.shape()[0] != Wl || loaded.shape()[1] != Hl || loaded.shape()[3] != Cl) {
+                    LOG_ERROR("LTXAV V2V guide-edit: banked guide grid %lldx%lldx%lldc != target %lldx%lldx%lldc "
+                              "(must match render width/height/model)",
+                              (long long)loaded.shape()[0], (long long)loaded.shape()[1], (long long)loaded.shape()[3],
+                              (long long)Wl, (long long)Hl, (long long)Cl);
+                    return std::nullopt;
+                }
+                lf = (int)loaded.shape()[2];
+                // Normalise to 5D [Wl,Hl,lf,Cl,1] (a banked latent may be saved as 4D) so the concat
+                // below matches generate_init_latent's layout. numel == Wl*Hl*lf*Cl either way.
+                guide_latent = sd::Tensor<float>({Wl, Hl, (int64_t)lf, Cl, 1});
+                std::memcpy(guide_latent.data(), loaded.data(), (size_t)Wl * Hl * lf * Cl * sizeof(float));
+                LOG_INFO("LTXAV V2V guide-edit: LATENT-IN guide %s (%d latent frames, no re-encode)", lat_path, lf);
+            } else {
+                if (sd_ctx->sd->vae_decode_only) {
+                    LOG_ERROR("LTXAV V2V guide-edit (pixel encode) requires VAE encoder weights; create the context with vae_decode_only=false");
+                    return std::nullopt;
+                }
+                int    lw = 0, lh = 0, lc = 0;
+                float* src = sd_ctx_encode_video_frames(sd_ctx, sd_vid_gen_params->control_frames,
+                                                        sd_vid_gen_params->control_frames_size,
+                                                        request->width, request->height, &lw, &lh, &lf, &lc);
+                if (src == nullptr) {
+                    LOG_ERROR("LTXAV V2V guide-edit: source VAE encode failed");
+                    return std::nullopt;
+                }
+                if (lw != (int)Wl || lh != (int)Hl || lc != (int)Cl) {
+                    LOG_ERROR("LTXAV V2V guide-edit: source latent grid %dx%dx%dc != target %lldx%lldx%lldc",
+                              lw, lh, lc, (long long)Wl, (long long)Hl, (long long)Cl);
+                    free(src);
+                    return std::nullopt;
+                }
+                guide_latent = sd::Tensor<float>({(int64_t)lw, (int64_t)lh, (int64_t)lf, (int64_t)lc, 1});
+                std::memcpy(guide_latent.data(), src, (size_t)lw * lh * lf * lc * sizeof(float));
+                free(src);
+                // Free the VAE encode compute buffer before the text-encoder runs (VRAM hygiene).
+                sd_ctx->sd->first_stage_model->free_compute_buffer();
+                LOG_INFO("LTXAV V2V guide-edit: PIXEL-ENCODE guide from %d source frames (%d latent frames)",
+                         sd_vid_gen_params->control_frames_size, lf);
+            }
+            if (lf != (int)target_lat_frames) {
+                // Not fatal — the guide covers its own lf latent frames on the timeline; but a 1:1
+                // guide (source length == output length) is what "edit this clip" wants.
+                LOG_WARN("LTXAV V2V guide-edit: guide %d latent frames != target %lld (expect 1:1)",
+                         lf, (long long)target_lat_frames);
+            }
+
+            // Director-2 "edit" strength = SDEdit denoise fraction: higher = bigger change from the
+            // prompt, lower = keep more of the source scene (~0.45 adds a localized element while
+            // holding the scene). Drives the sigma-schedule truncation in generate_video's SDEdit
+            // block (via v2v_guide_strength). 0 falls back to a full re-render.
+            float guide_strength = sd_vid_gen_params->v2v_guide_strength;
+            if (guide_strength <= 0.f) {
+                guide_strength = 1.f;
+            }
+            guide_strength = std::clamp(guide_strength, 0.f, 1.f);
+
+            // BASE-NATIVE structure-preserving edit = SDEdit — the mechanism Director-2's LTXVAddGuide
+            // uses for a whole-clip video guide (traced from comfy_extras/nodes_lt.py + the LTX
+            // pipeline): VAE-encode the source CLEAN, seed it into the init latent, then start sampling
+            // from a TRUNCATED sigma so only the top (guide_strength) fraction of the schedule denoises.
+            // Low-frequency scene structure survives everywhere and the new element enters through the
+            // PROMPT — NO IC-LoRA, NO spatial mask, NO appended tokens.
+            //
+            // This REPLACES the old per-step partial-freeze mask (denoise_mask = 1 - guide_strength +
+            // clean-x0 re-injection every step). That mixed clean x0 into a near-pure-noise field at
+            // high sigma -> horizontal striping. LTX never injects clean x0 mid-schedule; it places the
+            // conditioning token at a schedule-consistent noise level (lerp(noise, x0, strength)), which
+            // the SDEdit truncation does for the whole seeded clip. So mode==2 is now bit-identical to
+            // the mode==1 restyle path, differing only in the LATENT-IN guide source (edit a banked
+            // render with no re-encode) + the edit-tuned strength default. Standard t2v positions,
+            // all-ones mask (truncation, not a freeze mask, preserves the scene).
+            if (lf != (int)target_lat_frames) {
+                LOG_ERROR("LTXAV V2V guide-edit: source %d latent frames != target %lld (need a 1:1 clip)",
+                          lf, (long long)target_lat_frames);
+                return std::nullopt;
+            }
+            std::memcpy(latents.init_latent.data(), guide_latent.data(),
+                        (size_t)Wl * (size_t)Hl * (size_t)lf * (size_t)Cl * sizeof(float));
+            latents.denoise_mask                   = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            latents.video_conditioning_frame_count = 0;
+            latents.v2v_sdedit                     = true;
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("LTXAV V2V EDIT (SDEdit): %s guide -> %d latent frames over %lld target "
+                     "(edit strength=%.2f, truncated schedule); prep %" PRId64 " ms",
+                     latent_in ? "LATENT-IN" : "PIXEL-ENCODE", lf, (long long)target_lat_frames,
+                     guide_strength, t2 - t1);
         } else if (sd_vid_gen_params->keyframes != nullptr && sd_vid_gen_params->keyframes_size > 0 &&
                    sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
             // MERGED (Director v2): a CONTINUATION shot that ALSO pins identity keyframes mid-flow
@@ -9209,7 +9376,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // the schedule. strength >= 1.0 leaves the full schedule (start==0 → source ignored, a fresh
     // render). NULL v2v = v2v_sdedit false → untouched.
     if (latents.v2v_sdedit) {
-        float strength = std::clamp(sd_vid_gen_params->strength, 0.f, 1.f);
+        // v2v (SDEdit restyle=mode 1 / edit=mode 2) truncates by the guide-strength slider, NOT the
+        // image-pin `strength` (which defaults to 1.0 = no truncation = full re-render). koblem sends
+        // the slider as v2v_guide_strength for every v2v shot; both modes share this schedule slice.
+        float v2v_strength = sd_vid_gen_params->strength;
+        if (sd_vid_gen_params->v2v_mode >= 1 && sd_vid_gen_params->v2v_guide_strength > 0.f) {
+            v2v_strength = sd_vid_gen_params->v2v_guide_strength;
+        }
+        float strength = std::clamp(v2v_strength, 0.f, 1.f);
         if (strength < 1.f && plan.sample_steps > 0 &&
             (int)plan.sigmas.size() == plan.sample_steps + 1) {
             int t_enc = (int)(plan.sample_steps * strength);
@@ -10947,13 +11121,34 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (segmented_relip) {
             vp.control_frames      = chain_params->segment_control_frames[seg];
             vp.control_frames_size = chain_params->segment_control_frame_counts[seg];
-            // Per-segment mode override (else keep base_params->v2v_mode): 1 = generic V2V
-            // (SDEdit denoise of the source), 0 = lipdub relip reference append.
+            // Per-segment mode override (else keep base_params->v2v_mode): 0 = lipdub relip
+            // reference append, 1 = SDEdit denoise, 2 = guide-edit (source-as-guide + edit prompt).
             if (chain_params->segment_v2v_mode != nullptr) {
-                vp.v2v_mode = chain_params->segment_v2v_mode[seg] == 1 ? 1 : 0;
+                int m = chain_params->segment_v2v_mode[seg];
+                vp.v2v_mode = (m == 1 || m == 2) ? m : 0;
             }
+            const char* v2v_desc = vp.v2v_mode == 1 ? "V2V SDEdit"
+                                 : vp.v2v_mode == 2 ? "V2V guide-edit"
+                                                    : "V2V relip";
             LOG_INFO("generate_video_chain seg %d: %s source window (%d frames)",
-                     seg + 1, vp.v2v_mode == 1 ? "V2V SDEdit" : "V2V relip", vp.control_frames_size);
+                     seg + 1, v2v_desc, vp.control_frames_size);
+        }
+
+        // Guide-edit LATENT-IN (v2v_mode==2 with a banked seg_<i>.bin): the common "edit a shot we
+        // rendered" case — no pixels, just the banked latent path. When the per-segment array is
+        // present it OWNS this segment's guide source (an entry makes it a guide-edit even without
+        // control_frames; a NULL entry clears any inherited base path so this seg isn't a latent-in
+        // guide). A NULL array leaves the base_params->v2v_guide_latent_path inheritance intact
+        // (single-segment / global source).
+        if (chain_params->segment_v2v_guide_latent_paths != nullptr) {
+            const char* gp = chain_params->segment_v2v_guide_latent_paths[seg];
+            if (gp != nullptr && gp[0] != '\0') {
+                vp.v2v_guide_latent_path = gp;
+                vp.v2v_mode              = 2;
+                LOG_INFO("generate_video_chain seg %d: V2V guide-edit LATENT-IN %s", seg + 1, gp);
+            } else {
+                vp.v2v_guide_latent_path = nullptr;
+            }
         }
 
         // Director keyframes: a shot with per-segment keyframes (image+frame pins) renders FRESH

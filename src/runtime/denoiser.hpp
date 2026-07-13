@@ -559,6 +559,80 @@ struct LTX2Scheduler : SigmaScheduler {
     }
 };
 
+// LTX-Video "linear_quadratic" schedule (ComfyUI comfy/samplers.py::linear_quadratic_schedule /
+// Lightricks LTX-Video ltx_video/schedulers/rf.py). This is the schedule the WhatDreamsCost
+// Director-2 workflow uses for its guide-conditioned edits, and it is what the hand-tuned prod
+// LTX_CUSTOM_SIGMAS (1.0,0.99375,0.9875,0.98125,0.975,0.909375,0.725,0.421875,0) reproduces
+// bit-for-bit at 8 steps (linear_steps=4). Front-loaded: `linear_steps` nearly-free steps parked in
+// the top `threshold_noise` (2.5%) of noise, then a quadratic drop through the mid/low band — which
+// keeps 4 of 8 steps in the σ≈0.4–0.9 band that v2v/guide-edit leans on to hold the source scene.
+// (Unlike LTX2Scheduler's back-loaded flow curve, which blows through that band in ~2 steps.)
+struct LinearQuadraticScheduler : SigmaScheduler {
+    float threshold_noise = 0.025f;
+    int   linear_steps    = -1;  // -1 => steps/2 (ComfyUI default)
+
+    explicit LinearQuadraticScheduler(const char* extra_sample_args = nullptr) {
+        parse_extra_sample_args(extra_sample_args);
+    }
+
+    void parse_extra_sample_args(const char* extra_sample_args) {
+        for (const auto& [key, value] : parse_key_value_args(extra_sample_args, "linear_quadratic scheduler arg")) {
+            if (key == "threshold_noise") {
+                if (!parse_strict_float(value, threshold_noise)) {
+                    LOG_WARN("ignoring invalid linear_quadratic scheduler arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "linear_steps") {
+                if (!parse_strict_int(value, linear_steps)) {
+                    LOG_WARN("ignoring invalid linear_quadratic scheduler arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else {
+                LOG_WARN("ignoring unknown linear_quadratic scheduler arg '%s'", key.c_str());
+            }
+        }
+    }
+
+    // Direct port of linear_quadratic_schedule(steps, threshold_noise, linear_steps): builds an
+    // ASCENDING noise-fraction schedule (linear ramp + quadratic tail + terminal 1.0), then inverts
+    // (1 - x) to descending sigmas in [1, 0], size n+1. sigma_max is implicitly 1.0 for the LTX flow
+    // denoiser (matches ComfyUI's `* model_sampling.sigma_max` and the raw prod LTX_CUSTOM_SIGMAS).
+    std::vector<float> get_sigmas(uint32_t n, float /*sigma_min*/, float /*sigma_max*/, t_to_sigma_t /*t_to_sigma*/) override {
+        std::vector<float> sched;
+        if (n == 0) {
+            sched.push_back(0.0f);
+            return sched;
+        }
+        if (n == 1) {
+            sched = {1.0f, 0.0f};  // ComfyUI steps==1 special case
+            return sched;
+        }
+        const int steps = static_cast<int>(n);
+        int       lin   = (linear_steps >= 0) ? linear_steps : steps / 2;
+        lin             = std::clamp(lin, 1, steps);
+
+        std::vector<double> s;
+        s.reserve(static_cast<size_t>(steps) + 1);
+        for (int i = 0; i < lin; ++i) {
+            s.push_back(static_cast<double>(i) * threshold_noise / lin);
+        }
+        const int quad_steps = steps - lin;
+        if (quad_steps > 0) {
+            const double tnsd  = static_cast<double>(lin) - static_cast<double>(threshold_noise) * steps;
+            const double qcoef = tnsd / (static_cast<double>(lin) * static_cast<double>(quad_steps) * quad_steps);
+            const double lcoef = static_cast<double>(threshold_noise) / lin -
+                                 2.0 * tnsd / (static_cast<double>(quad_steps) * quad_steps);
+            const double cst = qcoef * static_cast<double>(lin) * lin;
+            for (int i = lin; i < steps; ++i) {
+                s.push_back(qcoef * static_cast<double>(i) * i + lcoef * i + cst);
+            }
+        }
+        s.push_back(1.0);  // terminal
+        for (double v : s) {
+            sched.push_back(static_cast<float>(1.0 - v));  // invert to descending sigmas
+        }
+        return sched;
+    }
+};
+
 struct Denoiser {
     virtual float sigma_min()                                                        = 0;
     virtual float sigma_max()                                                        = 0;
@@ -622,6 +696,10 @@ struct Denoiser {
             case LTX2_SCHEDULER:
                 LOG_INFO("get_sigmas with LTX2 scheduler");
                 scheduler = std::make_shared<LTX2Scheduler>(image_seq_len, extra_sample_args);
+                break;
+            case LINEAR_QUADRATIC_SCHEDULER:
+                LOG_INFO("get_sigmas with linear_quadratic scheduler");
+                scheduler = std::make_shared<LinearQuadraticScheduler>(extra_sample_args);
                 break;
             default:
                 LOG_INFO("get_sigmas with discrete scheduler (default)");

@@ -13,8 +13,20 @@
 //     "width","height","fps","steps","cfg_scale","sampling_method","scheduler","seed",
 //     "negative_prompt": "",
 //     "init_image": "<base64|data-uri>",        // optional, seg0 i2v (from_json_str loads it)
-//     "control_frames": ["<base64|data-uri>", ...], // chained V2V relip: N consecutive source windows
+//     "control_frames": ["<base64|data-uri>", ...], // V2V source: N consecutive source windows
 //     "relip_control_frame_counts": [97, ...],    // optional exact source-frame count per window
+//     "v2v_mode": 0,                              // how control_frames are used: 0=lipdub relip
+//                                                 //   (default), 1=SDEdit restyle, 2=guide-edit
+//                                                 //   (Director-2 keep-scene-add-element). Legacy
+//                                                 //   bool "v2v":true == mode 1. Per-segment via
+//                                                 //   segments[i].v2v_mode (int) or segments[i].v2v.
+//     "v2v_guide_strength": 1.0,                  // guide-edit (mode 2) LTXDirectorGuide scale:
+//                                                 //   1.0=hold scene, ~0.5=bigger edit (chain-global)
+//     "v2v_guide_latent_path": "/…/seg_0.bin",    // guide-edit LATENT-IN source (PREFERRED when we
+//                                                 //   rendered the source): a banked diffusion latent
+//                                                 //   to guide from with NO pixel re-encode. Per-seg
+//                                                 //   via segments[i].v2v_source_latent_path. Absent
+//                                                 //   => fall back to control_frames (pixel encode).
 //     "model": "edit",                            // selects the lipdub DiT variant
 //     "hires": { ... },                         // optional spatial upscaler
 //     "output_format": "webm" }

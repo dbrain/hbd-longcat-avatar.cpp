@@ -2651,6 +2651,8 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.moe_boundary              = moe_boundary;
     params.strength                  = strength;
     params.v2v_mode                  = 0;  // relip/off by default; run_vid_chain_job sets it per request
+    params.v2v_guide_strength        = 1.0f;  // guide-edit (v2v_mode==2) scale; run_vid_chain_job overrides
+    params.v2v_guide_latent_path     = nullptr;  // guide-edit latent-in source; run_vid_chain_job sets it
     params.seed                      = seed;
     params.video_frames              = video_frames;
     params.fps                       = fps;
