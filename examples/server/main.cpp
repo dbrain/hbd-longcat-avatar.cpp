@@ -2,7 +2,7 @@
 // LongCat-Video-Avatar production server replaces tools/avatar_server.py
 // with a warm-weights native binary + worker-subprocess isolation
 // (LONGCAT_AVATAR_WORKER_ISOLATION=1) matching the qwen3-tts.cpp /
-// siglip2.cpp / parakeet.cpp pattern. See HANDOFF-native-server.md.
+// siglip2.cpp / parakeet.cpp pattern.
 
 #include <atomic>
 #include <cstdlib>

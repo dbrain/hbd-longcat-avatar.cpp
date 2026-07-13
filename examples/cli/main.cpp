@@ -916,7 +916,7 @@ int main(int argc, const char* argv[]) {
             // process (no warm-worker sticky-value problem), so bridge only when the field was set
             // to a NON-default via --a2v-guidance / JSON — otherwise leave the env untouched so a
             // harness that sets LTXAV_A2V_GUIDANCE / LTXAV_RELIP_REF_TSTRIDE directly (e.g.
-            // run_ltx_relip.sh) still wins. The warm server, by contrast, MUST always-overwrite
+            // still wins. The warm server, by contrast, MUST always-overwrite
             // (apply_ltx_relip_env) to stop a prior render's value bleeding across requests.
             if (gen_params.a2v_guidance != 1.0f) {
                 setenv("LTXAV_A2V_GUIDANCE", std::to_string(gen_params.a2v_guidance).c_str(), 1);

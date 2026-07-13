@@ -8942,7 +8942,7 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
         }
     }
     // Dump the pre-VAE diffusion latent for offline VAE eval (LightVAE/LightTAE A/B).
-    // Forwards via the WAN_ prefix in run_wan22_i2v_nvfp4.sh. Same [W,H,T,C] f32 the
+    // Forwards via the WAN_ prefix. Same [W,H,T,C] f32 the
     // lighttae_eval harness reads; same space decode_first_stage de-norms internally.
     if (const char* sp = getenv("WAN_SAVE_LATENT"); sp != nullptr && sp[0] != '\0') {
         try {
@@ -8958,7 +8958,7 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
         // mean/std of the banked latent. This is the signal that exposed the VACE
         // 0.64->0.80->0.92 contrast runaway: if WAN_CONT_AGC holds, global std and
         // each channel's mean/std stay flat across the chain instead of ratcheting.
-        // run_wan_latent_cont.sh greps "[WAN_CHAIN_STATS]".
+        // Harnesses can grep "[WAN_CHAIN_STATS]".
         {
             int64_t      W = video_latent.shape()[0], H = video_latent.shape()[1];
             int64_t      T = video_latent.shape()[2];

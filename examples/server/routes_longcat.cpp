@@ -90,7 +90,7 @@ static std::vector<uint8_t> materialize_blob(const std::string& spec) {
 // take effect if the worker was SIGKILL'd between requests with the env
 // preset, which is exactly what /v1/admin/unload does. The supervisor handled
 // this by spawn-per-render; the native server's tradeoff is documented in
-// HANDOFF-native-server.md (BSA toggle requires worker recycle).
+// The BSA toggle requires worker recycle.
 //
 // We still parse + return the requested env so callers can verify the
 // payload, and we setenv() them in the parent so the next worker spawn picks

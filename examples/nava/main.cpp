@@ -5,7 +5,7 @@
 //       models/nava-dit-f16.gguf, runs ONE forward of the dual-stream
 //       audio-video MMDiT, writes the patched video velocity (+ auto-logged
 //       per-block stats). Numeric correctness is validated separately against
-//       a PyTorch bf16 reference. (The DiT is VERIFIED — see HANDOFF-nava.md
+//       a PyTorch bf16 reference. (The DiT is verified against an independent
 //       2026-06-03e: all 30 blocks 62-78 dB.)
 //
 //   nava render --prompt "..." [opts]
@@ -2191,7 +2191,7 @@ int main(int argc, char** argv) {
         //   nava render --video-anchor <out.bin>
         // to pin those M frames as clean motion anchors for the next segment. The legacy
         // raw-latent --video-anchor (slicing a prior render's P-frame into the I-frame slot)
-        // is WRONG and smears the decode (see HANDOFF-nava-CONTINUATION-NEXT.md).
+        // is wrong and smears the decode.
         //
         // K=1 (single frame) reproduces the `render --image` i2v anchor BIT-FOR-BIT (same VAE,
         // same full-frame encode, same vae_to_diffusion_latents) — a numeric parity gate.

@@ -1782,7 +1782,7 @@ namespace WAN {
         // LONGCAT_VAE_TEMPORAL_CHUNK=N : N>=1 enables decode streaming with N latent frames
         //                            per compute pass (encode streams its natural 1+4k groups).
         //                            0/unset = disabled (committed full-frame path untouched).
-        //                            (LONGCAT_ prefix so run_wan22_i2v_nvfp4.sh forwards it.)
+        //                            (LONGCAT_ prefix forwards it.)
         static int wan_vae_temporal_chunk() {
             static const int n = [] {
                 const char* s = getenv("LONGCAT_VAE_TEMPORAL_CHUNK");

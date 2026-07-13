@@ -10,7 +10,7 @@ are written F32 (what the model allocates). Clones the SRC gguf's tensor list/di
 maps ggml bare names <- official 'model.diffusion_model.<name>'. All 4444 SRC tensors map (verified).
 
 Usage: import_ltx_nvfp4.py <src_ggml_gguf> <official_nvfp4_st> <out_gguf>
-Adapted from flux2.cpp/spike_cutlass_fp4/import_official_fp4.py.
+Adapted from the Flux2 FP4 importer.
 """
 import sys,json,struct,numpy as np,os
 SRC,OFF,OUT=sys.argv[1],sys.argv[2],sys.argv[3]

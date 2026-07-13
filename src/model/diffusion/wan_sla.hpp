@@ -25,7 +25,7 @@
 // question — does our un-finetuned Wan tolerate 80% block-sparsity? — before
 // investing in the per-head GPU selector.
 //
-// STAGE 1 (design in HANDOFF-wan-sla-impl.md): make the selector a GPU kernel,
+// STAGE 1: make the selector a GPU kernel,
 // per head and per block, recomputed in-graph each step → a [n_heads, n_qtiles,
 // n_kwords] bitmap, kernel indexed with a head dim. This file's CPU selector is
 // the reference the GPU kernel must match.

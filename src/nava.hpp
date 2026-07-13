@@ -11,10 +11,10 @@
 #include "model/common/rope.hpp"
 
 // NAVA — 6.3B joint audio-video MMDiT (ernie-research/NAVA) ported into the
-// sd.cpp tree. This is the DiT backbone only (Phase 1 of HANDOFF-nava.md): a
+// sd.cpp tree. This is the DiT backbone only: a
 // single forward that COMPILES + RUNS. Numeric correctness is validated
 // separately by the human against a PyTorch bf16 reference — see the
-// "VERIFIED FORWARD SPEC" section of HANDOFF-nava.md, which this file mirrors
+// independently verified forward specification, which this file mirrors
 // line-for-line.
 //
 // House style is copied from src/wan.hpp (WanSelfAttention / WanAttentionBlock /
