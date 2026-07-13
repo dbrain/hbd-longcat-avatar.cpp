@@ -10823,6 +10823,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 // high-res detail stage receives a real local temporal history.
                 sd::Tensor<float> video_result(full_video.shape());
                 video_result.fill_(0.0f);
+                // Keep the original high-resolution I2V latent as an immutable
+                // non-contiguous reference for every later refine tile.  The short
+                // frozen overlap remains the local motion memory; this separate
+                // frame-zero guide is identity/appearance memory and must never be
+                // refreshed from generated motion.  It mirrors LTX's negative-index
+                // guide semantics without forcing the source frame into the local
+                // target timeline.
+                sd::Tensor<float> immutable_i2v_guide;
+                if (hires_video_reference.empty() && sd_vid_gen_params->init_image.data != nullptr &&
+                    full_video.shape()[2] > 0) {
+                    immutable_i2v_guide = sd::ops::slice(full_video, 2, 0, 1);
+                    LOG_INFO("LTX refine temporal immutable I2V guide: source latent frame 0 retained for all tiles");
+                }
                 sd::Tensor<float> appearance_anchor;
                 int64_t            appearance_anchor_start = 0;
                 sd::Tensor<float> refined_audio;
@@ -10881,12 +10894,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                     LOG_INFO("LTX refine temporal-window tile %d: latent [%lld,%lld), window=%d frozen-overlap=%lld",
                              tile_index, (long long)tile_start, (long long)end, temporal_window, (long long)frozen);
                     const bool use_appearance_anchor = !appearance_anchor.empty();
+                    const sd::Tensor<float>& identity_guide = refine_reference_windowable
+                                                                   ? hires_video_reference
+                                                                   : !immutable_i2v_guide.empty()
+                                                                   ? immutable_i2v_guide
+                                                                   : appearance_anchor;
                     auto refine_video_positions = refine_reference_windowable
                         ? build_ltxav_window_video_positions_with_reference(video_tile.shape()[0],
                                                                               video_tile.shape()[1],
                                                                               tile_start,
                                                                               length,
                                                                               hires_video_reference.shape()[2],
+                                                                              hires_request.fps,
+                                                                              hires_request.vae_scale_factor)
+                        : !immutable_i2v_guide.empty()
+                        ? build_ltxav_window_video_positions_with_reference(video_tile.shape()[0],
+                                                                              video_tile.shape()[1],
+                                                                              tile_start,
+                                                                              length,
+                                                                              immutable_i2v_guide.shape()[2],
                                                                               hires_request.fps,
                                                                               hires_request.vae_scale_factor)
                         : use_appearance_anchor
@@ -10908,7 +10934,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                      mask_tile,
                                                      refine_video_positions,
                                                      refine_audio_positions,
-                                                     use_appearance_anchor ? appearance_anchor : hires_video_reference);
+                                                     identity_guide);
                     if (tile.empty()) {
                         final_latent = {};
                         break;
@@ -10940,7 +10966,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                     // from an external first-frame portrait.  Periodic re-anchoring
                     // keeps the reference compatible with evolving hair/pose instead
                     // of freezing the initial appearance for the entire clip.
-                    const bool establish_anchor = appearance_anchor.empty() && anchor_frames > 0 && tile_index == 0;
+                    const bool establish_anchor = appearance_anchor.empty() && immutable_i2v_guide.empty() && anchor_frames > 0 && tile_index == 0;
                     const bool refresh_anchor = !appearance_anchor.empty() && anchor_refresh > 0 &&
                                                 tile_index > 0 && tile_index % anchor_refresh == 0;
                     if (establish_anchor || refresh_anchor) {
