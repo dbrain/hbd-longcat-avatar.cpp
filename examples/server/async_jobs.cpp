@@ -706,6 +706,11 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     }
 
     sd_vid_chain_params_t chain = {};
+    // RETAKE (bidirectional single-segment splice): body "retake_segment" (a FILTERED segment index
+    // into the banked seg_<i>.bin files) re-renders ONLY that shot, start-pinned by seg_{N-1}'s tail
+    // and end-pinned by seg_{N+1}'s head, then splices the banked tail. -1 (default) = ordinary
+    // chain/resume. Aggregate {} would give 0 (a valid index), so this MUST be set explicitly.
+    chain.retake_segment     = body.value("retake_segment", -1);
     chain.n_segments         = n_segments;
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
     chain.segment_prompts    = prompt_ptrs.data();

@@ -4091,6 +4091,8 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_anchor_path                      = nullptr;
     sd_vid_gen_params->cont_latent                           = nullptr;
     sd_vid_gen_params->cont_latent_frames                    = 0;
+    sd_vid_gen_params->end_cont_latent                       = nullptr;
+    sd_vid_gen_params->end_cont_latent_frames                = 0;
     sd_vid_gen_params->cont_refine_latent                    = nullptr;
     sd_vid_gen_params->cont_refine_latent_frames             = 0;
     sd_vid_gen_params->cont_refine_latent_width              = 0;
@@ -7277,6 +7279,111 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             int64_t t2 = ggml_time_ms();
             LOG_INFO("encode_first_stage (%d keyframes) completed, taking %" PRId64 " ms",
                      sd_vid_gen_params->keyframes_size, t2 - t1);
+        } else if (sd_vid_gen_params->end_cont_latent != nullptr && sd_vid_gen_params->end_cont_latent_frames > 0) {
+            // RETAKE BIDIRECTIONAL PIN (true single-segment retake). Re-render THIS segment pinned
+            // by BOTH neighbours: the START by seg_{N-1}'s tail (cont_latent, a held guide at frame
+            // 0 — the ordinary continuation) OR a fresh opener image (init_image at target frame 0),
+            // and the END by seg_{N+1}'s HEAD latent frames (end_cont_latent), appended as a frozen
+            // guide at a FUTURE timeline position so this segment's generated tail converges to the
+            // next segment's opening (N ends exactly where the unchanged, banked N+1 begins).
+            // Composed with build_ltxv_guides_video_positions (the same multi-guide machinery as the
+            // merged continuation+keyframe path). Fires ONLY when end_cont_latent is set (retake
+            // mode), so every ordinary render is byte-identical.
+            if (sd_ctx->sd->vae_decode_only && !start_image.empty()) {
+                LOG_ERROR("LTXAV retake opener image conditioning requires VAE encoder weights");
+                return std::nullopt;
+            }
+            int64_t t1                       = ggml_time_ms();
+            latents.init_latent              = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+            latents.denoise_mask             = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            int64_t target_lat_frames        = latents.init_latent.shape()[2];
+            latents.video_target_frame_count = target_lat_frames;
+
+            const int64_t Wl             = latents.init_latent.shape()[0];
+            const int64_t Hl             = latents.init_latent.shape()[1];
+            const int64_t Cl             = latents.init_latent.shape()[3];
+            const int     temporal_scale = 8;
+
+            float conditioning_strength = std::clamp(request->strength, 0.f, 1.f);
+
+            float omask = 0.0f;  // start motion-tail frozen (same knob as the pure-continuation path)
+            if (const char* e = std::getenv("LTXAV_CONT_OVERLAP_MASK")) {
+                omask = std::clamp((float)atof(e), 0.f, 1.f);
+            }
+            float end_mask = 0.0f;  // end pin frozen by default; loosen with LTXAV_RETAKE_END_MASK
+            if (const char* e = std::getenv("LTXAV_RETAKE_END_MASK")) {
+                end_mask = std::clamp((float)atof(e), 0.f, 1.f);
+            }
+
+            std::vector<LtxvGuideSpec> guides;
+
+            // ── START pin ────────────────────────────────────────────────────────────────
+            if (!start_image.empty()) {
+                // Fresh opener / scene-cut retake (N==0 or an image-anchored shot): pin the image at
+                // target frame 0 (part of the target block — no appended guide token).
+                if (!apply_ltxav_condition_image_by_latent_index(sd_ctx, start_image, &latents.init_latent,
+                                                                 &latents.denoise_mask, 0, "retake-init",
+                                                                 conditioning_strength)) {
+                    return std::nullopt;
+                }
+                LOG_INFO("LTXAV RETAKE: start pinned by opener image (target frame 0)");
+            } else if (sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+                // Continuation retake: seg_{N-1}'s tail as a held guide at frame 0.
+                int64_t K = sd_vid_gen_params->cont_latent_frames;
+                if (K > target_lat_frames) {
+                    LOG_ERROR("retake cont latent frames %lld exceed segment latent frames %lld",
+                              (long long)K, (long long)target_lat_frames);
+                    return std::nullopt;
+                }
+                sd::Tensor<float> cont_tail({Wl, Hl, K, Cl, 1});
+                std::memcpy(cont_tail.data(), sd_vid_gen_params->cont_latent, (size_t)cont_tail.numel() * sizeof(float));
+                latents.init_latent  = sd::ops::concat(latents.init_latent, cont_tail, 2);
+                auto cont_mask       = sd::full<float>({Wl, Hl, K, 1, 1}, omask);
+                latents.denoise_mask = sd::ops::concat(latents.denoise_mask, cont_mask, 2);
+                guides.push_back({0, (int)K, temporal_scale});
+                LOG_INFO("LTXAV RETAKE: start pinned by prior tail (%lld held frames at frame_idx 0, mask=%.2f)",
+                         (long long)K, omask);
+            } else {
+                LOG_INFO("LTXAV RETAKE: no start pin (fresh opener from noise)");
+            }
+
+            // ── END pin (seg_{N+1} head), appended AFTER any start guide so the tail-crop
+            //    (video_conditioning_frame_count) removes both appended blocks together. ────
+            {
+                int64_t Ke = sd_vid_gen_params->end_cont_latent_frames;
+                if (Ke > target_lat_frames) {
+                    LOG_ERROR("retake end_cont latent frames %lld exceed segment latent frames %lld",
+                              (long long)Ke, (long long)target_lat_frames);
+                    return std::nullopt;
+                }
+                sd::Tensor<float> end_head({Wl, Hl, Ke, Cl, 1});
+                std::memcpy(end_head.data(), sd_vid_gen_params->end_cont_latent, (size_t)end_head.numel() * sizeof(float));
+                latents.init_latent  = sd::ops::concat(latents.init_latent, end_head, 2);
+                auto end_msk         = sd::full<float>({Wl, Hl, Ke, 1, 1}, end_mask);
+                latents.denoise_mask = sd::ops::concat(latents.denoise_mask, end_msk, 2);
+                // Shadow the target's CLOSING Ke frames (symmetric to the start guide shadowing the
+                // opening K): place the guide at the pixel position of target latent frame
+                // (target_lat_frames - Ke) so the tail re-renders toward the next segment's head.
+                // Override with LTXAV_RETAKE_END_FRAME_IDX (pixel-frame units) for GPU tuning.
+                int end_frame_idx = (int)ltxv_latent_corner_to_pixel_frame(target_lat_frames - Ke, temporal_scale, true);
+                if (const char* e = std::getenv("LTXAV_RETAKE_END_FRAME_IDX")) {
+                    end_frame_idx = atoi(e);
+                }
+                guides.push_back({end_frame_idx, (int)Ke, temporal_scale});
+                LOG_INFO("LTXAV RETAKE: end pinned by next-segment head (%lld frozen frames at frame_idx %d, mask=%.2f)",
+                         (long long)Ke, end_frame_idx, end_mask);
+            }
+
+            int64_t appended = 0;
+            for (const auto& g : guides) {
+                appended += g.latent_frames;
+            }
+            latents.video_conditioning_frame_count = appended;
+            latents.video_positions                = build_ltxv_guides_video_positions(
+                Wl, Hl, target_lat_frames, guides, request->fps, request->vae_scale_factor, temporal_scale, true);
+            int64_t t2 = ggml_time_ms();
+            LOG_INFO("encode_first_stage (RETAKE bidirectional pin, %zu guide block(s)) completed, taking %" PRId64 " ms",
+                     guides.size(), t2 - t1);
         } else if (!start_image.empty() || !end_image.empty()) {
             if (sd_ctx->sd->vae_decode_only) {
                 LOG_ERROR("LTXAV image conditioning requires VAE encoder weights; create the context with vae_decode_only=false");
@@ -10595,6 +10702,31 @@ static bool write_seg_audio(const std::string& path, const sd_audio_t* a) {
     fclose(f);
     return true;
 }
+// RETAKE length-pinning: bank each rendered segment's KEPT frame count (post overlap-trim)
+// next to its latent, so a later single-segment retake reproduces the exact timeline offsets
+// (the content-adaptive seam auto-trim would otherwise re-derive a different drop against the
+// re-rendered segment and shift every downstream segment -> audio/beat desync). The bidirectional
+// end-pin makes the retaken segment land on the banked boundaries, so reusing the banked kept
+// count is both length-stable AND seam-clean.
+static void write_seg_len(const std::string& path, int kept) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (f != nullptr) {
+        fprintf(f, "%d\n", kept);
+        fclose(f);
+    }
+}
+static int read_seg_len(const std::string& path) {  // -1 = absent/unreadable (fall back to auto-trim)
+    FILE* f = fopen(path.c_str(), "r");
+    if (f == nullptr) {
+        return -1;
+    }
+    int v = -1;
+    if (fscanf(f, "%d", &v) != 1 || v < 0) {
+        v = -1;
+    }
+    fclose(f);
+    return v;
+}
 static sd_audio_t* read_seg_audio(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (f == nullptr) {
@@ -11019,9 +11151,23 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // sampling), and seed cont_buf from seg_{resume_from-1}.bin so segment resume_from
     // continues the motion. On any failure we fall back to a fresh full render.
     int start_seg = 0;
-    if (chain_params->resume_from > 0 && chain_params->save_dir != nullptr &&
+    // RETAKE (bidirectional single-segment splice) vs ordinary resume. When retake_active, the
+    // prefix reload stops at retake_seg and the sampler renders ONLY that one segment (end-pinned
+    // to seg_{retake_seg+1}'s head); the downstream segments are spliced from their banked latents
+    // after the loop. retake_segment < 0 (the default) leaves this fully inert.
+    const bool retake_active = chain_params->retake_segment >= 0 &&
+                               chain_params->retake_segment < n_chain &&
+                               chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0';
+    const int  retake_seg       = retake_active ? chain_params->retake_segment : -1;
+    const int  effective_resume = retake_active ? retake_seg : chain_params->resume_from;
+    const int  render_end       = retake_active ? retake_seg : (n_chain - 1);
+    if (retake_active) {
+        LOG_INFO("generate_video_chain: RETAKE segment %d (reload prefix [0,%d), render only %d, splice banked tail [%d,%d))",
+                 retake_seg, retake_seg, retake_seg, retake_seg + 1, n_chain);
+    }
+    if (effective_resume > 0 && chain_params->save_dir != nullptr &&
         chain_params->save_dir[0] != '\0') {
-        int               resume_k = std::min(chain_params->resume_from, n_chain - 1);
+        int               resume_k = std::min(effective_resume, n_chain - 1);
         const std::string sd_dir   = chain_params->save_dir;
         LOG_INFO("generate_video_chain: RESUME from segment %d/%d (reloading banked prefix from %s)",
                  resume_k, n_chain, sd_dir.c_str());
@@ -11047,6 +11193,19 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                     drop = atoi(e);
                 }
             }
+            // Length-pin: keep exactly the banked kept-count so the reloaded prefix reproduces the
+            // ORIGINAL stitched length. The live chain auto-trims continuation overlaps (~overlap_px),
+            // but this reload defaulted to drop=0 for keyframe-append -> the prefix grew by the
+            // untrimmed overlap and shifted the whole timeline (the retake length drift). Falls back
+            // to the default drop when no .len is banked (older jobs). Off via LTXAV_RETAKE_NO_PIN_LENGTH=1.
+            int pin_drop = -1;
+            if (getenv("LTXAV_RETAKE_NO_PIN_LENGTH") == nullptr) {
+                int banked = read_seg_len(sd_dir + "/seg_" + std::to_string(seg) + ".len");
+                if (banked >= 0 && banked <= cnt) {
+                    drop = cnt - banked;
+                    pin_drop = drop;
+                }
+            }
             if (drop > cnt) {
                 drop = cnt;
             }
@@ -11059,10 +11218,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             }
             free(fr);
             // Reload this prefix segment's banked audio onto the timeline (best-effort —
-            // a missing seg audio just means that slice is silent, not a resume failure).
+            // a missing seg audio just means that slice is silent, not a resume failure). Use the
+            // length-pinned drop when available so audio stays aligned with the pinned video.
             sd_audio_t* pa = read_seg_audio(sd_dir + "/seg_" + std::to_string(seg) + ".audio");
             if (pa != nullptr) {
-                audio_acc.append(pa, (seg == 0) ? 0 : audio_acc.drop_for(pa, overlap_px, base_params->fps));
+                int adrop = (seg == 0) ? 0 : (pin_drop >= 0 ? pin_drop : overlap_px);
+                audio_acc.append(pa, audio_acc.drop_for(pa, adrop, base_params->fps));
                 free_sd_audio(pa);
             }
         }
@@ -11106,7 +11267,41 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
     }
 
-    for (int seg = start_seg; seg < n_chain; ++seg) {
+    // RETAKE END-PIN: load seg_{retake_seg+1}'s HEAD K latent frames (video channels only) so the
+    // re-rendered segment terminates exactly where the unchanged, banked next segment begins.
+    // Absent (last-segment retake, or a decode failure) degrades to an Option-A single-segment
+    // render with no end pin — still safe.
+    std::vector<float> end_cont_buf;
+    int                end_cont_Ke = 0;
+    if (retake_active && retake_seg + 1 < n_chain) {
+        const std::string sd_dir = chain_params->save_dir;
+        const std::string nhead  = sd_dir + "/seg_" + std::to_string(retake_seg + 1) + ".bin";
+        try {
+            sd::Tensor<float> nxt = sd::load_tensor_from_file_as_tensor<float>(nhead);
+            int    lw = (int)nxt.shape()[0], lh = (int)nxt.shape()[1];
+            int    lt = (int)nxt.shape()[2], cv = (int)nxt.shape()[3];
+            int    keep  = std::min(K, lt);
+            int    cvk   = std::min(LTXAV_VIDEO_LATENT_CHANNELS, cv);
+            size_t plane = (size_t)lw * lh;
+            end_cont_buf.assign(plane * (size_t)keep * (size_t)cvk, 0.f);
+            const float* src_base = nxt.data();
+            for (int c = 0; c < cvk; ++c) {
+                for (int nf = 0; nf < keep; ++nf) {
+                    int          src_t = nf;  // HEAD frames [0, keep)
+                    const float* src   = src_base + ((size_t)c * lt + src_t) * plane;
+                    float*       dst   = end_cont_buf.data() + ((size_t)c * keep + nf) * plane;
+                    std::memcpy(dst, src, plane * sizeof(float));
+                }
+            }
+            end_cont_Ke = keep;
+            LOG_INFO("generate_video_chain: RETAKE end-pin loaded %d head frame(s) from seg_%d.bin", keep, retake_seg + 1);
+        } catch (const std::exception& e) {
+            LOG_WARN("generate_video_chain: RETAKE end-pin load failed (%s): %s — degrading to no end pin",
+                     nhead.c_str(), e.what());
+        }
+    }
+
+    for (int seg = start_seg; seg <= render_end; ++seg) {
         sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
         // Director variable-length: this shot renders its own frame count when the caller
         // supplied one (else the uniform base_params->video_frames). NULL/0 = byte-identical.
@@ -11114,6 +11309,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             chain_params->segment_video_frames[seg] > 0) {
             vp.video_frames = chain_params->segment_video_frames[seg];
         }
+        // RETAKE end-pin never leaks onto a non-retake segment: cleared here, set only for retake_seg.
+        vp.end_cont_latent        = nullptr;
+        vp.end_cont_latent_frames = 0;
         const bool segmented_relip = chain_params->segment_control_frames != nullptr &&
                                      chain_params->segment_control_frame_counts != nullptr &&
                                      chain_params->segment_control_frames[seg] != nullptr &&
@@ -11258,6 +11456,17 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_refine_latent_channels = cont_refine_Cv;
             vp.audio_frame_offset = seg * (base_params->video_frames - overlap_px);
         }
+        // RETAKE end-pin: this segment (retake_seg) terminates at seg_{retake_seg+1}'s head so the
+        // banked next segment still flows from its freshly re-rendered tail. Composes with whatever
+        // START conditioning the branch above set (cont_latent for a continuation shot, or init_image
+        // for a seg-0 opener / scene cut). A missing next segment (last-seg retake) leaves it off.
+        if (retake_active && seg == retake_seg && end_cont_Ke > 0) {
+            vp.end_cont_latent        = end_cont_buf.data();
+            vp.end_cont_latent_frames = end_cont_Ke;
+            LOG_INFO("generate_video_chain seg %d: RETAKE end-pin active (%d frozen next-head frames)",
+                     seg + 1, end_cont_Ke);
+        }
+
         // distinct seed per segment so the noise frames differ
         vp.seed = (base_params->seed < 0) ? base_params->seed : base_params->seed + seg;
 
@@ -11464,6 +11673,19 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 drop = atoi(e);
             }
         }
+        // RETAKE length-pin: reproduce the ORIGINAL kept length for the retaken segment so the
+        // timeline (and audio/beat sync) does not shift. The end-pin lands the new tail on the same
+        // boundary as the banked tail, so pinning the leading drop is seam-clean. Off via
+        // LTXAV_RETAKE_NO_PIN_LENGTH=1 (falls back to content-adaptive auto-trim).
+        if (retake_active && seg == retake_seg && getenv("LTXAV_RETAKE_NO_PIN_LENGTH") == nullptr &&
+            chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+            int banked = read_seg_len(std::string(chain_params->save_dir) + "/seg_" + std::to_string(seg) + ".len");
+            if (banked >= 0 && banked <= seg_count) {
+                LOG_INFO("generate_video_chain: RETAKE length-pin seg %d -> drop %d (auto-trim was %d; banked kept=%d)",
+                         seg, seg_count - banked, drop, banked);
+                drop = seg_count - banked;
+            }
+        }
         size_t kept_start = stitched.size();
         if (drop > seg_count) {
             drop = seg_count;
@@ -11498,6 +11720,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (chain_params->on_segment != nullptr && kept_n > 0) {
             chain_params->on_segment(seg, stitched.data() + kept_start, kept_n, chain_params->on_segment_user);
         }
+        // Bank this segment's kept-frame count so a later retake can pin the timeline (see
+        // read_seg_len). On a retake render this rewrites seg_<retake_seg>.len with the same value
+        // it was pinned to, so the banked length stays authoritative.
+        if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0' && kept_n > 0) {
+            write_seg_len(std::string(chain_params->save_dir) + "/seg_" + std::to_string(seg) + ".len", kept_n);
+        }
 
         // Audio: bank this segment's audio (for resume) + stitch it onto the timeline,
         // dropping the overlap head on seg>0 to stay aligned with the video stitch.
@@ -11518,6 +11746,98 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             getenv("LTXAV_NO_CHAIN_GPU_RECLAIM") == nullptr) {
             sd_ctx->sd->release_chain_segment_gpu_residency();
         }
+    }
+
+    // ── RETAKE tail splice ──────────────────────────────────────────────────────────────────
+    // Re-attach the UNCHANGED downstream segments [retake_seg+1, n_chain) from their banked
+    // latents (VAE-decode only, NO sampling). Because segment retake_seg was end-pinned to
+    // seg_{retake_seg+1}'s head, its new tail lands where the banked tail already begins, so the
+    // join is continuous without re-rendering or modifying the tail pixels — the downstream
+    // segments stay bit-identical to their banked webms (only the head auto-trim can differ). Each
+    // continuation tail segment re-derives its overlap drop against the NEW preceding frame so the
+    // N/N+1 join is clean; a fresh shot (scene cut / fresh keyframe) trims 0 as in the live path.
+    if (retake_active && chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+        const std::string sd_dir = chain_params->save_dir;
+        bool              legacy_head_s = false;
+        if (const char* e = std::getenv("LTXAV_CONT_LEGACY_HEAD")) {
+            legacy_head_s = atoi(e) != 0;
+        }
+        for (int seg = retake_seg + 1; seg < n_chain; ++seg) {
+            std::string p   = sd_dir + "/seg_" + std::to_string(seg) + ".bin";
+            int         cnt = 0;
+            sd_image_t* fr  = decode_banked_video_latent(sd_ctx, p, &cnt);
+            if (fr == nullptr || cnt <= 0) {
+                LOG_ERROR("generate_video_chain: RETAKE tail decode failed at seg %d (%s)", seg, p.c_str());
+                free(fr);
+                for (auto& f : stitched) {
+                    free(f.data);
+                }
+                return false;
+            }
+            // Fresh shot (scene cut / fresh keyframe) => trim 0; continuation => auto-trim vs the
+            // NEW preceding stitched frame. Mirrors the live-loop drop logic.
+            bool kf_here = chain_params->segment_keyframes != nullptr &&
+                           chain_params->segment_keyframe_counts != nullptr &&
+                           chain_params->segment_keyframe_counts[seg] > 0 &&
+                           chain_params->segment_keyframes[seg] != nullptr;
+            bool kf_frame0_here = false;
+            if (kf_here && chain_params->segment_keyframe_indices != nullptr &&
+                chain_params->segment_keyframe_indices[seg] != nullptr) {
+                int kc = chain_params->segment_keyframe_counts[seg];
+                for (int k = 0; k < kc; ++k) {
+                    if (chain_params->segment_keyframe_indices[seg][k] == 0) {
+                        kf_frame0_here = true;
+                        break;
+                    }
+                }
+            }
+            bool kf_fresh_here  = kf_here && (seg == 0 || kf_frame0_here);
+            bool scene_cut_here = seg > 0 && !kf_here &&
+                                  chain_params->segment_init_images != nullptr &&
+                                  chain_params->segment_init_images[seg] != nullptr &&
+                                  chain_params->segment_init_images[seg]->data != nullptr;
+            bool fresh_here = scene_cut_here || kf_fresh_here;
+            int  drop;
+            if (fresh_here) {
+                drop = 0;
+            } else if (legacy_head_s) {
+                drop = overlap_px;
+            } else {
+                drop = ltxav_auto_trim_drop(stitched.empty() ? sd_image_t{} : stitched.back(), fr, cnt, overlap_px);
+            }
+            if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
+                drop = atoi(e);
+            }
+            // RETAKE length-pin: reproduce each banked tail segment's ORIGINAL kept length so the
+            // total timeline is unchanged (only segment retake_seg's pixels differ). Off via
+            // LTXAV_RETAKE_NO_PIN_LENGTH=1.
+            if (getenv("LTXAV_RETAKE_NO_PIN_LENGTH") == nullptr && !fresh_here) {
+                int banked = read_seg_len(sd_dir + "/seg_" + std::to_string(seg) + ".len");
+                if (banked >= 0 && banked <= cnt) {
+                    LOG_INFO("generate_video_chain: RETAKE tail length-pin seg %d -> drop %d (auto-trim was %d; banked kept=%d)",
+                             seg, cnt - banked, drop, banked);
+                    drop = cnt - banked;
+                }
+            }
+            if (drop > cnt) {
+                drop = cnt;
+            }
+            for (int i = 0; i < cnt; ++i) {
+                if (i < drop) {
+                    free(fr[i].data);
+                } else {
+                    stitched.push_back(fr[i]);
+                }
+            }
+            free(fr);
+            sd_audio_t* pa = read_seg_audio(sd_dir + "/seg_" + std::to_string(seg) + ".audio");
+            if (pa != nullptr) {
+                audio_acc.append(pa, fresh_here ? 0 : audio_acc.drop_for(pa, drop, base_params->fps));
+                free_sd_audio(pa);
+            }
+        }
+        LOG_INFO("generate_video_chain: RETAKE spliced banked tail [%d, %d) after re-rendered segment %d",
+                 retake_seg + 1, n_chain, retake_seg);
     }
 
     // End-of-render GPU reclaim (opt-in: LTXAV_END_RENDER_RECLAIM=1). The between-segment

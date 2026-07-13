@@ -1000,6 +1000,7 @@ int main(int argc, const char* argv[]) {
                 // in one TE window, per-segment lip-sync audio, stitch) lives in the library so
                 // the CLI and the worker-isolated server share one implementation.
                 sd_vid_chain_params_t chain_params = {};
+                chain_params.retake_segment     = -1;  // off (aggregate {} would give 0 = a valid index)
                 chain_params.n_segments         = n_chain;
                 chain_params.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
                 chain_params.segment_prompts    = prompt_ptrs.data();

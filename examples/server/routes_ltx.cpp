@@ -193,6 +193,10 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             if (body.contains("frames")) {
                 chain["video_frames"] = body["frames"];
             }
+            // RETAKE (bidirectional single-segment splice) is OFF unless a valid retake_segment is
+            // supplied against a banked (resume) job below. Default it off so a stray body field or
+            // a fresh (non-resume) job can never trigger a spurious single-segment render.
+            chain["retake_segment"] = -1;
             std::string output_format = body.value("output_format", std::string("webm"));
 
             // Register the job (assign an id) before touching the filesystem, so a fresh job's
@@ -232,6 +236,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 resume_from = ltx_banked_segment_count(job_dir);
                 if (resume_from >= n_segments) {
                     resume_from = std::max(0, n_segments - 1);  // re-render at least the last seg
+                }
+                // RETAKE: re-render ONLY this banked shot, pinned by both neighbours, then splice
+                // the banked tail. The engine derives its own prefix-reload point from
+                // retake_segment; align resume_from to it so request.json stays consistent.
+                // Accept koblem's existing "retake_from" as an alias (same FILTERED-index meaning).
+                int retake_segment = body.value("retake_segment", body.value("retake_from", -1));
+                if (retake_segment >= 0 && retake_segment < n_segments) {
+                    chain["retake_segment"] = retake_segment;
+                    resume_from             = retake_segment;  // reload banked prefix [0, retake_segment)
                 }
             } else {
                 job_dir = root / job->id;
@@ -287,6 +300,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             out["media_url"]   = "/sdcpp/v1/jobs/" + job->id + "/media";
             out["segments"]    = n_segments;
             out["resume_from"] = resume_from;
+            out["retake_segment"] = chain.value("retake_segment", -1);
             out["job_dir"]     = job_dir.string();
 
             res.status = 202;
