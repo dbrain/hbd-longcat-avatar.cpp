@@ -4945,7 +4945,8 @@ static sd::Tensor<float> build_ltxav_window_video_positions_with_reference(int64
                                                                              int64_t reference_frames,
                                                                              int fps,
                                                                              int spatial_scale,
-                                                                             int temporal_scale = 8) {
+                                                                             int temporal_scale = 8,
+                                                                             int64_t reference_latent_start = -1) {
     GGML_ASSERT(width > 0 && height > 0 && latent_frames > 0 && reference_frames > 0 && fps > 0);
     sd::Tensor<float> positions({2, 3, width * height * (latent_frames + reference_frames), 1});
     int64_t token = 0;
@@ -4964,11 +4965,20 @@ static sd::Tensor<float> build_ltxav_window_video_positions_with_reference(int64
             }
         }
     }
-    // Continuation references are saved from the prior segment's head/tail
-    // anchor and use the same frame-zero guide coordinates as the full refine.
+    // The legacy continuation/I2V guide keeps its established frame-zero
+    // full-interval convention (the -1 default). A rolling appearance anchor
+    // instead carries the absolute location at which its low-motion frame was
+    // selected, so it remains a late local handoff rather than being
+    // reinterpreted as a global first-frame portrait.
     for (int64_t t = 0; t < reference_frames; ++t) {
-        const float t_start = static_cast<float>(t * temporal_scale) / static_cast<float>(fps);
-        const float t_end = static_cast<float>((t + 1) * temporal_scale) / static_cast<float>(fps);
+        const float t_start = reference_latent_start < 0
+                                  ? static_cast<float>(t * temporal_scale) / static_cast<float>(fps)
+                                  : ltxv_latent_corner_to_pixel_frame(reference_latent_start + t, temporal_scale, true) /
+                                        static_cast<float>(fps);
+        const float t_end = reference_latent_start < 0
+                                ? static_cast<float>((t + 1) * temporal_scale) / static_cast<float>(fps)
+                                : ltxv_latent_corner_to_pixel_frame(reference_latent_start + t + 1, temporal_scale, true) /
+                                      static_cast<float>(fps);
         for (int64_t h = 0; h < height; ++h) {
             for (int64_t w = 0; w < width; ++w) {
                 set_ltxv_video_position(&positions, token++, t_start, t_end,
@@ -11057,7 +11067,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                                               length,
                                                                               appearance_anchor.shape()[2],
                                                                               hires_request.fps,
-                                                                              hires_request.vae_scale_factor)
+                                                                              hires_request.vae_scale_factor,
+                                                                              8,
+                                                                              appearance_anchor_start)
                         : build_ltxav_window_video_positions(video_tile.shape()[0],
                                                              video_tile.shape()[1],
                                                              tile_start,
