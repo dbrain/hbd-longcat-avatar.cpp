@@ -10761,22 +10761,16 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             const int64_t total_frames = x_t.shape()[2];
             const int64_t stride = temporal_window - temporal_overlap;
             const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
-            // A fixed overlap gives a tile motion context but it falls out of the
-            // attention horizon on the following tile.  Keep one model-generated
-            // refined frame as a *separate* reference-token block after the first
-            // tile has established the subject.  This is the same two-memory
-            // pattern used by LTX's looping sampler: short contiguous context for
-            // motion, plus a small non-contiguous appearance anchor for identity.
-            // It is intentionally opt-in: T2V has no reliable subject before the
-            // first tile, and I2V should be able to re-anchor as pose changes.
+            // A fixed overlap carries immediate motion, but it falls out of the
+            // attention horizon on the following tile.  Optionally retain a small,
+            // late appearance reference as a separate token block: two memories,
+            // one contiguous for motion and one non-contiguous for identity.  The
+            // appearance reference rolls forward after every tile, never reaches
+            // back to tile zero, so it can follow legitimate scene changes.
             int anchor_frames = 0;
-            int anchor_refresh = 0;
             if (hires_video_reference.empty()) {
                 if (const char* e = std::getenv("LTX_REFINE_TEMPORAL_ANCHOR_FRAMES"); e != nullptr) {
                     anchor_frames = std::max(0, std::atoi(e));
-                }
-                if (const char* e = std::getenv("LTX_REFINE_TEMPORAL_ANCHOR_REFRESH"); e != nullptr) {
-                    anchor_refresh = std::max(0, std::atoi(e));
                 }
             }
             anchor_frames = std::min<int>(anchor_frames, temporal_window - 1);
@@ -10962,22 +10956,58 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                         }
                     }
                     produced_end = std::max(produced_end, end);
-                    // Establish only after tile 0 has produced a real subject, not
-                    // from an external first-frame portrait.  Periodic re-anchoring
-                    // keeps the reference compatible with evolving hair/pose instead
-                    // of freezing the initial appearance for the entire clip.
-                    const bool establish_anchor = appearance_anchor.empty() && immutable_i2v_guide.empty() && anchor_frames > 0 && tile_index == 0;
-                    const bool refresh_anchor = !appearance_anchor.empty() && anchor_refresh > 0 &&
-                                                tile_index > 0 && tile_index % anchor_refresh == 0;
-                    if (establish_anchor || refresh_anchor) {
-                        const int64_t anchor_end = end;
-                        const int64_t anchor_start = std::max<int64_t>(tile_start + frozen, anchor_end - anchor_frames);
+                    // T2V's guide is deliberately rolling rather than global: every
+                    // completed tile contributes a late, low-motion appearance frame
+                    // for its immediate successor, so legitimate scene/character
+                    // changes remain possible on longer clips.
+                    const bool establish_anchor = immutable_i2v_guide.empty() && anchor_frames > 0;
+                    if (establish_anchor) {
+                        int64_t anchor_end = end;
+                        int64_t anchor_start = std::max<int64_t>(tile_start + frozen, anchor_end - anchor_frames);
+                        // T2V has no external identity image.  For the first guide only,
+                        // choose a completed generated frame that is both locally detailed
+                        // and low-motion relative to its predecessor instead of blindly
+                        // anchoring the moving terminal frame of tile zero.  The contiguous
+                        // frozen overlap still carries actual motion into the next tile.
+                        const bool select_sharp_handoff =
+                            std::getenv("LTX_REFINE_TEMPORAL_ANCHOR_SELECT") != nullptr &&
+                            std::string(std::getenv("LTX_REFINE_TEMPORAL_ANCHOR_SELECT")) == "sharp";
+                        if (select_sharp_handoff && anchor_end - anchor_start > 1) {
+                            const int64_t width = full_video.shape()[0];
+                            const int64_t height = full_video.shape()[1];
+                            int64_t best = anchor_start;
+                            double best_score = std::numeric_limits<double>::infinity();
+                            const float* data = video_result.data();
+                            for (int64_t frame = std::max<int64_t>(anchor_start, 1); frame < anchor_end; ++frame) {
+                                double motion = 0.0, detail = 0.0;
+                                int64_t n = 0;
+                                for (int64_t ch = 0; ch < latent_channels; ch += 16) {
+                                    const float* cur = data + plane * (frame + total_frames * ch);
+                                    const float* prev = data + plane * (frame - 1 + total_frames * ch);
+                                    for (int64_t y = 1; y < height; y += 4) {
+                                        for (int64_t x = 1; x < width; x += 4) {
+                                            const int64_t p = x + width * y;
+                                            motion += std::fabs(cur[p] - prev[p]);
+                                            detail += std::fabs(cur[p] - cur[p - 1]) + std::fabs(cur[p] - cur[p - width]);
+                                            ++n;
+                                        }
+                                    }
+                                }
+                                const double score = motion / (detail + 1e-6);
+                                if (n > 0 && score < best_score) { best_score = score; best = frame; }
+                            }
+                            anchor_start = best;
+                            anchor_end = std::min<int64_t>(end, best + 1);
+                            LOG_INFO("LTX refine temporal rolling sharp-handoff selected latent %lld (score %.6f)",
+                                     (long long)best, best_score);
+                        }
                         const int64_t count = anchor_end - anchor_start;
                         if (count > 0) {
+                            const bool had_appearance_anchor = !appearance_anchor.empty();
                             appearance_anchor = sd::ops::slice(video_result, 2, anchor_start, anchor_end);
                             appearance_anchor_start = anchor_start;
                             LOG_INFO("LTX refine temporal appearance-anchor: %s latent [%lld,%lld) for later tiles",
-                                     establish_anchor ? "established" : "refreshed",
+                                     had_appearance_anchor ? "updated" : "established",
                                      (long long)appearance_anchor_start, (long long)anchor_end);
                         }
                     }
