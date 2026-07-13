@@ -10068,6 +10068,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             } else {
                 auto full_video = sd::ops::slice(x_t, 3, 0, latent_channels);
                 auto full_noise = sd::ops::slice(noise, 3, 0, latent_channels);
+                // Keep I2V/keyframe locks from the packed stage-one mask. The
+                // per-window audio mask is rebuilt for each sliced audio span;
+                // only its leading video channels belong to this timeline.
+                sd::Tensor<float> full_video_denoise_mask;
+                if (!latents.denoise_mask.empty()) {
+                    full_video_denoise_mask = sd::ops::slice(latents.denoise_mask, 3, 0, latent_channels);
+                }
                 auto full_audio = unpack_ltxav_audio_latent(x_t, latents.audio_length, static_cast<int>(latent_channels));
                 if (full_audio.empty()) {
                     LOG_ERROR("LTX base temporal-window could not unpack driving audio latent");
@@ -10117,11 +10124,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                             audio_start + 1,
                             full_audio.shape()[1]);
                         auto audio_tile = sd::ops::slice(full_audio, 1, audio_start, audio_end);
-                        auto video_mask = make_ltxav_video_denoise_mask(video_tile, 1.0f);
+                        // Preserve source/keyframe mask values instead of
+                        // recreating a fully denoisable tile, then freeze the
+                        // carried temporal overlap without changing audio.
+                        auto video_mask = full_video_denoise_mask.empty()
+                                              ? make_ltxav_video_denoise_mask(video_tile, 1.0f)
+                                              : sd::ops::slice(full_video_denoise_mask, 2, tile_start, end);
                         if (frozen > 0) {
                             float* mask_data = video_mask.data();
-                            for (int64_t local = 0; local < frozen; ++local) {
-                                std::fill_n(mask_data + plane * local, plane, 0.0f);
+                            const int64_t mask_channels = video_mask.shape()[3];
+                            for (int64_t channel = 0; channel < mask_channels; ++channel) {
+                                for (int64_t local = 0; local < frozen; ++local) {
+                                    std::fill_n(mask_data + plane * (local + length * channel), plane, 0.0f);
+                                }
                             }
                         }
                         auto latent_tile = pack_ltxav_audio_and_video_latents(video_tile, audio_tile);
