@@ -431,6 +431,16 @@ typedef struct {
     // the global audio timeline so lip-sync continues across segments.
     const float* cont_latent;
     int cont_latent_frames;
+    // RETAKE END-PIN (bidirectional single-segment retake): the FIRST end_cont_latent_frames
+    // latent frames (the HEAD) of the NEXT segment (seg_{N+1}). Held FROZEN as an appended guide
+    // at a FUTURE timeline position (just past this segment's last target frame) so this segment's
+    // generated TAIL converges to the next segment's opening — i.e. segment N ends exactly where
+    // the unchanged, banked segment N+1 begins, so N+1 still flows seamlessly from a freshly
+    // re-rendered N. Composes with cont_latent (start-pin from seg_{N-1}'s tail) to pin BOTH
+    // neighbours. Same ggml-ne layout as cont_latent: [W_lat, H_lat, end_cont_latent_frames,
+    // C_lat, 1] contiguous f32. NULL/0 (the default) is byte-identical to today.
+    const float* end_cont_latent;
+    int end_cont_latent_frames;
     // LTXAV two-stage continuation: the last refined HIGH-RES VIDEO-only latent frames from
     // the prior segment. These are not interchangeable with cont_latent: cont_latent carries
     // the base-grid motion tail into stage 1, while cont_refine_latent is supplied as a frozen
@@ -498,6 +508,17 @@ typedef struct {
     const char*  chain_audio_dir;     // dir with aud_<i>.wav per segment, or NULL (no lip-sync)
     const char*  save_dir;            // optional: bank each seg's video latent + webm to save_dir/seg_<i>.{bin,webm}
     int          resume_from;         // resume: skip+reload segments [0, resume_from) from save_dir banked latents (0 = fresh)
+    // RETAKE (bidirectional single-segment splice). When retake_segment >= 0, re-render ONLY that
+    // one banked segment N — START-pinned by seg_{N-1}'s tail (the resume cont-latent) AND
+    // END-pinned by seg_{N+1}'s head (end_cont_latent) — then splice the freshly rendered N back
+    // into the timeline, keeping every OTHER segment from its banked seg_<i>.bin (VAE-decode only,
+    // no sampling). This is the true "re-render just shot N" retake with continuity on both sides.
+    // Requires save_dir pointing at a fully banked prior render. Edge cases: N=0 has no start pin
+    // (a fresh opener, still end-pinned to seg_1); N=n_segments-1 has no end pin (degenerates to an
+    // Option-A last-segment resume). -1 (the default) = ordinary chain/resume, byte-identical to
+    // before. NOTE: aggregate `= {}` init yields 0 (a VALID index) — callers MUST set this to -1
+    // explicitly to leave retake OFF.
+    int          retake_segment;
     // Optional per-segment V2V source ranges for chained relip. Both arrays have n_segments
     // entries; segment_control_frames[i] points at the first frame and the matching count gives
     // its length. When supplied for a segment, it replaces base_params->control_frames and that
