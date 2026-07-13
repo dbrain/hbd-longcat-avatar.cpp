@@ -79,6 +79,10 @@
 #                      only the x2 three-step detail pass runs in overlapping temporal latent
 #                      windows, then blends them. Use REFINE_TBLEND_FRAMES=8 and
 #                      REFINE_TBLEND_OVERLAP=2 with long single segments.
+#   KEYFRAMES="/work/init.png@0 /work/key.png@48"
+#                      repeatable LTX timeline-image guides (path@pixel-frame) for
+#                      multi-keyframe I2V. They are re-encoded at high resolution
+#                      by the stage-two refine as well as conditioned in stage one.
 #   LTX_REFINE_TEMPORAL_ANCHOR_FRAMES=1
 #                      keep one internally generated refined frame from the first tile as a
 #                      separate appearance-reference block for later refine tiles. This preserves
@@ -237,6 +241,11 @@ if [ -n "$INIT_IMG" ]; then
   INIT_ARGS="--init-img $INIT_IMG"
 fi
 
+KEYFRAME_ARGS=""
+for keyframe in ${KEYFRAMES:-}; do
+  KEYFRAME_ARGS="$KEYFRAME_ARGS --keyframe $keyframe"
+done
+
 # ---- prod engine env (the beat-comfy nvfp4/fp8/cuDNN stack + leak-fix eviction) ----
 ENV=( -e GGML_CUDNN_ATTN=1 -e GGML_CUDNN_ATTN_F16_OUT=1 -e GGML_CUDNN_CONV3D=1 -e LTX_DIT_F16=1
   -e GGML_NVFP4_CUBLASLT=1 -e GGML_NVFP4_QUANT_TWOLEVEL=1 -e GGML_FP8_FFN=1 -e GGML_FP8_LAYERS=transformer_blocks
@@ -272,7 +281,7 @@ INNER="$PROFILER stdbuf -oL -eL $BIN -M vid_gen --diffusion-model /ltx2/$DIT \
   --lora-model-dir /ltx2/loras \
   --ltx-chain-segments $SEGMENTS --ltx-chain-prompts /work/prompt.txt --ltx-chain-audio-dir /work/adir --cont-latent-frames 3 \
   -W $WIDTH -H $HEIGHT --video-frames $F --fps $FPS --steps $STEPS --sampling-method $SAMPLING_METHOD --cfg-scale 1.0 --diffusion-fa \
-  $HIRES_ARGS $INIT_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s $SEED -v -o /work/_raw_$OUT_NAME"
+  $HIRES_ARGS $INIT_ARGS $KEYFRAME_ARGS --offload-to-cpu --mmap --max-vram $MAXV -s $SEED -v -o /work/_raw_$OUT_NAME"
 
 LOG="$OUTDIR/render.log"
 VRAM_LOG="$OUTDIR/vram.log"

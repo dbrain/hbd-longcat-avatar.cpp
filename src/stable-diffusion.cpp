@@ -4982,6 +4982,54 @@ static sd::Tensor<float> build_ltxav_window_video_positions_with_reference(int64
     return positions;
 }
 
+// The multi-keyframe conditioner is a set of single-frame image guides at
+// arbitrary *pixel-frame* positions, not a contiguous continuation tail.  A
+// temporal refine tile keeps its target on the absolute clip timeline and
+// appends those guides at the same timeline locations used by stage one.
+static sd::Tensor<float> build_ltxav_window_video_positions_with_keyframes(int64_t width,
+                                                                            int64_t height,
+                                                                            int64_t latent_start,
+                                                                            int64_t latent_frames,
+                                                                            const std::vector<int>& keyframe_frame_indices,
+                                                                            int fps,
+                                                                            int spatial_scale,
+                                                                            int temporal_scale = 8) {
+    GGML_ASSERT(width > 0 && height > 0 && latent_frames > 0 && fps > 0);
+    const int64_t n_keyframes = static_cast<int64_t>(keyframe_frame_indices.size());
+    GGML_ASSERT(n_keyframes > 0);
+    sd::Tensor<float> positions({2, 3, width * height * (latent_frames + n_keyframes), 1});
+    int64_t token = 0;
+    for (int64_t t = 0; t < latent_frames; ++t) {
+        const float t_start = ltxv_latent_corner_to_pixel_frame(latent_start + t, temporal_scale, true) /
+                              static_cast<float>(fps);
+        const float t_end = ltxv_latent_corner_to_pixel_frame(latent_start + t + 1, temporal_scale, true) /
+                            static_cast<float>(fps);
+        for (int64_t h = 0; h < height; ++h) {
+            for (int64_t w = 0; w < width; ++w) {
+                set_ltxv_video_position(&positions, token++, t_start, t_end,
+                                        static_cast<float>(h * spatial_scale),
+                                        static_cast<float>((h + 1) * spatial_scale),
+                                        static_cast<float>(w * spatial_scale),
+                                        static_cast<float>((w + 1) * spatial_scale));
+            }
+        }
+    }
+    for (int frame_idx : keyframe_frame_indices) {
+        const float t_start = static_cast<float>(frame_idx) / static_cast<float>(fps);
+        const float t_end   = static_cast<float>(frame_idx + 1) / static_cast<float>(fps);
+        for (int64_t h = 0; h < height; ++h) {
+            for (int64_t w = 0; w < width; ++w) {
+                set_ltxv_video_position(&positions, token++, t_start, t_end,
+                                        static_cast<float>(h * spatial_scale),
+                                        static_cast<float>((h + 1) * spatial_scale),
+                                        static_cast<float>(w * spatial_scale),
+                                        static_cast<float>((w + 1) * spatial_scale));
+            }
+        }
+    }
+    return positions;
+}
+
 static sd::Tensor<float> build_ltxav_window_audio_positions(int64_t audio_start, int64_t audio_frames) {
     std::vector<float> positions(static_cast<size_t>(audio_frames));
     for (int64_t t = 0; t < audio_frames; ++t) {
@@ -9349,8 +9397,10 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
         return true;
     }
 
+    const bool has_timeline_keyframes = sd_vid_gen_params->keyframes != nullptr &&
+                                        sd_vid_gen_params->keyframes_size > 0;
     if (sd_vid_gen_params->init_image.data == nullptr &&
-        sd_vid_gen_params->end_image.data == nullptr) {
+        sd_vid_gen_params->end_image.data == nullptr && !has_timeline_keyframes) {
         // No image conditioning to re-apply in the refine. For an AUDIO-DRIVEN LTXAV render
         // (latents.audio_fixed) the stage-2 refine must still PIN the driving-audio slot
         // (mask=0) every step, exactly like stage-1 (:7793-7801) and the relip stage-2 path
@@ -9394,7 +9444,47 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
     int image_height             = static_cast<int>(video_latent.shape()[1]) * request.vae_scale_factor;
     sd::Tensor<float> video_mask = make_ltxav_video_denoise_mask(video_latent, 1.f);
 
-    if (sd_vid_gen_params->init_image.data != nullptr) {
+    if (has_timeline_keyframes) {
+        if (video_reference_out == nullptr) {
+            LOG_ERROR("LTXV refine multi-keyframe conditioning requires a video_reference output");
+            return false;
+        }
+        std::vector<int> keyframe_positions;
+        sd::Tensor<float> keyframe_reference;
+        for (int i = 0; i < sd_vid_gen_params->keyframes_size; ++i) {
+            const int frame_idx = sd_vid_gen_params->keyframe_frame_indices != nullptr
+                                      ? sd_vid_gen_params->keyframe_frame_indices[i]
+                                      : 0;
+            if (frame_idx < 0 || frame_idx >= request.frames || sd_vid_gen_params->keyframes[i].data == nullptr) {
+                LOG_ERROR("invalid LTXV refine keyframe %d (frame=%d, range=[0,%d), image=%p)",
+                          i, frame_idx, request.frames, (void*)sd_vid_gen_params->keyframes[i].data);
+                return false;
+            }
+            auto keyframe_image = sd_image_to_tensor(sd_vid_gen_params->keyframes[i], image_width, image_height);
+            auto keyframe_latent = encode_ltxav_condition_image(sd_ctx, keyframe_image, "refine keyframe");
+            if (keyframe_latent.empty() || keyframe_latent.shape()[0] != video_latent.shape()[0] ||
+                keyframe_latent.shape()[1] != video_latent.shape()[1] || keyframe_latent.shape()[2] != 1 ||
+                keyframe_latent.shape()[3] != video_latent.shape()[3]) {
+                LOG_ERROR("invalid LTXV refine keyframe %d latent shape", i);
+                return false;
+            }
+            keyframe_reference = keyframe_reference.empty()
+                                     ? std::move(keyframe_latent)
+                                     : sd::ops::concat(keyframe_reference, keyframe_latent, 2);
+            keyframe_positions.push_back(frame_idx);
+        }
+        *video_reference_out = std::move(keyframe_reference);
+        *video_positions = build_ltxv_multi_keyframe_video_positions(video_latent.shape()[0],
+                                                                       video_latent.shape()[1],
+                                                                       video_latent.shape()[2],
+                                                                       keyframe_positions,
+                                                                       request.fps,
+                                                                       request.vae_scale_factor,
+                                                                       8,
+                                                                       true);
+        LOG_INFO("LTXV refine: re-applied %d timeline keyframe guide(s) at %dx%d",
+                 sd_vid_gen_params->keyframes_size, image_width, image_height);
+    } else if (sd_vid_gen_params->init_image.data != nullptr) {
         sd::Tensor<float> start_image = sd_image_to_tensor(sd_vid_gen_params->init_image, image_width, image_height);
         if (!apply_ltxav_condition_image_by_latent_index(sd_ctx,
                                                          start_image,
@@ -10207,6 +10297,36 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
 
+    // Stage-one timeline keyframes are appended guide tokens.  They must not be
+    // spatially upscaled or treated as output frames: stage two re-encodes the
+    // source images at its own resolution and passes those guides separately.
+    // Strip the stage-one tail before the upscale, preserving packed audio as a
+    // segment-global stream rather than shearing it by slicing the video axis.
+    const bool timeline_keyframes = sd_vid_gen_params->keyframes != nullptr &&
+                                    sd_vid_gen_params->keyframes_size > 0;
+    if (latent_refine_enabled && timeline_keyframes && latents.video_conditioning_frame_count > 0 &&
+        latents.video_target_frame_count > 0 &&
+        final_latent.shape()[2] == latents.video_target_frame_count + latents.video_conditioning_frame_count) {
+        const int64_t target_frames = latents.video_target_frame_count;
+        const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
+        if (latents.audio_length > 0 && final_latent.shape()[3] > latent_channels) {
+            auto video_latent = sd::ops::slice(final_latent, 3, 0, latent_channels);
+            auto audio_latent = unpack_ltxav_audio_latent(final_latent, latents.audio_length, (int)latent_channels);
+            if (audio_latent.empty()) {
+                LOG_ERROR("could not preserve packed audio while stripping stage-one keyframe guides");
+                return false;
+            }
+            video_latent = sd::ops::slice(video_latent, 2, 0, target_frames);
+            final_latent = pack_ltxav_audio_and_video_latents(video_latent, audio_latent);
+        } else {
+            final_latent = sd::ops::slice(final_latent, 2, 0, target_frames);
+        }
+        latents.video_conditioning_frame_count = 0;
+        latents.video_positions = {};
+        LOG_INFO("LTXV refine: stripped %d stage-one keyframe guide frame(s); stage-two will re-apply them separately",
+                 sd_vid_gen_params->keyframes_size);
+    }
+
     // Continuation + hires: when LTX latent spatial upscale is enabled, the continuation
     // latent handed back to the caller (final_latent_out) must be the BASE (pre-upscale)
     // latent, so the NEXT chained segment seeds + samples at the same base resolution it
@@ -10734,6 +10854,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                  hires_video_reference.shape()[0] == x_t.shape()[0] &&
                                                  hires_video_reference.shape()[1] == x_t.shape()[1] &&
                                                  hires_video_reference.shape()[3] == sd_ctx->sd->get_latent_channel();
+        const bool refine_timeline_keyframes_windowable = refine_reference_windowable &&
+                                                          sd_vid_gen_params->keyframes != nullptr &&
+                                                          sd_vid_gen_params->keyframes_size > 0 &&
+                                                          hires_video_reference.shape()[2] == sd_vid_gen_params->keyframes_size;
         const char* temporal_refine_env = std::getenv("LTX_REFINE_TEMPORAL_BLEND");
         const bool temporal_refine_enabled = temporal_refine_env != nullptr && temporal_refine_env[0] != '\0' &&
                                              std::string(temporal_refine_env) != "0" &&
@@ -10893,7 +11017,24 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                                    : !immutable_i2v_guide.empty()
                                                                    ? immutable_i2v_guide
                                                                    : appearance_anchor;
-                    auto refine_video_positions = refine_reference_windowable
+                    std::vector<int> refine_keyframe_positions;
+                    if (refine_timeline_keyframes_windowable) {
+                        refine_keyframe_positions.reserve(sd_vid_gen_params->keyframes_size);
+                        for (int i = 0; i < sd_vid_gen_params->keyframes_size; ++i) {
+                            refine_keyframe_positions.push_back(sd_vid_gen_params->keyframe_frame_indices != nullptr
+                                                                    ? sd_vid_gen_params->keyframe_frame_indices[i]
+                                                                    : 0);
+                        }
+                    }
+                    auto refine_video_positions = refine_timeline_keyframes_windowable
+                        ? build_ltxav_window_video_positions_with_keyframes(video_tile.shape()[0],
+                                                                              video_tile.shape()[1],
+                                                                              tile_start,
+                                                                              length,
+                                                                              refine_keyframe_positions,
+                                                                              hires_request.fps,
+                                                                              hires_request.vae_scale_factor)
+                        : refine_reference_windowable
                         ? build_ltxav_window_video_positions_with_reference(video_tile.shape()[0],
                                                                               video_tile.shape()[1],
                                                                               tile_start,
