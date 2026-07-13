@@ -2650,6 +2650,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.high_noise_sample_params  = high_noise_sample_params;
     params.moe_boundary              = moe_boundary;
     params.strength                  = strength;
+    params.v2v_mode                  = 0;  // relip/off by default; run_vid_chain_job sets it per request
     params.seed                      = seed;
     params.video_frames              = video_frames;
     params.fps                       = fps;

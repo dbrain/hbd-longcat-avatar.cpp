@@ -407,6 +407,12 @@ typedef struct {
     sd_sample_params_t high_noise_sample_params;
     float moe_boundary;
     float strength;
+    // Generic V2V (SDEdit) selector for control_frames. 0 (default) = the frames are IC-LoRA
+    // lipdub-relip reference tokens (structure-preserving mouth re-render). 1 = SDEdit denoise:
+    // the control_frames are VAE-encoded and seeded into the video channels of init_latent, and
+    // the sampler denoises from a `strength`-derived partial sigma (1.0 = full re-render / source
+    // ignored, lower = keep more of the source). Consumed only on the LTXAV path; 0 = byte-identical.
+    int v2v_mode;
     int64_t seed;
     int video_frames;
     int fps;
@@ -524,6 +530,21 @@ typedef struct {
     sd_image_t* const* segment_keyframes;
     const int* const*  segment_keyframe_indices;
     const int*         segment_keyframe_counts;
+    // Optional per-segment VIDEO FRAME COUNT ("Director" variable-length shots). n_segments
+    // entries; a 0/NULL entry uses base_params->video_frames (uniform, the default). Lets each
+    // shot on the timeline have its own duration instead of one global length. Each segment
+    // renders segment_video_frames[i] frames; the stitch/overlap-drop already operates on the
+    // actual per-segment output, so mixed lengths compose. A continuation segment's count must
+    // exceed the overlap (cont_latent_frames → overlap_px) or it contributes nothing after the
+    // drop; fresh shots (scene-cut / keyframe / seg-0) have no such floor. NULL = byte-identical
+    // uniform-length behaviour.
+    const int* segment_video_frames;
+    // Optional per-segment GENERIC V2V mode selector for segment_control_frames[i]. n_segments
+    // entries; segment_v2v_mode[i]==1 makes that segment an SDEdit denoise of its control-frame
+    // source (see sd_vid_gen_params_t.v2v_mode) instead of a lipdub-relip reference append. A
+    // 0/NULL entry keeps the existing relip behaviour (byte-identical). Only meaningful for a
+    // segment that has segment_control_frames set.
+    const int* segment_v2v_mode;
     // Optional: invoked once per stitched segment, in order, with that segment's kept frames
     // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
     // (server layer) bank a viewable per-segment webm as it's produced, without the core lib

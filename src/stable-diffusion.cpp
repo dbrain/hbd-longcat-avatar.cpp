@@ -4079,6 +4079,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->width                                 = 512;
     sd_vid_gen_params->height                                = 512;
     sd_vid_gen_params->strength                              = 0.75f;
+    sd_vid_gen_params->v2v_mode                              = 0;
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
@@ -4832,6 +4833,9 @@ struct ImageGenerationLatents {
     int audio_length                       = 0;
     int audio_target_length                = 0;
     bool audio_reference_conditioning      = false;
+    // Generic V2V (SDEdit): set when the video channels of init_latent were seeded from a source
+    // clip and the caller must truncate the sigma schedule by `strength` before sampling.
+    bool v2v_sdedit                        = false;
     bool audio_fixed                       = false;  // LTXAV: hold audio latent fixed (drive lip-sync to a given wav)
     // Two-stage lipdub relip (LTXAV_RELIP_TWOSTAGE=1): stage-1 ran at half res from-noise; the
     // hires latent-upscale stage-2 must RE-APPLY the relip reference at full res (Change B in
@@ -6663,7 +6667,7 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
-        if (sd_vid_gen_params->control_frames_size > 0) {
+        if (sd_vid_gen_params->control_frames_size > 0 && sd_vid_gen_params->v2v_mode != 1) {
             // LTX-2.3 V2V LIPDUB RELIP: the control_frames are an existing video clip (e.g. a
             // Wan2.2 render). Encode the WHOLE clip to video latents and append it as a frozen,
             // timeline-aligned IC-LoRA reference (apply_ltxav_video_relip_reference). With the
@@ -7336,6 +7340,47 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             LOG_INFO("TXT2VID (LTXAV)");
             latents.init_latent  = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
             latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+        }
+
+        // GENERIC V2V (SDEdit): a control-frame source with v2v_mode==1 fell through to the t2v
+        // branch above (relip gated off) so init_latent/mask/positions/audio are the plain t2v
+        // setup. Now VAE-encode the source clip and overwrite the VIDEO channels of init_latent
+        // with it; the caller then truncates the sigma schedule by `strength` so sampling starts
+        // from a partial sigma (img2img convention: 1.0 = full re-render / source ignored, lower =
+        // keep more of the source). The audio channels stay as the t2v init (they denoise weakly
+        // and are discarded — v2v audio is muxed downstream). NULL/0 v2v_mode = byte-identical.
+        if (sd_vid_gen_params->v2v_mode == 1 && sd_vid_gen_params->control_frames_size > 0 &&
+            latents.init_latent.dim() >= 4) {
+            if (sd_ctx->sd->vae_decode_only) {
+                LOG_ERROR("LTXAV V2V (SDEdit) requires VAE encoder weights (vae_decode_only=false)");
+                return std::nullopt;
+            }
+            int    lw = 0, lh = 0, lf = 0, lc = 0;
+            float* src = sd_ctx_encode_video_frames(sd_ctx, sd_vid_gen_params->control_frames,
+                                                    sd_vid_gen_params->control_frames_size,
+                                                    request->width, request->height, &lw, &lh, &lf, &lc);
+            if (src == nullptr) {
+                LOG_ERROR("LTXAV V2V: source VAE encode failed");
+                return std::nullopt;
+            }
+            int64_t Wl       = latents.init_latent.shape()[0];
+            int64_t Hl       = latents.init_latent.shape()[1];
+            int64_t Tl       = latents.init_latent.shape()[2];
+            size_t  src_vals = (size_t)lw * (size_t)lh * (size_t)lf * (size_t)lc;
+            if (lw != (int)Wl || lh != (int)Hl || lf != (int)Tl ||
+                src_vals > (size_t)latents.init_latent.numel()) {
+                LOG_ERROR("LTXAV V2V: source latent %dx%dx%dx%d != target grid %lldx%lldx%lld",
+                          lw, lh, lf, lc, (long long)Wl, (long long)Hl, (long long)Tl);
+                free(src);
+                return std::nullopt;
+            }
+            // init_latent is ggml-ne [W,H,T,C,1] contiguous: video channels are the first `lc`
+            // channels (= the first src_vals floats), audio channels follow. Seed video only.
+            std::memcpy(latents.init_latent.data(), src, src_vals * sizeof(float));
+            free(src);
+            latents.v2v_sdedit = true;
+            LOG_INFO("LTXAV V2V (SDEdit): seeded %d source frames into init_latent video channels (strength=%.2f)",
+                     sd_vid_gen_params->control_frames_size, sd_vid_gen_params->strength);
         }
     }
 
@@ -9158,6 +9203,33 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     ImageGenerationLatents latents = std::move(*latent_inputs_opt);
 
+    // GENERIC V2V (SDEdit): the source clip is seeded into init_latent's video channels; truncate
+    // the sigma schedule by `strength` so sampling starts from a partial sigma. img2img convention
+    // (mirrors prepare_image_generation_latents): t_enc = sample_steps*strength; keep the tail of
+    // the schedule. strength >= 1.0 leaves the full schedule (start==0 → source ignored, a fresh
+    // render). NULL v2v = v2v_sdedit false → untouched.
+    if (latents.v2v_sdedit) {
+        float strength = std::clamp(sd_vid_gen_params->strength, 0.f, 1.f);
+        if (strength < 1.f && plan.sample_steps > 0 &&
+            (int)plan.sigmas.size() == plan.sample_steps + 1) {
+            int t_enc = (int)(plan.sample_steps * strength);
+            if (t_enc >= plan.sample_steps) {
+                t_enc = plan.sample_steps - 1;
+            }
+            if (t_enc < 0) {
+                t_enc = 0;
+            }
+            int start = plan.sample_steps - t_enc - 1;
+            if (start > 0 && start < (int)plan.sigmas.size()) {
+                std::vector<float> sched(plan.sigmas.begin() + start, plan.sigmas.end());
+                plan.sigmas       = std::move(sched);
+                plan.sample_steps = (int)plan.sigmas.size() - 1;
+                LOG_INFO("LTXAV V2V: SDEdit strength=%.2f -> %d steps (t_enc=%d), sigma[0]=%.4f",
+                         strength, plan.sample_steps, t_enc, plan.sigmas.front());
+            }
+        }
+    }
+
     ImageGenerationEmbeds embeds = prepare_video_generation_embeds(sd_ctx,
                                                                    sd_vid_gen_params,
                                                                    request,
@@ -10862,6 +10934,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
 
     for (int seg = start_seg; seg < n_chain; ++seg) {
         sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
+        // Director variable-length: this shot renders its own frame count when the caller
+        // supplied one (else the uniform base_params->video_frames). NULL/0 = byte-identical.
+        if (chain_params->segment_video_frames != nullptr &&
+            chain_params->segment_video_frames[seg] > 0) {
+            vp.video_frames = chain_params->segment_video_frames[seg];
+        }
         const bool segmented_relip = chain_params->segment_control_frames != nullptr &&
                                      chain_params->segment_control_frame_counts != nullptr &&
                                      chain_params->segment_control_frames[seg] != nullptr &&
@@ -10869,8 +10947,13 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (segmented_relip) {
             vp.control_frames      = chain_params->segment_control_frames[seg];
             vp.control_frames_size = chain_params->segment_control_frame_counts[seg];
-            LOG_INFO("generate_video_chain seg %d: V2V relip source window (%d frames)",
-                     seg + 1, vp.control_frames_size);
+            // Per-segment mode override (else keep base_params->v2v_mode): 1 = generic V2V
+            // (SDEdit denoise of the source), 0 = lipdub relip reference append.
+            if (chain_params->segment_v2v_mode != nullptr) {
+                vp.v2v_mode = chain_params->segment_v2v_mode[seg] == 1 ? 1 : 0;
+            }
+            LOG_INFO("generate_video_chain seg %d: %s source window (%d frames)",
+                     seg + 1, vp.v2v_mode == 1 ? "V2V SDEdit" : "V2V relip", vp.control_frames_size);
         }
 
         // Director keyframes: a shot with per-segment keyframes (image+frame pins) renders FRESH

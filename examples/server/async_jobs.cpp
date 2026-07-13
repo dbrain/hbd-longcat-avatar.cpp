@@ -494,6 +494,10 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     int         resume_from = body.value("resume_from", 0);
 
     sd_vid_gen_params_t base = gen_params.to_sd_vid_gen_params_t();
+    // Generic V2V (SDEdit): top-level "v2v":true switches control_frames from lipdub-relip
+    // reference-append to an SDEdit denoise of the source (see sd_vid_gen_params_t.v2v_mode).
+    // Applies to every segment by default; per-segment segments[i].v2v overrides it below.
+    base.v2v_mode = body.value("v2v", false) ? 1 : 0;
 
     // Chained V2V relip accepts one contiguous control_frames array and partitions it into
     // per-segment source windows. Default is exactly video_frames per segment; callers may pass
@@ -619,10 +623,42 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         }
     }
 
+    // Director variable-length: per-segment frame count from body["segments"][i]["frames"].
+    // A 0/absent entry falls back to the uniform gen_params.video_frames. Any positive entry
+    // switches this render to variable-length (segment_video_frames wired below).
+    std::vector<int> seg_frames(n_segments, 0);
+    bool             any_seg_frames = false;
+    // Per-segment generic-V2V mode (segments[i].v2v). -1 = unset (use base.v2v_mode), 0/1 override.
+    std::vector<int> seg_v2v(n_segments, base.v2v_mode);
+    bool             any_seg_v2v = false;
+    if (!wan_mode && body.contains("segments") && body["segments"].is_array()) {
+        const auto& segs = body["segments"];
+        for (int seg = 0; seg < n_segments && seg < (int)segs.size(); ++seg) {
+            if (!segs[seg].is_object()) {
+                continue;
+            }
+            auto it = segs[seg].find("frames");
+            if (it != segs[seg].end() && it->is_number_integer() && it->get<int>() > 0) {
+                seg_frames[seg] = it->get<int>();
+                any_seg_frames  = true;
+                LOG_INFO("run_vid_chain_job: segment %d frame count %d (variable-length)",
+                         seg + 1, seg_frames[seg]);
+            }
+            auto vit = segs[seg].find("v2v");
+            if (vit != segs[seg].end() && vit->is_boolean()) {
+                seg_v2v[seg] = vit->get<bool>() ? 1 : 0;
+                any_seg_v2v  = true;
+                LOG_INFO("run_vid_chain_job: segment %d v2v mode = %d (SDEdit)", seg + 1, seg_v2v[seg]);
+            }
+        }
+    }
+
     sd_vid_chain_params_t chain = {};
     chain.n_segments         = n_segments;
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
     chain.segment_prompts    = prompt_ptrs.data();
+    chain.segment_video_frames = any_seg_frames ? seg_frames.data() : nullptr;
+    chain.segment_v2v_mode     = any_seg_v2v ? seg_v2v.data() : nullptr;
     chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
     chain.save_dir           = job_dir.empty() ? nullptr : job_dir.c_str();
     chain.resume_from        = std::max(0, resume_from);
