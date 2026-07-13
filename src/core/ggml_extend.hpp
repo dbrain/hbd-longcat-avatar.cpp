@@ -1412,7 +1412,11 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         do {
             int64_t oh1;
             ggml_tensor* xh;
-            if (tile_h) { oh1 = std::min(OH, oh0 + hstep); xh = ggml_ext_slice(ctx, xp, 1, oh0, oh1 + KH - 1, false); }
+            // cuDNN Conv3D may not retain arbitrary strided views across the tiled VAE graph ->
+            // a non-contiguous tile slice decodes/encodes as an ~8px latent grid (GPU-proven on v2v
+            // SDEdit at partial strength; tile-count-dependent). Materialize each tile so VAE encodes
+            // (i2v/v2v/retake anchors) and hi-res decodes get contiguous input.
+            if (tile_h) { oh1 = std::min(OH, oh0 + hstep); xh = ggml_ext_slice(ctx, xp, 1, oh0, oh1 + KH - 1); }
             else        { oh1 = 0; xh = xp; }
             const int64_t OW    = tile_w ? (xh->ne[0] - (KW - 1)) : 0;
             const int64_t wstep = tile_w ? (OW + conv3d_wtiles - 1) / conv3d_wtiles : 0;
@@ -1426,7 +1430,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
             do {
                 int64_t ow1;
                 ggml_tensor* xt;
-                if (tile_w) { ow1 = std::min(OW, ow0 + wstep); xt = ggml_ext_slice(ctx, xh, 0, ow0, ow1 + KW - 1, false); }
+                if (tile_w) { ow1 = std::min(OW, ow0 + wstep); xt = ggml_ext_slice(ctx, xh, 0, ow0, ow1 + KW - 1); }
                 else        { ow1 = 0; xt = xh; }
                 ggml_tensor* yt = conv_once(xt, p0e, p1e);
                 row_tiles.push_back(yt);

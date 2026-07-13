@@ -494,6 +494,31 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     int         resume_from = body.value("resume_from", 0);
 
     sd_vid_gen_params_t base = gen_params.to_sd_vid_gen_params_t();
+    // Generic V2V mode selector for control_frames (see sd_vid_gen_params_t.v2v_mode):
+    //   0 = lipdub relip (default), 1 = SDEdit denoise, 2 = guide-edit (Director-2 source-as-guide).
+    // Accept an explicit integer "v2v_mode" (0/1/2); fall back to the legacy boolean "v2v" (true=1
+    // SDEdit). Applies to every segment by default; per-segment segments[i].v2v_mode overrides below.
+    if (body.contains("v2v_mode") && body["v2v_mode"].is_number_integer()) {
+        int m         = body["v2v_mode"].get<int>();
+        base.v2v_mode = (m == 1 || m == 2) ? m : 0;
+    } else {
+        base.v2v_mode = body.value("v2v", false) ? 1 : 0;
+    }
+    // Guide-edit (v2v_mode==2) LTXDirectorGuide scale ("edit strength"): 1.0 = hold the source scene
+    // hard, ~0.5 = looser guide / bigger edit. Global to the chain in v1. Ignored for modes 0/1.
+    base.v2v_guide_strength = body.value("v2v_guide_strength", 1.0f);
+    // Guide-edit SOURCE (mode 2), LATENT-IN (preferred when we own the source, e.g. editing a shot we
+    // rendered): absolute path to a banked diffusion VIDEO latent (a prior job's seg_<i>.bin). When
+    // set, the guide loads straight from this latent — no pixel re-encode. Global/seg-0 here;
+    // per-segment via segments[i].v2v_source_latent_path below. Falls back to control_frames (pixel
+    // encode) when absent. (Owner string must outlive generate_video_chain — declared in this scope.)
+    std::string v2v_guide_latent_path = body.value("v2v_guide_latent_path", std::string());
+    base.v2v_guide_latent_path = v2v_guide_latent_path.empty() ? nullptr : v2v_guide_latent_path.c_str();
+    if (base.v2v_mode == 2) {
+        LOG_INFO("run_vid_chain_job: guide-edit v2v (mode 2), guide strength %.2f, source=%s",
+                 base.v2v_guide_strength,
+                 base.v2v_guide_latent_path ? "latent-in" : "pixel-encode(control_frames)");
+    }
 
     // Chained V2V relip accepts one contiguous control_frames array and partitions it into
     // per-segment source windows. Default is exactly video_frames per segment; callers may pass
@@ -619,10 +644,74 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         }
     }
 
+    // Director variable-length: per-segment frame count from body["segments"][i]["frames"].
+    // A 0/absent entry falls back to the uniform gen_params.video_frames. Any positive entry
+    // switches this render to variable-length (segment_video_frames wired below).
+    std::vector<int> seg_frames(n_segments, 0);
+    bool             any_seg_frames = false;
+    // Per-segment generic-V2V mode. Default = base.v2v_mode; override via segments[i].v2v_mode
+    // (integer 0/1/2) or the legacy boolean segments[i].v2v (true=1 SDEdit).
+    std::vector<int> seg_v2v(n_segments, base.v2v_mode);
+    bool             any_seg_v2v = false;
+    // Per-segment guide-edit LATENT-IN source: absolute path to that segment's banked seg_<i>.bin
+    // (from segments[i].v2v_source_latent_path). Owners (strings) outlive generate_video_chain; the
+    // const char* array is stable-sized. An entry makes that segment a latent-in guide-edit.
+    std::vector<std::string> seg_guide_paths(n_segments);
+    std::vector<const char*> seg_guide_ptrs(n_segments, nullptr);
+    bool                     any_seg_guide_lat = false;
+    if (!wan_mode && body.contains("segments") && body["segments"].is_array()) {
+        const auto& segs = body["segments"];
+        for (int seg = 0; seg < n_segments && seg < (int)segs.size(); ++seg) {
+            if (!segs[seg].is_object()) {
+                continue;
+            }
+            auto it = segs[seg].find("frames");
+            if (it != segs[seg].end() && it->is_number_integer() && it->get<int>() > 0) {
+                seg_frames[seg] = it->get<int>();
+                any_seg_frames  = true;
+                LOG_INFO("run_vid_chain_job: segment %d frame count %d (variable-length)",
+                         seg + 1, seg_frames[seg]);
+            }
+            bool seg_set_v2v = false;
+            auto mit         = segs[seg].find("v2v_mode");
+            if (mit != segs[seg].end() && mit->is_number_integer()) {
+                int m        = mit->get<int>();
+                seg_v2v[seg] = (m == 1 || m == 2) ? m : 0;
+                seg_set_v2v  = true;
+            } else {
+                auto vit = segs[seg].find("v2v");
+                if (vit != segs[seg].end() && vit->is_boolean()) {
+                    seg_v2v[seg] = vit->get<bool>() ? 1 : 0;
+                    seg_set_v2v  = true;
+                }
+            }
+            if (seg_set_v2v) {
+                any_seg_v2v   = true;
+                const char* d = seg_v2v[seg] == 1 ? "SDEdit" : seg_v2v[seg] == 2 ? "guide-edit" : "relip";
+                LOG_INFO("run_vid_chain_job: segment %d v2v mode = %d (%s)", seg + 1, seg_v2v[seg], d);
+            }
+            auto git = segs[seg].find("v2v_source_latent_path");
+            if (git != segs[seg].end() && git->is_string() && !git->get<std::string>().empty()) {
+                seg_guide_paths[seg] = git->get<std::string>();
+                seg_guide_ptrs[seg]  = seg_guide_paths[seg].c_str();
+                any_seg_guide_lat    = true;
+                // A latent-in guide segment is a guide-edit (mode 2) even without control_frames.
+                if (!seg_set_v2v) {
+                    seg_v2v[seg] = 2;
+                    any_seg_v2v  = true;
+                }
+                LOG_INFO("run_vid_chain_job: segment %d guide-edit LATENT-IN %s", seg + 1, seg_guide_paths[seg].c_str());
+            }
+        }
+    }
+
     sd_vid_chain_params_t chain = {};
     chain.n_segments         = n_segments;
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
     chain.segment_prompts    = prompt_ptrs.data();
+    chain.segment_video_frames = any_seg_frames ? seg_frames.data() : nullptr;
+    chain.segment_v2v_mode     = any_seg_v2v ? seg_v2v.data() : nullptr;
+    chain.segment_v2v_guide_latent_paths = any_seg_guide_lat ? seg_guide_ptrs.data() : nullptr;
     chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
     chain.save_dir           = job_dir.empty() ? nullptr : job_dir.c_str();
     chain.resume_from        = std::max(0, resume_from);

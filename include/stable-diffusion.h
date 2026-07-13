@@ -70,6 +70,7 @@ enum scheduler_t {
     LCM_SCHEDULER,
     BONG_TANGENT_SCHEDULER,
     LTX2_SCHEDULER,
+    LINEAR_QUADRATIC_SCHEDULER,
     SCHEDULER_COUNT
 };
 
@@ -407,6 +408,39 @@ typedef struct {
     sd_sample_params_t high_noise_sample_params;
     float moe_boundary;
     float strength;
+    // Generic V2V selector for control_frames. Consumed only on the LTXAV path; 0 = byte-identical.
+    //   0 (default) = the frames are IC-LoRA lipdub-relip reference tokens (structure-preserving
+    //       mouth re-render; needs the lipdub LoRA + a --drive-audio latent).
+    //   1 = SDEDIT DENOISE: the control_frames are VAE-encoded and seeded into the video channels
+    //       of init_latent, and the sampler denoises from a `strength`-derived partial sigma
+    //       (1.0 = full re-render / source ignored, lower = keep more of the source). A RESTYLE
+    //       tool — the source washes out over a long denoise, so it can't do structure-preserving
+    //       "keep the scene, add an element" edits.
+    //   2 = GUIDE-EDIT (Director-2 "LTXDirectorGuide"): "keep the scene, add an element." The
+    //       control_frames are VAE-encoded and APPENDED as guide tokens at their timeline positions
+    //       (the SAME conditioning primitive as the i2v / keyframe guide — mask = 1 - strength —
+    //       generalised from a single image to the whole source clip), while the FULL schedule
+    //       denoises the target from noise with the edit prompt. The guide holds the source scene at
+    //       every step; the prompt adds the edit. `v2v_guide_strength` is the LTXDirectorGuide scale.
+    //       This path DEFAULTS to the `linear_quadratic` scheduler over the full step budget (the
+    //       Director-2 guide schedule; prod LTX_CUSTOM_SIGMAS reproduces it bit-for-bit) when the
+    //       request leaves the scheduler unset — overridable for A/B. Needs VAE encoder weights;
+    //       does NOT need the lipdub LoRA or --drive-audio. Distinct from SDEdit (mode 1), which
+    //       washes structure out; this is the structure-preserving edit path.
+    int v2v_mode;
+    // GUIDE-EDIT (v2v_mode==2) guide scale = "edit strength", the LTXDirectorGuide scale (Director-2
+    // uses 1.0 / 0.5). 1.0 = hold the source scene hard (subtle edits); lower (~0.5) loosens the
+    // guide so the prompt can change more (bigger edits). <=0 is treated as 1.0. Read only when
+    // v2v_mode==2, so any value is byte-identical for modes 0/1.
+    float v2v_guide_strength;
+    // GUIDE-EDIT (v2v_mode==2) SOURCE, latent-in path (PREFERRED when we own the source, e.g. editing
+    // a shot WE just rendered). Absolute path to a banked diffusion VIDEO latent (the seg_<i>.bin the
+    // chain already writes, [Wl,Hl,lf,Cl], audio stripped). When set, the guide is loaded straight
+    // from this latent and appended — NO pixel decode->re-encode roundtrip (cleaner + faster; stays in
+    // latent space). Its grid MUST match the render (same width/height/model). If null/empty, the
+    // guide-edit falls back to VAE-encoding `control_frames` (the FOREIGN/uploaded-clip path). Read
+    // only when v2v_mode==2; null = byte-identical.
+    const char* v2v_guide_latent_path;
     int64_t seed;
     int video_frames;
     int fps;
@@ -524,6 +558,30 @@ typedef struct {
     sd_image_t* const* segment_keyframes;
     const int* const*  segment_keyframe_indices;
     const int*         segment_keyframe_counts;
+    // Optional per-segment VIDEO FRAME COUNT ("Director" variable-length shots). n_segments
+    // entries; a 0/NULL entry uses base_params->video_frames (uniform, the default). Lets each
+    // shot on the timeline have its own duration instead of one global length. Each segment
+    // renders segment_video_frames[i] frames; the stitch/overlap-drop already operates on the
+    // actual per-segment output, so mixed lengths compose. A continuation segment's count must
+    // exceed the overlap (cont_latent_frames → overlap_px) or it contributes nothing after the
+    // drop; fresh shots (scene-cut / keyframe / seg-0) have no such floor. NULL = byte-identical
+    // uniform-length behaviour.
+    const int* segment_video_frames;
+    // Optional per-segment GENERIC V2V mode selector for segment_control_frames[i]. n_segments
+    // entries; segment_v2v_mode[i] chooses how that segment consumes its control-frame source
+    // (see sd_vid_gen_params_t.v2v_mode): 0 = lipdub-relip reference append (default), 1 = SDEdit
+    // denoise, 2 = guide-edit (Director-2 source-as-guide + edit prompt, full schedule). A 0/NULL
+    // entry keeps the existing relip behaviour (byte-identical). Only meaningful for a segment that
+    // has segment_control_frames set OR a segment_v2v_guide_latent_paths[i] entry (guide-edit). The
+    // guide scale for mode 2 comes from base_params->v2v_guide_strength (global to the chain in v1).
+    const int* segment_v2v_mode;
+    // Optional per-segment GUIDE-EDIT (v2v_mode==2) latent-in source: n_segments entries, each an
+    // absolute path (or NULL) to a banked diffusion VIDEO latent (seg_<i>.bin) to use as that
+    // segment's guide WITHOUT a pixel re-encode (see sd_vid_gen_params_t.v2v_guide_latent_path). This
+    // is the "edit a shot we rendered" path — the common Director case. A NULL entry falls back to
+    // that segment's segment_control_frames (pixel-encode, foreign clip). NULL array = none (byte-
+    // identical). A segment with a path here needs NO segment_control_frames.
+    const char* const* segment_v2v_guide_latent_paths;
     // Optional: invoked once per stitched segment, in order, with that segment's kept frames
     // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
     // (server layer) bank a viewable per-segment webm as it's produced, without the core lib
