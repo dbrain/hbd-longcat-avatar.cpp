@@ -10768,6 +10768,15 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             const bool has_audio = latents.audio_length > 0 && x_t.shape()[3] > latent_channels;
             sd::Tensor<float> full_video = sd::ops::slice(x_t, 3, 0, latent_channels);
             sd::Tensor<float> full_noise = sd::ops::slice(noise, 3, 0, latent_channels);
+            // Stage-two I2V/keyframe conditioning has replaced its locations in
+            // x_t with full-resolution VAE latents and locked them in this mask.
+            // Preserve that mask when refine is split into temporal windows. For
+            // packed AV tensors, leading latent_channels are the video mask and
+            // trailing channels are the separately rebuilt audio mask.
+            sd::Tensor<float> full_video_denoise_mask;
+            if (!hires_denoise_mask.empty()) {
+                full_video_denoise_mask = sd::ops::slice(hires_denoise_mask, 3, 0, latent_channels);
+            }
             sd::Tensor<float> audio_latent;
             sd::Tensor<float> audio_noise;
             bool audio_unpack_ok = true;
@@ -10830,29 +10839,28 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                     sd::Tensor<float> latent_tile = video_tile;
                     sd::Tensor<float> packed_noise = noise_tile;
                     sd::Tensor<float> mask_tile;
+                    // Slice the original stage-two mask first, then overlay the
+                    // carried-overlap freeze. Recreating an all-ones tile mask
+                    // here re-denoises locked I2V/keyframe latents.
+                    auto video_mask = full_video_denoise_mask.empty()
+                                          ? make_ltxav_video_denoise_mask(video_tile, 1.0f)
+                                          : sd::ops::slice(full_video_denoise_mask, 2, tile_start, end);
+                    if (frozen > 0) {
+                        float* mask_data = video_mask.data();
+                        const int64_t mask_channels = video_mask.shape()[3];
+                        for (int64_t channel = 0; channel < mask_channels; ++channel) {
+                            for (int64_t local = 0; local < frozen; ++local) {
+                                std::fill_n(mask_data + plane * (local + length * channel), plane, 0.0f);
+                            }
+                        }
+                    }
                     if (has_audio) {
                         latent_tile = pack_ltxav_audio_and_video_latents(video_tile, audio_latent);
                         packed_noise = pack_ltxav_audio_and_video_latents(noise_tile, audio_noise);
-                        auto video_mask = make_ltxav_video_denoise_mask(video_tile, 1.0f);
-                        if (frozen > 0) {
-                            float* mask_data = video_mask.data();
-                            // Video denoise masks have one broadcast channel, unlike the
-                            // latent itself. Indexing by latent_channels corrupts the heap.
-                            for (int64_t local = 0; local < frozen; ++local) {
-                                std::fill_n(mask_data + plane * local, plane, 0.0f);
-                            }
-                        }
                         mask_tile = pack_ltxav_audio_and_video_denoise_mask(
                             video_mask, video_tile, audio_latent, latents.audio_fixed ? 0.0f : 1.0f);
                     } else {
-                        mask_tile = make_ltxav_video_denoise_mask(video_tile, 1.0f);
-                        if (frozen > 0) {
-                            float* mask_data = mask_tile.data();
-                            // The standalone mask is likewise [W, H, T, 1, 1].
-                            for (int64_t local = 0; local < frozen; ++local) {
-                                std::fill_n(mask_data + plane * local, plane, 0.0f);
-                            }
-                        }
+                        mask_tile = std::move(video_mask);
                     }
 
                     LOG_INFO("LTX refine temporal-window tile %d: latent [%lld,%lld), window=%d frozen-overlap=%lld",
