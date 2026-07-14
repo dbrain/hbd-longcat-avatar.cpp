@@ -10737,6 +10737,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 }
             }
         }
+        // Plain-generate ver3 refine default: a plain t2v/i2v two-pass render that provided no
+        // hires.custom_sigmas defaults to the ver3 2-step refine [0.725, 0.421875, 0.0] so the server
+        // fully defaults to ver3 (symmetric with the 6-step base baked in SamplePlan; base ends at
+        // 0.725, this refine finishes it). Gated to plain generate (no control_frames, not guide-edit);
+        // relip sets its own 3-step custom_sigmas upstream so it never reaches here.
+        if (sd_version_is_ltxav(sd_ctx->sd->version) &&
+            sd_vid_gen_params->control_frames_size <= 0 &&
+            sd_vid_gen_params->v2v_mode != 2 &&
+            (request.hires.custom_sigmas_count <= 0 || request.hires.custom_sigmas == nullptr)) {
+            static float kVer3RefineSigmas[] = {0.725f, 0.421875f, 0.0f};
+            request.hires.custom_sigmas       = kVer3RefineSigmas;
+            request.hires.custom_sigmas_count = 3;
+            LOG_INFO("LTXAV ver3 baked refine default: 3 sigmas => 2 steps [0.72500 .. 0.00000]");
+        }
         int hires_scheduler_steps           = 0;
         int64_t refine_schedule_start       = ggml_time_ms();
         std::vector<float> hires_sigma_sched =
