@@ -1808,7 +1808,19 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // cast to F32 (rope_pe is F32-only), yet cuDNN still emits F16 internally and the
         // to_out consumer is F16. The env is the dit_f16 opt-in; gate only on the cuDNN
         // selection shape (mask-free, D in {64,128}). cuDNN casts an F32 q to F16 itself.
-        static const bool cudnn_f16_out = getenv("GGML_CUDNN_ATTN_F16_OUT") != nullptr;
+        static const bool cudnn_f16_out_env = getenv("GGML_CUDNN_ATTN_F16_OUT") != nullptr;
+        // DEVICE-GATED (Blackwell-only). The F16 attention output only pays off when
+        // cuDNN SDPA (selected exclusively on cc >= Blackwell) stores it directly and the
+        // FP4 cuBLASLt GEMM consumes it. On non-Blackwell (e.g. sm86/RTX 3060) cuDNN is
+        // NOT selected — a native flash kernel runs, and retyping its output to F16 here
+        // leaves an F16 island the sm86 dispatch mishandles -> solid-white render. Gate on
+        // the active CUDA device so a single binary is correct on both GPUs. (CPU build:
+        // off — F16_OUT is a CUDA/cuDNN-only optimization.)
+#ifdef SD_USE_CUDA
+        const bool cudnn_f16_out = cudnn_f16_out_env && ggml_backend_cuda_device_has_blackwell_mma(0);
+#else
+        const bool cudnn_f16_out = false;
+#endif
         if (cudnn_f16_out && mask_in == nullptr && (d_head == 64 || d_head == 128)) {
             // Retype the (contiguous) flash output F32->F16 and recompute its strides;
             // ggml_flash_attn_ext hard-codes an F32 result, so nb[] is F32-sized and must
