@@ -1918,6 +1918,15 @@ bool SDGenerationParams::from_json_str(
         if (hires_json.contains("custom_sigmas") && hires_json["custom_sigmas"].is_array()) {
             hires_custom_sigmas = hires_json["custom_sigmas"].get<std::vector<float>>();
         }
+        // Independent refine-pass sampler (mirrors the top-level "sampling_method" parse). When set
+        // to a valid method, the hires/refine pass runs with THIS sampler instead of inheriting the
+        // base pass's sample_method. Sentinel SAMPLE_METHOD_COUNT (default) = inherit base.
+        if (hires_json.contains("sample_method") && hires_json["sample_method"].is_string()) {
+            enum sample_method_t m = str_to_sample_method(hires_json["sample_method"].get<std::string>().c_str());
+            if (m != SAMPLE_METHOD_COUNT) {
+                hires_sample_method = m;
+            }
+        }
         // FEATURE 1 (--hires-lora): JSON accepts the same spec string as the CLI flag under
         // hires.loras (e.g. "distill:0.8,ltx-2-19b-ic-lora-detailer:0.7"). Path resolution happens
         // later in resolve(). NOTE: unlike the top-level "loras" JSON field (which uses a resolver
@@ -2593,6 +2602,7 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    params.hires.sample_method       = hires_sample_method;
     return params;
 }
 
@@ -2677,6 +2687,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    params.hires.sample_method       = hires_sample_method;
     // FEATURE 1 (--hires-lora): flatten the resolved hires_lora_map into the sd_lora_t backing
     // vector and hand it to the C-API hires params. The engine (generate_video) re-applies these
     // just before the refine sample(), diffing from the base pass's lora state. hires_lora_vec is

@@ -279,6 +279,9 @@ struct SDGenerationParams {
     float hires_denoising_strength = 0.7f;
     int hires_upscale_tile_size    = 128;
     std::vector<float> hires_custom_sigmas;
+    // Independent refine-pass sampler. SAMPLE_METHOD_COUNT = unset -> inherit the base pass's
+    // sample_method (legacy). Parsed from JSON "hires.sample_method"; threaded to sd_hires_params_t.
+    enum sample_method_t hires_sample_method = SAMPLE_METHOD_COUNT;
     // FEATURE 1 (--hires-lora): a SECOND LoRA set applied only on the hires/refine pass, so the
     // refine can run a different distillation/detailer strength than the base pass (Denoise-AI
     // workflow: distill@0.65 base -> distill@0.8 + detailer@0.7 refine). `hires_lora_spec` is the

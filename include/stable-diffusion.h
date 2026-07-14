@@ -354,6 +354,11 @@ typedef struct {
     // cleanly from the base set. Backing storage is owned by the caller (SDGenerationParams).
     const sd_lora_t* loras;
     uint32_t lora_count;
+    // Independent refine-pass sampler. SAMPLE_METHOD_COUNT (the sentinel) = inherit the base
+    // pass's sample_method (legacy behavior). Set to a valid method to run the hires/refine
+    // pass with a DIFFERENT sampler than the base pass (e.g. base=lcm, refine=euler). Parsed
+    // from JSON "hires.sample_method" (or the LTXAV_HIRES_SAMPLE_METHOD env backstop).
+    enum sample_method_t sample_method;
 } sd_hires_params_t;
 
 typedef struct {

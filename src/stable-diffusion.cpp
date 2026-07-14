@@ -3805,6 +3805,7 @@ void sd_hires_params_init(sd_hires_params_t* hires_params) {
     hires_params->custom_sigmas_count = 0;
     hires_params->loras               = nullptr;  // FEATURE 1 (--hires-lora): default = reuse base pass LoRAs
     hires_params->lora_count          = 0;
+    hires_params->sample_method       = SAMPLE_METHOD_COUNT;  // sentinel = inherit base pass sampler
 }
 
 void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
@@ -4127,6 +4128,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->hires.upscale_tile_size               = 128;
     sd_vid_gen_params->hires.custom_sigmas                   = nullptr;
     sd_vid_gen_params->hires.custom_sigmas_count             = 0;
+    sd_vid_gen_params->hires.sample_method                   = SAMPLE_METHOD_COUNT;  // sentinel = inherit base sampler
     sd_cache_params_init(&sd_vid_gen_params->cache);
 }
 
@@ -10689,7 +10691,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         W                                   = hires_request.width / hires_request.vae_scale_factor;
         H                                   = hires_request.height / hires_request.vae_scale_factor;
         T                                   = static_cast<int>(x_t.shape()[2]);
-        sample_method_t hires_sample_method = plan.sample_method;
+        // Independent refine-pass sampler. Precedence: JSON hires.sample_method (request.hires.sample_method)
+        // > LTXAV_HIRES_SAMPLE_METHOD env backstop > inherit the base pass sampler (plan.sample_method).
+        // Unset (both sentinel/absent) keeps today's behavior IDENTICAL: refine inherits the base sampler.
+        sample_method_t hires_sample_method =
+            (request.hires.sample_method != SAMPLE_METHOD_COUNT) ? request.hires.sample_method : plan.sample_method;
+        if (request.hires.sample_method == SAMPLE_METHOD_COUNT) {
+            if (const char* e = std::getenv("LTXAV_HIRES_SAMPLE_METHOD"); e && *e) {
+                sample_method_t m = str_to_sample_method(e);
+                if (m != SAMPLE_METHOD_COUNT) {
+                    hires_sample_method = m;
+                }
+            }
+        }
         int hires_scheduler_steps           = 0;
         int64_t refine_schedule_start       = ggml_time_ms();
         std::vector<float> hires_sigma_sched =
