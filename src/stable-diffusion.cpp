@@ -4664,6 +4664,9 @@ struct SamplePlan {
     // default — an explicit scheduler / LTX_CUSTOM_SIGMAS / custom_sigmas still win (for GPU A/B).
     // false on every other path.
     bool v2v_guide_edit                           = false;
+    // control_frames_size at construction — 0 for plain t2v/i2v. Gates the LTXAV ver3 baked sigma
+    // default: relip / SDEdit / guide-edit provide control frames and keep the env / scheduler path.
+    int control_frames_count                      = 0;
     std::vector<float> sigmas;
 
     SamplePlan(sd_ctx_t* sd_ctx,
@@ -4691,6 +4694,7 @@ struct SamplePlan {
         }
         moe_boundary    = sd_vid_gen_params->moe_boundary;
         v2v_guide_edit  = (sd_vid_gen_params->v2v_mode == 2);
+        control_frames_count = sd_vid_gen_params->control_frames_size;
         resolve(sd_ctx, &request, &sd_vid_gen_params->sample_params);
     }
 
@@ -4721,7 +4725,49 @@ struct SamplePlan {
             }
         }
 
-        if (env_sigmas.size() >= 2) {
+        if (sample_params->custom_sigmas_count > 0) {
+            // Per-request explicit sigmas WIN over the LTX_CUSTOM_SIGMAS env A/B hook, so a caller
+            // (e.g. koblem's ver3 6-step base schedule) can override the container default. The env
+            // stays a fallback for callers that send no custom_sigmas (relip, direct scheduler A/B).
+            sigmas      = std::vector<float>(sample_params->custom_sigmas,
+                                        sample_params->custom_sigmas + sample_params->custom_sigmas_count);
+            total_steps = static_cast<int>(sigmas.size()) - 1;
+            if (sample_steps >= total_steps) {
+                sample_steps = total_steps;
+            }
+            if (high_noise_sample_steps > 0) {
+                high_noise_sample_steps = total_steps - sample_steps;
+            }
+            LOG_INFO("request custom_sigmas: %d sigmas => %d steps [%.5f .. %.5f]",
+                     static_cast<int>(sigmas.size()), total_steps, sigmas.front(), sigmas.back());
+        } else if (sd_version_is_ltxav(sd_ctx->sd->version) && !v2v_guide_edit && control_frames_count <= 0) {
+            // LTXAV plain-generate baked default = the ver3 "distilled" shape, and it beats the
+            // LTX_CUSTOM_SIGMAS env so plain t2v/i2v renders default to ver3 without any env/koblem
+            // help. Two-pass (a hires refine will run) splits the distilled schedule — the base
+            // denoises 1.0 -> 0.725 in 6 steps and the hires refine finishes 0.725 -> 0; single-pass
+            // runs the full 8-step schedule. Gated to plain t2v/i2v (no control_frames, not
+            // guide-edit) so relip / SDEdit / guide-edit fall through to the env / scheduler path
+            // below unchanged. Explicit request custom_sigmas still wins above.
+            if (request->hires.enabled) {
+                static const float kVer3TwoPassBase[] = {1.0f, 0.99375f, 0.9875f, 0.98125f, 0.975f, 0.909375f, 0.725f};
+                sigmas = std::vector<float>(kVer3TwoPassBase, kVer3TwoPassBase + 7);
+            } else {
+                static const float kVer3SinglePass[] = {1.0f, 0.99375f, 0.9875f, 0.98125f, 0.975f, 0.909375f, 0.725f, 0.421875f, 0.0f};
+                sigmas = std::vector<float>(kVer3SinglePass, kVer3SinglePass + 9);
+            }
+            total_steps = static_cast<int>(sigmas.size()) - 1;
+            if (sample_steps >= total_steps) {
+                sample_steps = total_steps;
+            }
+            if (high_noise_sample_steps > 0) {
+                high_noise_sample_steps = total_steps - sample_steps;
+            }
+            LOG_INFO("LTXAV ver3 baked default (%s): %d sigmas => %d steps [%.5f .. %.5f]",
+                     request->hires.enabled ? "two-pass 6-step base" : "single-pass 8-step",
+                     static_cast<int>(sigmas.size()), total_steps, sigmas.front(), sigmas.back());
+        } else if (env_sigmas.size() >= 2) {
+            // Reached only by relip / SDEdit / guide-edit (the baked branch above owns plain t2v/i2v).
+            // LTX_CUSTOM_SIGMAS supplies their base schedule (prod distilled 8-step), unchanged.
             sigmas      = env_sigmas;
             total_steps = static_cast<int>(sigmas.size()) - 1;
             sample_steps = std::min(sample_steps, total_steps);
@@ -4730,19 +4776,6 @@ struct SamplePlan {
             }
             LOG_INFO("LTX_CUSTOM_SIGMAS override: %d sigmas => %d steps [%.5f .. %.5f]",
                      static_cast<int>(sigmas.size()), total_steps, sigmas.front(), sigmas.back());
-        } else if (sample_params->custom_sigmas_count > 0) {
-            sigmas      = std::vector<float>(sample_params->custom_sigmas,
-                                        sample_params->custom_sigmas + sample_params->custom_sigmas_count);
-            total_steps = static_cast<int>(sigmas.size()) - 1;
-            LOG_WARN("total_steps != custom_sigmas_count - 1, set total_steps to %d", total_steps);
-            if (sample_steps >= total_steps) {
-                sample_steps = total_steps;
-                LOG_WARN("total_steps != custom_sigmas_count - 1, set sample_steps to %d", sample_steps);
-            }
-            if (high_noise_sample_steps > 0) {
-                high_noise_sample_steps = total_steps - sample_steps;
-                LOG_WARN("total_steps != custom_sigmas_count - 1, set high_noise_sample_steps to %d", high_noise_sample_steps);
-            }
         } else {
             scheduler_t scheduler = resolve_scheduler(sd_ctx,
                                                       sample_params->scheduler,
