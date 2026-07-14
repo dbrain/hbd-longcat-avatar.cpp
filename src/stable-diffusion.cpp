@@ -1886,14 +1886,52 @@ public:
 
         int64_t t0 = ggml_time_ms();
 
-        // 1. Free the current DiT compute + params buffers (releases VRAM and any
-        //    anon params backing). free_params_buffer() nulls the tensor
-        //    data/buffer pointers so the re-alloc below doesn't trip the
-        //    "already allocated" fast-path. For an mmap'd DiT the weight data
-        //    lives in a MmapTensorStore (the boot variant in `mmap_tensor_store`,
-        //    a prior swap in `dit_swap_mmap_store`), not the params buffer.
+        // 1. A variant swap replaces the outgoing DiT, so it must not retain that
+        //    model's warm GPU residency while the incoming weights are loaded.
+        //    free_params_buffer() alone is insufficient for the LTXAV offload
+        //    path: it releases params_buffer/runtime_params_buffer but deliberately
+        //    leaves resident_runtime_params_buffer (LONGCAT_SHARED_RESIDENT), the
+        //    graph-cut streaming/prefetch buffers, and the temporal cache alive.
+        //    Those are owned by the old weights and otherwise stack with the new
+        //    variant. Default-on; setting LTXAV_SWAP_FREE_OUTGOING=0 preserves the
+        //    old swap behaviour for A/B comparison.
+        const char* swap_free_outgoing_env = getenv("LTXAV_SWAP_FREE_OUTGOING");
+        const bool free_outgoing_ltxav = sd_version_is_ltxav(version) &&
+                                         (swap_free_outgoing_env == nullptr ||
+                                          std::string(swap_free_outgoing_env) != "0");
         diffusion_model->free_compute_buffer();
+        if (free_outgoing_ltxav) {
+            if (diffusion_model->params_offloaded_to_host()) {
+                // This also frees runtime + shared-resident param buffers, partial
+                // and prefetched streaming buffers, and the graph-cut cache buffer.
+                diffusion_model->release_all_gpu_param_residency();
+            } else {
+                // Direct-GPU params have no host-backed re-offload path; their
+                // params buffer is released below. Still drop the old graph-cut
+                // streaming/cache buffers before loading the replacement weights.
+                diffusion_model->free_streaming_scratch_buffers();
+                diffusion_model->free_cache_ctx_and_buffer();
+            }
+        }
+
+        // free_params_buffer() nulls the tensor data/buffer pointers so the re-alloc
+        // below doesn't trip the "already allocated" fast-path. For an mmap'd DiT
+        // the weight data lives in a MmapTensorStore (the boot variant in
+        // `mmap_tensor_store`, a prior swap in `dit_swap_mmap_store`), not the
+        // params buffer.
         diffusion_model->free_params_buffer();
+        if (free_outgoing_ltxav) {
+            // The old DiT's graph scratch has returned to the ggml VMM pool; make
+            // it real headroom before the incoming variant allocates. cuDNN's
+            // attention/conv execution plans and async-mempool pages sit outside
+            // that pool, so reset them too. The serialized worker guarantees no
+            // render is in flight; both calls rebuild lazily for the new variant.
+            ggml_backend_cuda_trim_pools(backend_for(SDBackendModule::DIFFUSION));
+            ggml_backend_cuda_release_cudnn_plans();
+            LOG_INFO("LTXAV_SWAP_FREE_OUTGOING: released outgoing DiT GPU residency "
+                     "(runtime + shared-resident + streaming/prefetch + graph-cut cache), "
+                     "trimmed DIFFUSION pool, and reset cuDNN plans before variant swap");
+        }
 
         // 2. Open the new gguf with the same prefix the runner's tensor keys use.
         ModelLoader swap_loader;
@@ -13325,9 +13363,9 @@ SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || diffusion_model_path == nullptr) {
         return false;
     }
-    // Hot-swap the DiT weights in place (e.g. FLUX.2-Klein base<->edit). The VAE +
-    // text encoder stay resident; only the diffusion model's param buffer is freed
-    // and refilled from the new gguf. Caller MUST ensure no render is in flight.
+    // Hot-swap the DiT weights in place. The VAE + text encoder stay resident; an
+    // LTXAV swap also tears down the outgoing DiT's GPU-only residency before
+    // refilling the runner from the new gguf. Caller MUST ensure no render is in flight.
     return sd_ctx->sd->swap_diffusion_model(diffusion_model_path);
 }
 
