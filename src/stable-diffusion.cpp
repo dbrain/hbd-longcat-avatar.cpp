@@ -9754,6 +9754,24 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     same_res_refine_enabled      = same_res_refine_enabled && request.hires.enabled;
     bool latent_refine_enabled   = request.hires.enabled;
     bool latent_upscale_enabled  = latent_refine_enabled && !same_res_refine_enabled;
+    // LTX_HIRES_CONTINUE: faithful ver3 "continue-trajectory" hires. The base denoises only to the
+    // partial σ where its schedule ends (ver3 = 6 steps 1.0->0.725), the LTX latent upsampler upscales
+    // that PARTIAL latent, and the refine CONTINUES the same diffusion 0.725->0 with NO SDEdit re-noise
+    // (mirrors the Wan MoE high->low expert handoff: base returns raw x with inverse_noise_scaling=false,
+    // refine gets empty noise so sample() feeds the upscaled partial latent straight in). Off (default)
+    // = today's SDEdit hires: base fully denoises to 0, refine re-noises the clean upscaled latent.
+    // Gated to plain two-pass t2v/i2v (latent upscale; not relip / SDEdit / guide-edit) so those paths
+    // are byte-identical. NOTE: base+refine sigmas must be contiguous (base ends where refine begins).
+    bool hires_continue_mode = false;
+    if (const char* e = std::getenv("LTX_HIRES_CONTINUE")) {
+        hires_continue_mode = e[0] != '\0' && std::string(e) != "0";
+    }
+    hires_continue_mode = hires_continue_mode && latent_upscale_enabled &&
+                          sd_version_is_ltxav(sd_ctx->sd->version) && !relip_twostage &&
+                          sd_vid_gen_params->v2v_mode == 0 && sd_vid_gen_params->control_frames_size <= 0;
+    if (hires_continue_mode) {
+        LOG_INFO("LTX_HIRES_CONTINUE: continue-trajectory hires (partial base -> upscale partial latent -> continue refine, no re-noise)");
+    }
     GenerationRequest hires_request = request;
     if (latent_refine_enabled) {
         if (!sd_version_is_ltxav(sd_ctx->sd->version)) {
@@ -10142,7 +10160,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                   const sd::Tensor<float>& window_audio_positions,
                                   const sd::Tensor<float>& window_video_reference) {
         return sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
-                                  true,
+                                  // continue-trajectory: don't inverse-scale a PARTIAL base latent
+                                  // (x/(1-σ) blows it up ~3.6x at σ=0.725); return the raw x for the refine.
+                                  hires_continue_mode ? false : true,
                                   window_latent,
                                   std::move(window_noise),
                                   embeds.cond,
@@ -10694,7 +10714,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             LOG_INFO("LTX_REFINE_CONST_SEED: refine noise re-seeded to constant %llu (identity-stable across chain segments)",
                      (unsigned long long)rseed);
         }
-        noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+        if (hires_continue_mode) {
+            // Continue-trajectory: leave noise EMPTY so sample() feeds the upscaled PARTIAL base latent
+            // straight in (init_latent branch, no noise_scaling) and continues denoising from σ=0.725.
+            noise = sd::Tensor<float>();
+        } else {
+            noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+        }
         LOG_INFO("[LTX_PHASE] refine noise tensor setup took %.3fs", (ggml_time_ms() - refine_noise_start) * 1.0f / 1000);
 
         // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
@@ -10934,7 +10960,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                              std::string(temporal_refine_env) != "0" &&
                                              sd_version_is_ltxav(sd_ctx->sd->version) &&
                                              (hires_video_positions.empty() || refine_reference_windowable) &&
-                                             x_t.dim() == 5 && x_t.shape()[2] > 1;
+                                             x_t.dim() == 5 && x_t.shape()[2] > 1 &&
+                                             !hires_continue_mode;  // temporal path slices `noise`; continue mode has none
         if (!temporal_refine_enabled) {
             final_latent = sample_refine_window(x_t,
                                                 std::move(noise),
