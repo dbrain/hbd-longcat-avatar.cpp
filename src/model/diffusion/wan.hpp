@@ -174,7 +174,18 @@ namespace WAN {
             // directly (fattn-cudnn.cu:213; fattn.cu:446 selects on K/V type only). Requires
             // GGML_CUDNN_ATTN (prod always on) — native ggml flash asserts F32 Q. Self-gated on
             // the F16 type; default path unchanged (byte-identical). Owner eye-test is the gate.
-            static const bool wan_rope_f16 = (std::getenv("WAN_ROPE_F16") != nullptr);
+            static const bool wan_rope_f16_env = (std::getenv("WAN_ROPE_F16") != nullptr);
+            // DEVICE-GATED (Blackwell-only). WAN_ROPE_F16 keeps q/k F16 through the fused
+            // RoPE and hands an F16 Q to flash attention — which ONLY cuDNN SDPA accepts,
+            // and cuDNN is selected exclusively on cc >= Blackwell. On non-Blackwell (e.g.
+            // sm86/RTX 3060) a native ggml flash kernel runs and hard-asserts Q->type==F32
+            // (fattn-common.cuh) -> abort. Fall back to the F32 q/k cast below so wan runs
+            // on the 3060; the 5060/cuDNN path is unchanged. (CPU build: off.)
+#ifdef SD_USE_CUDA
+            const bool wan_rope_f16 = wan_rope_f16_env && ggml_backend_cuda_device_has_blackwell_mma(0);
+#else
+            const bool wan_rope_f16 = false;
+#endif
             if (q->type == GGML_TYPE_F16 && !wan_rope_f16) {
                 q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
                 k = ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_F32);
@@ -1058,7 +1069,17 @@ namespace WAN {
             // x_orig (src1) → the <float,float,float> binbcast branch on an F16 src1 =
             // the binbcast.cu:261 stride assert. The prod i2v/t2v path has vace_layers==0,
             // so this just scopes F16 to the supported (and target) path.
-            static const bool wan_dit_f16 = (std::getenv("WAN_DIT_F16") != nullptr);
+            static const bool wan_dit_f16_env = (std::getenv("WAN_DIT_F16") != nullptr);
+            // DEVICE-GATED (Blackwell-only). The F16 residual stream feeds the FP4 cuBLASLt
+            // GEMM / cuDNN SDPA (Blackwell). On non-Blackwell (sm86/3060) it hands F16 q to
+            // the non-RoPE attentions, which reach the native flash kernel (cuDNN is
+            // Blackwell-only) and abort on GGML_ASSERT(Q->type==F32) (fattn-common.cuh). Fall
+            // back to the well-tested F32 stream so wan runs on the 3060. (CPU build: off.)
+#ifdef SD_USE_CUDA
+            static const bool wan_dit_f16 = wan_dit_f16_env && ggml_backend_cuda_device_has_blackwell_mma(0);
+#else
+            static const bool wan_dit_f16 = false;
+#endif
             // VACE is now supported: the before_proj add site (above) upcasts the F16 main stream
             // to F32 for the one collision, so the F16 residual win applies to the main stream of
             // both i2v/t2v (vace_layers==0) AND VACE continuation.
@@ -1412,7 +1433,14 @@ namespace WAN {
             // (unless WAN_ROPE_F16), and the F32 attn output re-enters the F16 stream via
             // o_proj (F16 dst). Cast back to F32 before the head below so the sampler/VAE
             // path is unchanged.
-            static const bool ss_dit_f16 = (std::getenv("WAN_DIT_F16") != nullptr);
+            static const bool ss_dit_f16_env = (std::getenv("WAN_DIT_F16") != nullptr);
+            // DEVICE-GATED (Blackwell-only) — see the wan_dit_f16 gate above; the F16 stream
+            // aborts native flash on sm86, so fall back to F32 on non-Blackwell.
+#ifdef SD_USE_CUDA
+            static const bool ss_dit_f16 = ss_dit_f16_env && ggml_backend_cuda_device_has_blackwell_mma(0);
+#else
+            static const bool ss_dit_f16 = false;
+#endif
             if (ss_dit_f16 && x->type == GGML_TYPE_F32) {
                 x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
             }
