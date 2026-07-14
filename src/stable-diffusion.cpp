@@ -12565,7 +12565,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                      drop, overlap_px);
         }
         if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
-            if (seg > 0) {
+            // Only pin the trim for genuine continuations. A fresh shot (scene cut / keyframe-fresh /
+            // relip anchor) already resolved drop=0 above and must NOT be trimmed — else its brand-new
+            // scene loses its opening frames and the whole timeline (and audio) shifts by the overlap.
+            if (seg > 0 && !(segmented_relip || fresh_anchor)) {
                 drop = atoi(e);
             }
         }
