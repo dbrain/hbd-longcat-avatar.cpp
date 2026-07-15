@@ -2853,23 +2853,27 @@ protected:
         // its tensor metadata cannot be reused by name. Rebind fresh metadata to the
         // existing allocation when every new source is outside that allocation and it
         // fits. This keeps the original copy sequence and avoids alloc-new/free-old.
-        bool can_rebind_old_cache = old_cache_buffer != nullptr;
-        const char* rebind_reason = can_rebind_old_cache ? "ok" : "no-old-buffer";
-        if (can_rebind_old_cache) {
+        bool old_cache_is_source_live = false;
+        if (old_cache_buffer != nullptr) {
             for (const auto& kv : source_to_cache_tensors) {
                 if (sd::ggml_graph_cut::tensor_buffer(kv.first) == old_cache_buffer) {
-                    can_rebind_old_cache = false;
-                    rebind_reason = "old-cache-still-live";
+                    old_cache_is_source_live = true;
                     break;
                 }
             }
         }
+        bool can_rebind_old_cache = old_cache_buffer != nullptr && !old_cache_is_source_live;
+        const char* rebind_reason = can_rebind_old_cache ? "ok" :
+                                                         (old_cache_buffer == nullptr ? "no-old-buffer" : "old-cache-still-live");
+        size_t needed_cache_bytes = 0;
+        bool old_cache_layout_too_small = false;
         if (can_rebind_old_cache) {
-            const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(
+            needed_cache_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
                 cache_ctx, ggml_backend_get_default_buffer_type(runtime_backend));
-            can_rebind_old_cache = needed <= ggml_backend_buffer_get_size(old_cache_buffer);
+            can_rebind_old_cache = needed_cache_bytes <= ggml_backend_buffer_get_size(old_cache_buffer);
             if (!can_rebind_old_cache) {
                 rebind_reason = "new-layout-larger";
+                old_cache_layout_too_small = true;
             }
         }
         if (can_rebind_old_cache) {
@@ -2883,6 +2887,21 @@ protected:
                       get_desc().c_str(), ggml_backend_buffer_get_size(cache_buffer) / 1048576.0,
                       num_tensors);
         } else {
+            // The old cache cannot be rebound when this cut needs a larger layout,
+            // but it is still safe to retire before allocating that replacement if
+            // no copy source resolves to the old buffer. This changes neither the
+            // cut outputs nor their copy order; it only avoids a transient overlap
+            // between dead old storage and the larger new allocation.
+            if (old_cache_buffer != nullptr && !old_cache_is_source_live && old_cache_layout_too_small) {
+                const size_t old_cache_bytes = ggml_backend_buffer_get_size(old_cache_buffer);
+                ggml_backend_buffer_free(old_cache_buffer);
+                old_cache_buffer = nullptr;
+                if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1') {
+                    LOG_INFO("[VRAM-LEDGER graph-cut-cache-early-free] model=%s old=%.2f MiB new=%.2f MiB reason=dead-old-larger-layout",
+                             get_desc().c_str(), old_cache_bytes / 1048576.0,
+                             needed_cache_bytes / 1048576.0);
+                }
+            }
             cache_buffer = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
             if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1' && old_cache_buffer != nullptr) {
                 LOG_INFO("[VRAM-LEDGER graph-cut-cache-rebind] model=%s eligible=0 reason=%s old=%.2f MiB",
