@@ -2763,6 +2763,13 @@ protected:
             ggml_tensor* source_tensor = sd::ggml_graph_cut::cache_source_tensor(kv.second);
             auto cache_tensor          = ggml_dup_tensor(cache_ctx, source_tensor);
             ggml_set_name(cache_tensor, kv.first.c_str());
+            if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1') {
+                LOG_INFO("[VRAM-LEDGER graph-cut-cache] model=%s tensor=%s bytes=%zu (%.2f MiB) type=%d shape=[%lld,%lld,%lld,%lld]",
+                         get_desc().c_str(), kv.first.c_str(), ggml_nbytes(source_tensor),
+                         ggml_nbytes(source_tensor) / 1048576.0, (int) source_tensor->type,
+                         (long long) source_tensor->ne[0], (long long) source_tensor->ne[1],
+                         (long long) source_tensor->ne[2], (long long) source_tensor->ne[3]);
+            }
             source_to_cache_tensors.push_back({source_tensor, cache_tensor});
         }
         size_t num_tensors = ggml_tensor_num(cache_ctx);
@@ -2803,6 +2810,10 @@ protected:
                   cache_buffer_size / (1024.f * 1024.f),
                   sd_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM",
                   num_tensors);
+        if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1') {
+            LOG_INFO("[VRAM-LEDGER graph-cut-cache] model=%s total=%.2f MiB tensors=%zu",
+                     get_desc().c_str(), cache_buffer_size / 1048576.0, num_tensors);
+        }
         if (old_cache_buffer != nullptr) {
             ggml_backend_buffer_free(old_cache_buffer);
         }
@@ -4018,6 +4029,16 @@ protected:
             return nullptr;
         }
 
+        if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1') {
+            for (ggml_tensor* tensor : selected) {
+                LOG_INFO("[VRAM-LEDGER graph-cut-input] model=%s tensor=%s bytes=%zu (%.2f MiB) uses=%d type=%d shape=[%lld,%lld,%lld,%lld]",
+                         get_desc().c_str(), tensor->name, ggml_nbytes(tensor),
+                         ggml_nbytes(tensor) / 1048576.0, external_use_count[tensor], (int) tensor->type,
+                         (long long) tensor->ne[0], (long long) tensor->ne[1],
+                         (long long) tensor->ne[2], (long long) tensor->ne[3]);
+            }
+        }
+
         auto persisted = std::make_unique<PersistentExternalInputSet>();
         ggml_init_params params;
         params.mem_size   = static_cast<size_t>(selected.size() * ggml_tensor_overhead());
@@ -4505,9 +4526,20 @@ protected:
         free_compute_buffer();
         free_cache_ctx_and_buffer();
 
+        const bool vram_ledger = [] {
+            const char* value = getenv("LONGCAT_VRAM_LEDGER");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (vram_ledger) {
+            ggml_cuda_fp8_act_cache_log_stats("graph-cut:entry");
+        }
+
         reset_offload_profile();
 
         auto persisted_external_inputs = persist_repeated_external_inputs_for_graph_cuts(plan, gf);
+        if (vram_ledger) {
+            ggml_cuda_fp8_act_cache_log_stats("graph-cut:after-persist-inputs");
+        }
 
         std::unordered_map<ggml_tensor*, PersistentExternalBinding> persistent_externals;
         snapshot_persistent_externals(plan, gf, persistent_externals);
@@ -4873,6 +4905,9 @@ protected:
             free_compute_buffer();
         }
         free_compute_ctx();
+        if (vram_ledger) {
+            ggml_cuda_fp8_act_cache_log_stats("graph-cut:after-compute-cleanup");
+        }
         // Diagnostic (a): param-buffer state at the end of this segment's sample. Compare
         // against (b) chain-reclaim and (c) next-segment plan-top to localize where the
         // buffer goes null.
