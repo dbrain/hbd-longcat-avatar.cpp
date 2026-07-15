@@ -11612,6 +11612,21 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
         int64_t audio_latent_decode_end = ggml_time_ms();
         LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_latent_decode_end - audio_latent_decode_start) * 1.0f / 1000);
+
+        // Audio decoding is complete before the much larger video-VAE decode starts.  In a
+        // warm chain, keep_diffusion_model_resident deliberately keeps the audio VAE's
+        // host-backed GPU residency alive for the next segment.  That leaves ~350 MB of
+        // otherwise unused audio-VAE weights resident beside the video decode's peak buffer.
+        // Unlike free_params_buffer(), this only releases the GPU copy: the mmap/host home
+        // remains intact and the next segment re-offloads it on demand.  This is allocation
+        // only, so it cannot change the generated waveform or video.
+        if (sd_ctx->sd->audio_vae_model->params_offloaded_to_host()) {
+            const double audio_vae_gpu_mib =
+                sd_ctx->sd->audio_vae_model->gpu_footprint_bytes() / (1024.0 * 1024.0);
+            sd_ctx->sd->audio_vae_model->release_all_gpu_param_residency();
+            LOG_INFO("LTXAV: released audio VAE GPU residency (%.0f MiB) before video decode",
+                     audio_vae_gpu_mib);
+        }
     }
 
     // Avatar: mux the INPUT conditioning audio back into the output container,
