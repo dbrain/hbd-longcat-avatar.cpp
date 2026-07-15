@@ -2716,6 +2716,14 @@ public:
         const std::string sa3_policy = sa3_policy_env != nullptr ? sa3_policy_env : "";
         const bool sa3_step_policy = sd_version_is_ltxav(version) &&
                                      (sa3_policy == "first" || sa3_policy == "last" || sa3_policy == "middle");
+        // The precise cuDNN step needs two full-length F16 buffers (converted Q
+        // and output).  Tile only that step's independent query rows; the SA3
+        // steps retain their one-shot graph and throughput.  The legacy global
+        // LTX_ATTN_QTILE keeps precedence when explicitly configured.
+        const char* precision_qtile_env = std::getenv("GGML_LTX_SA3_PRECISION_QTILE");
+        const bool precision_qtile_enabled = sa3_step_policy && precision_qtile_env != nullptr &&
+                                             atoll(precision_qtile_env) > 0 &&
+                                             (std::getenv("LTX_ATTN_QTILE") == nullptr || atoll(std::getenv("LTX_ATTN_QTILE")) == 0);
         struct SA3EnvRestore {
             bool active = false;
             bool had_value = false;
@@ -2726,6 +2734,16 @@ public:
                 else unsetenv("GGML_LTX_SA3");
             }
         } sa3_env_restore;
+        struct PrecisionQTileEnvRestore {
+            bool active = false;
+            bool had_value = false;
+            std::string value;
+            ~PrecisionQTileEnvRestore() {
+                if (!active) return;
+                if (had_value) setenv("GGML_CUDNN_LTX_QTILE", value.c_str(), 1);
+                else unsetenv("GGML_CUDNN_LTX_QTILE");
+            }
+        } precision_qtile_restore;
         if (sa3_step_policy) {
             if (const char* e = std::getenv("GGML_LTX_SA3")) {
                 sa3_env_restore.had_value = true;
@@ -2733,6 +2751,14 @@ public:
             }
             sa3_env_restore.active = true;
             LOG_INFO("LTX SA3 policy=%s (%zu total sampler steps)", sa3_policy.c_str(), steps);
+        }
+        if (precision_qtile_enabled) {
+            if (const char* e = std::getenv("GGML_CUDNN_LTX_QTILE")) {
+                precision_qtile_restore.had_value = true;
+                precision_qtile_restore.value = e;
+            }
+            precision_qtile_restore.active = true;
+            LOG_INFO("LTX SA3 precision-step query tile=%s", precision_qtile_env);
         }
         bool has_skiplayer = (slg_scale != 0.0f || slg_uncond) && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
@@ -2855,6 +2881,10 @@ public:
                                      : sa3_policy == "last" ? sample_step < (int)steps
                                                             : sample_step > 1 && sample_step < (int)steps;
                 setenv("GGML_LTX_SA3", use_sa3 ? "1" : "0", 1);
+                if (precision_qtile_enabled) {
+                    if (use_sa3) unsetenv("GGML_CUDNN_LTX_QTILE");
+                    else setenv("GGML_CUDNN_LTX_QTILE", precision_qtile_env, 1);
+                }
                 LOG_DEBUG("LTX SA3 policy=%s: step %d/%zu -> %s", sa3_policy.c_str(), sample_step, steps,
                           use_sa3 ? "SA3" : "cuDNN");
             }
