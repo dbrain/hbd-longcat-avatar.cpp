@@ -2756,6 +2756,80 @@ protected:
             return true;
         }
 
+        // Graph-cut cache rollover normally allocates a complete replacement buffer,
+        // copies the current cut outputs, and only then frees the prior buffer. For
+        // LTX's repeated transformer cuts that creates a short-lived second 303 MiB
+        // `vx` cache at the full-refine peak. If the existing cache has exactly the
+        // same named tensor layouts, its old contents have already been consumed by
+        // the just-finished segment, so overwrite it in place instead. This preserves
+        // the same GPU-to-GPU copies and data layout while avoiding the overlapping
+        // allocation; it is deliberately conservative and falls through to the
+        // replacement path for any topology/shape change.
+        if (old_cache_ctx != nullptr && old_cache_buffer != nullptr) {
+            bool can_reuse = true;
+            const char* reuse_reason = "ok";
+            if (can_reuse) {
+                for (const auto& kv : merged_cache_sources) {
+                    ggml_tensor* src = sd::ggml_graph_cut::cache_source_tensor(kv.second);
+                    ggml_tensor* dst = ggml_get_tensor(old_cache_ctx, kv.first.c_str());
+                    if (src == nullptr) {
+                        reuse_reason = "missing-source";
+                        can_reuse = false;
+                        break;
+                    }
+                    if (dst == nullptr) {
+                        reuse_reason = "missing-destination";
+                        can_reuse = false;
+                        break;
+                    }
+                    if (src->type != dst->type) {
+                        reuse_reason = "type";
+                        can_reuse = false;
+                        break;
+                    }
+                    if (ggml_nbytes(src) != ggml_nbytes(dst)) {
+                        reuse_reason = "bytes";
+                        can_reuse = false;
+                        break;
+                    }
+                    if (!ggml_are_same_shape(src, dst)) {
+                        reuse_reason = "shape";
+                        can_reuse = false;
+                        break;
+                    }
+                }
+            }
+            if (can_reuse) {
+                for (const auto& kv : merged_cache_sources) {
+                    ggml_tensor* src = sd::ggml_graph_cut::cache_source_tensor(kv.second);
+                    ggml_tensor* dst = ggml_get_tensor(old_cache_ctx, kv.first.c_str());
+                    if (src != dst) {
+                        const bool use_staging_copy = src->view_src != nullptr || !ggml_is_contiguous(src) || src->buffer == nullptr;
+                        if (use_staging_copy) {
+                            std::vector<uint8_t> host_data(ggml_nbytes(src));
+                            ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
+                            ggml_backend_tensor_set(dst, host_data.data(), 0, host_data.size());
+                        } else {
+                            ggml_backend_tensor_copy(src, dst);
+                        }
+                    }
+                }
+                ggml_backend_synchronize(runtime_backend);
+                cache_ctx    = old_cache_ctx;
+                cache_buffer = old_cache_buffer;
+                LOG_DEBUG("%s graph-cut cache reused %.2f MB (%zu tensors)",
+                          get_desc().c_str(), ggml_backend_buffer_get_size(cache_buffer) / 1048576.0,
+                          merged_cache_sources.size());
+                return true;
+            }
+            if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1') {
+                LOG_INFO("[VRAM-LEDGER graph-cut-cache-reuse] model=%s eligible=0 reason=%s old=%.2f MiB sources=%zu",
+                         get_desc().c_str(), reuse_reason,
+                         ggml_backend_buffer_get_size(old_cache_buffer) / 1048576.0,
+                         merged_cache_sources.size());
+            }
+        }
+
         alloc_cache_ctx();
         std::vector<std::pair<ggml_tensor*, ggml_tensor*>> source_to_cache_tensors;
         source_to_cache_tensors.reserve(merged_cache_sources.size());
@@ -2773,7 +2847,49 @@ protected:
             source_to_cache_tensors.push_back({source_tensor, cache_tensor});
         }
         size_t num_tensors = ggml_tensor_num(cache_ctx);
-        cache_buffer       = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
+        // A cut commonly replaces every cached tensor with the same-shaped payload
+        // under a new cut name (e.g. block 13 -> 27 -> 41). The old cache values are
+        // then absent from merged_cache_sources, so their buffer is dead even though
+        // its tensor metadata cannot be reused by name. Rebind fresh metadata to the
+        // existing allocation when every new source is outside that allocation and it
+        // fits. This keeps the original copy sequence and avoids alloc-new/free-old.
+        bool can_rebind_old_cache = old_cache_buffer != nullptr;
+        const char* rebind_reason = can_rebind_old_cache ? "ok" : "no-old-buffer";
+        if (can_rebind_old_cache) {
+            for (const auto& kv : source_to_cache_tensors) {
+                if (sd::ggml_graph_cut::tensor_buffer(kv.first) == old_cache_buffer) {
+                    can_rebind_old_cache = false;
+                    rebind_reason = "old-cache-still-live";
+                    break;
+                }
+            }
+        }
+        if (can_rebind_old_cache) {
+            const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                cache_ctx, ggml_backend_get_default_buffer_type(runtime_backend));
+            can_rebind_old_cache = needed <= ggml_backend_buffer_get_size(old_cache_buffer);
+            if (!can_rebind_old_cache) {
+                rebind_reason = "new-layout-larger";
+            }
+        }
+        if (can_rebind_old_cache) {
+            ggml_tallocr allocator = ggml_tallocr_new(old_cache_buffer);
+            for (const auto& kv : source_to_cache_tensors) {
+                GGML_ASSERT(ggml_tallocr_alloc(&allocator, kv.second) == GGML_STATUS_SUCCESS);
+            }
+            cache_buffer = old_cache_buffer;
+            old_cache_buffer = nullptr;
+            LOG_DEBUG("%s graph-cut cache storage rebound %.2f MB (%zu tensors)",
+                      get_desc().c_str(), ggml_backend_buffer_get_size(cache_buffer) / 1048576.0,
+                      num_tensors);
+        } else {
+            cache_buffer = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
+            if (const char* ledger = getenv("LONGCAT_VRAM_LEDGER"); ledger != nullptr && ledger[0] == '1' && old_cache_buffer != nullptr) {
+                LOG_INFO("[VRAM-LEDGER graph-cut-cache-rebind] model=%s eligible=0 reason=%s old=%.2f MiB",
+                         get_desc().c_str(), rebind_reason,
+                         ggml_backend_buffer_get_size(old_cache_buffer) / 1048576.0);
+            }
+        }
         GGML_ASSERT(cache_buffer != nullptr);
         for (const auto& kv : source_to_cache_tensors) {
             ggml_tensor* src              = kv.first;
