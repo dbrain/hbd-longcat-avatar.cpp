@@ -359,6 +359,8 @@ typedef struct {
     // pass with a DIFFERENT sampler than the base pass (e.g. base=lcm, refine=euler). Parsed
     // from JSON "hires.sample_method" (or the LTXAV_HIRES_SAMPLE_METHOD env backstop).
     enum sample_method_t sample_method;
+    // Per-stage CFG for LTXAV hires_chain. NAN means inherit the base cfg (legacy hires).
+    float cfg;
 } sd_hires_params_t;
 
 typedef struct {
@@ -395,6 +397,14 @@ typedef struct {
     int clip_skip;
     sd_image_t init_image;
     sd_image_t end_image;
+    // LTXAV character identity reference. The chain encodes this once and supplies the
+    // resulting frozen DiT token block to every segment; it is never an output-frame pin.
+    sd_image_t character_reference;
+    const float* character_reference_latent;
+    int character_reference_latent_width;
+    int character_reference_latent_height;
+    int character_reference_latent_frames;
+    int character_reference_latent_channels;
     // LTXAV MULTI-KEYFRAME conditioning: arbitrary (image, video-frame-index) guide pairs
     // pinned as frozen 1-frame conditioning frames on the target timeline. Generalises the
     // single start/end i2v pins (init_image @ frame 0, end_image @ frames-1) to N caller-placed
@@ -528,6 +538,9 @@ typedef struct {
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
+    // Ordered LTXAV upscale + SDEdit-refine stages. NULL/0 preserves legacy `hires` exactly.
+    const sd_hires_params_t* hires_chain;
+    int hires_chain_count;
 } sd_vid_gen_params_t;
 
 // LTXAV in-process multi-segment chain. Renders n_segments video segments with the DiT
@@ -615,6 +628,16 @@ typedef struct {
     // (skipped ones on resume already have their webm on disk). NULL = no callback.
     void (*on_segment)(int seg_index, const sd_image_t* frames, int frame_count, void* user);
     void*        on_segment_user;
+    // Optional WINDOWED STREAMING FINALIZE. When set, generate_video_chain does NOT accumulate the
+    // whole decoded timeline in RAM; it keeps only a bounded rolling window (the tail frames a future
+    // seam op — exposure-match ≤16 / crossfade W — could still read) and, once earlier frames are
+    // final, hands them to on_flush_frames IN ORDER. The callee MUST consume (encode) each frame and
+    // free its .data; after the call returns the chain treats them as gone. With this set *frames_out
+    // is NULL and *num_frames_out is the total flushed count (audio still returned via audio_out for
+    // the caller to mux). NULL = legacy whole-array return (frames_out owns the full timeline). This
+    // keeps the media encoder in the example layer (the core lib never links it), like on_segment.
+    void (*on_flush_frames)(sd_image_t* frames, int frame_count, void* user);
+    void*        on_flush_frames_user;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

@@ -2,7 +2,9 @@
 
 #include "async_jobs.h"
 
+#include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -12,6 +14,8 @@
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 #include "worker_session.h"
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -113,6 +117,18 @@ struct SegWebmWriter {
 
 void ltx_seg_webm_cb(int seg, const sd_image_t* frames, int n, void* user) {
     static_cast<SegWebmWriter*>(user)->enqueue(seg, frames, n);
+}
+
+// Windowed-streaming finalize: the chain hands us the now-final leading frames IN ORDER. Encode
+// (spool) each and free its pixels immediately, so the chain never materialises the whole timeline.
+// Synchronous by contract — the chain frees nothing here and considers these frames gone on return.
+void ltx_stream_flush_cb(sd_image_t* frames, int n, void* user) {
+    auto* w = static_cast<IncrementalWebmWriter*>(user);
+    for (int i = 0; i < n; ++i) {
+        w->append_video_frame(frames[i]);  // records an internal failure flag on error
+        free(frames[i].data);
+        frames[i].data = nullptr;
+    }
 }
 
 }  // namespace
@@ -494,6 +510,18 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     int         resume_from = body.value("resume_from", 0);
 
     sd_vid_gen_params_t base = gen_params.to_sd_vid_gen_params_t();
+    // Character identity reference is intentionally separate from init_image/control_frames.
+    // It is decoded once here and generate_video_chain VAE-encodes it once for all segments.
+    SDImageOwner character_reference_owner;
+    if (!wan_mode && body.contains("character_reference") && body["character_reference"].is_string() &&
+        !body["character_reference"].get<std::string>().empty()) {
+        if (!decode_base64_image(body["character_reference"].get<std::string>(), 3, base.width, base.height,
+                                 character_reference_owner)) {
+            error_message = "failed to decode character reference image";
+            return false;
+        }
+        base.character_reference = character_reference_owner.get();
+    }
     // Generic V2V mode selector for control_frames (see sd_vid_gen_params_t.v2v_mode):
     //   0 = lipdub relip (default), 1 = SDEdit denoise, 2 = guide-edit (Director-2 source-as-guide).
     // Accept an explicit integer "v2v_mode" (0/1/2); fall back to the legacy boolean "v2v" (true=1
@@ -745,6 +773,31 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         }
     }
 
+    // WINDOWED STREAMING FINALIZE. For webm chains with a durable job dir (the prod path — a 3.5-min
+    // 1080p chain is ~31.5 GB of decoded frames), stream each finalized frame straight into the WebM
+    // encoder instead of materialising the whole timeline. generate_video_chain keeps only a small
+    // rolling window and flushes the rest through on_flush_frames; the writer spools encoded VP8 and
+    // muxes the length-matched audio + publishes final.<fmt> atomically at finalize(). Byte-identical
+    // to the whole-array path. Other formats / no job dir fall back to the legacy whole-array encode.
+    std::string lc_format = output_format;
+    std::transform(lc_format.begin(), lc_format.end(), lc_format.begin(),
+                   [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    std::unique_ptr<IncrementalWebmWriter> stream_writer;
+    bool streaming = false;
+    // LTX chain only: generate_wan_vace_chain does not honour on_flush_frames (it returns the whole
+    // array), and Wan windows are short — the 31.5 GB peak is the LTX long-chain problem.
+    if (!wan_mode && lc_format == "webm" && !job_dir.empty()) {
+        const fs::path final_path = fs::path(job_dir) / ("final." + output_format);
+        stream_writer             = std::make_unique<IncrementalWebmWriter>();
+        if (stream_writer->open(final_path.string(), gen_params.fps, output_compression)) {
+            streaming                  = true;
+            chain.on_flush_frames      = &ltx_stream_flush_cb;
+            chain.on_flush_frames_user = stream_writer.get();
+        } else {
+            stream_writer.reset();  // spool open failed — degrade to whole-array (still correct)
+        }
+    }
+
     sd_image_t* frames      = nullptr;
     int         frame_count = 0;
     sd_audio_t* audio       = nullptr;
@@ -757,18 +810,43 @@ bool run_vid_chain_job(ServerRuntime& runtime,
             seg_writer->finish();  // drain pending seg webms before reporting outcome
         }
         if (!chain_ok) {
+            // Streaming: stream_writer's dtor drops the spool + any half-written .tmp (nothing published).
+            free_sd_audio(audio);
             error_message = "generate_video_chain failed";
             return false;
         }
     }
+
+    if (streaming) {
+        // Frames were streamed+freed incrementally; only metadata + audio came back.
+        if (frame_count <= 0) {
+            free_sd_audio(audio);
+            error_message = "generate_video_chain produced no frames";
+            return false;
+        }
+        stream_writer->set_audio(audio);
+        free_sd_audio(audio);
+        out_video = stream_writer->finalize();  // muxes spool + audio, publishes final.<fmt> atomically
+        if (out_video.empty()) {
+            error_message = "failed to encode generated video container";
+            return false;
+        }
+        out_mime        = video_mime_type(output_format);
+        out_frame_count = frame_count;
+        out_fps         = gen_params.fps;
+        return true;
+    }
+
     if (frame_count <= 0 || frames == nullptr) {
         free_sd_audio(audio);
         error_message = "generate_video_chain produced no frames";
         return false;
     }
 
+    // The final WebM encoder owns the chain's decoded pixels and releases each frame as
+    // soon as VP8 has consumed it. The nulling contract makes this cleanup loop safe.
     out_video = create_video_from_sd_images_to_vector(output_format, frames, frame_count,
-                                                      gen_params.fps, output_compression, audio);
+                                                      gen_params.fps, output_compression, audio, true);
     for (int i = 0; i < frame_count; ++i) {
         free(frames[i].data);
     }
@@ -783,11 +861,30 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // Persist the finished container so it survives the in-RAM result TTL and a client
     // disconnect (re-fetchable via GET /sdcpp/v1/jobs/{id}/media).
     if (!job_dir.empty()) {
-        std::string final_path = job_dir + "/final." + output_format;
-        std::ofstream out(final_path, std::ios::binary | std::ios::trunc);
-        if (out) {
-            out.write(reinterpret_cast<const char*>(out_video.data()),
-                      static_cast<std::streamsize>(out_video.size()));
+        const fs::path final_path = fs::path(job_dir) / ("final." + output_format);
+        const fs::path tmp_path   = final_path.string() + ".tmp";
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            error_message = "failed to open final video artifact";
+            return false;
+        }
+        out.write(reinterpret_cast<const char*>(out_video.data()),
+                  static_cast<std::streamsize>(out_video.size()));
+        if (!out) {
+            error_message = "failed to write final video artifact";
+            return false;
+        }
+        out.close();
+        if (!out) {
+            error_message = "failed to close final video artifact";
+            return false;
+        }
+        fs::rename(tmp_path, final_path, ec);
+        if (ec) {
+            error_message = "failed to publish final video artifact: " + ec.message();
+            return false;
         }
     }
 

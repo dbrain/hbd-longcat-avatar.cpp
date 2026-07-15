@@ -2,11 +2,14 @@
 
 #include "worker_ipc.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <string>
 #include <sys/socket.h>
@@ -24,6 +27,7 @@ const char* ipc_error_str(IpcError e) {
         case IpcError::EofClean:      return "peer closed cleanly";
         case IpcError::EofMidFrame:   return "peer closed mid-frame";
         case IpcError::SocketError:   return "socket error";
+        case IpcError::Timeout:       return "receive timeout";
         case IpcError::ProtocolError: return "protocol error";
         case IpcError::PayloadTooBig: return "payload too big";
     }
@@ -125,6 +129,48 @@ IpcError recv_frame(int fd, FrameHeader* out_hdr, std::vector<uint8_t>* out_payl
     out_payload->resize(out_hdr->len);
     if (out_hdr->len == 0) return IpcError::OK;
     return read_exact(fd, out_payload->data(), out_hdr->len);
+}
+
+static IpcError read_exact_with_timeout(int fd, void* buf, size_t len, int timeout_ms) {
+    if (timeout_ms < 0) return read_exact(fd, buf, len);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    char* p = static_cast<char*>(buf);
+    size_t got = 0;
+    while (got < len) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return IpcError::Timeout;
+        const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        pollfd pfd{fd, POLLIN, 0};
+        int rc;
+        do {
+            rc = ::poll(&pfd, 1, static_cast<int>(std::max<int64_t>(1, remain)));
+        } while (rc < 0 && errno == EINTR);
+        if (rc == 0) return IpcError::Timeout;
+        if (rc < 0 || (pfd.revents & (POLLERR | POLLNVAL))) return IpcError::SocketError;
+        ssize_t r = ::read(fd, p + got, len - got);
+        if (r > 0) { got += static_cast<size_t>(r); continue; }
+        if (r == 0) return got == 0 ? IpcError::EofClean : IpcError::EofMidFrame;
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        return IpcError::SocketError;
+    }
+    return IpcError::OK;
+}
+
+IpcError recv_frame_with_timeout(int fd, FrameHeader* out_hdr,
+                                 std::vector<uint8_t>* out_payload,
+                                 int timeout_ms) {
+    if (!out_hdr || !out_payload) return IpcError::ProtocolError;
+    if (timeout_ms < 0) return recv_frame(fd, out_hdr, out_payload);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    IpcError e = read_exact_with_timeout(fd, out_hdr, sizeof(*out_hdr), timeout_ms);
+    if (e != IpcError::OK) return e;
+    if (out_hdr->len > MAX_FRAME_PAYLOAD) return IpcError::PayloadTooBig;
+    out_payload->resize(out_hdr->len);
+    if (out_hdr->len == 0) return IpcError::OK;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return IpcError::Timeout;
+    const int remain = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    return read_exact_with_timeout(fd, out_payload->data(), out_hdr->len, remain);
 }
 
 static void append_u32_and_blob(std::vector<uint8_t>& out, const void* data, size_t n) {

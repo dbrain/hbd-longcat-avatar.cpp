@@ -20,6 +20,9 @@ struct RenderResult {
     bool ok = false;
     std::string error;
     std::vector<uint8_t> video_bytes;
+    // For durable chain renders the child returns this shared-volume path in
+    // metadata; the parent reads the finished file locally instead of IPCing it.
+    std::string final_video_path;
     int   segments_rendered = 0;
     int   frame_count       = 0;
     int   fps               = 25;
@@ -76,8 +79,8 @@ public:
     // Drive an LTXAV multi-segment video chain through the worker. `chain_json` is the
     // chain request (base gen-params + prompts[] + n_segments + cont_latent_frames +
     // chain_audio_dir + inline base64 init image). The child re-parses it and runs
-    // generate_video_chain via run_vid_chain_job. Same io_mutex_ + cancel machinery as
-    // render(); result.video_bytes is the encoded container (webm).
+    // generate_video_chain via run_vid_chain_job. The response contains only metadata
+    // and the shared-volume final path; this parent reads that file into result.video_bytes.
     RenderResult render_video_chain(const std::string& chain_json);
 
     // Send CANCEL_REQ to the worker for the currently in-flight render.

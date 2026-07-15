@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -1309,7 +1310,16 @@ static bool encode_audio_to_opus(const sd_audio_t* audio,
 }  // namespace
 #endif  // SD_USE_OPUS
 
-std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio) {
+// Shared WebM mux core. `get_vp8(i, out)` must fill `out` with frame i's encoded VP8 keyframe
+// bytes and return true (false = abort the whole container). This is the SINGLE mux sequence —
+// track setup, per-frame audio interleave, timestamps, Opus/PCM handling and Finalize — that both
+// the whole-array encoder and the incremental (streaming) writer funnel through, so their outputs
+// are byte-identical for the same frames + audio + num_images + fps. Per-frame VP8 encoding is
+// stateless (each frame is an independent keyframe), so pre-encoding frames elsewhere and feeding
+// them here reproduces the exact bytes an inline encode would have produced.
+static std::vector<uint8_t> mux_webm_vp8(int width, int height, int num_images, int fps,
+                                         const sd_audio_t* audio,
+                                         const std::function<bool(int, std::vector<uint8_t>&)>& get_vp8) {
     if (num_images == 0) {
         fprintf(stderr, "Error: Image array is empty.\n");
         return {};
@@ -1318,9 +1328,6 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         fprintf(stderr, "Error: FPS must be positive.\n");
         return {};
     }
-
-    const int width  = static_cast<int>(images[0].width);
-    const int height = static_cast<int>(images[0].height);
     if (width <= 0 || height <= 0) {
         fprintf(stderr, "Error: Invalid frame dimensions.\n");
         return {};
@@ -1420,15 +1427,8 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         uint64_t timestamp_ns = 0;
 
         for (int i = 0; i < num_images; ++i) {
-            const sd_image_t& image = images[i];
-            if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
-                fprintf(stderr, "Error: Frame dimensions do not match.\n");
-                return -1;
-            }
-
             std::vector<uint8_t> vp8_frame;
-            if (!encode_sd_image_to_vp8_frame(image, quality, vp8_frame)) {
-                fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
+            if (!get_vp8(i, vp8_frame)) {
                 return -1;
             }
 
@@ -1502,6 +1502,226 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
     return writer.data();
 }
 
+std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality,
+                                                           const sd_audio_t* audio, bool consume_image_data) {
+    if (num_images == 0) {
+        fprintf(stderr, "Error: Image array is empty.\n");
+        return {};
+    }
+    const int width  = static_cast<int>(images[0].width);
+    const int height = static_cast<int>(images[0].height);
+
+    // Inline per-frame encode; on transfer-of-ownership, release each pixel buffer as soon as its
+    // VP8 keyframe exists (mirrors the historical in-loop free — byte-identical, the VP8 bytes do
+    // not alias the pixels).
+    auto get_vp8 = [&](int i, std::vector<uint8_t>& out) -> bool {
+        sd_image_t& image = images[i];
+        if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
+            fprintf(stderr, "Error: Frame dimensions do not match.\n");
+            return false;
+        }
+        if (!encode_sd_image_to_vp8_frame(image, quality, out)) {
+            fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
+            return false;
+        }
+        if (consume_image_data) {
+            free(image.data);
+            image.data = nullptr;
+        }
+        return true;
+    };
+
+    return mux_webm_vp8(width, height, num_images, fps, audio, get_vp8);
+}
+
+// ─── Incremental (streaming) WebM writer ─────────────────────────────────────────────────────
+// Encodes each frame to VP8 as it arrives and SPOOLS the (small) encoded bytes to a temp file so
+// peak RAM stays bounded to the caller's live frame window regardless of clip length. The audio is
+// buffered whole (tiny). finalize() replays the spool through the shared mux core with the now-known
+// total frame count, muxes the length-matched audio, writes the container atomically (.tmp→rename),
+// and returns the bytes. Byte-identical to create_webm_from_sd_images_to_vector over the same frames.
+IncrementalWebmWriter::IncrementalWebmWriter() = default;
+
+IncrementalWebmWriter::~IncrementalWebmWriter() {
+    // Abort path: drop the spool + any half-written .tmp (a successful finalize() already removed
+    // the spool and renamed the .tmp away, so these become harmless no-ops).
+    if (spool_out_.is_open()) {
+        spool_out_.close();
+    }
+    if (spool_in_.is_open()) {
+        spool_in_.close();
+    }
+    std::error_code ec;
+    if (!spool_path_.empty()) {
+        fs::remove(fs::path(spool_path_), ec);
+    }
+    if (!final_path_.empty()) {
+        fs::remove(fs::path(final_path_ + ".tmp"), ec);
+    }
+    if (audio_owned_.data != nullptr) {
+        free(audio_owned_.data);
+        audio_owned_.data = nullptr;
+    }
+}
+
+bool IncrementalWebmWriter::open(const std::string& final_path, int fps, int quality) {
+    final_path_ = final_path;
+    spool_path_ = final_path + ".vp8spool";
+    fps_        = fps;
+    quality_    = quality;
+    width_      = 0;
+    height_     = 0;
+    num_frames_ = 0;
+    failed_     = false;
+    std::error_code ec;
+    fs::remove(fs::path(spool_path_), ec);
+    spool_out_.open(fs::path(spool_path_), std::ios::binary | std::ios::trunc);
+    if (!spool_out_) {
+        fprintf(stderr, "IncrementalWebmWriter: cannot open spool %s\n", spool_path_.c_str());
+        failed_ = true;
+        return false;
+    }
+    return true;
+}
+
+bool IncrementalWebmWriter::append_video_frame(const sd_image_t& image) {
+    if (failed_) {
+        return false;
+    }
+    if (!spool_out_.is_open()) {
+        failed_ = true;
+        return false;
+    }
+    const int w = static_cast<int>(image.width);
+    const int h = static_cast<int>(image.height);
+    if (num_frames_ == 0) {
+        width_  = w;  // dims fixed by the first frame, matching create_webm's images[0]
+        height_ = h;
+    } else if (w != width_ || h != height_) {
+        fprintf(stderr, "IncrementalWebmWriter: frame dimensions do not match.\n");
+        failed_ = true;
+        return false;
+    }
+    std::vector<uint8_t> vp8;
+    if (!encode_sd_image_to_vp8_frame(image, quality_, vp8)) {
+        fprintf(stderr, "IncrementalWebmWriter: failed to encode frame %d as VP8.\n", num_frames_);
+        failed_ = true;
+        return false;
+    }
+    const uint32_t len = static_cast<uint32_t>(vp8.size());
+    unsigned char  hdr[4];
+    hdr[0] = static_cast<unsigned char>(len & 0xFF);
+    hdr[1] = static_cast<unsigned char>((len >> 8) & 0xFF);
+    hdr[2] = static_cast<unsigned char>((len >> 16) & 0xFF);
+    hdr[3] = static_cast<unsigned char>((len >> 24) & 0xFF);
+    spool_out_.write(reinterpret_cast<const char*>(hdr), 4);
+    if (len > 0) {
+        spool_out_.write(reinterpret_cast<const char*>(vp8.data()), static_cast<std::streamsize>(len));
+    }
+    if (!spool_out_) {
+        fprintf(stderr, "IncrementalWebmWriter: spool write failed at frame %d.\n", num_frames_);
+        failed_ = true;
+        return false;
+    }
+    ++num_frames_;
+    return true;
+}
+
+void IncrementalWebmWriter::set_audio(const sd_audio_t* audio) {
+    if (audio_owned_.data != nullptr) {
+        free(audio_owned_.data);
+        audio_owned_.data = nullptr;
+    }
+    audio_owned_ = sd_audio_t{};
+    if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 || audio->channels == 0) {
+        return;
+    }
+    const size_t n = static_cast<size_t>(audio->sample_count) * static_cast<size_t>(audio->channels);
+    audio_owned_.data = static_cast<float*>(malloc(n * sizeof(float)));
+    if (audio_owned_.data == nullptr) {
+        return;  // no audio track rather than crash; video still muxes
+    }
+    memcpy(audio_owned_.data, audio->data, n * sizeof(float));
+    audio_owned_.sample_rate  = audio->sample_rate;
+    audio_owned_.channels     = audio->channels;
+    audio_owned_.sample_count = audio->sample_count;
+}
+
+std::vector<uint8_t> IncrementalWebmWriter::finalize() {
+    if (spool_out_.is_open()) {
+        spool_out_.flush();
+        spool_out_.close();
+    }
+    if (failed_ || num_frames_ == 0) {
+        return {};
+    }
+    spool_in_.open(fs::path(spool_path_), std::ios::binary);
+    if (!spool_in_) {
+        fprintf(stderr, "IncrementalWebmWriter: cannot reopen spool %s\n", spool_path_.c_str());
+        return {};
+    }
+    int next_read = 0;
+    auto get_vp8 = [&](int i, std::vector<uint8_t>& out) -> bool {
+        if (i != next_read) {  // the mux core reads strictly in order; guard the assumption
+            fprintf(stderr, "IncrementalWebmWriter: non-sequential frame read (%d != %d).\n", i, next_read);
+            return false;
+        }
+        unsigned char hdr[4];
+        spool_in_.read(reinterpret_cast<char*>(hdr), 4);
+        if (!spool_in_ || spool_in_.gcount() != 4) {
+            fprintf(stderr, "IncrementalWebmWriter: spool header read failed at frame %d.\n", i);
+            return false;
+        }
+        const uint32_t len = static_cast<uint32_t>(hdr[0]) | (static_cast<uint32_t>(hdr[1]) << 8) |
+                             (static_cast<uint32_t>(hdr[2]) << 16) | (static_cast<uint32_t>(hdr[3]) << 24);
+        out.resize(len);
+        if (len > 0) {
+            spool_in_.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(len));
+            if (!spool_in_ || static_cast<uint32_t>(spool_in_.gcount()) != len) {
+                fprintf(stderr, "IncrementalWebmWriter: spool body read failed at frame %d.\n", i);
+                return false;
+            }
+        }
+        ++next_read;
+        return true;
+    };
+
+    const sd_audio_t* audio = audio_owned_.data != nullptr ? &audio_owned_ : nullptr;
+    std::vector<uint8_t> bytes = mux_webm_vp8(width_, height_, num_frames_, fps_, audio, get_vp8);
+
+    spool_in_.close();
+    std::error_code ec;
+    fs::remove(fs::path(spool_path_), ec);
+    spool_path_.clear();
+
+    if (bytes.empty()) {
+        return {};
+    }
+
+    // B4 atomic publish: write .tmp then rename onto final_path.
+    const std::string tmp_path = final_path_ + ".tmp";
+    fs::remove(fs::path(tmp_path), ec);
+    {
+        std::ofstream out(fs::path(tmp_path), std::ios::binary | std::ios::trunc);
+        if (!out) {
+            fprintf(stderr, "IncrementalWebmWriter: cannot open %s\n", tmp_path.c_str());
+            return {};
+        }
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!out) {
+            fprintf(stderr, "IncrementalWebmWriter: write to %s failed\n", tmp_path.c_str());
+            return {};
+        }
+    }
+    fs::rename(fs::path(tmp_path), fs::path(final_path_), ec);
+    if (ec) {
+        fprintf(stderr, "IncrementalWebmWriter: rename %s -> %s failed: %s\n",
+                tmp_path.c_str(), final_path_.c_str(), ec.message().c_str());
+        return {};
+    }
+    return bytes;
+}
+
 int create_webm_from_sd_images(const char* filename, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio) {
     std::vector<uint8_t> webm_data = create_webm_from_sd_images_to_vector(images, num_images, fps, quality, audio);
     if (webm_data.empty()) {
@@ -1520,7 +1740,8 @@ std::vector<uint8_t> create_video_from_sd_images_to_vector(const std::string& ou
                                                            int num_images,
                                                            int fps,
                                                            int quality,
-                                                           const sd_audio_t* audio) {
+                                                           const sd_audio_t* audio,
+                                                           bool consume_image_data) {
     std::string format = output_format;
     std::transform(format.begin(), format.end(), format.begin(),
                    [](unsigned char c) { return static_cast<char>(tolower(c)); });
@@ -1530,7 +1751,7 @@ std::vector<uint8_t> create_video_from_sd_images_to_vector(const std::string& ou
 
 #ifdef SD_USE_WEBM
     if (format == "webm") {
-        return create_webm_from_sd_images_to_vector(images, num_images, fps, quality, audio);
+        return create_webm_from_sd_images_to_vector(images, num_images, fps, quality, audio, consume_image_data);
     }
 #endif
 

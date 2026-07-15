@@ -46,8 +46,9 @@ enum class WorkerFrame : uint32_t {
     // request JSON: base gen-params + segment prompts[] + n_segments + cont_latent_frames
     // + chain_audio_dir (a /tmp dir of aud_<i>.wav the PARENT wrote — parent/child share
     // the container fs) + init image as inline base64. The child re-parses it and runs
-    // generate_video_chain via the shared run_vid_chain_job(). RESP reuses the RENDER_RESP
-    // pack (json meta {ok,error,frame_count,fps,render_sec} + encoded video bytes).
+    // generate_video_chain via the shared run_vid_chain_job(). RESP is a small
+    // RENDER_RESP-shaped frame whose JSON carries {ok,error,frame_count,fps,render_sec,
+    // final_path}; the encoded final artifact stays on the shared job volume.
     VIDGEN_CHAIN_REQ  = 0x24,  // P->W  raw chain request JSON
     VIDGEN_CHAIN_RESP = 0x25,  // W->P  packed render response (json + video)
     // CANCEL_REQ: parent asks the worker to abort the in-flight render. Empty
@@ -78,6 +79,7 @@ enum class IpcError {
     EofClean,
     EofMidFrame,
     SocketError,
+    Timeout,
     ProtocolError,
     PayloadTooBig,
 };
@@ -96,6 +98,11 @@ IpcError send_frame(int fd, WorkerFrame type, uint32_t req_id,
 
 IpcError recv_frame(int fd, FrameHeader* out_hdr,
                     std::vector<uint8_t>* out_payload);
+// Same frame protocol, but with one deadline covering header and payload.  This is
+// used by long-running chain renders so a wedged child cannot hold the parent forever.
+IpcError recv_frame_with_timeout(int fd, FrameHeader* out_hdr,
+                                 std::vector<uint8_t>* out_payload,
+                                 int timeout_ms);
 
 // Pack JSON + image bytes + audio bytes into a single RENDER_REQ payload.
 std::vector<uint8_t> pack_render_request(const std::string& json_meta,

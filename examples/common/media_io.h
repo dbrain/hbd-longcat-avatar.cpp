@@ -2,6 +2,7 @@
 #define __MEDIA_IO_H__
 
 #include <cstdint>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -88,7 +89,47 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images,
                                                           int num_images,
                                                           int fps,
                                                           int quality             = 90,
-                                                          const sd_audio_t* audio = nullptr);
+                                                          const sd_audio_t* audio = nullptr,
+                                                          bool consume_image_data = false);
+
+// Streaming WebM encoder. Encodes+spools each frame's VP8 keyframe to disk as it arrives so the
+// caller never has to hold the whole decoded timeline in RAM; finalize() replays the spool through
+// the same mux core the whole-array encoder uses (byte-identical output) with the length-matched
+// audio, and publishes the container atomically (.tmp→rename). Additive — the whole-array API is
+// unchanged. Not copyable (owns a spool + a buffered audio track).
+class IncrementalWebmWriter {
+public:
+    IncrementalWebmWriter();
+    ~IncrementalWebmWriter();
+    IncrementalWebmWriter(const IncrementalWebmWriter&)            = delete;
+    IncrementalWebmWriter& operator=(const IncrementalWebmWriter&) = delete;
+
+    // Begin an encode targeting final_path (VP8 spool goes to final_path + ".vp8spool").
+    bool open(const std::string& final_path, int fps, int quality);
+    // Encode one frame and append it to the spool. Output dims are captured from the first frame
+    // (mirrors create_webm's images[0]). The caller retains ownership of `image` and frees it after.
+    bool append_video_frame(const sd_image_t& image);
+    // Buffer the whole audio track (deep-copied) to mux at finalize().
+    void set_audio(const sd_audio_t* audio);
+    // Mux spool + audio, publish final_path atomically, and return the encoded bytes ({} on failure).
+    std::vector<uint8_t> finalize();
+
+    int  frame_count() const { return num_frames_; }
+    bool failed() const { return failed_; }
+
+private:
+    std::string   final_path_;
+    std::string   spool_path_;
+    std::ofstream spool_out_;
+    std::ifstream spool_in_;
+    int           fps_        = 0;
+    int           quality_    = 90;
+    int           width_      = 0;
+    int           height_     = 0;
+    int           num_frames_ = 0;
+    bool          failed_     = false;
+    sd_audio_t    audio_owned_{};  // owned deep copy (data via malloc/free)
+};
 #endif
 
 int create_video_from_sd_images(const char* filename,
@@ -102,7 +143,8 @@ std::vector<uint8_t> create_video_from_sd_images_to_vector(const std::string& ou
                                                            int num_images,
                                                            int fps,
                                                            int quality             = 90,
-                                                           const sd_audio_t* audio = nullptr);
+                                                           const sd_audio_t* audio = nullptr,
+                                                           bool consume_image_data = false);
 
 bool write_wav_to_file(const std::string& path,
                        const float* interleaved_samples,

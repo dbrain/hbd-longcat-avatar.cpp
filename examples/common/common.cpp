@@ -1940,6 +1940,30 @@ bool SDGenerationParams::from_json_str(
         }
     }
 
+    // LTX quality profiles: a non-empty hires_chain replaces the legacy hires object.
+    // Keep the JSON field shape deliberately small and exact: {upscaler, custom_sigmas,
+    // sample_method, cfg, steps}. Model names are resolved below just like hires.upscaler.
+    if (j.contains("hires_chain") && j["hires_chain"].is_array()) {
+        hires_chain.clear();
+        for (const json& stage_json : j["hires_chain"]) {
+            if (!stage_json.is_object()) {
+                LOG_ERROR("hires_chain stages must be objects");
+                return false;
+            }
+            HiresChainStage stage;
+            if (stage_json.contains("upscaler") && stage_json["upscaler"].is_string()) stage.upscaler = stage_json["upscaler"];
+            if (stage_json.contains("custom_sigmas") && stage_json["custom_sigmas"].is_array()) stage.custom_sigmas = stage_json["custom_sigmas"].get<std::vector<float>>();
+            if (stage_json.contains("sample_method") && stage_json["sample_method"].is_string()) stage.sample_method = str_to_sample_method(stage_json["sample_method"].get<std::string>().c_str());
+            if (stage_json.contains("cfg") && stage_json["cfg"].is_number()) stage.cfg = stage_json["cfg"];
+            if (stage_json.contains("steps") && stage_json["steps"].is_number_integer()) stage.steps = stage_json["steps"];
+            if (stage.upscaler.empty() || stage.sample_method == SAMPLE_METHOD_COUNT || stage.custom_sigmas.size() < 2 || stage.steps <= 0 || stage.cfg < 0.f) {
+                LOG_ERROR("invalid hires_chain stage (requires upscaler, >=2 custom_sigmas, sample_method, cfg >= 0, steps > 0)");
+                return false;
+            }
+            hires_chain.push_back(std::move(stage));
+        }
+    }
+
     auto parse_sample_params_json = [&](const json& sample_json,
                                         sd_sample_params_t& target_params,
                                         std::string& target_extra_sample_args,
@@ -2305,6 +2329,16 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
             resolved_hires_upscaler = SD_HIRES_UPSCALER_MODEL;
         }
     }
+    for (auto& stage : hires_chain) {
+        stage.model_path.clear();
+        stage.resolved_upscaler = str_to_sd_hires_upscaler(stage.upscaler.c_str());
+        if (stage.resolved_upscaler == SD_HIRES_UPSCALER_NONE || stage.resolved_upscaler == SD_HIRES_UPSCALER_COUNT) {
+            static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt", ".pth"};
+            if (!resolve_model_file_from_dir(stage.upscaler, hires_upscalers_dir, valid_ext,
+                                             "hires_chain upscaler", stage.model_path)) return false;
+            stage.resolved_upscaler = SD_HIRES_UPSCALER_MODEL;
+        }
+    }
 
     prompt_with_lora = prompt;
     if (!lora_model_dir.empty()) {
@@ -2483,6 +2517,13 @@ bool SDGenerationParams::validate(SDMode mode) {
             return false;
         }
     }
+    for (const auto& stage : hires_chain) {
+        if (stage.steps <= 0 || stage.cfg < 0.f || stage.custom_sigmas.size() < 2 ||
+            stage.resolved_upscaler != SD_HIRES_UPSCALER_MODEL) {
+            LOG_ERROR("error: hires_chain stages require a spatial model upscaler, positive steps, cfg >= 0, and >=2 custom sigmas");
+            return false;
+        }
+    }
 
     if (mode == UPSCALE) {
         if (init_image_path.length() == 0) {
@@ -2603,6 +2644,7 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
     params.hires.sample_method       = hires_sample_method;
+    params.hires.cfg                 = NAN;
     return params;
 }
 
@@ -2699,6 +2741,24 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     }
     params.hires.loras      = hires_lora_vec.empty() ? nullptr : hires_lora_vec.data();
     params.hires.lora_count = static_cast<uint32_t>(hires_lora_vec.size());
+    hires_chain_params.clear();
+    hires_chain_params.reserve(hires_chain.size());
+    for (auto& stage : hires_chain) {
+        sd_hires_params_t view = {};
+        sd_hires_params_init(&view);
+        view.enabled             = true;
+        view.upscaler            = stage.resolved_upscaler;
+        view.model_path          = stage.model_path.c_str();
+        view.scale               = 2.f;
+        view.steps               = stage.steps;
+        view.custom_sigmas       = stage.custom_sigmas.data();
+        view.custom_sigmas_count = static_cast<int>(stage.custom_sigmas.size());
+        view.sample_method       = stage.sample_method;
+        view.cfg                 = stage.cfg;
+        hires_chain_params.push_back(view);
+    }
+    params.hires_chain       = hires_chain_params.empty() ? nullptr : hires_chain_params.data();
+    params.hires_chain_count = static_cast<int>(hires_chain_params.size());
     return params;
 }
 

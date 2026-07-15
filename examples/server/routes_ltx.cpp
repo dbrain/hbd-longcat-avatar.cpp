@@ -13,6 +13,7 @@
 //     "width","height","fps","steps","cfg_scale","sampling_method","scheduler","seed",
 //     "negative_prompt": "",
 //     "init_image": "<base64|data-uri>",        // optional, seg0 i2v (from_json_str loads it)
+//     "character_reference": "<base64|data-uri>", // optional LTXAV identity-only DiT reference
 //     "control_frames": ["<base64|data-uri>", ...], // V2V source: N consecutive source windows
 //     "relip_control_frame_counts": [97, ...],    // optional exact source-frame count per window
 //     "v2v_mode": 0,                              // how control_frames are used: 0=lipdub relip
@@ -28,7 +29,11 @@
 //                                                 //   via segments[i].v2v_source_latent_path. Absent
 //                                                 //   => fall back to control_frames (pixel encode).
 //     "model": "edit",                            // selects the lipdub DiT variant
-//     "hires": { ... },                         // optional spatial upscaler
+//     "hires": { ... },                         // optional legacy single spatial upscaler
+//     "hires_chain": [ { "upscaler": "<spatial-upscaler-x2 name>",
+//                         "custom_sigmas": [0.85,0.725,0.421875,0.0],
+//                         "sample_method": "euler_cfg_pp", "cfg": 1.0, "steps": 3 } ],
+//                                                 // optional ordered upscale+SDEdit stages; non-empty replaces hires
 //     "output_format": "webm" }
 // Per-segment lip-sync wavs (16kHz mono) ride as multipart parts audio_0, audio_1, …; the
 // parent writes them to a shared /tmp dir and passes the dir to the chain. For relip every
@@ -235,7 +240,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
                 resume_from = ltx_banked_segment_count(job_dir);
                 if (resume_from >= n_segments) {
-                    resume_from = std::max(0, n_segments - 1);  // re-render at least the last seg
+                    // All segment latents survived but final.webm did not (for example a
+                    // crash during finalization): reload and stitch every banked segment,
+                    // then encode only. Keep the old last-segment rerender behaviour when a
+                    // completed final artifact is already present.
+                    if (!fs::exists(job_dir / ("final." + output_format), ec)) {
+                        resume_from = n_segments;
+                    } else {
+                        resume_from = std::max(0, n_segments - 1);
+                    }
                 }
                 // RETAKE: re-render ONLY this banked shot, pinned by both neighbours, then splice
                 // the banked tail. The engine derives its own prefix-reload point from

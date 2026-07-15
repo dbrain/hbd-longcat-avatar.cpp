@@ -2,6 +2,7 @@
 
 #include "worker_session.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -36,6 +37,32 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace longcat_avatar {
+
+namespace {
+constexpr int kDefaultChainResponseTimeoutSeconds = 6 * 60 * 60;
+
+int chain_response_timeout_ms() {
+    const char* value = std::getenv("LTX_CHAIN_RESPONSE_TIMEOUT_SECONDS");
+    if (value == nullptr || value[0] == '\0') return kDefaultChainResponseTimeoutSeconds * 1000;
+    char* end = nullptr;
+    const long seconds = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0') return kDefaultChainResponseTimeoutSeconds * 1000;
+    return static_cast<int>(std::clamp(seconds, 60L, 24L * 60L * 60L) * 1000L);
+}
+
+bool read_shared_final_video(const std::string& path, std::vector<uint8_t>& bytes) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    const std::streampos end = in.tellg();
+    if (end < 0) return false;
+    bytes.resize(static_cast<size_t>(end));
+    in.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    return static_cast<bool>(in) || bytes.empty();
+}
+} // namespace
 
 // ─── parent-side handle ──────────────────────────────────────────────────────
 
@@ -297,7 +324,7 @@ RenderResult WorkerSession::render_video_chain(const std::string& chain_json) {
 
     FrameHeader hdr{};
     std::vector<uint8_t> resp_payload;
-    auto err = recv_frame(fd_, &hdr, &resp_payload);
+    auto err = recv_frame_with_timeout(fd_, &hdr, &resp_payload, chain_response_timeout_ms());
     if (err != IpcError::OK || hdr.type != (uint32_t)WorkerFrame::VIDGEN_CHAIN_RESP) {
         result.error = std::string("VIDGEN_CHAIN_RESP recv failed: ") + ipc_error_str(err);
         kill_worker_locked();
@@ -306,7 +333,8 @@ RenderResult WorkerSession::render_video_chain(const std::string& chain_json) {
     }
 
     std::string meta;
-    if (!unpack_render_response(resp_payload, &meta, &result.video_bytes)) {
+    std::vector<uint8_t> unused_video_payload;
+    if (!unpack_render_response(resp_payload, &meta, &unused_video_payload)) {
         result.error = "VIDGEN_CHAIN_RESP unpack failed";
         return result;
     }
@@ -317,9 +345,17 @@ RenderResult WorkerSession::render_video_chain(const std::string& chain_json) {
         result.frame_count = m.value("frame_count", 0);
         result.fps         = m.value("fps", 24);
         result.render_sec  = m.value("render_sec", 0.0);
+        result.final_video_path = m.value("final_path", std::string());
     } catch (const std::exception& e) {
         result.ok    = false;
         result.error = std::string("VIDGEN_CHAIN_RESP meta parse: ") + e.what();
+    }
+    if (result.ok) {
+        if (result.final_video_path.empty() ||
+            !read_shared_final_video(result.final_video_path, result.video_bytes)) {
+            result.ok = false;
+            result.error = "VIDGEN_CHAIN_RESP final.webm read failed";
+        }
     }
     return result;
 }
@@ -703,7 +739,32 @@ int run_worker_loop(int fd, int argc, const char** argv) {
                     {"frame_count", frame_count},
                     {"fps", fps},
                     {"render_sec", render_sec},
+                    {"final_path", ""},
                 };
+                if (ok) {
+                    try {
+                        json request = json::parse(chain_json);
+                        const std::string job_dir = request.value("ltx_job_dir", std::string());
+                        const std::string output_format = request.value("output_format", std::string("webm"));
+                        if (job_dir.empty()) {
+                            ok = false;
+                            err_msg = "chain worker requires ltx_job_dir for final artifact transport";
+                            meta["ok"] = false;
+                            meta["error"] = err_msg;
+                        } else {
+                            meta["final_path"] = job_dir + "/final." + output_format;
+                        }
+                    } catch (const std::exception& e) {
+                        ok = false;
+                        err_msg = std::string("chain final artifact metadata: ") + e.what();
+                        meta["ok"] = false;
+                        meta["error"] = err_msg;
+                    }
+                }
+                // final.<format> was written to the shared job volume by run_vid_chain_job.
+                // Never copy it through the capped IPC socket.
+                video_bytes.clear();
+                video_bytes.shrink_to_fit();
                 auto resp = pack_render_response(meta.dump(), video_bytes);
                 auto serr = send_frame(fd, WorkerFrame::VIDGEN_CHAIN_RESP, hdr.req_id, resp);
                 if (serr != IpcError::OK) {

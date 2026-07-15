@@ -183,6 +183,15 @@ struct SDContextParams {
 };
 
 struct SDGenerationParams {
+    struct HiresChainStage {
+        std::string upscaler;
+        std::string model_path;
+        std::vector<float> custom_sigmas;
+        enum sample_method_t sample_method = SAMPLE_METHOD_COUNT;
+        float cfg = 1.f;
+        int steps = 0;
+        sd_hires_upscaler_t resolved_upscaler = SD_HIRES_UPSCALER_COUNT;
+    };
     // User-facing input fields.
     std::string prompt;
     std::string negative_prompt;
@@ -282,6 +291,7 @@ struct SDGenerationParams {
     // Independent refine-pass sampler. SAMPLE_METHOD_COUNT = unset -> inherit the base pass's
     // sample_method (legacy). Parsed from JSON "hires.sample_method"; threaded to sd_hires_params_t.
     enum sample_method_t hires_sample_method = SAMPLE_METHOD_COUNT;
+    std::vector<HiresChainStage> hires_chain;
     // FEATURE 1 (--hires-lora): a SECOND LoRA set applied only on the hires/refine pass, so the
     // refine can run a different distillation/detailer strength than the base pass (Denoise-AI
     // workflow: distill@0.65 base -> distill@0.8 + detailer@0.7 refine). `hires_lora_spec` is the
@@ -298,6 +308,7 @@ struct SDGenerationParams {
     std::string prompt_with_lora;  // for metadata record only
     std::vector<sd_lora_t> lora_vec;
     std::vector<sd_lora_t> hires_lora_vec;  // FEATURE 1: backing storage for params.hires.loras
+    std::vector<sd_hires_params_t> hires_chain_params; // owned C-API view for hires_chain
     sd_hires_upscaler_t resolved_hires_upscaler;
 
     // Owned execution payload.
