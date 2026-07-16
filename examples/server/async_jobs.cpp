@@ -62,8 +62,16 @@ struct SegWebmWriter {
                 auto        bytes = create_video_from_sd_images_to_vector(
                     "webm", t.frames.data(), (int)t.frames.size(), fps, quality, nullptr);
                 if (!bytes.empty()) {
-                    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                    // Publish atomically (mirrors the final.webm write below): a status poller /
+                    // segment fetch must never observe a half-written seg webm, so encode into
+                    // seg_<i>.webm.tmp and rename() it into place once the bytes are fully flushed.
+                    std::string     tmp_path = path + ".tmp";
+                    std::error_code ec;
+                    fs::remove(tmp_path, ec);
+                    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
                     out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)bytes.size());
+                    out.close();
+                    fs::rename(tmp_path, path, ec);
                 }
                 for (auto& f : t.frames) {
                     free(f.data);
@@ -328,6 +336,52 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     } else {
         result["result"] = nullptr;
         result["error"]  = nullptr;
+    }
+
+    // Progressive per-segment previews (opt-in emit_segments). List every seg_<n>.webm the chain
+    // has banked so far so a client can play each shot as it lands. Read straight off the shared
+    // job dir here on the status HTTP thread — the partials NEVER ride the blocking render IPC
+    // channel. Present while Generating and once Completed; absent when no seg webms exist (the
+    // byte-identical off path). Cheap directory scan; skips the in-flight seg_<n>.webm.tmp files.
+    if (!job.job_dir.empty() && (job.status == AsyncJobStatus::Generating ||
+                                 job.status == AsyncJobStatus::Completed)) {
+        static const std::string kPrefix = "seg_";
+        static const std::string kSuffix = ".webm";
+        std::vector<int>         seg_indices;
+        std::error_code          ec;
+        for (auto it = fs::directory_iterator(job.job_dir, ec);
+             !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (!it->is_regular_file(ec)) {
+                continue;
+            }
+            const std::string name = it->path().filename().string();
+            if (name.size() <= kPrefix.size() + kSuffix.size() ||
+                name.compare(0, kPrefix.size(), kPrefix) != 0 ||
+                name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+                continue;  // not seg_<n>.webm (also drops the seg_<n>.webm.tmp in-flight file)
+            }
+            const std::string digits =
+                name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
+            if (digits.find_first_not_of("0123456789") != std::string::npos) {
+                continue;
+            }
+            seg_indices.push_back(std::stoi(digits));
+        }
+        // Only add the "partials" key when at least one seg webm exists. With emit_segments off
+        // (and no env override) none are written, so the key is absent and the status JSON is
+        // byte-identical to today — never an empty "partials": [].
+        if (!seg_indices.empty()) {
+            std::sort(seg_indices.begin(), seg_indices.end());
+            json partials = json::array();
+            for (int n : seg_indices) {
+                partials.push_back({
+                    {"segment_index", n},
+                    {"stage", 4},
+                    {"url", "/sdcpp/v1/jobs/" + job.id + "/segments/" + std::to_string(n)},
+                });
+            }
+            result["partials"] = std::move(partials);
+        }
     }
 
     return result;
@@ -750,6 +804,10 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // switches this render to variable-length (segment_video_frames wired below).
     std::vector<int> seg_frames(n_segments, 0);
     bool             any_seg_frames = false;
+    // Per-segment TEXT-ONLY SCENE CUT. segments[i].scene_cut=true makes that seg>0 shot a fresh
+    // scene from its prompt alone (no image, no continuation). Off/absent = ordinary continuation.
+    std::vector<int> seg_scene(n_segments, 0);
+    bool             any_seg_scene = false;
     // Per-segment generic-V2V mode. Default = base.v2v_mode; override via segments[i].v2v_mode
     // (integer 0/1/2) or the legacy boolean segments[i].v2v (true=1 SDEdit).
     std::vector<int> seg_v2v(n_segments, base.v2v_mode);
@@ -772,6 +830,12 @@ bool run_vid_chain_job(ServerRuntime& runtime,
                 any_seg_frames  = true;
                 LOG_INFO("run_vid_chain_job: segment %d frame count %d (variable-length)",
                          seg + 1, seg_frames[seg]);
+            }
+            auto scit = segs[seg].find("scene_cut");
+            if (scit != segs[seg].end() && scit->is_boolean() && scit->get<bool>()) {
+                seg_scene[seg] = 1;
+                any_seg_scene  = true;
+                LOG_INFO("run_vid_chain_job: segment %d TEXT SCENE CUT (fresh from prompt)", seg + 1);
             }
             bool seg_set_v2v = false;
             auto mit         = segs[seg].find("v2v_mode");
@@ -816,6 +880,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.cont_latent_frames = std::max(1, gen_params.cont_latent_take);
     chain.segment_prompts    = prompt_ptrs.data();
     chain.segment_video_frames = any_seg_frames ? seg_frames.data() : nullptr;
+    chain.segment_scene_cut    = any_seg_scene ? seg_scene.data() : nullptr;
     chain.segment_v2v_mode     = any_seg_v2v ? seg_v2v.data() : nullptr;
     chain.segment_v2v_guide_latent_paths = any_seg_guide_lat ? seg_guide_ptrs.data() : nullptr;
     chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
@@ -830,13 +895,18 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.before_segment      = &ltx_chain_dit_lease_cb;
     chain.before_segment_user = &chain_dit_lease;
 
-    // Bank a viewable per-segment webm as each segment lands (off the GPU thread). On by
-    // default when a job dir is set; LTX_BANK_SEG_WEBM=0 disables it (e.g. under tight RAM —
-    // resume only needs the seg_<i>.bin latents, which are banked regardless).
+    // Bank a viewable per-segment webm as each segment lands (off the GPU thread) for
+    // progressive delivery — a client plays each shot while the next renders. OPT-IN: only when
+    // the request set chain["emit_segments"]=true, OR the LTX_BANK_SEG_WEBM env override forces
+    // it on. When neither, on_segment stays null and frames flow only through the normal
+    // stitch/streaming path (byte-identical: nothing extra is encoded and no partials appear).
+    // (resume needs only the seg_<i>.bin latents, banked regardless of this flag.)
+    const bool emit_segments = body.value("emit_segments", false);
     std::unique_ptr<SegWebmWriter> seg_writer;
     if (!job_dir.empty()) {
-        const char* bank = getenv("LTX_BANK_SEG_WEBM");
-        bool        on   = (bank == nullptr) || (bank[0] != '0');
+        const char* bank   = getenv("LTX_BANK_SEG_WEBM");
+        const bool  env_on = (bank != nullptr) && (bank[0] != '0');
+        const bool  on     = emit_segments || env_on;
         if (on) {
             seg_writer          = std::make_unique<SegWebmWriter>();
             seg_writer->dir     = job_dir;

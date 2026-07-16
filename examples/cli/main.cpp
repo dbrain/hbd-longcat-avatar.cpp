@@ -1164,6 +1164,7 @@ int main(int argc, const char* argv[]) {
                                            want_latent ? &lat_out : nullptr,
                                            want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
                                            want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
+                                           nullptr, nullptr, nullptr, nullptr, nullptr,
                                            nullptr, nullptr, nullptr, nullptr, nullptr)) {
                         LOG_ERROR("continuation segment %d failed", seg + 1);
                         free_sd_audio(seg_audio);

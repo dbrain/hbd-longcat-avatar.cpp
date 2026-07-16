@@ -405,6 +405,30 @@ typedef struct {
     int character_reference_latent_height;
     int character_reference_latent_frames;
     int character_reference_latent_channels;
+    // Per-refine-stage HIGHER-RESOLUTION character identity references. The base-res
+    // character_reference_latent above is encoded at base_params->width/height (~base/vae_scale
+    // token grid, e.g. 15x8=120 tokens); at the 2x/4x SDEdit refine stages that coarse block can
+    // only hint identity, not enforce fine detail. These carry the SAME character image re-encoded
+    // at the refine stages' resolutions so each refine attaches a stage-matched, higher-detail
+    // identity token block:
+    //   _lo = first hires/refine stage (base*2) resolution  (e.g. 30x16=480 tokens);
+    //   _hi = final hires resolution (base*2^hires_chain_count) (e.g. 60x32=1920 tokens),
+    //         reused across every subsequent hires_chain stage.
+    // Encoded once per chain (the VAE encoder is available at chain level, before the per-segment
+    // LTXAV_VAE_LAZY frees it for the DiT sample+refine). Same ggml-ne layout as above
+    // [W_lat, H_lat, frames, video_channels, 1], contiguous f32. NULL/0 (the default) => that
+    // refine stage falls back to the base-res latent, byte-identical to the pre-existing
+    // single-resolution character-reference path.
+    const float* character_reference_latent_lo;
+    int character_reference_latent_lo_width;
+    int character_reference_latent_lo_height;
+    int character_reference_latent_lo_frames;
+    int character_reference_latent_lo_channels;
+    const float* character_reference_latent_hi;
+    int character_reference_latent_hi_width;
+    int character_reference_latent_hi_height;
+    int character_reference_latent_hi_frames;
+    int character_reference_latent_hi_channels;
     // LTXAV MULTI-KEYFRAME conditioning: arbitrary (image, video-frame-index) guide pairs
     // pinned as frozen 1-frame conditioning frames on the target timeline. Generalises the
     // single start/end i2v pins (init_image @ frame 0, end_image @ frames-1) to N caller-placed
@@ -502,6 +526,18 @@ typedef struct {
     int cont_refine_latent_width;
     int cont_refine_latent_height;
     int cont_refine_latent_channels;
+    // First-hires-stage LOWER-RES continuation refine guide. In a >=2-stage hires chain the
+    // refine happens at two resolutions (stage 0 = base*2, stage 1 = base*4); cont_refine_latent
+    // above carries the prior segment's FINAL full-res (stage-1) refined tail, while this carries
+    // its intermediate stage-0 (lower-res) refined tail so the next segment's stage-0 refine gets a
+    // matching-resolution continuation guide instead of redefining the character. Same ggml-ne
+    // layout [W_lat, H_lat, frames, video_channels, 1], contiguous f32. NULL/0 (single-stage or no
+    // continuation) is byte-identical to the pre-existing path.
+    const float* cont_refine_latent_lo;
+    int cont_refine_latent_lo_frames;
+    int cont_refine_latent_lo_width;
+    int cont_refine_latent_lo_height;
+    int cont_refine_latent_lo_channels;
     // LTXAV LATENT continuation (file-based, CLI-friendly): path to a saved VIDEO latent
     // (LTXAV_SAVE_VIDEO_LATENT output from the prior segment). When set on the LTXAV path,
     // the last cont_latent_frames latent frames are placed at the head of the new segment's
@@ -606,6 +642,14 @@ typedef struct {
     // drop; fresh shots (scene-cut / keyframe / seg-0) have no such floor. NULL = byte-identical
     // uniform-length behaviour.
     const int* segment_video_frames;
+    // Optional per-segment TEXT-ONLY SCENE CUT ("new scene" from a prompt alone). n_segments
+    // entries; a non-zero entry makes that seg>0 shot a FRESH scene rendered from its PROMPT with
+    // NO init image and NO continuation latent — the same fresh path as seg 0 / an i2v scene cut,
+    // just decoupled from the presence of an image (drop=0 at the seam, re-anchors continuity).
+    // 0/NULL = ordinary continuation (byte-identical). Ignored for a segment that already carries a
+    // scene image or keyframes (those are fresh anyway). Lets the Director cut to a brand-new scene
+    // without needing an image-to-video opener.
+    const int* segment_scene_cut;
     // Optional per-segment GENERIC V2V mode selector for segment_control_frames[i]. n_segments
     // entries; segment_v2v_mode[i] chooses how that segment consumes its control-frame source
     // (see sd_vid_gen_params_t.v2v_mode): 0 = lipdub-relip reference append (default), 1 = SDEdit
@@ -734,7 +778,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* refined_latent_width_out,
                               int* refined_latent_height_out,
                               int* refined_latent_frames_out,
-                              int* refined_latent_channels_out);
+                              int* refined_latent_channels_out,
+                              float** refined_latent_lo_out,
+                              int* refined_latent_lo_width_out,
+                              int* refined_latent_lo_height_out,
+                              int* refined_latent_lo_frames_out,
+                              int* refined_latent_lo_channels_out);
 
 // Render + stitch an LTXAV multi-segment chain (see sd_vid_chain_params_t). base_params is
 // the per-segment template; the chain overrides prompt / cont_latent / drive_audio / seed /

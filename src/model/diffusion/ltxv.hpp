@@ -2417,7 +2417,21 @@ namespace LTXV {
             // original tensor (no copy) => N==1 path byte-identical.
             const sd::Tensor<float>* eff_ts = &timesteps_tensor;
             if (ref_token_count > 0 && timesteps_tensor.numel() > 0) {
-                std::vector<float> combined(timesteps_tensor.data(), timesteps_tensor.data() + timesteps_tensor.numel());
+                // The main video timesteps may be a length-1 BROADCAST (uniform t over all tokens —
+                // e.g. a continuation/t2v refine whose denoise mask is all-ones, so every frame shares
+                // one timestep). Appending the reference's frozen t=0 entries onto a length-1 tensor
+                // yields (1 + ref_count) entries — neither the combined token count nor a valid
+                // broadcast — so the per-token modulation ggml_mul asserts (ggml_can_repeat). This is
+                // exactly the char-reference-on-a-continuation-refine crash. Expand a broadcast
+                // timestep to the MAIN video token count before appending the reference zeros, so
+                // eff_ts length == main_tokens + ref_token_count == the combined sequence length.
+                const int64_t main_tokens = vx->ne[0] * vx->ne[1] * vx->ne[2];
+                std::vector<float> combined;
+                if (timesteps_tensor.numel() == 1) {
+                    combined.assign(static_cast<size_t>(main_tokens), timesteps_tensor.data()[0]);
+                } else {
+                    combined.assign(timesteps_tensor.data(), timesteps_tensor.data() + timesteps_tensor.numel());
+                }
                 combined.insert(combined.end(), static_cast<size_t>(ref_token_count), 0.0f);
                 v_timestep_combined_cache = sd::Tensor<float>({static_cast<int64_t>(combined.size())}, combined);
                 eff_ts                    = &v_timestep_combined_cache;
@@ -2454,6 +2468,20 @@ namespace LTXV {
                 timesteps = make_input(*eff_ts);
             }
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
+            // The audio/prompt-context AdaLN branch falls back to `timestep` when no dedicated audio
+            // timestep exists (LTXAVModelBlock::forward :2087). But `timestep` here is the VIDEO-token
+            // timeline (compact [dim,1,U] or the combined main+reference per-token vector) — feeding it
+            // into the prompt-context AdaLN, which is indexed by the padded TEXT-context length, mismatches
+            // (crash: video-token U/len vs 1024 text tokens). This only bites when the video timeline is
+            // non-scalar AND no audio timestep was built — i.e. a reference-bearing continuation refine
+            // (all-ones mask → no audio timestep, but the char/relip reference append makes the video
+            // timeline per-token). Provide the ORIGINAL scalar video timestep (pre reference-append/collapse)
+            // as the audio/prompt timestep so that branch stays a scalar. When timesteps_tensor is already
+            // non-scalar (seg-0 frozen-pin) an audio timestep exists, so this fallback does not fire; and a
+            // no-reference render keeps timesteps_tensor length-1 → byte-identical scalar as before.
+            if (a_timestep == nullptr && timesteps_tensor.numel() == 1) {
+                a_timestep = make_input(timesteps_tensor);
+            }
             ggml_tensor* context    = make_optional_input(context_tensor);
             // NAG negative text context (null unless a NAG step). Same lifetime contract as
             // `context` (its data lives on the DiffusionParams/extra across the compute call).

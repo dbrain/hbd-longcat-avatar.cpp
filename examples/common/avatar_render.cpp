@@ -236,6 +236,7 @@ bool render_avatar_to_video_bytes(sd_ctx_t* sd_ctx,
                                    want_latent ? &lat_out : nullptr,
                                    want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
                                    want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
+                                   nullptr, nullptr, nullptr, nullptr, nullptr,
                                    nullptr, nullptr, nullptr, nullptr, nullptr)) {
                 free_sd_audio(seg_audio);
                 free(seg_video);

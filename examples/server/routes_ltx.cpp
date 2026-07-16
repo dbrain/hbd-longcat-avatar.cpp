@@ -202,6 +202,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             // supplied against a banked (resume) job below. Default it off so a stray body field or
             // a fresh (non-resume) job can never trigger a spurious single-segment render.
             chain["retake_segment"] = -1;
+            // Progressive per-segment delivery (opt-in). When true, run_vid_chain_job banks a
+            // viewable seg_<n>.webm as each shot lands and the job status lists it under
+            // "partials" so a client can play each shot while the next renders. Default false =
+            // byte-identical (no seg encode, no partials). Normalize the default here so the
+            // downstream reader (async_jobs.cpp) sees an explicit bool.
+            chain["emit_segments"] = body.value("emit_segments", false);
             std::string output_format = body.value("output_format", std::string("webm"));
 
             // Register the job (assign an id) before touching the filesystem, so a fresh job's
@@ -356,6 +362,40 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(bytes, "video/webm");
     });
 
-    LOG_INFO("ltx-video: POST /ltx/v1/generate + GET /sdcpp/v1/jobs/{id}/media registered "
+    // GET /sdcpp/v1/jobs/{id}/segments/{n} — stream a finished per-segment preview webm
+    // (seg_<n>.webm) from the job's artifact dir. This is the progressive-delivery fetch: the
+    // client polls /sdcpp/v1/jobs/{id}, reads the "partials" list, and pulls each seg webm as it
+    // lands. 404 until that segment's atomic seg_<n>.webm exists. Mirrors the /media handler:
+    // resolve the dir from RAM (falling back to LTX_JOB_DIR/<id> after the in-RAM TTL) and stream.
+    svr.Get(R"(/sdcpp/v1/jobs/([^/]+)/segments/(\d+))",
+            [runtime](const httplib::Request& req, httplib::Response& res) {
+        const std::string job_id = req.matches[1];
+        const std::string seg_n  = req.matches[2];
+        fs::path          dir;
+        {
+            AsyncJobManager&            manager = *runtime->async_job_manager;
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            auto                        it = manager.jobs.find(job_id);
+            if (it != manager.jobs.end() && !it->second->job_dir.empty()) {
+                dir = it->second->job_dir;
+            }
+        }
+        if (dir.empty()) {
+            dir = ltx_job_root() / job_id;  // job aged out of RAM; serve from disk
+        }
+        fs::path        seg_webm = dir / ("seg_" + seg_n + ".webm");
+        std::error_code ec;
+        if (!fs::exists(seg_webm, ec)) {
+            res.status = 404;
+            res.set_content(R"({"error":"segment webm not available"})", "application/json");
+            return;
+        }
+        std::ifstream in(seg_webm.string(), std::ios::binary);
+        std::string   bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        res.set_content(bytes, "video/webm");
+    });
+
+    LOG_INFO("ltx-video: POST /ltx/v1/generate + GET /sdcpp/v1/jobs/{id}/media + "
+             "GET /sdcpp/v1/jobs/{id}/segments/{n} registered "
              "(async chain; poll /sdcpp/v1/jobs/{id})\n");
 }

@@ -640,15 +640,23 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         if (job.status == AsyncJobStatus::Generating) {
             if (manager.generating_job_id == job.id) {
                 // Cooperative in-flight cancel: flag the render loop, which bails at
-                // its next step and the worker flips this job to "cancelled". Under
-                // worker isolation the render runs in the child, so route the cancel
-                // there (it trips sd_request_cancel inside the child); otherwise flag
-                // the in-process render directly.
+                // its next sampler step and the async worker flips this job to
+                // "cancelled". Under worker isolation the render runs in the CHILD, so
+                // route the cancel there (it trips sd_request_cancel inside the child
+                // process, which its denoise loop polls).
                 if (runtime->worker) {
                     runtime->worker->cancel_in_flight();
-                } else {
-                    sd_request_cancel();
                 }
+                // ALSO trip THIS (parent) process's cancel flag. async_job_worker reads
+                // sd_is_cancel_requested() here — in the parent — to classify the finished
+                // render (cancelled vs failed). The worker child's flag lives in the child's
+                // own address space and is invisible to the parent, so without this a
+                // cancelled worker-isolated chain would be reported "failed" instead of
+                // "cancelled". Safe: in worker mode the parent runs no render of its own, and
+                // async_job_worker clears the flag (sd_clear_cancel) before every job, so a
+                // stale cancel cannot bleed into the next render. In the non-worker path this
+                // is exactly the flag the in-process render itself polls.
+                sd_request_cancel();
                 res.status = 202;
                 res.set_content(make_async_job_json(manager, job).dump(), "application/json");
             } else {

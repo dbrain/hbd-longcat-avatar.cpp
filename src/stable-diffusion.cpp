@@ -4170,6 +4170,16 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->v2v_guide_strength                    = 1.0f;
     sd_vid_gen_params->v2v_guide_latent_path                 = nullptr;
     sd_vid_gen_params->character_reference_latent            = nullptr;
+    sd_vid_gen_params->character_reference_latent_lo         = nullptr;
+    sd_vid_gen_params->character_reference_latent_lo_width   = 0;
+    sd_vid_gen_params->character_reference_latent_lo_height  = 0;
+    sd_vid_gen_params->character_reference_latent_lo_frames  = 0;
+    sd_vid_gen_params->character_reference_latent_lo_channels = 0;
+    sd_vid_gen_params->character_reference_latent_hi         = nullptr;
+    sd_vid_gen_params->character_reference_latent_hi_width   = 0;
+    sd_vid_gen_params->character_reference_latent_hi_height  = 0;
+    sd_vid_gen_params->character_reference_latent_hi_frames  = 0;
+    sd_vid_gen_params->character_reference_latent_hi_channels = 0;
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
@@ -4185,6 +4195,11 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_refine_latent_width              = 0;
     sd_vid_gen_params->cont_refine_latent_height             = 0;
     sd_vid_gen_params->cont_refine_latent_channels           = 0;
+    sd_vid_gen_params->cont_refine_latent_lo                 = nullptr;
+    sd_vid_gen_params->cont_refine_latent_lo_frames          = 0;
+    sd_vid_gen_params->cont_refine_latent_lo_width           = 0;
+    sd_vid_gen_params->cont_refine_latent_lo_height          = 0;
+    sd_vid_gen_params->cont_refine_latent_lo_channels        = 0;
     sd_vid_gen_params->keyframes                             = nullptr;
     sd_vid_gen_params->keyframe_frame_indices                = nullptr;
     sd_vid_gen_params->keyframes_size                        = 0;
@@ -5417,6 +5432,39 @@ static sd::Tensor<float> build_ltxv_relip_video_positions(int64_t width,
     return positions;
 }
 
+// Character-reference identity conditioning is driven by the REQUEST (the presence of a
+// character-reference image), NOT by requiring the LTXAV_CHARACTER_REF env to be SET. The old
+// env-must-be-present gate left the koblem "character reference" toggle inert in prod (the field
+// was sent + decoded but never attached). LTXAV_CHARACTER_REF=0 / "false" / "no" is now an
+// explicit kill switch; unset (or any truthy value) keeps it enabled so a provided reference is
+// honoured. Requests that provide no reference are unaffected (the callers also check that the
+// character_reference latent/data is non-null), so flag-off token layout is byte-identical.
+static bool ltxav_character_ref_enabled() {
+    const char* v = std::getenv("LTXAV_CHARACTER_REF");
+    if (v == nullptr) return true;
+    return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+}
+
+// Whether the two-stage continuation attaches the prior segment's refined VIDEO tail as a separate
+// guide token block on the hires refine stage(s). Enabled unless LTXAV_CHAIN_HIRES_REFERENCE=0
+// (mirrors the inline env read the chain caller uses).
+static bool ltxav_chain_hires_reference_enabled() {
+    const char* v = std::getenv("LTXAV_CHAIN_HIRES_REFERENCE");
+    return v == nullptr || (v[0] != '\0' && std::string(v) != "0");
+}
+
+// Opt-in (default OFF): re-pin the init/end/keyframe IDENTITY at each hires-chain refine stage's
+// FULL resolution, so the final upscale can't reroll the look from the low-res base pass. Stage 0
+// already re-pins (apply_ltxv_refine_image_conditioning); the later hires_chain stages (the 4x
+// output stage) do NOT — they SDEdit the upscaled latent with an all-ones mask, so the frozen
+// frame-0 image drifts. With this enabled the final stage(s) re-encode + re-pin the source image
+// at the stage resolution too (a single-frame VAE encode per stage; VRAM-modest). OFF =
+// byte-identical to the historical all-ones-mask refine.
+static bool ltxav_refine_hires_identity_enabled() {
+    const char* v = std::getenv("LTXAV_REFINE_HIRES_IDENTITY");
+    return v != nullptr && v[0] != '0' && v[0] != 'f' && v[0] != 'F' && v[0] != 'n' && v[0] != 'N';
+}
+
 // Append a frozen identity block to the LTXAV DiT sequence. Reference tensors are flattened
 // to one token axis so a relip grid and a character-image grid may coexist without pretending
 // they share spatial dimensions; RoPE retains each block's own spatial coordinates.
@@ -5430,15 +5478,64 @@ static bool append_ltxav_character_reference(ImageGenerationLatents* latents,
     const int64_t target_tokens = tw * th * tf;
     auto char_pos = sd::ops::slice(char_pos_all, 2, target_tokens, target_tokens + cw * ch * cf);
     auto char_flat = character.reshape({cw * ch * cf, 1, 1, character.shape()[3], 1});
+    // Append the char identity tokens to the reference block (create it if this segment has none).
     if (latents->video_reference.empty()) {
         latents->video_reference = std::move(char_flat);
-        latents->video_positions = std::move(char_pos_all);
     } else {
         const auto old = latents->video_reference.reshape({latents->video_reference.shape()[0] * latents->video_reference.shape()[1] * latents->video_reference.shape()[2], 1, 1, latents->video_reference.shape()[3], 1});
         latents->video_reference = sd::ops::concat(old, char_flat, 0);
+    }
+    // Positions: KEY on video_positions.empty(), NOT video_reference.empty(). A CONTINUATION (or
+    // keyframe) segment stores its guide frames in init_latent and leaves video_reference empty, but
+    // has ALREADY built video_positions (guide frames pinned at their past-anchor RoPE slots). The
+    // old code keyed on video_reference.empty() and OVERWROTE those positions with char_pos_all's
+    // sequential relip layout — relabelling the guide frames from past-anchor to future-tail and
+    // destroying continuation. Only replace positions when there are none yet (pure t2v: char_pos_all
+    // = [target block][char block]); otherwise append ONLY the char rows, preserving the existing
+    // target(+guide/relip) layout token-for-token.
+    if (latents->video_positions.empty()) {
+        latents->video_positions = std::move(char_pos_all);
+    } else {
         latents->video_positions = sd::ops::concat(latents->video_positions, char_pos, 2);
     }
     return true;
+}
+
+// Which resolution tier of the character-identity reference a given DiT pass should attach.
+// Base = the base pass (base_params->width/height ~15x8 latent grid); Lo = the first hires/refine
+// stage (base*2); Hi = the later hires_chain stages (final res). The chain encodes all three once
+// (VAE available) and threads them onto every segment's params.
+enum class LtxavCharTier { Base, Lo, Hi };
+
+// Materialize the character-reference latent matched to a refine stage. Picks the _lo/_hi latent
+// for the Lo/Hi tiers when the caller supplied one, else FALLS BACK to the base-res latent (older
+// callers, single-stage renders, or the base pass itself). Returns an empty tensor only when no
+// character reference is present at all — so a no-reference request stays byte-identical.
+static sd::Tensor<float> ltxav_character_latent_for_stage(const sd_vid_gen_params_t* p, LtxavCharTier tier) {
+    const float* d  = p->character_reference_latent;
+    int64_t      cw = p->character_reference_latent_width;
+    int64_t      chh = p->character_reference_latent_height;
+    int64_t      cf = p->character_reference_latent_frames;
+    int64_t      cc = p->character_reference_latent_channels;
+    if (tier == LtxavCharTier::Lo && p->character_reference_latent_lo != nullptr) {
+        d   = p->character_reference_latent_lo;
+        cw  = p->character_reference_latent_lo_width;
+        chh = p->character_reference_latent_lo_height;
+        cf  = p->character_reference_latent_lo_frames;
+        cc  = p->character_reference_latent_lo_channels;
+    } else if (tier == LtxavCharTier::Hi && p->character_reference_latent_hi != nullptr) {
+        d   = p->character_reference_latent_hi;
+        cw  = p->character_reference_latent_hi_width;
+        chh = p->character_reference_latent_hi_height;
+        cf  = p->character_reference_latent_hi_frames;
+        cc  = p->character_reference_latent_hi_channels;
+    }
+    if (d == nullptr || cw <= 0 || chh <= 0 || cf <= 0 || cc <= 0) {
+        return {};
+    }
+    sd::Tensor<float> character({cw, chh, cf, cc, 1});
+    std::memcpy(character.data(), d, (size_t)character.numel() * sizeof(float));
+    return character;
 }
 
 // FIX 1 (VRAM) — host-level TEMPORAL-CHUNKED reference encode. The LTX video-VAE encode builds a
@@ -8813,16 +8910,14 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         latents.init_latent = pack_ltxav_audio_and_video_latents(latents.init_latent, latents.audio_latent);
     }
 
-    // Strict opt-in: when the env is absent, do not even inspect the extra request fields.
-    // This placement is after all legacy conditioning, so the flag-off token layout is unchanged.
-    if (sd_version_is_ltxav(sd_ctx->sd->version) && std::getenv("LTXAV_CHARACTER_REF") != nullptr &&
+    // Request-driven: only inspect the character-reference field when the request actually
+    // provides one (and it is not killed via LTXAV_CHARACTER_REF=0). This placement is after all
+    // legacy conditioning, so the no-reference token layout is byte-identical to before.
+    if (sd_version_is_ltxav(sd_ctx->sd->version) && ltxav_character_ref_enabled() &&
         sd_vid_gen_params->character_reference_latent != nullptr) {
-        sd::Tensor<float> character({sd_vid_gen_params->character_reference_latent_width,
-                                     sd_vid_gen_params->character_reference_latent_height,
-                                     sd_vid_gen_params->character_reference_latent_frames,
-                                     sd_vid_gen_params->character_reference_latent_channels, 1});
-        std::memcpy(character.data(), sd_vid_gen_params->character_reference_latent,
-                    (size_t)character.numel() * sizeof(float));
+        // Base pass runs at base resolution -> attach the base-res identity block (the higher-res
+        // _lo/_hi latents are reserved for the 2x/4x refine stages where the extra tokens pay off).
+        sd::Tensor<float> character = ltxav_character_latent_for_stage(sd_vid_gen_params, LtxavCharTier::Base);
         if (!append_ltxav_character_reference(&latents, character, request->fps, request->vae_scale_factor, 8)) {
             LOG_ERROR("failed to attach LTXAV character reference");
             return std::nullopt;
@@ -9744,7 +9839,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* refined_latent_width_out,
                               int* refined_latent_height_out,
                               int* refined_latent_frames_out,
-                              int* refined_latent_channels_out) {
+                              int* refined_latent_channels_out,
+                              float** refined_latent_lo_out,
+                              int* refined_latent_lo_width_out,
+                              int* refined_latent_lo_height_out,
+                              int* refined_latent_lo_frames_out,
+                              int* refined_latent_lo_channels_out) {
     if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
         return false;
     }
@@ -9762,6 +9862,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     if (refined_latent_out != nullptr) {
         *refined_latent_out = nullptr;
+    }
+    if (refined_latent_lo_out != nullptr) {
+        *refined_latent_lo_out = nullptr;
     }
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_vid_gen_params->vae_tiling_params;
@@ -10708,27 +10811,6 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
             return false;
         }
-        // apply_ltxv_refine_image_conditioning deliberately replaces the stage-1 relip block.
-        // Re-append the persistent identity block afterwards, for both relip and ordinary hires.
-        if (sd_version_is_ltxav(sd_ctx->sd->version) && std::getenv("LTXAV_CHARACTER_REF") != nullptr &&
-            sd_vid_gen_params->character_reference_latent != nullptr) {
-            sd::Tensor<float> character({sd_vid_gen_params->character_reference_latent_width,
-                                         sd_vid_gen_params->character_reference_latent_height,
-                                         sd_vid_gen_params->character_reference_latent_frames,
-                                         sd_vid_gen_params->character_reference_latent_channels, 1});
-            std::memcpy(character.data(), sd_vid_gen_params->character_reference_latent,
-                        (size_t)character.numel() * sizeof(float));
-            ImageGenerationLatents refine_refs;
-            refine_refs.init_latent = x_t;
-            refine_refs.video_reference = std::move(hires_video_reference);
-            refine_refs.video_positions = std::move(hires_video_positions);
-            if (!append_ltxav_character_reference(&refine_refs, character, hires_request.fps,
-                                                  hires_request.vae_scale_factor, 8)) {
-                return false;
-            }
-            hires_video_reference = std::move(refine_refs.video_reference);
-            hires_video_positions = std::move(refine_refs.video_positions);
-        }
         LOG_INFO("[LTX_PHASE] refine image/audio conditioning took %.3fs", (ggml_time_ms() - refine_conditioning_start) * 1.0f / 1000);
 
         // LTX_REFINE_CONTEXT_FRAMES=N (default unset = byte-identical): "refine only the surviving
@@ -10821,38 +10903,57 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
 
         // Dual-resolution continuation: stage 1 already received the prior BASE-grid tail via
-        // cont_latent. Add the prior segment's actual REFINED high-resolution VIDEO tail only
-        // after any optional base-guide context trim above, so the stage-2 target excludes those
-        // otherwise-throwaway base-guide frames while retaining a full-fidelity appearance guide.
-        const char* hires_ref_env = std::getenv("LTXAV_CHAIN_HIRES_REFERENCE");
-        const bool hires_ref_enabled = hires_ref_env == nullptr ||
-                                       (hires_ref_env[0] != '\0' && std::string(hires_ref_env) != "0");
-        if (hires_ref_enabled && !latents.relip_twostage &&
-            sd_vid_gen_params->cont_refine_latent != nullptr &&
-            sd_vid_gen_params->cont_refine_latent_frames > 0) {
+        // cont_latent. Add the prior segment's actual REFINED VIDEO tail only after any optional
+        // base-guide context trim above, so the refine target excludes those otherwise-throwaway
+        // base-guide frames while retaining a full-fidelity appearance guide. This is the FIRST
+        // hires stage (base*2), so prefer the matching-resolution stage-0 (lower-res) guide when the
+        // caller transported one; fall back to cont_refine_latent (the final full-res tail — matches
+        // only on the single-stage 2x path where this block IS the sole refine). It runs BEFORE the
+        // character-reference reattach below so that append composes the identity rows ONTO this
+        // guide layout instead of the two excluding each other.
+        const float* cont_src        = sd_vid_gen_params->cont_refine_latent;
+        int          cont_src_frames = sd_vid_gen_params->cont_refine_latent_frames;
+        int          cont_src_width  = sd_vid_gen_params->cont_refine_latent_width;
+        int          cont_src_height = sd_vid_gen_params->cont_refine_latent_height;
+        int          cont_src_chan   = sd_vid_gen_params->cont_refine_latent_channels;
+        if (sd_vid_gen_params->cont_refine_latent_lo != nullptr &&
+            sd_vid_gen_params->cont_refine_latent_lo_frames > 0) {
+            cont_src        = sd_vid_gen_params->cont_refine_latent_lo;
+            cont_src_frames = sd_vid_gen_params->cont_refine_latent_lo_frames;
+            cont_src_width  = sd_vid_gen_params->cont_refine_latent_lo_width;
+            cont_src_height = sd_vid_gen_params->cont_refine_latent_lo_height;
+            cont_src_chan   = sd_vid_gen_params->cont_refine_latent_lo_channels;
+        }
+        if (ltxav_chain_hires_reference_enabled() && !latents.relip_twostage &&
+            cont_src != nullptr && cont_src_frames > 0) {
             const int64_t video_ch = sd_ctx->sd->get_latent_channel();
             const int64_t target_w = x_t.shape()[0];
             const int64_t target_h = x_t.shape()[1];
             const int64_t target_t = x_t.shape()[2];
-            const int64_t guide_t  = sd_vid_gen_params->cont_refine_latent_frames;
-            const bool shape_ok = sd_vid_gen_params->cont_refine_latent_width == target_w &&
-                                  sd_vid_gen_params->cont_refine_latent_height == target_h &&
-                                  sd_vid_gen_params->cont_refine_latent_channels == video_ch &&
+            const int64_t guide_t  = cont_src_frames;
+            // Keep the empty()-guard: with the character-ref reattach moved AFTER this block it no
+            // longer pre-populates the reference/positions, so an empty check here NO LONGER blocks
+            // the char-ref compose (char-ref concatenates onto this guide below). The only thing it
+            // still blocks is a KEYFRAME refine layout (apply_ltxv_refine_image_conditioning sets
+            // video_reference/positions for kf_cont merged shots): those must not be clobbered by the
+            // continuation guide. Mirrors the stage-1 gate's stage_reference/stage_positions empty check.
+            const bool shape_ok = cont_src_width == target_w &&
+                                  cont_src_height == target_h &&
+                                  cont_src_chan == video_ch &&
                                   guide_t <= target_t &&
                                   sd_vid_gen_params->init_image.data == nullptr &&
                                   sd_vid_gen_params->end_image.data == nullptr &&
                                   hires_video_reference.empty() && hires_video_positions.empty();
             if (!shape_ok) {
-                LOG_WARN("LTX hires continuation reference skipped: prior [%d,%d,%d,%d] vs target [%lld,%lld,%lld,%lld], image/ref conditioning=%d/%d",
-                         sd_vid_gen_params->cont_refine_latent_width,
-                         sd_vid_gen_params->cont_refine_latent_height,
-                         sd_vid_gen_params->cont_refine_latent_frames,
-                         sd_vid_gen_params->cont_refine_latent_channels,
+                LOG_WARN("LTX hires continuation reference skipped: prior [%d,%d,%d,%d] vs target [%lld,%lld,%lld,%lld], image/ref conditioning=%d/%d/%d",
+                         cont_src_width, cont_src_height, cont_src_frames, cont_src_chan,
                          (long long)target_w, (long long)target_h, (long long)target_t, (long long)video_ch,
-                         (int)!hires_video_reference.empty(), (int)!hires_video_positions.empty());
+                         (int)(sd_vid_gen_params->init_image.data != nullptr),
+                         (int)(sd_vid_gen_params->end_image.data != nullptr),
+                         (int)(!hires_video_reference.empty() || !hires_video_positions.empty()));
             } else {
                 hires_video_reference = sd::Tensor<float>({target_w, target_h, guide_t, video_ch, 1});
-                std::memcpy(hires_video_reference.data(), sd_vid_gen_params->cont_refine_latent,
+                std::memcpy(hires_video_reference.data(), cont_src,
                             (size_t)hires_video_reference.numel() * sizeof(float));
                 hires_video_positions = build_ltxv_video_positions(target_w, target_h, target_t, guide_t,
                                                                      /*keyframe_frame_idx*/ 0,
@@ -10861,9 +10962,35 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                                      hires_request.vae_scale_factor,
                                                                      8,
                                                                      true);
-                LOG_INFO("LTX hires continuation reference: %lld refined VIDEO tail frames as separate guide tokens; target=%lld + guide=%lld frames",
+                LOG_INFO("LTX hires continuation reference (stage 0, %s): %lld refined VIDEO tail frames as separate guide tokens; target=%lld + guide=%lld frames",
+                         (sd_vid_gen_params->cont_refine_latent_lo != nullptr &&
+                          sd_vid_gen_params->cont_refine_latent_lo_frames > 0) ? "lower-res" : "full-res",
                          (long long)guide_t, (long long)target_t, (long long)guide_t);
             }
+        }
+
+        // apply_ltxv_refine_image_conditioning deliberately replaces the stage-1 relip block, and the
+        // continuation apply above builds the target/guide layout. Re-append the persistent identity
+        // block LAST, for relip / ordinary hires / continuation alike: append_ltxav_character_reference
+        // CONCATENATES the identity rows onto whatever reference/positions already exist (keying on
+        // video_positions.empty()), so the character reference COMPOSES with the continuation guide
+        // instead of the two excluding each other.
+        if (sd_version_is_ltxav(sd_ctx->sd->version) && ltxav_character_ref_enabled() &&
+            sd_vid_gen_params->character_reference_latent != nullptr) {
+            // First hires/refine stage (base*2): attach the stage-0 (_lo) identity block so this
+            // refine gets a resolution-matched, higher-detail character than the base-res hint;
+            // falls back to the base-res latent when no _lo was supplied (byte-identical).
+            sd::Tensor<float> character = ltxav_character_latent_for_stage(sd_vid_gen_params, LtxavCharTier::Lo);
+            ImageGenerationLatents refine_refs;
+            refine_refs.init_latent = x_t;
+            refine_refs.video_reference = std::move(hires_video_reference);
+            refine_refs.video_positions = std::move(hires_video_positions);
+            if (!append_ltxav_character_reference(&refine_refs, character, hires_request.fps,
+                                                  hires_request.vae_scale_factor, 8)) {
+                return false;
+            }
+            hires_video_reference = std::move(refine_refs.video_reference);
+            hires_video_positions = std::move(refine_refs.video_positions);
         }
 
         // LTX_REFINE_CONST_SEED (chain identity-stability): the chain gives each segment a DISTINCT
@@ -11482,6 +11609,47 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
 
+    // Dual-resolution continuation: export the STAGE-0 (pre stage-1 upscale) refined VIDEO tail so
+    // the NEXT segment's stage-0 refine gets a MATCHING-RESOLUTION continuation guide (the post-loop
+    // refined_latent_out export below only captures the final full-res stage-1 tail). Operate on a
+    // COPY — the stage-1 loop still consumes final_latent unchanged. Gated on hires_chain_count>=2 so
+    // the single-stage (2x) path never writes _lo (byte-identical). Mirrors the strip+export at the
+    // refined_latent_out path: drop packed audio channels, then trailing guide frames, then leading
+    // ref-image frames, then malloc+memcpy the video-only tail.
+    if (refined_latent_lo_out != nullptr && latent_upscale_enabled &&
+        sd_vid_gen_params->hires_chain_count >= 2 && !final_latent.empty()) {
+        const int64_t video_ch = sd_ctx->sd->get_latent_channel();
+        sd::Tensor<float> lo    = final_latent;
+        if (lo.dim() > 3 && lo.shape()[3] > video_ch) {
+            lo = sd::ops::slice(lo, 3, 0, video_ch);
+        }
+        if (!final_latent_prestripped && latents.video_conditioning_frame_count > 0) {
+            int64_t target_frames = latents.video_target_frame_count > 0
+                                        ? latents.video_target_frame_count
+                                        : lo.shape()[2] - latents.video_conditioning_frame_count;
+            lo = sd::ops::slice(lo, 2, 0, target_frames);
+        }
+        if (!final_latent_prestripped && latents.ref_image_num > 0) {
+            lo = sd::ops::slice(lo, 2, latents.ref_image_num, lo.shape()[2]);
+        }
+        if (lo.dim() > 3 && lo.shape()[3] == video_ch) {
+            const int64_t Wl = lo.shape()[0];
+            const int64_t Hl = lo.shape()[1];
+            const int64_t Tl = lo.shape()[2];
+            float* buf = (float*)malloc((size_t)lo.numel() * sizeof(float));
+            if (buf != nullptr) {
+                std::memcpy(buf, lo.data(), (size_t)lo.numel() * sizeof(float));
+                *refined_latent_lo_out = buf;
+                if (refined_latent_lo_width_out) *refined_latent_lo_width_out = (int)Wl;
+                if (refined_latent_lo_height_out) *refined_latent_lo_height_out = (int)Hl;
+                if (refined_latent_lo_frames_out) *refined_latent_lo_frames_out = (int)Tl;
+                if (refined_latent_lo_channels_out) *refined_latent_lo_channels_out = (int)video_ch;
+                LOG_INFO("LTX hires continuation: exported STAGE-0 refined video latent [%lld,%lld,%lld,%lld]",
+                         (long long)Wl, (long long)Hl, (long long)Tl, (long long)video_ch);
+            }
+        }
+    }
+
     // Stages after stage 0 intentionally use the same AV packing discipline as the
     // established refine path: upscale VIDEO while audio is separate, re-pack it,
     // then build a fresh audio-pinned SDEdit mask for that stage. The old single-hires
@@ -11560,20 +11728,95 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                         ? video_mask
                                         : pack_ltxav_audio_and_video_denoise_mask(video_mask, video, audio,
                                                                                    latents.audio_fixed ? 0.f : 1.f);
-            // Keep the identity-only DiT reference on every chain stage. It is a
-            // separate token block (never an output-frame pin), matching stage 0.
             sd::Tensor<float> stage_reference;
             sd::Tensor<float> stage_positions;
-            if (std::getenv("LTXAV_CHARACTER_REF") != nullptr &&
+            // #4 (opt-in, default off): re-pin the source image identity at THIS stage's FULL
+            // resolution so the final upscale anchors on the hi-res image instead of rerolling it
+            // from the low-res base pass. Mirrors stage 0 — apply_ltxv_refine_image_conditioning
+            // re-encodes init/end/keyframe at the stage res and freezes those frames in the mask.
+            // Only for real image-guide shots (i2v opener / scene cut / keyframes); relip and
+            // continuation-only shots keep the all-ones mask. OFF = historical byte-identical path.
+            if (ltxav_refine_hires_identity_enabled() && !latents.relip_twostage &&
+                (sd_vid_gen_params->init_image.data != nullptr ||
+                 sd_vid_gen_params->end_image.data != nullptr ||
+                 (sd_vid_gen_params->keyframes != nullptr && sd_vid_gen_params->keyframes_size > 0))) {
+                sd::Tensor<float> repin_latent = stage_latent;
+                sd::Tensor<float> repin_mask;
+                sd::Tensor<float> repin_positions;
+                sd::Tensor<float> repin_reference;
+                if (!apply_ltxv_refine_image_conditioning(sd_ctx, sd_vid_gen_params, stage_request, latents,
+                                                          &repin_latent, &repin_mask, &repin_positions,
+                                                          &repin_reference)) {
+                    return false;
+                }
+                if (!repin_mask.empty()) {
+                    stage_latent    = std::move(repin_latent);
+                    mask            = std::move(repin_mask);
+                    stage_positions = std::move(repin_positions);
+                    stage_reference = std::move(repin_reference);
+                    LOG_INFO("LTX hires_chain stage %d: re-pinned hi-res identity at %dx%d",
+                             stage_index, stage_request.width, stage_request.height);
+                }
+            }
+            // Dual-resolution continuation (this hires stage): attach the prior segment's REFINED
+            // full-resolution VIDEO tail (cont_refine_latent — the final 4x tail matches THIS stage's
+            // grid) as a separate guide token block so the final upscale anchors the character on its
+            // own prior appearance instead of rerolling it. Matching-resolution counterpart of the
+            // stage-0 apply; runs before the identity reattach below so the two COMPOSE. Only for a
+            // continuation-only shot (no image re-pin: gated on init/end==null and an empty
+            // stage_reference/stage_positions left by the #4 block above).
+            if (ltxav_chain_hires_reference_enabled() && !latents.relip_twostage &&
+                sd_vid_gen_params->cont_refine_latent != nullptr &&
+                sd_vid_gen_params->cont_refine_latent_frames > 0 &&
+                sd_vid_gen_params->init_image.data == nullptr &&
+                sd_vid_gen_params->end_image.data == nullptr &&
+                stage_reference.empty() && stage_positions.empty()) {
+                const int64_t video_ch = sd_ctx->sd->get_latent_channel();
+                const int64_t target_w = stage_latent.shape()[0];
+                const int64_t target_h = stage_latent.shape()[1];
+                const int64_t target_t = stage_latent.shape()[2];
+                const int64_t guide_t  = sd_vid_gen_params->cont_refine_latent_frames;
+                const bool shape_ok = sd_vid_gen_params->cont_refine_latent_width == target_w &&
+                                      sd_vid_gen_params->cont_refine_latent_height == target_h &&
+                                      sd_vid_gen_params->cont_refine_latent_channels == video_ch &&
+                                      guide_t <= target_t;
+                if (!shape_ok) {
+                    LOG_WARN("LTX hires_chain stage %d continuation reference skipped: prior [%d,%d,%d,%d] vs target [%lld,%lld,%lld,%lld]",
+                             stage_index,
+                             sd_vid_gen_params->cont_refine_latent_width,
+                             sd_vid_gen_params->cont_refine_latent_height,
+                             sd_vid_gen_params->cont_refine_latent_frames,
+                             sd_vid_gen_params->cont_refine_latent_channels,
+                             (long long)target_w, (long long)target_h, (long long)target_t, (long long)video_ch);
+                } else {
+                    stage_reference = sd::Tensor<float>({target_w, target_h, guide_t, video_ch, 1});
+                    std::memcpy(stage_reference.data(), sd_vid_gen_params->cont_refine_latent,
+                                (size_t)stage_reference.numel() * sizeof(float));
+                    stage_positions = build_ltxv_video_positions(target_w, target_h, target_t, guide_t,
+                                                                   /*keyframe_frame_idx*/ 0,
+                                                                   /*keyframe_pixel_frames*/ 8,
+                                                                   stage_request.fps,
+                                                                   stage_request.vae_scale_factor,
+                                                                   8,
+                                                                   true);
+                    LOG_INFO("LTX hires_chain stage %d continuation reference: %lld refined VIDEO tail frames as separate guide tokens; target=%lld + guide=%lld frames",
+                             stage_index, (long long)guide_t, (long long)target_t, (long long)guide_t);
+                }
+            }
+            // Keep the identity-only DiT reference on every chain stage. It is a separate token
+            // block (never an output-frame pin), matching stage 0; it COMPOSES onto any hi-res
+            // re-pin positions/reference or continuation guide set just above (the fixed append
+            // helper concatenates the identity rows, it never clobbers an existing target/guide layout).
+            if (ltxav_character_ref_enabled() &&
                 sd_vid_gen_params->character_reference_latent != nullptr) {
-                sd::Tensor<float> character({sd_vid_gen_params->character_reference_latent_width,
-                                             sd_vid_gen_params->character_reference_latent_height,
-                                             sd_vid_gen_params->character_reference_latent_frames,
-                                             sd_vid_gen_params->character_reference_latent_channels, 1});
-                std::memcpy(character.data(), sd_vid_gen_params->character_reference_latent,
-                            (size_t)character.numel() * sizeof(float));
+                // Later hires_chain stages (final res): attach the final-res (_hi) identity block so
+                // the highest-resolution refine anchors on a full-detail character instead of the
+                // base-res hint; falls back to the base-res latent when no _hi was supplied.
+                sd::Tensor<float> character = ltxav_character_latent_for_stage(sd_vid_gen_params, LtxavCharTier::Hi);
                 ImageGenerationLatents refs;
-                refs.init_latent = stage_latent;
+                refs.init_latent     = stage_latent;
+                refs.video_reference = std::move(stage_reference);
+                refs.video_positions = std::move(stage_positions);
                 if (!append_ltxav_character_reference(&refs, character, stage_request.fps,
                                                       stage_request.vae_scale_factor, 8)) {
                     return false;
@@ -11848,6 +12091,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            int* num_frames_out,
                            sd_audio_t** audio_out) {
     return generate_video_ex(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out, audio_out,
+                             nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, nullptr);
 }
@@ -12297,9 +12541,18 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     sd_ctx_keep_diffusion_model_resident(sd_ctx, true);
 
     // Encode once for the whole chain; this frozen DiT-only block is not an image pin.
+    // In addition to the base-res block for the base pass, encode the SAME reference image at the
+    // refine stages' resolutions (_lo = first hires stage = base*2, _hi = final = base*2^n_stages)
+    // so each SDEdit refine attaches a resolution-matched, higher-detail identity block instead of
+    // upscaling the coarse base-res one. This MUST happen here: the VAE encoder is available at
+    // chain level, but the per-segment LTXAV_VAE_LAZY path frees it before the DiT sample+refine
+    // (so the refine stages cannot re-encode without a costly reload). The refine attach sites fall
+    // back to the base-res latent when a tier is empty, so a failed/absent tier is non-fatal.
     sd::Tensor<float> chain_character_latent;
+    sd::Tensor<float> chain_character_latent_lo;
+    sd::Tensor<float> chain_character_latent_hi;
     const bool character_ref_enabled = sd_version_is_ltxav(sd_ctx->sd->version) &&
-                                       std::getenv("LTXAV_CHARACTER_REF") != nullptr &&
+                                       ltxav_character_ref_enabled() &&
                                        base_params->character_reference.data != nullptr;
     if (character_ref_enabled) {
         if (sd_ctx->sd->vae_decode_only) { LOG_ERROR("LTXAV character reference requires VAE encoder weights"); return false; }
@@ -12307,6 +12560,35 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         chain_character_latent = encode_ltxav_condition_image(sd_ctx, image, "character reference");
         if (chain_character_latent.empty()) return false;
         LOG_INFO("LTXAV character reference: encoded once for %d chain segments", n_chain);
+        // Every LTX latent-upscale refine stage is a fixed 2x, so stage 0 = base*2 and the final
+        // hires_chain stage = base*2^n_stages (n_stages = hires_chain_count, or 1 for legacy single
+        // hires). Aspect matches the base encode (sd_image_to_tensor rescales the same portrait).
+        const int  hc            = base_params->hires_chain_count;
+        const bool will_refine   = hc >= 1 || base_params->hires.enabled;
+        const int  n_stages      = std::max(1, hc);
+        const int  base_w        = base_params->width;
+        const int  base_h        = base_params->height;
+        if (will_refine) {
+            auto lo_image          = sd_image_to_tensor(base_params->character_reference, base_w * 2, base_h * 2);
+            chain_character_latent_lo = encode_ltxav_condition_image(sd_ctx, lo_image, "character reference (lo)");
+            if (chain_character_latent_lo.empty()) {
+                LOG_WARN("LTXAV character reference: stage-0 (base*2) encode failed; refine falls back to base-res identity");
+            }
+        }
+        if (hc >= 2) {
+            const int hi_scale     = 1 << n_stages;  // base*2^n_stages (2-stage chain -> 4)
+            auto hi_image          = sd_image_to_tensor(base_params->character_reference, base_w * hi_scale, base_h * hi_scale);
+            chain_character_latent_hi = encode_ltxav_condition_image(sd_ctx, hi_image, "character reference (hi)");
+            if (chain_character_latent_hi.empty()) {
+                LOG_WARN("LTXAV character reference: final-res (base*%d) encode failed; hires-chain refine falls back to base-res identity", hi_scale);
+            }
+        }
+        LOG_INFO("LTXAV character reference: refine identity tiers lo=%lldx%lld hi=%lldx%lld (0x0 = fall back to base-res %lldx%lld)",
+                 chain_character_latent_lo.empty() ? 0LL : (long long)chain_character_latent_lo.shape()[0],
+                 chain_character_latent_lo.empty() ? 0LL : (long long)chain_character_latent_lo.shape()[1],
+                 chain_character_latent_hi.empty() ? 0LL : (long long)chain_character_latent_hi.shape()[0],
+                 chain_character_latent_hi.empty() ? 0LL : (long long)chain_character_latent_hi.shape()[1],
+                 (long long)chain_character_latent.shape()[0], (long long)chain_character_latent.shape()[1]);
     }
 
     // Pre-encode EVERY distinct per-segment prompt in one text-encoder window so the
@@ -12343,6 +12625,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // and is never fed to the base sampler or latent-matched with the base transport.
     std::vector<float>      cont_refine_buf;
     int                     cont_refine_Wl = 0, cont_refine_Hl = 0, cont_refine_Cv = 0;
+    // Parallel stage-0 (lower-res) appearance tail, fed to the next segment's FIRST hires stage so
+    // its refine gets a matching-resolution continuation guide. Only captured on >=2-stage chains.
+    std::vector<float>      cont_refine_lo_buf;
+    int                     cont_refine_lo_Wl = 0, cont_refine_lo_Hl = 0, cont_refine_lo_Cv = 0;
     std::vector<sd_image_t> stitched;   // adopts each kept frame's .data (streaming: rolling window only)
     ChainAudioAcc           audio_acc;  // per-segment audio stitched onto one timeline
 
@@ -12577,6 +12863,21 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.character_reference_latent_height = (int)chain_character_latent.shape()[1];
             vp.character_reference_latent_frames = (int)chain_character_latent.shape()[2];
             vp.character_reference_latent_channels = (int)chain_character_latent.shape()[3];
+            // Stage-matched higher-res identity tiers (empty => refine falls back to base-res).
+            if (!chain_character_latent_lo.empty()) {
+                vp.character_reference_latent_lo          = chain_character_latent_lo.data();
+                vp.character_reference_latent_lo_width    = (int)chain_character_latent_lo.shape()[0];
+                vp.character_reference_latent_lo_height   = (int)chain_character_latent_lo.shape()[1];
+                vp.character_reference_latent_lo_frames   = (int)chain_character_latent_lo.shape()[2];
+                vp.character_reference_latent_lo_channels = (int)chain_character_latent_lo.shape()[3];
+            }
+            if (!chain_character_latent_hi.empty()) {
+                vp.character_reference_latent_hi          = chain_character_latent_hi.data();
+                vp.character_reference_latent_hi_width    = (int)chain_character_latent_hi.shape()[0];
+                vp.character_reference_latent_hi_height   = (int)chain_character_latent_hi.shape()[1];
+                vp.character_reference_latent_hi_frames   = (int)chain_character_latent_hi.shape()[2];
+                vp.character_reference_latent_hi_channels = (int)chain_character_latent_hi.shape()[3];
+            }
         }
         // Director variable-length: this shot renders its own frame count when the caller
         // supplied one (else the uniform base_params->video_frames). NULL/0 = byte-identical.
@@ -12661,9 +12962,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                chain_params->segment_init_images[seg] != nullptr &&
                                chain_params->segment_init_images[seg]->data != nullptr;
 
+        // TEXT-ONLY scene cut: a seg>0 shot explicitly flagged as a new scene with NO image and no
+        // keyframes — render it fresh from the prompt alone (mutually exclusive with scene_cut/kf).
+        const bool text_scene_cut = seg > 0 && !segmented_relip && !has_keyframes && !scene_cut &&
+                                    chain_params->segment_scene_cut != nullptr &&
+                                    chain_params->segment_scene_cut[seg] != 0;
+
         // A fresh shot does not continue the prior tail; its stitch drop is 0 and it re-anchors the
         // continuity references. A merged (kf_cont) shot DOES continue, so it is NOT a fresh anchor.
-        const bool fresh_anchor = scene_cut || kf_fresh;
+        const bool fresh_anchor = scene_cut || kf_fresh || text_scene_cut;
 
         if (kf_fresh) {
             // Fresh keyframe shot: pin the caller's images at their frame indices; the keyframe
@@ -12677,6 +12984,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_latent_frames        = 0;
             vp.cont_refine_latent        = nullptr;
             vp.cont_refine_latent_frames = 0;
+            vp.cont_refine_latent_lo        = nullptr;
+            vp.cont_refine_latent_lo_frames = 0;
             vp.audio_frame_offset        = (seg == 0) ? 0 : seg * (base_params->video_frames - overlap_px);
             LOG_INFO("generate_video_chain seg %d: KEYFRAME shot (%d frame-pinned image(s), fresh)",
                      seg + 1, vp.keyframes_size);
@@ -12694,6 +13003,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_refine_latent_width  = cont_refine_Wl;
             vp.cont_refine_latent_height = cont_refine_Hl;
             vp.cont_refine_latent_channels = cont_refine_Cv;
+            vp.cont_refine_latent_lo          = cont_refine_lo_buf.empty() ? nullptr : cont_refine_lo_buf.data();
+            vp.cont_refine_latent_lo_frames   = cont_refine_lo_buf.empty() ? 0 : hires_ref_K;
+            vp.cont_refine_latent_lo_width    = cont_refine_lo_Wl;
+            vp.cont_refine_latent_lo_height   = cont_refine_lo_Hl;
+            vp.cont_refine_latent_lo_channels = cont_refine_lo_Cv;
             vp.audio_frame_offset        = seg * (base_params->video_frames - overlap_px);
             LOG_INFO("generate_video_chain seg %d: MERGED continuation + %d keyframe pin(s)",
                      seg + 1, vp.keyframes_size);
@@ -12702,6 +13016,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_latent_frames = 0;
             vp.cont_refine_latent = nullptr;
             vp.cont_refine_latent_frames = 0;
+            vp.cont_refine_latent_lo        = nullptr;
+            vp.cont_refine_latent_lo_frames = 0;
             vp.audio_frame_offset = 0;
         } else if (scene_cut) {
             // Fresh scene from this shot's image: i2v start, no continuation latent (nothing to
@@ -12714,9 +13030,25 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_latent_frames = 0;
             vp.cont_refine_latent = nullptr;
             vp.cont_refine_latent_frames = 0;
+            vp.cont_refine_latent_lo        = nullptr;
+            vp.cont_refine_latent_lo_frames = 0;
             vp.audio_frame_offset = seg * (base_params->video_frames - overlap_px);
             LOG_INFO("generate_video_chain seg %d: SCENE CUT (fresh i2v from per-segment image %dx%d)",
                      seg + 1, vp.init_image.width, vp.init_image.height);
+        } else if (text_scene_cut) {
+            // Fresh scene from this shot's PROMPT ALONE — a pure t2v opener mid-chain: no init
+            // image (clear the lingering opener), no continuation latent. Same fresh path as seg 0,
+            // just decoupled from the presence of an image. drop=0 + re-anchor via fresh_anchor;
+            // audio stays on the per-segment aud_<seg>.wav path (inert offset like scene_cut).
+            vp.init_image.data           = nullptr;
+            vp.cont_latent               = nullptr;
+            vp.cont_latent_frames        = 0;
+            vp.cont_refine_latent        = nullptr;
+            vp.cont_refine_latent_frames = 0;
+            vp.cont_refine_latent_lo        = nullptr;
+            vp.cont_refine_latent_lo_frames = 0;
+            vp.audio_frame_offset        = seg * (base_params->video_frames - overlap_px);
+            LOG_INFO("generate_video_chain seg %d: TEXT SCENE CUT (fresh t2v, no image)", seg + 1);
         } else {
             // Clear the init image for seg>0: prepare_video_generation_latents checks the
             // start image BEFORE the cont-latent branch, so a lingering init image would
@@ -12729,6 +13061,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.cont_refine_latent_width = cont_refine_Wl;
             vp.cont_refine_latent_height = cont_refine_Hl;
             vp.cont_refine_latent_channels = cont_refine_Cv;
+            vp.cont_refine_latent_lo          = cont_refine_lo_buf.empty() ? nullptr : cont_refine_lo_buf.data();
+            vp.cont_refine_latent_lo_frames   = cont_refine_lo_buf.empty() ? 0 : hires_ref_K;
+            vp.cont_refine_latent_lo_width    = cont_refine_lo_Wl;
+            vp.cont_refine_latent_lo_height   = cont_refine_lo_Hl;
+            vp.cont_refine_latent_lo_channels = cont_refine_lo_Cv;
             vp.audio_frame_offset = seg * (base_params->video_frames - overlap_px);
         }
         // RETAKE end-pin: this segment (retake_seg) terminates at seg_{retake_seg+1}'s head so the
@@ -12777,6 +13114,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         int         lw = 0, lh = 0, lt = 0, lc = 0;  // lc = FULL channel count (video + audio)
         float*      refined_out = nullptr;
         int         rw = 0, rh = 0, rt = 0, rc = 0;
+        float*      refined_lo_out = nullptr;
+        int         rlow = 0, rloh = 0, rlot = 0, rloc = 0;
         bool        want_latent  = (seg + 1 < n_chain);
         if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
                                want_latent ? &lat_out : nullptr,
@@ -12786,12 +13125,18 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                (want_latent && chain_hires_reference) ? &rw : nullptr,
                                (want_latent && chain_hires_reference) ? &rh : nullptr,
                                (want_latent && chain_hires_reference) ? &rt : nullptr,
-                               (want_latent && chain_hires_reference) ? &rc : nullptr)) {
+                               (want_latent && chain_hires_reference) ? &rc : nullptr,
+                               (want_latent && chain_hires_reference) ? &refined_lo_out : nullptr,
+                               (want_latent && chain_hires_reference) ? &rlow : nullptr,
+                               (want_latent && chain_hires_reference) ? &rloh : nullptr,
+                               (want_latent && chain_hires_reference) ? &rlot : nullptr,
+                               (want_latent && chain_hires_reference) ? &rloc : nullptr)) {
             LOG_ERROR("generate_video_chain segment %d failed", seg + 1);
             free_sd_audio(seg_audio);
             free(seg_video);
             free(lat_out);
             free(refined_out);
+            free(refined_lo_out);
             // Free everything collected so far (audio_acc frees itself on scope exit).
             for (auto& f : stitched) {
                 free(f.data);
@@ -12894,8 +13239,34 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             cont_refine_buf.clear();
             cont_refine_Wl = cont_refine_Hl = cont_refine_Cv = 0;
         }
+        // Parallel capture of the STAGE-0 (lower-res) refined tail for the next segment's FIRST hires
+        // stage. Only exported by generate_video_ex on a >=2-stage chain, so on the single-stage (2x)
+        // path refined_lo_out stays null and cont_refine_lo_buf stays empty (byte-identical).
+        if (chain_hires_reference && want_latent && refined_lo_out != nullptr &&
+            rlow > 0 && rloh > 0 && rlot > 0 && rloc == LTXAV_VIDEO_LATENT_CHANNELS) {
+            const int keep = std::min(hires_ref_K, rlot);
+            const size_t plane = (size_t)rlow * rloh;
+            cont_refine_lo_buf.assign(plane * (size_t)keep * (size_t)rloc, 0.f);
+            for (int c = 0; c < rloc; ++c) {
+                for (int nf = 0; nf < keep; ++nf) {
+                    const int src_t = rlot - keep + nf;
+                    const float* src = refined_lo_out + ((size_t)c * rlot + src_t) * plane;
+                    float* dst = cont_refine_lo_buf.data() + ((size_t)c * keep + nf) * plane;
+                    std::memcpy(dst, src, plane * sizeof(float));
+                }
+            }
+            cont_refine_lo_Wl = rlow;
+            cont_refine_lo_Hl = rloh;
+            cont_refine_lo_Cv = rloc;
+            LOG_INFO("generate_video_chain: captured %d stage-0 refined VIDEO tail frames [%d,%d,%d] for next stage-0 reference",
+                     keep, rlow, rloh, rloc);
+        } else {
+            cont_refine_lo_buf.clear();
+            cont_refine_lo_Wl = cont_refine_lo_Hl = cont_refine_lo_Cv = 0;
+        }
         free(lat_out);
         free(refined_out);
+        free(refined_lo_out);
 
         // FEATURE A: capture SEG-0's per-channel latent stats as the anti-drift reference, and
         // (seg>0) remap this segment's freshly-captured tail onto them BEFORE it conditions the
@@ -13081,7 +13452,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                   chain_params->segment_init_images != nullptr &&
                                   chain_params->segment_init_images[seg] != nullptr &&
                                   chain_params->segment_init_images[seg]->data != nullptr;
-            bool fresh_here = scene_cut_here || kf_fresh_here;
+            bool text_scene_cut_here = seg > 0 && !kf_here && !scene_cut_here &&
+                                       chain_params->segment_scene_cut != nullptr &&
+                                       chain_params->segment_scene_cut[seg] != 0;
+            bool fresh_here = scene_cut_here || kf_fresh_here || text_scene_cut_here;
             int  drop;
             if (fresh_here) {
                 drop = 0;
@@ -13575,6 +13949,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
                                want_latent ? &lat_out : nullptr,
                                want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
                                want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
+                               nullptr, nullptr, nullptr, nullptr, nullptr,
                                nullptr, nullptr, nullptr, nullptr, nullptr) ||
             seg_video == nullptr || seg_count <= 0) {
             LOG_ERROR("generate_wan_vace_chain window %d failed", seg + 1);
