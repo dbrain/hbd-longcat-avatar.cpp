@@ -2298,6 +2298,9 @@ protected:
     std::unordered_set<ggml_tensor*> resident_param_set;
     uint64_t resident_state_token = 0;
 
+    // The server supplies the selected fused DiT at a chain lease boundary.
+    std::string residency_model_id_;
+
     // LongCat lap-C (FINDINGS-10): cross-step shared-param residency cache. The
     // shared-resident set + its plan signature are computed once per render and
     // reused across the (4) sampling steps, so the 3.26 GB payload is offloaded
@@ -5071,6 +5074,34 @@ protected:
     }
 
 public:
+    void set_residency_model_id(const std::string& model_id) {
+        residency_model_id_ = model_id;
+    }
+
+    std::string residency_model_id() {
+        return residency_model_id_.empty() ? get_desc() : residency_model_id_;
+    }
+
+    void log_gpu_residency_ledger(const char* phase) {
+        const auto bytes = [](ggml_backend_buffer_t b) -> size_t {
+            return b != nullptr ? ggml_backend_buffer_get_size(b) : 0;
+        };
+        size_t pool_bytes = 0;
+        for (ggml_backend_buffer_t b : prefetch_buf_pool_) pool_bytes += bytes(b);
+        const size_t resident = bytes(resident_runtime_params_buffer);
+        const size_t partial  = bytes(partial_runtime_params_buffer);
+        const size_t runtime  = bytes(runtime_params_buffer);
+        const size_t cache    = bytes(cache_buffer);
+        const size_t prefetched = bytes(prefetched_state_.buf);
+        const std::string model = residency_model_id();
+        LOG_INFO("[VRAM-LEDGER residency] model=%s phase=%s resident=%.2fMiB partial=%.2fMiB "
+                 "runtime=%.2fMiB graph_cache=%.2fMiB prefetched=%.2fMiB pool=%.2fMiB total=%.2fMiB",
+                 model.c_str(), phase != nullptr ? phase : "unknown",
+                 resident / 1048576.0, partial / 1048576.0, runtime / 1048576.0,
+                 cache / 1048576.0, prefetched / 1048576.0, pool_bytes / 1048576.0,
+                 (resident + partial + runtime + cache + prefetched + pool_bytes) / 1048576.0);
+    }
+
     void release_streaming_residency() {
         restore_resident_params();
         // FIX (1080p chain seg-2 crash): reset the monotonic streaming budget so a later COLD

@@ -119,6 +119,49 @@ void ltx_seg_webm_cb(int seg, const sd_image_t* frames, int n, void* user) {
     static_cast<SegWebmWriter*>(user)->enqueue(seg, frames, n);
 }
 
+// Kept alive by run_vid_chain_job while generate_video_chain is executing.
+// The core invokes this only at a segment boundary, after the previous segment
+// released its GPU-only buffers.
+struct ChainDitLease {
+    ServerRuntime*                  runtime = nullptr;
+    const std::vector<std::string>* variants = nullptr;
+    std::string                     error;
+};
+
+bool ltx_chain_dit_lease_cb(int seg, void* user) {
+    auto* lease = static_cast<ChainDitLease*>(user);
+    if (lease == nullptr || lease->runtime == nullptr || lease->variants == nullptr ||
+        seg < 0 || static_cast<size_t>(seg) >= lease->variants->size()) {
+        return false;
+    }
+    ServerRuntime& runtime = *lease->runtime;
+    ModelSwapState* swap = runtime.model_swap;
+    const std::string& want = (*lease->variants)[seg];
+    if (swap == nullptr || want.empty()) {
+        sd_ctx_set_diffusion_model_residency_id(runtime.sd_ctx, want.c_str());
+        return true;
+    }
+    if (!swap->loaded.load() || swap->loaded_variant != want) {
+        const auto it = swap->variants.find(want);
+        if (it == swap->variants.end() || it->second.empty()) {
+            lease->error = "no diffusion model path for chain variant '" + want + "'";
+            return false;
+        }
+        LOG_INFO("LTXAV_DIT_LEASE: segment %d switching DiT %s -> %s after outgoing GPU lease release",
+                 seg + 1, swap->loaded_variant.c_str(), want.c_str());
+        if (!sd_ctx_swap_diffusion_model(runtime.sd_ctx, it->second.c_str())) {
+            swap->loaded.store(false);
+            lease->error = "failed to load chain diffusion model variant '" + want + "'";
+            return false;
+        }
+        swap->loaded_variant = want;
+        swap->loaded.store(true);
+    }
+    sd_ctx_set_diffusion_model_residency_id(runtime.sd_ctx, want.c_str());
+    LOG_INFO("LTXAV_DIT_LEASE: segment %d active_dit_models=[%s]", seg + 1, want.c_str());
+    return true;
+}
+
 // Windowed-streaming finalize: the chain hands us the now-final leading frames IN ORDER. Encode
 // (spool) each and free its pixels immediately, so the chain never materialises the whole timeline.
 // Synchronous by contract — the chain frees nothing here and considers these frames gone on return.
@@ -298,6 +341,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
 
     SDImageVec results;
 
+    std::string chain_default_variant;
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = generate_image(runtime.sd_ctx, &params);
@@ -470,9 +514,38 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         if (!ensure_variant_loaded(runtime, want_variant, error_message)) {
             return false;  // error_message set by ensure_variant_loaded
         }
+        chain_default_variant = runtime.model_swap != nullptr
+                                    ? runtime.model_swap->loaded_variant
+                                    : want_variant;
     }
 
     int n_segments = std::max(1, gen_params.ltx_chain_segments);
+
+    // A chain normally keeps its selected DiT. A segment may override it with a
+    // registered compatible fused variant; every transition is validated before
+    // rendering and leased at the safe boundary in the core chain loop.
+    std::vector<std::string> segment_model_variants(n_segments, chain_default_variant);
+    if (!wan_mode && body.contains("segments") && body["segments"].is_array()) {
+        const auto& segs = body["segments"];
+        for (int seg = 0; seg < n_segments && seg < (int)segs.size(); ++seg) {
+            if (!segs[seg].is_object()) {
+                continue;
+            }
+            const auto it = segs[seg].find("model");
+            if (it == segs[seg].end() || !it->is_string() || it->get<std::string>().empty()) {
+                continue;
+            }
+            const std::string candidate = it->get<std::string>();
+            if (runtime.model_swap != nullptr &&
+                runtime.model_swap->variants.find(candidate) == runtime.model_swap->variants.end()) {
+                error_message = "unknown model variant \"" + candidate + "\" for chain segment " +
+                                std::to_string(seg + 1);
+                return false;
+            }
+            segment_model_variants[seg] = candidate;
+        }
+    }
+    ChainDitLease chain_dit_lease{&runtime, &segment_model_variants, {}};
 
     // Per-segment prompts (the director layer): a JSON array. Fewer than n_segments reuses
     // the last; none reuses the base prompt. Storage must outlive the chain call.
@@ -754,6 +827,8 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.segment_keyframes        = any_kf ? kf_img_ptrs.data() : nullptr;
     chain.segment_keyframe_indices = any_kf ? kf_idx_ptrs.data() : nullptr;
     chain.segment_keyframe_counts  = any_kf ? kf_counts.data() : nullptr;
+    chain.before_segment      = &ltx_chain_dit_lease_cb;
+    chain.before_segment_user = &chain_dit_lease;
 
     // Bank a viewable per-segment webm as each segment lands (off the GPU thread). On by
     // default when a job dir is set; LTX_BANK_SEG_WEBM=0 disables it (e.g. under tight RAM —
@@ -812,7 +887,9 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         if (!chain_ok) {
             // Streaming: stream_writer's dtor drops the spool + any half-written .tmp (nothing published).
             free_sd_audio(audio);
-            error_message = "generate_video_chain failed";
+            error_message = chain_dit_lease.error.empty()
+                                ? "generate_video_chain failed"
+                                : chain_dit_lease.error;
             return false;
         }
     }

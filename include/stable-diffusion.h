@@ -621,6 +621,11 @@ typedef struct {
     // that segment's segment_control_frames (pixel-encode, foreign clip). NULL array = none (byte-
     // identical). A segment with a path here needs NO segment_control_frames.
     const char* const* segment_v2v_guide_latent_paths;
+    // Optional safe-boundary hook, called immediately before each newly-rendered
+    // segment starts using the DiT. Returning false aborts the chain before work
+    // for that segment begins. NULL preserves single-DiT chain behaviour.
+    bool (*before_segment)(int seg_index, void* user);
+    void*        before_segment_user;
     // Optional: invoked once per stitched segment, in order, with that segment's kept frames
     // (overlap head already dropped; the frames stay owned by the chain). Lets the caller
     // (server layer) bank a viewable per-segment webm as it's produced, without the core lib
@@ -789,6 +794,8 @@ SD_API void sd_ctx_precompute_chain_text_conds(sd_ctx_t*    sd_ctx,
 // ctx as unusable for img_gen until a successful swap/reload). The caller MUST
 // guarantee no render is in flight (call from the serial async worker thread).
 SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path);
+// Labels the current DiT in GPU-residency diagnostics. This does not load or retain a model.
+SD_API void sd_ctx_set_diffusion_model_residency_id(sd_ctx_t* sd_ctx, const char* model_id);
 
 // Free the diffusion (DiT) model's VRAM (compute + param buffers) without touching
 // the resident VAE / text encoder. Used by the server's /v1/admin/unload so an

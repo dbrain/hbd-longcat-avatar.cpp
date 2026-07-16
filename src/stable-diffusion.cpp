@@ -3528,6 +3528,7 @@ public:
             if (!runner) {
                 return;
             }
+            runner->log_gpu_residency_ledger("chain-boundary:before-release");
             runner->release_streaming_residency();    // drop any cross-step shared-resident payload
             runner->free_compute_buffer();            // restore offloaded params to host + free activations
             // SEAM FIX (97f continuation refine VRAM): free_compute_buffer's restore_partial_params
@@ -3540,6 +3541,7 @@ public:
             // (which repopulates the pool). No-op when empty → single-render byte-identical.
             runner->free_streaming_scratch_buffers();
             runner->free_cache_ctx_and_buffer();      // free the temporal/causal-conv cache buffer
+            runner->log_gpu_residency_ledger("chain-boundary:after-release");
             // Diagnostic (b): param-buffer state right after the between-segment reclaim's
             // free_compute_buffer (which runs restore_partial/all_params). If the DiT
             // buffer is NULL here despite keep_diffusion_model_resident=true, the reclaim
@@ -12561,6 +12563,13 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     }
 
     for (int seg = start_seg; seg <= render_end; ++seg) {
+        // The preceding segment has released its GPU-only chain residency, so a
+        // host may safely switch to this segment's compatible fused DiT here.
+        if (chain_params->before_segment != nullptr &&
+            !chain_params->before_segment(seg, chain_params->before_segment_user)) {
+            LOG_ERROR("generate_video_chain: DiT residency lease failed before segment %d", seg + 1);
+            return false;
+        }
         sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
         if (!chain_character_latent.empty()) {
             vp.character_reference_latent = chain_character_latent.data();
@@ -13737,6 +13746,13 @@ SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_
     // LTXAV swap also tears down the outgoing DiT's GPU-only residency before
     // refilling the runner from the new gguf. Caller MUST ensure no render is in flight.
     return sd_ctx->sd->swap_diffusion_model(diffusion_model_path);
+}
+
+SD_API void sd_ctx_set_diffusion_model_residency_id(sd_ctx_t* sd_ctx, const char* model_id) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || !sd_ctx->sd->diffusion_model) {
+        return;
+    }
+    sd_ctx->sd->diffusion_model->set_residency_model_id(model_id != nullptr ? model_id : "");
 }
 
 SD_API void sd_ctx_free_diffusion_model(sd_ctx_t* sd_ctx) {
