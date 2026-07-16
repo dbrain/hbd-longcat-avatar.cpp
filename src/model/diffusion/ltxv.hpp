@@ -2,10 +2,14 @@
 #define __SD_MODEL_DIFFUSION_LTXV_HPP__
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -578,6 +582,137 @@ namespace LTXV {
         return build_rope_matrix_from_frequencies(freqs, dim);
     }
 
+    // LTX-2's video RoPE has three separable coordinate axes. The legacy table
+    // repeats the exact [cos,-sin,sin,cos] values for every token *and* head;
+    // at 145f/1920x1024 that is 4.56 GiB. Keep the precomputed F32 values (no
+    // trig or precision change in the CUDA hot path), but store each distinct
+    // axis coordinate once and index it per token. The CUDA op reconstructs the
+    // same lookup directly while rotating q/k. A deliberately conservative
+    // uniqueness limit retains the legacy dense table for genuinely irregular
+    // position inputs.
+    struct CompactVideoRope {
+        std::vector<float> basis;
+        std::vector<int32_t> token_axis_index;
+    };
+
+    __STATIC_INLINE__ bool build_compact_video_rope_from_positions(const sd::Tensor<float>& positions,
+                                                                     int dim,
+                                                                     float theta,
+                                                                     const std::vector<int>& max_pos,
+                                                                     bool use_middle_indices_grid,
+                                                                     CompactVideoRope& out) {
+        GGML_ASSERT(positions.shape()[0] == 2 && positions.shape()[1] == 3);
+        const int64_t tokens = positions.shape()[2];
+        const int half_dim = dim / 2;
+        const std::vector<float> freq = generate_freq_grid(theta, 3, dim);
+        const int pad = half_dim - static_cast<int>(freq.size()) * 3;
+        std::array<std::unordered_map<uint32_t, int32_t>, 3> ids;
+        std::array<std::vector<float>, 3> values;
+        out.token_axis_index.resize(static_cast<size_t>(tokens) * 3);
+
+        for (int64_t token = 0; token < tokens; ++token) {
+            for (int axis = 0; axis < 3; ++axis) {
+                const float start = positions.dim() == 4 ? positions.index(0, axis, token, 0)
+                                                         : positions.index(0, axis, token);
+                const float end = positions.dim() == 4 ? positions.index(1, axis, token, 0)
+                                                       : positions.index(1, axis, token);
+                const float coord = use_middle_indices_grid ? 0.5f * (start + end) : start;
+                uint32_t key;
+                std::memcpy(&key, &coord, sizeof(key));
+                auto [it, inserted] = ids[axis].emplace(key, static_cast<int32_t>(values[axis].size()));
+                if (inserted) values[axis].push_back(coord);
+                out.token_axis_index[static_cast<size_t>(token) * 3 + axis] = it->second;
+            }
+        }
+        // The first implementation is intentionally bounded: compact regular
+        // grids are a few hundred entries; a pathological unstructured input
+        // falls back to the proven dense path instead of silently changing cost.
+        size_t entry_count = values[0].size() + values[1].size() + values[2].size();
+        if (entry_count == 0 || entry_count > 4096) {
+            LOG_INFO("ltxav compact video RoPE unavailable: %lld tokens, axis entries=[%zu,%zu,%zu] (limit=4096)",
+                     (long long) tokens,
+                     values[0].size(),
+                     values[1].size(),
+                     values[2].size());
+            out = {};
+            return false;
+        }
+        // Make per-axis ids globally address the packed basis entries.
+        int32_t axis_base[3] = {0, static_cast<int32_t>(values[0].size()),
+                                 static_cast<int32_t>(values[0].size() + values[1].size())};
+        for (int64_t token = 0; token < tokens; ++token) {
+            for (int axis = 0; axis < 3; ++axis) {
+                out.token_axis_index[static_cast<size_t>(token) * 3 + axis] += axis_base[axis];
+            }
+        }
+        out.basis.resize(entry_count * static_cast<size_t>(half_dim) * 4);
+        size_t entry = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            for (float coord : values[axis]) {
+                for (int pair = 0; pair < half_dim; ++pair) {
+                    float angle = 0.f;
+                    if (pair >= pad && ((pair - pad) % 3) == axis) {
+                        angle = freq[(pair - pad) / 3] * (coord / static_cast<float>(max_pos[axis]) * 2.f - 1.f);
+                    }
+                    const size_t base = (entry * static_cast<size_t>(half_dim) + pair) * 4;
+                    const float c = std::cos(angle), s = std::sin(angle);
+                    out.basis[base + 0] = c;
+                    out.basis[base + 1] = -s;
+                    out.basis[base + 2] = s;
+                    out.basis[base + 3] = c;
+                }
+                ++entry;
+            }
+        }
+        return true;
+    }
+
+    __STATIC_INLINE__ bool build_compact_video_rope(int64_t width,
+                                                     int64_t height,
+                                                     int64_t frames,
+                                                     float frame_rate,
+                                                     int dim,
+                                                     float theta,
+                                                     const std::vector<int>& max_pos,
+                                                     const std::tuple<int, int, int>& vae_scale_factors,
+                                                     bool causal_temporal_positioning,
+                                                     bool use_middle_indices_grid,
+                                                     CompactVideoRope& out) {
+        sd::Tensor<float> positions({2, 3, width * height * frames});
+        const int scale_t = std::get<0>(vae_scale_factors);
+        const int scale_h = std::get<1>(vae_scale_factors);
+        const int scale_w = std::get<2>(vae_scale_factors);
+        int64_t token = 0;
+        for (int64_t t = 0; t < frames; ++t) {
+            float t_start = static_cast<float>(t * scale_t);
+            float t_end   = static_cast<float>((t + 1) * scale_t);
+            if (causal_temporal_positioning) {
+                t_start = std::max(0.f, t_start + 1.f - scale_t);
+                t_end   = std::max(0.f, t_end + 1.f - scale_t);
+            }
+            t_start /= frame_rate;
+            t_end /= frame_rate;
+            for (int64_t h = 0; h < height; ++h) {
+                const float h_start = static_cast<float>(h * scale_h);
+                const float h_end   = static_cast<float>((h + 1) * scale_h);
+                for (int64_t w = 0; w < width; ++w, ++token) {
+                    positions.index(0, 0, token) = t_start;
+                    positions.index(1, 0, token) = t_end;
+                    positions.index(0, 1, token) = h_start;
+                    positions.index(1, 1, token) = h_end;
+                    positions.index(0, 2, token) = static_cast<float>(w * scale_w);
+                    positions.index(1, 2, token) = static_cast<float>((w + 1) * scale_w);
+                }
+            }
+        }
+        return build_compact_video_rope_from_positions(positions,
+                                                        dim,
+                                                        theta,
+                                                        max_pos,
+                                                        use_middle_indices_grid,
+                                                        out);
+    }
+
     __STATIC_INLINE__ std::vector<float> build_1d_rope_matrix(int64_t seq_len,
                                                               int dim,
                                                               int num_heads          = 1,
@@ -620,6 +755,7 @@ namespace LTXV {
     __STATIC_INLINE__ ggml_tensor* apply_hidden_rope(ggml_context* ctx,
                                                      ggml_tensor* x,
                                                      ggml_tensor* pe,
+                                                     ggml_tensor* compact_pe_index,
                                                      int64_t heads,
                                                      int64_t dim_head,
                                                      bool rope_interleaved) {
@@ -639,6 +775,12 @@ namespace LTXV {
         if (pe != nullptr && pe->ne[3] == x->ne[1] * heads) {
             auto x_flat   = ggml_reshape_4d(ctx, x4, dim_head, 1, x->ne[1] * heads, x->ne[2]);
             auto out_flat = Rope::apply_rope(ctx, x_flat, pe, rope_interleaved);
+            auto out4     = ggml_reshape_4d(ctx, out_flat, dim_head, heads, x->ne[1], x->ne[2]);
+            return ggml_reshape_3d(ctx, out4, heads * dim_head, x->ne[1], x->ne[2]);
+        }
+        if (pe != nullptr && compact_pe_index != nullptr) {
+            auto x_flat   = ggml_reshape_4d(ctx, x4, dim_head, 1, x->ne[1] * heads, x->ne[2]);
+            auto out_flat = ggml_rope_pe_compact(ctx, x_flat, pe, compact_pe_index, rope_interleaved);
             auto out4     = ggml_reshape_4d(ctx, out_flat, dim_head, heads, x->ne[1], x->ne[2]);
             return ggml_reshape_3d(ctx, out4, heads * dim_head, x->ne[1], x->ne[2]);
         }
@@ -763,7 +905,8 @@ namespace LTXV {
                              ggml_tensor* mask        = nullptr,
                              ggml_tensor* pe          = nullptr,
                              ggml_tensor* k_pe        = nullptr,
-                             ggml_tensor* nag_context = nullptr) {
+                             ggml_tensor* nag_context = nullptr,
+                             ggml_tensor* compact_pe_index = nullptr) {
             if (context == nullptr) {
                 context = x;
             }
@@ -779,7 +922,7 @@ namespace LTXV {
             auto q = to_q->forward(ctx, x);
             q      = q_norm->forward(ctx, q);
             if (pe != nullptr) {
-                q = apply_hidden_rope(gc, q, pe, heads, dim_head, rope_interleaved);
+                q = apply_hidden_rope(gc, q, pe, compact_pe_index, heads, dim_head, rope_interleaved);
             }
 
             // Protective kv_scale: with flash-attn, K/V are cast to F16. On deep-chain cont latents
@@ -815,7 +958,7 @@ namespace LTXV {
                 auto v = to_v->forward(ctx, kv_context);
                 k      = k_norm->forward(ctx, k);
                 if (pe != nullptr) {
-                    k = apply_hidden_rope(gc, k, k_pe, heads, dim_head, rope_interleaved);
+                    k = apply_hidden_rope(gc, k, k_pe, compact_pe_index, heads, dim_head, rope_interleaved);
                 }
                 return ggml_ext_attention_ext(gc,
                                               ctx->backend,
@@ -1426,6 +1569,7 @@ namespace LTXV {
                                                       ggml_tensor* v_timestep,
                                                       ggml_tensor* a_timestep,
                                                       ggml_tensor* v_pe,
+                                                      ggml_tensor* v_pe_compact_index,
                                                       ggml_tensor* a_pe,
                                                       ggml_tensor* v_cross_pe,
                                                       ggml_tensor* a_cross_pe,
@@ -1465,7 +1609,7 @@ namespace LTXV {
                 v_norm = rms_norm(ctx->ggml_ctx, vx);
                 v_norm = modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             }
-            auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
+            auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe, nullptr, nullptr, v_pe_compact_index);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
             if (stop_at_subop == 0) {
                 return {vx, ax};  // truncate after video self-attn (attn1)
@@ -1835,6 +1979,7 @@ namespace LTXV {
                                                       ggml_tensor* audio_timestep,
                                                       ggml_tensor* context,
                                                       ggml_tensor* v_pe,
+                                                      ggml_tensor* v_pe_compact_index,
                                                       ggml_tensor* a_pe,
                                                       ggml_tensor* v_cross_pe,
                                                       ggml_tensor* a_cross_pe,
@@ -2029,6 +2174,7 @@ namespace LTXV {
                                             v_timestep_mod,
                                             a_timestep_mod,
                                             v_pe,
+                                            v_pe_compact_index,
                                             a_pe,
                                             v_cross_pe,
                                             a_cross_pe,
@@ -2100,6 +2246,8 @@ namespace LTXV {
         LTXAVConfig config;
         LTXAVModelBlock model;
         std::vector<float> video_pe_vec;
+        std::vector<float> video_pe_compact_basis_vec;
+        std::vector<int32_t> video_pe_compact_index_vec;
         std::vector<float> audio_pe_vec;
         std::vector<float> video_cross_pe_vec;
         std::vector<float> audio_cross_pe_vec;
@@ -2320,7 +2468,40 @@ namespace LTXV {
             // (no vx_ref) => count is the plain target grid (legacy, byte-identical).
             int64_t video_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2] + ref_token_count;
             bool has_video_positions  = !video_positions_tensor.empty();
-            if (has_video_positions) {
+            bool compact_video_pe = false;
+            CompactVideoRope compact_rope;
+            const char* compact_env = std::getenv("LTXAV_COMPACT_VIDEO_ROPE");
+            const bool compact_enabled = compact_env == nullptr || compact_env[0] != '0';
+            if (has_video_positions && compact_enabled) {
+                compact_video_pe = build_compact_video_rope_from_positions(video_positions_tensor,
+                                                                            static_cast<int>(config.hidden_size),
+                                                                            config.positional_embedding_theta,
+                                                                            config.positional_embedding_max_pos,
+                                                                            config.use_middle_indices_grid,
+                                                                            compact_rope);
+            } else if (compact_enabled && ref_token_count == 0) {
+                compact_video_pe = build_compact_video_rope(vx->ne[0],
+                                                            vx->ne[1],
+                                                            vx->ne[2],
+                                                            video_frame_rate,
+                                                            static_cast<int>(config.hidden_size),
+                                                            config.positional_embedding_theta,
+                                                            config.positional_embedding_max_pos,
+                                                            config.vae_scale_factors,
+                                                            config.causal_temporal_positioning,
+                                                            config.use_middle_indices_grid,
+                                                            compact_rope);
+            }
+            if (compact_video_pe) {
+                video_pe_compact_basis_vec = std::move(compact_rope.basis);
+                video_pe_compact_index_vec = std::move(compact_rope.token_axis_index);
+                video_pe_vec.clear();
+                LOG_INFO("ltxav compact video RoPE: %lld tokens, %zu basis entries, %.2f MiB basis + %.2f MiB token indices",
+                         (long long) video_token_count,
+                         video_pe_compact_basis_vec.size() / static_cast<size_t>(4 * (config.hidden_size / 2)),
+                         video_pe_compact_basis_vec.size() * sizeof(float) / 1048576.0,
+                         video_pe_compact_index_vec.size() * sizeof(int32_t) / 1048576.0);
+            } else if (has_video_positions) {
                 GGML_ASSERT(video_positions_tensor.shape()[2] == video_token_count);
                 video_pe_vec = build_video_rope_matrix_from_positions(video_positions_tensor,
                                                                       static_cast<int>(config.hidden_size),
@@ -2341,9 +2522,22 @@ namespace LTXV {
                                                        config.causal_temporal_positioning,
                                                        config.use_middle_indices_grid);
             }
-            auto video_pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.attention_head_dim / 2, video_token_count * config.num_attention_heads);
-            ggml_set_name(video_pe, "ltxav_video_pe");
-            set_backend_tensor_data(video_pe, video_pe_vec.data());
+            ggml_tensor* video_pe = nullptr;
+            ggml_tensor* video_pe_compact_index = nullptr;
+            if (compact_video_pe) {
+                const int64_t entries = static_cast<int64_t>(video_pe_compact_basis_vec.size()) /
+                                        (4 * (config.hidden_size / 2));
+                video_pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.hidden_size / 2, entries);
+                ggml_set_name(video_pe, "ltxav_video_pe_compact_basis");
+                set_backend_tensor_data(video_pe, video_pe_compact_basis_vec.data());
+                video_pe_compact_index = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_I32, 3, video_token_count);
+                ggml_set_name(video_pe_compact_index, "ltxav_video_pe_compact_index");
+                set_backend_tensor_data(video_pe_compact_index, video_pe_compact_index_vec.data());
+            } else {
+                video_pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.attention_head_dim / 2, video_token_count * config.num_attention_heads);
+                ggml_set_name(video_pe, "ltxav_video_pe");
+                set_backend_tensor_data(video_pe, video_pe_vec.data());
+            }
 
             ggml_tensor* audio_pe       = nullptr;
             ggml_tensor* video_cross_pe = nullptr;
@@ -2476,6 +2670,7 @@ namespace LTXV {
                                             a_timestep,
                                             context,
                                             video_pe,
+                                            video_pe_compact_index,
                                             audio_pe,
                                             video_cross_pe,
                                             audio_cross_pe,
