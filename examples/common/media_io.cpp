@@ -13,6 +13,7 @@
 #include <functional>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -38,6 +39,10 @@
 #include "mkvmuxer/mkvwriter.h"
 #ifdef SD_USE_OPUS
 #include <opus/opus.h>
+#endif
+#ifdef SD_USE_VPX
+#include <vpx/vp8cx.h>
+#include <vpx/vpx_encoder.h>
 #endif
 #endif
 
@@ -1310,16 +1315,257 @@ static bool encode_audio_to_opus(const sd_audio_t* audio,
 }  // namespace
 #endif  // SD_USE_OPUS
 
-// Shared WebM mux core. `get_vp8(i, out)` must fill `out` with frame i's encoded VP8 keyframe
-// bytes and return true (false = abort the whole container). This is the SINGLE mux sequence —
-// track setup, per-frame audio interleave, timestamps, Opus/PCM handling and Finalize — that both
-// the whole-array encoder and the incremental (streaming) writer funnel through, so their outputs
-// are byte-identical for the same frames + audio + num_images + fps. Per-frame VP8 encoding is
-// stateless (each frame is an independent keyframe), so pre-encoding frames elsewhere and feeding
-// them here reproduces the exact bytes an inline encode would have produced.
-static std::vector<uint8_t> mux_webm_vp8(int width, int height, int num_images, int fps,
-                                         const sd_audio_t* audio,
-                                         const std::function<bool(int, std::vector<uint8_t>&)>& get_vp8) {
+#ifdef SD_USE_VPX
+// ─── VP9 10-bit encoder ──────────────────────────────────────────────────────────────────────
+// Replaces the libwebp→VP8-keyframe hack: a real, stateful libvpx VP9 encoder emitting 10-bit
+// (profile 2) inter-frame video with BT.709/limited-range signalling and constant-quality rate
+// control. Frames are fed strictly in order; the muxer replays the encoded packets (with each
+// packet's real keyframe flag) so the streaming and whole-array paths stay identical.
+//
+// The RGB→YUV conversion folds in a black-point lift (LTX's VAE floors dark scenes at ~5% grey,
+// so true black never reaches 0) plus ordered dither on the luma quantise to keep the lift from
+// introducing new contours. Tunable at runtime without a rebuild:
+//   LTXAV_VP9_CQ           constant-quality level 4..63 (default 32; lower = higher quality/bigger)
+//   LTXAV_VP9_BLACK_POINT  STATIC input black point 0..0.3 mapped to 0 (default 0 = off). A fixed
+//                          linear lift clips shadow detail below the threshold, so it is off by
+//                          default; leave it 0 and prefer a content-adaptive black level upstream.
+//   LTXAV_VP9_CPU_USED     libvpx speed 0..8 (default 4; higher = faster/lower quality)
+//   LTXAV_VP9_KF_SECONDS   max keyframe interval in seconds for seeking (default 5)
+static float vp9_env_float(const char* name, float defv, float lo, float hi) {
+    const char* s = getenv(name);
+    if (s == nullptr || *s == '\0') {
+        return defv;
+    }
+    char* end = nullptr;
+    const float v = strtof(s, &end);
+    if (end == s) {
+        return defv;
+    }
+    return std::max(lo, std::min(hi, v));
+}
+
+struct EncodedVideoPacket {
+    std::vector<uint8_t> bytes;
+    bool                 is_key = false;
+};
+
+// One ordered-dither Bayer 4x4 threshold matrix, values recentred to [-0.5, 0.5).
+static float bayer4(int x, int y) {
+    static const int m[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+    return (static_cast<float>(m[(y & 3) * 4 + (x & 3)]) + 0.5f) / 16.0f - 0.5f;
+}
+
+// RGB8 → 10-bit BT.709 limited-range YUV 4:2:0, with black-point lift + luma dither. Width/height
+// are assumed even (LTX dims are ×32-snapped). Planes are sized by the caller's vpx_image strides.
+static void rgb8_to_yuv420p10(const uint8_t* rgb, int channels, int w, int h, float black_point,
+                              uint16_t* yp, int ys, uint16_t* up, int us, uint16_t* vp, int vs) {
+    const float inv = black_point < 1.0f ? 1.0f / (1.0f - black_point) : 1.0f;
+    auto lift       = [&](float c01) { return std::max(0.0f, (c01 - black_point) * inv); };
+    auto clamp10    = [](float v) { return static_cast<uint16_t>(std::max(0.0f, std::min(1023.0f, v))); };
+
+    // Luma (per-pixel) with ordered dither.
+    for (int y = 0; y < h; ++y) {
+        uint16_t* yrow = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(yp) + static_cast<size_t>(y) * ys);
+        for (int x = 0; x < w; ++x) {
+            const uint8_t* px = rgb + (static_cast<size_t>(y) * w + x) * channels;
+            const float r = lift(px[0] / 255.0f), g = lift(px[1] / 255.0f), b = lift(px[2] / 255.0f);
+            const float yl = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            yrow[x] = clamp10(64.0f + 876.0f * yl + bayer4(x, y));
+        }
+    }
+    // Chroma 4:2:0 — average each 2×2 block of lifted RGB, then convert (co-sited enough for video).
+    for (int y = 0; y < h; y += 2) {
+        uint16_t* urow = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(up) + static_cast<size_t>(y / 2) * us);
+        uint16_t* vrow = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(vp) + static_cast<size_t>(y / 2) * vs);
+        for (int x = 0; x < w; x += 2) {
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    const uint8_t* px = rgb + (static_cast<size_t>(y + dy) * w + (x + dx)) * channels;
+                    r += lift(px[0] / 255.0f);
+                    g += lift(px[1] / 255.0f);
+                    b += lift(px[2] / 255.0f);
+                }
+            }
+            r *= 0.25f;
+            g *= 0.25f;
+            b *= 0.25f;
+            const float yl = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            urow[x / 2] = clamp10(512.0f + 896.0f * ((b - yl) / 1.8556f));
+            vrow[x / 2] = clamp10(512.0f + 896.0f * ((r - yl) / 1.5748f));
+        }
+    }
+}
+
+// Extract an RGB view of an sd_image_t (handles gray/RGBA); returns a pointer + channel count into
+// `scratch` when a conversion is needed, else a pointer straight into the frame.
+static const uint8_t* sd_image_as_rgb(const sd_image_t& image, std::vector<uint8_t>& scratch, int& out_channels) {
+    const int w = static_cast<int>(image.width), h = static_cast<int>(image.height);
+    const int c = static_cast<int>(image.channel);
+    if (c == 3 || c == 4) {
+        out_channels = c;
+        return image.data;
+    }
+    scratch.resize(static_cast<size_t>(w) * h * 3);
+    for (int i = 0; i < w * h; ++i) {
+        scratch[i * 3 + 0] = scratch[i * 3 + 1] = scratch[i * 3 + 2] = image.data[i];
+    }
+    out_channels = 3;
+    return scratch.data();
+}
+
+class Vp9Encoder {
+public:
+    ~Vp9Encoder() {
+        if (initialized_) {
+            vpx_codec_destroy(&ctx_);
+        }
+        if (img_alloc_) {
+            vpx_img_free(&img_);
+        }
+    }
+
+    bool init(int width, int height, int fps) {
+        width_  = width;
+        height_ = height;
+        fps_    = fps > 0 ? fps : 24;
+        if ((width & 1) || (height & 1)) {
+            fprintf(stderr, "Vp9Encoder: odd dimensions %dx%d unsupported.\n", width, height);
+            return false;
+        }
+        black_point_    = vp9_env_float("LTXAV_VP9_BLACK_POINT", 0.0f, 0.0f, 0.3f);
+        const int cq    = static_cast<int>(vp9_env_float("LTXAV_VP9_CQ", 32.0f, 4.0f, 63.0f));
+        const int cpu   = static_cast<int>(vp9_env_float("LTXAV_VP9_CPU_USED", 4.0f, 0.0f, 8.0f));
+        const float kfs = vp9_env_float("LTXAV_VP9_KF_SECONDS", 5.0f, 0.0f, 100.0f);
+
+        vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
+        vpx_codec_enc_cfg_t cfg{};
+        if (vpx_codec_enc_config_default(iface, &cfg, 0) != VPX_CODEC_OK) {
+            fprintf(stderr, "Vp9Encoder: enc_config_default failed.\n");
+            return false;
+        }
+        cfg.g_w               = static_cast<unsigned>(width);
+        cfg.g_h               = static_cast<unsigned>(height);
+        cfg.g_timebase.num    = 1;
+        cfg.g_timebase.den    = fps_;
+        cfg.g_profile         = 2;  // 10/12-bit 4:2:0
+        cfg.g_bit_depth       = VPX_BITS_10;
+        cfg.g_input_bit_depth = 10;
+        cfg.g_pass            = VPX_RC_ONE_PASS;
+        cfg.g_lag_in_frames   = 0;  // 1-in-1-out: keeps the streaming spool a clean frame↔packet map
+        cfg.rc_end_usage      = VPX_Q;
+        cfg.rc_target_bitrate = 0;
+        cfg.kf_mode           = VPX_KF_AUTO;
+        cfg.kf_max_dist       = kfs > 0.0f ? std::max(1u, static_cast<unsigned>(kfs * fps_)) : 9999u;
+        unsigned hw_threads   = std::thread::hardware_concurrency();
+        cfg.g_threads         = std::max(1u, std::min(hw_threads ? hw_threads : 4u, 8u));
+
+        if (vpx_codec_enc_init(&ctx_, iface, &cfg, VPX_CODEC_USE_HIGHBITDEPTH) != VPX_CODEC_OK) {
+            fprintf(stderr, "Vp9Encoder: enc_init failed: %s\n", vpx_codec_error(&ctx_));
+            return false;
+        }
+        initialized_ = true;
+        vpx_codec_control(&ctx_, VP8E_SET_CPUUSED, cpu);
+        vpx_codec_control(&ctx_, VP8E_SET_CQ_LEVEL, cq);  // shared VP8/VP9 constant-quality control
+        vpx_codec_control(&ctx_, VP9E_SET_ROW_MT, 1);
+        vpx_codec_control(&ctx_, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
+        vpx_codec_control(&ctx_, VP9E_SET_COLOR_RANGE, VPX_CR_STUDIO_RANGE);
+
+        if (vpx_img_alloc(&img_, VPX_IMG_FMT_I42016, width, height, 1) == nullptr) {
+            fprintf(stderr, "Vp9Encoder: img_alloc failed.\n");
+            return false;
+        }
+        img_.bit_depth = 10;  // 10-bit samples in the 16-bit I42016 planes
+        img_alloc_     = true;
+        return true;
+    }
+
+    // Encode one frame, appending every emitted packet (usually exactly one with lag=0) to `out`.
+    bool encode(const sd_image_t& image, std::vector<EncodedVideoPacket>& out) {
+        if (!initialized_ || !img_alloc_) {
+            return false;
+        }
+        if (static_cast<int>(image.width) != width_ || static_cast<int>(image.height) != height_) {
+            fprintf(stderr, "Vp9Encoder: frame dimensions do not match.\n");
+            return false;
+        }
+        std::vector<uint8_t> scratch;
+        int channels        = 3;
+        const uint8_t* rgb  = sd_image_as_rgb(image, scratch, channels);
+        rgb8_to_yuv420p10(rgb, channels, width_, height_, black_point_,
+                          reinterpret_cast<uint16_t*>(img_.planes[VPX_PLANE_Y]), img_.stride[VPX_PLANE_Y],
+                          reinterpret_cast<uint16_t*>(img_.planes[VPX_PLANE_U]), img_.stride[VPX_PLANE_U],
+                          reinterpret_cast<uint16_t*>(img_.planes[VPX_PLANE_V]), img_.stride[VPX_PLANE_V]);
+        if (vpx_codec_encode(&ctx_, &img_, pts_++, 1, 0, VPX_DL_GOOD_QUALITY) != VPX_CODEC_OK) {
+            fprintf(stderr, "Vp9Encoder: encode failed: %s\n", vpx_codec_error(&ctx_));
+            return false;
+        }
+        return drain(out);
+    }
+
+    // Flush the encoder (lag=0 leaves nothing pending, but this is correct regardless).
+    bool finish(std::vector<EncodedVideoPacket>& out) {
+        if (!initialized_) {
+            return false;
+        }
+        if (vpx_codec_encode(&ctx_, nullptr, pts_, 1, 0, VPX_DL_GOOD_QUALITY) != VPX_CODEC_OK) {
+            fprintf(stderr, "Vp9Encoder: flush failed: %s\n", vpx_codec_error(&ctx_));
+            return false;
+        }
+        return drain(out);
+    }
+
+private:
+    bool drain(std::vector<EncodedVideoPacket>& out) {
+        vpx_codec_iter_t iter = nullptr;
+        const vpx_codec_cx_pkt_t* pkt = nullptr;
+        while ((pkt = vpx_codec_get_cx_data(&ctx_, &iter)) != nullptr) {
+            if (pkt->kind != VPX_CODEC_CX_FRAME_PKT) {
+                continue;
+            }
+            EncodedVideoPacket p;
+            p.is_key = (pkt->data.frame.flags & VPX_FRAME_IS_KEY) != 0;
+            p.bytes.assign(static_cast<const uint8_t*>(pkt->data.frame.buf),
+                           static_cast<const uint8_t*>(pkt->data.frame.buf) + pkt->data.frame.sz);
+            out.push_back(std::move(p));
+        }
+        return true;
+    }
+
+    vpx_codec_ctx_t ctx_{};
+    vpx_image_t     img_{};
+    bool            initialized_ = false;
+    bool            img_alloc_   = false;
+    int             width_       = 0;
+    int             height_      = 0;
+    int             fps_         = 24;
+    float           black_point_ = 0.0f;
+    vpx_codec_pts_t pts_         = 0;
+};
+
+// True when this build was compiled with VP9 support AND it is not force-disabled at runtime.
+static bool webm_use_vp9() {
+    const char* codec = getenv("LTXAV_WEBM_CODEC");
+    if (codec != nullptr && (strcmp(codec, "vp8") == 0 || strcmp(codec, "VP8") == 0)) {
+        return false;
+    }
+    return true;
+}
+#endif  // SD_USE_VPX
+
+// Shared WebM mux core. `get_frame(i, out, is_key)` must fill `out` with frame i's encoded video
+// bytes, set `is_key` to whether it is a keyframe, and return true (false = abort the container).
+// This is the SINGLE mux sequence — track setup, per-frame audio interleave, timestamps, Opus/PCM
+// handling and Finalize — that both the whole-array encoder and the incremental (streaming) writer
+// funnel through, so their outputs match for the same frames + audio + num_images + fps. Muxing is
+// codec-agnostic and order-preserving: pre-encoding frames elsewhere (a spool, a buffer) and
+// feeding them here in order reproduces the exact bytes an inline encode would have produced, which
+// holds for VP9 inter-frame packets too as long as each packet's real keyframe flag is preserved.
+// use_vp9 selects the codec id (V_VP9 vs V_VP8) and, for VP9, writes BT.709/limited colour tags so
+// browsers render the range correctly instead of guessing.
+static std::vector<uint8_t> mux_webm(int width, int height, int num_images, int fps,
+                                     const sd_audio_t* audio, bool use_vp9,
+                                     const std::function<bool(int, std::vector<uint8_t>&, bool&)>& get_frame) {
     if (num_images == 0) {
         fprintf(stderr, "Error: Image array is empty.\n");
         return {};
@@ -1347,7 +1593,7 @@ static std::vector<uint8_t> mux_webm_vp8(int width, int height, int num_images, 
 
         const uint64_t track_number = segment.AddVideoTrack(width, height, 0);
         if (track_number == 0) {
-            fprintf(stderr, "Error: Failed to add VP8 video track.\n");
+            fprintf(stderr, "Error: Failed to add video track.\n");
             return -1;
         }
         if (!segment.CuesTrack(track_number)) {
@@ -1360,6 +1606,23 @@ static std::vector<uint8_t> mux_webm_vp8(int width, int height, int num_images, 
             video_track->set_display_width(static_cast<uint64_t>(width));
             video_track->set_display_height(static_cast<uint64_t>(height));
             video_track->set_frame_rate(static_cast<double>(fps));
+            if (use_vp9) {
+                video_track->set_codec_id("V_VP9");
+                // Signal BT.709 / limited range so browsers stop guessing the range (the untagged
+                // VP8 path rendered washed-out blacks). Matches the encoder's VP9E colour controls.
+                mkvmuxer::Colour colour;
+                colour.set_matrix_coefficients(1);       // BT.709
+                colour.set_range(1);                     // broadcast / limited (studio)
+                colour.set_primaries(1);                 // BT.709
+                colour.set_transfer_characteristics(1);  // BT.709
+                colour.set_bits_per_channel(10);
+                colour.set_chroma_subsampling_horz(1);
+                colour.set_chroma_subsampling_vert(1);
+                if (!video_track->SetColour(colour)) {
+                    fprintf(stderr, "Error: Failed to set WebM colour metadata.\n");
+                    return -1;
+                }
+            }
         }
 
         uint64_t audio_track_number = 0;
@@ -1427,16 +1690,17 @@ static std::vector<uint8_t> mux_webm_vp8(int width, int height, int num_images, 
         uint64_t timestamp_ns = 0;
 
         for (int i = 0; i < num_images; ++i) {
-            std::vector<uint8_t> vp8_frame;
-            if (!get_vp8(i, vp8_frame)) {
+            std::vector<uint8_t> video_frame;
+            bool is_key = true;
+            if (!get_frame(i, video_frame, is_key)) {
                 return -1;
             }
 
-            if (!segment.AddFrame(vp8_frame.data(),
-                                  static_cast<uint64_t>(vp8_frame.size()),
+            if (!segment.AddFrame(video_frame.data(),
+                                  static_cast<uint64_t>(video_frame.size()),
                                   track_number,
                                   timestamp_ns,
-                                  true)) {
+                                  is_key)) {
                 fprintf(stderr, "Error: Failed to mux frame %d into WebM.\n", i);
                 return -1;
             }
@@ -1511,10 +1775,49 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
     const int width  = static_cast<int>(images[0].width);
     const int height = static_cast<int>(images[0].height);
 
-    // Inline per-frame encode; on transfer-of-ownership, release each pixel buffer as soon as its
-    // VP8 keyframe exists (mirrors the historical in-loop free — byte-identical, the VP8 bytes do
-    // not alias the pixels).
-    auto get_vp8 = [&](int i, std::vector<uint8_t>& out) -> bool {
+#ifdef SD_USE_VPX
+    if (webm_use_vp9()) {
+        // Encode every frame in order through one stateful VP9 encoder (lag=0 → exactly one packet
+        // per frame), buffering the small encoded packets, then mux. Free each pixel buffer as soon
+        // as it is encoded on transfer-of-ownership.
+        Vp9Encoder enc;
+        if (!enc.init(width, height, fps)) {
+            return {};
+        }
+        std::vector<EncodedVideoPacket> packets;
+        packets.reserve(static_cast<size_t>(num_images));
+        for (int i = 0; i < num_images; ++i) {
+            sd_image_t& image = images[i];
+            if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
+                fprintf(stderr, "Error: Frame dimensions do not match.\n");
+                return {};
+            }
+            if (!enc.encode(image, packets)) {
+                return {};
+            }
+            if (consume_image_data) {
+                free(image.data);
+                image.data = nullptr;
+            }
+        }
+        enc.finish(packets);
+        if (static_cast<int>(packets.size()) != num_images) {
+            fprintf(stderr, "Error: VP9 emitted %zu packets for %d frames.\n", packets.size(), num_images);
+            return {};
+        }
+        auto get_frame = [&](int i, std::vector<uint8_t>& out, bool& is_key) -> bool {
+            out    = std::move(packets[i].bytes);
+            is_key = packets[i].is_key;
+            return true;
+        };
+        return mux_webm(width, height, num_images, fps, audio, true, get_frame);
+    }
+#endif
+
+    // VP8 fallback (build without SD_USE_VPX, or LTXAV_WEBM_CODEC=vp8): per-frame independent
+    // keyframe, released as soon as it is encoded (the encoded bytes do not alias the pixels).
+    auto get_frame = [&](int i, std::vector<uint8_t>& out, bool& is_key) -> bool {
+        is_key            = true;
         sd_image_t& image = images[i];
         if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
             fprintf(stderr, "Error: Frame dimensions do not match.\n");
@@ -1531,15 +1834,16 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         return true;
     };
 
-    return mux_webm_vp8(width, height, num_images, fps, audio, get_vp8);
+    return mux_webm(width, height, num_images, fps, audio, false, get_frame);
 }
 
 // ─── Incremental (streaming) WebM writer ─────────────────────────────────────────────────────
-// Encodes each frame to VP8 as it arrives and SPOOLS the (small) encoded bytes to a temp file so
-// peak RAM stays bounded to the caller's live frame window regardless of clip length. The audio is
-// buffered whole (tiny). finalize() replays the spool through the shared mux core with the now-known
-// total frame count, muxes the length-matched audio, writes the container atomically (.tmp→rename),
-// and returns the bytes. Byte-identical to create_webm_from_sd_images_to_vector over the same frames.
+// Encodes each frame as it arrives (VP9 10-bit via a stateful encoder, or VP8 in the fallback) and
+// SPOOLS the (small) encoded packet to a temp file so peak RAM stays bounded to the caller's live
+// frame window regardless of clip length. The audio is buffered whole (tiny). finalize() replays
+// the spool through the shared mux core with the now-known total frame count, muxes the
+// length-matched audio, writes the container atomically (.tmp→rename), and returns the bytes.
+// Matches create_webm_from_sd_images_to_vector over the same frames (same encoder, same order).
 IncrementalWebmWriter::IncrementalWebmWriter() = default;
 
 IncrementalWebmWriter::~IncrementalWebmWriter() {
@@ -1564,15 +1868,37 @@ IncrementalWebmWriter::~IncrementalWebmWriter() {
     }
 }
 
+// Spool one encoded packet: [len:u32-le][is_key:u8][bytes]. The keyframe flag matters for VP9
+// inter-frame packets (the mux must tag it); VP8 keyframes always pass true.
+static bool spool_write_record(std::ofstream& out, const uint8_t* bytes, size_t len, bool is_key) {
+    unsigned char hdr[5];
+    hdr[0] = static_cast<unsigned char>(len & 0xFF);
+    hdr[1] = static_cast<unsigned char>((len >> 8) & 0xFF);
+    hdr[2] = static_cast<unsigned char>((len >> 16) & 0xFF);
+    hdr[3] = static_cast<unsigned char>((len >> 24) & 0xFF);
+    hdr[4] = is_key ? 1 : 0;
+    out.write(reinterpret_cast<const char*>(hdr), 5);
+    if (len > 0) {
+        out.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(len));
+    }
+    return static_cast<bool>(out);
+}
+
 bool IncrementalWebmWriter::open(const std::string& final_path, int fps, int quality) {
     final_path_ = final_path;
-    spool_path_ = final_path + ".vp8spool";
+    spool_path_ = final_path + ".vspool";
     fps_        = fps;
     quality_    = quality;
     width_      = 0;
     height_     = 0;
     num_frames_ = 0;
     failed_     = false;
+#ifdef SD_USE_VPX
+    use_vp9_ = webm_use_vp9();  // encoder is created lazily on the first frame (needs its dims)
+    vp9_.reset();
+#else
+    use_vp9_ = false;
+#endif
     std::error_code ec;
     fs::remove(fs::path(spool_path_), ec);
     spool_out_.open(fs::path(spool_path_), std::ios::binary | std::ios::trunc);
@@ -1602,23 +1928,40 @@ bool IncrementalWebmWriter::append_video_frame(const sd_image_t& image) {
         failed_ = true;
         return false;
     }
+
+#ifdef SD_USE_VPX
+    if (use_vp9_) {
+        if (num_frames_ == 0) {
+            vp9_ = std::make_unique<Vp9Encoder>();
+            if (!vp9_->init(width_, height_, fps_)) {
+                failed_ = true;
+                return false;
+            }
+        }
+        std::vector<EncodedVideoPacket> packets;
+        if (!vp9_->encode(image, packets)) {
+            failed_ = true;
+            return false;
+        }
+        for (const auto& p : packets) {
+            if (!spool_write_record(spool_out_, p.bytes.data(), p.bytes.size(), p.is_key)) {
+                fprintf(stderr, "IncrementalWebmWriter: spool write failed at frame %d.\n", num_frames_);
+                failed_ = true;
+                return false;
+            }
+            ++num_frames_;
+        }
+        return true;
+    }
+#endif
+
     std::vector<uint8_t> vp8;
     if (!encode_sd_image_to_vp8_frame(image, quality_, vp8)) {
         fprintf(stderr, "IncrementalWebmWriter: failed to encode frame %d as VP8.\n", num_frames_);
         failed_ = true;
         return false;
     }
-    const uint32_t len = static_cast<uint32_t>(vp8.size());
-    unsigned char  hdr[4];
-    hdr[0] = static_cast<unsigned char>(len & 0xFF);
-    hdr[1] = static_cast<unsigned char>((len >> 8) & 0xFF);
-    hdr[2] = static_cast<unsigned char>((len >> 16) & 0xFF);
-    hdr[3] = static_cast<unsigned char>((len >> 24) & 0xFF);
-    spool_out_.write(reinterpret_cast<const char*>(hdr), 4);
-    if (len > 0) {
-        spool_out_.write(reinterpret_cast<const char*>(vp8.data()), static_cast<std::streamsize>(len));
-    }
-    if (!spool_out_) {
+    if (!spool_write_record(spool_out_, vp8.data(), vp8.size(), true)) {
         fprintf(stderr, "IncrementalWebmWriter: spool write failed at frame %d.\n", num_frames_);
         failed_ = true;
         return false;
@@ -1648,6 +1991,22 @@ void IncrementalWebmWriter::set_audio(const sd_audio_t* audio) {
 }
 
 std::vector<uint8_t> IncrementalWebmWriter::finalize() {
+#ifdef SD_USE_VPX
+    // Drain any packets the encoder is still holding (lag=0 leaves none, but this is correct
+    // regardless) before the spool is closed, so the container has every frame.
+    if (use_vp9_ && vp9_ && !failed_ && spool_out_.is_open()) {
+        std::vector<EncodedVideoPacket> tail;
+        if (vp9_->finish(tail)) {
+            for (const auto& p : tail) {
+                if (!spool_write_record(spool_out_, p.bytes.data(), p.bytes.size(), p.is_key)) {
+                    failed_ = true;
+                    break;
+                }
+                ++num_frames_;
+            }
+        }
+    }
+#endif
     if (spool_out_.is_open()) {
         spool_out_.flush();
         spool_out_.close();
@@ -1661,19 +2020,20 @@ std::vector<uint8_t> IncrementalWebmWriter::finalize() {
         return {};
     }
     int next_read = 0;
-    auto get_vp8 = [&](int i, std::vector<uint8_t>& out) -> bool {
+    auto get_frame = [&](int i, std::vector<uint8_t>& out, bool& is_key) -> bool {
         if (i != next_read) {  // the mux core reads strictly in order; guard the assumption
             fprintf(stderr, "IncrementalWebmWriter: non-sequential frame read (%d != %d).\n", i, next_read);
             return false;
         }
-        unsigned char hdr[4];
-        spool_in_.read(reinterpret_cast<char*>(hdr), 4);
-        if (!spool_in_ || spool_in_.gcount() != 4) {
+        unsigned char hdr[5];
+        spool_in_.read(reinterpret_cast<char*>(hdr), 5);
+        if (!spool_in_ || spool_in_.gcount() != 5) {
             fprintf(stderr, "IncrementalWebmWriter: spool header read failed at frame %d.\n", i);
             return false;
         }
         const uint32_t len = static_cast<uint32_t>(hdr[0]) | (static_cast<uint32_t>(hdr[1]) << 8) |
                              (static_cast<uint32_t>(hdr[2]) << 16) | (static_cast<uint32_t>(hdr[3]) << 24);
+        is_key             = hdr[4] != 0;
         out.resize(len);
         if (len > 0) {
             spool_in_.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(len));
@@ -1687,7 +2047,7 @@ std::vector<uint8_t> IncrementalWebmWriter::finalize() {
     };
 
     const sd_audio_t* audio = audio_owned_.data != nullptr ? &audio_owned_ : nullptr;
-    std::vector<uint8_t> bytes = mux_webm_vp8(width_, height_, num_frames_, fps_, audio, get_vp8);
+    std::vector<uint8_t> bytes = mux_webm(width_, height_, num_frames_, fps_, audio, use_vp9_, get_frame);
 
     spool_in_.close();
     std::error_code ec;

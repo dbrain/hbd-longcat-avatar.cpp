@@ -238,6 +238,33 @@ if(SD_WEBM)
     else()
         message(WARNING "Opus not found: WebM audio falls back to raw PCM (silent in browsers)")
     endif()
+
+    # libvpx for VP9 10-bit video. When present, WebM output is real VP9 (BT.709/limited, constant
+    # quality) instead of the libwebp→VP8-keyframe hack; when absent it falls back to VP8.
+    set(SD_VPX_FOUND FALSE)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(Vpx IMPORTED_TARGET GLOBAL vpx)
+    endif()
+    if(Vpx_FOUND)
+        add_library(vpx ALIAS PkgConfig::Vpx)
+        set(SD_VPX_FOUND TRUE)
+    else()
+        find_path(VPX_INCLUDE_DIR NAMES vpx/vpx_encoder.h)
+        find_library(VPX_LIBRARY NAMES vpx)
+        if(VPX_INCLUDE_DIR AND VPX_LIBRARY)
+            add_library(vpx UNKNOWN IMPORTED GLOBAL)
+            set_target_properties(vpx PROPERTIES
+                IMPORTED_LOCATION "${VPX_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${VPX_INCLUDE_DIR}")
+            set(SD_VPX_FOUND TRUE)
+        endif()
+    endif()
+    if(SD_VPX_FOUND)
+        message(STATUS "libvpx found: WebM video will be VP9 10-bit")
+    else()
+        message(WARNING "libvpx not found: WebM video falls back to VP8 (8-bit, larger, milky blacks)")
+    endif()
 endif()
 
 set(SD_LIB stable-diffusion)

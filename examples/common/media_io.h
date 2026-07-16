@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -92,11 +93,17 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images,
                                                           const sd_audio_t* audio = nullptr,
                                                           bool consume_image_data = false);
 
-// Streaming WebM encoder. Encodes+spools each frame's VP8 keyframe to disk as it arrives so the
-// caller never has to hold the whole decoded timeline in RAM; finalize() replays the spool through
-// the same mux core the whole-array encoder uses (byte-identical output) with the length-matched
-// audio, and publishes the container atomically (.tmp→rename). Additive — the whole-array API is
-// unchanged. Not copyable (owns a spool + a buffered audio track).
+#ifdef SD_USE_VPX
+class Vp9Encoder;  // defined in media_io.cpp; held by pimpl so the header stays codec-agnostic
+#endif
+
+// Streaming WebM encoder. Encodes+spools each frame's encoded video packet to disk as it arrives so
+// the caller never has to hold the whole decoded timeline in RAM; finalize() replays the spool
+// through the same mux core the whole-array encoder uses with the length-matched audio, and
+// publishes the container atomically (.tmp→rename). With SD_USE_VPX it emits VP9 10-bit (a single
+// stateful encoder is fed the frames in arrival order; muxing replays the packets); otherwise it
+// falls back to per-frame VP8 keyframes. Additive — the whole-array API is unchanged. Not copyable
+// (owns a spool, a buffered audio track, and the encoder state).
 class IncrementalWebmWriter {
 public:
     IncrementalWebmWriter();
@@ -104,7 +111,7 @@ public:
     IncrementalWebmWriter(const IncrementalWebmWriter&)            = delete;
     IncrementalWebmWriter& operator=(const IncrementalWebmWriter&) = delete;
 
-    // Begin an encode targeting final_path (VP8 spool goes to final_path + ".vp8spool").
+    // Begin an encode targeting final_path (encoded packets spool to final_path + ".vspool").
     bool open(const std::string& final_path, int fps, int quality);
     // Encode one frame and append it to the spool. Output dims are captured from the first frame
     // (mirrors create_webm's images[0]). The caller retains ownership of `image` and frees it after.
@@ -129,6 +136,10 @@ private:
     int           num_frames_ = 0;
     bool          failed_     = false;
     sd_audio_t    audio_owned_{};  // owned deep copy (data via malloc/free)
+    bool          use_vp9_    = false;
+#ifdef SD_USE_VPX
+    std::unique_ptr<Vp9Encoder> vp9_;  // stateful VP9 encoder (null in VP8 fallback)
+#endif
 };
 #endif
 
