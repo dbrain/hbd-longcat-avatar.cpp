@@ -33,8 +33,9 @@ struct SegWebmWriter {
     std::mutex              m;
     std::condition_variable cv;
     struct Task {
-        int                     seg = 0;
-        std::vector<sd_image_t> frames;  // owned deep copies, freed after encode
+        int                     seg   = 0;
+        int                     stage = 0;  // 0 = final seg_<i>.webm; >0 = intermediate seg_<i>_stage<k>.webm
+        std::vector<sd_image_t> frames;     // owned deep copies, freed after encode
     };
     std::deque<Task> q;
     bool             busy = false;
@@ -58,7 +59,11 @@ struct SegWebmWriter {
                     q.pop_front();
                     busy = true;
                 }
-                std::string path  = dir + "/seg_" + std::to_string(t.seg) + ".webm";
+                // stage 0 = the final full-res per-segment webm (seg_<i>.webm, existing behaviour);
+                // stage>0 = an intermediate progressive-preview webm (seg_<i>_stage<k>.webm).
+                std::string path  = t.stage > 0
+                                        ? dir + "/seg_" + std::to_string(t.seg) + "_stage" + std::to_string(t.stage) + ".webm"
+                                        : dir + "/seg_" + std::to_string(t.seg) + ".webm";
                 auto        bytes = create_video_from_sd_images_to_vector(
                     "webm", t.frames.data(), (int)t.frames.size(), fps, quality, nullptr);
                 if (!bytes.empty()) {
@@ -85,8 +90,12 @@ struct SegWebmWriter {
         });
     }
 
-    void enqueue(int seg, const sd_image_t* fr, int n) {
-        {  // back-pressure: wait until the prior segment has drained
+    // stage 0 = the final per-segment webm (on_segment); stage>0 = an intermediate progressive
+    // preview (on_stage). Both share this one bounded writer: back-pressure keeps at most ~one
+    // segment's decoded frames in flight, so a mid-segment stage preview and the final segment webm
+    // never pile up. Copies the frames (the core frees the originals right after the callback).
+    void enqueue(int seg, const sd_image_t* fr, int n, int stage = 0) {
+        {  // back-pressure: wait until the prior task has drained
             std::unique_lock<std::mutex> lk(m);
             cv.wait(lk, [&] { return done || (q.empty() && !busy); });
             if (done) {
@@ -106,7 +115,7 @@ struct SegWebmWriter {
         }
         {
             std::lock_guard<std::mutex> lk(m);
-            q.push_back(Task{seg, std::move(copies)});
+            q.push_back(Task{seg, stage, std::move(copies)});
         }
         cv.notify_all();
     }
@@ -125,6 +134,18 @@ struct SegWebmWriter {
 
 void ltx_seg_webm_cb(int seg, const sd_image_t* frames, int n, void* user) {
     static_cast<SegWebmWriter*>(user)->enqueue(seg, frames, n);
+}
+
+// Progressive UPSCALE-STAGE preview (opt-in emit_stages). Fired from generate_video_ex mid-segment
+// after an intermediate stage's latent is VAE-decoded: stage_scale 1 = base (fast, low-res), 2 =
+// STAGE-0 refine. Banked to seg_<seg>_stage<scale>.webm off the GPU thread via the shared writer, so
+// the encode is CPU/background and never stalls the render. The final full-res webm still lands via
+// ltx_seg_webm_cb (seg_<seg>.webm). width/height are informational (the frames already carry them).
+void ltx_stage_webm_cb(int seg, int stage_scale, int width, int height,
+                       const sd_image_t* frames, int n, void* user) {
+    (void)width;
+    (void)height;
+    static_cast<SegWebmWriter*>(user)->enqueue(seg, frames, n, stage_scale);
 }
 
 // Kept alive by run_vid_chain_job while generate_video_chain is executing.
@@ -338,17 +359,24 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
         result["error"]  = nullptr;
     }
 
-    // Progressive per-segment previews (opt-in emit_segments). List every seg_<n>.webm the chain
-    // has banked so far so a client can play each shot as it lands. Read straight off the shared
-    // job dir here on the status HTTP thread — the partials NEVER ride the blocking render IPC
-    // channel. Present while Generating and once Completed; absent when no seg webms exist (the
-    // byte-identical off path). Cheap directory scan; skips the in-flight seg_<n>.webm.tmp files.
+    // Progressive previews (opt-in emit_segments / emit_stages). List every banked preview webm so a
+    // client can play each as it lands. Two shapes: seg_<n>.webm = the FINAL full-res shot (stage 4),
+    // and seg_<n>_stage<k>.webm = an intermediate WITHIN-shot upscale preview (stage k: 1=base low-res,
+    // 2=mid-res). Read straight off the shared job dir here on the status HTTP thread — the partials
+    // NEVER ride the blocking render IPC channel. Present while Generating and once Completed; absent
+    // when no preview webms exist (the byte-identical off path). Cheap directory scan; skips the
+    // in-flight *.webm.tmp files (they don't end in ".webm").
     if (!job.job_dir.empty() && (job.status == AsyncJobStatus::Generating ||
                                  job.status == AsyncJobStatus::Completed)) {
         static const std::string kPrefix = "seg_";
         static const std::string kSuffix = ".webm";
-        std::vector<int>         seg_indices;
-        std::error_code          ec;
+        struct PartialEntry {
+            int  seg;
+            int  stage;
+            bool staged;  // seg_<n>_stage<k>.webm vs the final seg_<n>.webm
+        };
+        std::vector<PartialEntry> entries;
+        std::error_code           ec;
         for (auto it = fs::directory_iterator(job.job_dir, ec);
              !ec && it != fs::directory_iterator(); it.increment(ec)) {
             if (!it->is_regular_file(ec)) {
@@ -358,26 +386,50 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
             if (name.size() <= kPrefix.size() + kSuffix.size() ||
                 name.compare(0, kPrefix.size(), kPrefix) != 0 ||
                 name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
-                continue;  // not seg_<n>.webm (also drops the seg_<n>.webm.tmp in-flight file)
+                continue;  // not seg_*.webm (also drops the seg_*.webm.tmp in-flight files)
             }
-            const std::string digits =
+            // core = the part between "seg_" and ".webm": "<n>" (final) or "<n>_stage<k>" (staged).
+            const std::string core =
                 name.substr(kPrefix.size(), name.size() - kPrefix.size() - kSuffix.size());
-            if (digits.find_first_not_of("0123456789") != std::string::npos) {
+            const std::string kStage = "_stage";
+            const size_t      sp     = core.find(kStage);
+            std::string       seg_d, stage_d;
+            bool              staged = false;
+            if (sp != std::string::npos) {
+                seg_d   = core.substr(0, sp);
+                stage_d = core.substr(sp + kStage.size());
+                staged  = true;
+                if (stage_d.empty() || stage_d.find_first_not_of("0123456789") != std::string::npos) {
+                    continue;
+                }
+            } else {
+                seg_d = core;
+            }
+            if (seg_d.empty() || seg_d.find_first_not_of("0123456789") != std::string::npos) {
                 continue;
             }
-            seg_indices.push_back(std::stoi(digits));
+            entries.push_back(PartialEntry{std::stoi(seg_d),
+                                           staged ? std::stoi(stage_d) : 4,  // final = 4x
+                                           staged});
         }
-        // Only add the "partials" key when at least one seg webm exists. With emit_segments off
-        // (and no env override) none are written, so the key is absent and the status JSON is
-        // byte-identical to today — never an empty "partials": [].
-        if (!seg_indices.empty()) {
-            std::sort(seg_indices.begin(), seg_indices.end());
+        // Only add the "partials" key when at least one preview webm exists. With both flags off (and
+        // no env override) none are written, so the key is absent and the status JSON is byte-identical
+        // to today — never an empty "partials": [].
+        if (!entries.empty()) {
+            std::sort(entries.begin(), entries.end(), [](const PartialEntry& a, const PartialEntry& b) {
+                return a.seg != b.seg ? a.seg < b.seg : a.stage < b.stage;
+            });
             json partials = json::array();
-            for (int n : seg_indices) {
+            for (const auto& e : entries) {
+                // Staged previews carry ?stage=<k>; the final shot keeps its plain URL (unchanged).
+                std::string url = "/sdcpp/v1/jobs/" + job.id + "/segments/" + std::to_string(e.seg);
+                if (e.staged) {
+                    url += "?stage=" + std::to_string(e.stage);
+                }
                 partials.push_back({
-                    {"segment_index", n},
-                    {"stage", 4},
-                    {"url", "/sdcpp/v1/jobs/" + job.id + "/segments/" + std::to_string(n)},
+                    {"segment_index", e.seg},
+                    {"stage", e.stage},
+                    {"url", url},
                 });
             }
             result["partials"] = std::move(partials);
@@ -901,12 +953,17 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // it on. When neither, on_segment stays null and frames flow only through the normal
     // stitch/streaming path (byte-identical: nothing extra is encoded and no partials appear).
     // (resume needs only the seg_<i>.bin latents, banked regardless of this flag.)
+    // emit_stages (opt-in) additionally banks intermediate progressive-preview webms
+    // (seg_<i>_stage<k>.webm — a fast low-res base, then the mid-res refine) WITHIN each shot so the
+    // client sees a rough preview ASAP that sharpens. It implies the per-segment final webm too (the
+    // stage-4 = seg_<i>.webm), so a full 1->2->4 ladder is available. Byte-identical when off.
     const bool emit_segments = body.value("emit_segments", false);
+    const bool emit_stages   = body.value("emit_stages", false);
     std::unique_ptr<SegWebmWriter> seg_writer;
     if (!job_dir.empty()) {
         const char* bank   = getenv("LTX_BANK_SEG_WEBM");
         const bool  env_on = (bank != nullptr) && (bank[0] != '0');
-        const bool  on     = emit_segments || env_on;
+        const bool  on     = emit_segments || emit_stages || env_on;
         if (on) {
             seg_writer          = std::make_unique<SegWebmWriter>();
             seg_writer->dir     = job_dir;
@@ -915,6 +972,13 @@ bool run_vid_chain_job(ServerRuntime& runtime,
             seg_writer->start();
             chain.on_segment      = &ltx_seg_webm_cb;
             chain.on_segment_user = seg_writer.get();
+            if (emit_stages) {
+                // Route the core's per-stage hook through the SAME bounded writer (base_params
+                // propagates on_stage into every per-segment vp; the chain sets vp.stage_seg_index).
+                base.emit_stages   = 1;
+                base.on_stage      = &ltx_stage_webm_cb;
+                base.on_stage_user = seg_writer.get();
+            }
         }
     }
 

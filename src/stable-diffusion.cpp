@@ -4233,6 +4233,10 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->hires.cfg                             = NAN;
     sd_vid_gen_params->hires_chain                           = nullptr;
     sd_vid_gen_params->hires_chain_count                     = 0;
+    sd_vid_gen_params->emit_stages                           = 0;
+    sd_vid_gen_params->on_stage                              = nullptr;
+    sd_vid_gen_params->on_stage_user                         = nullptr;
+    sd_vid_gen_params->stage_seg_index                       = 0;
     sd_cache_params_init(&sd_vid_gen_params->cache);
 }
 
@@ -5453,16 +5457,18 @@ static bool ltxav_chain_hires_reference_enabled() {
     return v == nullptr || (v[0] != '\0' && std::string(v) != "0");
 }
 
-// Opt-in (default OFF): re-pin the init/end/keyframe IDENTITY at each hires-chain refine stage's
-// FULL resolution, so the final upscale can't reroll the look from the low-res base pass. Stage 0
-// already re-pins (apply_ltxv_refine_image_conditioning); the later hires_chain stages (the 4x
-// output stage) do NOT — they SDEdit the upscaled latent with an all-ones mask, so the frozen
-// frame-0 image drifts. With this enabled the final stage(s) re-encode + re-pin the source image
-// at the stage resolution too (a single-frame VAE encode per stage; VRAM-modest). OFF =
-// byte-identical to the historical all-ones-mask refine.
+// Default ON (LTXAV_REFINE_HIRES_IDENTITY=0/false/no to disable): re-pin the init/end/keyframe
+// IDENTITY at each hires-chain refine stage's FULL resolution, so the final upscale can't reroll
+// the look from the low-res base pass. Stage 0 already re-pins (apply_ltxv_refine_image_conditioning);
+// the later hires_chain stages (the 4x output stage) do NOT by themselves — they SDEdit the upscaled
+// latent with an all-ones mask, so the frozen frame-0 image drifts. With this the final stage(s)
+// re-encode + re-pin the source image at the stage resolution (a single-frame VAE encode per stage;
+// VRAM-modest). Only fires for image-guide shots (i2v opener / scene cut / keyframes); continuation
+// and no-image shots are unaffected, so default-on is byte-identical for them.
 static bool ltxav_refine_hires_identity_enabled() {
     const char* v = std::getenv("LTXAV_REFINE_HIRES_IDENTITY");
-    return v != nullptr && v[0] != '0' && v[0] != 'f' && v[0] != 'F' && v[0] != 'n' && v[0] != 'N';
+    if (v == nullptr) return true;
+    return !(v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
 }
 
 // Append a frozen identity block to the LTXAV DiT sequence. Reference tensors are flattened
@@ -9451,6 +9457,75 @@ static sd::Tensor<float> upscale_ltx_spatial_video_latent(sd_ctx_t* sd_ctx,
     return upscaled;
 }
 
+// The LTX 2.3 temporal upscaler has a temporal pixel-shuffle followed by a
+// [1, end) temporal slice, so T input latent frames produce 2*T-1 output
+// latent frames.  This intentionally accepts VIDEO latents only: audio's
+// independently packed timeline is not resampled by this test-stage.
+static sd::Tensor<float> upscale_ltx_temporal_video_latent(sd_ctx_t* sd_ctx,
+                                                           const char* model_path,
+                                                           const sd::Tensor<float>& video_latent) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || video_latent.empty()) {
+        return {};
+    }
+    if (strlen(SAFE_STR(model_path)) == 0) {
+        LOG_ERROR("LTX latent temporal upscale requires a model path");
+        return {};
+    }
+    if (!sd_ctx->sd->ensure_backend_pair(SDBackendModule::UPSCALER)) {
+        return {};
+    }
+
+    const int64_t input_t = video_latent.shape()[2];
+    sd::Tensor<float> unnormalized = sd_ctx->sd->un_normalize_ltx_video_latents(video_latent);
+    if (unnormalized.empty()) {
+        LOG_ERROR("LTX latent un-normalization failed before temporal upscale");
+        return {};
+    }
+
+    std::shared_ptr<LTXVUpsampler::LatentUpsamplerRunner> upsampler = sd_ctx->sd->ltx_latent_upsampler;
+    const std::string requested_model_path = SAFE_STR(model_path);
+    if (!upsampler || sd_ctx->sd->ltx_latent_upsampler_path != requested_model_path) {
+        int64_t load_start = ggml_time_ms();
+        upsampler = std::make_shared<LTXVUpsampler::LatentUpsamplerRunner>(
+            sd_ctx->sd->backend_for(SDBackendModule::UPSCALER),
+            sd_ctx->sd->params_backend_for(SDBackendModule::UPSCALER));
+        const size_t max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(sd_ctx->sd->max_vram);
+        upsampler->set_max_graph_vram_bytes(max_graph_vram_bytes);
+        if (!upsampler->load_from_file(model_path, sd_ctx->sd->n_threads)) {
+            sd_ctx->sd->ltx_latent_upsampler.reset();
+            sd_ctx->sd->ltx_latent_upsampler_path.clear();
+            LOG_ERROR("load LTX temporal latent upsampler failed");
+            return {};
+        }
+        sd_ctx->sd->ltx_latent_upsampler      = upsampler;
+        sd_ctx->sd->ltx_latent_upsampler_path = requested_model_path;
+        LOG_INFO("[LTX_PHASE] temporal latent upsampler load/cache fill took %.3fs",
+                 (ggml_time_ms() - load_start) * 1.0f / 1000);
+    } else {
+        LOG_INFO("LTX temporal latent upsampler cache hit: %s", requested_model_path.c_str());
+    }
+
+    sd::Tensor<float> upscaled = upsampler->compute(sd_ctx->sd->n_threads, unnormalized);
+    upsampler->free_compute_buffer();
+    upsampler->release_all_gpu_param_residency();
+    if (upscaled.empty()) {
+        LOG_ERROR("LTX latent temporal upscale failed");
+        return {};
+    }
+    if (upscaled.shape()[2] != 2 * input_t - 1) {
+        LOG_ERROR("LTX temporal upscale returned unexpected latent T=%lld (expected %lld)",
+                  (long long)upscaled.shape()[2], (long long)(2 * input_t - 1));
+        return {};
+    }
+
+    upscaled = sd_ctx->sd->normalize_ltx_video_latents(upscaled);
+    if (upscaled.empty()) {
+        LOG_ERROR("LTX latent normalization failed after temporal upscale");
+        return {};
+    }
+    return upscaled;
+}
+
 // Two-stage lipdub (Change B helper): encode the relip reference video at `out_w x out_h`
 // (already the full target res / reference_downscale_factor), tile-encoded exactly like the
 // stage-1 relip encode block, then temporally subsampled by `ref_tstride`. Returns the
@@ -9754,6 +9829,17 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
         LOG_INFO("LTXV refine: re-applied %d timeline keyframe guide(s) at %dx%d",
                  sd_vid_gen_params->keyframes_size, image_width, image_height);
     } else if (sd_vid_gen_params->init_image.data != nullptr) {
+        // Frame 0 (the i2v opener) is normally pinned at strength 1.0 -> denoise mask 0.0, i.e.
+        // frozen: it is the only frame that skips the SDEdit refine's texture-harmonizing pass, so it
+        // comes out as a raw VAE round-trip of the init image (over-sharp "crunch") while every other
+        // frame gets the softer refined look. LTXAV_REFINE_INIT_STRENGTH < 1.0 lets the refine partially
+        // re-diffuse frame 0 so its texture matches its neighbours while still anchoring identity.
+        float init_strength = conditioning_strength;
+        if (const char* e = std::getenv("LTXAV_REFINE_INIT_STRENGTH")) {
+            init_strength = std::clamp(static_cast<float>(atof(e)), 0.f, 1.f);
+            LOG_INFO("LTXV refine init pin strength overridden -> %.3f (mask=%.3f) via LTXAV_REFINE_INIT_STRENGTH",
+                     init_strength, 1.f - init_strength);
+        }
         sd::Tensor<float> start_image = sd_image_to_tensor(sd_vid_gen_params->init_image, image_width, image_height);
         if (!apply_ltxav_condition_image_by_latent_index(sd_ctx,
                                                          start_image,
@@ -9761,7 +9847,7 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
                                                          &video_mask,
                                                          0,
                                                          "init",
-                                                         conditioning_strength)) {
+                                                         init_strength)) {
             return false;
         }
     }
@@ -10757,6 +10843,119 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
 
+    // ---- OPT-IN progressive UPSCALE-STAGE previews (emit_stages) ----
+    // Only meaningful when the caller asked for stage previews AND this is a real LTX refine render
+    // (base < final resolution); a no-refine render's single decode already IS the final output, so
+    // no BASE preview is emitted (byte-identical). The hook fires a fast low-res BASE preview here
+    // (before the first refine) and a mid-res STAGE-0 preview after the first refine on a >=2-stage
+    // chain. The FINAL full-res frames are the ordinary per-segment output (on_segment / frames_out),
+    // never re-decoded here.
+    const bool emit_stages_on = sd_vid_gen_params->emit_stages != 0 &&
+                                sd_vid_gen_params->on_stage != nullptr &&
+                                sd_version_is_ltxav(sd_ctx->sd->version) &&
+                                latent_refine_enabled;
+    // Re-evict the video+audio VAE after a valley decode, restoring exactly the headroom the
+    // following upscale/refine expects. Mirrors the LTXAV_VAE_LAZY eviction block; a no-op when the
+    // lever is off (the VAE was never evicted, so it must stay resident). Idempotent under a
+    // double-call (the refine's own 2nd eviction is then a no-op).
+    auto reevict_vae_lazy = [&]() {
+        if (!(ltxav_vae_lazy && sd_ctx->sd->first_stage_model)) {
+            return;
+        }
+        auto& vvae = sd_ctx->sd->first_stage_model;
+        auto& avae = sd_ctx->sd->audio_vae_model;
+        if (vvae->params_offloaded_to_host()) {
+            vvae->release_all_gpu_param_residency();
+            if (avae) {
+                avae->release_all_gpu_param_residency();
+            }
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
+            ggml_backend_cuda_release_cudnn_conv3d_weights();
+        } else if (sd_ctx->sd->resident_reload_loader) {
+            vvae->free_params_buffer();
+            if (avae) {
+                avae->free_params_buffer();
+            }
+        }
+    };
+    // Decode an intermediate stage latent to pixels and hand the frames to on_stage. The VAE was
+    // freed for the sample loop (LTXAV_VAE_LAZY prod recipe), so this runs in the VALLEY between
+    // sample stages: it (1) releases the DiT GPU residency — the surrounding refine path releases it
+    // at the very next stage boundary anyway (:free_dit_before_upscale / hires-chain handoff), so this
+    // just moves that release a few lines earlier so DiT+VAE peaks never stack; (2) reloads the VAE;
+    // (3) decodes a CLEAN video-only latent (audio channels + trailing guide frames + leading ref
+    // frames stripped, mirroring the refined_latent_lo export / final decode strips); (4) dispatches
+    // the frames (the callee copies them onto its own encoder thread); (5) re-evicts the VAE. All of
+    // this is skipped entirely when emit_stages is off, so the default path is byte-identical.
+    auto emit_stage_preview = [&](int stage_scale, const sd::Tensor<float>& raw_latent) {
+        if (!emit_stages_on || raw_latent.empty()) {
+            return;
+        }
+        int64_t stage_t0 = ggml_time_ms();
+        const int64_t     video_ch = sd_ctx->sd->get_latent_channel();
+        sd::Tensor<float> lat      = raw_latent;
+        if (lat.dim() > 3 && lat.shape()[3] > video_ch) {
+            lat = sd::ops::slice(lat, 3, 0, video_ch);
+        }
+        if (!final_latent_prestripped && latents.video_conditioning_frame_count > 0) {
+            int64_t target_frames = latents.video_target_frame_count > 0
+                                        ? latents.video_target_frame_count
+                                        : lat.shape()[2] - latents.video_conditioning_frame_count;
+            if (target_frames > 0 && target_frames <= lat.shape()[2]) {
+                lat = sd::ops::slice(lat, 2, 0, target_frames);
+            }
+        }
+        if (!final_latent_prestripped && latents.ref_image_num > 0 &&
+            latents.ref_image_num < lat.shape()[2]) {
+            lat = sd::ops::slice(lat, 2, latents.ref_image_num, lat.shape()[2]);
+        }
+        if (lat.empty() || lat.shape()[2] <= 0) {
+            return;
+        }
+        // (1) release the DiT so the valley decode never stacks DiT+VAE (host-offload re-offloads at
+        // the next sample; skip on GPU-resident params — no re-offload path).
+        if (sd_ctx->sd->diffusion_model &&
+            sd_ctx->sd->diffusion_model->params_offloaded_to_host()) {
+            sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
+            ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+        }
+        // (2) bring the VAE back (no-op if resident / the LAZY lever is off).
+        if (!sd_ctx->sd->reload_first_stage_model()) {
+            LOG_WARN("emit_stages: VAE reload for stage-%d preview failed; skipping this preview", stage_scale);
+            return;
+        }
+        // (3) decode the clean video-only latent to pixels.
+        sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(lat, true);
+        if (vid.empty()) {
+            LOG_WARN("emit_stages: stage-%d preview decode failed", stage_scale);
+            reevict_vae_lazy();
+            return;
+        }
+        int n = (int)vid.shape()[2];
+        int w = (int)vid.shape()[0];
+        int h = (int)vid.shape()[1];
+        if (n > 0) {
+            sd_image_t* imgs = (sd_image_t*)calloc((size_t)n, sizeof(sd_image_t));
+            if (imgs != nullptr) {
+                for (int i = 0; i < n; ++i) {
+                    imgs[i] = tensor_to_sd_image(vid, i);
+                }
+                // (4) dispatch — the callee (server) copies frames onto its background encoder.
+                sd_vid_gen_params->on_stage(sd_vid_gen_params->stage_seg_index, stage_scale, w, h,
+                                            imgs, n, sd_vid_gen_params->on_stage_user);
+                for (int i = 0; i < n; ++i) {
+                    free(imgs[i].data);
+                }
+                free(imgs);
+            }
+        }
+        // (5) restore the pre-refine headroom.
+        reevict_vae_lazy();
+        LOG_INFO("emit_stages: seg %d stage-%d preview (%dx%d, %d frames) decoded+dispatched in %.2fs",
+                 sd_vid_gen_params->stage_seg_index, stage_scale, w, h, n,
+                 (ggml_time_ms() - stage_t0) * 1.0f / 1000);
+    };
+
     // Stage-one timeline keyframes are appended guide tokens.  They must not be
     // spatially upscaled or treated as output frames: stage two re-encodes the
     // source images at its own resolution and passes those guides separately.
@@ -10800,6 +10999,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         chain_base_latent = final_latent;
         LOG_INFO("[LTX_PHASE] chain base latent capture took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
     }
+
+    // BASE stage preview (stage_scale 1): the fast low-res base latent, decoded BEFORE any refine so
+    // a client gets a rough preview as early as possible. No-op unless emit_stages was requested.
+    emit_stage_preview(1, final_latent);
 
     if (latent_refine_enabled) {
         int64_t refine_total_start = ggml_time_ms();
@@ -11794,6 +11997,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
+    // MID stage preview (stage_scale 2): the STAGE-0 (base*2, e.g. 960) refined latent, decoded after
+    // the first refine but BEFORE the next hires-chain upscale — the intermediate sharpen. Only fired
+    // on a genuine >=2-stage chain (else the first refine IS the final = the per-segment output, no
+    // intermediate). At this point final_latent is the STAGE-0 refined latent. No-op unless emit_stages.
+    if (emit_stages_on && latent_upscale_enabled && sd_vid_gen_params->hires_chain_count >= 2) {
+        emit_stage_preview(2, final_latent);
+    }
+
     // Stages after stage 0 intentionally use the same AV packing discipline as the
     // established refine path: upscale VIDEO while audio is separate, re-pack it,
     // then build a fresh audio-pinned SDEdit mask for that stage. The old single-hires
@@ -12142,6 +12353,53 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
+    // Test-only final temporal interpolation.  Keep this after all sampling/refine
+    // bookkeeping so its changed timeline never reaches RoPE, masks, or continuation
+    // state.  Audio has a separate packed timeline and is deliberately unsupported
+    // here rather than guessing a resampling rule.
+    bool temporal_upscale_applied = false;
+    const char* temporal_upscale_env = std::getenv("LTXAV_TEMPORAL_UPSCALE");
+    if (temporal_upscale_env != nullptr && temporal_upscale_env[0] != '\0' &&
+        std::string(temporal_upscale_env) != "0" && std::string(temporal_upscale_env) != "false") {
+        const int64_t video_channels = sd_ctx->sd->get_latent_channel();
+        const bool packed_audio_present = latents.audio_length > 0 &&
+                                          final_latent.dim() > 3 &&
+                                          final_latent.shape()[3] > video_channels;
+        const bool continuation_active = final_latent_out != nullptr ||
+                                         sd_vid_gen_params->cont_latent != nullptr ||
+                                         sd_vid_gen_params->cont_refine_latent != nullptr ||
+                                         sd_vid_gen_params->cont_refine_latent_lo != nullptr ||
+                                         sd_vid_gen_params->end_cont_latent != nullptr;
+        if (!sd_version_is_ltxav(sd_ctx->sd->version)) {
+            LOG_INFO("LTX temporal upscale skipped: non-LTXAV request");
+        } else if (continuation_active) {
+            LOG_INFO("LTX temporal upscale skipped: continuation/chain request unsupported in test build");
+        } else if (packed_audio_present) {
+            LOG_INFO("LTX temporal upscale skipped: audio present (unsupported in test build)");
+        } else {
+            constexpr const char* temporal_model_path =
+                "/models/ltx2/latent_upscale_models/ltx-2.3-temporal-upscaler-x2-1.0.safetensors";
+            const int64_t input_t = final_latent.shape()[2];
+            sd::Tensor<float> temporal_latent =
+                upscale_ltx_temporal_video_latent(sd_ctx, temporal_model_path, final_latent);
+            if (temporal_latent.empty()) {
+                LOG_ERROR("LTX temporal upscale failed; leaving final latent unchanged");
+            } else {
+                final_latent = std::move(temporal_latent);
+                temporal_upscale_applied = true;
+                // decode_video_outputs normally limits video to request.frames.
+                // This test stage intentionally returns the interpolated timeline.
+                if (latent_refine_enabled) {
+                    hires_request.frames = 0;
+                } else {
+                    request.frames = 0;
+                }
+                LOG_INFO("LTX temporal upscale: latent T=%d -> %d",
+                         (int)input_t, (int)final_latent.shape()[2]);
+            }
+        }
+    }
+
     // Return a second, video-only continuation state for the next segment's hires refine.
     // The ordinary final_latent_out intentionally remains the BASE-grid state, because it is
     // sampled at base resolution on the next segment. The refined state is only meaningful
@@ -12211,6 +12469,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (result == nullptr) {
         free_sd_audio(generated_audio);
         return false;
+    }
+    if (temporal_upscale_applied && num_frames_out != nullptr) {
+        LOG_INFO("LTX temporal upscale: final decoded frame count=%d", *num_frames_out);
     }
     LOG_INFO("[LTX_PHASE] video decode outputs total took %.3fs", (ggml_time_ms() - video_decode_start) * 1.0f / 1000);
 
@@ -13001,6 +13262,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return false;
         }
         sd_vid_gen_params_t vp = *base_params;  // per-segment copy of the template
+        vp.stage_seg_index     = seg;           // progressive stage previews (emit_stages) report THIS segment
         if (!chain_character_latent.empty()) {
             vp.character_reference_latent = chain_character_latent.data();
             vp.character_reference_latent_width = (int)chain_character_latent.shape()[0];
@@ -13983,6 +14245,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
         const bool          is_cont = (seg > 0);
         sd_vid_gen_params_t vp      = *base_params;
         vp.seed                     = (base_params->seed < 0) ? base_params->seed : base_params->seed + seg;
+        vp.stage_seg_index          = seg;  // stage previews (emit_stages) report THIS window (Wan has no refine → inert)
 
         if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[seg] != nullptr) {
             vp.prompt = chain_params->segment_prompts[seg];

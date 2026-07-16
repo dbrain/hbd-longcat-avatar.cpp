@@ -208,6 +208,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             // byte-identical (no seg encode, no partials). Normalize the default here so the
             // downstream reader (async_jobs.cpp) sees an explicit bool.
             chain["emit_segments"] = body.value("emit_segments", false);
+            // Progressive WITHIN-shot upscale-stage previews (opt-in). When true, the engine banks
+            // seg_<n>_stage<k>.webm (a fast low-res base, then the mid-res refine) as each shot renders,
+            // and the job status lists them under "partials" with their stage, so a client sees a rough
+            // preview ASAP that sharpens. Implies emit_segments' final per-shot webm too. Default false =
+            // byte-identical (no extra decode/encode, no stage partials).
+            chain["emit_stages"] = body.value("emit_stages", false);
             std::string output_format = body.value("output_format", std::string("webm"));
 
             // Register the job (assign an id) before touching the filesystem, so a fresh job's
@@ -362,11 +368,13 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(bytes, "video/webm");
     });
 
-    // GET /sdcpp/v1/jobs/{id}/segments/{n} — stream a finished per-segment preview webm
-    // (seg_<n>.webm) from the job's artifact dir. This is the progressive-delivery fetch: the
-    // client polls /sdcpp/v1/jobs/{id}, reads the "partials" list, and pulls each seg webm as it
-    // lands. 404 until that segment's atomic seg_<n>.webm exists. Mirrors the /media handler:
-    // resolve the dir from RAM (falling back to LTX_JOB_DIR/<id> after the in-RAM TTL) and stream.
+    // GET /sdcpp/v1/jobs/{id}/segments/{n}[?stage=<k>] — stream a banked preview webm from the job's
+    // artifact dir. Default / stage=4 = the FINAL full-res shot (seg_<n>.webm). ?stage=1 or 2 = an
+    // intermediate WITHIN-shot progressive preview (seg_<n>_stage<k>.webm: 1=base low-res, 2=mid-res),
+    // banked only when the request set emit_stages. This is the progressive-delivery fetch: the client
+    // polls /sdcpp/v1/jobs/{id}, reads the "partials" list (each carries its stage + url), and pulls
+    // each as it lands. 404 until that atomic webm exists. Mirrors the /media handler: resolve the dir
+    // from RAM (falling back to LTX_JOB_DIR/<id> after the in-RAM TTL) and stream.
     svr.Get(R"(/sdcpp/v1/jobs/([^/]+)/segments/(\d+))",
             [runtime](const httplib::Request& req, httplib::Response& res) {
         const std::string job_id = req.matches[1];
@@ -383,7 +391,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         if (dir.empty()) {
             dir = ltx_job_root() / job_id;  // job aged out of RAM; serve from disk
         }
-        fs::path        seg_webm = dir / ("seg_" + seg_n + ".webm");
+        // stage=4 (or absent) is the final seg_<n>.webm; stage 1/2 select the intermediate previews.
+        const std::string stage_q = req.has_param("stage") ? req.get_param_value("stage") : "";
+        fs::path          seg_webm;
+        if (!stage_q.empty() && stage_q != "4" &&
+            stage_q.find_first_not_of("0123456789") == std::string::npos) {
+            seg_webm = dir / ("seg_" + seg_n + "_stage" + stage_q + ".webm");
+        } else {
+            seg_webm = dir / ("seg_" + seg_n + ".webm");
+        }
         std::error_code ec;
         if (!fs::exists(seg_webm, ec)) {
             res.status = 404;

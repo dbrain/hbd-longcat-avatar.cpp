@@ -577,6 +577,24 @@ typedef struct {
     // Ordered LTXAV upscale + SDEdit-refine stages. NULL/0 preserves legacy `hires` exactly.
     const sd_hires_params_t* hires_chain;
     int hires_chain_count;
+    // OPT-IN progressive UPSCALE-STAGE previews. When emit_stages != 0 AND on_stage != NULL,
+    // generate_video_ex fires on_stage after each intermediate (pre-final) upscale stage's latent is
+    // VAE-decoded to pixels: the fast low-res BASE (stage_scale 1, before any refine) and, on a
+    // >=2-stage hires chain, the STAGE-0 mid-res refined latent (stage_scale 2) — so a client sees a
+    // rough preview early and it sharpens. The FINAL full-res stage is NOT fired here; it is the
+    // ordinary decoded output (per-segment on_segment / frames_out). `frames` stay owned by the core
+    // and are freed right after the call returns, so the callee MUST copy what it needs synchronously
+    // (the example layer hands them to a background webm encoder, like on_segment). stage_seg_index is
+    // the segment number reported (generate_video_chain sets it per segment; 0 for a lone generate).
+    // Default OFF is byte-identical: no extra VAE decode/encode runs. Each preview costs one VAE
+    // reload + a low-res decode + a re-eviction, serialized in the valley BETWEEN sample stages (with
+    // the DiT residency released) so it never coincides with the render's VRAM peak. LTXAV refine
+    // path only (emit_stages_on also requires latent_refine_enabled + an LTX model).
+    int emit_stages;
+    void (*on_stage)(int seg_index, int stage_scale, int width, int height,
+                     const sd_image_t* frames, int frame_count, void* user);
+    void* on_stage_user;
+    int   stage_seg_index;
 } sd_vid_gen_params_t;
 
 // LTXAV in-process multi-segment chain. Renders n_segments video segments with the DiT
