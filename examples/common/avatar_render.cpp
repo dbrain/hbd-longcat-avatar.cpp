@@ -119,12 +119,14 @@ bool render_avatar_to_video_bytes(sd_ctx_t* sd_ctx,
     SDImageVec results;
     sd_audio_t* generated_audio = nullptr;
     int num_results = 0;
+    int effective_output_fps = gen_params.fps;
 
     const int n_segments = std::max(1, gen_params.segments);
     if (n_segments == 1) {
         // Fast path — single render, just like the non-chain CLI branch.
         sd_image_t* generated_video = nullptr;
-        if (!generate_video(sd_ctx, &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
+        if (!generate_video(sd_ctx, &vid_gen_params, &generated_video, &num_results, &generated_audio,
+                            &effective_output_fps)) {
             generated_video = nullptr;
         }
         results.adopt(generated_video, num_results);
@@ -232,7 +234,7 @@ bool render_avatar_to_video_bytes(sd_ctx_t* sd_ctx,
             bool want_latent      = raw_latent || (use_ref_anchor && seg == 0);
             float* lat_out        = nullptr;
             int lw = 0, lh = 0, lt = 0, lc = 0;
-            if (!generate_video_ex(sd_ctx, &vid_gen_params, &seg_video, &seg_count, &seg_audio,
+            if (!generate_video_ex(sd_ctx, &vid_gen_params, &seg_video, &seg_count, &seg_audio, nullptr,
                                    want_latent ? &lat_out : nullptr,
                                    want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
                                    want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
@@ -335,7 +337,7 @@ bool render_avatar_to_video_bytes(sd_ctx_t* sd_ctx,
     out_bytes = create_video_from_sd_images_to_vector(output_format,
                                                       results.data(),
                                                       num_results,
-                                                      gen_params.fps,
+                                                      effective_output_fps,
                                                       output_quality,
                                                       generated_audio);
     free_sd_audio(generated_audio);

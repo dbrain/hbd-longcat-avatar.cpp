@@ -9916,6 +9916,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               sd_image_t** frames_out,
                               int* num_frames_out,
                               sd_audio_t** audio_out,
+                              int* output_fps,
                               float** final_latent_out,
                               int* latent_width_out,
                               int* latent_height_out,
@@ -9942,6 +9943,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     if (num_frames_out != nullptr) {
         *num_frames_out = 0;
+    }
+    int effective_output_fps = std::max(1, sd_vid_gen_params->fps);
+    if (output_fps != nullptr) {
+        *output_fps = effective_output_fps;
     }
     if (final_latent_out != nullptr) {
         *final_latent_out = nullptr;
@@ -12355,9 +12360,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 
     // Test-only final temporal interpolation.  Keep this after all sampling/refine
     // bookkeeping so its changed timeline never reaches RoPE, masks, or continuation
-    // state.  Audio has a separate packed timeline and is deliberately unsupported
-    // here rather than guessing a resampling rule.
+    // state. Audio is decoded before this stage and keeps its duration while the video
+    // switches to twice the presentation fps.
     bool temporal_upscale_applied = false;
+    bool temporal_upscale_audio_present = false;
     const char* temporal_upscale_env = std::getenv("LTXAV_TEMPORAL_UPSCALE");
     if (temporal_upscale_env != nullptr && temporal_upscale_env[0] != '\0' &&
         std::string(temporal_upscale_env) != "0" && std::string(temporal_upscale_env) != "false") {
@@ -12374,25 +12380,38 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             LOG_INFO("LTX temporal upscale skipped: non-LTXAV request");
         } else if (continuation_active) {
             LOG_INFO("LTX temporal upscale skipped: continuation/chain request unsupported in test build");
-        } else if (packed_audio_present) {
-            LOG_INFO("LTX temporal upscale skipped: audio present (unsupported in test build)");
         } else {
             constexpr const char* temporal_model_path =
                 "/models/ltx2/latent_upscale_models/ltx-2.3-temporal-upscaler-x2-1.0.safetensors";
             const int64_t input_t = final_latent.shape()[2];
+            sd::Tensor<float> video_latent = final_latent;
+            if (packed_audio_present) {
+                video_latent = sd::ops::slice(final_latent, 3, 0, video_channels);
+                LOG_INFO("LTX temporal upscale: audio present; stripped packed audio channels and upscaling VIDEO latent only");
+            }
             sd::Tensor<float> temporal_latent =
-                upscale_ltx_temporal_video_latent(sd_ctx, temporal_model_path, final_latent);
+                upscale_ltx_temporal_video_latent(sd_ctx, temporal_model_path, video_latent);
             if (temporal_latent.empty()) {
                 LOG_ERROR("LTX temporal upscale failed; leaving final latent unchanged");
             } else {
                 final_latent = std::move(temporal_latent);
                 temporal_upscale_applied = true;
+                temporal_upscale_audio_present = packed_audio_present;
                 // decode_video_outputs normally limits video to request.frames.
                 // This test stage intentionally returns the interpolated timeline.
                 if (latent_refine_enabled) {
                     hires_request.frames = 0;
                 } else {
                     request.frames = 0;
+                }
+                if (temporal_upscale_audio_present) {
+                    const int old_fps = effective_output_fps;
+                    effective_output_fps *= 2;
+                    if (output_fps != nullptr) {
+                        *output_fps = effective_output_fps;
+                    }
+                    LOG_INFO("LTX temporal upscale: audio present; output fps %d -> %d to preserve audio/video duration",
+                             old_fps, effective_output_fps);
                 }
                 LOG_INFO("LTX temporal upscale: latent T=%d -> %d",
                          (int)input_t, (int)final_latent.shape()[2]);
@@ -12471,7 +12490,15 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
     if (temporal_upscale_applied && num_frames_out != nullptr) {
-        LOG_INFO("LTX temporal upscale: final decoded frame count=%d", *num_frames_out);
+        if (temporal_upscale_audio_present) {
+            const double audio_duration = generated_audio != nullptr && generated_audio->sample_rate > 0
+                                              ? (double)generated_audio->sample_count / generated_audio->sample_rate
+                                              : 0.0;
+            LOG_INFO("LTX temporal upscale: final frames=%d fps=%d audio_duration=%.3fs",
+                     *num_frames_out, effective_output_fps, audio_duration);
+        } else {
+            LOG_INFO("LTX temporal upscale: final decoded frame count=%d", *num_frames_out);
+        }
     }
     LOG_INFO("[LTX_PHASE] video decode outputs total took %.3fs", (ggml_time_ms() - video_decode_start) * 1.0f / 1000);
 
@@ -12494,8 +12521,9 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,
                            int* num_frames_out,
-                           sd_audio_t** audio_out) {
-    return generate_video_ex(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out, audio_out,
+                           sd_audio_t** audio_out,
+                           int* output_fps) {
+    return generate_video_ex(sd_ctx, sd_vid_gen_params, frames_out, num_frames_out, audio_out, output_fps,
                              nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, nullptr,
                              nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -13523,7 +13551,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         float*      refined_lo_out = nullptr;
         int         rlow = 0, rloh = 0, rlot = 0, rloc = 0;
         bool        want_latent  = (seg + 1 < n_chain);
-        if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
+        if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio, nullptr,
                                want_latent ? &lat_out : nullptr,
                                want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
                                want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,
@@ -14352,7 +14380,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                    sd_ctx,
         float*      lat_out     = nullptr;
         int         lw = 0, lh = 0, lt = 0, lc = 0;
         const bool  want_latent = (seg + 1 < n_chain);
-        if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio,
+        if (!generate_video_ex(sd_ctx, &vp, &seg_video, &seg_count, &seg_audio, nullptr,
                                want_latent ? &lat_out : nullptr,
                                want_latent ? &lw : nullptr, want_latent ? &lh : nullptr,
                                want_latent ? &lt : nullptr, want_latent ? &lc : nullptr,

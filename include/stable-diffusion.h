@@ -775,7 +775,10 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,
                            int* num_frames_out,
-                           sd_audio_t** audio_out);
+                           sd_audio_t** audio_out,
+                           // Effective container fps for frames_out; normally the request fps.
+                           // May be NULL when the caller does not encode a container.
+                           int* output_fps);
 
 // Like generate_video, but for LongCat-Avatar continuation chaining it also returns
 // the final diffusion latent (caller-freed via free()) so the caller can feed the
@@ -787,6 +790,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               sd_image_t** frames_out,
                               int* num_frames_out,
                               sd_audio_t** audio_out,
+                              int* output_fps,
                               float** final_latent_out,
                               int* latent_width_out,
                               int* latent_height_out,
