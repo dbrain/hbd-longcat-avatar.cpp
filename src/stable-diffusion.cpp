@@ -10443,11 +10443,33 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     };
     if (final_latent.empty()) {
         const char* base_window_env = std::getenv("LTX_BASE_TEMPORAL_WINDOW");
+        // A char-reference block (latents.video_reference) and/or a PAST-ANCHOR continuation/keyframe
+        // guide (init_latent tail frames, => latents.video_positions non-empty) can now COMPOSE with
+        // base temporal windowing: each is re-attached to every tile below (bounded token cost).
+        // Previously any such conditioning DISABLED windowing and forced a single full-length base
+        // pass whose VRAM grows with segment length. audio_fixed is no longer a windowing PRECONDITION
+        // for the reference path — it only selects the audio denoise-mask value — so a char-ref t2v
+        // render (audio_fixed=false) can window too.
+        //
+        // The reference path re-maps positions by EXTRACTING the guide/char rows VERBATIM from
+        // latents.video_positions (never rebuilding them), so it is agnostic to the guide's RoPE
+        // convention (past-anchor continuation, keyframe indices, mixed Director guides). It is still
+        // gated to NON-v2v renders (control_frames_size==0 && v2v_mode==0): that excludes relip-lipdub
+        // (timeline-aligned reference; note its DEFAULT direct-audio mode does NOT set audio_positions,
+        // so audio_positions.empty() alone would not exclude it), SDEdit (v2v_mode==1) and guide-edit
+        // (v2v_mode==2), all of which keep the historical full pass byte-for-byte. vace_context and a
+        // separate audio_positions block (reference-audio lipdub) also remain hard-disabled.
+        const bool base_window_ref =
+            (!latents.video_positions.empty() || !latents.video_reference.empty()) &&
+            !latents.video_positions.empty() && sd_vid_gen_params->control_frames_size == 0 &&
+            sd_vid_gen_params->v2v_mode == 0;
+        const bool base_window_legacy_audio =
+            latents.audio_fixed && latents.video_positions.empty() && latents.video_reference.empty();
         const bool base_temporal_windowing = base_window_env != nullptr && base_window_env[0] != '\0' &&
                                              std::string(base_window_env) != "0" &&
-                                             sd_version_is_ltxav(sd_ctx->sd->version) && latents.audio_fixed &&
-                                             latents.video_positions.empty() && latents.audio_positions.empty() &&
-                                             latents.video_reference.empty() && latents.vace_context.empty() &&
+                                             sd_version_is_ltxav(sd_ctx->sd->version) &&
+                                             (base_window_legacy_audio || base_window_ref) &&
+                                             latents.audio_positions.empty() && latents.vace_context.empty() &&
                                              (x_t.dim() == 4 || (x_t.dim() == 5 && x_t.shape()[4] == 1)) &&
                                              x_t.shape()[2] > 1;
         if (!base_temporal_windowing) {
@@ -10465,15 +10487,50 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 temporal_overlap = std::max(1, std::atoi(overlap_env));
             }
             const int64_t total_frames = x_t.shape()[2];
-            temporal_window = std::clamp(temporal_window, 2, static_cast<int>(total_frames));
+            const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
+            // A continuation/keyframe guide lives as extra FROZEN frames at the TAIL of the video
+            // grid (init_latent); only the leading target frames are windowed. A char-ref block is
+            // separate (latents.video_reference) and never in the grid.
+            const int64_t base_guide_frames  = base_window_ref ? latents.video_conditioning_frame_count : 0;
+            const int64_t base_target_frames = total_frames - base_guide_frames;
+            const bool base_window_has_audio = latents.audio_length > 0 && x_t.shape()[3] > latent_channels;
+            const int64_t base_char_ref_tokens =
+                (base_window_ref && !latents.video_reference.empty()) ? latents.video_reference.shape()[0] : 0;
+            // Extraction invariant: video_positions must be exactly [main grid (total_frames) ++ char].
+            // If a caller ever lays it out differently, fall back to the full pass rather than corrupt
+            // RoPE — the windowed reference path relies on this contiguity.
+            const int64_t base_expected_pos_rows =
+                x_t.shape()[0] * x_t.shape()[1] * total_frames + base_char_ref_tokens;
+            const bool base_window_ref_layout_ok =
+                !base_window_ref ||
+                (!latents.video_positions.empty() &&
+                 latents.video_positions.shape()[2] == base_expected_pos_rows);
+            temporal_window =
+                std::clamp(temporal_window, 2, static_cast<int>(std::max<int64_t>(2, base_target_frames)));
             temporal_overlap = std::clamp(temporal_overlap, 1, temporal_window - 1);
             const int64_t stride = temporal_window - temporal_overlap;
-            const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
-            if (x_t.shape()[3] <= latent_channels) {
+            if (base_window_ref && (base_target_frames <= temporal_window || !base_window_ref_layout_ok)) {
+                // Single tile (or unexpected layout): identical to the historical full base pass.
+                if (!base_window_ref_layout_ok) {
+                    LOG_WARN("LTX base temporal-window: unexpected video_positions layout (%lld rows, expected "
+                             "%lld); using full base pass",
+                             (long long)latents.video_positions.shape()[2], (long long)base_expected_pos_rows);
+                }
+                final_latent = sample_base_window(x_t,
+                                                  std::move(noise),
+                                                  latents.denoise_mask,
+                                                  latents.audio_length,
+                                                  latents.video_positions,
+                                                  latents.audio_positions,
+                                                  latents.video_reference);
+            } else if (!base_window_has_audio && !base_window_ref) {
                 LOG_ERROR("LTX base temporal-window requires packed fixed driving audio");
             } else {
                 auto full_video = sd::ops::slice(x_t, 3, 0, latent_channels);
                 auto full_noise = sd::ops::slice(noise, 3, 0, latent_channels);
+                const int64_t Wl = full_video.shape()[0];
+                const int64_t Hl = full_video.shape()[1];
+                const int64_t video_ch = full_video.shape()[3];
                 // Keep I2V/keyframe locks from the packed stage-one mask. The
                 // per-window audio mask is rebuilt for each sliced audio span;
                 // only its leading video channels belong to this timeline.
@@ -10481,14 +10538,41 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 if (!latents.denoise_mask.empty()) {
                     full_video_denoise_mask = sd::ops::slice(latents.denoise_mask, 3, 0, latent_channels);
                 }
-                auto full_audio = unpack_ltxav_audio_latent(x_t, latents.audio_length, static_cast<int>(latent_channels));
-                if (full_audio.empty()) {
+                // The in-grid continuation/keyframe guide (init_latent tail, base_guide_frames) becomes
+                // a separate frozen reference GRID re-attached to EVERY tile; the flattened char-ref
+                // block keeps its own token rows. Positions are NOT rebuilt — the guide+char position
+                // rows are EXTRACTED VERBATIM from latents.video_positions (everything past the target
+                // block), so their exact RoPE convention (past-anchor / keyframe / mixed) is preserved
+                // and late tiles keep continuing the prior motion. Both blocks are bounded (guide K +
+                // char tokens), so per-window token count stays ~one window regardless of segment
+                // length — restoring the VRAM budget for char-ref/continuation renders.
+                sd::Tensor<float> guide_ref_grid;
+                if (base_guide_frames > 0) {
+                    guide_ref_grid = sd::ops::slice(full_video, 2, base_target_frames, total_frames);
+                }
+                const sd::Tensor<float>& char_ref_block = latents.video_reference;
+                const int64_t char_ref_tokens = char_ref_block.empty() ? 0 : char_ref_block.shape()[0];
+                // Guide (K frames) + char rows = everything after the windowed target block. Reused
+                // unchanged for every tile (the reference sits at fixed absolute positions).
+                sd::Tensor<float> reference_positions;
+                if (!latents.video_positions.empty()) {
+                    reference_positions = sd::ops::slice(latents.video_positions, 2, Wl * Hl * base_target_frames,
+                                                         latents.video_positions.shape()[2]);
+                }
+                sd::Tensor<float> full_audio;
+                if (base_window_has_audio) {
+                    full_audio =
+                        unpack_ltxav_audio_latent(x_t, latents.audio_length, static_cast<int>(latent_channels));
+                }
+                if (base_window_has_audio && full_audio.empty()) {
                     LOG_ERROR("LTX base temporal-window could not unpack driving audio latent");
                 } else {
                     sd::Tensor<float> video_result(full_video.shape());
                     video_result.fill_(0.0f);
-                    const int64_t plane = full_video.shape()[0] * full_video.shape()[1];
+                    const int64_t plane = Wl * Hl;
                     const int64_t audio_rate = 25;  // LTXAV audio latent tokens per second.
+                    // audio_fixed => hold driving audio (mask 0); otherwise generate audio (mask 1).
+                    const float audio_mask_value = latents.audio_fixed ? 0.0f : 1.0f;
                     int tile_index = 0;
                     int64_t produced_end = 0;
                     for (int64_t start = 0;; start += stride, ++tile_index) {
@@ -10497,10 +10581,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                         // window and use the already-sampled latent history as
                         // additional frozen context; only unseen tail frames are
                         // emitted below.
-                        const int64_t tile_start = start + temporal_window >= total_frames
-                                                       ? std::max<int64_t>(0, total_frames - temporal_window)
+                        const int64_t tile_start = start + temporal_window >= base_target_frames
+                                                       ? std::max<int64_t>(0, base_target_frames - temporal_window)
                                                        : start;
-                        const int64_t end = std::min<int64_t>(total_frames, tile_start + temporal_window);
+                        const int64_t end = std::min<int64_t>(base_target_frames, tile_start + temporal_window);
                         const int64_t length = end - tile_start;
                         const int64_t frozen = tile_index == 0
                                                    ? 0
@@ -10521,15 +10605,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                         // Each latent step advances eight display frames after the initial frame.
                         // Rebase both modalities to the local window while retaining the exact
                         // audio time slice that corresponds to these video frames.
-                        const int64_t pixel_start = tile_start * 8;
-                        const int64_t pixel_end = std::min<int64_t>(request.frames, (end - 1) * 8 + 1);
-                        const int64_t audio_start = std::clamp<int64_t>(
-                            (pixel_start * audio_rate) / request.fps, 0, full_audio.shape()[1]);
-                        const int64_t audio_end = std::clamp<int64_t>(
-                            (pixel_end * audio_rate + request.fps - 1) / request.fps,
-                            audio_start + 1,
-                            full_audio.shape()[1]);
-                        auto audio_tile = sd::ops::slice(full_audio, 1, audio_start, audio_end);
+                        int64_t audio_start = 0;
+                        int64_t audio_end   = 0;
+                        sd::Tensor<float> audio_tile;
+                        if (base_window_has_audio) {
+                            const int64_t pixel_start = tile_start * 8;
+                            const int64_t pixel_end = std::min<int64_t>(request.frames, (end - 1) * 8 + 1);
+                            audio_start = std::clamp<int64_t>(
+                                (pixel_start * audio_rate) / request.fps, 0, full_audio.shape()[1]);
+                            audio_end = std::clamp<int64_t>(
+                                (pixel_end * audio_rate + request.fps - 1) / request.fps,
+                                audio_start + 1,
+                                full_audio.shape()[1]);
+                            audio_tile = sd::ops::slice(full_audio, 1, audio_start, audio_end);
+                        }
                         // Preserve source/keyframe mask values instead of
                         // recreating a fully denoisable tile, then freeze the
                         // carried temporal overlap without changing audio.
@@ -10545,26 +10634,64 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                 }
                             }
                         }
-                        auto latent_tile = pack_ltxav_audio_and_video_latents(video_tile, audio_tile);
-                        auto packed_noise = pack_ltxav_audio_and_video_latents(noise_tile, audio_tile);
-                        auto mask_tile = pack_ltxav_audio_and_video_denoise_mask(video_mask, video_tile, audio_tile, 0.0f);
-                        auto video_positions = build_ltxav_window_video_positions(video_tile.shape()[0],
-                                                                                    video_tile.shape()[1],
-                                                                                    tile_start,
-                                                                                    length,
-                                                                                    request.fps,
-                                                                                    request.vae_scale_factor);
-                        auto audio_positions = build_ltxav_window_audio_positions(audio_start, audio_tile.shape()[1]);
-                        LOG_INFO("LTX base temporal-window tile %d: latent [%lld,%lld), frozen-overlap=%lld, audio [%lld,%lld)",
+                        sd::Tensor<float> latent_tile = base_window_has_audio
+                                                            ? pack_ltxav_audio_and_video_latents(video_tile, audio_tile)
+                                                            : video_tile;
+                        sd::Tensor<float> packed_noise = base_window_has_audio
+                                                             ? pack_ltxav_audio_and_video_latents(noise_tile, audio_tile)
+                                                             : noise_tile;
+                        sd::Tensor<float> mask_tile =
+                            base_window_has_audio
+                                ? pack_ltxav_audio_and_video_denoise_mask(video_mask, video_tile, audio_tile,
+                                                                          audio_mask_value)
+                                : video_mask;
+                        // Per-tile RoPE rows: the windowed target rows sliced VERBATIM from the full
+                        // video_positions (byte-identical to the full pass for these absolute frames),
+                        // then the extracted guide+char rows unchanged — matching the reference token
+                        // block assembled below token-for-token. No-reference tiles build target rows
+                        // directly (byte-identical to the historical audio-driven path).
+                        sd::Tensor<float> video_positions;
+                        if (base_window_ref) {
+                            auto target_positions = sd::ops::slice(latents.video_positions, 2,
+                                                                   Wl * Hl * tile_start, Wl * Hl * end);
+                            video_positions = reference_positions.empty()
+                                                  ? target_positions
+                                                  : sd::ops::concat(target_positions, reference_positions, 2);
+                        } else {
+                            video_positions = build_ltxav_window_video_positions(
+                                Wl, Hl, tile_start, length, request.fps, request.vae_scale_factor);
+                        }
+                        // Reference token block: a grid guide alone; the flattened char-ref alone; or
+                        // (both) the guide flattened + char-ref concatenated — matching the position
+                        // row order [target ++ guide ++ char] above.
+                        sd::Tensor<float> tile_reference;
+                        if (base_guide_frames > 0 && char_ref_tokens > 0) {
+                            auto guide_flat =
+                                guide_ref_grid.reshape({Wl * Hl * base_guide_frames, 1, 1, video_ch, 1});
+                            tile_reference = sd::ops::concat(guide_flat, char_ref_block, 0);
+                        } else if (base_guide_frames > 0) {
+                            tile_reference = guide_ref_grid;
+                        } else if (char_ref_tokens > 0) {
+                            tile_reference = char_ref_block;
+                        }
+                        sd::Tensor<float> audio_positions;
+                        int tile_audio_length = 0;
+                        if (base_window_has_audio) {
+                            audio_positions = build_ltxav_window_audio_positions(audio_start, audio_tile.shape()[1]);
+                            tile_audio_length = static_cast<int>(audio_tile.shape()[1]);
+                        }
+                        LOG_INFO("LTX base temporal-window tile %d: latent [%lld,%lld), frozen-overlap=%lld, "
+                                 "audio [%lld,%lld), guide=%lld charref=%lld",
                                  tile_index, (long long)tile_start, (long long)end, (long long)frozen,
-                                 (long long)audio_start, (long long)audio_end);
+                                 (long long)audio_start, (long long)audio_end,
+                                 (long long)base_guide_frames, (long long)char_ref_tokens);
                         auto tile = sample_base_window(latent_tile,
                                                        std::move(packed_noise),
                                                        mask_tile,
-                                                       static_cast<int>(audio_tile.shape()[1]),
+                                                       tile_audio_length,
                                                        video_positions,
                                                        audio_positions,
-                                                       sd::Tensor<float>());
+                                                       tile_reference);
                         // Each window may materialize a different graph-cut/shared-resident DiT
                         // set. Keeping that set across the next audio window accumulates several
                         // GiB of dead weights even though the host-offloaded model can re-stream
@@ -10590,8 +10717,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                             }
                         }
                         produced_end = std::max(produced_end, end);
-                        if (end == total_frames) {
-                            final_latent = pack_ltxav_audio_and_video_latents(video_result, full_audio);
+                        if (end == base_target_frames) {
+                            // Carry the frozen in-grid guide frames through unchanged so the emitted
+                            // latent keeps its historical [target + guide] shape for the downstream
+                            // crop keyed on video_conditioning_frame_count.
+                            if (base_guide_frames > 0) {
+                                const float* g = full_video.data();
+                                float* rd = video_result.data();
+                                for (int64_t channel = 0; channel < latent_channels; ++channel) {
+                                    for (int64_t local = 0; local < base_guide_frames; ++local) {
+                                        const int64_t f = base_target_frames + local;
+                                        std::memcpy(rd + plane * (f + total_frames * channel),
+                                                    g + plane * (f + total_frames * channel),
+                                                    static_cast<size_t>(plane) * sizeof(float));
+                                    }
+                                }
+                            }
+                            final_latent = base_window_has_audio
+                                               ? pack_ltxav_audio_and_video_latents(video_result, full_audio)
+                                               : video_result;
                             break;
                         }
                     }
