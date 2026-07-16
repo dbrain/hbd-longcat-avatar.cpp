@@ -341,7 +341,6 @@ bool execute_img_gen_job(ServerRuntime& runtime,
 
     SDImageVec results;
 
-    std::string chain_default_variant;
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = generate_image(runtime.sd_ctx, &params);
@@ -490,6 +489,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // because ensure_variant_loaded takes that same mutex internally. koblem calls
     // /v1/admin/unload before the edit render, so the swap re-forks/loads the edit DiT
     // fresh. Validation mirrors the FLUX route so the error text matches.
+    std::string chain_default_variant;
     {
         std::string want_variant;  // empty = keep whatever DiT is loaded (base) — byte-identical
         if (body.contains("model") && body["model"].is_string()) {
