@@ -11067,6 +11067,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 }
             }
             sd_ctx->sd->diffusion_model->set_refine_resident_scope(true);
+            // The base pass deliberately keeps its full hot DiT residency for speed.
+            // Return that stale base residency before the first high-resolution
+            // sample materialises the DiT under its bounded refine policy.
+            if (sd_ctx->sd->diffusion_model->params_offloaded_to_host()) {
+                sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
+                ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+                LOG_INFO("LTXAV refine handoff: released full base DiT GPU residency before bounded refine reuse");
+            }
         }
 
         LOG_INFO("[LTX_PHASE] refine setup total before sample took %.3fs", (ggml_time_ms() - refine_total_start) * 1.0f / 1000);
@@ -11479,11 +11487,42 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (hires_chain_enabled) {
         for (int stage_index = 1; stage_index < sd_vid_gen_params->hires_chain_count; ++stage_index) {
             const sd_hires_params_t& stage = sd_vid_gen_params->hires_chain[stage_index];
+            // Each later SDEdit stage is a same-model transition.  Release the
+            // prior stage's full DiT residency before reserving the larger graph.
+            if (sd_ctx->sd->diffusion_model) {
+                sd_ctx->sd->diffusion_model->set_refine_resident_scope(true);
+                if (sd_ctx->sd->diffusion_model->params_offloaded_to_host()) {
+                    sd_ctx->sd->diffusion_model->release_all_gpu_param_residency();
+                    ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
+                    LOG_INFO("LTXAV hires-chain handoff: released full DiT GPU residency before stage %d bounded reuse",
+                             stage_index);
+                }
+            }
             sd::Tensor<float> stage_latent = upscale_ltx_spatial_video_latent(sd_ctx, stage.model_path,
                                                                                 final_latent, latents.audio_length);
             if (stage_latent.empty()) {
                 LOG_ERROR("LTX hires_chain stage %d upscale failed", stage_index);
                 return false;
+            }
+            // The spatial upscaler has re-offloaded the VAE for its encode pass.
+            // Refinement is latent-only, so that GPU residency is dead until final
+            // decode and must not coexist with the high-resolution DiT graph.
+            if (ltxav_vae_lazy &&
+                sd_version_is_ltxav(sd_ctx->sd->version) &&
+                sd_ctx->sd->first_stage_model &&
+                sd_ctx->sd->first_stage_model->params_offloaded_to_host()) {
+                sd_ctx->sd->first_stage_model->release_all_gpu_param_residency();
+                if (sd_ctx->sd->audio_vae_model) {
+                    sd_ctx->sd->audio_vae_model->release_all_gpu_param_residency();
+                }
+                ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
+                ggml_backend_cuda_release_cudnn_conv3d_weights();
+                LOG_INFO("LTXAV hires-chain stage %d: released VAE GPU residency before latent refine",
+                         stage_index);
+            }
+            if (sd_ctx->sd->diffusion_model) {
+                sd_ctx->sd->diffusion_model->free_streaming_scratch_buffers();
+                ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::DIFFUSION));
             }
             GenerationRequest stage_request = hires_request;
             stage_request.hires = stage;
@@ -11558,6 +11597,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 return false;
             }
             hires_request = std::move(stage_request);
+        }
+        if (sd_ctx->sd->diffusion_model) {
+            sd_ctx->sd->diffusion_model->set_refine_resident_scope(false);
         }
     }
 
