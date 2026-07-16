@@ -1978,6 +1978,49 @@ public:
             return false;
         }
 
+        // 5. Re-register the INCOMING gguf's nvfp4 per-tensor weight globals.
+        //    Boot registers these ONLY for diffusion_model_path / high_noise_diffusion_model_path
+        //    (see the dit_legs block at load). Every selectable DiT — "base", "edit" and each
+        //    --diffusion-model-variants entry — is hot-swapped through here instead
+        //    (build_model_variants, examples/server/runtime.cpp), so without this an UNFOLDED
+        //    import swapped in as a variant kept the BOOT model's map: nvfp4_weight_global_for()
+        //    missed every tensor, defaulted w_global to 1.0, and the weights ran ~2688x too large
+        //    -> pure white frames, silently, with no warning.
+        //    CLEAR FIRST: g_wglobal is process-global, so an unfolded -> folded swap must not
+        //    leave the outgoing globals registered (a folded gguf folds its global into the block
+        //    scale and would be scaled twice). A folded gguf exports no .wglobal -> empty map ->
+        //    nothing re-registered -> w_global stays 1.0 = byte-identical legacy behaviour.
+        {
+            ggml_cuda_nvfp4_clear_weight_globals();
+            std::map<std::string, float> wglobals;
+            load_nvfp4_weight_globals(new_diffusion_model_path, wglobals);
+            const std::string pfx = "model.diffusion_model.";
+            size_t n_reg = 0;
+            for (auto& kv : dit_tensors) {
+                if (wglobals.empty()) {
+                    break;
+                }
+                const std::string& full = kv.first;
+                if (full.compare(0, pfx.size(), pfx) != 0 || kv.second == nullptr) {
+                    continue;
+                }
+                const std::string bare = full.substr(pfx.size());
+                auto it = wglobals.find(bare + ".wglobal");
+                if (it != wglobals.end()) {
+                    // Same belt-and-suspenders keying as the boot path: the FP4 GEMM looks up
+                    // src0->name, which may be the ggml (truncated) name, the prefixed key, or
+                    // the bare stem depending on the offload/mmap path. Extra keys are harmless.
+                    ggml_cuda_nvfp4_register_weight_global(kv.second->name, it->second);
+                    ggml_cuda_nvfp4_register_weight_global(full.c_str(), it->second);
+                    ggml_cuda_nvfp4_register_weight_global(bare.c_str(), it->second);
+                    ++n_reg;
+                }
+            }
+            LOG_INFO("swap_diffusion_model: nvfp4 weight globals re-registered %zu/%zu for '%s'%s",
+                     n_reg, wglobals.size(), new_diffusion_model_path.c_str(),
+                     wglobals.empty() ? " (folded gguf: none present, w_global=1.0)" : "");
+        }
+
         LOG_INFO("swap_diffusion_model: loaded DiT from '%s' (mmap=%d), taking %.2fs",
                  new_diffusion_model_path.c_str(),
                  (int)dit_swap_enable_mmap,
