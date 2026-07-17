@@ -127,7 +127,17 @@ struct ChainInput {
     // the model pixal3d's own Python pipeline runs (5 global tokens + proj_linear over the stage3b proj cond).
     // Everything downstream (denorm, tex decoder, bake) is identical — this swaps ONLY the generative model,
     // so it is a clean A/B. tex_flow_w overrides the weight dir/basename for whichever mode is selected.
-    bool tex_proj = false;
+    // DEFAULT = true (PROJ-mode) since 2026-07-17. Owner-judged on the eye-test A/B (proj vs cross,
+    // matched F16 weights, seed 42, identical mesh both sides): "they all look about the same with
+    // slightly different lighting... the proj-mode (gilly's model) is the very very mildly best... so
+    // yeah default should be proj". It is ALSO what committed HEAD always shipped -- cross-mode was an
+    // uncommitted working-tree swap (`git log -S'trellis2_tex_1024'` is empty) -- and it is ~12% faster
+    // (tex DiT 157.7s vs 178.7s; 5 KV tokens vs 4101).
+    // The A/B settled a bigger question: the model swap is NOT the cause of the texture quality gap.
+    // That was the bake fraying material boundaries (fixed by --tex-volume-direct: 5.13% -> 0.74% bad
+    // texels) plus the subject (gilly is anime cel-shaded, ~95% flat colour fields, so the volume's
+    // band-limiting costs her almost nothing). `--tex-dit cross` A/Bs back.
+    bool tex_proj = true;
     std::string tex_flow_w;                       // "" = the mode's default (TEXFLOW_W / TEXFLOW_PROJ_W)
     bool watertight = true;                       // A1: close the dual-grid holes (interim hack path)
     bool remesh = false;                          // A1: QEM-decimate the dual-grid mesh (non-manifold-tolerant)

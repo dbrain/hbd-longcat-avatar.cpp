@@ -43,3 +43,8 @@ thirdparty/instant-meshes/
 # root-owned nsys/ncu profiling output from the docker bench runs (the rules above only cover
 # bench/results/). Big, regenerable, and not ours to commit.
 /m3b_*
+
+# Working notes: handoffs, status boards, research, scopes. NEVER committed -- this is a public repo,
+# and these go stale in place and then eat an agent's context before it touches any code. Keep them
+# next to the work so they are findable, but out of history so they can't be merged or rot in it.
+/notes/
