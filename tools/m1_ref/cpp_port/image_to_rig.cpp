@@ -31,6 +31,7 @@
 #include "glb_rigged_textured.hpp"     // write_rigged_textured_glb
 #include "rig_transfer.hpp"            // transfer_skin
 #include "rig_pipeline.hpp"            // run_rig_pipeline
+#include "rig_bone_names.hpp"          // name_bones + falsify_bone_names (standard bone naming)
 #include "mesh_sample.hpp"             // prep_mesh_for_rig_inmem, normalize_mesh
 #include "p3sam_segment.hpp"           // P3-SAM part segmentation (native, --part-retopo)
 #include "per_part_decimate.hpp"       // region-adaptive per-part decimation (hands kept dense)
@@ -56,6 +57,12 @@ static void usage() {
            "        [--r1w <dir>] [--qwen3 <dir>] [--skin-vae <dir>] [--beams N] [--rig-seed N]\n"
            "        [--rig-sample]  (stochastic scaffold recipe do_sample=true beams=10; default is\n"
            "                         deterministic beam=20 = fan-free rig)\n"
+           "        [--no-bone-names] [--bone-names mixamo|smpl] [--bone-facing +z|-z]\n"
+           "                         (standard bone naming, ON by default: anonymous bone_N is\n"
+           "                          retargetable by nothing. Names are derived from skeleton\n"
+           "                          structure + rest geometry and falsified before the write.\n"
+           "                          --bone-facing overrides the auto-derived facing, which is what\n"
+           "                          decides LEFT vs RIGHT; env RIG_BONE_FACING does the same)\n"
            "        [--part-retopo] [--p3sam-weights <dir>] [--obj-decimate <path>]\n"
            "                         (native P3-SAM finger-preserving per-part decimation before bake;\n"
            "                          CPU correctness-port, slow, OFF by default — GPU port = perf TODO)\n"
@@ -88,9 +95,11 @@ static void usage() {
            "                          sets the nearest-voxel search radius (default 8 in direct mode, 0 in\n"
            "                          the snap modes = today's behaviour); r=0 in direct mode reproduces\n"
            "                          the historic BLACK-TEXTURE bug.)\n"
-           "        [--tex-project] [--tex-back <img>] [--tex-view <yaw_deg> <img>]...\n"
+           "        [--tex-project] [--tex-front <img>] [--tex-back <img>] [--tex-view <yaw_deg> <img>]...\n"
            "                         (texture by PROJECTING the real images into the UV atlas instead of\n"
-           "                          sampling TRELLIS's soft PBR volume: front = --image, back = optional\n"
+           "                          sampling TRELLIS's soft PBR volume: front = --image (or --tex-front,\n"
+           "                          a TEXTURE-ONLY front source in the SAME camera frame -- e.g. an\n"
+           "                          sd-delight de-lit --image; geometry always keeps --image), back = optional\n"
            "                          --tex-back (sugar for --tex-view 180). --tex-view is REPEATABLE and\n"
            "                          takes any yaw about +Y (e.g. --tex-view 90 right.png), so side views\n"
            "                          can be added as they become available. Z-buffered occlusion +\n"
@@ -169,6 +178,13 @@ int main(int argc, char** argv) {
     std::string dump_geo, from_geo;
     bool no_rig = false;
     uint64_t rig_seed = 0;
+    // Standard bone naming (ON by default -- an anonymous bone_N rig cannot take a Mixamo or
+    // AMASS clip without a human hand-mapping it, which is the whole point of rigging).
+    //   --no-bone-names   keep anonymous bone_N
+    //   --bone-names smpl|mixamo   emit SMPL-H 22 names instead of Mixamo (default mixamo)
+    //   --bone-facing +z|-z        override the auto-derived facing (which decides LEFT/RIGHT)
+    bool bone_names = true, bone_names_smpl = false;
+    int  bone_facing = 0;   // 0 = auto-derive from the feet
     // --part-retopo: native P3-SAM part segmentation -> region-adaptive per-part decimation
     // (hands/fingers kept dense, hair/torso crushed) BEFORE texture bake, replacing the flat decimate.
     // CPU correctness-first port (validated cos 1.0 backbone/heads); GPU port = perf follow-up, so it
@@ -217,6 +233,13 @@ int main(int argc, char** argv) {
     // `--tex-view 90 right.png --tex-view -90 left.png` needs no code change here).
     bool tex_project = false;
     std::string tex_back;
+    // --tex-front: use a DIFFERENT image than --image as the front projection source. Geometry and
+    // texturing already consume different tensors (geometry gets the resized + ImageNet-normalized
+    // img512_raw/img1024_raw; projection gets pcfg.front_img -> stbi_load at native res); they share
+    // only this path variable. Splitting it lets the front be de-lit (sd-delight) while geometry keeps
+    // the LIT original it was validated on -- i.e. de-lighting cannot regress TRELLIS by construction.
+    // MUST be the same camera frame as --image (same crop/scale), so in practice: a processed --image.
+    std::string tex_front;
     std::vector<texproj::ViewSpec> tex_views;
     // --quad: rung-2 quad retopology (quadwild-bimdf) on the refined mesh -> clean field-aligned topology,
     // TRIANGULATED for the tri-only bake/rig/glb downstream. Shell-out (no linking). OFF by default while
@@ -235,7 +258,14 @@ int main(int argc, char** argv) {
         if      (a == "--model" && i+1 < argc) model = argv[++i];
         else if (a == "--image" && i+1 < argc) image = argv[++i];
         else if (a == "--out"   && i+1 < argc) out = argv[++i];
-        else if (a == "--fov"   && i+1 < argc) cam = std::atof(argv[++i]) * (float)M_PI / 180.0f;
+        // cam and dist are THE SAME PARAMETER: DEF_DIST == 0.5/tan(DEF_CAM/2) to 7 d.p. (1.3021560).
+        // DEF_DIST was never a measured constant -- it is the canonical "unit-diameter object exactly
+        // fills the frame" render convention. Setting cam WITHOUT dist breaks the identity and turns a
+        // perspective change into a ZOOM: measured on the soldier, --moge's 46.5deg made the model
+        // +16% BIGGER (extents x1.164/1.159/1.146, shape unchanged to ~1%) and pushed 23,336 verts
+        // through the canonical box floor at Y <= -0.4999 -- a flat plane where the boots should be.
+        // That is what OOM'd the refine (bigger subject -> N1 1227->1701 -> M 12541->18674 -> M^2).
+        else if (a == "--fov"   && i+1 < argc) { cam = std::atof(argv[++i]) * (float)M_PI / 180.0f; dist = 0.5f / std::tan(cam * 0.5f); }
         else if (a == "--cam"   && i+3 < argc) { cam = std::atof(argv[++i]); dist = std::atof(argv[++i]); ms = std::atof(argv[++i]); }
         else if (a == "--texsize" && i+1 < argc) texsize = std::atoi(argv[++i]);
         else if (a == "--decimate" && i+1 < argc) decimate = std::atoi(argv[++i]);
@@ -252,6 +282,9 @@ int main(int argc, char** argv) {
         else if (a == "--beams" && i+1 < argc) num_beams = std::atoi(argv[++i]);
         else if (a == "--rig-sample") { rig_sample = true; if (num_beams == 20) num_beams = 10; }
         else if (a == "--rig-seed" && i+1 < argc) rig_seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--no-bone-names") bone_names = false;
+        else if (a == "--bone-names" && i+1 < argc) { std::string v = argv[++i]; bone_names_smpl = (v == "smpl"); }
+        else if (a == "--bone-facing" && i+1 < argc) { bone_facing = (argv[++i][0] == '-') ? -1 : +1; }
         else if (a == "--part-retopo") part_retopo = true;
         else if (a == "--p3sam-weights" && i+1 < argc) p3sam_w = argv[++i];
         else if (a == "--obj-decimate" && i+1 < argc) obj_decimate = argv[++i];
@@ -276,6 +309,7 @@ int main(int argc, char** argv) {
         else if (a == "--tex-volume-direct") tex_volume_direct = true;
         else if (a == "--tex-fallback-r" && i+1 < argc) tex_fallback_r = std::atoi(argv[++i]);
         else if (a == "--tex-project") tex_project = true;
+        else if (a == "--tex-front" && i+1 < argc) tex_front = argv[++i];
         else if (a == "--tex-back" && i+1 < argc) tex_back = argv[++i];
         else if (a == "--tex-view" && i+2 < argc) {
             texproj::ViewSpec vs;
@@ -329,7 +363,12 @@ int main(int argc, char** argv) {
     if (use_moge) {
         double t_m = pix::now_s();
         float ang = moge::estimate_cam_angle_x(image, moge_w, use_cuda, true);
-        if (ang > 0.05f && ang < 3.0f) { cam = ang; printf("  [0/4] MoGe camera: fov=%.4frad (%.2fdeg)  (%.1fs)\n", cam, cam*180.0f/(float)M_PI, pix::now_s()-t_m); }
+        // MUST set dist with cam -- they are the same parameter (see the --fov note above). MoGe even
+        // COMPUTES this and we were throwing it away: its logged fx_norm=1.163723 IS 0.5/tan(ang/2)
+        // = 1.163724. Without this line --moge is a zoom, not a camera, and it clips the model through
+        // the floor of the canonical box and then OOMs the refine.
+        if (ang > 0.05f && ang < 3.0f) { cam = ang; dist = 0.5f / std::tan(cam * 0.5f);
+            printf("  [0/4] MoGe camera: fov=%.4frad (%.2fdeg) dist=%.6f  (%.1fs)\n", cam, cam*180.0f/(float)M_PI, dist, pix::now_s()-t_m); }
         else printf("  [0/4] MoGe returned implausible fov=%.4f — keeping cam=%.4f\n", ang, cam);
     }
 
@@ -542,13 +581,16 @@ int main(int argc, char** argv) {
         double t_proj = pix::now_s();
         texproj::Cfg pcfg;
         pcfg.cam = cam; pcfg.dist = dist; pcfg.ms = ms;
-        pcfg.front_img = image;
+        // --tex-front overrides the front source; geometry above still ran on `image` (the lit original).
+        pcfg.front_img = tex_front.empty() ? image : tex_front;
         pcfg.back_img  = tex_back;
         pcfg.views     = tex_views;              // extra non-front, non-back yaws (repeatable --tex-view)
         pcfg.verbose   = true;
         pcfg.debug_dir = stage_dir;              // empty = no debug dumps (env TEXPROJ_DEBUG_DIR overrides)
         texproj::Stats ps;
         if (!texproj::project_onto(bt, pcfg, &ps)) { printf("FAIL: tex projection\n"); return 1; }
+        if (!tex_front.empty())
+            printf("         front source: %s (--tex-front; geometry used %s)\n", tex_front.c_str(), image.c_str());
         std::string vdesc = "front";
         if (!tex_back.empty()) vdesc += "+back";
         for (const auto& v : tex_views) vdesc += "+yaw" + std::to_string((int)std::lround(v.yaw_deg));
@@ -629,13 +671,41 @@ int main(int argc, char** argv) {
     std::vector<float> dst_w;
     rig::transfer_skin(P.vertices, R.skin_pred, R.J, verts_norm, dst_w, 4);
 
+    // ---------- name the bones to a standard humanoid convention (automatic) ----------
+    // SkinTokens emits anonymous bone_0..bone_N, which no Mixamo/AMASS clip can retarget
+    // onto. Derive standard names from the skeleton's structure + rest geometry, then run
+    // the falsifier so a wrong answer is LOUD instead of silent. Naming never blocks the
+    // write: a rig we cannot name still ships with bone_N names, just un-retargetable.
+    std::vector<std::string> jnames;
+    {
+        rig::NameOpts no;
+        no.style = bone_names_smpl ? rig::NameStyle::SmplH : rig::NameStyle::Mixamo;
+        no.facing_override = bone_facing;
+        if (!bone_names) {
+            printf("  [4/4] bone naming: DISABLED (--no-bone-names) -> anonymous bone_N\n");
+        } else {
+            rig::BoneNaming BN = rig::name_bones(R.joints, R.parents, no);
+            if (!BN.ok) {
+                printf("  [4/4] bone naming: FAILED (%s) -> falling back to anonymous bone_N\n",
+                       BN.fail_reason.c_str());
+            } else {
+                int fails = rig::falsify_bone_names(R.joints, R.parents, BN, true);
+                printf("  [4/4] bone naming: %s core=%d/22 fingers=%d extra=%d facing=%+dZ\n",
+                       fails ? "FALSIFIED (names kept; TRUST THEM AT YOUR OWN RISK)" : "clean",
+                       BN.named_core, BN.named_fingers, BN.n_extra, BN.facing);
+                jnames = BN.names;
+            }
+        }
+    }
+
     // baseColor RGBA atlas -> PNG (the only texture the rigged-textured writer carries, matching combine).
     std::vector<uint8_t> base_png = glb::encode_png(bt.base_color.data(), bt.tw, bt.th, 4);
     bool have_nrm = bt.normals.size() == bt.verts.size();
     bool ok = glb::write_rigged_textured_glb(out.c_str(), verts_norm, faces64, bt.uvs,
                                              R.joints, R.parents, dst_w,
                                              have_nrm ? &bt.normals : nullptr,
-                                             base_png.data(), base_png.size(), "image/png");
+                                             base_png.data(), base_png.size(), "image/png",
+                                             jnames.empty() ? nullptr : &jnames);
     if (!ok) { printf("FAIL: write_rigged_textured_glb\n"); return 1; }
     printf("==== DONE -> %s  (verts=%zu faces=%zu J=%d, %.1fs total) ====\n",
            out.c_str(), verts_norm.size()/3, faces64.size()/3, R.J, pix::now_s() - t_geo);

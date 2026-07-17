@@ -115,13 +115,35 @@ inline void rig_topk4(const std::vector<float>& skin_weights, uint32_t V, uint32
     }
 }
 
+// Escape a bone name for embedding in the glTF JSON chunk. Standard names (mixamorig:Hips)
+// need nothing, but never trust a name we did not generate to be JSON-safe.
+inline std::string json_escape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                if ((unsigned char)c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+                else o += c;
+        }
+    }
+    return o;
+}
+
+// joint_names: optional [J] names for the joint nodes. nullptr (or wrong size) => "bone_<j>".
 inline bool write_rigged_glb(const char* path,
                              const std::vector<float>&   verts,        // V*3
                              const std::vector<int64_t>& faces,        // F*3
                              const std::vector<float>&   joints,       // J*3 world
                              const std::vector<int>&     parents,      // J, root=-1
                              const std::vector<float>&   skin_weights, // V*J row-major
-                             const std::vector<float>*   normals = nullptr) {
+                             const std::vector<float>*   normals = nullptr,
+                             const std::vector<std::string>* joint_names = nullptr) {
     const uint32_t V  = (uint32_t)(verts.size() / 3);
     const uint32_t F3 = (uint32_t)faces.size();   // index count = F*3
     const uint32_t J  = (uint32_t)(joints.size() / 3);
@@ -215,10 +237,13 @@ inline bool write_rigged_glb(const char* path,
 
     // nodes
     js += "\"nodes\":[";
+    const bool have_names = joint_names && joint_names->size() == J;
     for (uint32_t j = 0; j < J; j++) {
-        int n = snprintf(buf, sizeof(buf),
-            "{\"name\":\"bone_%u\",\"translation\":[%.8g,%.8g,%.8g]",
-            j, locals[j*3+0], locals[j*3+1], locals[j*3+2]);
+        std::string jname = have_names ? json_escape((*joint_names)[j])
+                                       : ("bone_" + std::to_string(j));
+        js += "{\"name\":\"" + jname + "\",";
+        int n = snprintf(buf, sizeof(buf), "\"translation\":[%.8g,%.8g,%.8g]",
+                         locals[j*3+0], locals[j*3+1], locals[j*3+2]);
         if (n < 0 || n >= (int)sizeof(buf)) return false;
         js += buf;
         if (!children[j].empty()) {
