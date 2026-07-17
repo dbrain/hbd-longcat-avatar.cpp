@@ -17,6 +17,7 @@ enum SDVersion {
     VERSION_SD1_TINY_UNET,
     VERSION_SD2,
     VERSION_SD2_INPAINT,
+    VERSION_SD2_PIX2PIX,
     VERSION_SD2_TINY_UNET,
     VERSION_SDXS_512_DS,
     VERSION_SDXS_09,
@@ -61,7 +62,7 @@ static inline bool sd_version_is_sd1(SDVersion version) {
 }
 
 static inline bool sd_version_is_sd2(SDVersion version) {
-    if (version == VERSION_SD2 || version == VERSION_SD2_INPAINT || version == VERSION_SD2_TINY_UNET || version == VERSION_SDXS_09) {
+    if (version == VERSION_SD2 || version == VERSION_SD2_INPAINT || version == VERSION_SD2_PIX2PIX || version == VERSION_SD2_TINY_UNET || version == VERSION_SDXS_09) {
         return true;
     }
     return false;
@@ -228,7 +229,16 @@ static inline bool sd_version_is_dit(SDVersion version) {
 }
 
 static inline bool sd_version_is_unet_edit(SDVersion version) {
-    return version == VERSION_SD1_PIX2PIX || version == VERSION_SDXL_PIX2PIX;
+    return version == VERSION_SD1_PIX2PIX || version == VERSION_SD2_PIX2PIX || version == VERSION_SDXL_PIX2PIX;
+}
+
+// The image-latent semantics of diffusers' StableDiffusionInstructPix2PixPipeline: the
+// conditioning image latent is the posterior MODE (not a gaussian sample) and is NOT
+// multiplied by the VAE scaling factor.
+// SDXL ip2p (CosXL edit) is DELIBERATELY excluded -- it samples the posterior and does
+// apply the scaling factor -- so this must not be folded into sd_version_is_unet_edit().
+static inline bool sd_version_is_sd_unet_edit(SDVersion version) {
+    return version == VERSION_SD1_PIX2PIX || version == VERSION_SD2_PIX2PIX;
 }
 
 static inline bool sd_version_is_control(SDVersion version) {
