@@ -141,6 +141,30 @@ static inline ggml_tensor* us_dit_self_attn(M1Harness& H, ggml_context* ctx, con
     kh = us_dit_rms(ctx, kh, H.weight(p + "k_norm.weight"), cfg.qk_eps);
     qh = us_rope_apply(ctx, qh, rcos, rsin);
     kh = us_rope_apply(ctx, kh, rcos, rsin);
+
+    // USR_DIT_FLASH (opt-in, default OFF -> byte-identical to prod): fuse the refine DiT self-attention
+    // with ggml_flash_attn_ext. This is the S=8192 self-attn whose dense [S, S, heads] fp32 scores
+    // tensor is ~4.3 GB = the pipeline's VRAM PEAK (held ~813s), and it never flashed because this call
+    // site passes no mask. Flash removes the scores tensor entirely (VRAM) and fuses the softmax (time).
+    // fp32 accumulation kept; only K/V storage is f16. Null mask safe (S=8192 is x256). V is power-of-2
+    // pre-scaled (exact in f16) against the documented low-t V-overflow NaN (m1_ggml.hpp attention()).
+    static const bool dit_flash = getenv("USR_DIT_FLASH") != nullptr;
+    if (dit_flash) {
+        const int64_t d = qh->ne[0], nhd = qh->ne[1], tq = qh->ne[2];
+        ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, qh, 0, 2, 1, 3));   // [d, S, head] F32
+        ggml_tensor* kf = ggml_cont(ctx, ggml_permute(ctx, kh, 0, 2, 1, 3));
+        ggml_tensor* vf = ggml_cont(ctx, ggml_permute(ctx, vh, 0, 2, 1, 3));
+        const float vsc = 1.0f / 64.0f;
+        vf = ggml_scale(ctx, vf, vsc);
+        kf = ggml_cast(ctx, kf, GGML_TYPE_F16);
+        vf = ggml_cast(ctx, vf, GGML_TYPE_F16);
+        ggml_tensor* r = ggml_flash_attn_ext(ctx, qf, kf, vf, nullptr, cfg.attn_scale(), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);
+        ggml_tensor* o = ggml_cont_2d(ctx, r, d * nhd, tq);
+        o = ggml_scale(ctx, o, 1.0f / vsc);
+        return lin(ctx, H.weight(p + "out_proj.weight"), H.weight(p + "out_proj.bias"), o);
+    }
+
     ggml_tensor* o = attention(ctx, qh, kh, vh, cfg.attn_scale());    // [2048, S]
     return lin(ctx, H.weight(p + "out_proj.weight"), H.weight(p + "out_proj.bias"), o);
 }
