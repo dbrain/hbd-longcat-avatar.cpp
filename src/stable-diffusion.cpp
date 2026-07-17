@@ -2905,6 +2905,20 @@ public:
                      nag_scale, nag_alpha, nag_tau, nag_until_sigma);
         }
 
+        // FNV-1a over a host tensor's raw f32 bytes. Free: these tensors are ALREADY on the host
+        // (compute() returns them), so hashing adds no sync and cannot perturb GPU timing — which
+        // matters, because a probe that adds a sync can suppress the very race it is hunting.
+        auto ltx_tensor_fnv1a = [](const sd::Tensor<float>& t) -> uint64_t {
+            uint64_t h       = 1469598103934665603ULL;
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(t.data());
+            const size_t n   = static_cast<size_t>(t.numel()) * sizeof(float);
+            for (size_t i = 0; i < n; i++) {
+                h ^= p[i];
+                h *= 1099511628211ULL;
+            }
+            return h;
+        };
+
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             // Cooperative cancel: client disconnected mid-render. Bail before launching
             // this step's DiT compute. An empty pred makes sample_k_diffusion yield an
@@ -3094,6 +3108,103 @@ public:
                 if (output_opt.empty()) {
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
+                }
+
+                // LTX_DIT_STEP_HASH=1: log a hash of EVERY step's DiT output during a real render.
+                // Diff two same-seed renders' logs -> the FIRST step whose hash differs = where the
+                // divergence is born. This is the companion to LTX_DIT_SELFCHECK and covers exactly
+                // what the self-check CANNOT: the self-check re-runs one forward in a loop, which
+                // reuses already-streamed weights (measured: 1.79s/iter vs a real step's 5.43s), so
+                // it is blind to anything born in the per-step weight OFFLOAD, and it only ever
+                // probes the single step it fires on. This sees every step, on the true path, at
+                // zero added sync.
+                if (const char* e_sh = getenv("LTX_DIT_STEP_HASH"); e_sh && atoi(e_sh)) {
+                    LOG_INFO("[DIT_STEPHASH] step=%d sigma=%.6f numel=%lld hash=%016llx",
+                             step, (double)sigma, (long long)output_opt.numel(),
+                             (unsigned long long)ltx_tensor_fnv1a(output_opt));
+                }
+
+                // LTX_DIT_SELFCHECK=N: re-run THIS forward N times on bit-identical inputs and hash
+                // each output, stopping at the first mismatch.
+                //
+                // Why this and not "render twice, diff the latents": a render is a 51s, 8-step
+                // chaotic trajectory, so a divergence is only observable AFTER amplification and
+                // could have been born in any of ~12k FP8 calls, the sampler, the RNG, the VAE, or
+                // the offload. Here the inputs (x/timesteps/context/audio) are the SAME OBJECTS,
+                // the weights are untouched, and no sampler state advances between iterations — so
+                // a hash mismatch localises nondeterminism to ONE forward pass and nothing else.
+                // A match is not proof of determinism (the rate is per-call, so keep N high); a
+                // MISMATCH is proof, and it is what we want to catch.
+                //
+                // Pair with LTX_DIT_STOP_AT_BLOCK=N to bisect WHICH block first goes unstable
+                // (that env truncates the net after block N and runs the real tail, so it survives
+                // the offload graph-cut that prunes plain capture_tensor taps — see ltxv.hpp:2172).
+                //
+                // Cost: fires ONCE per process — on the first forward, or on
+                // LTX_DIT_SELFCHECK_STEP if set — then N pure forwards. Zero cost unless set.
+                {
+                    static int s_sc      = -1;
+                    static int s_sc_step = -1;
+                    if (s_sc < 0) {
+                        const char* e  = getenv("LTX_DIT_SELFCHECK");
+                        s_sc           = (e && atoi(e) > 0) ? atoi(e) : 0;
+                        // -1 (default) = fire on the FIRST forward, whatever it is numbered.
+                        // NB sampler steps here are 1-BASED and `step` can be NEGATIVE (the sign is
+                        // a flag — see the std::abs(step) at the sa3_step_policy block), so a
+                        // `step == 0` gate silently never fires. Compare on abs(), and default to
+                        // "first call" rather than to a step number that may not exist.
+                        const char* es = getenv("LTX_DIT_SELFCHECK_STEP");
+                        s_sc_step      = (es && *es) ? atoi(es) : -1;
+                    }
+                    static bool s_sc_done = false;
+                    if (s_sc > 0 && !s_sc_done &&
+                        (s_sc_step < 0 || std::abs(step) == s_sc_step)) {
+                        s_sc_done = true;
+                        const uint64_t h0 = ltx_tensor_fnv1a(output_opt);
+                        LOG_INFO("[DIT_SELFCHECK] step=%d numel=%lld iters=%d ref_hash=%016llx",
+                                 step, (long long)output_opt.numel(), s_sc, (unsigned long long)h0);
+                        int diverged_at = -1;
+                        for (int it = 1; it < s_sc && diverged_at < 0; it++) {
+                            auto o = work_diffusion_model->compute(n_threads, diffusion_params);
+                            if (o.empty()) {
+                                LOG_ERROR("[DIT_SELFCHECK] iter=%d compute failed", it);
+                                break;
+                            }
+                            const uint64_t h = ltx_tensor_fnv1a(o);
+                            if (h != h0) {
+                                diverged_at = it;
+                                // Report WHERE in the tensor, and by how much: a 1-ULP wobble and a
+                                // NaN/inf cascade are different bugs and must not be conflated.
+                                int64_t first = -1, ndiff = 0;
+                                float maxabs = 0.f;
+                                for (int64_t i = 0; i < o.numel(); i++) {
+                                    const float a = output_opt.data()[i], b = o.data()[i];
+                                    if (memcmp(&a, &b, sizeof(float)) != 0) {
+                                        if (first < 0) first = i;
+                                        ndiff++;
+                                        const float d = fabsf(a - b);
+                                        if (d > maxabs) maxabs = d;
+                                    }
+                                }
+                                LOG_ERROR("[DIT_SELFCHECK] DIVERGED iter=%d hash=%016llx != ref=%016llx",
+                                          it, (unsigned long long)h, (unsigned long long)h0);
+                                LOG_ERROR("[DIT_SELFCHECK]   ndiff=%lld/%lld first_idx=%lld max_abs_delta=%.6g",
+                                          (long long)ndiff, (long long)o.numel(), (long long)first, (double)maxabs);
+                                if (first >= 0) {
+                                    LOG_ERROR("[DIT_SELFCHECK]   ref[%lld]=%.9g  run[%lld]=%.9g",
+                                              (long long)first, (double)output_opt.data()[first],
+                                              (long long)first, (double)o.data()[first]);
+                                }
+                            } else {
+                                LOG_INFO("[DIT_SELFCHECK] iter=%d hash=%016llx OK", it,
+                                         (unsigned long long)h);
+                            }
+                        }
+                        if (diverged_at < 0) {
+                            LOG_INFO("[DIT_SELFCHECK] %d/%d forwards bit-identical (NOT proof of "
+                                     "determinism — the rate is per-call)", s_sc, s_sc);
+                        }
+                    }
                 }
 
                 step_cache.after_condition(&condition, noised_input, output_opt);
@@ -10648,7 +10759,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // ptr) holds orphaned buffers from the prior segment. Free them now or they leak
             // ~1.4 GB/segment on a continuation. Zero perf cost (they re-reorder at decode anyway).
             ggml_backend_cuda_release_cudnn_conv3d_weights();
-            LOG_INFO("LTXAV_VAE_LAZY: released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv3d reorder weights before DiT sample+refine; re-offload from host at decode");
+            // Same hazard, same boundary, for the cuDNN *2D*-conv reorder cache: it is keyed by
+            // the same now-stale weight pointers. Empty (free) unless this VAE runs conv2d-direct
+            // (--vae-conv-direct / GGML_CUDNN_CONV); wired here so enabling that lever can never
+            // silently reintroduce the leak — or a stale hit on a recycled address.
+            ggml_backend_cuda_release_cudnn_conv2d_weights();
+            LOG_INFO("LTXAV_VAE_LAZY: released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv2d/conv3d reorder weights before DiT sample+refine; re-offload from host at decode");
         } else if (sd_ctx->sd->resident_reload_loader) {
             // Regime (B): free the GPU-resident buffers; reload from disk before decode.
             size_t freed = vvae->get_params_buffer_size();
@@ -11251,6 +11367,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             }
             ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
             ggml_backend_cuda_release_cudnn_conv3d_weights();
+            ggml_backend_cuda_release_cudnn_conv2d_weights();
         } else if (sd_ctx->sd->resident_reload_loader) {
             vvae->free_params_buffer();
             if (avae) {
@@ -11945,7 +12062,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // Same reason as the first eviction: VAE param pointers are now stale, so free the
             // cuDNN conv3d reorder-weight buffers keyed by those pointers (else ~1.4 GB/segment leak).
             ggml_backend_cuda_release_cudnn_conv3d_weights();
-            LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv3d reorder weights before the hires/refine sample; re-offload from host at decode");
+            ggml_backend_cuda_release_cudnn_conv2d_weights();
+            LOG_INFO("LTXAV_VAE_LAZY: re-released offloaded video+audio VAE GPU params (runtime + shared-resident) + trimmed VAE pool + freed conv2d/conv3d reorder weights before the hires/refine sample; re-offload from host at decode");
             LOG_INFO("[LTX_PHASE] pre-refine VAE re-eviction took %.3fs", (ggml_time_ms() - phase_t0) * 1.0f / 1000);
         }
 
@@ -12486,6 +12604,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 }
                 ggml_backend_cuda_trim_pools(sd_ctx->sd->backend_for(SDBackendModule::VAE));
                 ggml_backend_cuda_release_cudnn_conv3d_weights();
+                ggml_backend_cuda_release_cudnn_conv2d_weights();
                 LOG_INFO("LTXAV hires-chain stage %d: released VAE GPU residency before latent refine",
                          stage_index);
             }
