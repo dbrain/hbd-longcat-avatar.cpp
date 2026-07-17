@@ -14,7 +14,18 @@
 | decode speed (clean rig) | 5.2 tok/s | **~30–32 tok/s (≈6×)** |
 | decode speed (long/malformed) | ~3 tok/s | 16.4 tok/s |
 | runaways @2048 | n/a (couldn't run) | **0/10** (all seeds terminate) |
-| quality | locked baseline | tightest/most Python-like distribution (see below) |
+| quality | locked baseline | forward-faithful + distribution-parity; **structural parity NOT reached** (see Quality status) |
+
+## Quality status (honest) — perf done, rigging NOT fully done
+The perf pass is forward-faithful (tfprobe KL 0.0006/step) and matches Python's *distribution* (termination
+rate, joint-count range, ~2 malformed). It does **NOT** reproduce Python's clean tight **42–56 / 61-joint
+structure**: on golden cond the C++ runs busier/wider (J 23–81 across variants) with some asymmetric seeds —
+visible in `:8013/rig_perf.html` (skeletons overlaid in the textured gilly mesh). This is the residual
+**beam-search / structure** gap (the prior session's "J-creep"), independent of the perf work. NOTE: the
+perf pass moved fp32-KV → f16-KV for the 2048 budget, which slightly widened the spread — but **fp32-KV is
+NOT the fix**: with the VRAM headroom, fp32-KV @2048 was re-tested (fits 6.9 GB) and gave NO quality gain
+(3 malformed vs 2, still not Python-tight). Precision is ruled out; keep f16-KV (4.5 GB). The structure gap
+is the next agent's job #1 (HANDOFF-rig-next.md).
 
 The model is small (**~425 M params, 1.7 GB fp32 on disk, ~1.7 GB resident** — embed_tokens stays
 host-side). **VRAM was never the model — it was the KV cache:** 2·num_beams+1 = 21 caches × 589 MB
