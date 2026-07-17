@@ -50,7 +50,9 @@ inline bool write_rigged_textured_glb(const char* path,
                                       const std::vector<float>*    normals,
                                       const uint8_t*               tex_png,
                                       size_t                       tex_png_len,
-                                      const char*                  mime = "image/png") {
+                                      const char*                  mime = "image/png",
+                                      // optional [J] joint node names; nullptr => "bone_<j>"
+                                      const std::vector<std::string>* joint_names = nullptr) {
     const uint32_t V  = (uint32_t)(verts.size() / 3);
     const uint32_t F3 = (uint32_t)faces.size();   // index count = F*3
     const uint32_t J  = (uint32_t)(joints.size() / 3);
@@ -142,10 +144,13 @@ inline bool write_rigged_textured_glb(const char* path,
 
     // nodes
     js += "\"nodes\":[";
+    const bool have_names = joint_names && joint_names->size() == J;
     for (uint32_t j = 0; j < J; j++) {
-        int n = snprintf(buf, sizeof(buf),
-            "{\"name\":\"bone_%u\",\"translation\":[%.8g,%.8g,%.8g]",
-            j, locals[j*3+0], locals[j*3+1], locals[j*3+2]);
+        std::string jname = have_names ? json_escape((*joint_names)[j])
+                                       : ("bone_" + std::to_string(j));
+        js += "{\"name\":\"" + jname + "\",";
+        int n = snprintf(buf, sizeof(buf), "\"translation\":[%.8g,%.8g,%.8g]",
+                         locals[j*3+0], locals[j*3+1], locals[j*3+2]);
         if (n < 0 || n >= (int)sizeof(buf)) return false;
         js += buf;
         if (!children[j].empty()) {
