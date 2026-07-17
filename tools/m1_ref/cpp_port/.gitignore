@@ -6,9 +6,9 @@
 # test_p3sam_segment / p3sam_retopo; svae_cuda.o linked into pixal3d) — without this line the build
 # depends on files git is configured never to see, and a clean clone does not compile.
 !*.cu
-# Docs. These were invisible for the whole life of this dir, which is HOW work got forgotten: the
-# handoff recording that the animation tools were never wired into the pipeline was itself ignored.
-!*.md
+# NOTE: *.md is deliberately NOT whitelisted. This is a public repo, and handoff/status docs go stale
+# in place, then burn an agent's context before it touches anything. Working notes live in the
+# gitignored /notes/ dir at the repo root instead.
 !*.sh
 !*.py
 !.gitignore
