@@ -148,7 +148,10 @@ static void bbox_canon_onto(std::vector<float>& v, const std::vector<float>& ref
 }
 
 int main(int argc, char** argv) {
-    setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+    // Correctness-first: fp32 matmul accumulation, no TF32 (TF32's ~1e-2 noise flips occupancy-threshold
+    // voxels). overwrite=0 so a caller CAN relax it (export NVIDIA_TF32_OVERRIDE=1) for the perf A/B --
+    // pixal3d.cpp:67's sibling comment already says "perf phase relaxes". Default stays 0.
+    setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
     std::string model, image, out;
     std::string r1w     = "/mnt/hdd/3d/avatar-shootout/rig_audit/r1w_real";
     std::string qwen3_w = "/mnt/hdd/3d/avatar-shootout/rig_audit/inputs/qwen3_w";

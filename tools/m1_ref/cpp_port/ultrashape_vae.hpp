@@ -123,6 +123,37 @@ static inline ggml_tensor* us_cross_attn(M1Harness& H, ggml_context* ctx, const 
     ggml_tensor* v = vs_take_head_slice(ctx, kv, hd, nh, 2, 1);
     qh = us_qk_ln(ctx, qh, H.weight(ap + "attention.q_norm.weight"), H.weight(ap + "attention.q_norm.bias"), cfg.ln_eps);
     k  = us_qk_ln(ctx, k,  H.weight(ap + "attention.k_norm.weight"), H.weight(ap + "attention.k_norm.bias"), cfg.ln_eps);
+
+    // USR_DECODE_FLASH (opt-in, default OFF -> byte-identical to prod): fuse this cross-attention with
+    // ggml_flash_attn_ext instead of the dense QK^T -> soft_max_f32 -> AV path. nsys (TF32 off, prod)
+    // put soft_max_f32 at 27% of the decode -- the dense path materialises a [Tk, Tq, heads] fp32
+    // scores tensor (Tk=8192 latents, Tq=chunk) and streams it through a standalone softmax; flash
+    // fuses all three into one kernel with no scores tensor (also the decode's VRAM peak). Independent
+    // of PIXAL3D_FAST: fp32 ACCUMULATION is kept (set_prec F32), so the only precision change is F16
+    // STORAGE of K/V -- occupancy is a threshold, so this is A/B'd as MESHES, not timed. The stale
+    // m1_ggml.hpp comment "cross-attn's 5 kv tokens don't benefit" predates this 8192-kv call site.
+    static const bool decode_flash = getenv("USR_DECODE_FLASH") != nullptr;
+    if (decode_flash) {
+        const int64_t d = qh->ne[0], nhd = qh->ne[1], tq = qh->ne[2], tk = k->ne[2];
+        ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, qh, 0, 2, 1, 3));   // [d, tq, head] F32
+        ggml_tensor* kf = ggml_cont(ctx, ggml_permute(ctx, k,  0, 2, 1, 3));   // [d, tk, head]
+        ggml_tensor* vf = ggml_cont(ctx, ggml_permute(ctx, v,  0, 2, 1, 3));   // [d, tk, head]
+        // V pre-scale by a power of 2 (EXACT in F16: shifts the exponent, zero precision loss) so the
+        // flash PV accumulator can't overflow F16 -> +inf -> NaN, then undo on the output. Same fix as
+        // m1_ggml.hpp's attention(). Tk=8192 and Tq=chunk are both multiples of 256, so a NULL mask is
+        // safe (the documented null-mask MMA over-read only bites non-256 n_kv).
+        const float vsc = 1.0f / 64.0f;
+        vf = ggml_scale(ctx, vf, vsc);
+        kf = ggml_cast(ctx, kf, GGML_TYPE_F16);
+        vf = ggml_cast(ctx, vf, GGML_TYPE_F16);
+        ggml_tensor* r = ggml_flash_attn_ext(ctx, qf, kf, vf, nullptr, cfg.attn_scale(), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);
+        ggml_tensor* o = ggml_cont_2d(ctx, r, d * nhd, tq);                    // [d,head,tq] -> [width, Tq]
+        o = ggml_scale(ctx, o, 1.0f / vsc);
+        (void)tk;
+        return lin(ctx, H.weight(ap + "c_proj.weight"), H.weight(ap + "c_proj.bias"), o);
+    }
+
     ggml_tensor* o = attention(ctx, qh, k, v, cfg.attn_scale());  // [width, Tq]
     return lin(ctx, H.weight(ap + "c_proj.weight"), H.weight(ap + "c_proj.bias"), o);
 }
