@@ -918,24 +918,54 @@ std::vector<std::string> token_split(const std::string& text) {
         }
 
         // `\s*[\r\n]+|\s+(?!\S)|\s+`
+        //
+        // These are THREE ordered alternatives, and the distinction is load-bearing:
+        // it decides whether "\n    Summarize" tokenises as ["\n\n", "   ", " Summarize"]
+        // (correct) or something else. The previous implementation had two defects:
+        //
+        //   1. it appended the current codepoint and THEN `break`ed without `++i`, so
+        //      the first space after a newline was emitted in this token AND re-read as
+        //      the start of the next one -- a duplicated character. encode() did not
+        //      round-trip: "\n\n    " (2 nl + 4 sp) came back as "\n\n " + "    "
+        //      (2 nl + 5 sp).
+        //   2. `\s+(?!\S)` was not implemented at all, so a run of spaces before a word
+        //      was consumed whole, leaving the word without the leading space that
+        //      byte-level BPE expects (" Summarize" -> "    " + "Summarize").
+        //
+        // Both are silent: the ids change, the shapes do not.
         if (is_space(cp)) {
-            std::string token;
-            bool saw_new_line = false;
-
-            while (i < cps.size() && is_space(cps[i])) {
-                token += codepoint_to_utf8(cps[i]);
-
-                if (cps[i] == U'\r' || cps[i] == U'\n') {
-                    saw_new_line = true;
-                } else {
-                    if (saw_new_line) {
-                        break;
-                    }
+            // The maximal run of whitespace starting at i.
+            size_t run_end     = i;
+            size_t last_new_line = std::string::npos;
+            while (run_end < cps.size() && is_space(cps[run_end])) {
+                if (cps[run_end] == U'\r' || cps[run_end] == U'\n') {
+                    last_new_line = run_end;
                 }
-
-                ++i;
+                ++run_end;
             }
 
+            // Alt 1 -- `\s*[\r\n]+`: greedy \s* followed by at least one newline, i.e.
+            // the run up to and INCLUDING its last newline. Trailing spaces are left
+            // for the next alternative to claim.
+            size_t end;
+            if (last_new_line != std::string::npos) {
+                end = last_new_line + 1;
+            } else if (run_end < cps.size()) {
+                // Alt 2 -- `\s+(?!\S)`: a non-space follows, so greedy \s+ backtracks
+                // by exactly one to put the lookahead on a space. Needs run >= 2.
+                // Alt 3 -- `\s+`: if the run is a single space, alt 2 cannot match at
+                // all (it can't shrink below one), so \s+ takes it.
+                end = (run_end - i >= 2) ? run_end - 1 : run_end;
+            } else {
+                // Alt 2 with the lookahead satisfied by end-of-text: the whole run.
+                end = run_end;
+            }
+
+            std::string token;
+            for (size_t k = i; k < end; ++k) {
+                token += codepoint_to_utf8(cps[k]);
+            }
+            i = end;
             tokens.push_back(token);
             continue;
         }
