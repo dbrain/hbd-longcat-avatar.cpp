@@ -101,6 +101,12 @@ int main(int argc,char**argv){
     int roots=0; for(int k=0;k<J;k++) if(parent[k]<0) roots++;
     vector<int> nchild(J,0); for(int k=0;k<J;k++) if(parent[k]>=0) nchild[parent[k]]++;
     int leaves=0; for(int k=0;k<J;k++) if(nchild[k]==0) leaves++;
+    // max_children = the "fan" defect signal. A real biped branches at most ~5 (pelvis->spine+2legs,
+    // chest->neck+2arms); Python's beam-sample ceiling on gilly was 5. The C++ sampled beam OCCASIONALLY
+    // emits a head-fan (one joint with 16-26+ children) that bilateral-symmetry MISSES (a roughly radial
+    // fan reflects onto itself). Score it explicitly so best-of-N rejects fanned rigs. (See the maxfan
+    // sweep: clean seeds maxfan<=6, fanned/runaway seeds 16/26/143.)
+    int max_children=0; for(int k=0;k<J;k++) max_children=std::max(max_children,nchild[k]);
     int max_depth=0; for(int k=0;k<J;k++){ int d=0,c=k,guard=0; while(parent[c]>=0&&guard++<J){ d++; c=parent[c]; } max_depth=std::max(max_depth,d); }
 
     // joints bbox + centroid
@@ -157,12 +163,16 @@ int main(int argc,char**argv){
     float depth_s=depth_plaus(max_depth);
     float structure=0.5f*root_s + 0.5f*depth_s;
 
-    float TOTAL = 0.50f*symmetry + 0.30f*coverage + 0.20f*structure;
+    // fan penalty: 1.0 while max_children<=6 (a clean biped never exceeds this), decaying to 0 by >=12.
+    // A head-fan / runaway is an unambiguous defect, so it multiplies the whole score (not a weighted term).
+    float fan_s = max_children<=6 ? 1.f : std::max(0.f, 1.f - (float)(max_children-6)/6.f);
+
+    float TOTAL = (0.50f*symmetry + 0.30f*coverage + 0.20f*structure) * fan_s;
 
     printf("%-40s J=%-3d", path, J);
     if(expected>0) printf(" (exp~%d)",expected);
-    printf("  roots=%d leaves=%d depth=%d  symmetry=%.3f coverage=%.3f structure=%.3f  TOTAL=%.3f\n",
-           roots,leaves,max_depth, symmetry,coverage,structure, TOTAL);
+    printf("  roots=%d leaves=%d depth=%d maxfan=%d  symmetry=%.3f coverage=%.3f structure=%.3f fan=%.2f  TOTAL=%.3f\n",
+           roots,leaves,max_depth,max_children, symmetry,coverage,structure,fan_s, TOTAL);
     printf("    sub: root_s=%.2f depth_s=%.2f | sym_x=%.3f sym_y=%.3f sym_z=%.3f | jext=[%.2f %.2f %.2f] mext=[%.2f %.2f %.2f] mesh=%s\n",
            root_s,depth_s, sx,sy,sz, jext[0],jext[1],jext[2], mext[0],mext[1],mext[2], have_mesh?"yes":"NO");
     return 0;

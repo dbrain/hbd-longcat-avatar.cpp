@@ -32,12 +32,12 @@ step(){ echo; echo "######## $* ########"; }
 step "0/6 matte  ($IMG -> $MATTE)"
 ( cd "$CP" && ./make_matte "$IMG" "$MATTE" )
 
-step "1/6 pixal3d geometry  (-> $GEOM)"
-( cd "$CP" && ./pixal3d --model weights_gguf --image "$MATTE" --out "$GEOM" --ply )
-
-step "1b/6 pixal3d --tex  (PBR + dump_*.bin into $CP)  (-> $TEXGLB)"
+step "1/6 pixal3d geom+tex (ONE diffusion -> $GEOM + $TEXGLB + dump_*.bin)"
+# Tier-0.1 dedup: a single pixal3d run emits the textured GLB + PBR dump AND, via --geom-out, the
+# decimated geometry GLB UltraShape consumes — from ONE geometry diffusion (was re-run twice, ~427s).
+# The --geom-out GLB is bit-identical to the old standalone `--ply` geom output.
 ( cd "$CP" && PIXAL3D_FORCE_UVATLAS=1 PIXAL3D_DUMP_BAKE=1 ./pixal3d --model weights_gguf \
-    --image "$MATTE" --out "$TEXGLB" --tex --texsize "$TEXSIZE" )
+    --image "$MATTE" --out "$TEXGLB" --geom-out "$GEOM" --tex --texsize "$TEXSIZE" )
 # Snapshot the fresh DENSE mesh (the --tex run dumps it as dump_mesh_*; dump_dense is gated on the
 # remesh path) -> dump_dense_*, the bake's colour source. Must happen BEFORE step 4 overwrites dump_mesh
 # with the 69k. Keeps colour-source + PBR + target all from THIS run (the stale-dump bug the old probe hit).

@@ -24,8 +24,13 @@ static const float DEF_CAM = 0.7332379387484828f, DEF_DIST = 1.3021559715270996f
 static void usage() {
     printf("usage: pixal3d --model <gguf_dir> --image <png> --out <glb>\n"
            "               [--fov <deg>] [--cam <ang_rad> <dist> <scale>] [--mesh-scale <s>]\n"
-           "               [--tex] [--vcolor] [--texsize <N>] [--decimate <faces>]\n"
+           "               [--tex] [--geom-out <glb>] [--vcolor] [--texsize <N>] [--decimate <faces>] [--resolution <N>]\n"
+           "       --geom-out <g> : (with --tex) ALSO write the plain decimated geometry GLB to <g> from\n"
+           "                        the same geometry diffusion — one run feeds both tex + UltraShape.\n"
            "               [--remesh] [--no-watertight] [--cpu] [--ply] [--fast] [--pack [hero|small]]\n"
+           "       --resolution <N>: HR cascade resolution (default 1024; 1536 = finer voxel lattice\n"
+           "                        = thinner separable features e.g. fingers, at higher VRAM/time).\n"
+           "                        Mirrors Python pipeline_type '1024_cascade'/'1536_cascade'. Mult of 16.\n"
            "       --pack         : write a COMPRESSED GLB (native, in-process): meshopt geometry\n"
            "                        (KHR_mesh_quantization + EXT_meshopt_compression) + KTX2 textures\n"
            "                        (KHR_texture_basisu). hero=UASTC near-lossless (default), small=ETC1S.\n"
@@ -60,7 +65,7 @@ static std::vector<float> load_norm(const std::string& model, const char* which)
 
 int main(int argc, char** argv) {
     setenv("NVIDIA_TF32_OVERRIDE", "0", 1);  // fp32 matmul (correctness-first); perf phase relaxes
-    std::string model, image, out;
+    std::string model, image, out, geom_out;
     float cam = DEF_CAM, dist = DEF_DIST, ms = DEF_MS;
     bool use_cuda = true, write_ply = false, textured = false, fast = false, vcolor = false, watertight = true, remesh = false;
     int pack = 0;   // 0=off (uncompressed GLB), 1=hero (UASTC+Zstd), 2=small (ETC1S) — meshopt+KTX2
@@ -74,6 +79,11 @@ int main(int argc, char** argv) {
         if (a == "--model" && i+1 < argc) model = argv[++i];
         else if (a == "--image" && i+1 < argc) image = argv[++i];
         else if (a == "--out" && i+1 < argc) out = argv[++i];
+        // --geom-out: in a --tex run, ALSO emit the plain decimated GEOMETRY GLB (the exact mesh the
+        // standalone `--ply` geom pass would produce) from the SAME geometry diffusion. Lets one
+        // pixal3d invocation feed both the textured-bake path AND UltraShape — dedups the ~427s geom
+        // diffusion that run_pipeline used to re-run for the separate geom + tex passes (lossless).
+        else if (a == "--geom-out" && i+1 < argc) geom_out = argv[++i];
         else if (a == "--fov" && i+1 < argc) cam = std::atof(argv[++i]) * (float)M_PI / 180.0f;
         else if (a == "--cam" && i+3 < argc) { cam = std::atof(argv[++i]); dist = std::atof(argv[++i]); ms = std::atof(argv[++i]); }
         else if (a == "--mesh-scale" && i+1 < argc) ms = std::atof(argv[++i]);
@@ -89,6 +99,10 @@ int main(int argc, char** argv) {
         else if (a == "--pack") {               // compressed GLB: meshopt geo + KTX2 tex (native, in-process)
             pack = 1;                            // default hero (UASTC)
             if (i+1 < argc && argv[i+1][0] != '-') { std::string m = argv[++i]; pack = (m=="small") ? 2 : 1; }
+        }
+        else if ((a == "--resolution" || a == "--res") && i+1 < argc) {
+            in.resolution = std::atoi(argv[++i]);   // HR cascade res (1024 default / 1536 finer)
+            if (in.resolution % 16 != 0) { printf("--resolution must be a multiple of 16 (got %d)\n", in.resolution); return 1; }
         }
         // ---- conditioning (Trellis.2 sampler knobs; defaults already set in ChainInput) ----
         else if (a == "--seed" && i+1 < argc) in.seed = std::atoi(argv[++i]);
@@ -149,6 +163,22 @@ int main(int argc, char** argv) {
         uvatlas ? &pbr_feats : nullptr,
         uvatlas ? &pbr_coords : nullptr);
 
+    // --geom-out: emit the plain GEOMETRY GLB from the SAME `mesh` (the geometry diffusion already ran
+    // for the tex branch). Mirrors EXACTLY the non-textured `--ply` decimate path below (same `decimate`
+    // budget, same texatlas::decimate, same write_glb), so the geom GLB is bit-identical to a standalone
+    // geometry run — UltraShape consumes it. Done on a COPY so `mesh` stays dense for the atlas bake.
+    if (!geom_out.empty()) {
+        if (decimate > 0 && (int)mesh.faces.size()/3 > decimate) {
+            std::vector<float> dv; std::vector<int64_t> df;
+            texatlas::decimate(mesh.verts, mesh.faces, (size_t)decimate, dv, df);
+            if (!glb::write_glb(geom_out.c_str(), dv, df, nullptr)) { printf("geom-out write failed: %s\n", geom_out.c_str()); return 1; }
+            printf("  [geom-out] %d v / %d f (decimated from %d f) -> %s\n", (int)dv.size()/3, (int)df.size()/3, (int)mesh.faces.size()/3, geom_out.c_str());
+        } else {
+            if (!glb::write_glb(geom_out.c_str(), mesh.verts, mesh.faces, nullptr)) { printf("geom-out write failed: %s\n", geom_out.c_str()); return 1; }
+            printf("  [geom-out] %d v / %d f (full) -> %s\n", mesh.N, mesh.F, geom_out.c_str());
+        }
+    }
+
     // PIXAL3D_DUMP_BAKE: dump the ALIGNED bake inputs (decimated mesh + the PBR volume from the SAME
     // run) so the atlas/bake can be iterated offline (tex_bake_test) without misaligned golden data.
     if (uvatlas && std::getenv("PIXAL3D_DUMP_BAKE")) {
@@ -177,7 +207,7 @@ int main(int argc, char** argv) {
         // segmentation hang (minutes); use our normal-cone PRE-CLUSTER + AddUvMesh (pack-only) instead.
         bool precluster = remesh && !std::getenv("PIXAL3D_NO_PRECLUSTER");
         texatlas::BakedTexture bt = texatlas::bake(mesh.verts, mesh.faces, pbr_feats, pbr_coords,
-                                                   /*grid_res*/1024, texsize, bake_deci, 4, true, fb_r,
+                                                   /*grid_res*/in.resolution, texsize, bake_deci, 4, true, fb_r,
                                                    precluster);
         printf("  [tex] UV-atlas bake: %dx%d, %d charts, %d out-verts (%.1fs)\n",
                bt.tw, bt.th, bt.chart_count, (int)bt.verts.size()/3, pix::now_s()-tb);

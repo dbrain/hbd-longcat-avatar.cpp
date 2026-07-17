@@ -11,8 +11,11 @@ NAME="${3:-$(basename "$MESH" | sed 's/\.[^.]*$//')}"
 OUT="$ROOT/_shootout_out/ultrashape_$NAME"; mkdir -p "$OUT"
 MESH_C="/work/${MESH#"$ROOT/"}"; IMG_C="/work/${IMG#"$ROOT/"}"
 NUM_LATENTS="${NUM_LATENTS:-8192}"; CHUNK="${CHUNK:-2048}"; STEPS="${STEPS:-50}"; OCTREE="${OCTREE:-512}"
+# Dual-GPU box: pin to the 3060 (sm_86) by UUID. This image's PyTorch only carries sm_50..sm_90 kernels,
+# so --gpus all exposes the 5060 Ti (sm_120) and PyTorch dies "no kernel image". Override w/ GPU_UUID.
+GPU_UUID="${GPU_UUID:-GPU-3b9ac5cf-95c5-5c9e-de19-af33af4b27d6}"
 echo "=== UltraShape refine: $MESH (img $IMG) -> $OUT  (low_vram, num_latents=$NUM_LATENTS chunk=$CHUNK octree=$OCTREE steps=$STEPS) ==="
-docker run --rm --gpus all -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+docker run --rm --gpus "device=$GPU_UUID" -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -v "$ROOT":/work ultrashape bash -c "cd /work/UltraShape-1.0 && \
     PYTHONPATH=/work/UltraShape-1.0 python3 scripts/infer_dit_refine.py \
       --config configs/infer_dit_refine.yaml \

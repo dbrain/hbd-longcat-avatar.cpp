@@ -187,28 +187,28 @@ inline void gather(const std::vector<float>& pts, const std::vector<int>& idx, s
 // (4) prep_mesh_for_rig — full host front-end for a GLB.
 // ---------------------------------------------------------------------------
 struct PrepResult {
-    std::vector<float> vertices;    // N*3  (area-weighted surface samples)
-    std::vector<float> normals;     // N*3  (per-sample face normals)
-    std::vector<float> sampled_pc;  // M*3  (R1 query: choice N->4M then FPS 4M->M from idx 0)
+    std::vector<float> vertices;      // N*3  (area-weighted surface samples)
+    std::vector<float> normals;       // N*3  (per-sample face normals)
+    std::vector<float> sampled_pc;    // M*3  (R1 query: choice N->4M then FPS 4M->M from idx 0)
+    std::vector<float> sampled_feats; // M*3  (the per-sample normals AT the query points; R1 feats)
     int N = 0;
     int M = 0;
     bool ok = false;
 };
 
-inline PrepResult prep_mesh_for_rig(const char* glb_path, int N = 8192, int M = 512, uint64_t seed = 0) {
+// In-memory variant: same logic as prep_mesh_for_rig but on verts/faces already in RAM (the inline
+// image->rig API feeds the freshly-generated mesh straight in, no GLB round-trip). `verts` is copied
+// (it is normalized in place); `faces` is read-only.
+inline PrepResult prep_mesh_for_rig_inmem(std::vector<float> verts, const std::vector<int64_t>& faces,
+                                          int N = 8192, int M = 512, uint64_t seed = 0) {
     PrepResult R;
-    glb::Mesh mesh;
-    if (!glb::read_glb(glb_path, mesh)) {
-        std::fprintf(stderr, "prep_mesh_for_rig: read_glb failed for '%s'\n", glb_path);
+    if (verts.empty() || faces.empty()) {
+        std::fprintf(stderr, "prep_mesh_for_rig_inmem: empty mesh (V=%zu F=%zu)\n",
+                     verts.size() / 3, faces.size() / 3);
         return R;
     }
-    if (mesh.verts.empty() || mesh.faces.empty()) {
-        std::fprintf(stderr, "prep_mesh_for_rig: empty mesh (V=%zu F=%zu)\n",
-                     mesh.verts.size() / 3, mesh.faces.size() / 3);
-        return R;
-    }
-    normalize_mesh(mesh.verts);
-    if (!sample_surface(mesh.verts, mesh.faces, N, seed, R.vertices, R.normals)) {
+    normalize_mesh(verts);
+    if (!sample_surface(verts, faces, N, seed, R.vertices, R.normals)) {
         std::fprintf(stderr, "prep_mesh_for_rig: sample_surface failed\n");
         return R;
     }
@@ -219,6 +219,7 @@ inline PrepResult prep_mesh_for_rig(const char* glb_path, int N = 8192, int M = 
     // ind = choice(N, M*4, replace = M*4 > N)  -> here 8192 -> 2048 distinct (replace=False).
     int K = M * 4;
     std::vector<float> pre;          // K*3 candidate subset
+    std::vector<int>   pre_idx(K);   // original surface-sample index of each candidate (-> normals)
     std::mt19937_64 rng(seed);
     if (K <= N) {
         // distinct draw of K indices (partial Fisher-Yates over 0..N-1)
@@ -230,24 +231,44 @@ inline PrepResult prep_mesh_for_rig(const char* glb_path, int N = 8192, int M = 
             std::swap(perm[i], perm[j]);
         }
         pre.resize((size_t)K * 3);
-        for (int i = 0; i < K; ++i)
+        for (int i = 0; i < K; ++i) {
+            pre_idx[i] = perm[i];
             for (int k = 0; k < 3; ++k)
                 pre[(size_t)i * 3 + k] = R.vertices[(size_t)perm[i] * 3 + k];
+        }
     } else {
         // with replacement (K > N): pad by sampling with replacement
         pre.resize((size_t)K * 3);
         std::uniform_int_distribution<int> D(0, N - 1);
         for (int i = 0; i < K; ++i) {
             int j = D(rng);
+            pre_idx[i] = j;
             for (int k = 0; k < 3; ++k) pre[(size_t)i * 3 + k] = R.vertices[(size_t)j * 3 + k];
         }
     }
     // fps(pre, ratio=1/4) -> K/4 == M points, start index 0.
     std::vector<int> fidx = fps(pre, M, 0);
     gather(pre, fidx, R.sampled_pc);
+    // sampled_feats = the per-sample NORMALS at exactly those query points (R1 VecSet `sampled_feats`),
+    // gathered from THIS mesh — not borrowed from a banked giraffe.
+    R.sampled_feats.assign(fidx.size() * 3, 0.f);
+    for (size_t i = 0; i < fidx.size(); ++i) {
+        int orig = pre_idx[(size_t)fidx[i]];
+        for (int k = 0; k < 3; ++k)
+            R.sampled_feats[i * 3 + k] = R.normals[(size_t)orig * 3 + k];
+    }
     R.M = (int)fidx.size();
     R.ok = true;
     return R;
+}
+
+inline PrepResult prep_mesh_for_rig(const char* glb_path, int N = 8192, int M = 512, uint64_t seed = 0) {
+    glb::Mesh mesh;
+    if (!glb::read_glb(glb_path, mesh)) {
+        std::fprintf(stderr, "prep_mesh_for_rig: read_glb failed for '%s'\n", glb_path);
+        return PrepResult{};
+    }
+    return prep_mesh_for_rig_inmem(std::move(mesh.verts), mesh.faces, N, M, seed);
 }
 
 }  // namespace rig

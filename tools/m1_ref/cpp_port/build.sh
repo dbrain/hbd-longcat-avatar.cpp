@@ -15,7 +15,7 @@ COMMON="-O2 -std=c++17 -Wall -Wno-unused-variable"
 
 # geometry_e2e / pixal3d are the FULL chain: ggml-cuda graphs (DINOv3/NAF/DiT/VAE) + the spike
 # CUDA conv (M3a/M4). Links both ggml-cuda and sparse_subm_conv.o; defines M1_USE_CUDA + M3A_USE_CUDA.
-if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ]; } && [ "$MODE" = "cuda" ]; then
+if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "image_to_rig" ]; } && [ "$MODE" = "cuda" ]; then
   TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
   SPIKE="$HERE/../../sparse_spike"
   BUILD="$GGML/build-cuda"
@@ -41,10 +41,18 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ]; } && [ "$MODE" = "
   BU="$HERE/../../../thirdparty/basis_universal"
   "$HERE/build_basisu.sh"
   PACK_DEFS="-DPIXAL3D_PACK -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
-  "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH $PACK_DEFS $INC -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
+  # image_to_rig --part-retopo: GPU P3-SAM seg/iou heads (cuBLAS). Compile the kernels + define
+  # P3SAM_USE_CUDA so p3sam_postprocess.hpp routes the heads through the GPU (else they run ~30min CPU).
+  P3SAM_OBJ=""; P3SAM_DEF=""
+  if [ "$BASE" = "image_to_rig" ]; then
+    "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
+      -c "$HERE/p3sam_heads_cuda.cu" -o "$HERE/p3sam_heads_cuda.o"
+    P3SAM_OBJ="$HERE/p3sam_heads_cuda.o"; P3SAM_DEF="-DP3SAM_USE_CUDA"
+  fi
+  "$TOOL/bin/g++" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH $P3SAM_DEF $PACK_DEFS $INC -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
     "$HERE/$SRC" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
     "$TP/meshoptimizer/vertexcodec.cpp" "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
-    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" $CUMESH_OBJS \
+    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" $CUMESH_OBJS $P3SAM_OBJ \
     "$BU/build/libbasisu_enc.a" -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
     -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
@@ -63,6 +71,21 @@ if { [ "$BASE" = "m4_gpu_test" ] || [ "$BASE" = "m6_gpu_test" ] || [ "$BASE" = "
     -c "$HERE/svae_cuda.cu" -o "$HERE/svae_cuda.o"
   "$TOOL/bin/g++" $COMMON -fopenmp -DM3A_USE_CUDA -I"$TOOL/include" "$HERE/$SRC" \
     "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" \
+    -o "$HERE/$BIN" -L"$TOOL/lib" -lcudart -lcublas -L/usr/lib -lcuda -lm \
+    -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# test_p3sam_segment / p3sam_retopo CUDA: GPU heads (cuBLAS + p3sam_heads_cuda.cu) for the seg/iou
+# heads (the entire segmentation cost). Host preprocess/sonata/postprocess stay CPU (OpenMP).
+if { [ "$BASE" = "test_p3sam_segment" ] || [ "$BASE" = "p3sam_retopo" ]; } && [ "$MODE" = "cuda" ]; then
+  TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
+  echo ">> CUDA build $SRC (P3-SAM GPU heads: nvcc p3sam_heads_cuda + g++ host -DP3SAM_USE_CUDA + cublas)"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$TOOL/bin/g++" \
+    -c "$HERE/p3sam_heads_cuda.cu" -o "$HERE/p3sam_heads_cuda.o"
+  "$TOOL/bin/g++" -O3 -std=c++17 -march=native -ffast-math -fopenmp -DP3SAM_USE_CUDA -I"$TOOL/include" \
+    "$HERE/$SRC" "$HERE/p3sam_heads_cuda.o" \
     -o "$HERE/$BIN" -L"$TOOL/lib" -lcudart -lcublas -L/usr/lib -lcuda -lm \
     -Wl,-rpath,"$TOOL/lib" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
@@ -132,6 +155,16 @@ if [ "$BASE" = "glb_repack" ]; then
   exit 0
 fi
 
+# moge_fov_test: MoGe-2 recover_focal_shift -> FOV host math (moge_fov.hpp). Header-only + npy reader,
+# no ggml/CUDA. Validates against the banked golden points/mask -> fov_result (41.252 deg).
+if [ "$BASE" = "moge_fov_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build moge_fov_test (moge_fov.hpp recover_focal_shift LM, no ggml)"
+  "$CXX" -O2 -std=c++17 -Wall -Wno-unused-variable "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # make_matte: square black-bg RGB matte from an RGBA source. Header-only stb (load+write), no ggml/CUDA.
 if [ "$BASE" = "make_matte" ]; then
   CXX="${CXX:-/usr/bin/g++}"
@@ -146,6 +179,36 @@ if [ "$BASE" = "dump_to_glb" ]; then
   CXX="${CXX:-/usr/bin/g++}"
   echo ">> build dump_to_glb (glb_writer, no ggml)"
   "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# ultrashape_mc_test: native marching-cubes surface extractor (ultrashape_mc.hpp) validated vs the
+# cubvh golden + GLB write. Pure CPU, no ggml/CUDA — npy.hpp + glb_writer.hpp only.
+if [ "$BASE" = "ultrashape_mc_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build ultrashape_mc_test (ultrashape_mc + npy + glb_writer, no ggml)"
+  "$CXX" $COMMON "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# shape_subs_test: validate senc::build_guide_subs (tex-decoder guide_subs from mesh occupancy) — grow
+# grid-64 back to grid-1024 and check IoU vs the voxelizer. Pure CPU (shape_slat_encoder + sparse_vae + npy).
+if [ "$BASE" = "shape_subs_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build shape_subs_test (build_guide_subs structural check, no ggml)"
+  "$CXX" $COMMON -fopenmp "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# us_image_proc_test: native ImageProcessorV2 (us_image_proc.hpp) — raw PNG -> proc_image/proc_mask vs
+# the cond_full goldens. Pure CPU (stb_image + npy.hpp), no ggml.
+if [ "$BASE" = "us_image_proc_test" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build us_image_proc_test (ImageProcessorV2 cv2 resamplers, stb + npy, no ggml)"
+  "$CXX" $COMMON "$HERE/$SRC" -o "$HERE/$BIN" -lm
   echo ">> built $BIN"
   exit 0
 fi
@@ -286,7 +349,7 @@ fi
 
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
-if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ]; then
+if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "tex_bake_trellis" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ] || [ "$BASE" = "texproj_probe" ]; then
   if [ "$MODE" = "cuda" ] && [ "$BASE" = "tex_reproject" ]; then
     TOOL=/mnt/hdd/3d/avatar-shootout/toolchain
     TP="$HERE/../../../thirdparty"

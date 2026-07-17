@@ -38,10 +38,12 @@ int main(int argc, char** argv) {
     std::string dir = argv[1], out = argv[2];
     ggml_type qtype = GGML_TYPE_F32;
     std::vector<std::string> keepf16;   // name substrings to keep at F16 (mixed precision study)
+    std::vector<std::string> keepf32;   // name substrings to FORCE F32 (parity-critical, e.g. MoE gate)
     for (int i = 3; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--type" && i + 1 < argc) qtype = parse_qtype(argv[++i]);
         else if (a == "--keep" && i + 1 < argc) keepf16.push_back(argv[++i]);  // -> F16 (near-lossless)
+        else if (a == "--keepf32" && i + 1 < argc) keepf32.push_back(argv[++i]); // -> F32 (no precision loss)
     }
     int qblk = (qtype == GGML_TYPE_F32) ? 1 : (int)ggml_blck_size(qtype);
     printf("pack_gguf: type=%s (block=%d) for 2D matmul .weight tensors",
@@ -87,7 +89,9 @@ int main(int argc, char** argv) {
 
         // per-tensor target type: only 2D matmul weights are eligible. --keep substrings -> F16
         // (near-lossless); otherwise the main qtype if block-aligned, else F16 fallback.
-        bool is_matmul = (qtype != GGML_TYPE_F32) && ends_with(k, ".weight") && nd == 2;
+        bool force_f32 = false;
+        for (auto& s : keepf32) if (k.find(s) != std::string::npos) force_f32 = true;
+        bool is_matmul = !force_f32 && (qtype != GGML_TYPE_F32) && ends_with(k, ".weight") && nd == 2;
         ggml_type tt = GGML_TYPE_F32;
         if (is_matmul) {
             bool keep = false;
