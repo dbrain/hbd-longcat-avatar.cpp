@@ -181,7 +181,15 @@ namespace HYMotion {
         MLP(int64_t in_dim, int64_t hidden, int64_t out_dim, bool gelu_tanh)
             : gelu_tanh(gelu_tanh) {
             blocks["fc1"] = std::shared_ptr<GGMLBlock>(new Linear(in_dim, hidden, true));
-            blocks["fc2"] = std::shared_ptr<GGMLBlock>(new Linear(hidden, out_dim, true));
+            // FFN down-proj: 1/128 pre-scale, the same anti-overflow tool ZImage's w2 and
+            // block.hpp's net.2 use, for the same reason. With F16 weights the CUDA backend
+            // casts the F32 activation to F16 and accumulates in F16 (PREC_DEFAULT ->
+            // cublasGemmEx COMPUTE_16F), so a large-K GEMM can cross the 65504 ceiling ->
+            // inf -> NaN, while CPU (F32 accumulate) stays clean. MEASURED on this model:
+            // the DiT went 100% NaN on CUDA for every t >= ~0.335 (clean below, CPU clean
+            // everywhere) because activations grow with t; the scale is an exact identity
+            // (x*s -> GEMM -> x/s, bias added after) and removes the overflow at its source.
+            blocks["fc2"] = std::shared_ptr<GGMLBlock>(new Linear(hidden, out_dim, true, false, false, 1.f / 128.f));
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
@@ -497,7 +505,9 @@ namespace HYMotion {
             blocks["modulation"] = std::shared_ptr<GGMLBlock>(new ModulateDiT(feat_dim, 3));
             blocks["norm"]       = std::shared_ptr<GGMLBlock>(new LayerNorm(feat_dim, 1e-6f, false));
             blocks["linear1"]    = std::shared_ptr<GGMLBlock>(new Linear(feat_dim, feat_dim * 3 + mlp_hidden, true));
-            blocks["linear2"]    = std::shared_ptr<GGMLBlock>(new Linear(feat_dim + mlp_hidden, feat_dim, true));
+            // linear2 is this block's FFN/attn down-proj (K = feat_dim + mlp_hidden, the
+            // largest K in the model) -- same 1/128 anti-overflow pre-scale as MLP::fc2.
+            blocks["linear2"]    = std::shared_ptr<GGMLBlock>(new Linear(feat_dim + mlp_hidden, feat_dim, true, false, false, 1.f / 128.f));
             blocks["q_norm"]     = std::shared_ptr<GGMLBlock>(new RMSNorm(head_dim, 1e-6f));
             blocks["k_norm"]     = std::shared_ptr<GGMLBlock>(new RMSNorm(head_dim, 1e-6f));
         }

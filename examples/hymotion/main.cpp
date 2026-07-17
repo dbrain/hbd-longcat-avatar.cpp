@@ -487,12 +487,35 @@ int main(int argc, char** argv) {
     // torchdiffeq odeint(method="euler"): y_{n+1} = y_n + dt * f(t_n, y_n)
     std::vector<float> y = y0;
     const float dt       = 1.0f / (float)steps;
+    // Diagnostic falsifiers for the CUDA-only step-17 NaN cliff (env-gated, default OFF
+    // => prod path is byte-identical). The cliff happens on a SMOOTHLY varying input
+    // (pred stays in ~[-5.5,4.9], dt=0.02), so "activations blow up" does not fit. These
+    // separate the three candidate variables:
+    //   HYMOTION_FREEZE_Y — never advance the ODE: every step re-runs the SAME input y0.
+    //   HYMOTION_FREEZE_T — pin t=0: every step uses the SAME timestep embedding.
+    // Both set => every compute() is bit-identical work. If the NaN STILL lands on the
+    // same step index, the trigger is per-compute STATE (offload/prefetch/alloc reuse),
+    // not the data and not t.
+    const bool freeze_y = getenv("HYMOTION_FREEZE_Y") != nullptr;
+    const bool freeze_t = getenv("HYMOTION_FREEZE_T") != nullptr;
     for (int s = 0; s < steps; ++s) {
-        const float t = (float)s / (float)steps;
+        const float t = freeze_t ? 0.0f : (float)s / (float)steps;
 
         runner.x_vec.assign((size_t)(N * T_full * p.input_dim), 0.0f);
         for (int64_t n = 0; n < N; ++n) {
             std::copy(y.begin(), y.end(), runner.x_vec.begin() + (size_t)(n * T_full * p.input_dim));
+        }
+
+        if (getenv("HYMOTION_DEBUG")) {
+            // Measure the INPUT too, not just the output: a NaN in pred with a clean y
+            // localises the fault INSIDE this compute; a dirty y means it arrived earlier.
+            size_t ynan = 0;
+            float ymn = 1e30f, ymx = -1e30f;
+            for (size_t i = 0; i < y.size(); ++i) {
+                if (!std::isfinite(y[i])) { ynan++; } else { ymn = std::min(ymn, y[i]); ymx = std::max(ymx, y[i]); }
+            }
+            fprintf(stderr, "\n[dbg] step %d t=%.3f y_in: nan=%zu/%zu min=%.4f max=%.4f\n",
+                    s, (double)t, ynan, y.size(), (double)ymn, (double)ymx);
         }
 
         auto pred = runner.compute(threads, t, frames, text_valid);
@@ -508,12 +531,14 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < stride * (size_t)N; ++i) {
                 if (!std::isfinite(d[i])) { nan++; } else { mn = std::min(mn, d[i]); mx = std::max(mx, d[i]); }
             }
-            fprintf(stderr, "\n[dbg] step %d t=%.3f pred: nan=%zu/%zu min=%.4f max=%.4f\n",
+            fprintf(stderr, "[dbg] step %d t=%.3f pred: nan=%zu/%zu min=%.4f max=%.4f\n",
                     s, (double)t, nan, stride * (size_t)N, (double)mn, (double)mx);
         }
-        for (size_t i = 0; i < stride; ++i) {
-            const float v = do_cfg ? (d[i] + cfg * (d[stride + i] - d[i])) : d[i];
-            y[i] += dt * v;
+        if (!freeze_y) {
+            for (size_t i = 0; i < stride; ++i) {
+                const float v = do_cfg ? (d[i] + cfg * (d[stride + i] - d[i])) : d[i];
+                y[i] += dt * v;
+            }
         }
         fprintf(stderr, "\rhymotion: step %d/%d", s + 1, steps);
     }

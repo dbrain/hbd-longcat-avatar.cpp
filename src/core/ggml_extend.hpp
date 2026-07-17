@@ -1165,6 +1165,14 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     // dst avoids the store-overflow; the fp8 cuBLASLt GEMM already supports an F32 dst. nvfp4 dst
     // and the default (env unset) are byte-identical to before.
     static const bool f8_f32_dst = getenv("GGML_F8_F32_DST") != nullptr;
+    // GGML_FORCE_PREC_F32 (diagnostic, opt-in, default OFF => every existing caller is
+    // byte-identical): force GGML_PREC_F32 on EVERY Linear's mul_mat. With F16 weights and
+    // PREC_DEFAULT the CUDA backend casts the F32 activation to F16 and accumulates in F16
+    // (cublasGemmEx CUBLAS_COMPUTE_16F); PREC_F32 instead upcasts the weight and runs SGEMM,
+    // so neither the activation nor the accumulator can hit the 65504 ceiling. CPU always
+    // accumulates F32 -- which is exactly the CPU-clean/CUDA-NaN asymmetry this isolates.
+    static const bool force_prec_f32_env = getenv("GGML_FORCE_PREC_F32") != nullptr;
+    force_prec_f32 = force_prec_f32 || force_prec_f32_env;
     ggml_type mm_dst = GGML_TYPE_F32;
     if (!force_prec_f32 && x->type == GGML_TYPE_F16) {
         if (w->type == GGML_TYPE_NVFP4 || (w->type == GGML_TYPE_F8_E4M3 && !f8_f32_dst)) {
