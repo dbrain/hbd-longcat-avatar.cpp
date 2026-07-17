@@ -759,7 +759,8 @@ struct AutoEncoderKL : public VAE {
     sd::Tensor<float> vae_output_to_latents(const sd::Tensor<float>& vae_output, std::shared_ptr<RNG> rng) override {
         if (sd_version_uses_flux2_vae(version)) {
             return vae_output;
-        } else if (version == VERSION_SD1_PIX2PIX) {
+        } else if (sd_version_is_sd_unet_edit(version)) {
+            // diffusers ip2p: image_latents = vae.encode(image).latent_dist.mode()
             return sd::ops::chunk(vae_output, 2, 2)[0];
         } else {
             return gaussian_latent_sample(vae_output, rng);

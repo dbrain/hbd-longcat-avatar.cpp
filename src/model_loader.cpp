@@ -611,6 +611,9 @@ SDVersion ModelLoader::get_sd_version() {
         if (is_inpaint) {
             return VERSION_SD2_INPAINT;
         }
+        if (is_ip2p) {
+            return VERSION_SD2_PIX2PIX;
+        }
         if (!has_middle_block_1) {
             return has_attn_1024 ? VERSION_SDXS_09 : VERSION_SD2_TINY_UNET;
         }

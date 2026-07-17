@@ -60,6 +60,7 @@ const char* model_version_to_str[] = {
     "SD 1.x Tiny UNet",
     "SD 2.x",
     "SD 2.x Inpaint",
+    "SD 2.x Instruct-Pix2Pix",
     "SD 2.x Tiny UNet",
     "SDXS (512-DS)",
     "SDXS (09)",
@@ -93,6 +94,12 @@ const char* model_version_to_str[] = {
     "PiD",
     "Ideogram 4",
 };
+
+// model_version_to_str is indexed by SDVersion (see the LOG_INFO at "Version: %s"), so a new
+// enum value inserted anywhere but the end silently shifts every name after it. Catch that at
+// compile time instead of shipping mislabelled models.
+static_assert(sizeof(model_version_to_str) / sizeof(model_version_to_str[0]) == VERSION_COUNT,
+              "model_version_to_str is out of sync with enum SDVersion");
 
 const char* sampling_methods_str[] = {
     "Euler",
@@ -1607,6 +1614,11 @@ public:
         sd::Tensor<float> concat;
         if (is_inpaint) {
             concat = sd::zeros<float>({8, 8, 5, 1});
+        } else if (sd_version_is_unet_edit(version)) {
+            // ip2p conv_in takes 8 ch = [x(4), img_latent(4)]. Without the image half this
+            // probe would feed a 4-ch x into an 8-ch conv_in and assert. Pass --prediction
+            // explicitly to skip the probe entirely.
+            concat = sd::zeros<float>({8, 8, 4, 1});
         }
 
         int64_t t0 = ggml_time_ms();
@@ -2676,7 +2688,8 @@ public:
         if (latents.empty()) {
             return {};
         }
-        if (version != VERSION_SD1_PIX2PIX) {
+        // diffusers ip2p does NOT scale the conditioning image latent by the VAE scaling factor.
+        if (!sd_version_is_sd_unet_edit(version)) {
             latents = first_stage_model->vae_to_diffusion_latents(latents);
         }
         return latents;
