@@ -34,3 +34,12 @@ thirdparty/basis_universal/
 
 # vendored on demand by tools/m1_ref/cpp_port/build_quadriflow.sh (pinned QF_REF)
 thirdparty/QuadriFlow/
+
+# vendored on demand, same as the two above. Both carry a nested .git, so without these lines a
+# `git add -A` silently commits a BROKEN GITLINK STUB instead of the tree (163MB / 105MB).
+thirdparty/ManifoldPlus/
+thirdparty/instant-meshes/
+
+# root-owned nsys/ncu profiling output from the docker bench runs (the rules above only cover
+# bench/results/). Big, regenerable, and not ours to commit.
+/m3b_*
