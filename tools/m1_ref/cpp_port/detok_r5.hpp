@@ -80,10 +80,15 @@ inline Skeleton detokenize(const int64_t* all, int64_t n_all, const Spec& s) {
         if (id < s.num_discrete) {
             V3 current;
             if (is_branch) {
+                // a branch joint needs a full 6-token group (parent xyz ++ child xyz). On a malformed/
+                // truncated stream the tail may be short -> reading ids[i+3..i+5] would run off the end
+                // (garbage int64 -> ~1e12 joint coords). Stop parsing cleanly instead of emitting junk.
+                if (i + 6 > ids.size()) break;
                 V3 p_joint = undiscretize(&ids[i], s);
                 current = undiscretize(&ids[i + 3], s);
                 joints.push_back(current); p_joints.push_back(p_joint); i += 6;
             } else {
+                if (i + 3 > ids.size()) break;   // need a full xyz triplet; tail too short -> stop
                 current = undiscretize(&ids[i], s);
                 joints.push_back(current);
                 if (p_joints.empty()) p_joints.push_back(current);   // root

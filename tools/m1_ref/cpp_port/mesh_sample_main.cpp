@@ -4,12 +4,15 @@
 //
 // Loads an arbitrary GLB, normalizes to [-1,1]^3, area-weighted surface-samples N points + normals,
 // and derives the R1 VecSet query sampled_pc[M] (choice N->4M then FPS 4M->M from idx 0). Writes:
-//   <out_dir>/vertices.npy    [N,3] f32
-//   <out_dir>/normals.npy     [N,3] f32
-//   <out_dir>/sampled_pc.npy  [M,3] f32
+//   <out_dir>/vertices.npy      [N,3] f32
+//   <out_dir>/normals.npy       [N,3] f32
+//   <out_dir>/sampled_pc.npy    [M,3] f32  (R1 VecSet query points)
+//   <out_dir>/sampled_feats.npy [M,3] f32  (the normals AT those query points — R1 feats, fresh)
 // These are drop-in replacements for the banked giraffe npys consumed by skintokens_e2e (r1=real):
-//   vertices.npy/normals.npy  -> the e2e dir (-e arg, default /tmp/skintokens_e2e)
-//   sampled_pc.npy            -> the r1 weight dir (-r1w arg, default /tmp/vecset_r0)
+//   vertices.npy/normals.npy       -> the e2e dir (-e arg, default /tmp/skintokens_e2e)
+//   sampled_pc.npy/sampled_feats.npy -> the r1 weight dir (-r1w arg, default /tmp/vecset_r0)
+// With sampled_feats emitted here, r1=real no longer needs ANY banked giraffe npys for the query
+// feats (only the output_proj.* ckpt weights, which are mesh-agnostic).
 //
 // Pure CPU. No ggml/CUDA. Build:  ./build.sh mesh_sample_main
 #include <cmath>
@@ -56,9 +59,10 @@ int main(int argc, char** argv) {
     rig::PrepResult R = rig::prep_mesh_for_rig(glb, N, M, seed);
     if (!R.ok) { std::fprintf(stderr, "mesh_sample: prep failed\n"); return 1; }
 
-    npy_write(out_dir + "/vertices.npy",   R.vertices.data(),   { R.N, 3 });
-    npy_write(out_dir + "/normals.npy",    R.normals.data(),    { R.N, 3 });
-    npy_write(out_dir + "/sampled_pc.npy", R.sampled_pc.data(), { R.M, 3 });
+    npy_write(out_dir + "/vertices.npy",      R.vertices.data(),      { R.N, 3 });
+    npy_write(out_dir + "/normals.npy",       R.normals.data(),       { R.N, 3 });
+    npy_write(out_dir + "/sampled_pc.npy",    R.sampled_pc.data(),    { R.M, 3 });
+    npy_write(out_dir + "/sampled_feats.npy", R.sampled_feats.data(), { R.M, 3 });
 
     // ---- sanity stats ----
     auto bbox = [](const std::vector<float>& p, int n, double mn[3], double mx[3]) {

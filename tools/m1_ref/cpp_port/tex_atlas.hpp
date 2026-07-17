@@ -8,6 +8,7 @@
 // Produces exactly the textures the glTF needs; the per-voxel 6-ch PBR is already validated
 // bit-exact (m6_tex_decode). Replaces the interim per-vertex COLOR_0 bake.
 #pragma once
+#include <string>
 #include "tex_grid_sample.hpp"
 #include "tex_reproject.hpp"     // lap-18: closest-point-on-dense-mesh reproject (kills splatter/cracks)
 #ifdef TEXATLAS_NATIVE_CUMESH
@@ -970,17 +971,44 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         // triangle-choice flips on fine hair; == pyref's sampling, but on the correct on-shell point).
         // RP_ATTR=1 uses the barycentric dense-mesh attr instead (speckles on fine strand detail).
         const bool use_attr = std::getenv("RP_ATTR")!=nullptr;
+        // RP_DIRECT=1 (--tex-volume-direct): THE FRAY FIX. Both snap modes above read the volume at a
+        // point found by composing TWO closest-point projections (texel P → coarse shell → volume).
+        // That composition SLIDES ALONG THE SURFACE: measured on inline_soldier1536, 9.2% of texels end
+        // up reading a voxel >4 voxels away from the voxel actually nearest to them (p99 = 13.2 vox) —
+        // which at a material boundary means fetching the wrong material. That sliding IS the fraying;
+        // it is not per-vertex quantisation (snap+volume scores the same as RP_ATTR: 4.73% vs 4.84%
+        // texels >0.15 off the volume) and it is not the back-fallback (0.1% of bad texels).
+        // Direct mode reads the volume AT THE TEXEL'S OWN rasterised position — one projection, no
+        // slide. The reason that was abandoned (the BLACK-TEXTURE bug: the refined surface sits ~2.5
+        // vox off the sparse PBR shell, so all 8 trilinear corners are empty → black) is really the
+        // `sample_fallback_r` argument being 0 at the production call site: at fallback_r=0 direct
+        // sampling is 47.6% wrong, at fallback_r=8 it is 1.34% wrong (vs RP_ATTR's 4.87%). The snap is
+        // kept as the guard for the ~1.9% of texels the volume has no data near at all.
+        const bool volume_direct = std::getenv("RP_DIRECT")!=nullptr;
         texgs::VolIndex vol(pbr_coords.data(), (int)pbr_coords.size()/4, 4, 1);
         double tbh=_now();
         texrp::DenseHash dh(dense_verts->data(), dense_faces->data(), (int64_t)dense_faces->size()/3, ncell);
-        if (verbose) printf("[atlas] reproject: dense %zu v / %zu f, hash %d^3 cells (%.2fs build), front_dot=%.2f, maxdist=%.2f vox, back_fallback=%s, mode=%s\n",
+        if (verbose) printf("[atlas] reproject: dense %zu v / %zu f, hash %d^3 cells (%.2fs build), front_dot=%.2f, maxdist=%.2f vox, back_fallback=%s, mode=%s, fallback_r=%d\n",
                             dense_verts->size()/3, dense_faces->size()/3, ncell, _now()-tbh, fdot, maxdist_vox,
-                            allow_back?"on":"off", use_attr?"mesh-attr":"snap+volume");
-        size_t miss=0;
-        #pragma omp parallel for schedule(dynamic, 2048) reduction(+:miss)
+                            allow_back?"on":"off",
+                            volume_direct ? (use_attr?"volume-direct (guard: mesh-attr)":"volume-direct (guard: snap+volume)")
+                                          : (use_attr?"mesh-attr":"snap+volume"),
+                            sample_fallback_r);
+        size_t miss=0, guard=0;
+        #pragma omp parallel for schedule(dynamic, 2048) reduction(+:miss) reduction(+:guard)
         for (int p=0;p<W*Ht;p++){
             if (!mask[p]) continue;
             const float* P=&pos[(size_t)p*3]; const float* Nn=&nrm[(size_t)p*3];
+            // VOLUME-DIRECT: read the volume at the texel's OWN position first. No shell round-trip →
+            // no slide → the volume's own boundary sharpness survives. Only if the volume has nothing
+            // within sample_fallback_r of this texel do we fall through to the snap (the black-texture guard).
+            if (volume_direct) {
+                float q0=(P[0]+0.5f)*grid_res, q1=(P[1]+0.5f)*grid_res, q2=(P[2]+0.5f)*grid_res;
+                texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r);
+                bool any=false; for (int c=0;c<C;c++) if (atl[(size_t)p*C+c]!=0.f){ any=true; break; }
+                if (any) continue;
+                guard++;
+            }
             float qn[3]={Nn[0],Nn[1],Nn[2]}; float L=std::sqrt(qn[0]*qn[0]+qn[1]*qn[1]+qn[2]*qn[2]);
             if (L>1e-20f){ qn[0]/=L;qn[1]/=L;qn[2]/=L; }
             float snap[3];
@@ -988,6 +1016,8 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             if (!use_attr){ float q0=(snap[0]+0.5f)*grid_res, q1=(snap[1]+0.5f)*grid_res, q2=(snap[2]+0.5f)*grid_res;
                 texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r); }
         }
+        if (verbose && volume_direct) printf("[atlas] volume-direct: %zu texels (%.3f%% of covered) had no voxel within fallback_r=%d -> snap guard\n",
+                                             guard, 100.0*guard/(double)std::max(1,covered), sample_fallback_r);
         if (verbose && miss) printf("[atlas] reproject misses (no dense tri in range): %zu (%.3f%% of covered)\n",
                                     miss, 100.0*miss/(double)std::max(1,covered));
     } else {
@@ -1037,11 +1067,29 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     }
 
     // ---- pack to uint8 textures (Python layout) ----
+    // baseColor colourspace lever (owner judges — do not declare a winner). The tex-DiT baseColor sits
+    // in a dark/linear space; an encode brightens it to the spec-correct stored value. The decoder emits
+    // LINEAR baseColor but glTF tags the texture sRGB, so a conformant viewer double-converts -> ~54% too
+    // dark. The sRGB OETF (linear->sRGB) here makes the stored texel round-trip correctly (verified
+    // numerically 2026-06-20: spec-viewer decode recovers the true albedo to <0.002). DEFAULT ON now;
+    // set ATL_BASECOLOR_SRGB=0 to disable. ATL_BASECOLOR_GAMMA=g instead applies pow(c,g) (g<1 brightens).
+    // Applied to the RGB baseColor channels only (not alpha/PBR).
+    const char* bc_srgb_env = std::getenv("ATL_BASECOLOR_SRGB");
+    const bool bc_srgb = bc_srgb_env ? (std::atoi(bc_srgb_env) != 0) : true;
+    const float bc_gamma = std::getenv("ATL_BASECOLOR_GAMMA") ? (float)atof(std::getenv("ATL_BASECOLOR_GAMMA")) : 0.f;
+    auto enc_bc = [&](float c)->float{
+        if (c<0.f) c=0.f; if (c>1.f) c=1.f;
+        if (bc_srgb) return c<=0.0031308f ? 12.92f*c : 1.055f*std::pow(c,1.f/2.4f)-0.055f;
+        if (bc_gamma>0.f) return std::pow(c, bc_gamma);
+        return c;
+    };
+    if (verbose && (bc_srgb || bc_gamma>0.f))
+        printf("[atlas] baseColor encode: %s\n", bc_srgb ? "sRGB OETF" : ("gamma " + std::to_string(bc_gamma)).c_str());
     bt.base_color.resize((size_t)W*Ht*4);
     bt.metal_rough.resize((size_t)W*Ht*3);
     for (size_t p=0;p<(size_t)W*Ht;p++){
         const float* a=&atl[p*C];
-        bt.base_color[p*4+0]=u8(a[0]); bt.base_color[p*4+1]=u8(a[1]); bt.base_color[p*4+2]=u8(a[2]);
+        bt.base_color[p*4+0]=u8(enc_bc(a[0])); bt.base_color[p*4+1]=u8(enc_bc(a[1])); bt.base_color[p*4+2]=u8(enc_bc(a[2]));
         bt.base_color[p*4+3]=u8(a[5]);                       // alpha
         bt.metal_rough[p*3+0]=0;                              // R unused
         bt.metal_rough[p*3+1]=u8(a[4]);                       // G = roughness

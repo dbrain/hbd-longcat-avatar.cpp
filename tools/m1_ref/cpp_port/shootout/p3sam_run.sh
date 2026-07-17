@@ -16,8 +16,11 @@ MESH_C="/work/${MESH#"$ROOT/"}"; [ "$MESH_C" = "/work/$MESH" ] && MESH_C="$MESH"
 # 3060 12GB: seg-head tensor = [point_num, prompt_bs, 518] fp32. Default prompt_bs=32 OOMs (~6.6GB);
 # 8 keeps it ~1.6GB (just more prompt iterations, no quality loss). Tune via PROMPT_BS / POINT_NUM env.
 PROMPT_BS="${PROMPT_BS:-8}"; POINT_NUM="${POINT_NUM:-100000}"
+# Dual-GPU box: pin to the 3060 (sm_86) by UUID — this image's PyTorch has no sm_120 (5060 Ti) kernels,
+# so --gpus all crashes "no kernel image". Override w/ GPU_UUID.
+GPU_UUID="${GPU_UUID:-GPU-3b9ac5cf-95c5-5c9e-de19-af33af4b27d6}"
 echo "=== P3-SAM segment: $MESH -> $OUT  (prompt_bs=$PROMPT_BS point_num=$POINT_NUM) ==="
-docker run --rm --gpus all \
+docker run --rm --gpus "device=$GPU_UUID" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -v "$ROOT":/work \
   -v "$ROOT/_sonata_cache":/root/sonata \

@@ -72,6 +72,10 @@ struct M1Harness {
     std::vector<std::pair<ggml_tensor*, const void*>> gguf_uploads;  // (ctx_w dst, gguf host src)
     // tensors that need host data uploaded after alloc: (tensor, npy path)
     std::vector<std::pair<ggml_tensor*, std::string>> uploads;
+    // stacked-weight slice uploads: (dst tensor, byte offset into dst, npy path)
+    std::vector<std::tuple<ggml_tensor*, size_t, std::string>> upload_slices;
+    // GGUF stacked-weight slice uploads: (dst tensor, byte offset into dst, gguf host src, nbytes)
+    std::vector<std::tuple<ggml_tensor*, size_t, const void*, size_t>> gguf_slice_uploads;
     // input tensors filled from an in-memory float buffer (gallocr-managed)
     std::vector<std::pair<ggml_tensor*, std::vector<float>>> raw_uploads;
     // PERSISTENT constants (ctx_w, host data) — survive across graph_compute calls,
@@ -182,6 +186,45 @@ struct M1Harness {
         return weight_shaped(key, 4, ne);
     }
 
+    // Stacked weight: build ONE ctx_w tensor of the full (already-reversed) ne whose SLOWEST dim
+    // indexes `keys` (one per expert), uploading each key's f32 .npy into its contiguous slice at
+    // alloc time (no big transient host buffer). For MoE: W stack ne=[in,out,n_exp] (3D, feeds
+    // ggml_mul_mat_id), bias stack ne=[out,n_exp] (2D, feeds ggml_get_rows). Each .npy's raw bytes
+    // are layout-identical to the ggml slice (Linear [out,in] npy == ggml [in,out] slice).
+    ggml_tensor* weight_stack(const std::vector<std::string>& keys, int nd, const int64_t ne[4]) {
+        std::string nm = keys[0] + ".stack";
+        auto it = wcache.find(nm);
+        if (it != wcache.end()) return it->second;
+        // GGUF path: the per-expert tensors are stored at their packed type (F16 for big .weight,
+        // F32 for biases). Build ONE stacked tensor of that type and queue a slice upload from each
+        // gguf host src (mmap'd, already the right dtype -> no conversion, fast load).
+        if (use_gguf) {
+            ggml_tensor* s0 = ggml_get_tensor(gctx_data, keys[0].c_str());
+            if (!s0) throw std::runtime_error("gguf stack tensor not found: " + keys[0]);
+            ggml_type tt = s0->type;
+            ggml_tensor* t = ggml_new_tensor(ctx_w, tt, nd, ne);
+            ggml_set_name(t, nm.c_str());
+            size_t slice = ggml_nbytes(t) / keys.size();
+            for (size_t i = 0; i < keys.size(); ++i) {
+                ggml_tensor* s = ggml_get_tensor(gctx_data, keys[i].c_str());
+                if (!s) throw std::runtime_error("gguf stack tensor not found: " + keys[i]);
+                if (s->type != tt) throw std::runtime_error("gguf stack type mismatch: " + keys[i]);
+                if (ggml_nbytes(s) != slice)
+                    throw std::runtime_error("gguf stack slice size mismatch: " + keys[i]);
+                gguf_slice_uploads.push_back({t, i * slice, s->data, slice});
+            }
+            wcache[nm] = t;
+            return t;
+        }
+        ggml_tensor* t = ggml_new_tensor(ctx_w, GGML_TYPE_F32, nd, ne);
+        ggml_set_name(t, nm.c_str());
+        size_t slice = ggml_nbytes(t) / keys.size();
+        for (size_t i = 0; i < keys.size(); ++i)
+            upload_slices.push_back({t, i * slice, wdir + "/" + keys[i] + ".npy"});
+        wcache[nm] = t;
+        return t;
+    }
+
     // Persistent constant tensor (in ctx_w, host data) — for values that DON'T change
     // across recomputes (e.g. rope cos/sin/freqs). Uploaded once after wbuf alloc.
     ggml_tensor* const_tensor(const char* name, int nd, const int64_t ne[4], std::vector<float> data) {
@@ -230,6 +273,9 @@ struct M1Harness {
         for (auto& gu : gguf_uploads) {  // GGUF-backed weights: upload from the gguf host data
             ggml_backend_tensor_set(gu.first, gu.second, 0, ggml_nbytes(gu.first));
         }
+        for (auto& gs : gguf_slice_uploads) {  // GGUF stacked-weight slices (MoE experts)
+            ggml_backend_tensor_set(std::get<0>(gs), std::get<2>(gs), std::get<1>(gs), std::get<3>(gs));
+        }
         for (auto& u : uploads) {
             NpyArray a = npy_load(u.second);
             if (a.descr != "<f4")
@@ -238,6 +284,12 @@ struct M1Harness {
             if (bytes != ggml_nbytes(u.first))
                 throw std::runtime_error("size mismatch " + u.second);
             ggml_backend_tensor_set(u.first, a.raw.data(), 0, bytes);
+        }
+        for (auto& u : upload_slices) {  // stacked-weight slices (e.g. MoE experts)
+            NpyArray a = npy_load(std::get<2>(u));
+            if (a.descr != "<f4")
+                throw std::runtime_error("stack slice not f32: " + std::get<2>(u) + " (" + a.descr + ")");
+            ggml_backend_tensor_set(std::get<0>(u), a.raw.data(), std::get<1>(u), (size_t)a.numel() * 4);
         }
         for (auto& c : const_uploads) {
             if (c.second.size() * 4 != ggml_nbytes(c.first))
@@ -524,6 +576,7 @@ static inline CmpStats compare_to_npy(M1Harness& H, ggml_tensor* t, const std::s
     const double* rd = ref_f64 ? ref.f64() : nullptr;
     auto rv = [&](int64_t i) { return ref_f64 ? rd[i] : (double)r[i]; };
     double maxabs = 0, sum = 0, maxrel = 0;
+    double dot = 0, ng = 0, nr = 0;
     int64_t worst = -1;
     for (int64_t i = 0; i < n; i++) {
         double d = std::fabs((double)got[i] - rv(i));
@@ -531,11 +584,13 @@ static inline CmpStats compare_to_npy(M1Harness& H, ggml_tensor* t, const std::s
         sum += d;
         double rel = d / (std::fabs(rv(i)) + 1e-6);
         maxrel = std::max(maxrel, rel);
+        dot += (double)got[i] * rv(i); ng += (double)got[i] * (double)got[i]; nr += rv(i) * rv(i);
     }
+    double cosine = dot / (std::sqrt(ng) * std::sqrt(nr) + 1e-30);
     CmpStats s{maxabs, sum / n, maxrel, n};
     if (print) {
-        printf("  [%s] n=%lld maxabs=%.3e meanabs=%.3e maxrel=%.3e  worst@%lld got=%.6f ref=%.6f\n",
-               tag, (long long)n, s.maxabs, s.meanabs, s.maxrel, (long long)worst,
+        printf("  [%s] n=%lld cosine=%.6f maxabs=%.3e meanabs=%.3e maxrel=%.3e  worst@%lld got=%.6f ref=%.6f\n",
+               tag, (long long)n, cosine, s.maxabs, s.meanabs, s.maxrel, (long long)worst,
                worst >= 0 ? got[worst] : 0.f, worst >= 0 ? rv(worst) : 0.0);
     }
     return s;

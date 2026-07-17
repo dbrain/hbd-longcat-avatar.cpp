@@ -158,7 +158,7 @@ static inline std::vector<uint8_t> compute_subdiv(GpuW& W, float* d_feats, int N
 inline svae::Mesh m4_decode_mesh(const std::vector<int32_t>& coords_in,
         const std::vector<float>& shape_slat, const std::string& wdir,
         std::vector<std::vector<uint8_t>>* out_subs = nullptr, bool close_surface = false,
-        std::vector<int32_t>* out_coords1024 = nullptr) {
+        std::vector<int32_t>* out_coords1024 = nullptr, int resolution = 1024) {
     GpuW W(wdir);
     const int MC[5]={1024,512,256,128,64}; const int NB[4]={4,16,8,4}; const float EPS=1e-6f;
     int N=(int)coords_in.size()/4;
@@ -193,8 +193,17 @@ inline svae::Mesh m4_decode_mesh(const std::vector<int32_t>& coords_in,
         for (int d=0;d<3;d++) inter[(size_t)i*3+d]=(h7[(size_t)i*7+3+d]>0.f)?1:0;
         qlerp[i]=softplusf(h7[(size_t)i*7+6]);
     }
-    if (out_coords1024) *out_coords1024 = io.coords;   // A1: grid-1024 occupancy for the marching-tet remesh
-    return svae::flexible_dual_grid_to_mesh(io.coords.data(), Nf, dual.data(), inter.data(), qlerp.data(), 1024, close_surface);
+    // PIXAL3D_DEBUG_DECODE: diagnose the 1536 "0-face" bug — is `intersected` all-zero because the
+    // logits are NaN (overflow/garbage), all-negative (degenerate/OOD decode), or fine (meshing bug)?
+    if (std::getenv("PIXAL3D_DEBUG_DECODE")) {
+        long nz=0, nan=0; float mn=1e30f, mx=-1e30f;
+        for (int i=0;i<Nf;i++) for (int d=0;d<3;d++){ float v=h7[(size_t)i*7+3+d];
+            if (std::isnan(v)) nan++; if (v>0.f) nz++; if(v<mn)mn=v; if(v>mx)mx=v; }
+        fprintf(stderr,"[decode-dbg] Nf=%d intersected_pos=%ld nan=%ld intersected_logit[min=%.4f max=%.4f]\n",
+                Nf, nz, nan, mn, mx);
+    }
+    if (out_coords1024) *out_coords1024 = io.coords;   // A1: grid-`resolution` occupancy for the marching-tet remesh
+    return svae::flexible_dual_grid_to_mesh(io.coords.data(), Nf, dual.data(), inter.data(), qlerp.data(), resolution, close_surface);
 }
 
 // ===================== M3a: upsample -> hr_coords =====================

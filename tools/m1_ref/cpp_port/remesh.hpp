@@ -25,6 +25,8 @@
 #include <cmath>
 #include <functional>
 #include <cstdio>
+#include <cstdlib>           // getenv/atoi/abort (REMESH_CLOSE_R seal knob)
+#include <cstring>           // memset (separable box morphology)
 
 namespace svae {
 
@@ -417,48 +419,234 @@ inline Mesh marching_cubes_coarse(const int32_t* coords, int N, int fine_grid, i
 // the shell encloses, not the shell itself:
 //   1. coarse-rasterise: coarse cell = occupied if ANY fine voxel in it is occupied (thickens the
 //      shell → seals the small gaps the M4 extractor leaves, so the flood-fill can't leak inside).
-//   2. flood-fill the EXTERIOR on the coarse grid (6-connectivity from the padded bbox shell).
-//   3. solid = NOT exterior (fills the interior cavity the shell encloses) → one connected volume.
-//   4. box-blur the binary solid → smooth field, MC at iso=0.5 + linear interp → a SMOOTH,
+//   2. SEAL (REMESH_CLOSE_R, below) — the coarse rasterise ALONE does NOT stop the leak.
+//   3. flood-fill the EXTERIOR on the coarse grid (6-connectivity from the padded bbox shell).
+//   4. solid = NOT exterior (fills the interior cavity the shell encloses) → one connected volume.
+//   5. box-blur the binary solid → smooth field, MC at iso=0.5 + linear interp → a SMOOTH,
 //      WATERTIGHT, SINGLE-COMPONENT, coherent-normal low-poly outer surface → tight atlas, no
 //      decimation step. Seconds on CPU. (This is what cumesh's dual-contour remesh achieves; same
 //      end product, open recipe.)
+//
+// ============================ THE LEAK, AND WHY THE SEAL IS SHAPED LIKE THIS ==================
+// Step 1's comment ("so the flood-fill can't leak inside") was WRONG, and the bug it let through
+// shipped: the exterior flood LEAKED into the interior, so `solid` collapsed back onto the seed
+// shell and MC meshed the SHELL — an outer skin PLUS a never-visible inner skin ~1 wall beneath it
+// (a "vacuum-formed toy"). Measured on the soldier @res1536/stride2 (grid 768³): solid/wall = 1.000.
+// ~37% of the shipped mesh's area was interior, explaining ~73% of the texture-bake holes.
+//
+// WHY it leaks — digital topology, not a coding slip: the coarse shell is ~1 cell thick, and a
+// 1-cell-thick 26-connected (diagonal/staircase) surface does NOT separate a 6-connected
+// background. The 6-neighbour flood walks straight through the diagonal steps. This is the
+// standard (26-object ⇒ 6-background) pairing: such a shell is NOT 6-separating, by construction.
+//
+// WHY A PLAIN "CLOSE BEFORE THE FILL" DOES NOT FIX IT (the intuitive fix — it is a NO-OP here):
+// a morphological close (dilate∘erode) fills gaps SMALLER THAN the structuring element, but a
+// diagonal staircase has no such gap — it is already closed w.r.t. a box SE. Worked 2-D example,
+// X = {(i,i)}, B = 3×3: dilate(X,B) = {|x−y| ≤ 2}; erode(that,B) = {|x−y| ≤ 0} = X exactly. The
+// close returns the shell UNCHANGED, the flood still leaks, and solid/wall stays 1.00. (Verified
+// in-grid — see the R sweep in the handoff.) The close only helps against genuine holes.
+//
+// WHAT ACTUALLY WORKS = DILATE → FILL → ERODE (note the fill is INSIDE the pair):
+//   dilate by R : the shell becomes ≥(2R+1) thick in Chebyshev ⇒ 6-tunnel-free ⇒ the flood CANNOT
+//                 leak, whatever the staircase or the M4 extractor's holes do.
+//   flood+invert: the interior cavity is filled with BULK material.
+//   erode by R  : peels the R layers back off the OUTSIDE, restoring the silhouette — but the bulk
+//                 interior is not a thin shell, so erosion does not re-open it. The fill STICKS.
+// Net: outer surface back where it was, interior solid. is_solid then answers about a BODY, not a
+// shell, so MC emits ONE skin.
+//   * Silhouette safety: erode∘dilate = the morphological CLOSING of the seed (⊒ seed, and it can
+//     never exceed the seed's bbox: a point R+1 outside would need its whole SE-box inside
+//     dilate(X), which only reaches R). So the outside moves by ≤0 cells — verified empirically
+//     (REMESH_SEAL_VERBOSE prints the 3 silhouette projections before/after; delta must be 0).
+//   * The real cost of R is FEATURE FUSION, not silhouette: a closing bridges gaps ≤ ~2R coarse
+//     cells (= 2·R·stride fine voxels). That is the twintail/finger risk — keep R as small as
+//     seals, hence the sweep. R is a knob: REMESH_CLOSE_R=0 restores the exact legacy (leaky) path.
+// =============================================================================================
+
+// separable (2r+1)³ BOX morphology on a dense binary volume; index = (x*ny + y)*nz + z (z
+// contiguous). A box max/min is SEPARABLE per axis, so an r=3 close is 6 linear passes (~7
+// taps/cell/axis) rather than 343 taps/cell, and needs ONE temp buffer instead of a 7³ gather.
+// Out-of-volume counts as EMPTY for both ops; callers pad by ≥ r+2 so real content is never
+// clipped. dilate=true → OR (max), false → AND (min).
+inline void box_morph3(std::vector<uint8_t>& v, int nx, int ny, int nz, int r, bool dilate) {
+    if (r <= 0) return;
+    std::vector<uint8_t> t(v.size());
+    const size_t sy = (size_t)nz, sx = (size_t)ny * (size_t)nz;
+    const uint8_t init = dilate ? 0 : 1;
+    // ---- Z pass (the varying axis is the contiguous one)
+    #pragma omp parallel for schedule(static)
+    for (int x = 0; x < nx; x++)
+        for (int y = 0; y < ny; y++) {
+            const uint8_t* s = &v[(size_t)x*sx + (size_t)y*sy];
+            uint8_t* d = &t[(size_t)x*sx + (size_t)y*sy];
+            for (int z = 0; z < nz; z++) {
+                int lo = z-r, hi = z+r; uint8_t a;
+                if (dilate) { a = 0; if (lo<0) lo=0; if (hi>=nz) hi=nz-1;
+                              for (int k=lo;k<=hi;k++) a = (uint8_t)(a | s[k]); }
+                else if (lo<0 || hi>=nz) { a = 0; }
+                else { a = 1; for (int k=lo;k<=hi;k++) a = (uint8_t)(a & s[k]); }
+                d[z] = a;
+            }
+        }
+    v.swap(t);
+    // ---- Y pass (accumulate whole z-rows so the inner loop stays contiguous)
+    #pragma omp parallel for schedule(static)
+    for (int x = 0; x < nx; x++)
+        for (int y = 0; y < ny; y++) {
+            uint8_t* d = &t[(size_t)x*sx + (size_t)y*sy];
+            int lo = y-r, hi = y+r;
+            if (!dilate && (lo<0 || hi>=ny)) { memset(d, 0, (size_t)nz); continue; }
+            if (lo<0) lo=0;
+            if (hi>=ny) hi=ny-1;
+            memset(d, init, (size_t)nz);
+            for (int k=lo;k<=hi;k++) { const uint8_t* s=&v[(size_t)x*sx + (size_t)k*sy];
+                if (dilate) for (int z=0;z<nz;z++) d[z] = (uint8_t)(d[z] | s[z]);
+                else        for (int z=0;z<nz;z++) d[z] = (uint8_t)(d[z] & s[z]); }
+        }
+    v.swap(t);
+    // ---- X pass
+    #pragma omp parallel for schedule(static)
+    for (int x = 0; x < nx; x++)
+        for (int y = 0; y < ny; y++) {
+            uint8_t* d = &t[(size_t)x*sx + (size_t)y*sy];
+            int lo = x-r, hi = x+r;
+            if (!dilate && (lo<0 || hi>=nx)) { memset(d, 0, (size_t)nz); continue; }
+            if (lo<0) lo=0;
+            if (hi>=nx) hi=nx-1;
+            memset(d, init, (size_t)nz);
+            for (int k=lo;k<=hi;k++) { const uint8_t* s=&v[(size_t)k*sx + (size_t)y*sy];
+                if (dilate) for (int z=0;z<nz;z++) d[z] = (uint8_t)(d[z] | s[z]);
+                else        for (int z=0;z<nz;z++) d[z] = (uint8_t)(d[z] & s[z]); }
+        }
+    v.swap(t);
+}
+
+// Default SEAL radius in COARSE cells. *** DEFAULT 0 = OFF, AND THAT IS THE CORRECT DEFAULT. ***
+// MEASURED IN-GRID (soldier @res1536/stride2, the real 768³ production grid, REMESH_CLOSE_R=0):
+//     seed(wall) = 999,290 cells   solid = 6,240,249 cells   solid/wall = 6.245
+//     emitted surface signed volume = 0.013778  vs  solid*cellvol = 0.013776   (match to 0.01%)
+//                                              vs  seed*cellvol   = 0.002206   (6.2x off)
+// i.e. the flood fill DOES NOT LEAK, `solid` IS a filled body, and the surface this function emits
+// bounds THAT BODY — a SINGLE skin. The "the fill is a no-op / solid == 1.00x wall / the mesh is
+// double-walled because of this function" theory is REFUTED at the real resolution. (Control: this
+// path reproduces production's 4,831,250 verts exactly, so it is the real legacy path.)
+// The seal below is therefore INSURANCE, not a fix — it costs feature fusion (it bridges gaps of
+// ≤ ~2*R coarse cells; at stride 2 R=1 already fuses ~4 fine voxels, which is the twintail/finger
+// risk the mc_blur comment warns about) and buys nothing on inputs that already fill correctly.
+// Turn it on ONLY for an input the QC warning below actually fires on.
+#ifndef REMESH_CLOSE_R_DEFAULT
+#define REMESH_CLOSE_R_DEFAULT 0
+#endif
+
 inline Mesh marching_cubes_solid(const int32_t* coords, int N, int fine_grid, int stride,
                                  int blur = 1, float iso = 0.5f) {
     const int Gc = fine_grid / stride;
     const float voxel_c = (float)stride / (float)fine_grid, aabb0 = -0.5f;
 
-    // 1. coarse occupied seed + bbox (in coarse coords)
+    // SEAL knobs. REMESH_CLOSE_R=0 reproduces the legacy (double-walled) mesh bit-for-bit for A/B.
+    const char* cr_env  = std::getenv("REMESH_CLOSE_R");
+    const int   close_r = cr_env ? atoi(cr_env) : REMESH_CLOSE_R_DEFAULT;
+    const bool  seal_strict  = std::getenv("REMESH_SEAL_STRICT")  != nullptr;
+    const bool  seal_verbose = std::getenv("REMESH_SEAL_VERBOSE") != nullptr;
+
+    // 1. coarse occupied seed + bbox (in coarse coords). Two linear passes over `coords` — no hash
+    //    map: the dense bbox grid IS the membership structure (and it is what the seal needs).
     int mnx=Gc,mny=Gc,mnz=Gc,mxx=-1,mxy=-1,mxz=-1;
-    std::unordered_map<int64_t,char> seed; seed.reserve((size_t)N);
     for (int i=0;i<N;i++){ int X=coords[i*4+1]/stride, Y=coords[i*4+2]/stride, Z=coords[i*4+3]/stride;
-        seed.emplace(coord_key(0,X,Y,Z),(char)1);
         mnx=X<mnx?X:mnx; mny=Y<mny?Y:mny; mnz=Z<mnz?Z:mnz;
         mxx=X>mxx?X:mxx; mxy=Y>mxy?Y:mxy; mxz=Z>mxz?Z:mxz; }
-    const int pad=2;
+    // pad must clear the dilation: with pad = 2+R the corner seed stays empty after dilate by R.
+    const int pad = 2 + (close_r > 0 ? close_r : 0);
     int bx0=mnx-pad, by0=mny-pad, bz0=mnz-pad;
     int nbx=(mxx-mnx)+1+2*pad, nby=(mxy-mny)+1+2*pad, nbz=(mxz-mnz)+1+2*pad;
+    const size_t ncell = (size_t)nbx*(size_t)nby*(size_t)nbz;
     auto bidx=[&](int X,int Y,int Z)->int64_t{ return ((int64_t)(X-bx0)*nby + (Y-by0))*nbz + (Z-bz0); };
-    // dense state: 0=unknown(interior candidate), 1=occupied-seed(solid), 2=exterior
-    std::vector<uint8_t> st((size_t)nbx*nby*nbz, 0);
-    for (auto& kv: seed){ int64_t k=kv.first; int Z=(int)(k&0xFFFFF),Y=(int)((k>>20)&0xFFFFF),X=(int)((k>>40)&0xFFFFF);
-        st[bidx(X,Y,Z)] = 1; }
-    // 2. flood-fill exterior from (bx0,by0,bz0) corner (guaranteed empty due to pad)
-    std::vector<int> stack; stack.reserve(nbx*nby);
-    auto push=[&](int x,int y,int z){ size_t id=(size_t)(x-bx0)*nby*nbz+(size_t)(y-by0)*nbz+(z-bz0);
-        if(st[id]==0){ st[id]=2; stack.push_back((int)id);} };
-    push(bx0,by0,bz0);
-    const int dirs[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-    while(!stack.empty()){ int id=stack.back(); stack.pop_back();
-        int z=id%nbz, y=(id/nbz)%nby, x=id/(nbz*nby);
-        int X=x+bx0,Y=y+by0,Z=z+bz0;
-        for(auto&dd:dirs){ int nX=X+dd[0],nY=Y+dd[1],nZ=Z+dd[2];
-            if(nX<bx0||nY<by0||nZ<bz0||nX>=bx0+nbx||nY>=by0+nby||nZ>=bz0+nbz) continue;
-            push(nX,nY,nZ); } }
-    // 3. solid predicate: in-bbox and not exterior
+    std::vector<uint8_t> occ(ncell, 0);
+    for (int i=0;i<N;i++) occ[bidx(coords[i*4+1]/stride, coords[i*4+2]/stride, coords[i*4+3]/stride)] = 1;
+    int64_t seed_cells=0; for (size_t i=0;i<ncell;i++) seed_cells += occ[i];
+
+    // 2. SEAL step A — DILATE the shell so it is 6-tunnel-free (skipped entirely when close_r==0).
+    std::vector<uint8_t> work = occ;
+    if (close_r > 0) box_morph3(work, nbx, nby, nbz, close_r, /*dilate=*/true);
+
+    // 3. flood-fill exterior (6-conn) from the (bx0,by0,bz0) corner == index 0 (empty: pad ≥ R+2).
+    //    state: 0=unknown(interior candidate), 1=shell, 2=exterior. int64 ids — a coarse bbox can
+    //    exceed 2^31 cells at small stride, which the old `int` stack would have silently wrapped.
+    std::vector<uint8_t> st(ncell, 0);
+    for (size_t i=0;i<ncell;i++) if (work[i]) st[i]=1;
+    {
+        std::vector<int64_t> stack; stack.reserve(1u<<16);
+        auto push=[&](int64_t id){ if(st[id]==0){ st[id]=2; stack.push_back(id);} };
+        push(0);
+        const int64_t sy=nbz, sx=(int64_t)nby*nbz;
+        while(!stack.empty()){ int64_t id=stack.back(); stack.pop_back();
+            int64_t z=id%nbz, y=(id/nbz)%nby, x=id/sx;
+            if(z>0)      push(id-1);
+            if(z<nbz-1)  push(id+1);
+            if(y>0)      push(id-sy);
+            if(y<nby-1)  push(id+sy);
+            if(x>0)      push(id-sx);
+            if(x<nbx-1)  push(id+sx);
+        }
+    }
+    std::vector<uint8_t>().swap(work);   // free before the erode allocates its temp
+
+    // 4. solid = NOT exterior ... then SEAL step B — ERODE by the same R (restores the silhouette;
+    //    the now-BULK interior does not re-open). Union the seed back in so the seal is extensive:
+    //    a genuinely sub-R-thin feature can never be erased, only failed-to-fill.
+    std::vector<uint8_t> solid(ncell);
+    for (size_t i=0;i<ncell;i++) solid[i] = (st[i]!=2) ? 1 : 0;
+    std::vector<uint8_t>().swap(st);
+    if (close_r > 0) {
+        box_morph3(solid, nbx, nby, nbz, close_r, /*dilate=*/false);
+        for (size_t i=0;i<ncell;i++) if (occ[i]) solid[i]=1;
+    }
+    int64_t solid_cells=0; for (size_t i=0;i<ncell;i++) solid_cells += solid[i];
+    const double ratio = seed_cells ? (double)solid_cells/(double)seed_cells : 0.0;
+
+    // ---- QC: THE check that was missing. boundary==0, nonmanifold==0 and single-component ALL
+    // PASS PERFECTLY on a leaked double-walled shell — every acceptance test we had was blind to
+    // it, which is exactly how it shipped. solid/wall is the one number that sees it: a filled
+    // body is many times its own shell; a leak pins the ratio at ~1.0.
+    if (ratio < 1.2) {
+        fprintf(stderr,
+            "[remesh] *** QC: solid/wall = %.3f (solid=%lld seed=%lld, close_r=%d, grid=%d) ***\n"
+            "[remesh]     The exterior flood-fill LEAKED through the occupancy shell, so `solid`\n"
+            "[remesh]     collapsed onto the shell and MC will emit a DOUBLE-WALLED mesh (outer\n"
+            "[remesh]     skin + a never-visible inner skin) — ~37%% wasted polys/atlas and ~73%%\n"
+            "[remesh]     of the texture holes. Raise REMESH_CLOSE_R (0 = leaky legacy path).\n"
+            "[remesh]     NB boundary/nonmanifold/component checks CANNOT see this. Expected for a\n"
+            "[remesh]     genuinely sheet-like (not closed) input; otherwise it is the bug.\n"
+            "[remesh]     (REMESH_SEAL_STRICT=1 turns this warning into an abort.)\n",
+            ratio, (long long)solid_cells, (long long)seed_cells, close_r, Gc);
+        if (seal_strict) { fprintf(stderr, "[remesh] REMESH_SEAL_STRICT: aborting.\n"); abort(); }
+    }
+    if (seal_verbose) {
+        // SILHOUETTE SAFETY: project seed and solid down each axis. The seal is a closing on the
+        // outside, so the projections must be IDENTICAL — any growth here means the fix moved the
+        // outer surface and is wrong.
+        int64_t ps[3]={0,0,0}, pl[3]={0,0,0};
+        auto proj=[&](int axis, const std::vector<uint8_t>& v)->int64_t{
+            int d0 = axis==0?nby:nbx, d1 = axis==2?nby:nbz;
+            std::vector<uint8_t> msk((size_t)d0*d1, 0);
+            for (int x=0;x<nbx;x++) for (int y=0;y<nby;y++) for (int z=0;z<nbz;z++)
+                if (v[((size_t)x*nby+y)*nbz+z]) {
+                    int u = axis==0?y:x, w = axis==2?y:z;
+                    msk[(size_t)u*d1+w] = 1; }
+            int64_t c=0; for (size_t i=0;i<msk.size();i++) c+=msk[i]; return c; };
+        for (int ax=0; ax<3; ax++){ ps[ax]=proj(ax,occ); pl[ax]=proj(ax,solid); }
+        fprintf(stderr, "[remesh] SEAL close_r=%d grid=%d bbox=%dx%dx%d (%.1fM cells)\n"
+                        "[remesh]   seed(wall)=%lld solid=%lld  solid/wall=%.3f\n"
+                        "[remesh]   silhouette proj (seed -> solid): X %lld -> %lld | Y %lld -> %lld | Z %lld -> %lld  (delta must be 0)\n",
+                close_r, Gc, nbx, nby, nbz, (double)ncell/1e6,
+                (long long)seed_cells, (long long)solid_cells, ratio,
+                (long long)ps[0],(long long)pl[0],(long long)ps[1],(long long)pl[1],(long long)ps[2],(long long)pl[2]);
+    }
+
+    // 5. solid predicate: in-bbox and filled.
     auto is_solid=[&](int X,int Y,int Z)->bool{
         if(X<bx0||Y<by0||Z<bz0||X>=bx0+nbx||Y>=by0+nby||Z>=bz0+nbz) return false;
-        return st[bidx(X,Y,Z)] != 2; };
+        return solid[bidx(X,Y,Z)] != 0; };
     // 4. smoothed field = box-blur of binary solid
     const int r=blur; const float inv_box=1.0f/(float)((2*r+1)*(2*r+1)*(2*r+1));
     auto field_at=[&](int X,int Y,int Z)->float{

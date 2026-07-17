@@ -488,8 +488,8 @@ int main(int argc, char** argv) {
     r3_generated = std::max(0, (int)tokens.size() - (int)start_tokens.size());
     printf("[STAGE R3] generated %zu tokens (first eos@? last=%d)\n", tokens.size(), tokens.empty() ? -1 : tokens.back());
 
-    // token-match vs golden output_ids.npy
-    {
+    // token-match vs golden output_ids.npy (validation only — absent when rigging a fresh mesh).
+    if (file_exists(e2e + "/output_ids.npy")) {
         NpyArray oi = npy_load(e2e + "/output_ids.npy");
         const int64_t* g = oi.i64(); int64_t ng = oi.numel();
         int64_t cmp = std::min((int64_t)tokens.size(), ng), match = 0;
