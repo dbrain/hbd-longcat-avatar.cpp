@@ -5,11 +5,19 @@
 **C++/docker builds fine here; NO Rust builds.** **READ FIRST:** memory `project_rig_audit_gilly`,
 `FINDINGS-rig-perf-pass.md` (perf detail), and `$A/DIAGNOSIS-decode.md` (the journey).
 
-## State you're inheriting (DONE — don't redo)
-The C++ auto-rigger (`skintokens_e2e`, R1→R3→R5→R4→R6) produces clean bipeds on gilly and is BOTH
-quality-locked AND perf-optimized:
-- **Quality:** beam = faithful transformers 5.9.0 `_beam_search` (`rig_beam_generate.hpp`), `prec=fp32`,
-  forward proven bit-faithful (tfprobe KL 0.0006/step). Don't add sticky-tape (no joint-caps / eos-prefs).
+## State you're inheriting
+The C++ auto-rigger (`skintokens_e2e`, R1→R3→R5→R4→R6) is **perf-optimized (DONE)** and **forward-faithful**,
+but **NOT yet at structural quality parity with Python** — that's your job #1 below.
+- **Perf (DONE — don't redo):** see below.
+- **Forward + distribution parity (DONE):** beam = faithful transformers 5.9.0 `_beam_search`
+  (`rig_beam_generate.hpp`), `prec=fp32`, forward proven bit-faithful (tfprobe KL 0.0006/step). The C++
+  reproduces Python's *distribution* (termination rate, joint-count range, ~2 malformed). Don't add
+  sticky-tape (no joint-caps / eos-prefs — tried + reverted).
+- **THE ASTERISK (NOT done):** the C++ does NOT reproduce Python's clean **61-joint structure**. On golden
+  cond it runs **busier/wider (J 53–78 vs Python's tight 42–56)** with some asymmetric/degenerate seeds —
+  visible in the render (`:8013/rig_perf.html`, C++ skeletons overlaid in the textured gilly mesh: denser
+  bones, occasional zero-length joints). This is a **beam-search / structure** gap, NOT precision: KV
+  precision is ruled out (fp32-KV @2048 tested = no gain, 3 malformed, costs 2.4 GB → keep f16-KV).
 - **Perf (this pass):** maxnew=2048 budget now RUNS in **4.5 GB** (was ~14 GB OOM) at **~30 tok/s clean
   (≈6×)**, **0/10 runaways**. Levers (all in `qwen3_decode.hpp` / `qwen3_batched.hpp` /
   `rig_beam_generate_batched.hpp`): f16-KV (`RIG_KV_F16`, default on) + shared-prefix KV (bit-exact) +
@@ -37,7 +45,15 @@ quality-locked AND perf-optimized:
 - Sweep harness: `$A/perf/{sweep_2048.sh, batched_validate.sh}` (10-seed J/eos/rig_score/VRAM tables).
 
 ## THE REMAINING BITS (your work, roughly in order)
-1. **Real-cond end-to-end (the big one).** EVERYTHING above used golden-cond (banked `learned_mesh_cond.npy`,
+1. **Close the rig-structure gap to Python (golden-cond) — THE asterisk, do this first.** On golden cond the
+   C++ rig is busier/wider than Python's clean 61 (see render). Forward is proven faithful (don't chase it)
+   and precision is ruled out (fp32-KV tested = no gain — DON'T retry KV-precision/quant levers). So the gap
+   is in the BEAM SEARCH reaching/keeping Python's coherent ~61-joint hypotheses: compare the C++ beam
+   bookkeeping (selection, length-norm, finished-pool, the 2*num_beams joint draw) against transformers
+   5.9.0 `_beam_search` once more on the busier/malformed seeds; and check the detok for zero-length/
+   coincident joints (e.g. perf_s9 had 4 joints at local origin). Judge by RENDER + `rig_score` (no
+   sticky-tape). Goal: golden-cond rigs that track Python's tight 42–56 / clean 61-joint structure.
+2. **Real-cond end-to-end.** EVERYTHING above used golden-cond (banked `learned_mesh_cond.npy`,
    R3 isolated from R1). The real path runs the C++ VecSet R1 encoder on actual mesh verts/normals:
    `r1=real cond=real r1w=$A/r1w` with e2e dir `$A/samp` (a real generated mesh, NOT the giraffe golden).
    R1 `mesh_cond` is **cosine 0.9998** vs golden — the DIAGNOSIS notes this tiny diff is load-bearing
@@ -46,7 +62,7 @@ quality-locked AND perf-optimized:
    (tighten the vecset encoder / FPS query sampling toward 0.9999+; FPS `rng.choice` is currently a
    deterministic mt19937 replica of Python's nondeterministic draw — see `skintokens_e2e.cpp` R1=real path
    + `vecset_encoder.hpp`). Validate on a NEW mesh (e.g. a fresh pixal3d output), not just gilly.
-2. **PORT the quality-ladder models to C++/ggml — the SkinTokens way, NOT Python wiring.** The end goal is
+3. **PORT the quality-ladder models to C++/ggml — the SkinTokens way, NOT Python wiring.** The end goal is
    pure C++/ggml (Python only ever wraps *unported* models — `feedback_automate_no_manual_stitching`). Port
    each the way SkinTokens/pixal3d were ported (see [[project_3dgen_cpp_port]] A2): `pack_gguf.cpp` packs the
    weights to GGUF (npy-vs-gguf bit-identical), a ggml forward in `$CP`, `gguf_reader.hpp` + env
@@ -60,7 +76,7 @@ quality-locked AND perf-optimized:
      end). Public MoGe weights exist and are presumably packable — source them, GGUF-pack, port the forward,
      validate vs Python.
    Then chain the ports into the e2e so raw image → clean riggable textured GLB, fully C++ (no manual stitching).
-3. **Productionize as a koblem engine** (the broader [[project_3dgen_cpp_port]] goal): worker-isolation +
+4. **Productionize as a koblem engine** (the broader [[project_3dgen_cpp_port]] goal): worker-isolation +
    routes + frontend, like the other cpp ports (sa3/flux2/qwen3-tts patterns). The `docker/rigprof` image
    is the build template. Off-server Rust build.
 
