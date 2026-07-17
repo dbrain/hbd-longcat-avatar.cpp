@@ -504,6 +504,14 @@ typedef struct {
     // the global audio timeline so lip-sync continues across segments.
     const float* cont_latent;
     int cont_latent_frames;
+    // LTXAV_SHARED_REFINE_NOISE: this segment's ABSOLUTE start position on the chain's latent-frame
+    // timeline (segment 0 = 0; a continuation segment advances by the prior segment's latent frames
+    // MINUS the cont_latent_frames overlap it re-renders). The refine keys its noise to this absolute
+    // index so a given timeline position draws identical noise in every segment that covers it —
+    // without it, each segment's refine noises the shared overlap independently and the two
+    // re-inventions cannot agree. Only read when LTXAV_SHARED_REFINE_NOISE=1; 0 (the default) is the
+    // legacy no-offset behaviour and is byte-identical.
+    int64_t chain_latent_offset;
     // RETAKE END-PIN (bidirectional single-segment retake): the FIRST end_cont_latent_frames
     // latent frames (the HEAD) of the NEXT segment (seg_{N+1}). Held FROZEN as an appended guide
     // at a FUTURE timeline position (just past this segment's last target frame) so this segment's
@@ -705,6 +713,30 @@ typedef struct {
     // keeps the media encoder in the example layer (the core lib never links it), like on_segment.
     void (*on_flush_frames)(sd_image_t* frames, int frame_count, void* user);
     void*        on_flush_frames_user;
+    // ── ENGINE-OWNED AUDIO (supersedes chain_audio_dir's pre-sliced aud_<i>.wav) ──────────
+    // The caller hands over the WHOLE timeline's audio ONCE and the chain slices/aligns it
+    // per segment from its OWN run variables. This exists because the pre-sliced path forces
+    // the CLIENT to predict the engine's seam trim: koblem sliced at a hardcoded 24 frames
+    // while the engine's content-adaptive ltxav_auto_trim_drop actually picks 23-25 per
+    // segment, so every seam where they disagreed shifted that segment's lip-sync AND left
+    // the stitched timeline a different length than the client assumed (the error accumulates
+    // across a chain). No client-side constant can track a per-segment content-adaptive trim.
+    //
+    // chain_audio_full: WAV path (any rate/channels — downmixed to 16k mono internally) whose
+    //   t=0 corresponds to timeline frame chain_audio_offset_frames. Each segment's drive
+    //   window is cut from it against the TRUE accumulated timeline position, so a mis-predicted
+    //   trim costs at most a sub-frame within one segment and CANNOT accumulate. NULL = fall
+    //   back to chain_audio_dir (byte-identical legacy behaviour).
+    // chain_audio_track: WAV path muxed VERBATIM (rate/channels preserved) as the deliverable's
+    //   audio, replacing the generated per-segment audio. Sliced from chain_audio_offset_frames
+    //   and truncated to the stitched length. NULL = deliver the generated audio as before.
+    //   May be the same file as chain_audio_full (voice-drives-and-delivers).
+    // chain_audio_offset_frames: timeline frame at which BOTH clips' t=0 sits. 0 = clip starts
+    //   with the render. Lets a caller hand over a 3-minute track for a chain that renders a
+    //   window part-way into it without pre-cutting the file.
+    const char* chain_audio_full;
+    const char* chain_audio_track;
+    int         chain_audio_offset_frames;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

@@ -123,6 +123,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
             json body;
             std::vector<std::pair<int, std::string>> audio_parts;  // (segment index, wav bytes)
+            std::string audio_full_part;   // whole-timeline drive clip (engine slices it)
+            std::string audio_track_part;  // whole-timeline deliverable track (engine muxes it)
             if (req.is_multipart_form_data()) {
                 std::string req_json;
                 if (req.form.has_field("request")) {
@@ -142,6 +144,16 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         break;
                     }
                     audio_parts.emplace_back(i, req.form.get_file(key).content);
+                }
+                // ENGINE-OWNED AUDIO: the whole timeline, once. `audio_full` drives lip-sync,
+                // `audio_track` is the deliverable; either may be omitted. When present these
+                // SUPERSEDE the pre-sliced audio_<i> parts above — the engine cuts each segment's
+                // window from its own seam trim instead of trusting the client to predict it.
+                if (req.form.has_file("audio_full")) {
+                    audio_full_part = req.form.get_file("audio_full").content;
+                }
+                if (req.form.has_file("audio_track")) {
+                    audio_track_part = req.form.get_file("audio_track").content;
                 }
             } else {
                 if (req.body.empty()) {
@@ -290,6 +302,32 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
             if (!audio_dir.empty()) {
                 chain["chain_audio_dir"] = audio_dir;
+            }
+
+            // ENGINE-OWNED AUDIO: stage the whole-timeline clips next to the per-segment dir.
+            // Written on the FIRST submit and then simply re-discovered by path on every
+            // resume/retake (same trick as chain_audio_dir above) — a retake of shot 12 of a
+            // 3-minute clip needs no re-upload and, crucially, no client-side hunt for "which
+            // chunk of audio does shot 12 use": the engine re-derives that window itself from
+            // the banked seg_<i>.len prefix it already replays.
+            if (!audio_full_part.empty() || !audio_track_part.empty()) {
+                fs::create_directories(job_dir / "audio", ec);
+            }
+            if (!audio_full_part.empty()) {
+                ltx_write_blob((job_dir / "audio" / "full.wav").string(), audio_full_part);
+            }
+            if (!audio_track_part.empty()) {
+                ltx_write_blob((job_dir / "audio" / "track.wav").string(), audio_track_part);
+            }
+            if (fs::exists(job_dir / "audio" / "full.wav", ec)) {
+                chain["chain_audio_full"] = (job_dir / "audio" / "full.wav").string();
+            }
+            if (fs::exists(job_dir / "audio" / "track.wav", ec)) {
+                chain["chain_audio_track"] = (job_dir / "audio" / "track.wav").string();
+            }
+            // Timeline frame at which both clips' t=0 sits (default 0 = clip starts with the render).
+            if (body.contains("chain_audio_offset_frames")) {
+                chain["chain_audio_offset_frames"] = body.value("chain_audio_offset_frames", 0);
             }
             chain["ltx_job_dir"] = job_dir.string();
             chain["resume_from"] = resume_from;

@@ -38,6 +38,99 @@
 namespace LONGCAT_AUDIO {
 
     // ---------------------------------------------------------------------
+    // FULL-FIDELITY WAV reader: PCM16 / PCM32 / IEEE float, any sample rate, any
+    // channel count — preserved VERBATIM (no downmix, no resample). Returns the
+    // INTERLEAVED (channel-minor) float waveform in [-1, 1], matching sd_audio_t.data's
+    // layout (see ChainAudioAcc::append_window in stable-diffusion.cpp — the planar
+    // reading of that buffer was a real historical bug; do not "fix" this to planar).
+    //
+    // Distinct from load_wav_16k_mono below, which is the LIP-SYNC DRIVE loader and
+    // deliberately destroys rate/channels to feed the audio encoder. This one is the
+    // DELIVERABLE-TRACK loader: whatever the user uploaded reaches the muxer intact,
+    // so the Opus encode is the only generation loss.
+    //
+    // out_sample_rate/out_channels receive the file's native values. Returns false and
+    // leaves outputs untouched on any parse failure.
+    // ---------------------------------------------------------------------
+    inline bool load_wav_full(const std::string& path,
+                             std::vector<float>& out,
+                             uint32_t&           out_sample_rate,
+                             uint32_t&           out_channels) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f.is_open()) {
+            LOG_ERROR("audio: cannot open wav '%s'", path.c_str());
+            return false;
+        }
+        std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (buf.size() < 44 || std::memcmp(buf.data(), "RIFF", 4) != 0 || std::memcmp(buf.data() + 8, "WAVE", 4) != 0) {
+            LOG_ERROR("audio: '%s' is not a RIFF/WAVE file", path.c_str());
+            return false;
+        }
+        auto rd_u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, buf.data() + o, 4); return v; };
+        auto rd_u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, buf.data() + o, 2); return v; };
+
+        uint16_t audio_format = 1, channels = 1, bits = 16;
+        uint32_t sample_rate = 48000;
+        size_t   data_off = 0, data_len = 0;
+        size_t   p = 12;
+        while (p + 8 <= buf.size()) {
+            uint32_t cksz = rd_u32(p + 4);
+            if (std::memcmp(buf.data() + p, "fmt ", 4) == 0) {
+                audio_format = rd_u16(p + 8);
+                channels     = rd_u16(p + 10);
+                sample_rate  = rd_u32(p + 12);
+                bits         = rd_u16(p + 22);
+            } else if (std::memcmp(buf.data() + p, "data", 4) == 0) {
+                data_off = p + 8;
+                data_len = cksz;
+                break;
+            }
+            p += 8 + cksz + (cksz & 1);
+        }
+        if (data_off == 0 || channels == 0 || sample_rate == 0) {
+            LOG_ERROR("audio: no usable data/fmt chunk in '%s'", path.c_str());
+            return false;
+        }
+        data_len = std::min(data_len, buf.size() - data_off);
+
+        const char* d = buf.data() + data_off;
+        std::vector<float> inter;
+        if (audio_format == 1 && bits == 16) {
+            size_t n = data_len / 2;
+            inter.resize(n);
+            for (size_t i = 0; i < n; i++) {
+                int16_t s;
+                std::memcpy(&s, d + i * 2, 2);
+                inter[i] = s / 32768.0f;
+            }
+        } else if (audio_format == 3 && bits == 32) {
+            size_t n = data_len / 4;
+            inter.resize(n);
+            std::memcpy(inter.data(), d, n * 4);
+        } else if (audio_format == 1 && bits == 32) {
+            size_t n = data_len / 4;
+            inter.resize(n);
+            for (size_t i = 0; i < n; i++) {
+                int32_t s;
+                std::memcpy(&s, d + i * 4, 4);
+                inter[i] = s / 2147483648.0f;
+            }
+        } else {
+            LOG_ERROR("audio: unsupported wav format=%u bits=%u in '%s'", audio_format, bits, path.c_str());
+            return false;
+        }
+        // Drop any ragged partial frame so sample_count*channels == data size exactly.
+        inter.resize((inter.size() / channels) * channels);
+
+        out              = std::move(inter);
+        out_sample_rate  = sample_rate;
+        out_channels     = channels;
+        LOG_INFO("audio: loaded '%s' verbatim (%u Hz x%u, %zu frames)",
+                 path.c_str(), sample_rate, channels, out.size() / channels);
+        return true;
+    }
+
+    // ---------------------------------------------------------------------
     // Minimal WAV reader: PCM16 / PCM32 / IEEE float, mono or multi-channel
     // (averaged to mono). Linear-resamples to 16 kHz if needed. The test input
     // is already 16 kHz mono PCM16, so the common path is a straight read.

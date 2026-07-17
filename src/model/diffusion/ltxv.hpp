@@ -2039,7 +2039,35 @@ namespace LTXV {
             // takes low-precision (FP8/FP16) activations directly (comfy's native scaled_mm)
             // — a ggml-cuda nvfp4-cublaslt change, NOT this cast. Kept env-gated as the
             // scaffold for that follow-up; leave OFF.
-            static const bool dit_f16 = (std::getenv("LTX_DIT_F16") != nullptr);
+            // Honour the VALUE, not mere presence: `LTX_DIT_F16=0` used to ENABLE the F16 stream
+            // (getenv != nullptr), so bisects that set it to 0 silently kept F16 on and then died
+            // in the F32-Q assert (fattn-common.cuh:942) with no obvious cause.
+            static const bool dit_f16_env = [] {
+                const char * e = std::getenv("LTX_DIT_F16");
+                return e != nullptr && atoi(e) != 0;
+            }();
+            // DEVICE-GATED (Blackwell-only) — mirrors WAN_DIT_F16 (wan.hpp:1072-1082), WAN_ROPE_F16
+            // (wan.hpp:185) and GGML_CUDNN_ATTN_F16_OUT (ggml_extend.hpp:1817-1822). LTX was the
+            // only F16 stream left ungated.
+            //
+            // The F16 residual stream makes the NVFP4 Linears emit an F16 dst
+            // (ggml_extend.hpp:1142), so `to_q` hands an F16 q to attention. RoPE is F32-only and
+            // casts q back itself (apply_hidden_rope, ltxv.hpp:771-773), which is why the
+            // self-attentions survive — but the CROSS-attentions pass pe==nullptr
+            // (ltxv.hpp:923-926) and so keep the F16 q. An F16 q is consumable ONLY by cuDNN SDPA
+            // (fattn.cu:447-465) or SA3 (fattn-sa3.cu:254), and BOTH are gated to
+            // cc >= GGML_CUDA_CC_BLACKWELL. On any other GPU (e.g. the RTX 3060, sm86 — which
+            // LTX_CUDA_ARCHS="86;120" made a legal placement target) the cross-attention therefore
+            // reaches a native flash kernel and aborts on GGML_ASSERT(Q->type == GGML_TYPE_F32)
+            // (fattn-common.cuh:942) at the first DiT block of the first sampler step — i.e. EVERY
+            // render on that card, independent of sampler / step count / sigma schedule. Fall back
+            // to the well-tested F32 stream there so LTX runs on the 3060; Blackwell (the prod
+            // 5060 Ti) keeps the F16 stream and its VRAM win byte-identically. (CPU build: off.)
+#ifdef SD_USE_CUDA
+            static const bool dit_f16 = dit_f16_env && ggml_backend_cuda_device_has_blackwell_mma(0);
+#else
+            static const bool dit_f16 = false;
+#endif
             if (dit_f16) {
                 vx = ggml_cast(ctx->ggml_ctx, vx, GGML_TYPE_F16);
                 if (ax != nullptr) {

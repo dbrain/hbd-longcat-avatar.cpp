@@ -4231,6 +4231,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_anchor_path                      = nullptr;
     sd_vid_gen_params->cont_latent                           = nullptr;
     sd_vid_gen_params->cont_latent_frames                    = 0;
+    sd_vid_gen_params->chain_latent_offset                   = 0;  // 0 = legacy/no absolute offset
     sd_vid_gen_params->end_cont_latent                       = nullptr;
     sd_vid_gen_params->end_cont_latent_frames                = 0;
     sd_vid_gen_params->cont_refine_latent                    = nullptr;
@@ -5266,11 +5267,39 @@ static sd::Tensor<float> build_ltxv_video_positions(int64_t width,
         }
     }
 
+    // [SEAM 2026-07-17] The appended block's temporal grid MUST match the target's, or the guide
+    // claims coordinates for content that lives elsewhere on the timeline.
+    //
+    // The TARGET loop above maps latent corner t through ltxv_latent_corner_to_pixel_frame(), which
+    // under causal_temporal_positioning is max(0, 8t-7): frame 0 -> [0,1), frame 1 -> [1,9),
+    // frame 2 -> [9,17). This loop instead used a UNIFORM stride-8 grid: frame 0 -> [0,8),
+    // frame 1 -> [8,16), frame 2 -> [16,24) — ignoring causal_temporal_positioning entirely. So a
+    // CONTINUATION guide (a K-latent-frame VIDEO tail depicting exactly the target's overlap
+    // frames) was placed up to temporal_scale-1 = 7 pixel frames LATER than the content it depicts.
+    // Candidate mechanism for the measured "anchor holds ~3 frames then falls off a cliff", and for
+    // the echo/ghost that got LTXAV_CONT_LEGACY_HEAD rejected.
+    //
+    // keyframe_pixel_frames == 1 is a genuine single-INSTANT image pin (i2v / Director keyframe):
+    // one pixel frame at its own index, no causal span. That path is unchanged.
+    //
+    // Env-gated for A/B; unset => the historical uniform grid, byte-identical. VALUE-gated, never
+    // presence-gated (compose "${VAR:-}" yields an empty string and getenv returns non-null for it).
+    const char* guide_causal_env = std::getenv("LTXAV_GUIDE_CAUSAL_POS");
+    const bool  guide_causal     = guide_causal_env != nullptr && guide_causal_env[0] == '1' &&
+                                   guide_causal_env[1] == '\0' && keyframe_pixel_frames != 1;
     for (int64_t t = 0; t < keyframe_latent_frames; t++) {
-        float t_start = static_cast<float>(keyframe_frame_idx + t * temporal_scale);
-        float t_end   = static_cast<float>(keyframe_frame_idx + (t + 1) * temporal_scale);
-        if (keyframe_pixel_frames == 1) {
-            t_end = t_start + 1.f;
+        float t_start, t_end;
+        if (guide_causal) {
+            t_start = keyframe_frame_idx +
+                      ltxv_latent_corner_to_pixel_frame(t, temporal_scale, causal_temporal_positioning);
+            t_end   = keyframe_frame_idx +
+                      ltxv_latent_corner_to_pixel_frame(t + 1, temporal_scale, causal_temporal_positioning);
+        } else {
+            t_start = static_cast<float>(keyframe_frame_idx + t * temporal_scale);
+            t_end   = static_cast<float>(keyframe_frame_idx + (t + 1) * temporal_scale);
+            if (keyframe_pixel_frames == 1) {
+                t_end = t_start + 1.f;
+            }
         }
         t_start /= static_cast<float>(fps);
         t_end /= static_cast<float>(fps);
@@ -5756,6 +5785,119 @@ static sd::Tensor<float> make_ltxav_video_denoise_mask(const sd::Tensor<float>& 
                            value);
 }
 
+// LTXAV_SHARED_REFINE_NOISE (value-gated, default off = byte-identical).
+//
+// The chain renders long video as segments whose refine re-noises to sigma0 with FRESH noise per
+// segment. A continuation segment re-renders the prior segment's tail (the K-frame overlap), so that
+// timeline region is denoised twice — from two INDEPENDENT noise draws. Two independent inventions
+// of the same region cannot agree, which is the seam. Keying the noise to the ABSOLUTE timeline
+// position makes both segments' refines see the same eps there, so they fall toward the same basin
+// instead of diverging. Same idea as LTX's tiled sampler (one full_noise, sliced per tile) and
+// FreeNoise/CoNo; it is a strict refinement of LTX_REFINE_CONST_SEED, which already makes the refine
+// noise chain-constant but aligns it by LOCAL frame index — the overlap sits at DIFFERENT local
+// indices in the two segments (seg N's last K vs seg N+1's first K), so const-seed cannot align it.
+static bool ltxav_shared_refine_noise_enabled() {
+    // VALUE-gated, never presence-gated: compose passes "${VAR:-}" which yields an EMPTY STRING, and
+    // getenv returns non-null for it. A presence check would silently enable this on every render.
+    const char* e = std::getenv("LTXAV_SHARED_REFINE_NOISE");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+
+// Chain-CONSTANT base seed for the position-keyed noise. It must NOT depend on the segment: the chain
+// gives each segment seed = base + seg (generate_video_chain) precisely so base motion varies, and
+// inheriting that here would hand the same absolute frame a different seed in each segment — defeating the whole
+// mechanism. Following LTX_REFINE_CONST_SEED's established precedent, the value is arbitrary (only
+// cross-segment consistency matters) and seed variety keeps living in the base pass.
+static uint64_t ltxav_shared_refine_noise_seed() {
+    if (const char* e = std::getenv("LTXAV_SHARED_REFINE_NOISE_SEED"); e != nullptr && e[0] != '\0') {
+        return std::strtoull(e, nullptr, 10);
+    }
+    return 0x5D1F'C0DEull;
+}
+
+// splitmix64: a counter-based bijective mixer (period 2^64, full avalanche). Deliberately NOT
+// STDDefaultRNG re-seeded per frame: that is minstd_rand0, a 31-bit LCG whose single ~2.1e9 orbit is
+// shared by every seed, so per-frame re-seeding drops ~200 frames x ~6e5 draws onto one cycle and
+// adjacent frames overlap with high probability — duplicated noise runs that would read as a temporal
+// artefact, not a crash. A counter-based mixer has no orbit to collide on and stays O(1) in memory
+// (the alternative, drawing one contiguous stream from frame 0 and slicing, is O(n^2) over the chain).
+static inline uint64_t ltxav_splitmix64(uint64_t& state) {
+    uint64_t z = (state += 0x9E37'79B9'7F4A'7C15ull);
+    z          = (z ^ (z >> 30)) * 0xBF58'476D'1CE4'E5B9ull;
+    z          = (z ^ (z >> 27)) * 0x94D0'49BB'1331'11EBull;
+    return z ^ (z >> 31);
+}
+
+// Fill `dst` with n i.i.d. N(0,1) draws deterministically derived from `key` (Box-Muller).
+static void ltxav_positional_normals(float* dst, int64_t n, uint64_t key) {
+    uint64_t state = key;
+    // Decorrelate keys that differ only in the low bits (adjacent absolute frames).
+    state          = ltxav_splitmix64(state);
+    for (int64_t i = 0; i < n; i += 2) {
+        // (0,1]: never 0, so log() is finite.
+        const double u1 = static_cast<double>((ltxav_splitmix64(state) >> 11) + 1) * (1.0 / 9007199254740993.0);
+        const double u2 = static_cast<double>(ltxav_splitmix64(state) >> 11) * (1.0 / 9007199254740992.0);
+        const double r  = std::sqrt(-2.0 * std::log(u1));
+        const double th = 2.0 * M_PI * u2;
+        dst[i]          = static_cast<float>(r * std::cos(th));
+        if (i + 1 < n) {
+            dst[i + 1] = static_cast<float>(r * std::sin(th));
+        }
+    }
+}
+
+// Position-keyed replacement for Tensor::randn_like at the refine sites.
+//
+// `like` is the refine's [W, H, T, C, 1] latent, possibly AV-PACKED (audio occupies the channels above
+// video_channels as a flat blob — pack_ltxav_audio_and_video_latents, sd:5658). Layout is verified from
+// Tensor::offset_of (core/tensor.hpp:308-325): stride starts at 1 and multiplies by shape_[i] as i
+// ascends, so shape[0] is FASTEST-varying and (t,c) is a contiguous W*H plane at flat offset
+// (c*T + t)*W*H.
+//
+// Frame -> absolute index follows the tensor's TWO-BLOCK layout: frames [0, target_frames) are this
+// segment's own output at abs frame_offset + t, while any trailing guide block appended by
+// apply_ltxav_video_guide_by_keyframe_index is the PRIOR segment's tail carrying RoPE
+// keyframe_frame_idx=0 — i.e. it truly sits at the segment START, abs frame_offset + (t - target_frames).
+// Keying it there makes seg N+1's guide agree with seg N's own tail frames at the same absolute time.
+//
+// AUDIO is left on `rng` (one draw for the whole trailing region, video-frame-count-keyed rather than
+// timeline-keyed): the packed audio blob has its own temporal geometry and its own known seam bug, and
+// position-keying it would be a guess. Unchanged-from-today behaviour for audio, no silent corruption.
+static sd::Tensor<float> positional_randn_like(const sd::Tensor<float>& like,
+                                               const std::shared_ptr<RNG>& rng,
+                                               uint64_t seed,
+                                               int64_t frame_offset,
+                                               int64_t video_channels,
+                                               int64_t target_frames) {
+    GGML_ASSERT(like.dim() == 5);
+    const int64_t W = like.shape()[0];
+    const int64_t H = like.shape()[1];
+    const int64_t T = like.shape()[2];
+    const int64_t C = like.shape()[3];
+    GGML_ASSERT(video_channels > 0 && video_channels <= C);
+    GGML_ASSERT(target_frames > 0 && target_frames <= T);
+
+    sd::Tensor<float> out(like.shape());
+    const int64_t plane = W * H;
+    std::vector<float> frame_noise(static_cast<size_t>(plane * video_channels));
+    for (int64_t t = 0; t < T; ++t) {
+        const int64_t abs_t = frame_offset + (t < target_frames ? t : t - target_frames);
+        ltxav_positional_normals(frame_noise.data(), plane * video_channels,
+                                 seed ^ (static_cast<uint64_t>(abs_t) * 0x9E37'79B9'7F4A'7C15ull));
+        // Scatter this frame's draws across the channel-strided planes.
+        for (int64_t c = 0; c < video_channels; ++c) {
+            std::copy_n(frame_noise.data() + c * plane, plane, out.data() + (c * T + t) * plane);
+        }
+    }
+    const int64_t audio_start = plane * T * video_channels;
+    const int64_t audio_n     = out.numel() - audio_start;
+    if (audio_n > 0) {
+        std::vector<float> audio_noise = rng->randn(static_cast<uint32_t>(audio_n));
+        std::copy_n(audio_noise.data(), audio_n, out.data() + audio_start);
+    }
+    return out;
+}
+
 static sd::Tensor<float> encode_ltxav_condition_image(sd_ctx_t* sd_ctx,
                                                       const sd::Tensor<float>& image,
                                                       const char* name) {
@@ -5803,6 +5945,196 @@ static bool apply_ltxav_condition_by_latent_index(sd::Tensor<float>* video_laten
 
     sd::ops::slice_assign(video_latent, 2, latent_idx, latent_idx + condition_frames, condition_latent);
     sd::ops::fill_slice(video_mask, 2, latent_idx, latent_idx + condition_frames, conditioned_mask);
+    return true;
+}
+
+// LTXAV_PIN_REFINE_OVERLAP (value-gated, default off = byte-identical).
+//
+// THE BUG. A continuation segment's hires refine is an SDEdit at sigma0=0.85 — the OFFICIAL LTX-2.3
+// recipe (Lightricks' shipped ComfyUI workflow, the "Deno" workflows, Wan2GP's
+// DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES all agree), so 0.85 is not negotiable. The segment's target
+// frames [0,K) ARE the prior segment's tail re-rendered (the chain drops 1+(K-1)*8 pixel frames off
+// this head at stitch), yet they carry denoise mask 1.0 like every other frame — so the refine
+// re-noises the SHARED overlap to 0.85 and RE-INVENTS it. Two independent inventions of one timeline
+// region cannot agree: that is the seam. The prior tail rides today only as `hires_video_reference`,
+// APPENDED guide tokens (clean, frozen) — a real anchor, but an advisory one that measurably decays
+// within ~3 frames (frame-diff 1.6 at the cut -> 30.4 three frames later).
+//
+// THE FIX (what every implementation that actually runs a strong refine on chained video does — they
+// PIN, they do not match noise; matching noise was measured here and made the seam WORSE, 1.14 ->
+// 1.26, and StreamingT2V/Wan2GP corroborate):
+//   - Wan2GP (models/ltx2/ltx2.py:1299 _append_prefix_entries) feeds the clean overlap prefix to BOTH
+//     stages; VideoConditionByKeyframeIndex sets denoise_mask = 1.0 - strength with
+//     input_video_strength=1.0 => mask 0 => per-token timestep 0 + a hard restore every step.
+//   - Lightricks LTXVLoopingSampler: noise_mask = 1 - strength clamp on the overlap.
+//   - RuneXX Extend: overlap as a known encoded latent + LTXVAddLatentGuide strength 1.0.
+// We do exactly that: write the prior segment's REFINED tail into the refine's x_t over the overlap
+// frames and drop the mask there to 1.0 - strength. sample() then gives those tokens timestep 0
+// (process_ltxav_video_timesteps: per-token t = mask * t0) and restores them every step
+// (`noised_input`/`denoised` = x * mask + init_latent * (1 - mask), :2982/:2991/:3246). The refine
+// physically CANNOT re-invent the overlap; it can only harmonize the frames after it.
+//
+// Reuses apply_ltxav_condition_by_latent_index — the SAME helper the base path's LTXAV_CONT_LEGACY_HEAD
+// uses (:8091) — rather than a parallel implementation. It fits exactly: pass the UNPACKED video latent
+// and the VIDEO-ONLY mask and its shape check (shape[0]/[1]/[3] equality), slice_assign on the frame
+// dim, and fill_slice of the mask over the same frames are precisely the pin.
+static bool ltxav_pin_refine_overlap_enabled() {
+    // VALUE-gated, NEVER presence-gated: compose passes "${VAR:-}" which yields an EMPTY STRING and
+    // getenv returns non-null for it, so a presence check silently enables the feature on every
+    // render. That has bitten this codebase twice — LTX_REFINE_CONTEXT_FRAMES (commented out in
+    // docker-compose.yml for exactly this) and LTXAV_CHAIN_HIRES_REFERENCE_FRAMES (:12990).
+    const char* e = std::getenv("LTXAV_PIN_REFINE_OVERLAP");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+
+// Pin strength, mirroring Wan2GP's `input_video_strength` and our existing LTXAV_CONT_OVERLAP_MASK /
+// LTXAV_RELIP_REF_STRENGTH levers: 1.0 (default) = mask 0.0 = fully frozen overlap. Lower values let
+// the refine partially re-diffuse the overlap so its texture blends with the frames after it, at the
+// cost of loosening the lock. Explicit e[0] != '\0' guard so an empty "${VAR:-}" cannot atof() to 0.0
+// and silently turn the pin off while the feature reports as engaged.
+static float ltxav_pin_refine_overlap_strength() {
+    if (const char* e = std::getenv("LTXAV_PIN_REFINE_OVERLAP_STRENGTH"); e != nullptr && e[0] != '\0') {
+        return std::clamp(static_cast<float>(atof(e)), 0.f, 1.f);
+    }
+    return 1.0f;
+}
+
+// Pin `tail_frames` clean prior-segment refined latent frames over this refine's overlap and hold them
+// at mask = 1 - strength. Returns true only when frames were actually written.
+//
+// `overlap_frames` is K (sd_vid_gen_params->cont_latent_frames) — the base overlap this segment
+// re-renders; `tail_frames` is the transported refined tail (hires_ref_K), which may be SMALLER.
+static bool ltxav_pin_refine_overlap(sd::Tensor<float>* latent,
+                                     sd::Tensor<float>* mask,
+                                     const float* tail_data,
+                                     int64_t tail_frames,
+                                     int64_t tail_w,
+                                     int64_t tail_h,
+                                     int64_t tail_c,
+                                     int64_t video_ch,
+                                     int64_t overlap_frames,
+                                     int64_t target_frames,
+                                     const char* stage_label) {
+    if (latent == nullptr || mask == nullptr || latent->empty() || tail_data == nullptr) {
+        LOG_WARN("LTXAV_PIN_REFINE_OVERLAP (%s): SKIPPED, pinned 0 frames - no refine latent or no transported tail",
+                 stage_label);
+        return false;
+    }
+    if (latent->dim() != 5 || video_ch <= 0) {
+        LOG_WARN("LTXAV_PIN_REFINE_OVERLAP (%s): SKIPPED, pinned 0 frames - unexpected refine latent rank %d",
+                 stage_label, (int)latent->dim());
+        return false;
+    }
+    const int64_t W     = latent->shape()[0];
+    const int64_t H     = latent->shape()[1];
+    const int64_t T_all = latent->shape()[2];
+    const int64_t C_all = latent->shape()[3];
+    // video_target_frame_count owns the [target | guide] split. Pin the TARGET's own frames only —
+    // the appended guide block at [T_tgt, T_tgt+K) is a separate, already-working anchor and must not
+    // be confused with the target's first K frames. (On the default path LTX_REFINE_CONTEXT_FRAMES
+    // has already trimmed the guide out of x_t, so T_tgt == T_all; an explicit env value can retain
+    // it, hence the clamp.)
+    const int64_t T_tgt = (target_frames > 0 && target_frames < T_all) ? target_frames : T_all;
+
+    // ALIGNMENT (a silent-corruption trap). The tail is the prior segment's LAST `tail_frames`
+    // refined frames; this segment's target frames [0,K) re-render the prior segment's LAST K frames,
+    // 1:1 in order. So prior frame (T_prev - K + j) == our frame j, and the tail therefore lands at
+    // [K - tail_frames, K) — NOT at [0, tail_frames). With the shipped defaults K=3 and
+    // hires_ref_K=min(3,K)=3 the two coincide, but a larger --cont-latent-take (or
+    // LTXAV_CHAIN_HIRES_REFERENCE_FRAMES < K) makes tail_frames < K, and pinning at 0 would place the
+    // prior tail (K - tail_frames) frames EARLIER than its true timeline slot — a temporal stutter
+    // welded in at full strength, with no error anywhere.
+    const int64_t pin_start = overlap_frames - tail_frames;
+    const int64_t pin_end   = overlap_frames;
+
+    const bool shape_ok = tail_w == W && tail_h == H && tail_c == video_ch &&
+                          tail_frames > 0 && overlap_frames > 0 && tail_frames <= overlap_frames &&
+                          pin_start >= 0 && pin_end <= T_tgt && C_all >= video_ch;
+    if (!shape_ok) {
+        // Mirrors the hires-guide gate's shape_ok WARN (:11456): never corrupt, just decline.
+        LOG_WARN("LTXAV_PIN_REFINE_OVERLAP (%s): SKIPPED, pinned 0 frames - tail [w=%lld,h=%lld,t=%lld,c=%lld] vs refine "
+                 "[w=%lld,h=%lld,t=%lld(target %lld),c=%lld], video_ch=%lld, K=%lld -> wanted target frames [%lld,%lld)",
+                 stage_label, (long long)tail_w, (long long)tail_h, (long long)tail_frames, (long long)tail_c,
+                 (long long)W, (long long)H, (long long)T_all, (long long)T_tgt, (long long)C_all,
+                 (long long)video_ch, (long long)overlap_frames, (long long)pin_start, (long long)pin_end);
+        return false;
+    }
+
+    // PACKED AV. pack_ltxav_audio_and_video_latents (:5659) lays the VIDEO block out as a CONTIGUOUS
+    // flat prefix of W*H*T*video_ch floats with the audio blob memcpy'd after it, so slicing dim 3 at
+    // [0, video_ch) and assigning that same range back is exactly a read/write of the video prefix —
+    // the audio bytes are never touched. Deliberately NOT the unpack -> repack pattern used at
+    // :11384: repacking rebuilds the audio mask from a flat audio_mask_value and would SILENTLY DROP
+    // the LipDub per-token audio mask (make_ltxav_lipdub_audio_mask) that the relip stage-2 path
+    // installs at :9881. Slice-and-assign-back preserves the audio mask bit-for-bit.
+    const bool latent_packed = C_all > video_ch;
+    sd::Tensor<float> video  = latent_packed ? sd::ops::slice(*latent, 3, 0, video_ch) : *latent;
+
+    // EMPTY MASK. On the plain continuation refine apply_ltxv_refine_image_conditioning returns early
+    // (:9903-9924) leaving hires_denoise_mask EMPTY — it only fills it for i2v/keyframe/relip or an
+    // audio-pinned (audio_fixed) refine. sample() skips the whole mask branch on an empty mask, so
+    // without creating one here the pin would write x_t and then be silently overwritten at step 1.
+    // An all-ones mask is arithmetically inert for every UNPINNED frame (x*1 + init*0 == x) and for
+    // the audio channels (a 1-channel mask broadcasts to 1.0 over them = "generate", which is what an
+    // absent mask already meant — and audio_fixed renders never reach here with an empty mask).
+    bool mask_created = mask->empty();
+    bool mask_packed  = false;
+    sd::Tensor<float> video_mask;
+    if (mask_created) {
+        video_mask = make_ltxav_video_denoise_mask(video, 1.f);
+    } else if (mask->dim() != 5 || mask->shape()[0] != W || mask->shape()[1] != H || mask->shape()[2] != T_all) {
+        LOG_WARN("LTXAV_PIN_REFINE_OVERLAP (%s): SKIPPED, pinned 0 frames - refine denoise mask shape mismatch "
+                 "(rank %d, [%lld,%lld,%lld] vs latent [%lld,%lld,%lld])",
+                 stage_label, (int)mask->dim(),
+                 (long long)(mask->dim() > 0 ? mask->shape()[0] : 0),
+                 (long long)(mask->dim() > 1 ? mask->shape()[1] : 0),
+                 (long long)(mask->dim() > 2 ? mask->shape()[2] : 0),
+                 (long long)W, (long long)H, (long long)T_all);
+        return false;
+    } else if (mask->shape()[3] > video_ch) {
+        // Packed mask: extract the VIDEO channels only. fill_slice on the frame dim iterates every
+        // channel, so pinning the packed mask directly would zero the trailing AUDIO mask channels at
+        // those flat offsets and mute/freeze arbitrary audio tokens.
+        video_mask  = sd::ops::slice(*mask, 3, 0, video_ch);
+        mask_packed = true;
+    } else {
+        video_mask = *mask;
+    }
+
+    const float strength = ltxav_pin_refine_overlap_strength();
+    const float pin_mask = 1.0f - strength;  // Wan2GP's input_video_strength=1.0 -> denoise_mask 0.0
+
+    sd::Tensor<float> tail({W, H, tail_frames, video_ch, 1});
+    std::memcpy(tail.data(), tail_data, (size_t)tail.numel() * sizeof(float));
+
+    if (!apply_ltxav_condition_by_latent_index(&video, &video_mask, tail, pin_start,
+                                               "refine overlap pin", pin_mask)) {
+        return false;
+    }
+
+    if (latent_packed) {
+        sd::ops::slice_assign(latent, 3, 0, video_ch, video);
+    } else {
+        *latent = std::move(video);
+    }
+    if (mask_packed) {
+        sd::ops::slice_assign(mask, 3, 0, video_ch, video_mask);
+    } else {
+        *mask = std::move(video_mask);
+    }
+
+    // Log ONCE per stage when engaged. Absence of a log line has twice been mistaken here for absence
+    // of the thing, so state the stage, K, the exact frames pinned, the mask value and the tail dims;
+    // every decline above logs a distinct "SKIPPED, pinned 0 frames" WARN so a no-op is never silent.
+    LOG_INFO("LTXAV_PIN_REFINE_OVERLAP (%s): PINNED %lld overlap frame(s) at target [%lld,%lld) of %lld (K=%lld), "
+             "strength=%.3f -> denoise mask=%.3f (0=frozen), tail [w=%lld,h=%lld,t=%lld,c=%lld], refine latent "
+             "[w=%lld,h=%lld,t=%lld,c=%lld] (audio channels=%lld untouched), mask=%s",
+             stage_label, (long long)tail_frames, (long long)pin_start, (long long)pin_end, (long long)T_tgt,
+             (long long)overlap_frames, strength, pin_mask,
+             (long long)tail_w, (long long)tail_h, (long long)tail_frames, (long long)tail_c,
+             (long long)W, (long long)H, (long long)T_all, (long long)C_all, (long long)(C_all - video_ch),
+             mask_created ? "CREATED all-ones (was empty)"
+                          : (mask_packed ? "existing packed (video channels only)" : "existing video-only"));
     return true;
 }
 
@@ -11388,6 +11720,37 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             hires_video_positions = std::move(refine_refs.video_positions);
         }
 
+        // LTXAV_PIN_REFINE_OVERLAP (stage 0): hold this segment's overlap frames CLEAN through the
+        // 0.85 SDEdit instead of letting it re-invent them. Uses the SAME `cont_src` the guide block
+        // above selected (stage-0's own lower-res tail when transported, else the full-res tail —
+        // whichever matches THIS stage's [W,H]; K is temporal so it is resolution-independent).
+        // Runs AFTER the guide/character-reference appends so it sees the final target/guide layout,
+        // and BEFORE the noise + temporal-window blocks so the pin composes with both: the blend path
+        // slices its per-tile latent out of x_t and its per-tile mask out of hires_denoise_mask, so
+        // pinned values and zeroed mask frames both survive the tiling. (That path is INERT in prod
+        // regardless — it is gated `&& !hires_continue_mode` at :11813 and prod sets LTX_HIRES_CONTINUE=1.)
+        //
+        // Gated to the PURE continuation shape (no init/end image, no timeline keyframes, not relip
+        // two-stage): those refines legitimately pin frame 0 / keyframe indices to re-encoded images
+        // via apply_ltxv_refine_image_conditioning, and an overlap pin over [0,K) would fight them.
+        if (ltxav_pin_refine_overlap_enabled() && sd_version_is_ltxav(sd_ctx->sd->version) &&
+            !latents.relip_twostage && cont_src != nullptr && cont_src_frames > 0 &&
+            sd_vid_gen_params->init_image.data == nullptr &&
+            sd_vid_gen_params->end_image.data == nullptr &&
+            (sd_vid_gen_params->keyframes == nullptr || sd_vid_gen_params->keyframes_size == 0)) {
+            ltxav_pin_refine_overlap(&x_t,
+                                     &hires_denoise_mask,
+                                     cont_src,
+                                     cont_src_frames,
+                                     cont_src_width,
+                                     cont_src_height,
+                                     cont_src_chan,
+                                     sd_ctx->sd->get_latent_channel(),
+                                     sd_vid_gen_params->cont_latent_frames,
+                                     latents.video_target_frame_count,
+                                     "stage 0");
+        }
+
         // LTX_REFINE_CONST_SEED (chain identity-stability): the chain gives each segment a DISTINCT
         // seed (base+seg, sd:10183) for base-motion variety, but the stage-2 refine INHERITS that
         // per-segment RNG -> each segment's refine adds DIFFERENT noise -> re-denoises the face/skin
@@ -11405,9 +11768,34 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             LOG_INFO("LTX_REFINE_CONST_SEED: refine noise re-seeded to constant %llu (identity-stable across chain segments)",
                      (unsigned long long)rseed);
         }
+        // LTXAV_SHARED_REFINE_NOISE: key this refine's noise to the ABSOLUTE timeline so the
+        // continuation overlap is re-noised identically in both segments that cover it (see
+        // positional_randn_like). Runs BEFORE the fallback below; off => the fallback is the only
+        // path and is byte-identical to today.
+        bool refine_noise_positional = false;
+        if (ltxav_shared_refine_noise_enabled() && sd_version_is_ltxav(sd_ctx->sd->version) &&
+            x_t.dim() == 5 && x_t.shape()[2] > 0 && x_t.shape()[3] >= sd_ctx->sd->get_latent_channel()) {
+            const int64_t video_ch = sd_ctx->sd->get_latent_channel();
+            const int64_t T_all    = x_t.shape()[2];
+            // video_target_frame_count owns the [target | guide] split. The guide is trimmed out of
+            // x_t above on the default (cont_refine_latent) path, so clamp to the tensor we have.
+            const int64_t T_tgt = latents.video_target_frame_count > 0
+                                      ? std::min<int64_t>(latents.video_target_frame_count, T_all)
+                                      : T_all;
+            const uint64_t pseed = ltxav_shared_refine_noise_seed();
+            noise = positional_randn_like(x_t, sd_ctx->sd->rng, pseed,
+                                          sd_vid_gen_params->chain_latent_offset, video_ch, T_tgt);
+            refine_noise_positional = true;
+            LOG_INFO("LTXAV shared refine noise (stage 0): abs latent offset %lld, target=%lld guide=%lld frames, "
+                     "video_ch=%lld, seed=%llu",
+                     (long long)sd_vid_gen_params->chain_latent_offset, (long long)T_tgt,
+                     (long long)(T_all - T_tgt), (long long)video_ch, (unsigned long long)pseed);
+        }
         // In continue mode this matches ComfyUI stage two's RandomNoise:
         // sample() applies (1-σ) * upscaled_x0 + σ * fresh_noise.
-        noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+        if (!refine_noise_positional) {
+            noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+        }
         LOG_INFO("[LTX_PHASE] refine noise tensor setup took %.3fs", (ggml_time_ms() - refine_noise_start) * 1.0f / 1000);
 
         // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
@@ -11716,7 +12104,15 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             // trailing channels are the separately rebuilt audio mask.
             sd::Tensor<float> full_video_denoise_mask;
             if (!hires_denoise_mask.empty()) {
-                full_video_denoise_mask = sd::ops::slice(hires_denoise_mask, 3, 0, latent_channels);
+                // A VIDEO-ONLY mask is 1-channel (make_ltxav_video_denoise_mask), not latent_channels:
+                // that is what the no-audio refine already stores (:10065) and what the overlap pin
+                // creates. resolve_slice_bounds THROWS when end > dim_size, so the unclamped
+                // slice(..., 3, 0, latent_channels) was a live crash on any 1-channel mask reaching
+                // here (i2v + LTX_REFINE_TEMPORAL_BLEND=1 + LTX_HIRES_CONTINUE=0 today). Clamping is a
+                // no-op for every packed mask (min picks latent_channels) and keeps the 1-channel mask
+                // whole — it broadcasts over the video channels exactly as sample() expects.
+                const int64_t mask_video_ch = std::min<int64_t>(latent_channels, hires_denoise_mask.shape()[3]);
+                full_video_denoise_mask     = sd::ops::slice(hires_denoise_mask, 3, 0, mask_video_ch);
             }
             sd::Tensor<float> audio_latent;
             sd::Tensor<float> audio_noise;
@@ -12227,7 +12623,55 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 stage_reference = std::move(refs.video_reference);
                 stage_positions = std::move(refs.video_positions);
             }
-            sd::Tensor<float> noise = sd::Tensor<float>::randn_like(stage_latent, sd_ctx->sd->rng);
+            // LTXAV_PIN_REFINE_OVERLAP (this hires stage): identical mechanism to stage 0, against
+            // the FULL-RESOLUTION refined tail (cont_refine_latent) whose grid matches THIS stage's —
+            // the same source the stage's guide block just above uses. K is a LATENT-FRAME count, so
+            // it is unchanged by this stage's doubled [W,H]; the tail TENSOR must match the stage's
+            // grid, which the helper's shape_ok check enforces (WARN + skip, never corrupt).
+            // Unlike stage 0 the mask here always exists (built at :12268), so this is the
+            // packed/video-only mask path, never the created path.
+            if (ltxav_pin_refine_overlap_enabled() && sd_version_is_ltxav(sd_ctx->sd->version) &&
+                !latents.relip_twostage &&
+                sd_vid_gen_params->cont_refine_latent != nullptr &&
+                sd_vid_gen_params->cont_refine_latent_frames > 0 &&
+                sd_vid_gen_params->init_image.data == nullptr &&
+                sd_vid_gen_params->end_image.data == nullptr &&
+                (sd_vid_gen_params->keyframes == nullptr || sd_vid_gen_params->keyframes_size == 0)) {
+                char stage_label[32];
+                snprintf(stage_label, sizeof(stage_label), "stage %d", stage_index);
+                ltxav_pin_refine_overlap(&stage_latent,
+                                         &mask,
+                                         sd_vid_gen_params->cont_refine_latent,
+                                         sd_vid_gen_params->cont_refine_latent_frames,
+                                         sd_vid_gen_params->cont_refine_latent_width,
+                                         sd_vid_gen_params->cont_refine_latent_height,
+                                         sd_vid_gen_params->cont_refine_latent_channels,
+                                         latent_channels,
+                                         sd_vid_gen_params->cont_latent_frames,
+                                         latents.video_target_frame_count,
+                                         stage_label);
+            }
+            // LTXAV_SHARED_REFINE_NOISE (see stage 0): the offset is in LATENT FRAMES, which are
+            // temporal and therefore resolution-independent — this stage's [W,H] have doubled since
+            // stage 0 but its frame t is still the same absolute timeline position, so the SAME
+            // offset applies unchanged. Per-frame draws scale with this stage's plane size.
+            sd::Tensor<float> noise;
+            if (ltxav_shared_refine_noise_enabled() && sd_version_is_ltxav(sd_ctx->sd->version) &&
+                stage_latent.dim() == 5 && stage_latent.shape()[2] > 0 &&
+                stage_latent.shape()[3] >= latent_channels) {
+                const int64_t T_all = stage_latent.shape()[2];
+                const int64_t T_tgt = latents.video_target_frame_count > 0
+                                          ? std::min<int64_t>(latents.video_target_frame_count, T_all)
+                                          : T_all;
+                const uint64_t pseed = ltxav_shared_refine_noise_seed();
+                noise = positional_randn_like(stage_latent, sd_ctx->sd->rng, pseed,
+                                              sd_vid_gen_params->chain_latent_offset, latent_channels, T_tgt);
+                LOG_INFO("LTXAV shared refine noise (stage %d): abs latent offset %lld, target=%lld guide=%lld frames, seed=%llu",
+                         stage_index, (long long)sd_vid_gen_params->chain_latent_offset, (long long)T_tgt,
+                         (long long)(T_all - T_tgt), (unsigned long long)pseed);
+            } else {
+                noise = sd::Tensor<float>::randn_like(stage_latent, sd_ctx->sd->rng);
+            }
             LOG_INFO("LTX hires_chain stage %d: upscale -> SDEdit sigma0=%.5f, steps=%d, sampler=%s, cfg=%.3f",
                      stage_index, sigmas.front(), scheduler_steps, sampling_methods_str[stage.sample_method], stage.cfg);
             final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model, true, stage_latent, std::move(noise),
@@ -12683,6 +13127,100 @@ static sd_audio_t* read_seg_audio(const std::string& path) {
     return a;
 }
 
+// ── ENGINE-OWNED AUDIO helpers (chain_audio_full / chain_audio_track) ────────────────────
+// The chain slices the caller's full-timeline clip itself instead of trusting a client to
+// predict the seam trim. See sd_vid_chain_params_t::chain_audio_full for the why.
+
+// Minimal 16 kHz mono PCM16 WAV writer. The core lib does NOT link the example layer's
+// media_io (that's the whole point of the on_segment/on_flush_frames callbacks), so the
+// per-segment drive slices get their own local writer — same precedent as write_seg_audio
+// above. Writing a real file (rather than plumbing samples in-memory) keeps
+// encode_ltxav_drive_audio's path-based contract untouched AND leaves the exact audio that
+// drove each segment on disk next to its latent, which is a debugging affordance the
+// pre-sliced path also had.
+static bool write_wav_16k_mono(const std::string& path, const float* samples, size_t n) {
+    if (samples == nullptr) {
+        return false;
+    }
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        LOG_ERROR("chain audio: cannot write drive slice '%s'", path.c_str());
+        return false;
+    }
+    const uint32_t sr        = 16000;
+    const uint16_t ch        = 1;
+    const uint16_t bits      = 16;
+    const uint32_t data_len  = (uint32_t)(n * 2);
+    const uint32_t riff_len  = 36 + data_len;
+    const uint32_t byte_rate = sr * ch * (bits / 8);
+    const uint16_t blk_align = (uint16_t)(ch * (bits / 8));
+    const uint32_t fmt_len   = 16;
+    const uint16_t fmt_tag   = 1;
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_len, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f);
+    fwrite(&fmt_len, 4, 1, f);
+    fwrite(&fmt_tag, 2, 1, f);
+    fwrite(&ch, 2, 1, f);
+    fwrite(&sr, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&blk_align, 2, 1, f);
+    fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_len, 4, 1, f);
+    for (size_t i = 0; i < n; ++i) {
+        float   v = samples[i];
+        int32_t s = (int32_t)llround(std::max(-1.0f, std::min(1.0f, v)) * 32767.0f);
+        int16_t o = (int16_t)std::max(-32768, std::min(32767, s));
+        fwrite(&o, 2, 1, f);
+    }
+    fclose(f);
+    return true;
+}
+
+// The caller's full-timeline audio, loaded once and sliced per segment by the chain.
+// `samples` is 16 kHz MONO for the drive clip (that's all the audio VAE encoder consumes),
+// and VERBATIM interleaved for the deliverable track (rate/channels preserved so the Opus
+// encode is the only generation loss).
+struct ChainFullAudio {
+    std::vector<float> samples;
+    uint32_t           sample_rate = 0;
+    uint32_t           channels    = 0;
+    bool               loaded      = false;
+
+    size_t frames() const {  // audio frames (sample groups), NOT video frames
+        return (channels == 0) ? 0 : samples.size() / channels;
+    }
+
+    // Cut [start_frame, start_frame + n_frames) of the VIDEO timeline out of this clip,
+    // given the clip's t=0 sits at `offset_frames` on that timeline. Reads out of range are
+    // ZERO-FILLED rather than clamped: silence is the honest answer for "before the clip
+    // starts" / "after it ends", whereas clamping would smear the first/last sample and a
+    // short read would silently retime everything after it.
+    std::vector<float> window(long long start_frame, long long n_frames, float fps, long long offset_frames) const {
+        std::vector<float> out;
+        if (!loaded || channels == 0 || n_frames <= 0 || fps <= 0.0f) {
+            return out;
+        }
+        const long long total = (long long)frames();
+        // Clip-local audio-frame range for this video-frame window.
+        const long long a0 = llround((double)(start_frame - offset_frames) * (double)sample_rate / (double)fps);
+        const long long a1 = llround((double)(start_frame - offset_frames + n_frames) * (double)sample_rate / (double)fps);
+        const long long want = std::max(0LL, a1 - a0);
+        out.assign((size_t)want * channels, 0.0f);
+        for (long long i = 0; i < want; ++i) {
+            const long long src = a0 + i;
+            if (src < 0 || src >= total) {
+                continue;  // zero-fill outside the clip
+            }
+            for (uint32_t c = 0; c < channels; ++c) {
+                out[(size_t)i * channels + c] = samples[(size_t)src * channels + c];
+            }
+        }
+        return out;
+    }
+};
+
 // Stitches per-segment audio onto one continuous timeline.  LTXAV continuation appends
 // its video guide as extra, cropped tokens, while the driven audio remains at target time
 // zero; therefore the kept video window maps to the HEAD of each generated audio segment.
@@ -13123,6 +13661,61 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     }
     const int WINDOW_KEEP = std::max(16, crossfade_W);  // exposure_match N=16, crossfade W
     long long flushed_total = 0;
+
+    // ── ENGINE-OWNED AUDIO: load the caller's full timeline ONCE ─────────────────────────
+    // `chain_audio_full` drives lip-sync (16k mono — all the audio VAE takes); `chain_audio_track`
+    // is the deliverable, kept verbatim. Same path for both = the common "voice drives AND
+    // delivers" case, loaded twice at different fidelities on purpose.
+    const long long audio_offset_frames =
+        (chain_params->chain_audio_full != nullptr || chain_params->chain_audio_track != nullptr)
+            ? (long long)chain_params->chain_audio_offset_frames
+            : 0;
+    ChainFullAudio drive_full;
+    if (chain_params->chain_audio_full != nullptr && chain_params->chain_audio_full[0] != '\0') {
+        if (LONGCAT_AUDIO::load_wav_16k_mono(chain_params->chain_audio_full, drive_full.samples) &&
+            !drive_full.samples.empty()) {
+            drive_full.sample_rate = 16000;
+            drive_full.channels    = 1;
+            drive_full.loaded      = true;
+            LOG_INFO("generate_video_chain: engine-owned DRIVE audio '%s' (%zu frames @16k mono, timeline offset %lld)",
+                     chain_params->chain_audio_full, drive_full.frames(), audio_offset_frames);
+        } else {
+            // Hard-fail rather than silently reverting to chain_audio_dir or to no lip-sync:
+            // an unreadable clip that renders anyway burns a full chain and looks like a
+            // model regression. (A missing per-segment aud_<i>.wav on the LEGACY path is
+            // deliberately silent-not-fatal; this is a new, explicit contract.)
+            LOG_ERROR("generate_video_chain: chain_audio_full '%s' unreadable (need RIFF/WAVE PCM16/PCM32/float)",
+                      chain_params->chain_audio_full);
+            return false;
+        }
+    }
+    ChainFullAudio track_full;
+    if (chain_params->chain_audio_track != nullptr && chain_params->chain_audio_track[0] != '\0') {
+        if (LONGCAT_AUDIO::load_wav_full(chain_params->chain_audio_track, track_full.samples,
+                                         track_full.sample_rate, track_full.channels) &&
+            !track_full.samples.empty()) {
+            track_full.loaded = true;
+            LOG_INFO("generate_video_chain: engine-owned TRACK audio '%s' (%zu frames @%u Hz x%u)",
+                     chain_params->chain_audio_track, track_full.frames(),
+                     track_full.sample_rate, track_full.channels);
+        } else {
+            LOG_ERROR("generate_video_chain: chain_audio_track '%s' unreadable", chain_params->chain_audio_track);
+            return false;
+        }
+    }
+    // Where the drive slices are written. Prefer save_dir (banked next to the latents, so a
+    // resume/retake can see exactly what drove each segment); else the audio dir; else skip.
+    std::string drive_slice_dir;
+    if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+        drive_slice_dir = chain_params->save_dir;
+    } else if (chain_params->chain_audio_dir != nullptr && chain_params->chain_audio_dir[0] != '\0') {
+        drive_slice_dir = chain_params->chain_audio_dir;
+    }
+    if (drive_full.loaded && drive_slice_dir.empty()) {
+        LOG_ERROR("generate_video_chain: chain_audio_full needs save_dir or chain_audio_dir to stage slices");
+        return false;
+    }
+
     auto flush_window = [&](bool final_flush) {
         if (!streaming) {
             return;
@@ -13322,6 +13915,29 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             LOG_WARN("generate_video_chain: RETAKE end-pin load failed (%s): %s — degrading to no end pin",
                      nhead.c_str(), e.what());
         }
+    }
+
+    // LTXAV_SHARED_REFINE_NOISE: running ABSOLUTE latent-frame position of the segment being rendered.
+    //   offset(0) = 0;  offset(s) = offset(s-1) + T_lat(s-1) - overlap(s)
+    // T_lat = 1 + (pixel_frames - 1) / 8 (the LTX causal-VAE 8:1 temporal ratio this function already
+    // relies on for overlap_px at :13001), and overlap(s) is the K frames segment s re-renders from
+    // the prior tail — exactly vp.cont_latent_frames, which the conditioning branch below already sets
+    // to K for a continuation and 0 for a fresh anchor (seg 0 / scene cut / text cut / fresh keyframe
+    // shot). Taking it from vp keeps this in lockstep with that branch instead of re-deriving it.
+    //
+    // RESUME (start_seg > 0): the skipped prefix was rendered by an earlier process, so its true
+    // absolute positions must be reconstructed. This pre-roll assumes the prefix was all continuations
+    // (what a resume means), mirroring the existing audio_frame_offset closed form. A scene cut inside
+    // the skipped prefix would shift the base — which costs the feature at the resume seam only (that
+    // seam degrades to today's independent noise) and cannot corrupt output.
+    int64_t chain_latent_offset     = 0;
+    int64_t prev_seg_latent_frames  = 0;
+    for (int s = 0; s < start_seg; ++s) {
+        const int frames_s = (chain_params->segment_video_frames != nullptr &&
+                              chain_params->segment_video_frames[s] > 0)
+                                 ? chain_params->segment_video_frames[s]
+                                 : base_params->video_frames;
+        chain_latent_offset += (1 + (frames_s - 1) / 8) - K;
     }
 
     for (int seg = start_seg; seg <= render_end; ++seg) {
@@ -13556,6 +14172,19 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                      seg + 1, end_cont_Ke);
         }
 
+        // LTXAV_SHARED_REFINE_NOISE: advance to THIS segment's absolute latent-frame start. Placed
+        // after the conditioning branch so vp.cont_latent_frames already reflects whether this segment
+        // continues the prior tail (K) or re-anchors fresh (0). Inert unless the engine-side gate is on.
+        const int64_t seg_latent_frames = 1 + (vp.video_frames - 1) / 8;
+        if (seg > start_seg) {
+            const int64_t seg_overlap = (vp.cont_latent != nullptr && vp.cont_latent_frames > 0)
+                                            ? vp.cont_latent_frames
+                                            : 0;
+            chain_latent_offset += prev_seg_latent_frames - seg_overlap;
+        }
+        vp.chain_latent_offset = chain_latent_offset;
+        prev_seg_latent_frames = seg_latent_frames;
+
         // distinct seed per segment so the noise frames differ
         vp.seed = (base_params->seed < 0) ? base_params->seed : base_params->seed + seg;
 
@@ -13565,13 +14194,56 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             LOG_INFO("generate_video_chain seg %d prompt: %s", seg, vp.prompt);
         }
 
-        // Per-segment lip-sync audio: chain_audio_dir/aud_<seg>.wav (16kHz mono). The
-        // string must outlive the generate call, so keep it loop-scoped.
+        // Per-segment lip-sync audio. The string must outlive the generate call, so keep it
+        // loop-scoped.
         std::string seg_audio_path;
-        if (chain_params->chain_audio_dir != nullptr && chain_params->chain_audio_dir[0] != '\0') {
+        if (drive_full.loaded) {
+            // ── ENGINE-OWNED SLICE ───────────────────────────────────────────────────────
+            // Anchor this segment's drive window to the TRUE accumulated timeline rather than
+            // to a predicted grid. `timeline_pos` is where this segment's first KEPT frame
+            // will land — every earlier segment's ACTUAL (auto-trimmed) kept length is already
+            // baked into it, which is exactly what the client-side slicer could not know.
+            //
+            // We render seg_frames and later drop `drop` from the head, so segment-local frame
+            // `drop` must carry timeline_pos's audio => the window starts drop_pred frames EARLY.
+            // `drop` is content-adaptive (ltxav_auto_trim_drop) and only measurable AFTER the
+            // render, so drop_pred is the a-priori estimate. A miss of δ frames offsets lip-sync
+            // by δ WITHIN this segment only (~40ms/frame @24fps) and CANNOT accumulate: the next
+            // segment re-anchors to the corrected timeline_pos. That self-correction is the whole
+            // point of moving this in-engine — the old client-side constant had no feedback path,
+            // so its error compounded across every seam.
+            const long long timeline_pos = flushed_total + (long long)stitched.size();
+            int drop_pred = (seg == 0 || segmented_relip || fresh_anchor) ? 0 : overlap_px;
+            if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
+                // Value-gate: "${VAR:-}" yields an EMPTY STRING and getenv returns non-null, so a
+                // bare presence check silently enables drop=0 via atoi(""). Only a real integer pins.
+                if (e[0] != '\0' && seg > 0 && !(segmented_relip || fresh_anchor)) {
+                    char* end = nullptr;
+                    long  v   = strtol(e, &end, 10);
+                    if (end != nullptr && *end == '\0' && v >= 0) {
+                        drop_pred = (int)v;
+                    }
+                }
+            }
+            const long long win_start = timeline_pos - drop_pred;
+            std::vector<float> win =
+                drive_full.window(win_start, (long long)vp.video_frames, (float)base_params->fps, audio_offset_frames);
+            seg_audio_path = drive_slice_dir + "/aud_" + std::to_string(seg) + ".wav";
+            if (!win.empty() && write_wav_16k_mono(seg_audio_path, win.data(), win.size())) {
+                vp.drive_audio_path = seg_audio_path.c_str();
+                LOG_INFO("generate_video_chain seg %d drive-audio: engine slice [%lld,%lld) frames "
+                         "(timeline_pos=%lld drop_pred=%d) -> %s",
+                         seg, win_start, win_start + vp.video_frames, timeline_pos, drop_pred,
+                         seg_audio_path.c_str());
+            } else {
+                LOG_ERROR("generate_video_chain seg %d: drive slice failed; segment renders without lip-sync", seg);
+                seg_audio_path.clear();
+            }
+        } else if (chain_params->chain_audio_dir != nullptr && chain_params->chain_audio_dir[0] != '\0') {
+            // LEGACY: caller pre-sliced aud_<i>.wav against its own guess of the seam trim.
             seg_audio_path     = std::string(chain_params->chain_audio_dir) + "/aud_" + std::to_string(seg) + ".wav";
             vp.drive_audio_path = seg_audio_path.c_str();
-            LOG_INFO("generate_video_chain seg %d drive-audio: %s", seg, seg_audio_path.c_str());
+            LOG_INFO("generate_video_chain seg %d drive-audio: %s (legacy pre-sliced)", seg, seg_audio_path.c_str());
         }
 
         LOG_INFO("=== generate_video_chain segment %d/%d ===", seg + 1, n_chain);
@@ -14006,6 +14678,44 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
 
     // Assemble the stitched audio timeline (null if no segment produced audio).
     sd_audio_t* chain_audio = audio_acc.build();
+
+    // ── ENGINE-OWNED TRACK: deliver the caller's audio, cut to the ACTUAL timeline ────────
+    // The generated per-segment audio was only ever lip-sync conditioning; the deliverable is
+    // the user's own clip. Doing this here (rather than the client re-muxing afterwards) is
+    // what makes it correct: `total_frames` is the REAL stitched length after every
+    // content-adaptive auto-trim, so the cut lands where the video actually ends. A client
+    // muxing "the full track with -shortest" instead aligns only at t=0 and lets any
+    // accumulated trim disagreement ride as a progressive A/V drift.
+    if (track_full.loaded) {
+        const long long total_frames = flushed_total + (long long)stitched.size();
+        std::vector<float> win =
+            track_full.window(0, total_frames, (float)base_params->fps, audio_offset_frames);
+        if (!win.empty()) {
+            sd_audio_t* t = (sd_audio_t*)malloc(sizeof(sd_audio_t));
+            if (t != nullptr) {
+                t->sample_rate  = track_full.sample_rate;
+                t->channels     = track_full.channels;
+                t->sample_count = win.size() / track_full.channels;
+                t->data         = (float*)malloc(win.size() * sizeof(float));
+                if (t->data != nullptr) {
+                    std::memcpy(t->data, win.data(), win.size() * sizeof(float));
+                    LOG_INFO("generate_video_chain: engine-owned track -> %llu frames @%u Hz x%u "
+                             "(cut to %lld video frames @%.3f fps)",
+                             (unsigned long long)t->sample_count, t->sample_rate, t->channels,
+                             total_frames, (double)base_params->fps);
+                    free_sd_audio(chain_audio);  // generated audio was conditioning only
+                    chain_audio = t;
+                } else {
+                    free(t);
+                    LOG_ERROR("generate_video_chain: track alloc failed; keeping generated audio");
+                }
+            }
+        } else {
+            LOG_WARN("generate_video_chain: engine-owned track produced an empty window "
+                     "(offset %lld vs %lld video frames); keeping generated audio",
+                     audio_offset_frames, flushed_total + (long long)stitched.size());
+        }
+    }
 
     // Windowed streaming finalize: drain the residual window, then hand back only metadata + audio
     // (frames were flushed+freed incrementally). Peak frame RAM stayed ≈ WINDOW_KEEP + one segment.

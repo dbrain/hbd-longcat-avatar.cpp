@@ -682,6 +682,11 @@ bool run_vid_chain_job(ServerRuntime& runtime,
 
     // Per-segment lip-sync audio dir (aud_<i>.wav), written by the parent route handler.
     std::string audio_dir     = body.value("chain_audio_dir", std::string());
+    // Engine-owned whole-timeline audio (supersedes the pre-sliced aud_<i>.wav when present):
+    // `full` drives lip-sync, `track` is muxed as the deliverable. Both staged by the route.
+    std::string audio_full    = body.value("chain_audio_full", std::string());
+    std::string audio_track   = body.value("chain_audio_track", std::string());
+    int         audio_offset_frames = body.value("chain_audio_offset_frames", 0);
     std::string output_format = body.value("output_format", std::string("webm"));
     int         output_compression = body.value("output_compression", 90);
 
@@ -938,6 +943,9 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.segment_v2v_mode     = any_seg_v2v ? seg_v2v.data() : nullptr;
     chain.segment_v2v_guide_latent_paths = any_seg_guide_lat ? seg_guide_ptrs.data() : nullptr;
     chain.chain_audio_dir    = audio_dir.empty() ? nullptr : audio_dir.c_str();
+    chain.chain_audio_full   = audio_full.empty() ? nullptr : audio_full.c_str();
+    chain.chain_audio_track  = audio_track.empty() ? nullptr : audio_track.c_str();
+    chain.chain_audio_offset_frames = audio_offset_frames;
     chain.save_dir           = job_dir.empty() ? nullptr : job_dir.c_str();
     chain.resume_from        = std::max(0, resume_from);
     chain.segment_control_frames = relip_control_starts.empty() ? nullptr : relip_control_starts.data();
