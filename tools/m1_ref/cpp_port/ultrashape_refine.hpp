@@ -262,21 +262,224 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
     int64_t Ngrid = (int64_t)G*G*G;
     std::vector<float> logits(Ngrid, 0.0f);
     double t_d0 = now_s();
-    if (cfg.verbose)
-        printf("  [US] VAE dense decode: G=%d -> %lld queries / %lld-chunk = %lld computes ...\n",
-               G, (long long)Ngrid, (long long)CHUNK, (long long)((Ngrid+CHUNK-1)/CHUNK));
-    for (int64_t s = 0; s < Ngrid; s += CHUNK) {
-        int64_t n = std::min(CHUNK, Ngrid-s);
-        std::vector<float> qchunk((size_t)CHUNK*3, 0.0f);
-        std::copy(grid.begin()+s*3, grid.begin()+(s+n)*3, qchunk.begin());
-        std::vector<float> qe = us_fourier_embed(qchunk.data(), CHUNK, vcfg);
-        Hv.upload_input_raw(query_embed, qe);
-        Hv.compute(gv);
-        std::vector<float> got(CHUNK);
-        ggml_backend_tensor_get(occ, got.data(), 0, CHUNK*sizeof(float));
-        std::copy(got.begin(), got.begin()+n, logits.begin()+s);
+
+    // ------------------------------------------------------------------------------------------
+    // USR_SPARSE_DECODE (default ON; =0 restores the dense sweep for A/B) -- close the port gap
+    // ultrashape_e2e.cpp:84 admits: "DENSE grid here; Python uses a hierarchical octree".
+    //
+    // The dense sweep evaluates all G^3 corners to find an isosurface that MEASURED occupies 0.341%
+    // of them (voxelising refined.glb: 457,147 of 134M; surface-area cross-check 0.366%). So >99% of
+    // the most expensive stage in the pipeline decodes empty space or solid interior.
+    //
+    // Construction (the reference's, NOT a coarse band -- a band alone is NOT lossless: a +-4 band
+    // still misses 0.40% of isosurface cells => holes):
+    //   (1) decode a stride-S coarse lattice in full;
+    //   (2) any coarse CELL whose 8 corners straddle the iso is subdivided -- every fine corner in it
+    //       becomes active. Dilated by one coarse cell so a straddle never sits on the active border;
+    //   (3) UNION a +-BAND fine-cell shell around the coarse mesh's own vertices, which catches
+    //       features thinner than a coarse cell (fingers, straps) that (2) cannot see;
+    //   (4) undecoded corners inherit their coarse cell's uniform sign as +-BIG. Marching cubes is
+    //       UNCHANGED: an all-same-sign cell emits no triangle, so filled regions are inert.
+    // Verified by the QC the pipeline already prints (signed volume / boundary) + a mesh A/B vs the
+    // dense path at the same octree -- NOT by timing.
+    // ------------------------------------------------------------------------------------------
+    const bool  sparse   = [](){ const char* e = getenv("USR_SPARSE_DECODE"); return !e || atoi(e) != 0; }();
+    const int   S        = [](){ const char* e = getenv("USR_SPARSE_STRIDE"); return e ? std::max(2, atoi(e)) : 4; }();
+    const int   BAND     = [](){ const char* e = getenv("USR_SPARSE_BAND");   return e ? std::max(0, atoi(e)) : 2; }();
+    const float BIG      = 1e4f;
+
+    std::vector<int64_t> active_idx;      // fine-grid linear indices still to decode
+    std::vector<uint8_t> decoded;         // 1 = logits[p] holds a real decoded value
+    if (sparse) {
+        double t_a0 = now_s();
+        decoded.assign((size_t)Ngrid, 0);
+        std::vector<uint8_t> act((size_t)Ngrid, 0);
+        const int GC = (G - 1) / S + 1;                  // coarse lattice points per axis
+        auto FIDX = [&](int64_t i, int64_t j, int64_t k) { return (i*G + j)*G + k; };
+
+        // (1) coarse lattice -> active
+        for (int ci = 0; ci < GC; ++ci)
+          for (int cj = 0; cj < GC; ++cj)
+            for (int ck = 0; ck < GC; ++ck)
+              act[(size_t)FIDX(std::min(ci*S, G-1), std::min(cj*S, G-1), std::min(ck*S, G-1))] = 1;
+        for (int64_t p = 0; p < Ngrid; ++p) if (act[(size_t)p]) active_idx.push_back(p);
+        if (cfg.verbose)
+            printf("  [US] sparse decode: L0 stride=%d -> %zu coarse queries (%.3f%% of %lld)\n",
+                   S, active_idx.size(), 100.0*(double)active_idx.size()/(double)Ngrid, (long long)Ngrid);
+        (void)t_a0;
     }
-    if (cfg.verbose) printf("  [US] VAE dense decode: %.1fs\n", now_s()-t_d0);
+    if (cfg.verbose)
+        printf("  [US] VAE %s decode: G=%d -> %lld queries / %lld-chunk = %lld computes ...\n",
+               sparse ? "sparse" : "dense", G, (long long)Ngrid, (long long)CHUNK,
+               (long long)((Ngrid+CHUNK-1)/CHUNK));
+    // Per-phase accounting for the decode (the pipeline's single most expensive stage). A prod run
+    // measured 38.37 ms/chunk while a prod-shaped micro-bench of the SAME fixed-shape graph measured
+    // 27.4 ms/chunk -- a 1.4x gap that host-overhead, clock throttling and attention tiling were each
+    // measured and eliminated as explanations. These four counters split the loop so the gap is
+    // attributed instead of guessed. Cost: 4 doubles + one clock_gettime per phase.
+    double th_prep = 0, th_up = 0, th_gpu = 0, th_dl = 0;
+    int64_t n_queries = 0;
+    // Decode an arbitrary list of fine-grid linear indices, chunked. The tail of the last chunk is
+    // zero-padded and its results are ignored (identical to the dense loop's tail handling).
+    std::vector<float> qchunk((size_t)CHUNK*3, 0.0f);   // hoisted: the dense loop re-allocated these
+    std::vector<float> got((size_t)CHUNK);              // ~198k heap allocs over a prod run
+    auto decode_indices = [&](const std::vector<int64_t>& idx) {
+        for (size_t s = 0; s < idx.size(); s += (size_t)CHUNK) {
+            const size_t n = std::min((size_t)CHUNK, idx.size() - s);
+            double a = now_s();
+            std::fill(qchunk.begin(), qchunk.end(), 0.0f);
+            for (size_t t = 0; t < n; ++t) {
+                const int64_t p = idx[s+t];
+                qchunk[t*3+0] = grid[(size_t)p*3+0];
+                qchunk[t*3+1] = grid[(size_t)p*3+1];
+                qchunk[t*3+2] = grid[(size_t)p*3+2];
+            }
+            std::vector<float> qe = us_fourier_embed(qchunk.data(), CHUNK, vcfg);
+            double b = now_s(); th_prep += b - a;
+            Hv.upload_input_raw(query_embed, qe);
+            double c = now_s(); th_up += c - b;
+            Hv.compute(gv);
+            double d = now_s(); th_gpu += d - c;
+            ggml_backend_tensor_get(occ, got.data(), 0, CHUNK*sizeof(float));
+            for (size_t t = 0; t < n; ++t) {
+                logits[(size_t)idx[s+t]] = got[t];
+                if (!decoded.empty()) decoded[(size_t)idx[s+t]] = 1;
+            }
+            th_dl += now_s() - d;
+            n_queries += (int64_t)n;
+        }
+    };
+
+    if (!sparse) {
+        for (int64_t s = 0; s < Ngrid; s += CHUNK) {
+            int64_t n = std::min(CHUNK, Ngrid-s);
+            double a = now_s();
+            std::fill(qchunk.begin(), qchunk.end(), 0.0f);
+            std::copy(grid.begin()+s*3, grid.begin()+(s+n)*3, qchunk.begin());
+            std::vector<float> qe = us_fourier_embed(qchunk.data(), CHUNK, vcfg);
+            double b = now_s(); th_prep += b - a;
+            Hv.upload_input_raw(query_embed, qe);
+            double c = now_s(); th_up += c - b;
+            Hv.compute(gv);
+            double d = now_s(); th_gpu += d - c;
+            ggml_backend_tensor_get(occ, got.data(), 0, CHUNK*sizeof(float));
+            std::copy(got.begin(), got.begin()+n, logits.begin()+s);
+            th_dl += now_s() - d;
+            n_queries += n;
+        }
+    } else {
+        const int GC = (G - 1) / S + 1, NC = GC - 1;
+        auto FIDX = [&](int64_t i, int64_t j, int64_t k) { return (i*G + j)*G + k; };
+        auto CLI  = [&](int v) { return std::min(v, G-1); };
+
+        decode_indices(active_idx);                       // (1) L0 coarse lattice
+        const size_t n_l0 = active_idx.size();
+
+        std::vector<uint8_t> act((size_t)Ngrid, 0);
+        auto mark_box = [&](int i0, int i1, int j0, int j1, int k0, int k1) {
+            for (int i = std::max(0,i0); i <= std::min(G-1,i1); ++i)
+              for (int j = std::max(0,j0); j <= std::min(G-1,j1); ++j)
+                for (int k = std::max(0,k0); k <= std::min(G-1,k1); ++k)
+                  act[(size_t)FIDX(i,j,k)] = 1;
+        };
+
+        // (2) subdivide sign-straddling coarse cells, dilated by one coarse cell so a straddle can
+        //     never sit exactly on the active-set border.
+        size_t n_mixed = 0;
+        for (int ci = 0; ci < NC; ++ci)
+          for (int cj = 0; cj < NC; ++cj)
+            for (int ck = 0; ck < NC; ++ck) {
+                bool pos = false, neg = false;
+                for (int dx = 0; dx < 2; ++dx)
+                  for (int dy = 0; dy < 2; ++dy)
+                    for (int dz = 0; dz < 2; ++dz) {
+                        const float v = logits[(size_t)FIDX(CLI((ci+dx)*S), CLI((cj+dy)*S), CLI((ck+dz)*S))];
+                        (v >= 0.0f ? pos : neg) = true;
+                    }
+                if (pos && neg) {
+                    ++n_mixed;
+                    mark_box(ci*S - S, ci*S + 2*S, cj*S - S, cj*S + 2*S, ck*S - S, ck*S + 2*S);
+                }
+            }
+
+        // (3) UNION a +-BAND fine shell around the coarse mesh itself -- catches features thinner
+        //     than a coarse cell, which (2) is blind to. FRAME: us_vox::voxelize_mesh_inmem
+        //     normalises ITS OWN COPY (longest axis -> [-1,1], then *0.99); the caller hands us the
+        //     pixal [-0.5,0.5] frame, NOT the grid's +-1. Replicate exactly or the band lands in the
+        //     wrong place and silently makes holes.
+        size_t n_band = 0;
+        if (BAND > 0) {
+            std::vector<float> bv = coarse_verts;
+            rig::normalize_mesh(bv);
+            for (auto& v : bv) v *= 0.99f;
+            const float inv = (float)(G - 1) / (2.0f * BNDS);
+            for (size_t v = 0; v + 2 < bv.size(); v += 3) {
+                const int gi = (int)std::lround((bv[v+0] + BNDS) * inv);
+                const int gj = (int)std::lround((bv[v+1] + BNDS) * inv);
+                const int gk = (int)std::lround((bv[v+2] + BNDS) * inv);
+                mark_box(gi-BAND, gi+BAND, gj-BAND, gj+BAND, gk-BAND, gk+BAND);
+                ++n_band;
+            }
+        }
+
+        // (3b) Dilate the active set by ONE fine cell. MC does not just test signs, it INTERPOLATES
+        //      between corners: t = (iso - v0)/(v1 - v0). A straddling cell with one decoded corner
+        //      and one FILLED corner would interpolate against the +-BIG sentinel and displace the
+        //      vertex. The +-S straddle margin is wide enough, but the vertex band has a hard edge --
+        //      MEASURED: without this, 2 of 630,300 verts moved (max 0.023 of a cell) at octree 512.
+        //      Dilating guarantees every cell touching the active set has all 8 corners decoded, so
+        //      no interpolation ever reads a sentinel.
+        {
+            std::vector<uint8_t> act2 = act;
+            for (int64_t i = 0; i < G; ++i)
+              for (int64_t j = 0; j < G; ++j)
+                for (int64_t k = 0; k < G; ++k) {
+                    if (!act[(size_t)FIDX(i,j,k)]) continue;
+                    for (int di = -1; di <= 1; ++di)
+                      for (int dj = -1; dj <= 1; ++dj)
+                        for (int dk = -1; dk <= 1; ++dk) {
+                            const int64_t ni = i+di, nj = j+dj, nk = k+dk;
+                            if (ni < 0 || nj < 0 || nk < 0 || ni >= G || nj >= G || nk >= G) continue;
+                            act2[(size_t)FIDX(ni,nj,nk)] = 1;
+                        }
+                }
+            act.swap(act2);
+        }
+
+        std::vector<int64_t> refine_idx;
+        for (int64_t p = 0; p < Ngrid; ++p) if (act[(size_t)p] && !decoded[(size_t)p]) refine_idx.push_back(p);
+        if (cfg.verbose)
+            printf("  [US] sparse decode: %zu straddling cells + band over %zu verts -> %zu refine queries\n",
+                   n_mixed, n_band, refine_idx.size());
+        decode_indices(refine_idx);                       // (2)+(3)
+
+        // (4) undecoded corners inherit their coarse cell's uniform sign. MC is unchanged: an
+        //     all-same-sign cell emits nothing, so these regions are inert.
+        int64_t n_fill = 0;
+        for (int64_t i = 0; i < G; ++i)
+          for (int64_t j = 0; j < G; ++j)
+            for (int64_t k = 0; k < G; ++k) {
+                const int64_t p = FIDX(i,j,k);
+                if (decoded[(size_t)p]) continue;
+                const float pv = logits[(size_t)FIDX(CLI((int)(i/S)*S), CLI((int)(j/S)*S), CLI((int)(k/S)*S))];
+                logits[(size_t)p] = (pv >= 0.0f) ? BIG : -BIG;
+                ++n_fill;
+            }
+        if (cfg.verbose)
+            printf("  [US] sparse decode: L0 %zu + refine %zu = %lld decoded (%.3f%% of %lld), %lld filled\n",
+                   n_l0, refine_idx.size(), (long long)n_queries,
+                   100.0*(double)n_queries/(double)Ngrid, (long long)Ngrid, (long long)n_fill);
+    }
+    if (cfg.verbose) {
+        const double tot = now_s()-t_d0;
+        const long long nch = std::max<long long>(1, (n_queries+CHUNK-1)/CHUNK);   // ACTUAL chunks run
+        printf("  [US] VAE %s decode: %.1fs\n", sparse ? "sparse" : "dense", tot);
+        printf("  [US]   decode split over %lld chunks (%.3f ms/chunk): prep %.1fs (%.1f%%) "
+               "upload %.1fs (%.1f%%) compute %.1fs (%.1f%%) readback %.1fs (%.1f%%)\n",
+               nch, 1000.0*tot/(double)nch,
+               th_prep, 100*th_prep/tot, th_up, 100*th_up/tot,
+               th_gpu, 100*th_gpu/tot, th_dl, 100*th_dl/tot);
+    }
 
     // ---- marching cubes (bounds ±1.0) -> svae::Mesh (UltraShape frame) ----
     // `logits` are OCCUPANCY logits: inside = POSITIVE (sigmoid>0.5 <=> logit>0). us_mc defaults to
