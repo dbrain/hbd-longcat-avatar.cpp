@@ -229,7 +229,10 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
                 Hf.upload_input_raw(gin, c?global512:zg); Hf.upload_input_raw(pin, c?proj_ss:zp);
                 Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
             double t=now_s();
+            const bool nsys_ss = std::getenv("PIXAL3D_NSYS_SS") != nullptr;
+            if (nsys_ss) cudaProfilerStart();
             z_s = geo::flow_sampler(NEL, noise1, 1e-5f, in.ss.guidance, in.ss.rescale, in.ss.rescale_t, in.ss.lo, in.ss.hi, in.ss.steps, fwd, V?"ss-dit":nullptr);
+            if (nsys_ss) cudaProfilerStop();
             LOG("[2] SS DiT (%.1fs)\n", now_s()-t);
         }
         {
