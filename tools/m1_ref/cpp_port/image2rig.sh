@@ -35,10 +35,10 @@ CP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IN="${1:?input image}"; OUT="${2:?out.glb}"; shift 2 || true
 EXTRA=(); if [[ "${1:-}" == "--" ]]; then shift; EXTRA=("$@"); fi
 
-GEO_GGUF="${PIXAL3D_GGUF_DIR:-/mnt/hdd/pixal3d/weights_gguf_q8}"   # M3b+tex Q8_0 (near-lossless, −111s); F16 set = weights_gguf_f16
-SKIN_VAE_GGUF="${SKIN_VAE_GGUF:-/mnt/hdd/3d/avatar-shootout/_weights/skin_vae_gguf}"
-QWEN3_W="${QWEN3_W:-/mnt/hdd/3d/avatar-shootout/rig_audit/inputs/qwen3_w}"
-R1W_SRC="${R1W_SRC:-/mnt/hdd/3d/avatar-shootout/rig_audit/r1w_real}"
+GEO_GGUF="${PIXAL3D_GGUF_DIR:-/home/dbrain/models/3d/geo}"   # M3b+tex Q8_0 (near-lossless, −111s); F16 set = weights_gguf_f16
+SKIN_VAE_GGUF="${SKIN_VAE_GGUF:-/home/dbrain/models/3d/rig/skin_vae_gguf}"
+QWEN3_W="${QWEN3_W:-/home/dbrain/models/3d/rig/qwen3_w}"
+R1W_SRC="${R1W_SRC:-/home/dbrain/models/3d/rig/r1w_real}"
 SEED="${SEED:-0}"; TEXSIZE="${TEXSIZE:-1024}"; DECIMATE="${DECIMATE:-150000}"
 
 WORKDIR="${WORKDIR:-$(mktemp -d /tmp/image2rig.XXXXXX)}"; mkdir -p "$WORKDIR"

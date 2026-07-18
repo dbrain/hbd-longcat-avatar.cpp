@@ -169,9 +169,9 @@ int main(int argc, char** argv) {
     //    `USR_GEO_FLASH=0` restores the fp32 dense-tiled path.
     setenv("USR_GEO_FLASH",    "1",    0);
     std::string model, image, out;
-    std::string r1w     = "/mnt/hdd/3d/avatar-shootout/rig_audit/r1w_real";
-    std::string qwen3_w = "/mnt/hdd/3d/avatar-shootout/rig_audit/inputs/qwen3_w";
-    std::string skinvae = "/mnt/hdd/3d/avatar-shootout/_weights/skin_vae_gguf";
+    std::string r1w     = "/home/dbrain/models/3d/rig/r1w_real";
+    std::string qwen3_w = "/home/dbrain/models/3d/rig/qwen3_w";
+    std::string skinvae = "/home/dbrain/models/3d/rig/skin_vae_gguf";
     float cam = DEF_CAM, dist = DEF_DIST, ms = DEF_MS;
     bool use_cuda = true, fast = false;
     // Inline-API rig default = DETERMINISTIC beam (do_sample=false) + beams=20 — the fan-free recipe

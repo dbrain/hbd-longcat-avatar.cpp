@@ -33,7 +33,7 @@ EXTRA=()
 if [[ "${1:-}" == "--" ]]; then shift; EXTRA=("$@"); fi
 
 MATTING_URL="${MATTING_URL:-http://localhost:18898}"
-PIXAL3D_GGUF_DIR="${PIXAL3D_GGUF_DIR:-/mnt/hdd/pixal3d/weights_gguf_q8}"   # M3b+tex Q8_0 (near-lossless, −111s); F16 set = weights_gguf_f16
+PIXAL3D_GGUF_DIR="${PIXAL3D_GGUF_DIR:-/home/dbrain/models/3d/geo}"   # M3b+tex Q8_0 (near-lossless, −111s); F16 set = weights_gguf_f16
 MODEL_DIR="${PIXAL3D_MODEL:-$PIXAL3D_GGUF_DIR}"
 MOGE_PY="${MOGE_PY:-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python}"
 MATTE_MARGIN="${MATTE_MARGIN:-0.05}"
