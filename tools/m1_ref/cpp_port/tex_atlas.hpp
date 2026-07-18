@@ -915,6 +915,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     }
 
     // ---- rasterize (serial; writes per-texel 3D position + interpolated normal + mask) ----
+    double t_ras = _now();
     std::vector<float> pos((size_t)W*Ht*3, 0.f);
     std::vector<float> nrm((size_t)W*Ht*3, 0.f);   // lap-18: texel normal for front-face reproject
     std::vector<uint8_t> mask((size_t)W*Ht, 0);
@@ -952,7 +953,8 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         }
     }
     int covered=0; for (auto m:mask) covered+=m;
-    if (verbose) printf("[atlas] rasterized: %d / %d texels covered (%.1f%%)\n", covered, W*Ht, 100.0*covered/(W*Ht));
+    if (verbose) printf("[atlas] rasterized: %d / %d texels covered (%.1f%%) (%.2fs)\n", covered, W*Ht, 100.0*covered/(W*Ht), _now()-t_ras);
+    double t_attr = _now();
 
     // ---- per-texel attribute: either reproject onto the dense shell (lap-18) or grid_sample the
     //      PBR volume at the rasterised position (the legacy/teal-splatter path) ----
@@ -1030,6 +1032,9 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r);
         }
     }
+
+    if (verbose) printf("[atlas] per-texel attr (%s): (%.2fs)\n", do_reproject?"reproject":"grid_sample", _now()-t_attr);
+    double t_inp = _now();
 
     // ---- inpaint: gutter + INTERIOR HOLES. A texel can be covered (inside a chart triangle) yet
     // grid_sample misses (the remeshed surface is too far from the sparse PBR shell in deep
@@ -1119,6 +1124,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         blur_u8_gaussian_rgb(bt.base_color, bt.tw, bt.th, 4, sigma);
     }
     xatlas::Destroy(atlas);
+    if (verbose) printf("[atlas] inpaint+encode+resize (%.2fs)\n", _now()-t_inp);
     return bt;
 }
 

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -259,6 +260,7 @@ inline Mesh flexible_dual_grid_to_mesh(const int32_t* coords, int N,
 
     Mesh m; m.N = N;
     m.verts.resize((size_t)N * 3);
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < N; i++)
         for (int d = 0; d < 3; d++)
             m.verts[(size_t)i*3 + d] = ((float)coords[i*4+1+d] + dual_vertices[(size_t)i*3+d]) * voxel_size + aabb0;
@@ -289,26 +291,76 @@ inline Mesh flexible_dual_grid_to_mesh(const int32_t* coords, int N,
     }
     auto ql = [&](int idx) { return idx < N ? quad_lerp[idx] : 1.0f; };     // synth corners: neutral
 
-    // assemble quads in torch order, split into triangles
-    m.faces.reserve((size_t)N * 6);
-    int q[4];
-    for (int n = 0; n < N; n++) {
-        int32_t x = coords[n*4+1], y = coords[n*4+2], z = coords[n*4+3];
-        for (int e = 0; e < 3; e++) {
-            if (!intersected[(size_t)n*3 + e]) continue;
-            bool ok = true;
-            for (int k = 0; k < 4; k++) {
-                auto it = index.find(coord_key(0, x + OFF[e][k][0], y + OFF[e][k][1], z + OFF[e][k][2]));
-                if (it == index.end()) { ok = false; break; }
-                q[k] = it->second;
+    // assemble quads in torch order, split into triangles. `index` is READ-ONLY from here on (any
+    // close_surface synth inserts already completed above), so the per-voxel emission parallelises with
+    // no shared writes. Two-pass count -> prefix-sum -> scatter keeps the exact o_voxel face ORDER
+    // (voxel n's block lands at offset foff[n]; edges e=0..2 and the 6 split indices stay in order) ==
+    // bit-exact vs the serial push_back path (validated by m4_mesh's elementwise oracle). Env
+    // PIXAL3D_MESHER_SERIAL=1 restores the reference serial loop for A/B.
+    const int Nq = (int)(m.verts.size() / 3);   // includes synth cells (close_surface)
+    if (std::getenv("PIXAL3D_MESHER_SERIAL")) {
+        m.faces.reserve((size_t)N * 6);
+        int q[4];
+        for (int n = 0; n < N; n++) {
+            int32_t x = coords[n*4+1], y = coords[n*4+2], z = coords[n*4+3];
+            for (int e = 0; e < 3; e++) {
+                if (!intersected[(size_t)n*3 + e]) continue;
+                bool ok = true;
+                for (int k = 0; k < 4; k++) {
+                    auto it = index.find(coord_key(0, x + OFF[e][k][0], y + OFF[e][k][1], z + OFF[e][k][2]));
+                    if (it == index.end()) { ok = false; break; }
+                    q[k] = it->second;
+                }
+                if (!ok) continue;
+                float w02 = ql(q[0]) * ql(q[2]);
+                float w13 = ql(q[1]) * ql(q[3]);
+                const int* sp = (w02 > w13) ? SPLIT1 : SPLIT2;
+                for (int t = 0; t < 6; t++) m.faces.push_back((int64_t)q[sp[t]]);
             }
-            if (!ok) continue;
-            float w02 = ql(q[0]) * ql(q[2]);
-            float w13 = ql(q[1]) * ql(q[3]);
-            const int* sp = (w02 > w13) ? SPLIT1 : SPLIT2;
-            for (int t = 0; t < 6; t++) m.faces.push_back((int64_t)q[sp[t]]);
+        }
+    } else {
+        // pass 1: per-voxel face-index count (each formed quad -> 6 indices)
+        std::vector<int> fcount(N, 0);
+        #pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; n++) {
+            int32_t x = coords[n*4+1], y = coords[n*4+2], z = coords[n*4+3];
+            int c = 0;
+            for (int e = 0; e < 3; e++) {
+                if (!intersected[(size_t)n*3 + e]) continue;
+                bool ok = true;
+                for (int k = 0; k < 4; k++)
+                    if (index.find(coord_key(0, x + OFF[e][k][0], y + OFF[e][k][1], z + OFF[e][k][2])) == index.end()) { ok = false; break; }
+                if (ok) c += 6;
+            }
+            fcount[n] = c;
+        }
+        // prefix sum -> per-voxel write offset (serial, cheap over N)
+        std::vector<size_t> foff((size_t)N + 1, 0);
+        for (int n = 0; n < N; n++) foff[n+1] = foff[n] + (size_t)fcount[n];
+        m.faces.resize(foff[N]);
+        // pass 2: re-resolve + scatter at the deterministic offset (parallel, no races)
+        #pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; n++) {
+            int32_t x = coords[n*4+1], y = coords[n*4+2], z = coords[n*4+3];
+            size_t w = foff[n];
+            int q[4];
+            for (int e = 0; e < 3; e++) {
+                if (!intersected[(size_t)n*3 + e]) continue;
+                bool ok = true;
+                for (int k = 0; k < 4; k++) {
+                    auto it = index.find(coord_key(0, x + OFF[e][k][0], y + OFF[e][k][1], z + OFF[e][k][2]));
+                    if (it == index.end()) { ok = false; break; }
+                    q[k] = it->second;
+                }
+                if (!ok) continue;
+                float w02 = ql(q[0]) * ql(q[2]);
+                float w13 = ql(q[1]) * ql(q[3]);
+                const int* sp = (w02 > w13) ? SPLIT1 : SPLIT2;
+                for (int t = 0; t < 6; t++) m.faces[w++] = (int64_t)q[sp[t]];
+            }
         }
     }
+    (void)Nq;
     m.N = (int)(m.verts.size() / 3);   // includes synth cells (close_surface)
     m.F = (int)(m.faces.size() / 3);
     return m;

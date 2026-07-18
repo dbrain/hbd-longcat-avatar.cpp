@@ -121,8 +121,9 @@ int main(int argc, char** argv) {
 
     // mesh
     printf("\n[m4] === mesh extractor ===\n");
+    double t_msh = svae::now_s();
     svae::Mesh mesh = svae::flexible_dual_grid_to_mesh(coords.data(), N, dual.data(), inter.data(), qlerp.data(), 1024);
-    printf("[m4] mine: verts=%d faces=%d\n", mesh.N, mesh.F);
+    printf("[m4] mine: verts=%d faces=%d  MESHER=%.3fs (N=%d)\n", mesh.N, mesh.F, svae::now_s()-t_msh, N);
     NpyArray ovN = npy_load(std::string(REFS)+"/oracle_verts.npy");
     NpyArray ofN = npy_load(std::string(REFS)+"/oracle_faces.npy");
     int oV=(int)ovN.shape[0], oF=(int)ofN.shape[0];

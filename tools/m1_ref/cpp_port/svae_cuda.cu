@@ -63,6 +63,16 @@ extern "C" void launch_add(float* d_a, const float* d_b, size_t n, cudaStream_t 
     int T = 256; add_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(d_a, d_b, n);
 }
 
+// ---- f32 -> f16 cast (for the scoped f16-GEMM path in the continuous PBR tex decoder) ----
+#include <cuda_fp16.h>
+__global__ void f32_to_f16_kernel(const float* __restrict__ in, __half* __restrict__ out, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2half(in[i]);
+}
+extern "C" void launch_f32_to_f16(const float* d_in, void* d_out, size_t n, cudaStream_t stream) {
+    int T = 256; f32_to_f16_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(d_in, (__half*)d_out, n);
+}
+
 // ---- bias add: y[n*Cout + o] += bias[o]  (broadcast over rows) ----
 __global__ void biasadd_kernel(float* __restrict__ y, const float* __restrict__ bias, int N, int Cout) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;

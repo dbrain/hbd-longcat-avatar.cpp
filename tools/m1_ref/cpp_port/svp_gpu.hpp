@@ -25,6 +25,7 @@ extern "C" void launch_add(float*, const float*, size_t, cudaStream_t);
 extern "C" void launch_biasadd(float*, const float*, int, int, cudaStream_t);
 extern "C" void launch_gather_children(const float*, const int*, const int*, float*, int, int, cudaStream_t);
 extern "C" void launch_repeat_interleave(const float*, float*, int, int, int, cudaStream_t);
+extern "C" void launch_f32_to_f16(const float*, void*, size_t, cudaStream_t);
 // conv (sparse_subm_conv.cu)
 extern "C" void launch_subm_conv_cuda(const float*, const uint32_t*, const float*, const float*,
                                       float*, int, int, int, int, cudaStream_t);
@@ -39,8 +40,9 @@ struct GpuW {
     svp::WLoad loader;
     cublasHandle_t handle;
     std::unordered_map<std::string, float*> cache;
+    std::unordered_map<std::string, void*> cache_f16;   // f16 weight copies (scoped f16-GEMM path)
     explicit GpuW(const std::string& wdir) : loader(wdir) { cublasCreate(&handle); }
-    ~GpuW() { for (auto& kv : cache) cudaFree(kv.second); cublasDestroy(handle); }
+    ~GpuW() { for (auto& kv : cache) cudaFree(kv.second); for (auto& kv : cache_f16) cudaFree(kv.second); cublasDestroy(handle); }
     GpuW(const GpuW&) = delete; GpuW& operator=(const GpuW&) = delete;
     float* get(const std::string& key) {
         auto it = cache.find(key);
@@ -49,6 +51,14 @@ struct GpuW {
         float* p; cudaMalloc(&p, h.size()*4); cudaMemcpy(p, h.data(), h.size()*4, cudaMemcpyHostToDevice);
         cache[key] = p; return p;
     }
+    // f16 copy of an f32 weight, converted once on device and cached (for cublasGemmEx). `n` = element count.
+    void* get_f16(const std::string& key, size_t n) {
+        auto it = cache_f16.find(key);
+        if (it != cache_f16.end()) return it->second;
+        float* d_f32 = get(key);
+        void* p; cudaMalloc(&p, n*2); launch_f32_to_f16(d_f32, p, n, 0);
+        cache_f16[key] = p; return p;
+    }
 };
 
 static inline float* dmalloc(size_t n) { float* p; cudaMalloc(&p, n*4); return p; }
@@ -56,13 +66,25 @@ static inline uint32_t* dmalloc_u32(size_t n) { uint32_t* p; cudaMalloc(&p, n*4)
 static inline int* dmalloc_i32(size_t n) { int* p; cudaMalloc(&p, n*4); return p; }
 
 // y[N,Cout] = x[N,Cin] @ W[Cout,Cin]^T + b[Cout].  (row-major; see svp_gpu notes)
+// `fast`: run the matmul as an f16-input / f32-accumulate tensor-core GEMM (cublasGemmEx). Weights and
+// activations cast to f16, accumulation stays f32 (== the geo-DiT scoped-flash recipe). Bias add is
+// f32. ONLY safe for CONTINUOUS output fields (the PBR tex decoder) — never for threshold/occupancy
+// decodes (M4 head, SS). Off by default; set true only from m6_tex_decode.
 static inline float* linear_gpu(GpuW& W, float* d_x, const std::string& wkey, const std::string& bkey,
-                                int N, int Cin, int Cout) {
-    float* d_W = W.get(wkey);
+                                int N, int Cin, int Cout, bool fast=false) {
     float* d_y = dmalloc((size_t)N*Cout);
     const float alpha=1.f, beta=0.f;
-    cublasSgemm(W.handle, CUBLAS_OP_T, CUBLAS_OP_N, Cout, N, Cin, &alpha,
-                d_W, Cin, d_x, Cin, &beta, d_y, Cout);
+    if (fast) {
+        void* dW16 = W.get_f16(wkey, (size_t)Cin*Cout);
+        void* dx16; cudaMalloc(&dx16, (size_t)N*Cin*2); launch_f32_to_f16(d_x, dx16, (size_t)N*Cin, 0);
+        cublasGemmEx(W.handle, CUBLAS_OP_T, CUBLAS_OP_N, Cout, N, Cin, &alpha,
+                     dW16, CUDA_R_16F, Cin, dx16, CUDA_R_16F, Cin, &beta,
+                     d_y, CUDA_R_32F, Cout, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        cudaFree(dx16);
+    } else {
+        cublasSgemm(W.handle, CUBLAS_OP_T, CUBLAS_OP_N, Cout, N, Cin, &alpha,
+                    W.get(wkey), Cin, d_x, Cin, &beta, d_y, Cout);
+    }
     if (!bkey.empty()) launch_biasadd(d_y, W.get(bkey), N, Cout, 0);
     return d_y;
 }
@@ -83,16 +105,16 @@ struct LevelIO {
     uint32_t* d_nmap;              // device nmap [N,27]
 };
 
-// run NB ConvNeXt blocks at (N,C) on resident feats.
-static inline void run_convnext_blocks(GpuW& W, LevelIO& io, int L, int NB, float EPS) {
+// run NB ConvNeXt blocks at (N,C) on resident feats. `fast` = f16 MLP GEMMs (continuous fields only).
+static inline void run_convnext_blocks(GpuW& W, LevelIO& io, int L, int NB, float EPS, bool fast=false) {
     char pfx[64];
     for (int j=0;j<NB;j++) {
         snprintf(pfx,sizeof(pfx),"blocks.%d.%d",L,j); std::string p(pfx);
         float* h = conv_gpu(W, io.d_feats, io.d_nmap, p+".conv.weight", p+".conv.bias", io.N, io.C, io.C);
         launch_layernorm(h, W.get(p+".norm.weight"), W.get(p+".norm.bias"), io.N, io.C, EPS, 0);
-        float* mm = linear_gpu(W, h, p+".mlp.0.weight", p+".mlp.0.bias", io.N, io.C, 4*io.C);
+        float* mm = linear_gpu(W, h, p+".mlp.0.weight", p+".mlp.0.bias", io.N, io.C, 4*io.C, fast);
         launch_silu(mm, (size_t)io.N*4*io.C, 0);
-        float* mm2 = linear_gpu(W, mm, p+".mlp.2.weight", p+".mlp.2.bias", io.N, 4*io.C, io.C);
+        float* mm2 = linear_gpu(W, mm, p+".mlp.2.weight", p+".mlp.2.bias", io.N, 4*io.C, io.C, fast);
         launch_add(io.d_feats, mm2, (size_t)io.N*io.C, 0);
         cudaFree(h); cudaFree(mm); cudaFree(mm2);
     }
@@ -203,7 +225,10 @@ inline svae::Mesh m4_decode_mesh(const std::vector<int32_t>& coords_in,
                 Nf, nz, nan, mn, mx);
     }
     if (out_coords1024) *out_coords1024 = io.coords;   // A1: grid-`resolution` occupancy for the marching-tet remesh
-    return svae::flexible_dual_grid_to_mesh(io.coords.data(), Nf, dual.data(), inter.data(), qlerp.data(), resolution, close_surface);
+    double t_msh = svae::now_s();
+    svae::Mesh out_mesh = svae::flexible_dual_grid_to_mesh(io.coords.data(), Nf, dual.data(), inter.data(), qlerp.data(), resolution, close_surface);
+    if (std::getenv("PIXAL3D_TIME_MESHER")) fprintf(stderr, "[7m] FDG mesher (N=%d -> %d v / %d f): %.1fs\n", Nf, out_mesh.N, out_mesh.F, svae::now_s()-t_msh);
+    return out_mesh;
 }
 
 // ===================== M3a: upsample -> hr_coords =====================
@@ -236,12 +261,16 @@ inline std::vector<float> m6_tex_decode(const std::vector<int32_t>& coords_in,
         const std::vector<float>& tex_slat, const std::vector<std::vector<uint8_t>>& guide_subs,
         const std::string& wdir, std::vector<int32_t>* out_coords = nullptr) {
     GpuW W(wdir);
+    // Scoped f16-input/f32-accumulate GEMMs for the ConvNeXt MLPs + head. PBR is a CONTINUOUS field
+    // (not a threshold like M4-occupancy/SS), so f16 rounding shifts colour sub-quantisation, not
+    // topology. Opt-in via PIXAL3D_TEX_F16=1 pending an owner textured A/B. The subm convs stay f32.
+    const bool f16 = std::getenv("PIXAL3D_TEX_F16") != nullptr;
     const int MC[5]={1024,512,256,128,64}; const int NB[4]={4,16,8,4}; const float EPS=1e-6f;
     int N=(int)coords_in.size()/4;
     LevelIO io; io.coords=coords_in; io.N=N; io.C=1024;
     float* d_slat = dmalloc((size_t)N*32);
     cudaMemcpy(d_slat, tex_slat.data(), (size_t)N*32*4, cudaMemcpyHostToDevice);
-    io.d_feats = linear_gpu(W, d_slat, "from_latent.weight", "from_latent.bias", N, 32, 1024);
+    io.d_feats = linear_gpu(W, d_slat, "from_latent.weight", "from_latent.bias", N, 32, 1024, f16);
     cudaFree(d_slat);
     { std::vector<uint32_t> nm = svae::build_nmap(io.coords.data(), N);
       io.d_nmap = dmalloc_u32((size_t)N*27);
@@ -249,11 +278,11 @@ inline std::vector<float> m6_tex_decode(const std::vector<int32_t>& coords_in,
     for (int L=0;L<4;L++) {
         int Cout=MC[L+1];
         std::string up = std::string("blocks.")+std::to_string(L)+"."+std::to_string(NB[L]);
-        run_convnext_blocks(W, io, L, NB[L], EPS);
+        run_convnext_blocks(W, io, L, NB[L], EPS, f16);
         run_c2s_upblock(W, io, up, Cout, EPS, guide_subs[L]);   // pred_subdiv=false: SHAPE subs
     }
     launch_layernorm(io.d_feats, nullptr, nullptr, io.N, 64, 1e-5f, 0);
-    float* d_out6 = linear_gpu(W, io.d_feats, "output_layer.weight", "output_layer.bias", io.N, 64, 6);
+    float* d_out6 = linear_gpu(W, io.d_feats, "output_layer.weight", "output_layer.bias", io.N, 64, 6, f16);
     std::vector<float> out6((size_t)io.N*6);
     cudaMemcpy(out6.data(), d_out6, (size_t)io.N*6*4, cudaMemcpyDeviceToHost);
     cudaFree(d_out6); cudaFree(io.d_feats); cudaFree(io.d_nmap);
