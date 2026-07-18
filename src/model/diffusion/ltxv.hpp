@@ -1425,6 +1425,10 @@ namespace LTXV {
         int64_t a_dim;
         bool cross_attention_adaln;
         bool has_audio = true;
+        // Diagnostic-only graph label. The runner assigns this while building
+        // a forward so one selected block's RMSNorm/modulate boundary tensors
+        // can be hashed on their producing CUDA stream.
+        int diag_block_index = -1;
         // LTX_BLOCK_STOP_AT_SUBOP: when this block is the truncation block (set by
         // forward_core for the LTX_DIT_STOP_AT_BLOCK block), return vx early after a
         // chosen video sub-op so the surviving terminal output isolates WHICH op in the
@@ -1601,6 +1605,34 @@ namespace LTXV {
             bool run_a2v = run_ax && !ctx->ltx_skip_a2v;
             bool run_v2a = run_ax && !ctx->ltx_skip_a2v;
 
+            // Debug-only graph-cut subdivision of one selected AV block.  This
+            // keeps the real graph-cut/offload execution model, but makes its
+            // major internal residual boundaries cache-visible.  It is off by
+            // default and exists solely to localize an already-demonstrated
+            // per-block divergence; it is never a production scheduling mode.
+            static const int diag_subcut_block = [] {
+                const char* e = getenv("LTX_DIT_SUBCUT_BLOCK");
+                return e != nullptr ? atoi(e) : -1;
+            }();
+            auto mark_subcut = [&](ggml_tensor* tensor, const char* stage, const char* stream) {
+                if (diag_block_index == diag_subcut_block && tensor != nullptr) {
+                    const std::string label = "ltxdiag.subcut.block." + std::to_string(diag_block_index) + "." + stage;
+                    sd::ggml_graph_cut::mark_graph_cut(tensor, label, stream);
+                    // Some audio-path cuts are consumed entirely within a later
+                    // merged segment and therefore never reach the cache ledger.
+                    // Make an F32 snapshot an explicit terminal graph consumer
+                    // for a host-byte provenance run.  Off by default; this is
+                    // diagnostic-only and intentionally carries its own output.
+                    const char* capture = getenv("LTX_DIT_SUBCUT_CAPTURE");
+                    if (capture != nullptr && capture[0] == '1') {
+                        ggml_tensor* f32 = tensor->type == GGML_TYPE_F32
+                            ? tensor
+                            : ggml_cast(ctx->ggml_ctx, tensor, GGML_TYPE_F32);
+                        ctx->capture_tensor(label + "." + stream, f32);
+                    }
+                }
+            };
+
             auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
             ggml_tensor* v_norm = nullptr;
             if (ltx_rms_mod_fuse_enabled()) {
@@ -1611,6 +1643,7 @@ namespace LTXV {
             }
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe, nullptr, nullptr, v_pe_compact_index);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
+            mark_subcut(vx, "video_sa", "vx");
             if (stop_at_subop == 0) {
                 return {vx, ax};  // truncate after video self-attn (attn1)
             }
@@ -1627,6 +1660,7 @@ namespace LTXV {
                                                      ctx->ltx_video_token_sel,
                                                      v_context_neg);  // NAG negative video text context (null unless a NAG step)
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
+            mark_subcut(vx, "video_txt", "vx");
             if (stop_at_subop == 1) {
                 return {vx, ax};  // truncate after video text cross-attn (attn2)
             }
@@ -1638,7 +1672,13 @@ namespace LTXV {
                     a_norm = modulate_fused(ctx->ggml_ctx, ax, a_mods[0], a_mods[1]);
                 } else {
                     a_norm = rms_norm(ctx->ggml_ctx, ax);
+                    if (diag_block_index == 18 && getenv("GGML_LTX_TENSOR_HASH") != nullptr) {
+                        ggml_set_name(a_norm, "ltxdiag_b18_audio_rms");
+                    }
                     a_norm = modulate(ctx->ggml_ctx, a_norm, a_mods[0], a_mods[1]);
+                }
+                if (diag_block_index == 18 && getenv("GGML_LTX_TENSOR_HASH") != nullptr) {
+                    ggml_set_name(a_norm, "ltxdiag_b18_audio_mod");
                 }
                 auto a_sa   = audio_attn1->forward(ctx, a_norm, nullptr, nullptr, a_pe);
                 ax          = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_sa, a_mods[2]));
@@ -1653,6 +1693,7 @@ namespace LTXV {
                                                          a_dim,
                                                          attention_mask);
                 ax          = ggml_add(ctx->ggml_ctx, ax, a_txt);
+                mark_subcut(ax, "audio_txt", "ax");
 
                 auto vx_norm3 = rms_norm(ctx->ggml_ctx, vx);
                 auto ax_norm3 = rms_norm(ctx->ggml_ctx, ax);
@@ -1669,6 +1710,7 @@ namespace LTXV {
                     auto a2v_gate        = get_ada_values(ctx, a2v_gate_table, v_cross_gate_timestep, v_dim, 1)[0];
                     vx                   = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, a2v_out, a2v_gate));
                 }
+                mark_subcut(vx, "audio_to_video", "vx");
                 if (stop_at_subop == 2) {
                     return {vx, ax};  // truncate after audio_to_video cross-attn (a2v)
                 }
@@ -1695,6 +1737,7 @@ namespace LTXV {
                 }
                 auto a_ff_out  = audio_ff->forward(ctx, ax_scaled);
                 ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
+                mark_subcut(ax, "audio_ff", "ax");
             }
 
             auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, ctx->ltx_video_token_sel);
@@ -1707,6 +1750,7 @@ namespace LTXV {
             }
             auto v_ff_out  = ff->forward(ctx, vx_scaled);
             vx             = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_ff_out, v_ff_mods[2]));
+            mark_subcut(vx, "video_ff", "vx");
 
             return {vx, ax};
         }
@@ -2193,6 +2237,7 @@ namespace LTXV {
                 // it composes with LTX_DIT_STOP_AT_BLOCK (e.g. STOP_AT_BLOCK=3 SUBOP=0 =
                 // "run blocks 0-2 whole, then block 3 only up to its self-attn").
                 block->stop_at_subop = (dit_stop_at_block >= 0 && i == dit_stop_at_block) ? dit_stop_at_subop : -1;
+                block->diag_block_index = i;
                 auto out   = block->forward(ctx,
                                             vx,
                                             ax,

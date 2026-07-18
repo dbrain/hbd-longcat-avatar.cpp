@@ -1808,7 +1808,10 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         // cast to F32 (rope_pe is F32-only), yet cuDNN still emits F16 internally and the
         // to_out consumer is F16. The env is the dit_f16 opt-in; gate only on the cuDNN
         // selection shape (mask-free, D in {64,128}). cuDNN casts an F32 q to F16 itself.
-        static const bool cudnn_f16_out_env = getenv("GGML_CUDNN_ATTN_F16_OUT") != nullptr;
+        static const bool cudnn_f16_out_env = [] {
+            const char * e = getenv("GGML_CUDNN_ATTN_F16_OUT");
+            return e != nullptr && atoi(e) != 0;
+        }();
         // DEVICE-GATED (Blackwell-only). The F16 attention output only pays off when
         // cuDNN SDPA (selected exclusively on cc >= Blackwell) stores it directly and the
         // FP4 cuBLASLt GEMM consumes it. On non-Blackwell (e.g. sm86/RTX 3060) cuDNN is
@@ -2297,6 +2300,7 @@ protected:
     ggml_backend_buffer_t resident_runtime_params_buffer = nullptr;
     std::unordered_set<ggml_tensor*> resident_param_set;
     uint64_t resident_state_token = 0;
+    bool resident_layout_only_active_ = false;
 
     // The server supplies the selected fused DiT at a chain lease boundary.
     std::string residency_model_id_;
@@ -2424,6 +2428,11 @@ protected:
     std::map<std::string, ggml_tensor*> cache_tensor_map;  // name -> tensor
     std::vector<std::pair<ggml_tensor*, std::string>> debug_tensors;
     const std::string final_result_name = "ggml_runner_final_result_tensor";
+    // 1-based graph-cut segment identity for debug-only provenance at the
+    // offload/compute boundary. Set by compute_with_graph_cuts around its
+    // execute_graph call; zero means an unsegmented compute.
+    size_t active_graph_cut_segment_index_ = 0;
+    size_t active_graph_cut_segment_count_ = 0;
     // Optional per-segment readback hook: called inside execute_graph after compute
     // + sync but BEFORE the segment compute buffer is freed, so the caller can copy
     // segment-local outputs (e.g. the causal KV cache's per-block K/V) to host. The
@@ -2809,11 +2818,21 @@ protected:
                     if (src != dst) {
                         const bool use_staging_copy = src->view_src != nullptr || !ggml_is_contiguous(src) || src->buffer == nullptr;
                         if (use_staging_copy) {
+                            // The graph producer runs on runtime_backend's CUDA stream.  The
+                            // legacy tensor_get/tensor_set path uses cudaStreamPerThread, which
+                            // has no dependency on that producer; fence before crossing to the
+                            // host staging stream.
+                            ggml_backend_synchronize(runtime_backend);
                             std::vector<uint8_t> host_data(ggml_nbytes(src));
                             ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
                             ggml_backend_tensor_set(dst, host_data.data(), 0, host_data.size());
                         } else {
-                            ggml_backend_tensor_copy(src, dst);
+                            // Keep the D2D cache hand-off on the same stream as the segment
+                            // producer.  ggml_backend_tensor_copy() dispatches through the
+                            // buffer API on cudaStreamPerThread, so its copy can otherwise race
+                            // the just-enqueued producer kernels.  Apart from restoring the
+                            // required dependency this keeps the same D2D copy and cache layout.
+                            ggml_backend_tensor_copy_async(runtime_backend, runtime_backend, src, dst);
                         }
                     }
                 }
@@ -2934,11 +2953,16 @@ protected:
             }
             const bool use_staging_copy = src->view_src != nullptr || !ggml_is_contiguous(src) || src->buffer == nullptr;
             if (use_staging_copy) {
+                // See the direct D2D branch below: a host staging stream is not ordered
+                // behind the runtime producer stream by itself.
+                ggml_backend_synchronize(runtime_backend);
                 std::vector<uint8_t> host_data(ggml_nbytes(src));
                 ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
                 ggml_backend_tensor_set(dst, host_data.data(), 0, host_data.size());
             } else {
-                ggml_backend_tensor_copy(src, dst);
+                // Queue on the producer/consumer runtime stream rather than the independent
+                // cudaStreamPerThread used by the synchronous buffer-copy helper.
+                ggml_backend_tensor_copy_async(runtime_backend, runtime_backend, src, dst);
             }
         }
         ggml_backend_synchronize(runtime_backend);
@@ -2959,6 +2983,87 @@ protected:
             ggml_free(old_cache_ctx);
         }
         return true;
+    }
+
+    // Debug-only graph-cut boundary provenance.  execute_graph() calls this only
+    // AFTER copy_cache_tensors_to_cache_buffer() has completed its ordered D2D
+    // hand-off and synchronized runtime_backend.  Reading the cached cut outputs
+    // here therefore cannot race their producer and, unlike an in-graph tap,
+    // does not change graph shape, allocation, or kernel scheduling.  It can
+    // delay the *next* segment, so matching hashes are not a negative result;
+    // a cross-render mismatch is nevertheless a decisive upper bound on the
+    // segment that produced that cache value.
+    void log_graph_cut_cache_hashes(size_t segment_index, size_t segment_count) {
+        const char* trace = getenv("LTX_GRAPH_CUT_CACHE_HASH");
+        if (trace == nullptr || trace[0] != '1' || cache_ctx == nullptr) {
+            return;
+        }
+        for (ggml_tensor* tensor = ggml_get_first_tensor(cache_ctx);
+             tensor != nullptr;
+             tensor = ggml_get_next_tensor(cache_ctx, tensor)) {
+            const size_t bytes = ggml_nbytes(tensor);
+            std::vector<uint8_t> host(bytes);
+            // copy_cache_tensors_to_cache_buffer() synchronized runtime_backend
+            // before returning, so the legacy synchronous readback stream sees a
+            // completed, immutable cache value here.
+            ggml_backend_tensor_get(tensor, host.data(), 0, bytes);
+            uint64_t hash = 1469598103934665603ULL;
+            for (uint8_t byte : host) {
+                hash ^= byte;
+                hash *= 1099511628211ULL;
+            }
+            LOG_INFO("[LTX_CUT_CACHE_HASH] model=%s segment=%zu/%zu tensor=%s bytes=%zu hash=%016llx",
+                     get_desc().c_str(), segment_index + 1, segment_count,
+                     tensor->name[0] != '\0' ? tensor->name : "<unnamed>",
+                     bytes, (unsigned long long) hash);
+        }
+    }
+
+    // Debug-only H2D provenance for one selected graph-cut segment.  The host
+    // source is the CPU half of partial_offload_pairs after the pointer swap;
+    // the live tensor is its GPU twin.  Synchronizing here is intentionally
+    // intrusive and may affect later timing, so equal hashes are not a negative
+    // result. A host/device mismatch across same-input replays proves the
+    // segment-local offload path is already handing compute different bytes.
+    void log_graph_cut_partial_param_hash() {
+        const char* value = getenv("LTX_GRAPH_CUT_PARAM_HASH_SEGMENT");
+        if (value == nullptr || get_desc() != "ltxav" || active_graph_cut_segment_index_ == 0 ||
+            static_cast<size_t>(strtoull(value, nullptr, 10)) != active_graph_cut_segment_index_ ||
+            partial_offload_pairs.empty()) {
+            return;
+        }
+        ggml_backend_synchronize(runtime_backend);
+        uint64_t host_aggregate   = 0;
+        uint64_t device_aggregate = 0;
+        size_t bytes              = 0;
+        for (const auto& pair : partial_offload_pairs) {
+            ggml_tensor* device_tensor = pair.first;
+            ggml_tensor* host_tensor   = pair.second;
+            if (device_tensor == nullptr || host_tensor == nullptr || host_tensor->data == nullptr) {
+                continue;
+            }
+            const size_t nbytes = ggml_nbytes(device_tensor);
+            std::vector<uint8_t> device(nbytes);
+            ggml_backend_tensor_get(device_tensor, device.data(), 0, nbytes);
+            auto hash_bytes = [](const uint8_t* data, size_t size) {
+                uint64_t hash = 1469598103934665603ULL;
+                for (size_t i = 0; i < size; ++i) {
+                    hash ^= data[i];
+                    hash *= 1099511628211ULL;
+                }
+                return hash;
+            };
+            const uint64_t name_hash = hash_bytes(reinterpret_cast<const uint8_t*>(device_tensor->name),
+                                                  strnlen(device_tensor->name, GGML_MAX_NAME));
+            const uint64_t item_mix  = name_hash ^ (uint64_t)nbytes * 0x9e3779b97f4a7c15ULL;
+            host_aggregate ^= hash_bytes(static_cast<const uint8_t*>(host_tensor->data), nbytes) ^ item_mix;
+            device_aggregate ^= hash_bytes(device.data(), nbytes) ^ item_mix;
+            bytes += nbytes;
+        }
+        LOG_INFO("[LTX_CUT_PARAM_HASH] segment=%zu/%zu tensors=%zu bytes=%zu host=%016llx device=%016llx",
+                 active_graph_cut_segment_index_, active_graph_cut_segment_count_,
+                 partial_offload_pairs.size(), bytes, (unsigned long long)host_aggregate,
+                 (unsigned long long)device_aggregate);
     }
 
     template <typename T>
@@ -2989,11 +3094,13 @@ protected:
         }
 
         sd::Tensor<T> result(sd::shape_from_ggml(tensor));
-        if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor) || tensor->buffer == nullptr) {
-            ggml_backend_tensor_get(tensor, result.data(), 0, ggml_nbytes(tensor));
-        } else {
-            ggml_backend_tensor_get(tensor, result.data(), 0, ggml_nbytes(tensor));
-        }
+        // The final graph result feeds the CPU sampler immediately.  The synchronous
+        // buffer helper uses cudaStreamPerThread, which is independent of the runtime
+        // graph stream and can therefore copy a still-producing result.  Queue the D2H
+        // transfer on the runtime stream, after the graph, then wait for precisely that
+        // ordered stream before returning host-visible data.
+        ggml_backend_tensor_get_async(runtime_backend, tensor, result.data(), 0, ggml_nbytes(tensor));
+        ggml_backend_synchronize(runtime_backend);
         return result;
     }
 
@@ -3008,6 +3115,50 @@ protected:
         }
         for (int i = 0; i < n_nodes; ++i) {
             graph_tensor_set.insert(ggml_graph_node(gf, i));
+        }
+
+        // Host-only provenance for the real graph-cut ingress.  Unlike an in-stream
+        // activation probe this runs before any H2D submission and launches no CUDA
+        // work, so a mismatch in a failing pair decisively places the source upstream
+        // of the device.  The commutative aggregate deliberately avoids pointer/order
+        // identity: both vary between fresh workers while the external input values do
+        // not.  Persistent inputs are reported separately at their own upload site.
+        static const bool graph_input_hash = [] {
+            const char * e = getenv("LTX_GRAPH_INPUT_HASH");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        if (graph_input_hash) {
+            auto hash_bytes = [](const void * data, size_t size) {
+                const uint8_t * p = static_cast<const uint8_t *>(data);
+                uint64_t h = 1469598103934665603ULL;
+                for (size_t i = 0; i < size; ++i) {
+                    h ^= p[i];
+                    h *= 1099511628211ULL;
+                }
+                return h;
+            };
+            uint64_t aggregate = 0;
+            size_t total_bytes = 0;
+            size_t count       = 0;
+            for (const auto & kv : backend_tensor_data_map) {
+                const ggml_tensor * tensor = kv.first;
+                const void * data           = kv.second;
+                if (tensor == nullptr || data == nullptr || graph_tensor_set.find(tensor) == graph_tensor_set.end()) {
+                    continue;
+                }
+                const size_t bytes = ggml_nbytes(tensor);
+                uint64_t item = hash_bytes(data, bytes);
+                item ^= (uint64_t) bytes * 0x9e3779b97f4a7c15ULL;
+                item ^= (uint64_t) tensor->type * 0xbf58476d1ce4e5b9ULL;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    item ^= (uint64_t) tensor->ne[d] * (0x94d049bb133111ebULL + (uint64_t) d);
+                }
+                aggregate ^= item;
+                total_bytes += bytes;
+                ++count;
+            }
+            LOG_INFO("[LTX_GRAPH_INPUT_HASH] transient count=%zu bytes=%zu hash=%016llx",
+                     count, total_bytes, (unsigned long long) aggregate);
         }
 
         for (auto& kv : backend_tensor_data_map) {
@@ -3044,7 +3195,19 @@ protected:
                 continue;
             }
 
-            ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor));
+            // These are graph leaves (including the changing sampler state).  On CUDA the
+            // synchronous buffer helper submits its H2D transfer on cudaStreamPerThread,
+            // whereas the immediately following graph runs on runtime_backend's stream.
+            // There is no ordering edge between those streams, so a graph-cut segment could
+            // consume a partly copied external input.  Queue the transfer on the consuming
+            // stream instead: the subsequent graph compute is ordered naturally, with no
+            // device-wide fence or extra allocation.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, tensor, data, 0, ggml_nbytes(tensor));
+            } else {
+                ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor));
+            }
         }
 
         if (clear_after_copy) {
@@ -3086,7 +3249,15 @@ protected:
         ggml_tensor* offload_t = ggml_get_first_tensor(offload_ctx);
 
         while (t != nullptr && offload_t != nullptr) {
-            ggml_backend_tensor_copy(t, offload_t);
+            // The CPU-resident source must be uploaded on the stream that will
+            // consume this weight.  The synchronous buffer helper uses
+            // cudaStreamPerThread and has no ordering edge to runtime_backend.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, offload_t, t->data, 0, ggml_nbytes(t));
+            } else {
+                ggml_backend_tensor_copy(t, offload_t);
+            }
             std::swap(t->buffer, offload_t->buffer);
             std::swap(t->data, offload_t->data);
             std::swap(t->extra, offload_t->extra);
@@ -3792,7 +3963,15 @@ protected:
             ggml_tensor* tensor         = pair.first;
             ggml_tensor* offload_tensor = pair.second;
 
-            ggml_backend_tensor_copy(tensor, offload_tensor);
+            // As above, queue the per-segment H2D copy on the consuming runtime
+            // stream.  The pointer exchange below does not alter the already
+            // enqueued source/destination addresses.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, offload_tensor, tensor->data, 0, ggml_nbytes(tensor));
+            } else {
+                ggml_backend_tensor_copy(tensor, offload_tensor);
+            }
             std::swap(tensor->buffer, offload_tensor->buffer);
             std::swap(tensor->data, offload_tensor->data);
             std::swap(tensor->extra, offload_tensor->extra);
@@ -3926,16 +4105,79 @@ protected:
         }
         ggml_backend_buffer_set_usage(resident_runtime_params_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+        static const bool resident_copy_on_runtime_stream = [] {
+            const char * e = getenv("LONGCAT_SHARED_RESIDENT_ASYNC_COPY");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        static const bool resident_copy_hash = [] {
+            const char * e = getenv("LONGCAT_SHARED_RESIDENT_COPY_HASH");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        const auto hash_bytes = [](const uint8_t * p, size_t n) {
+            unsigned long long h = 0;
+            for (size_t i = 0; i < n; ++i) {
+                unsigned long long x = (unsigned long long) i * 0x9E3779B97F4A7C15ULL + p[i];
+                x ^= x >> 29; x *= 0xbf58476d1ce4e5b9ULL; x ^= x >> 32;
+                h ^= x;
+            }
+            return h;
+        };
+        unsigned long long resident_host_hash = 0;
+        if (resident_copy_hash) {
+            ggml_cuda_matmul_src_hash_read_reset(nullptr);
+        }
+
+        // Debug-only layout discriminator: retain the exact resident CUDA allocation but
+        // leave every parameter on the normal per-segment streamed path. This separates
+        // an allocation-placement effect from the resident H2D copy/pointer exchange.
+        // The empty pair list makes restore_resident_params() free this unused buffer
+        // without touching the original CPU tensors. Never enable in a production recipe.
+        static const bool resident_layout_only = [] {
+            const char * e = getenv("LONGCAT_SHARED_RESIDENT_LAYOUT_ONLY");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        if (resident_layout_only) {
+            const size_t sz = ggml_backend_buffer_get_size(resident_runtime_params_buffer);
+            LOG_INFO("%s shared-resident layout-only allocation (%6.2f MB, %zu tensors)",
+                     get_desc().c_str(), sz / (1024.f * 1024.f), resident_offload_pairs.size());
+            resident_offload_pairs.clear();
+            resident_layout_only_active_ = true;
+            return true;
+        }
+
         for (auto& pair : resident_offload_pairs) {
             ggml_tensor* t    = pair.first;
             ggml_tensor* twin = pair.second;
-            ggml_backend_tensor_copy(t, twin);
+            const size_t nbytes = ggml_nbytes(t);
+            if (resident_copy_hash) {
+                resident_host_hash ^= hash_bytes(static_cast<const uint8_t *>(t->data), nbytes);
+            }
+            if (resident_copy_on_runtime_stream) {
+                // Keep resident H2D transfers on the very stream that will consume
+                // them. The ordinary tensor-copy helper uses cudaStreamPerThread and
+                // synchronizes that separate stream once per tensor; this path queues
+                // the identical transfers in order and the existing backend sync below
+                // fences the whole batch before any pointer becomes compute-visible.
+                ggml_backend_tensor_set_async(runtime_backend, twin, t->data, 0, nbytes);
+            } else {
+                ggml_backend_tensor_copy(t, twin);
+            }
             std::swap(t->buffer, twin->buffer);
             std::swap(t->data, twin->data);
             std::swap(t->extra, twin->extra);
             resident_param_set.insert(t);
+            if (resident_copy_hash) {
+                ggml_cuda_matmul_src_hash(t->data, nbytes, nullptr);
+            }
         }
         ggml_backend_synchronize(runtime_backend);
+        if (resident_copy_hash) {
+            unsigned long long resident_device_hash = 0;
+            ggml_cuda_matmul_src_hash_read_reset(&resident_device_hash);
+            LOG_INFO("%s resident-copy hash host=%016llx device=%016llx %s",
+                     get_desc().c_str(), resident_host_hash, resident_device_hash,
+                     resident_host_hash == resident_device_hash ? "MATCH" : "MISMATCH");
+        }
 
         size_t sz = ggml_backend_buffer_get_size(resident_runtime_params_buffer);
         LOG_INFO("%s offload resident params (%6.2f MB, %zu tensors) to runtime backend (%s)",
@@ -3958,6 +4200,7 @@ protected:
             }
             resident_param_set.clear();
             resident_state_token = 0;
+            resident_layout_only_active_ = false;
             return;
         }
         for (auto& pair : resident_offload_pairs) {
@@ -3981,6 +4224,7 @@ protected:
         }
         resident_param_set.clear();
         resident_state_token = 0;
+        resident_layout_only_active_ = false;
     }
 
     bool should_use_graph_cut_segmented_compute(const GraphCutPlan& plan) {
@@ -4201,6 +4445,23 @@ protected:
             return nullptr;
         }
 
+        static const bool graph_input_hash = [] {
+            const char * e = getenv("LTX_GRAPH_INPUT_HASH");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        uint64_t persistent_hash  = 0;
+        size_t persistent_bytes   = 0;
+        size_t persistent_count   = 0;
+        const auto hash_bytes = [](const void * data, size_t size) {
+            const uint8_t * p = static_cast<const uint8_t *>(data);
+            uint64_t h = 1469598103934665603ULL;
+            for (size_t i = 0; i < size; ++i) {
+                h ^= p[i];
+                h *= 1099511628211ULL;
+            }
+            return h;
+        };
+
         for (const auto& binding : bindings) {
             ggml_tensor* original = binding.first;
             ggml_tensor* copy     = binding.second;
@@ -4208,11 +4469,35 @@ protected:
             if (data_it == backend_tensor_data_map.end() || data_it->second == nullptr) {
                 continue;
             }
-            ggml_backend_tensor_set(copy, data_it->second, 0, ggml_nbytes(copy));
+            if (graph_input_hash) {
+                const size_t bytes = ggml_nbytes(copy);
+                uint64_t item = hash_bytes(data_it->second, bytes);
+                item ^= (uint64_t) bytes * 0x9e3779b97f4a7c15ULL;
+                item ^= (uint64_t) copy->type * 0xbf58476d1ce4e5b9ULL;
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    item ^= (uint64_t) copy->ne[d] * (0x94d049bb133111ebULL + (uint64_t) d);
+                }
+                persistent_hash ^= item;
+                persistent_bytes += bytes;
+                ++persistent_count;
+            }
+            // Persistent graph inputs are consumed by the following segmented
+            // CUDA graph; keep their H2D transfer on that same stream too.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, copy, data_it->second, 0, ggml_nbytes(copy));
+            } else {
+                ggml_backend_tensor_set(copy, data_it->second, 0, ggml_nbytes(copy));
+            }
             original->buffer = copy->buffer;
             original->data   = copy->data;
             original->extra  = copy->extra;
             backend_tensor_data_map.erase(data_it);
+        }
+
+        if (graph_input_hash) {
+            LOG_INFO("[LTX_GRAPH_INPUT_HASH] persistent count=%zu bytes=%zu hash=%016llx",
+                     persistent_count, persistent_bytes, (unsigned long long) persistent_hash);
         }
 
         LOG_INFO("%s graph-cut persisted %zu repeated external input tensor(s), %.0f MB, avoiding per-segment recopy",
@@ -4403,6 +4688,8 @@ protected:
             }
         }
         int64_t t_offload_end = ggml_time_ms();
+
+        log_graph_cut_partial_param_hash();
 
         int64_t t_alloc_begin = ggml_time_ms();
         if (!alloc_compute_buffer(gf)) {
@@ -4893,8 +5180,8 @@ protected:
             }
             if (token == 0) token = 1;  // never alias the "nothing resident" sentinel
             const bool already_resident = shared_resident_cross &&
-                                          !resident_param_set.empty() &&
-                                          token == resident_state_token;
+                ((resident_layout_only_active_ || !resident_param_set.empty()) &&
+                 token == resident_state_token);
             if (!already_resident) {
                 restore_resident_params();  // clear any stale set (plan changed)
                 if (!shared.empty()) {
@@ -5000,6 +5287,8 @@ protected:
             ggml_context* segment_graph_ctx = nullptr;
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
             offload_profile_.graphprep_ms += ggml_time_ms() - t_prep_begin;
+            active_graph_cut_segment_index_ = seg_idx + 1;
+            active_graph_cut_segment_count_ = plan.segments.size();
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
                                                    true,
@@ -5007,6 +5296,8 @@ protected:
                                                    true,
                                                    !is_last_segment || no_return,
                                                    &future_cut_names);
+            active_graph_cut_segment_index_ = 0;
+            active_graph_cut_segment_count_ = 0;
             ggml_free(segment_graph_ctx);
             if (!segment_output.has_value()) {
                 free_cache_ctx_and_buffer();
@@ -5014,6 +5305,7 @@ protected:
                 free_compute_ctx();
                 return std::nullopt;
             }
+            log_graph_cut_cache_hashes(seg_idx, plan.segments.size());
             output = std::move(segment_output);
             if (pipelining_active) {
                 skip_internal_offload_ = false;

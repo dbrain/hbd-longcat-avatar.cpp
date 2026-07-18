@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +59,20 @@
 
 const char* sd_vae_format_name(enum sd_vae_format_t format);
 static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion fallback);
+
+// The generation tensors returned from compute() are host f32 buffers.  Keep this
+// hash host-only: a diagnostic sync can hide the scheduling-sensitive fault being
+// investigated.  It deliberately hashes raw bytes rather than float values.
+static uint64_t ltx_host_tensor_fnv1a(const sd::Tensor<float>& t) {
+    uint64_t h       = 1469598103934665603ULL;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(t.data());
+    const size_t n   = static_cast<size_t>(t.numel()) * sizeof(float);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
 
 const char* model_version_to_str[] = {
     "SD 1.x",
@@ -2905,20 +2920,6 @@ public:
                      nag_scale, nag_alpha, nag_tau, nag_until_sigma);
         }
 
-        // FNV-1a over a host tensor's raw f32 bytes. Free: these tensors are ALREADY on the host
-        // (compute() returns them), so hashing adds no sync and cannot perturb GPU timing — which
-        // matters, because a probe that adds a sync can suppress the very race it is hunting.
-        auto ltx_tensor_fnv1a = [](const sd::Tensor<float>& t) -> uint64_t {
-            uint64_t h       = 1469598103934665603ULL;
-            const uint8_t* p = reinterpret_cast<const uint8_t*>(t.data());
-            const size_t n   = static_cast<size_t>(t.numel()) * sizeof(float);
-            for (size_t i = 0; i < n; i++) {
-                h ^= p[i];
-                h *= 1099511628211ULL;
-            }
-            return h;
-        };
-
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             // Cooperative cancel: client disconnected mid-render. Bail before launching
             // this step's DiT compute. An empty pred makes sample_k_diffusion yield an
@@ -3121,8 +3122,48 @@ public:
                 if (const char* e_sh = getenv("LTX_DIT_STEP_HASH"); e_sh && atoi(e_sh)) {
                     LOG_INFO("[DIT_STEPHASH] step=%d sigma=%.6f numel=%lld hash=%016llx",
                              step, (double)sigma, (long long)output_opt.numel(),
-                             (unsigned long long)ltx_tensor_fnv1a(output_opt));
+                             (unsigned long long)ltx_host_tensor_fnv1a(output_opt));
                 }
+
+#ifdef SD_USE_CUDA
+                // Minimal real-path FP8 provenance: GGML_FP8_INHASH=2 hashes only
+                // call 0, and this read/reset scopes it to each real sampler forward.
+                // A matching weight hash with a moving activation hash proves that
+                // the first FFN GEMM is being handed already-divergent data.
+                if (const char* e_rh = getenv("LTX_DIT_FP8_REALHASH"); e_rh && atoi(e_rh)) {
+                    unsigned long long whash = 0, ahash = 0;
+                    ggml_cuda_fp8_inhash_read_reset(&whash, &ahash);
+                    LOG_INFO("[DIT_FP8_REALHASH] step=%d whash=%016llx ahash=%016llx",
+                             step, whash, ahash);
+                }
+
+                // Hash the raw activation feeding one named Linear, independent
+                // of whether dispatch routes that Linear to FP8 or FP4.  Earlier
+                // sampler steps contribute the same XOR on same-seed replays, so
+                // reading at the first divergent step detects a new wobble there.
+                if (const char* e_mh = getenv("LTX_DIT_MATMUL_SRC_HASH_STEP"); e_mh && *e_mh &&
+                    std::abs(step) == atoi(e_mh)) {
+                    unsigned long long hash = 0;
+                    ggml_cuda_matmul_src_hash_read_reset(&hash);
+                    LOG_INFO("[DIT_MATMUL_SRCHASH] step=%d hash=%016llx", step, hash);
+                }
+
+                // Cross-render FP8 provenance probe.  Unlike SELFCHECK, restrict the
+                // snapshot to one real sampler step: subsequent same-seed jobs then
+                // compare the exact same forward, including its ordinary weight stream.
+                // This synchronizes only the selected diagnostic step and is never
+                // enabled in a production recipe.
+                if (const char* e_fd = getenv("LTX_DIT_FP8_DIAG_STEP"); e_fd && *e_fd &&
+                    std::abs(step) == atoi(e_fd)) {
+                    int slot = -1, ncalls = 0, gm = 0, gk = 0, gn = 0;
+                    const char* field = "none";
+                    ggml_cuda_fp8_first_divergent_gemm(&slot, &field, &ncalls);
+                    const char* name = slot >= 0 ? ggml_cuda_fp8_idxname(slot, &gm, &gk, &gn) : "-";
+                    LOG_INFO("[DIT_FP8_REALDIV] step=%d ncalls=%d first_divergent_gemm=%d "
+                             "field=%s M=%d K=%d N=%d name=%s",
+                             step, ncalls, slot, field, gm, gk, gn, name);
+                }
+#endif
 
                 // LTX_DIT_SELFCHECK=N: re-run THIS forward N times on bit-identical inputs and hash
                 // each output, stopping at the first mismatch.
@@ -3141,10 +3182,15 @@ public:
                 // the offload graph-cut that prunes plain capture_tensor taps — see ltxv.hpp:2172).
                 //
                 // Cost: fires ONCE per process — on the first forward, or on
-                // LTX_DIT_SELFCHECK_STEP if set — then N pure forwards. Zero cost unless set.
+                // LTX_DIT_SELFCHECK_STEP if set — then N pure forwards.  An optional
+                // LTX_DIT_SELFCHECK_MIN_INPUT_NUMEL gate selects a geometry rather
+                // than a sampler-local step number; that is required for LTX's
+                // two-stage path because both base and refine restart at step 1.
+                // Zero cost unless set.
                 {
-                    static int s_sc      = -1;
-                    static int s_sc_step = -1;
+                    static int     s_sc           = -1;
+                    static int     s_sc_step      = -1;
+                    static int64_t s_sc_min_numel = -2;
                     if (s_sc < 0) {
                         const char* e  = getenv("LTX_DIT_SELFCHECK");
                         s_sc           = (e && atoi(e) > 0) ? atoi(e) : 0;
@@ -3155,14 +3201,18 @@ public:
                         // "first call" rather than to a step number that may not exist.
                         const char* es = getenv("LTX_DIT_SELFCHECK_STEP");
                         s_sc_step      = (es && *es) ? atoi(es) : -1;
+                        const char* em = getenv("LTX_DIT_SELFCHECK_MIN_INPUT_NUMEL");
+                        s_sc_min_numel = (em && *em) ? atoll(em) : 0;
                     }
                     static bool s_sc_done = false;
                     if (s_sc > 0 && !s_sc_done &&
-                        (s_sc_step < 0 || std::abs(step) == s_sc_step)) {
+                        (s_sc_step < 0 || std::abs(step) == s_sc_step) &&
+                        (s_sc_min_numel <= 0 || noised_input.numel() >= s_sc_min_numel)) {
                         s_sc_done = true;
-                        const uint64_t h0 = ltx_tensor_fnv1a(output_opt);
-                        LOG_INFO("[DIT_SELFCHECK] step=%d numel=%lld iters=%d ref_hash=%016llx",
-                                 step, (long long)output_opt.numel(), s_sc, (unsigned long long)h0);
+                        const uint64_t h0 = ltx_host_tensor_fnv1a(output_opt);
+                        LOG_INFO("[DIT_SELFCHECK] step=%d input_numel=%lld numel=%lld iters=%d ref_hash=%016llx",
+                                 step, (long long)noised_input.numel(), (long long)output_opt.numel(), s_sc,
+                                 (unsigned long long)h0);
                         // 2026-07-17: run ALL N iters (do NOT stop at the first mismatch) and report a
                         // HISTOGRAM of distinct hashes. WHY THIS MATTERS: the reference h0 is the
                         // output of the REAL forward in the sampler flow, while iters 1..N-1 are
@@ -3184,7 +3234,7 @@ public:
                                 LOG_ERROR("[DIT_SELFCHECK] iter=%d compute failed", it);
                                 break;
                             }
-                            const uint64_t h = ltx_tensor_fnv1a(o);
+                            const uint64_t h = ltx_host_tensor_fnv1a(o);
                             hist[h]++;
 #ifdef SD_USE_CUDA
                             // PER-FORWARD cuBLASLt path accounting. If these deltas are not
@@ -9543,6 +9593,19 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
         embeds.uncond.c_vector = latents.clip_vision_output;
     }
 
+    // Cross-job provenance only: text conditioning is an owning host tensor and is
+    // either freshly encoded or copied from avatar_cond_cache above.  Hashing it here
+    // neither launches CUDA work nor synchronizes the device, so it can distinguish a
+    // changing TE/cache handoff from a later DiT/offload divergence without perturbing
+    // GPU scheduling.  Empty is a valid (but separately visible) condition.
+    if (const char * e = getenv("LTX_TEXT_COND_HASH"); e != nullptr && atoi(e) != 0) {
+        const auto & c = embeds.cond.c_crossattn;
+        LOG_INFO("[LTX_TEXT_COND_HASH] source=%s numel=%lld hash=%016llx",
+                 use_text_cache ? "cache" : "encode",
+                 (long long) c.numel(),
+                 (unsigned long long) ltx_host_tensor_fnv1a(c));
+    }
+
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
@@ -10873,6 +10936,19 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     sd::Tensor<float> x_t   = latents.init_latent;
     sd::Tensor<float> noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
 
+    // Host-only provenance at the sampler boundary.  A fixed-input DiT replay and
+    // cached text conditioning are already stable; this distinguishes a bad seeded
+    // latent/noise state from a later GPU-side divergence without perturbing CUDA
+    // scheduling.  Empty is inert.
+    if (const char* e = std::getenv("LTX_DIT_INPUT_HASH"); e != nullptr && e[0] != '\0' && std::string(e) != "0") {
+        LOG_INFO("[LTX_DIT_INPUT_HASH] tensor=init_latent numel=%lld hash=%016llx",
+                 (long long)x_t.numel(),
+                 (unsigned long long)ltx_host_tensor_fnv1a(x_t));
+        LOG_INFO("[LTX_DIT_INPUT_HASH] tensor=initial_noise numel=%lld hash=%016llx",
+                 (long long)noise.numel(),
+                 (unsigned long long)ltx_host_tensor_fnv1a(noise));
+    }
+
     // LongCat-Avatar audio path: wav -> log-mel -> whisper encoder -> windowed
     // AudioProjModel inputs, set on the avatar runner so every DiT block's audio
     // cross-attn drives lip-sync from the speech. No-op (silent video) if absent.
@@ -11586,6 +11662,18 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     emit_stage_preview(1, final_latent);
 
     if (latent_refine_enabled) {
+        // Diagnostic-only base -> hires boundary provenance.  All three tensors
+        // below are host buffers, so this adds no CUDA operation or synchronization.
+        // It distinguishes a base-pass wobble from one born in the latent upscaler,
+        // deterministic host noise generation, or the high-resolution DiT refine.
+        const char* pre_hires_hash_env = std::getenv("LTX_DIT_PRE_HIRES_HASH");
+        const bool pre_hires_hash = pre_hires_hash_env != nullptr && pre_hires_hash_env[0] != '\0' &&
+                                    std::string(pre_hires_hash_env) != "0";
+        if (pre_hires_hash) {
+            LOG_INFO("[LTX_PRE_HIRES_HASH] tensor=base_final numel=%lld hash=%016llx",
+                     (long long)final_latent.numel(),
+                     (unsigned long long)ltx_host_tensor_fnv1a(final_latent));
+        }
         int64_t refine_total_start = ggml_time_ms();
         int64_t upscale_start             = ggml_time_ms();
         // The stage-1 DiT has finished before the latent upsampler runs. Keeping
@@ -11997,6 +12085,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         if (!refine_noise_positional) {
             noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
         }
+        if (pre_hires_hash) {
+            LOG_INFO("[LTX_PRE_HIRES_HASH] tensor=refine_input numel=%lld hash=%016llx",
+                     (long long)x_t.numel(),
+                     (unsigned long long)ltx_host_tensor_fnv1a(x_t));
+            LOG_INFO("[LTX_PRE_HIRES_HASH] tensor=refine_noise numel=%lld hash=%016llx",
+                     (long long)noise.numel(),
+                     (unsigned long long)ltx_host_tensor_fnv1a(noise));
+        }
         LOG_INFO("[LTX_PHASE] refine noise tensor setup took %.3fs", (ggml_time_ms() - refine_noise_start) * 1.0f / 1000);
 
         // FIX 3 (LTXAV_TWOSTAGE_FREE_UNUSED, default on): the stage-2 reference VAE encode is now
@@ -12263,12 +12359,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                              // strictly-gated ComfyUI two-pass workflow.
                                              !hires_continue_mode;
         if (!temporal_refine_enabled) {
-            final_latent = sample_refine_window(x_t,
-                                                std::move(noise),
-                                                hires_denoise_mask,
-                                                hires_video_positions,
-                                                latents.audio_positions,
-                                                hires_video_reference);
+            // Debug-only high-path fork: retain the real base pass, DiT-residency
+            // release, learned latent upscale, stage-two conditioning, and refine
+            // noise construction, but bypass the refine DiT itself.  Comparing
+            // final latent bytes across two runs tells us whether a high-resolution
+            // wobble was already present before the first refine forward.  This is
+            // deliberately value-gated and never a quality/release setting.
+            const char * skip_refine_env = std::getenv("LTX_HIRES_SKIP_DIT_REFINE");
+            const bool skip_dit_refine = skip_refine_env != nullptr && std::atoi(skip_refine_env) != 0;
+            if (skip_dit_refine) {
+                final_latent = x_t;
+                LOG_INFO("LTX_HIRES_SKIP_DIT_REFINE=1: bypassing refine DiT for boundary localization");
+            } else {
+                final_latent = sample_refine_window(x_t,
+                                                    std::move(noise),
+                                                    hires_denoise_mask,
+                                                    hires_video_positions,
+                                                    latents.audio_positions,
+                                                    hires_video_reference);
+            }
         } else {
             int temporal_window = 8;
             int temporal_overlap = 2;
