@@ -79,7 +79,7 @@ struct RefineCfg {
     std::string dit_w   = "/mnt/hdd/3d/avatar-shootout/ultrashape_goldens/weights_npy/dit";
     std::string vae_w   = "/mnt/hdd/3d/avatar-shootout/ultrashape_goldens/weights_npy/vae";
     std::string cnd_w   = "/mnt/hdd/3d/avatar-shootout/ultrashape_goldens/weights_npy/conditioner";
-    std::string gguf_dir= "/mnt/hdd/3d/avatar-shootout/ultrashape_goldens/gguf";       // has dit.gguf (F16)
+    std::string gguf_dir= "/mnt/hdd/3d/avatar-shootout/ultrashape_goldens/gguf_q8";    // dit.gguf = Q8_0 (default; −44% time/−40% VRAM, near-lossless). gguf/ = F16 fallback (--us-gguf)
     std::string meta    = "/mnt/hdd/3d/avatar-shootout/e2e_goldens/meta.npy";           // scale_factor, vox_res
 };
 
