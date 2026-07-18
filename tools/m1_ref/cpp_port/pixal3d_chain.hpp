@@ -12,6 +12,7 @@
 #include "geometry_e2e.hpp"
 #include "sparse_vae_pipeline.hpp"
 #include "svp_gpu.hpp"            // GPU-resident decode (Phase C #1): linear→cuBLAS, feats resident
+#include <cuda_profiler_api.h>    // PIXAL3D_NSYS_{M3B,TEX}: nsys/ncu --capture-range=cudaProfilerApi
 #include "remesh.hpp"            // A1: marching-tetrahedra manifold watertight remesh
 #include "qem.hpp"               // lap-17: feature-preserving QEM decimation of the dual-grid mesh
 #include "tex_grid_sample.hpp"   // lap-17: per-vertex PBR grid_sample for the remeshed mesh
@@ -344,7 +345,10 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
             Hf.upload_input_raw(gin, c?global1024:zg); Hf.upload_input_raw(pin, c?cond3b:zp);
             Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
         double t=now_s();
+        const bool nsys_m3b = std::getenv("PIXAL3D_NSYS_M3B") != nullptr;
+        if (nsys_m3b) cudaProfilerStart();
         std::vector<float> hr_raw = geo::flow_sampler(NEL, noise3, 1e-5f, in.shape.guidance, in.shape.rescale, in.shape.rescale_t, in.shape.lo, in.shape.hi, in.shape.steps, fwd, V?"m3b-dit":nullptr);
+        if (nsys_m3b) cudaProfilerStop();
         LOG("[6] M3b DiT (%.1fs)\n", now_s()-t);
         shape_denorm = hr_raw;
         geo::denorm_inplace(shape_denorm, in.norm_mean.data(), in.norm_std.data(), slatdit::INCH);
@@ -460,7 +464,10 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
                 Hf.upload_input_raw(gin, c?global1024:zg); Hf.upload_input_raw(pin, c?cond3b:zp);
                 Hf.compute(gff); std::vector<float> v(NEL); ggml_backend_tensor_get(vout,v.data(),0,NEL*4); return v; };
             double tt=now_s();
+            const bool nsys_tex = std::getenv("PIXAL3D_NSYS_TEX") != nullptr;
+            if (nsys_tex) cudaProfilerStart();
             tex_raw = geo::flow_sampler(NEL, tex_noise, 1e-5f, in.tex.guidance, in.tex.rescale, in.tex.rescale_t, in.tex.lo, in.tex.hi, in.tex.steps, fwd, V?"tex-dit":nullptr);
+            if (nsys_tex) cudaProfilerStop();
             if (V) { printf("[8] tex DiT (PROJ-mode, 5 global tokens + proj_linear, w=%s) (%.1fs)\n", pw, now_s()-tt); fflush(stdout); }
         } else {
         // CROSS-MODE tex DiT (TRELLIS-2 oracle's tex_slat_flow_model = image_attn_mode="cross"):
