@@ -3163,15 +3163,58 @@ public:
                         const uint64_t h0 = ltx_tensor_fnv1a(output_opt);
                         LOG_INFO("[DIT_SELFCHECK] step=%d numel=%lld iters=%d ref_hash=%016llx",
                                  step, (long long)output_opt.numel(), s_sc, (unsigned long long)h0);
+                        // 2026-07-17: run ALL N iters (do NOT stop at the first mismatch) and report a
+                        // HISTOGRAM of distinct hashes. WHY THIS MATTERS: the reference h0 is the
+                        // output of the REAL forward in the sampler flow, while iters 1..N-1 are
+                        // REPLAYED compute() calls. If iter 0 is merely SPECIAL (cold cuBLASLt algo
+                        // cache / cold anything) then the histogram is {h0:1, hX:N-1} — iters 1..N-1
+                        // mutually bit-identical — which is a COLD/WARM ARTIFACT, *NOT* a race, and the
+                        // old stop-at-first-mismatch loop could not tell the two apart. A real race
+                        // gives MANY distinct hashes. Read `distinct_excluding_ref` as the verdict.
                         int diverged_at = -1;
-                        for (int it = 1; it < s_sc && diverged_at < 0; it++) {
+                        std::map<uint64_t, int> hist;
+                        unsigned long long p_ok = 0, p_peek = 0, p_other = 0;
+#ifdef SD_USE_CUDA
+                        ggml_cuda_fp8_pathstats(&p_ok, &p_peek, &p_other);
+#endif
+                        for (int it = 1; it < s_sc; it++) {
+                            unsigned long long q_ok = 0, q_peek = 0, q_other = 0;
                             auto o = work_diffusion_model->compute(n_threads, diffusion_params);
                             if (o.empty()) {
                                 LOG_ERROR("[DIT_SELFCHECK] iter=%d compute failed", it);
                                 break;
                             }
                             const uint64_t h = ltx_tensor_fnv1a(o);
-                            if (h != h0) {
+                            hist[h]++;
+#ifdef SD_USE_CUDA
+                            // PER-FORWARD cuBLASLt path accounting. If these deltas are not
+                            // CONSTANT across iterations then the forward is taking a different
+                            // number of fast-path GEMMs each time => the divergence is a silent
+                            // PATH FLIP into different math, not a nondeterministic kernel.
+                            ggml_cuda_fp8_pathstats(&q_ok, &q_peek, &q_other);
+                            unsigned long long whash = 0, ahash = 0;
+                            ggml_cuda_fp8_inhash_read_reset(&whash, &ahash);
+                            LOG_INFO("[DIT_SELFCHECK] iter=%d hash=%016llx %s | fp8_gemms=%llu "
+                                     "bail_peek=%llu bail_other=%llu | whash=%016llx ahash=%016llx",
+                                     it, (unsigned long long)h, h == h0 ? "==ref" : "DIFF",
+                                     q_ok - p_ok, q_peek - p_peek, q_other - p_other,
+                                     whash, ahash);
+                            // FIRST divergent GEMM across ALL calls of the forward, vs the previous
+                            // forward. Reports which FIELD moved first, which localises the bug:
+                            // raw => upstream of that GEMM; qin/scale => the quant; out => the GEMM.
+                            {
+                                int dslot = -1, ncalls = 0;
+                                const char * dfield = "none";
+                                ggml_cuda_fp8_first_divergent_gemm(&dslot, &dfield, &ncalls);
+                                int gm = 0, gk = 0, gn = 0;
+                                const char * nm = dslot >= 0 ? ggml_cuda_fp8_idxname(dslot, &gm, &gk, &gn) : "-";
+                                LOG_INFO("[DIT_FIRSTDIV] iter=%d ncalls=%d first_divergent_gemm=%d "
+                                         "field=%s M=%d K=%d N=%d name=%s",
+                                         it, ncalls, dslot, dfield, gm, gk, gn, nm);
+                            }
+                            p_ok = q_ok; p_peek = q_peek; p_other = q_other;
+#endif
+                            if (h != h0 && diverged_at < 0) {
                                 diverged_at = it;
                                 // Report WHERE in the tensor, and by how much: a 1-ULP wobble and a
                                 // NaN/inf cascade are different bugs and must not be conflated.
@@ -3195,10 +3238,24 @@ public:
                                               (long long)first, (double)output_opt.data()[first],
                                               (long long)first, (double)o.data()[first]);
                                 }
-                            } else {
-                                LOG_INFO("[DIT_SELFCHECK] iter=%d hash=%016llx OK", it,
-                                         (unsigned long long)h);
                             }
+                        }
+                        // The verdict line. distinct_excluding_ref == 1 => every REPLAYED forward
+                        // agreed with every other one; any mismatch vs h0 is then a cold-vs-warm
+                        // artifact of the first call, not nondeterminism. > 1 => a genuine race.
+                        int ref_hits = hist.count(h0) ? hist[h0] : 0;
+                        LOG_INFO("[DIT_SELFCHECK] HISTOGRAM over %d replayed forwards: distinct=%d "
+                                 "(ref_hash seen %d/%d) => %s",
+                                 (int)(s_sc - 1), (int)hist.size(), ref_hits, (int)(s_sc - 1),
+                                 hist.size() == 1
+                                     ? (ref_hits > 0 ? "ALL REPLAYS == REF: deterministic"
+                                                     : "ALL REPLAYS AGREE but differ from REF: "
+                                                       "COLD/WARM ARTIFACT, *NOT* A RACE")
+                                     : "MULTIPLE DISTINCT REPLAY HASHES: GENUINE NONDETERMINISM");
+                        for (const auto & kv : hist) {
+                            LOG_INFO("[DIT_SELFCHECK]   hash=%016llx x%d%s",
+                                     (unsigned long long)kv.first, kv.second,
+                                     kv.first == h0 ? "  <- ref" : "");
                         }
                         if (diverged_at < 0) {
                             LOG_INFO("[DIT_SELFCHECK] %d/%d forwards bit-identical (NOT proof of "
@@ -10598,6 +10655,33 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (hires_continue_mode) {
         LOG_INFO("LTX_HIRES_CONTINUE: ver3 x0/SDEdit hires (partial LCM base denoised_output -> upscale -> fresh-noise Euler refine)");
     }
+
+    // LTXAV_TEMPORAL_REFINE (optional, OFF by default): the native temporal frame-upscaler
+    // (LTXAV_TEMPORAL_UPSCALE, applied post-sampling below) doubles the latent timeline but does NOT
+    // denoise its interpolated (in-between) frames, so they can ghost on motion. When this flag is on
+    // we run a light SDEdit clean-up pass on the temporal-upscaled VIDEO latent (audio untouched).
+    // That refine needs the DiT to still be resident, but the base/refine sample below frees the DiT
+    // params on the non-resident single-generate path. Detect the exact condition under which the
+    // temporal refine will want the DiT and, if so, skip those frees (we free the DiT ourselves right
+    // after the temporal refine). Mirrors the temporal-upscale gate at the post-sampling block: LTXAV
+    // request, not a continuation/chain. No-op (byte-identical) when either flag is unset.
+    const char* temporal_upscale_env_early = std::getenv("LTXAV_TEMPORAL_UPSCALE");
+    const bool  temporal_upscale_flag_early =
+        temporal_upscale_env_early != nullptr && temporal_upscale_env_early[0] != '\0' &&
+        std::string(temporal_upscale_env_early) != "0" && std::string(temporal_upscale_env_early) != "false";
+    const char* temporal_refine_env_early = std::getenv("LTXAV_TEMPORAL_REFINE");
+    const bool  temporal_refine_flag_early =
+        temporal_refine_env_early != nullptr && temporal_refine_env_early[0] != '\0' &&
+        std::string(temporal_refine_env_early) != "0" && std::string(temporal_refine_env_early) != "false";
+    const bool temporal_continuation_active_early =
+        final_latent_out != nullptr || sd_vid_gen_params->cont_latent != nullptr ||
+        sd_vid_gen_params->cont_refine_latent != nullptr || sd_vid_gen_params->cont_refine_latent_lo != nullptr ||
+        sd_vid_gen_params->end_cont_latent != nullptr;
+    const bool temporal_refine_keep_dit =
+        temporal_upscale_flag_early && temporal_refine_flag_early &&
+        sd_version_is_ltxav(sd_ctx->sd->version) && !temporal_continuation_active_early &&
+        sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident;
+
     GenerationRequest hires_request = request;
     if (latent_refine_enabled) {
         if (!sd_version_is_ltxav(sd_ctx->sd->version)) {
@@ -12502,7 +12586,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         // NEXT segment's forward read freed weights -> segfault ("peer closed cleanly"). 720p-flat
         // never hit it (no hires -> takes the correctly-gated :9292 branch), which is why only the
         // hires path died. Keep the DiT host-resident across the seam like the non-hires path.
-        if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
+        if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident &&
+            !temporal_refine_keep_dit) {
             sd_ctx->sd->diffusion_model->free_params_buffer();
         }
         if (final_latent.empty()) {
@@ -12514,7 +12599,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         LOG_INFO("%s completed, taking %.2fs",
                  same_res_refine_enabled ? "sampling(same-res refine)" : "sampling(latent upscale)",
                  (sampling_end - sampling_start) * 1.0f / 1000);
-    } else if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident) {
+    } else if (sd_ctx->sd->free_params_immediately && !sd_ctx->sd->keep_diffusion_model_resident &&
+               !temporal_refine_keep_dit) {
         sd_ctx->sd->diffusion_model->free_params_buffer();
     }
 
@@ -13021,8 +13107,124 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 }
                 LOG_INFO("LTX temporal upscale: latent T=%d -> %d",
                          (int)input_t, (int)final_latent.shape()[2]);
+
+                // LTXAV_TEMPORAL_REFINE (optional, OFF by default): the temporal upscaler only
+                // INTERPOLATES latent frames — it never denoises them — so the in-between frames can
+                // ghost on motion. Run a light SDEdit clean-up on the VIDEO-only temporal latent
+                // (final_latent is already video-only here: audio was decoded earlier into
+                // generated_audio and its packed channels were stripped above, so nothing audio-side
+                // is touched or re-timed). Reuses the same sd::sample() denoise machinery the hires
+                // refine uses. Renoise schedule is env-configurable so the ghosting/motion trade-off
+                // can be tuned on GPU without rebuilding.
+                if (temporal_refine_flag_early) {
+                    // LTXAV_TEMPORAL_REFINE_SIGMAS: comma-separated custom sigmas (must end at 0.0).
+                    // Unset => a light low-renoise 1-step default [0.421875, 0.0] (low so it cleans
+                    // interpolation blur WITHOUT re-synthesizing motion). steps = count - 1.
+                    std::vector<float> refine_sigmas;
+                    if (const char* s = std::getenv("LTXAV_TEMPORAL_REFINE_SIGMAS"); s != nullptr && s[0] != '\0') {
+                        std::string spec(s);
+                        size_t pos = 0;
+                        while (true) {
+                            size_t comma = spec.find(',', pos);
+                            std::string tok = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                            size_t b = tok.find_first_not_of(" \t\r\n");
+                            size_t e = tok.find_last_not_of(" \t\r\n");
+                            if (b != std::string::npos) {
+                                refine_sigmas.push_back((float)std::atof(tok.substr(b, e - b + 1).c_str()));
+                            }
+                            if (comma == std::string::npos) break;
+                            pos = comma + 1;
+                        }
+                    }
+                    if (refine_sigmas.empty()) {
+                        refine_sigmas = {0.421875f, 0.0f};
+                    }
+                    if (refine_sigmas.back() != 0.0f) {
+                        refine_sigmas.push_back(0.0f);  // schedule must terminate at sigma=0
+                    }
+                    // Optional explicit step-count override (LTXAV_TEMPORAL_REFINE_STEPS): re-space the
+                    // schedule between sigma0 and 0 into N linear steps when the caller wants more/less
+                    // work than the raw sigma list implies. Rarely needed — the sigma list alone drives
+                    // the step count — but exposed for GPU tuning parity with the hires knobs.
+                    if (const char* st = std::getenv("LTXAV_TEMPORAL_REFINE_STEPS"); st != nullptr && st[0] != '\0') {
+                        int n_steps = std::atoi(st);
+                        if (n_steps >= 1) {
+                            float s0 = refine_sigmas.front();
+                            refine_sigmas.assign((size_t)n_steps + 1, 0.0f);
+                            for (int i = 0; i <= n_steps; ++i) {
+                                refine_sigmas[i] = s0 * (1.0f - (float)i / (float)n_steps);
+                            }
+                        }
+                    }
+                    const int refine_steps = (int)refine_sigmas.size() - 1;
+                    if (refine_steps < 1) {
+                        LOG_WARN("LTX temporal refine: skipped (need >=1 step; parsed %zu sigmas)", refine_sigmas.size());
+                    } else if (sd_ctx->sd->diffusion_model == nullptr) {
+                        LOG_WARN("LTX temporal refine: skipped (no diffusion model resident)");
+                    } else {
+                        // The temporal upscaler doubled the frame count over the SAME real-time
+                        // duration, i.e. the latent's effective frame rate doubled. Passing 2x fps
+                        // with EMPTY video_positions lets sd::sample() build the default LTXAV RoPE
+                        // for the 2T-1 timeline at the correct temporal spacing (plain t2v/i2v also
+                        // sample with empty positions, so this matches the base path's convention).
+                        const float refine_frame_rate = 2.0f * (float)std::max(1, sd_vid_gen_params->fps);
+                        LOG_INFO("LTX temporal refine: renoise sigma0=%.6f steps=%d frame_rate=%.1f "
+                                 "(video-only latent [%d,%d,%d,%d]; audio untouched)",
+                                 refine_sigmas.front(), refine_steps, refine_frame_rate,
+                                 (int)final_latent.shape()[0], (int)final_latent.shape()[1],
+                                 (int)final_latent.shape()[2],
+                                 (int)(final_latent.dim() > 3 ? final_latent.shape()[3] : 1));
+                        sd::Tensor<float> refine_noise = sd::randn_like<float>(final_latent, sd_ctx->sd->rng);
+                        int64_t refine_t0 = ggml_time_ms();
+                        sd::Tensor<float> refined = sd_ctx->sd->sample(
+                            sd_ctx->sd->diffusion_model,
+                            true,  // inverse_noise_scaling: SDEdit renoise the clean latent to sigma0
+                            final_latent,
+                            std::move(refine_noise),
+                            embeds.cond,
+                            request.use_uncond ? embeds.uncond : SDCondition(),
+                            embeds.img_uncond,
+                            sd::Tensor<float>(),  // control_image
+                            0.f,                  // control_strength
+                            sd_vid_gen_params->sample_params.guidance,
+                            plan.eta,
+                            sd_vid_gen_params->sample_params.shifted_timestep,
+                            plan.sample_method,
+                            sd_ctx->sd->is_flow_denoiser(),
+                            plan.extra_sample_args,
+                            refine_sigmas,
+                            std::vector<sd::Tensor<float>>{},  // ref_latents
+                            false,                             // increase_ref_index
+                            sd::Tensor<float>(),               // denoise_mask (empty => refine ALL frames)
+                            sd::Tensor<float>(),               // vace_context
+                            0.f,                               // vace_strength
+                            0,                                 // audio_length: VIDEO-only refine
+                            refine_frame_rate,
+                            request.cache_params,
+                            sd::Tensor<float>(),  // video_positions (empty => default RoPE from frame_rate)
+                            sd::Tensor<float>(),  // audio_positions
+                            false,                // ltxav_audio_fixed
+                            sd::Tensor<float>()); // video_reference
+                        if (refined.empty()) {
+                            LOG_ERROR("LTX temporal refine: sample failed; keeping un-refined temporal latent");
+                        } else {
+                            final_latent = std::move(refined);
+                            LOG_INFO("LTX temporal refine: completed in %.2fs",
+                                     (ggml_time_ms() - refine_t0) * 1.0f / 1000);
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // Free the DiT params we deliberately kept resident across the temporal upscale for the
+    // temporal refine (mirrors the post-sample frees at the refine/no-refine branches, which were
+    // skipped when temporal_refine_keep_dit was set). Runs whether or not the refine actually fired
+    // (upscale may have failed), so the memory behavior matches the un-refined path exactly. No-op
+    // when the temporal-refine feature is inactive.
+    if (temporal_refine_keep_dit && sd_ctx->sd->diffusion_model != nullptr) {
+        sd_ctx->sd->diffusion_model->free_params_buffer();
     }
 
     // Return a second, video-only continuation state for the next segment's hires refine.

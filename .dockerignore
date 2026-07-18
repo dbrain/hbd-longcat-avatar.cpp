@@ -2,6 +2,8 @@ build*/
 docs/
 test/
 
+.git
+.git/
 .cache/
 *.swp
 models/

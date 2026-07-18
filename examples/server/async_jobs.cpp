@@ -969,6 +969,27 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // stage-4 = seg_<i>.webm), so a full 1->2->4 ladder is available. Byte-identical when off.
     const bool emit_segments = body.value("emit_segments", false);
     const bool emit_stages   = body.value("emit_stages", false);
+
+    // LTX native temporal frame-upscaler (LTXAV_TEMPORAL_UPSCALE): generate_video_ex turns the
+    // decoded video into 2T-1 frames but leaves the base fps request untouched, so the container
+    // must be muxed at 2x fps to keep real-time playback (frames double + fps double => duration
+    // unchanged; the ORIGINAL audio, already that duration, still lines up 1:1 and is NOT touched
+    // here). The upscaler only fires on a single-segment LTX chain — multi-segment chains are
+    // continuation-gated in the core and skip it, so their frame count is NOT doubled and their
+    // fps must stay put. No-op (byte-identical) when the flag is unset.
+    int effective_fps = gen_params.fps;
+    {
+        const char* tu     = getenv("LTXAV_TEMPORAL_UPSCALE");
+        const bool  tu_on  = tu != nullptr && tu[0] != '\0' &&
+                            std::string(tu) != "0" && std::string(tu) != "false";
+        if (tu_on && !wan_mode && n_segments == 1) {
+            effective_fps = std::max(1, gen_params.fps) * 2;
+            LOG_INFO("LTX temporal upscale active (single-segment LTX chain): muxing container at 2x fps "
+                     "(%d -> %d); audio passes through unchanged",
+                     gen_params.fps, effective_fps);
+        }
+    }
+
     std::unique_ptr<SegWebmWriter> seg_writer;
     if (!job_dir.empty()) {
         const char* bank   = getenv("LTX_BANK_SEG_WEBM");
@@ -977,7 +998,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         if (on) {
             seg_writer          = std::make_unique<SegWebmWriter>();
             seg_writer->dir     = job_dir;
-            seg_writer->fps     = gen_params.fps;
+            seg_writer->fps     = effective_fps;
             seg_writer->quality = output_compression;
             seg_writer->start();
             chain.on_segment      = &ltx_seg_webm_cb;
@@ -1008,7 +1029,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     if (!wan_mode && lc_format == "webm" && !job_dir.empty()) {
         const fs::path final_path = fs::path(job_dir) / ("final." + output_format);
         stream_writer             = std::make_unique<IncrementalWebmWriter>();
-        if (stream_writer->open(final_path.string(), gen_params.fps, output_compression)) {
+        if (stream_writer->open(final_path.string(), effective_fps, output_compression)) {
             streaming                  = true;
             chain.on_flush_frames      = &ltx_stream_flush_cb;
             chain.on_flush_frames_user = stream_writer.get();
@@ -1054,7 +1075,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
         }
         out_mime        = video_mime_type(output_format);
         out_frame_count = frame_count;
-        out_fps         = gen_params.fps;
+        out_fps         = effective_fps;
         return true;
     }
 
@@ -1067,7 +1088,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     // The final WebM encoder owns the chain's decoded pixels and releases each frame as
     // soon as VP8 has consumed it. The nulling contract makes this cleanup loop safe.
     out_video = create_video_from_sd_images_to_vector(output_format, frames, frame_count,
-                                                      gen_params.fps, output_compression, audio, true);
+                                                      effective_fps, output_compression, audio, true);
     for (int i = 0; i < frame_count; ++i) {
         free(frames[i].data);
     }
@@ -1111,7 +1132,7 @@ bool run_vid_chain_job(ServerRuntime& runtime,
 
     out_mime        = video_mime_type(output_format);
     out_frame_count = frame_count;
-    out_fps         = gen_params.fps;
+    out_fps         = effective_fps;
     return true;
 }
 

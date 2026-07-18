@@ -1322,15 +1322,21 @@ static bool encode_audio_to_opus(const sd_audio_t* audio,
 // control. Frames are fed strictly in order; the muxer replays the encoded packets (with each
 // packet's real keyframe flag) so the streaming and whole-array paths stay identical.
 //
-// The RGB→YUV conversion folds in a black-point lift (LTX's VAE floors dark scenes at ~5% grey,
-// so true black never reaches 0) plus ordered dither on the luma quantise to keep the lift from
-// introducing new contours. Tunable at runtime without a rebuild:
-//   LTXAV_VP9_CQ           constant-quality level 4..63 (default 32; lower = higher quality/bigger)
+// The RGB→YUV conversion folds in an optional black-point lift (LTX's VAE floors dark scenes at
+// ~5% grey, so true black never reaches 0). Tunable at runtime without a rebuild:
+//   LTXAV_VP9_CQ           constant-quality level 4..63 (default 20; lower = higher quality/bigger).
+//                          Default leans toward quality; ~6x larger than the old size-first CQ32 but
+//                          visually near-transparent. Bump toward 28-32 if size matters more.
 //   LTXAV_VP9_BLACK_POINT  STATIC input black point 0..0.3 mapped to 0 (default 0 = off). A fixed
 //                          linear lift clips shadow detail below the threshold, so it is off by
 //                          default; leave it 0 and prefer a content-adaptive black level upstream.
-//   LTXAV_VP9_CPU_USED     libvpx speed 0..8 (default 4; higher = faster/lower quality)
-//   LTXAV_VP9_KF_SECONDS   max keyframe interval in seconds for seeking (default 5)
+//   LTXAV_VP9_DITHER       ordered (Bayer 4x4) luma dither on the 10-bit quantise (default 0 = off).
+//                          10-bit has ample headroom vs 8-bit banding, so dither is unnecessary and
+//                          net-harmful: on flat regions it turns sub-LSB model noise into visible
+//                          ±1-LSB toggling that reads as temporal shimmer. Set 1 only if a black-
+//                          point lift is contouring a genuinely 8-bit-ish source.
+//   LTXAV_VP9_CPU_USED     libvpx good-quality speed 0..8 (default 4; higher = faster/lower quality)
+//   LTXAV_VP9_KF_SECONDS   max keyframe interval in seconds for seeking (default 2)
 static float vp9_env_float(const char* name, float defv, float lo, float hi) {
     const char* s = getenv(name);
     if (s == nullptr || *s == '\0') {
@@ -1355,22 +1361,26 @@ static float bayer4(int x, int y) {
     return (static_cast<float>(m[(y & 3) * 4 + (x & 3)]) + 0.5f) / 16.0f - 0.5f;
 }
 
-// RGB8 → 10-bit BT.709 limited-range YUV 4:2:0, with black-point lift + luma dither. Width/height
-// are assumed even (LTX dims are ×32-snapped). Planes are sized by the caller's vpx_image strides.
+// RGB8 → 10-bit BT.709 limited-range YUV 4:2:0, with optional black-point lift and optional luma
+// dither. Width/height are assumed even (LTX dims are ×32-snapped). Planes are sized by the caller's
+// vpx_image strides. `dither` gates the ordered Bayer term: off by default because at 10 bits it
+// converts sub-LSB per-frame model noise on flat regions into visible ±1-LSB temporal shimmer.
 static void rgb8_to_yuv420p10(const uint8_t* rgb, int channels, int w, int h, float black_point,
-                              uint16_t* yp, int ys, uint16_t* up, int us, uint16_t* vp, int vs) {
+                              bool dither, uint16_t* yp, int ys, uint16_t* up, int us, uint16_t* vp, int vs) {
     const float inv = black_point < 1.0f ? 1.0f / (1.0f - black_point) : 1.0f;
     auto lift       = [&](float c01) { return std::max(0.0f, (c01 - black_point) * inv); };
     auto clamp10    = [](float v) { return static_cast<uint16_t>(std::max(0.0f, std::min(1023.0f, v))); };
 
-    // Luma (per-pixel) with ordered dither.
+    // Luma (per-pixel). Dither adds the spatial Bayer offset; without it we round-to-nearest (+0.5)
+    // so the truncating cast does not floor-bias, keeping flat regions temporally stable.
     for (int y = 0; y < h; ++y) {
         uint16_t* yrow = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(yp) + static_cast<size_t>(y) * ys);
         for (int x = 0; x < w; ++x) {
             const uint8_t* px = rgb + (static_cast<size_t>(y) * w + x) * channels;
             const float r = lift(px[0] / 255.0f), g = lift(px[1] / 255.0f), b = lift(px[2] / 255.0f);
             const float yl = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-            yrow[x] = clamp10(64.0f + 876.0f * yl + bayer4(x, y));
+            const float d  = dither ? bayer4(x, y) : 0.5f;
+            yrow[x] = clamp10(64.0f + 876.0f * yl + d);
         }
     }
     // Chroma 4:2:0 — average each 2×2 block of lifted RGB, then convert (co-sited enough for video).
@@ -1434,9 +1444,10 @@ public:
             return false;
         }
         black_point_    = vp9_env_float("LTXAV_VP9_BLACK_POINT", 0.0f, 0.0f, 0.3f);
-        const int cq    = static_cast<int>(vp9_env_float("LTXAV_VP9_CQ", 32.0f, 4.0f, 63.0f));
+        dither_         = vp9_env_float("LTXAV_VP9_DITHER", 0.0f, 0.0f, 1.0f) >= 0.5f;
+        const int cq    = static_cast<int>(vp9_env_float("LTXAV_VP9_CQ", 20.0f, 4.0f, 63.0f));
         const int cpu   = static_cast<int>(vp9_env_float("LTXAV_VP9_CPU_USED", 4.0f, 0.0f, 8.0f));
-        const float kfs = vp9_env_float("LTXAV_VP9_KF_SECONDS", 5.0f, 0.0f, 100.0f);
+        const float kfs = vp9_env_float("LTXAV_VP9_KF_SECONDS", 2.0f, 0.0f, 100.0f);
 
         vpx_codec_iface_t* iface = vpx_codec_vp9_cx();
         vpx_codec_enc_cfg_t cfg{};
@@ -1492,7 +1503,7 @@ public:
         std::vector<uint8_t> scratch;
         int channels        = 3;
         const uint8_t* rgb  = sd_image_as_rgb(image, scratch, channels);
-        rgb8_to_yuv420p10(rgb, channels, width_, height_, black_point_,
+        rgb8_to_yuv420p10(rgb, channels, width_, height_, black_point_, dither_,
                           reinterpret_cast<uint16_t*>(img_.planes[VPX_PLANE_Y]), img_.stride[VPX_PLANE_Y],
                           reinterpret_cast<uint16_t*>(img_.planes[VPX_PLANE_U]), img_.stride[VPX_PLANE_U],
                           reinterpret_cast<uint16_t*>(img_.planes[VPX_PLANE_V]), img_.stride[VPX_PLANE_V]);
@@ -1540,6 +1551,7 @@ private:
     int             height_      = 0;
     int             fps_         = 24;
     float           black_point_ = 0.0f;
+    bool            dither_      = false;
     vpx_codec_pts_t pts_         = 0;
 };
 
