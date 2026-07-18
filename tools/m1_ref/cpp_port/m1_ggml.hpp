@@ -390,6 +390,14 @@ struct M1Harness {
 // (unset) keeps correctness-first fp32 accumulation. Judge by mesh IoU. Read once.
 static inline bool pix_fast_prec() { static bool v = (std::getenv("PIXAL3D_FAST") != nullptr); return v; }
 
+// SCOPED flash-attn for the geometry DiTs (M3b/tex-proj slat, tex-cross), independent of PIXAL3D_FAST.
+// PIXAL3D_FAST is GLOBALLY lossy (drops fp32 forcing on EVERY lin/FFN matmul -> occupancy flips). The
+// flash path in attention() is NOT: it casts only Q/K/V to f16 and keeps GGML_PREC_F32 accumulation
+// (same deal as the refine DiT's USR_DIT_FLASH). USR_GEO_FLASH lets the self-attn flash (fuses away the
+// [tk,tq,head] scores tensor = the geo-DiT VRAM peak + tiling stall) while lin/FFN stay fp32-forced.
+// image_to_rig sets =1 (prod default); =0 disables. Tests (no env) get the fp32 dense path.
+static inline bool geo_flash() { static int v = -1; if (v<0){ const char* e=std::getenv("USR_GEO_FLASH"); v = e ? (std::atoi(e)!=0) : 0; } return v!=0; }
+
 // Linear y = x @ W^T + b.  W ggml ne={in,out}, x ne0=in.  b ggml ne={out} or null.
 // Force fp32 accumulation (correctness-first): CUDA defaults to tf32 for fp32 matmul,
 // which adds ~1e-2 noise that flips a few occupancy-threshold voxels. PIXAL3D_FAST re-enables.
@@ -445,7 +453,8 @@ static inline ggml_tensor* attention(ggml_context* ctx, ggml_tensor* q, ggml_ten
         ggml_set_output(k); ggml_set_name(k,"cap_k");
         ggml_set_output(v); ggml_set_name(v,"cap_v"); } }
     const bool fast = pix_fast_prec();   // PIXAL3D_FAST: f16 tensor-core QK/AV (softmax stays fp32)
-    if (fast && fa_mask) {
+    // Flash on PIXAL3D_FAST OR the scoped USR_GEO_FLASH (fp32-accum flash without the global prec drop).
+    if ((fast || geo_flash()) && fa_mask) {
         // ---- FLASH-ATTENTION path ----
         int64_t nkvpad = fa_mask->ne[0], nqpad = fa_mask->ne[1];
         ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [d, tq, head]

@@ -162,6 +162,12 @@ int main(int argc, char** argv) {
     setenv("USR_DIT_FLASH",    "1",    0);
     setenv("USR_DECODE_FLASH", "1",    0);
     setenv("USR_MOE_CHUNK",    "8192", 0);
+    //  - USR_GEO_FLASH=1: flash the GEOMETRY DiTs' self-attn (M3b slat + tex-proj + tex-cross), same deal
+    //    as USR_DIT_FLASH but for the pixal3d geo stages. M3b 280->192s, tex 160->111s (-138s, 31%), peak
+    //    4.3GB. Effectively lossless: coarse.glb A/B adds only ~0.016% chamfer OVER the geo DiTs' own
+    //    ~0.08% run-to-run nondeterminism floor (f16 Q/K/V, GGML_PREC_F32 accum; lin/FFN/MoE stay fp32).
+    //    `USR_GEO_FLASH=0` restores the fp32 dense-tiled path.
+    setenv("USR_GEO_FLASH",    "1",    0);
     std::string model, image, out;
     std::string r1w     = "/mnt/hdd/3d/avatar-shootout/rig_audit/r1w_real";
     std::string qwen3_w = "/mnt/hdd/3d/avatar-shootout/rig_audit/inputs/qwen3_w";

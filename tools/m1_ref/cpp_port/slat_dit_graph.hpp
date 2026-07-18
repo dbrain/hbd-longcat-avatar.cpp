@@ -61,7 +61,7 @@ static inline ggml_tensor* build_slat_dit_forward(ggml_context* ctx, M1Harness& 
     // Flash-attn padding mask (PIXAL3D_FLASH + FAST): F16 [n_kv_pad, n_q_pad], -inf on the padded
     // keys, built ONCE and shared by all NB self-attn blocks (one ~47MB tensor, not NB copies).
     ggml_tensor* fa_mask = nullptr;
-    if (pix_fast_prec() && std::getenv("PIXAL3D_FLASH")) {
+    if ((pix_fast_prec() && std::getenv("PIXAL3D_FLASH")) || geo_flash()) {
         int64_t nkvpad = GGML_PAD((int64_t)N, 256), nqpad = GGML_PAD((int64_t)N, 256);
         std::vector<uint16_t> md((size_t)nkvpad * nqpad, 0);   // 0x0000 = keep
         uint16_t maskval = std::getenv("FLASH_ZM") ? 0x0000 : 0xFBFF;   // diag: all-zero mask

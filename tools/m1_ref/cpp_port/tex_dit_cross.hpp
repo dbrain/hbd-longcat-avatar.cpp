@@ -46,7 +46,7 @@ static inline ggml_tensor* build_tex_dit_cross_forward(ggml_context* ctx, M1Harn
 
     // Flash-attn padding mask for the self-attn (shared across blocks), as in slat_dit_graph.
     ggml_tensor* fa_mask = nullptr;
-    if (pix_fast_prec() && std::getenv("PIXAL3D_FLASH")) {
+    if ((pix_fast_prec() && std::getenv("PIXAL3D_FLASH")) || geo_flash()) {
         int64_t nkvpad = GGML_PAD((int64_t)N, 256), nqpad = GGML_PAD((int64_t)N, 256);
         std::vector<uint16_t> md((size_t)nkvpad * nqpad, 0);
         uint16_t maskval = 0xFBFF;   // -65504
