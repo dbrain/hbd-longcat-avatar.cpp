@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -79,6 +80,54 @@ static int ltx_banked_segment_count(const fs::path& dir) {
         ++k;
     }
     return k;
+}
+
+// Blackwell's F16 LTX text cross-attention is not repeatable for very short query
+// sequences.  The smallest demonstrated stable sequence is 128 latent tokens
+// (256x256/9f); accepting smaller clips would knowingly enqueue a generation that
+// can change for the same seed.  This is an API admission check, not a sampler
+// fallback: supported requests retain their model, VRAM use and timing unchanged.
+static bool ltx_validate_deterministic_token_floor(const ServerRuntime& runtime,
+                                                   const json& chain,
+                                                   int n_segments,
+                                                   std::string& error) {
+    SDGenerationParams params = *runtime.default_gen_params;
+    if (!params.from_json_str(chain.dump())) {
+        // The normal worker-side parser reports malformed requests with its existing
+        // error path; this check must not turn that into a misleading determinism error.
+        return true;
+    }
+
+    const int64_t spatial_tokens =
+        static_cast<int64_t>(params.get_resolved_width() / 32) * (params.get_resolved_height() / 32);
+    int default_frames = params.video_frames;
+    if (default_frames <= 0) {
+        return true;  // normal validation owns this malformed request
+    }
+
+    const json* segments = chain.contains("segments") && chain["segments"].is_array()
+                               ? &chain["segments"]
+                               : nullptr;
+    for (int seg = 0; seg < n_segments; ++seg) {
+        int frames = default_frames;
+        if (segments != nullptr && seg < static_cast<int>(segments->size()) && (*segments)[seg].is_object()) {
+            const auto it = (*segments)[seg].find("frames");
+            if (it != (*segments)[seg].end() && it->is_number_integer() && it->get<int>() > 0) {
+                frames = it->get<int>();
+            }
+        }
+        const int64_t latent_frames = (static_cast<int64_t>(frames) - 1) / 8 + 1;
+        const int64_t tokens        = spatial_tokens * latent_frames;
+        if (tokens < 128) {
+            error = "LTX deterministic-mode minimum is 128 latent tokens; segment " +
+                    std::to_string(seg + 1) + " resolves to " + std::to_string(tokens) +
+                    " (" + std::to_string(params.get_resolved_width()) + "x" +
+                    std::to_string(params.get_resolved_height()) + ", " +
+                    std::to_string(frames) + " frames). Increase resolution and/or length.";
+            return false;
+        }
+    }
+    return true;
 }
 
 // Keep only the newest LTX_JOB_KEEP job dirs (default 20), deleting older ones so the
@@ -227,6 +276,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             // byte-identical (no extra decode/encode, no stage partials).
             chain["emit_stages"] = body.value("emit_stages", false);
             std::string output_format = body.value("output_format", std::string("webm"));
+
+            std::string determinism_error;
+            if (!ltx_validate_deterministic_token_floor(*runtime, chain, n_segments, determinism_error)) {
+                res.status = 422;
+                res.set_content(json({{"error", "nondeterministic_request"},
+                                      {"message", determinism_error}}).dump(),
+                                "application/json");
+                return;
+            }
 
             // Register the job (assign an id) before touching the filesystem, so a fresh job's
             // artifact dir can be keyed by its own id.
