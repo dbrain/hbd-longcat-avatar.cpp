@@ -76,7 +76,7 @@ struct RefineCfg {
     uint64_t seed       = 0;
     bool    verbose     = true;
     // weight dirs (npy); the DiT F16 GGUF (dit.gguf) is loaded from gguf_dir via PIXAL3D_GGUF_DIR.
-    std::string dit_w   = "/home/dbrain/models/3d/refine/npy/dit";
+    std::string dit_w   = "/mnt/hdd/3d/avatar-shootout/ultrashape_goldens/weights_npy/dit";
     std::string vae_w   = "/home/dbrain/models/3d/refine/npy/vae";
     std::string cnd_w   = "/home/dbrain/models/3d/refine/npy/conditioner";
     std::string gguf_dir= "/home/dbrain/models/3d/refine/gguf";    // dit.gguf = Q8_0 (default; −44% time/−40% VRAM, near-lossless). gguf/ = F16 fallback (--us-gguf)
