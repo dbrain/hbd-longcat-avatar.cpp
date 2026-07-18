@@ -401,9 +401,14 @@ static inline bool geo_flash() { static int v = -1; if (v<0){ const char* e=std:
 // Linear y = x @ W^T + b.  W ggml ne={in,out}, x ne0=in.  b ggml ne={out} or null.
 // Force fp32 accumulation (correctness-first): CUDA defaults to tf32 for fp32 matmul,
 // which adds ~1e-2 noise that flips a few occupancy-threshold voxels. PIXAL3D_FAST re-enables.
+// SCOPED tensor-core (TF32) allow-flag for lin() only. When true, lin() does NOT force GGML_PREC_F32,
+// so its GEMMs take the fast TF32 tensor-core path (needs NVIDIA_TF32_OVERRIDE=1). Attention QKᵀ/AV
+// SGEMMs are unaffected (they force PREC_F32 in attention() independently). Used by the SS-DiT TF32 A/B
+// (USR_SS_TF32): SS is a hard occupancy THRESHOLD, so this must be mesh-validated, not assumed lossless.
+inline bool g_lin_allow_tc = false;
 static inline ggml_tensor* lin(ggml_context* ctx, ggml_tensor* W, ggml_tensor* b, ggml_tensor* x) {
     ggml_tensor* y = ggml_mul_mat(ctx, W, x);  // [out, ...]
-    if (!pix_fast_prec()) ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    if (!pix_fast_prec() && !g_lin_allow_tc) ggml_mul_mat_set_prec(y, GGML_PREC_F32);
     if (b) y = ggml_add(ctx, y, b);            // b broadcasts over ne0
     return y;
 }

@@ -219,9 +219,15 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
             int64_t t_ne[4]={1,1,1,1};                    ggml_tensor* tin=Hf.input("t",1,t_ne);
             int64_t g_ne[4]={1024,5,1,1};                 ggml_tensor* gin=Hf.input("global",2,g_ne);
             int64_t p_ne[4]={1024,ssdit::SEQ,1,1};        ggml_tensor* pin=Hf.input("proj",2,p_ne);
+            // SS-DiT TF32 A/B: allow tensor-core GEMMs in this graph's lin()s (FFN/proj; attention stays
+            // fp32). SS is a THRESHOLD stage — validate the coarse mesh, do not assume lossless.
+            const bool ss_tf32 = std::getenv("USR_SS_TF32") != nullptr;
+            const bool tc_save = g_lin_allow_tc;
+            if (ss_tf32) g_lin_allow_tc = true;
             ggml_tensor* vout = ssdit::build_ss_dit_forward(cf, Hf, xin, tin, gin, pin);
             ggml_set_output(vout);
             ggml_cgraph* gff = new_graph(cf, 32768); ggml_build_forward_expand(gff, vout);
+            g_lin_allow_tc = tc_save;
             Hf.alloc_and_upload(gff);
             std::vector<float> zg(global512.size(),0.f), zp(proj_ss.size(),0.f);
             auto fwd=[&](const std::vector<float>& xx, float ts, bool c){
