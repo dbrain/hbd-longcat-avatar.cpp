@@ -21,6 +21,7 @@
 #endif
 #include "../../sparse_spike/npy.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -320,10 +321,34 @@ struct M1Harness {
             sched = ggml_backend_sched_new(bks, nullptr, 2, 32768, false, false);
             if (!ggml_backend_sched_reserve(sched, gf))
                 throw std::runtime_error("sched reserve failed");
-        } else {
+        }
+        if (std::getenv("PIXAL3D_GRAPH_DUMP")) {   // DIAG: largest graph tensors (pre-alloc, survives OOM)
+            int nn = ggml_graph_n_nodes(gf);
+            std::vector<std::pair<size_t,std::string>> ts;
+            size_t total = 0;
+            for (int i = 0; i < nn; i++) {
+                ggml_tensor* t = ggml_graph_node(gf, i);
+                size_t nb = ggml_nbytes(t);
+                total += nb;
+                ts.push_back({nb, std::string(ggml_get_name(t)) + " [" + std::to_string(t->ne[0]) + "," +
+                    std::to_string(t->ne[1]) + "," + std::to_string(t->ne[2]) + "] " + ggml_type_name(t->type) +
+                    " " + ggml_op_name(t->op)});
+            }
+            std::sort(ts.begin(), ts.end(), [](auto&a, auto&b){ return a.first > b.first; });
+            fprintf(stderr, "[GRAPH] %d nodes, sum(node outputs)=%.1f MiB. Top 15:\n", nn, total/1048576.0);
+            for (int i = 0; i < 15 && i < (int)ts.size(); i++)
+                fprintf(stderr, "  %7.1f MiB  %s\n", ts[i].first/1048576.0, ts[i].second.c_str());
+        }
+        if (galloc == nullptr && !use_sched && !nogalloc_buf) {
             galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             if (!ggml_gallocr_alloc_graph(galloc, gf))
                 throw std::runtime_error("gallocr_alloc_graph failed");
+        }
+        if (std::getenv("PIXAL3D_VRAM_LOG")) {                        // DIAG: report VRAM split
+            size_t wb = wbuf ? ggml_backend_buffer_get_size(wbuf) : 0;
+            size_t cb = galloc ? ggml_gallocr_get_buffer_size(galloc, 0) : 0;
+            fprintf(stderr, "[VRAM] weights=%.1f MiB  compute_graph=%.1f MiB  nodes=%d\n",
+                    wb/1048576.0, cb/1048576.0, ggml_graph_n_nodes(gf));
         }
         for (auto& r : raw_uploads) {
             if (r.second.size() * 4 != ggml_nbytes(r.first))

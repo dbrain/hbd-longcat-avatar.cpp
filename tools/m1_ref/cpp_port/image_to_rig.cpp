@@ -152,6 +152,16 @@ int main(int argc, char** argv) {
     // voxels). overwrite=0 so a caller CAN relax it (export NVIDIA_TF32_OVERRIDE=1) for the perf A/B --
     // pixal3d.cpp:67's sibling comment already says "perf phase relaxes". Default stays 0.
     setenv("NVIDIA_TF32_OVERRIDE", "0", 0);
+    // UltraShape refine perf defaults (overwrite=0 -> caller's env always wins = escape hatch):
+    //  - USR_DIT_FLASH / USR_DECODE_FLASH: flash the refine DiT (self+cross attn) and the VAE decode.
+    //    ~2x faster refine (172s vs 334s @ N=8192), sub-voxel (0.61 MC cells vs the fp32 path) and it IS
+    //    the reference regime (bf16+flash_attn). `USR_DIT_FLASH=0` / `USR_DECODE_FLASH=0` restore fp32.
+    //  - USR_MOE_CHUNK=8192: token-tile the MoE ONLY above 8192 latents (untiled at N<=8192 -> no cost),
+    //    so N=16384/32768 fit the 3060's 12GB (the mul_mat_id pool OOMs untiled). Lossless. `=0` disables.
+    // Library defaults stay OFF so the fp32 parity tests (which call the DiT/decode directly) are unchanged.
+    setenv("USR_DIT_FLASH",    "1",    0);
+    setenv("USR_DECODE_FLASH", "1",    0);
+    setenv("USR_MOE_CHUNK",    "8192", 0);
     std::string model, image, out;
     std::string r1w     = "/mnt/hdd/3d/avatar-shootout/rig_audit/r1w_real";
     std::string qwen3_w = "/mnt/hdd/3d/avatar-shootout/rig_audit/inputs/qwen3_w";

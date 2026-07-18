@@ -148,7 +148,7 @@ static inline ggml_tensor* us_dit_self_attn(M1Harness& H, ggml_context* ctx, con
     // site passes no mask. Flash removes the scores tensor entirely (VRAM) and fuses the softmax (time).
     // fp32 accumulation kept; only K/V storage is f16. Null mask safe (S=8192 is x256). V is power-of-2
     // pre-scaled (exact in f16) against the documented low-t V-overflow NaN (m1_ggml.hpp attention()).
-    static const bool dit_flash = getenv("USR_DIT_FLASH") != nullptr;
+    static const bool dit_flash = []{ const char* e=std::getenv("USR_DIT_FLASH"); return e ? std::atoi(e)!=0 : false; }();  // image_to_rig sets =1 (prod default); =0 disables. Tests (no env) get fp32.
     if (dit_flash) {
         const int64_t d = qh->ne[0], nhd = qh->ne[1], tq = qh->ne[2];
         ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, qh, 0, 2, 1, 3));   // [d, S, head] F32
@@ -182,6 +182,28 @@ static inline ggml_tensor* us_dit_cross_attn(M1Harness& H, ggml_context* ctx, co
     ggml_tensor* vh = vs_take_head_slice(ctx, kv, hd, nh, 2, 1);
     qh = us_dit_rms(ctx, qh, H.weight(p + "q_norm.weight"), cfg.qk_eps);
     kh = us_dit_rms(ctx, kh, H.weight(p + "k_norm.weight"), cfg.qk_eps);
+
+    // USR_DIT_FLASH: flash the cross-attention too. Its dense [Tc, S, heads] f32 scores (Tc=cond tokens)
+    // are the DiT's VRAM peak at high N (query-tiled by the GLOBAL PIXAL3D_ATTN_CAP_MB, which other
+    // stages -- geo DiT/VAE/decode -- want HIGH for speed). Flashing here removes them WITHOUT touching
+    // that global cap. KV = Tc cond tokens (small); q = S DiT tokens. fp32 accum; f16 K/V storage.
+    static const bool dit_flash = []{ const char* e=std::getenv("USR_DIT_FLASH"); return e ? std::atoi(e)!=0 : false; }();  // image_to_rig sets =1 (prod default); =0 disables. Tests (no env) get fp32.
+    if (dit_flash) {
+        const int64_t d = qh->ne[0], nhd = qh->ne[1], tq = qh->ne[2];
+        ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, qh, 0, 2, 1, 3));   // [d, S, head]
+        ggml_tensor* kf = ggml_cont(ctx, ggml_permute(ctx, kh, 0, 2, 1, 3));   // [d, Tc, head]
+        ggml_tensor* vf = ggml_cont(ctx, ggml_permute(ctx, vh, 0, 2, 1, 3));
+        const float vsc = 1.0f / 64.0f;
+        vf = ggml_scale(ctx, vf, vsc);
+        kf = ggml_cast(ctx, kf, GGML_TYPE_F16);
+        vf = ggml_cast(ctx, vf, GGML_TYPE_F16);
+        ggml_tensor* r = ggml_flash_attn_ext(ctx, qf, kf, vf, nullptr, cfg.attn_scale(), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);
+        ggml_tensor* o = ggml_cont_2d(ctx, r, d * nhd, tq);
+        o = ggml_scale(ctx, o, 1.0f / vsc);
+        return lin(ctx, H.weight(p + "out_proj.weight"), H.weight(p + "out_proj.bias"), o);
+    }
+
     ggml_tensor* o = attention(ctx, qh, kh, vh, cfg.attn_scale());// [2048, S]
     return lin(ctx, H.weight(p + "out_proj.weight"), H.weight(p + "out_proj.bias"), o);
 }
@@ -213,22 +235,44 @@ static inline ggml_tensor* us_moe(M1Harness& H, ggml_context* ctx, const UsDitCf
     ggml_tensor* sel_flat = ggml_reshape_1d(ctx, sel, K * N);                 // gather bias per (k,token)
     // (ggml_mul_mat_set_prec asserts OP==MUL_MAT, so it can't force fp32 on mul_mat_id; CPU is fp32
     //  regardless, and the parity-critical gate matmul above already forces PREC_F32.)
-    ggml_tensor* a0 = ggml_mul_mat_id(ctx, W0, hb, sel);                      // [F, K, N]
-    ggml_tensor* gb0 = ggml_reshape_3d(ctx, ggml_get_rows(ctx, B0, sel_flat), F, K, N);  // bias [F,K,N]
-    a0 = ggml_add(ctx, a0, gb0);
-    a0 = gelu_erf_(ctx, a0);
-    ggml_tensor* a2 = ggml_mul_mat_id(ctx, W2, a0, sel);                      // [D, K, N]
-    ggml_tensor* gb2 = ggml_reshape_3d(ctx, ggml_get_rows(ctx, B2, sel_flat), D, K, N);  // bias [D,K,N]
-    a2 = ggml_add(ctx, a2, gb2);
-    a2 = ggml_mul(ctx, a2, w);                                                // weight by gate scores
-    // sum over the K selected experts (ne1)
-    ggml_tensor* acc = ggml_cont(ctx, ggml_view_2d(ctx, a2, D, N, a2->nb[2], 0));
-    for (int j = 1; j < K; ++j)
-        acc = ggml_add(ctx, acc, ggml_cont(ctx, ggml_view_2d(ctx, a2, D, N, a2->nb[2], (size_t)j * a2->nb[1])));
-    // --- shared expert (always applied) ---
-    ggml_tensor* shared = us_ffn(H, ctx, p + "shared_experts.net.0.proj.weight", p + "shared_experts.net.0.proj.bias",
-                                 p + "shared_experts.net.2.weight", p + "shared_experts.net.2.bias", h);
-    return ggml_add(ctx, acc, shared);
+
+    // USR_MOE_CHUNK: process the expert path in token tiles. The expert intermediate a0 [F=8192,K,N]
+    // and its bias gather gb0 [F,K,N] are the DiT's dominant N-scaling tensors (~2x F*K*N*4 bytes =
+    // ~4.3 GB at N=16384) AND the mul_mat_id runtime pool scales with them -> the N>=16384 OOM.
+    // Tiling caps them at F*K*chunk; the result is bit-identical (per-token routing, no cross-token
+    // op). Default 0 = untiled (exact legacy path). The gate (sel/w) stays full — it's tiny [E/K,N].
+    static const int64_t moe_chunk = []{ const char* e=std::getenv("USR_MOE_CHUNK"); return e?atoll(e):(int64_t)0; }();  // image_to_rig sets =8192 (prod default: untiles at N<=8192, tiles above to fit); =0 disables
+    auto expert_path = [&](ggml_tensor* hb_c, ggml_tensor* sel_c, ggml_tensor* w_c, ggml_tensor* h_c,
+                           int64_t n) -> ggml_tensor* {
+        ggml_tensor* sf = ggml_reshape_1d(ctx, sel_c, K * n);
+        ggml_tensor* a0 = ggml_mul_mat_id(ctx, W0, hb_c, sel_c);                              // [F,K,n]
+        ggml_tensor* gb0 = ggml_reshape_3d(ctx, ggml_get_rows(ctx, B0, sf), F, K, n);         // [F,K,n]
+        a0 = gelu_erf_(ctx, ggml_add(ctx, a0, gb0));
+        ggml_tensor* a2 = ggml_mul_mat_id(ctx, W2, a0, sel_c);                                // [D,K,n]
+        ggml_tensor* gb2 = ggml_reshape_3d(ctx, ggml_get_rows(ctx, B2, sf), D, K, n);         // [D,K,n]
+        a2 = ggml_mul(ctx, ggml_add(ctx, a2, gb2), w_c);
+        ggml_tensor* acc = ggml_cont(ctx, ggml_view_2d(ctx, a2, D, n, a2->nb[2], 0));
+        for (int j = 1; j < K; ++j)
+            acc = ggml_add(ctx, acc, ggml_cont(ctx, ggml_view_2d(ctx, a2, D, n, a2->nb[2], (size_t)j*a2->nb[1])));
+        ggml_tensor* shared = us_ffn(H, ctx, p+"shared_experts.net.0.proj.weight", p+"shared_experts.net.0.proj.bias",
+                                     p+"shared_experts.net.2.weight", p+"shared_experts.net.2.bias", h_c);
+        return ggml_add(ctx, acc, shared);                                                   // [D,n]
+    };
+    if (moe_chunk <= 0 || moe_chunk >= N) {
+        return expert_path(hb, sel, w, h, N);
+    }
+    // tiled: slice tokens [t0, t0+tc) off hb/sel/w/h, run experts, concat back along ne1.
+    ggml_tensor* out = nullptr;
+    for (int64_t t0 = 0; t0 < N; t0 += moe_chunk) {
+        int64_t tc = std::min<int64_t>(moe_chunk, N - t0);
+        ggml_tensor* hb_c = ggml_cont(ctx, ggml_view_3d(ctx, hb, D, 1, tc, hb->nb[1], hb->nb[2], (size_t)t0*hb->nb[2]));
+        ggml_tensor* sel_c = ggml_cont(ctx, ggml_view_2d(ctx, sel, K, tc, sel->nb[1], (size_t)t0*sel->nb[1]));
+        ggml_tensor* w_c  = ggml_cont(ctx, ggml_view_3d(ctx, w,  1, K, tc, w->nb[1], w->nb[2], (size_t)t0*w->nb[2]));
+        ggml_tensor* h_c  = ggml_cont(ctx, ggml_view_2d(ctx, h,  D, tc, h->nb[1], (size_t)t0*h->nb[1]));
+        ggml_tensor* part = expert_path(hb_c, sel_c, w_c, h_c, tc);                           // [D,tc]
+        out = out ? ggml_concat(ctx, out, part, 1) : part;
+    }
+    return out;
 }
 
 // One DiT block.  x [2048, S].  skip = popped earlier-block output (or null).  cond [1024, Tc].
@@ -237,6 +281,10 @@ static inline ggml_tensor* us_dit_block(M1Harness& H, ggml_context* ctx, const U
                                         ggml_tensor* rcos, ggml_tensor* rsin) {
     const std::string p = "blocks." + std::to_string(layer) + ".";
     if (cfg.has_skip(layer)) {
+        // USR_F16_SKIP stores the U-Net skip stack in F16 (~half the held VRAM; the skips are the
+        // biggest N-scaling live tensors after flash removes the attn scores). Cast back to F32 here
+        // so the concat/skip_linear run at full precision. Near-lossless (residual features); A/B meshes.
+        if (skip->type != GGML_TYPE_F32) skip = ggml_cast(ctx, skip, GGML_TYPE_F32);
         ggml_tensor* cat = ggml_concat(ctx, skip, x, 0);   // [4096, S] = cat([skip, x], -1)
         x = lin(ctx, H.weight(p + "skip_linear.weight"), H.weight(p + "skip_linear.bias"), cat);  // [2048,S]
         x = layernorm(ctx, x, H.weight(p + "skip_norm.weight"), H.weight(p + "skip_norm.bias"), cfg.ln_eps);
@@ -272,13 +320,15 @@ static inline ggml_tensor* us_refine_dit(M1Harness& H, ggml_context* ctx, const 
     ggml_tensor* xe = lin(ctx, H.weight("x_embedder.weight"), H.weight("x_embedder.bias"), x_lat);  // [2048, K]
     if (dump) { ggml_set_output(c); ggml_set_name(c, "dbg_c"); ggml_set_output(xe); ggml_set_name(xe, "dbg_xe"); }
     ggml_tensor* x = ggml_concat(ctx, c, xe, 1);                                            // [2048, 1+K]
+    static const bool f16skip = std::getenv("USR_F16_SKIP") != nullptr;
     std::vector<ggml_tensor*> skip_stack;
     for (int layer = 0; layer < cfg.depth; ++layer) {
         ggml_tensor* skip = nullptr;
         if (cfg.has_skip(layer)) { skip = skip_stack.back(); skip_stack.pop_back(); }
         x = us_dit_block(H, ctx, cfg, layer, x, cond, skip, rcos, rsin);
         if (dump) { char nm[24]; snprintf(nm, sizeof(nm), "dbg_blk%d", layer); ggml_set_output(x); ggml_set_name(x, nm); }
-        if (cfg.pushes(layer)) skip_stack.push_back(x);
+        // Push the skip in F16 (USR_F16_SKIP) — halves the held U-Net skip VRAM at high N.
+        if (cfg.pushes(layer)) skip_stack.push_back(f16skip ? ggml_cast(ctx, x, GGML_TYPE_F16) : x);
     }
     // final_layer: norm_final -> drop time token -> linear(2048->64)
     x = layernorm(ctx, x, H.weight("final_layer.norm_final.weight"), H.weight("final_layer.norm_final.bias"), cfg.ln_eps);

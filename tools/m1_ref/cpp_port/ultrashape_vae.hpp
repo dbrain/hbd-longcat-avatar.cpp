@@ -132,7 +132,7 @@ static inline ggml_tensor* us_cross_attn(M1Harness& H, ggml_context* ctx, const 
     // of PIXAL3D_FAST: fp32 ACCUMULATION is kept (set_prec F32), so the only precision change is F16
     // STORAGE of K/V -- occupancy is a threshold, so this is A/B'd as MESHES, not timed. The stale
     // m1_ggml.hpp comment "cross-attn's 5 kv tokens don't benefit" predates this 8192-kv call site.
-    static const bool decode_flash = getenv("USR_DECODE_FLASH") != nullptr;
+    static const bool decode_flash = []{ const char* e=std::getenv("USR_DECODE_FLASH"); return e ? std::atoi(e)!=0 : false; }();  // image_to_rig sets =1 (prod default); =0 disables. Tests (no env) get fp32.
     if (decode_flash) {
         const int64_t d = qh->ne[0], nhd = qh->ne[1], tq = qh->ne[2], tk = k->ne[2];
         ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, qh, 0, 2, 1, 3));   // [d, tq, head] F32
