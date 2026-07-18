@@ -24,6 +24,7 @@
 #include "torch_randn.hpp"
 #include "sparse_vae.hpp"                 // svae::Mesh
 #include "m1_ggml.hpp"                    // M1Harness, new_graph
+#include <cuda_profiler_api.h>            // cudaProfilerStart/Stop (PIXAL3D_NSYS_REFINE capture range)
 #include "../../sparse_spike/npy.hpp"     // npy_load (meta.npy: scale_factor, vox_res)
 #include <cstdio>
 #include <cstdlib>
@@ -193,6 +194,8 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
 
         std::vector<float> pred_c((size_t)N*ich), pred_u((size_t)N*ich);
         double t_s0 = now_s();
+        const bool prof = std::getenv("PIXAL3D_NSYS_REFINE") != nullptr;  // nsys/ncu --capture-range=cudaProfilerApi
+        if (prof) cudaProfilerStart();
         for (int i = 0; i < steps; i++) {
             float tnorm = sigmas[i];   // t/num_train == sigmas[i] (shift=1)
             std::vector<float> ts = us_timesteps_embed(tnorm, hidden);
@@ -218,6 +221,7 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
                 printf("  [US] step %2d/%d t=%.4f |x|=%.4f\n", i, steps, tnorm, m);
             }
         }
+        if (prof) { cudaProfilerStop(); }
         if (cfg.verbose)
             printf("  [US] DiT sampling: %d steps x2(CFG) over N=%d = %.1fs (%.2fs/step)\n",
                    steps, N, now_s()-t_s0, (now_s()-t_s0)/std::max(1,steps));
