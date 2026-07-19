@@ -4030,6 +4030,7 @@ const char* scheduler_to_str[] = {
     "bong_tangent",
     "ltx2",
     "linear_quadratic",
+    "beta",
 };
 
 const char* sd_scheduler_name(enum scheduler_t scheduler) {

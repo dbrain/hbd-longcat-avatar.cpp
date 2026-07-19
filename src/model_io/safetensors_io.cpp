@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "binary_io.h"
@@ -11,6 +13,7 @@
 #include "json.hpp"
 
 static constexpr size_t ST_HEADER_SIZE_LEN = 8;
+namespace fs = std::filesystem;
 
 static void set_error(std::string* error, const std::string& message) {
     if (error != nullptr) {
@@ -41,7 +44,7 @@ bool is_safetensors_file(const std::string& file_path) {
     }
 
     size_t header_size_ = model_io::read_u64(header_size_buf);
-    if (header_size_ >= file_size_ || header_size_ <= 2) {
+    if (header_size_ > file_size_ - ST_HEADER_SIZE_LEN || header_size_ <= 2) {
         return false;
     }
 
@@ -112,10 +115,11 @@ bool read_safetensors_file(const std::string& file_path,
     }
 
     size_t header_size_ = model_io::read_u64(header_size_buf);
-    if (header_size_ >= file_size_) {
+    if (header_size_ > file_size_ - ST_HEADER_SIZE_LEN) {
         set_error(error, "invalid safetensor file '" + file_path + "'");
         return false;
     }
+    const size_t data_start = ST_HEADER_SIZE_LEN + header_size_;
 
     // read header
     std::vector<char> header_buf;
@@ -154,6 +158,11 @@ bool read_safetensors_file(const std::string& file_path,
 
         size_t begin = tensor_info["data_offsets"][0].get<size_t>();
         size_t end   = tensor_info["data_offsets"][1].get<size_t>();
+
+        if (begin > end || end > file_size_ - data_start) {
+            set_error(error, "data offsets out of bounds for tensor '" + name + "'");
+            return false;
+        }
 
         ggml_type type = safetensors_dtype_to_ggml_type(dtype);
         if (type == GGML_TYPE_COUNT) {
@@ -218,6 +227,60 @@ bool read_safetensors_file(const std::string& file_path,
         tensor_storages.push_back(tensor_storage);
 
         // LOG_DEBUG("%s %s", tensor_storage.to_string().c_str(), dtype.c_str());
+    }
+
+    return true;
+}
+
+static std::string resolve_index_shard_path(const std::string& index_path, const std::string& shard_path) {
+    fs::path shard_fs_path(shard_path);
+    if (shard_fs_path.is_absolute()) {
+        return shard_fs_path.lexically_normal().string();
+    }
+    return (fs::path(index_path).parent_path() / shard_fs_path).lexically_normal().string();
+}
+
+bool read_safetensors_index_file(const std::string& file_path,
+                                 std::vector<std::string>& shard_paths,
+                                 std::string* error) {
+    shard_paths.clear();
+
+    std::ifstream file(file_path);
+    if (!file.is_open()) {
+        set_error(error, "failed to open '" + file_path + "'");
+        return false;
+    }
+
+    nlohmann::json index;
+    try {
+        index = nlohmann::json::parse(file);
+    } catch (const std::exception&) {
+        set_error(error, "parsing safetensors index failed: '" + file_path + "'");
+        return false;
+    }
+
+    if (!index.is_object() || !index.contains("weight_map") || !index["weight_map"].is_object()) {
+        set_error(error, "invalid safetensors index '" + file_path + "'");
+        return false;
+    }
+
+    std::unordered_set<std::string> seen_shard_paths;
+    for (const auto& item : index["weight_map"].items()) {
+        if (!item.value().is_string()) {
+            set_error(error, "invalid shard path for tensor '" + item.key() + "'");
+            return false;
+        }
+
+        std::string shard_path = resolve_index_shard_path(file_path,
+                                                          item.value().get<std::string>());
+        if (seen_shard_paths.insert(shard_path).second) {
+            shard_paths.push_back(std::move(shard_path));
+        }
+    }
+
+    if (shard_paths.empty()) {
+        set_error(error, "safetensors index has no tensors: '" + file_path + "'");
+        return false;
     }
 
     return true;
