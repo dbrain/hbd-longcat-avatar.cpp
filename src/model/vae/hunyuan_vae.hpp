@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "model/vae/wan_vae.hpp"
-#include "model_manager.h"
 
 namespace Hunyuan {
     constexpr int HUNYUAN_VIDEO_VAE_GRAPH_SIZE                  = 65536;
@@ -740,12 +739,12 @@ namespace Hunyuan {
 
     public:
         HunyuanVideoVAERunner(ggml_backend_t backend,
-                              const String2TensorStorage& tensor_storage_map,
-                              const std::string& prefix,
-                              bool decode_only,
-                              SDVersion version,
-                              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-            : VAE(version, backend, prefix, weight_manager),
+                              ggml_backend_t params_backend,
+                              const String2TensorStorage& tensor_storage_map = {},
+                              const std::string& prefix                      = "",
+                              bool decode_only                               = false,
+                              SDVersion version                              = VERSION_HUNYUAN_VIDEO)
+            : VAE(version, backend, params_backend),
               decode_only(decode_only ||
                           tensor_storage_map.find(prefix + ".encoder.conv_in.conv.weight") == tensor_storage_map.end()) {
             if (!this->decode_only) {
@@ -758,11 +757,11 @@ namespace Hunyuan {
             return "hunyuan_video_vae";
         }
 
-        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
+        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) override {
             if (!decode_only) {
-                encoder.get_param_tensors(tensors, weight_prefix + ".encoder");
+                encoder.get_param_tensors(tensors, prefix + ".encoder");
             }
-            decoder.get_param_tensors(tensors, weight_prefix + ".decoder");
+            decoder.get_param_tensors(tensors, prefix + ".decoder");
         }
 
         int get_encoder_output_channels(int input_channels) override {

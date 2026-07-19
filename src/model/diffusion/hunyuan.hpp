@@ -7,7 +7,6 @@
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/mmdit.hpp"
 #include "model/diffusion/wan.hpp"
-#include "model_manager.h"
 
 namespace Hunyuan {
     constexpr int HUNYUAN_VIDEO_GRAPH_SIZE = 65536;
@@ -544,11 +543,11 @@ namespace Hunyuan {
         SDVersion version;
 
         HunyuanVideoRunner(ggml_backend_t backend,
-                           const String2TensorStorage& tensor_storage_map      = {},
-                           const std::string prefix                            = "",
-                           SDVersion version                                   = VERSION_HUNYUAN_VIDEO,
-                           std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-            : DiffusionModelRunner(backend, prefix, weight_manager),
+                           ggml_backend_t params_backend,
+                           const String2TensorStorage& tensor_storage_map = {},
+                           const std::string prefix                       = "",
+                           SDVersion version                              = VERSION_HUNYUAN_VIDEO)
+            : DiffusionModelRunner(backend, params_backend, prefix),
               config(HunyuanVideoConfig::detect_from_weights(tensor_storage_map, prefix)),
               version(version) {
             LOG_INFO("HunyuanVideo blocks: %d double, %d single", config.depth, config.depth_single_blocks);

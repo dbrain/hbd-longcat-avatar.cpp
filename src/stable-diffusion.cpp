@@ -28,6 +28,7 @@
 #include "model/diffusion/flux.hpp"
 #include "model/diffusion/hidream_o1.hpp"
 #include "model/diffusion/ideogram4.hpp"
+#include "model/diffusion/krea2.hpp"
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/ltxv.hpp"
 #include "model/diffusion/mmdit.hpp"
@@ -99,6 +100,11 @@ const char* model_version_to_str[] = {
     "PiD",
     "Ideogram 4",
     "Wan 2.2 S2V (LiveAvatar)",
+    "Krea2",
+    "Boogu Image",
+    "MiniT2I",
+    "HunyuanVideo 1.5",
+    "LingBot Video",
 };
 
 const char* sampling_methods_str[] = {
@@ -700,6 +706,17 @@ public:
                                                                                params_backend_for(SDBackendModule::DIFFUSION),
                                                                                tensor_storage_map,
                                                                                "model.diffusion_model");
+            } else if (sd_version_is_krea2(version)) {
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 params_backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 true);
+                diffusion_model  = std::make_shared<Krea2::Krea2Runner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                       params_backend_for(SDBackendModule::DIFFUSION),
+                                                                       tensor_storage_map,
+                                                                       "model.diffusion_model");
             } else if (sd_version_is_flux(version)) {
                 bool is_chroma = false;
                 for (auto pair : tensor_storage_map) {
@@ -1012,7 +1029,8 @@ public:
                 } else if (sd_version_is_wan(version) ||
                            sd_version_is_qwen_image(version) ||
                            sd_version_is_anima(version) ||
-                           sd_version_is_longcat_avatar(version)) {
+                           sd_version_is_longcat_avatar(version) ||
+                           sd_version_is_krea2(version)) {
                     return std::make_shared<WAN::WanVAERunner>(backend_for(SDBackendModule::VAE),
                                                                params_backend_for(SDBackendModule::VAE),
                                                                tensor_storage_map,
@@ -1599,7 +1617,8 @@ public:
                 } else if (sd_version_is_flux(version) ||
                            sd_version_is_longcat(version) ||
                            sd_version_is_lens(version) ||
-                           sd_version_is_ltxav(version)) {
+                           sd_version_is_ltxav(version) ||
+                           sd_version_is_krea2(version)) {
                     pred_type = FLUX_FLOW_PRED;
 
                     default_flow_shift = 1.0f;  // TODO: validate
@@ -1615,6 +1634,8 @@ public:
                         default_flow_shift = 1.83f;
                     } else if (sd_version_is_ltxav(version)) {
                         default_flow_shift = 2.37f;
+                    } else if (sd_version_is_krea2(version)) {
+                        default_flow_shift = 1.15f;
                     }
                 } else if (sd_version_is_flux2(version)) {
                     pred_type = FLUX2_FLOW_PRED;

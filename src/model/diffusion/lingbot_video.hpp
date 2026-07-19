@@ -611,14 +611,11 @@ namespace LingBotVideo {
         std::vector<float> pe_vec;
 
         LingBotVideoRunner(ggml_backend_t backend,
-                           const String2TensorStorage& tensor_storage_map      = {},
-                           const std::string prefix                            = "",
-                           std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
-                           const char* model_args                              = nullptr)
-            : DiffusionModelRunner(backend, prefix, weight_manager),
+                           ggml_backend_t params_backend,
+                           const String2TensorStorage& tensor_storage_map = {},
+                           const std::string prefix                       = "")
+            : DiffusionModelRunner(backend, params_backend, prefix),
               config(LingBotVideoConfig::detect_from_weights(tensor_storage_map, prefix)) {
-            SD_UNUSED(model_args);
-
             lingbot_video = LingBotVideoModel(config);
             lingbot_video.init(params_ctx, tensor_storage_map, prefix);
         }
@@ -674,7 +671,7 @@ namespace LingBotVideo {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,

@@ -473,10 +473,10 @@ namespace MiniT2I {
         int64_t cached_head_dim                     = -1;
 
         MiniT2IRunner(ggml_backend_t backend,
-                      const String2TensorStorage& tensor_storage_map      = {},
-                      const std::string prefix                            = "",
-                      std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-            : DiffusionModelRunner(backend, prefix, weight_manager),
+                      ggml_backend_t params_backend,
+                      const String2TensorStorage& tensor_storage_map = {},
+                      const std::string prefix                       = "")
+            : DiffusionModelRunner(backend, params_backend, prefix),
               config(MiniT2IConfig::detect_from_weights(tensor_storage_map, this->prefix)),
               model(config) {
             model.init(params_ctx, tensor_storage_map, this->prefix);
@@ -589,7 +589,7 @@ namespace MiniT2I {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, mask);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,

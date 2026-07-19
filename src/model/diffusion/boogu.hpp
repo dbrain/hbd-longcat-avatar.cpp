@@ -754,11 +754,10 @@ namespace Boogu {
         std::vector<float> pe_vec;
 
         BooguImageRunner(ggml_backend_t backend,
-                         const String2TensorStorage& tensor_storage_map      = {},
-                         const std::string prefix                            = "",
-                         SDVersion version                                   = VERSION_BOOGU_IMAGE,
-                         std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-            : DiffusionModelRunner(backend, prefix, weight_manager),
+                         ggml_backend_t params_backend,
+                         const String2TensorStorage& tensor_storage_map = {},
+                         const std::string prefix                       = "")
+            : DiffusionModelRunner(backend, params_backend, prefix),
               config(BooguConfig::detect_from_weights(tensor_storage_map, prefix)) {
             boogu = BooguImageModel(config);
             boogu.init(params_ctx, tensor_storage_map, prefix);
@@ -815,7 +814,7 @@ namespace Boogu {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context, ref_latents);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false), x.dim());
         }
 
         sd::Tensor<float> compute(int n_threads,
@@ -827,7 +826,7 @@ namespace Boogu {
                            *diffusion_params.x,
                            *diffusion_params.timesteps,
                            tensor_or_empty(diffusion_params.context),
-                           diffusion_params.ref_latents && diffusion_params.ref_image_params.pass_to_dit ? *diffusion_params.ref_latents : empty_ref_latents);
+                           diffusion_params.ref_latents ? *diffusion_params.ref_latents : empty_ref_latents);
         }
     };
 }  // namespace Boogu

@@ -50,6 +50,11 @@ enum SDVersion {
     VERSION_PID,
     VERSION_IDEOGRAM4,
     VERSION_WAN_S2V,
+    VERSION_KREA2,
+    VERSION_BOOGU_IMAGE,
+    VERSION_MINIT2I,
+    VERSION_HUNYUAN_VIDEO,
+    VERSION_LINGBOT_VIDEO,
     VERSION_COUNT,
 };
 
@@ -188,6 +193,27 @@ static inline bool sd_version_is_ideogram4(SDVersion version) {
     return false;
 }
 
+// upstream-adopted models (ported onto the fork runner convention)
+static inline bool sd_version_is_krea2(SDVersion version) {
+    return version == VERSION_KREA2;
+}
+
+static inline bool sd_version_is_boogu_image(SDVersion version) {
+    return version == VERSION_BOOGU_IMAGE;
+}
+
+static inline bool sd_version_is_minit2i(SDVersion version) {
+    return version == VERSION_MINIT2I;
+}
+
+static inline bool sd_version_is_hunyuan_video(SDVersion version) {
+    return version == VERSION_HUNYUAN_VIDEO;
+}
+
+static inline bool sd_version_is_lingbot_video(SDVersion version) {
+    return version == VERSION_LINGBOT_VIDEO;
+}
+
 static inline bool sd_version_uses_flux2_vae(SDVersion version) {
     if (sd_version_is_flux2(version) || sd_version_is_ernie_image(version) || sd_version_is_lens(version) || sd_version_is_ideogram4(version)) {
         return true;
@@ -221,7 +247,12 @@ static inline bool sd_version_is_dit(SDVersion version) {
         sd_version_is_longcat(version) ||
         sd_version_is_longcat_avatar(version) ||
         sd_version_is_pid(version) ||
-        sd_version_is_ideogram4(version)) {
+        sd_version_is_ideogram4(version) ||
+        sd_version_is_krea2(version) ||
+        sd_version_is_boogu_image(version) ||
+        sd_version_is_minit2i(version) ||
+        sd_version_is_hunyuan_video(version) ||
+        sd_version_is_lingbot_video(version)) {
         return true;
     }
     return false;
