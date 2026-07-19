@@ -37,6 +37,7 @@
 // LTXV::modulate is resolved before the global overload becomes visible (avoids ADL ambiguity).
 #include "model/diffusion/hunyuan.hpp"
 #include "model/diffusion/lingbot_video.hpp"
+#include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/model.hpp"
 #include "model/diffusion/pid.hpp"
 #include "model/diffusion/qwen_image.hpp"
@@ -713,6 +714,14 @@ public:
                                                                                params_backend_for(SDBackendModule::DIFFUSION),
                                                                                tensor_storage_map,
                                                                                "model.diffusion_model");
+            } else if (sd_version_is_minit2i(version)) {
+                cond_stage_model = std::make_shared<MiniT2IConditioner>(backend_for(SDBackendModule::TE),
+                                                                        params_backend_for(SDBackendModule::TE),
+                                                                        tensor_storage_map);
+                diffusion_model  = std::make_shared<MiniT2I::MiniT2IRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                           params_backend_for(SDBackendModule::DIFFUSION),
+                                                                           tensor_storage_map,
+                                                                           "model.diffusion_model.model.net");
             } else if (sd_version_is_krea2(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  params_backend_for(SDBackendModule::TE),
@@ -1118,7 +1127,7 @@ public:
 
             bool vae_mmap = module_can_mmap(SDBackendModule::VAE);
 
-            if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1) {
+            if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1 || sd_version_is_minit2i(version)) {
                 LOG_INFO("using FakeVAE");
                 first_stage_model = std::make_shared<FakeVAE>(version,
                                                               backend_for(SDBackendModule::VAE),
@@ -1704,6 +1713,8 @@ public:
                     }
                 } else if (sd_version_is_flux2(version)) {
                     pred_type = FLUX2_FLOW_PRED;
+                } else if (sd_version_is_minit2i(version)) {
+                    pred_type = MINIT2I_FLOW_PRED;
                 } else {
                     pred_type = EPS_PRED;
                 }
@@ -1739,6 +1750,11 @@ public:
                 case FLUX2_FLOW_PRED: {
                     LOG_INFO("running in Flux2 FLOW mode");
                     denoiser = std::make_shared<Flux2FlowDenoiser>();
+                    break;
+                }
+                case MINIT2I_FLOW_PRED: {
+                    LOG_INFO("running in MiniT2I FLOW mode");
+                    denoiser = std::make_shared<MiniT2IFlowDenoiser>();
                     break;
                 }
                 default: {
@@ -3191,6 +3207,9 @@ public:
                         condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0],
                         condition.c_vector.empty() ? nullptr : &condition.c_vector,
                         hunyuan_timestep_r_tensor.empty() ? nullptr : &hunyuan_timestep_r_tensor};
+                } else if (sd_version_is_minit2i(version)) {
+                    diffusion_params.extra = MiniT2IDiffusionExtra{
+                        condition.c_vector.empty() ? nullptr : &condition.c_vector};
                 } else {
                     diffusion_params.extra = std::monostate{};
                 }
@@ -3607,6 +3626,8 @@ public:
                 latent_channel = 3;
             } else if (sd_version_is_pid(version)) {
                 latent_channel = 3;
+            } else if (sd_version_is_minit2i(version)) {
+                latent_channel = 3;
             } else if (sd_version_uses_flux2_vae(version)) {
                 latent_channel = 128;
             } else {
@@ -3769,7 +3790,7 @@ public:
             LOG_INFO("[F8_DBG] pre-VAE latent: numel=%zu  max|latent|=%.6g  mean|latent|=%.6g",
                      n, mx, n ? sum / (float)n : 0.f);
         }
-        if (sd_version_is_pid(version)) {
+        if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
         }
         // Free resident diffusion params before VAE allocates its compute buffer.
@@ -4034,6 +4055,7 @@ const char* prediction_to_str[] = {
     "sd3_flow",
     "flux_flow",
     "flux2_flow",
+    "minit2i_flow",
 };
 
 const char* sd_prediction_name(enum prediction_t prediction) {
@@ -7041,6 +7063,9 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     if (request->use_uncond || request->use_high_noise_uncond) {
         if (sd_version_is_ideogram4(sd_ctx->sd->version)) {
             uncond.c_vector = sd::Tensor<float>::from_vector({1.0f});
+        } else if (sd_version_is_minit2i(sd_ctx->sd->version)) {
+            uncond.c_crossattn = cond.c_crossattn;
+            uncond.c_vector    = sd::Tensor<float>::zeros_like(cond.c_vector);
         } else {
             bool zero_out_masked = false;
             if (sd_version_is_sdxl(sd_ctx->sd->version) &&

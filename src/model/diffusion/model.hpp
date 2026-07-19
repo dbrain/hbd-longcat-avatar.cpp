@@ -81,6 +81,10 @@ struct HunyuanVideoDiffusionExtra {
     const sd::Tensor<float>* timestep_r = nullptr;
 };
 
+struct MiniT2IDiffusionExtra {
+    const sd::Tensor<float>* mask = nullptr;
+};
+
 using DiffusionExtraParams = std::variant<std::monostate,
                                           UNetDiffusionExtra,
                                           SkipLayerDiffusionExtra,
@@ -90,7 +94,8 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           HiDreamO1DiffusionExtra,
                                           LTXAVDiffusionExtra,
                                           LongCatAvatarDiffusionExtra,
-                                          HunyuanVideoDiffusionExtra>;
+                                          HunyuanVideoDiffusionExtra,
+                                          MiniT2IDiffusionExtra>;
 
 struct DiffusionParams {
     const sd::Tensor<float>* x                        = nullptr;
