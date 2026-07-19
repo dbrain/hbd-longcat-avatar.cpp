@@ -38,6 +38,7 @@
 #include "moge_cam.hpp"                // native MoGe camera (FOV) estimation (--moge)
 #include "ultrashape_refine.hpp"       // native UltraShape refine (clean/watertight densify, --refine)
 #include "quad_retopo.hpp"             // rung 2: quadwild-bimdf quad retopology (--quad, shell-out)
+#include "im_retopo.hpp"               // rung 2 (default): Instant Meshes retopo (clean organic flow)
 #include "glb_writer.hpp"              // glb::write_glb (intermediate stage artifacts)
 #include "glb_reader.hpp"              // glb::read_glb (--from-refined resume)
 #include "../../sparse_spike/npy.hpp"
@@ -265,6 +266,10 @@ int main(int argc, char** argv) {
     // bringing up; --quadwild-repo overrides the built-repo path. See quad_retopo.hpp.
     bool do_quad = false;
     qr::QuadCfg qcfg;
+    // --retopo <im|quadwild>: which retopology tool the --quad stage uses. Default IM (Instant Meshes) —
+    // clean organic quad flow + watertight; quadwild tears organic flat regions (validated on a robot).
+    std::string retopo_tool = "im";
+    imretopo::ImCfg imcfg;
     // Staging: --stage-dir writes every intermediate GLB (coarse/refined/decimated) as a named artifact
     // for the eye-test page AND the .bin caches to resume. --from-refined <dir> skips geometry+refine
     // (loads refined.glb + the cached PBR volume). --from-geo (below) skips only the geometry diffusion.
@@ -356,6 +361,9 @@ int main(int argc, char** argv) {
         else if (a == "--tex-dit-w" && i+1 < argc) in.tex_flow_w = argv[++i];
         else if (a == "--quad") do_quad = true;
         else if (a == "--no-quad") do_quad = false;
+        else if (a == "--retopo" && i+1 < argc) retopo_tool = argv[++i];   // im (default) | quadwild
+        else if (a == "--im-adaptivity" && i+1 < argc) imcfg.adaptivity = (float)std::atof(argv[++i]);
+        else if (a == "--im-verts" && i+1 < argc) imcfg.target_verts = std::atoi(argv[++i]);
         else if (a == "--quadwild-repo" && i+1 < argc) qcfg.repo = argv[++i];
         else if (a == "--no-clean") clean = false;
         else if (a == "--mc-stride" && i+1 < argc) mc_stride = std::atoi(argv[++i]);
@@ -515,12 +523,14 @@ int main(int argc, char** argv) {
     // the fan-triangulation). The quad mesh IS the clean retopo, so the bake must not re-decimate it.
     if (do_quad) {
         double t_q = pix::now_s();
-        printf("  [1a2/4] quad retopo: quadwild on %d v / %d f (refined)...\n", mesh.N, mesh.F);
+        const bool use_im = (retopo_tool != "quadwild");
+        printf("  [1a2/4] retopo (%s) on %d v / %d f (refined)...\n", use_im ? "instant-meshes" : "quadwild", mesh.N, mesh.F);
         svae::Mesh quad;
-        if (!qr::quad_retopo(mesh, qcfg, quad)) { printf("FAIL: quad retopo\n"); return 1; }
+        bool ok = use_im ? imretopo::im_retopo(mesh, imcfg, quad) : qr::quad_retopo(mesh, qcfg, quad);
+        if (!ok) { printf("FAIL: retopo (%s)\n", use_im ? "im" : "quadwild"); return 1; }
         mesh = std::move(quad);
-        decimate = 0;   // quad mesh is the intended final topology — keep it through the bake
-        printf("  [1a2/4] quad retopo: -> %d v / %d f  (%.1fs)\n", mesh.N, mesh.F, pix::now_s() - t_q);
+        decimate = 0;   // retopo mesh is the intended final topology — keep it through the bake
+        printf("  [1a2/4] retopo: -> %d v / %d f  (%.1fs)\n", mesh.N, mesh.F, pix::now_s() - t_q);
         if (!stage_dir.empty()) {
             mkdir(stage_dir.c_str(), 0755);
             if (glb::write_glb((stage_dir + "/quad.glb").c_str(), mesh.verts, mesh.faces))
