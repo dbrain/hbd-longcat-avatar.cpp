@@ -39,6 +39,12 @@
 #include "ultrashape_refine.hpp"       // native UltraShape refine (clean/watertight densify, --refine)
 #include "quad_retopo.hpp"             // rung 2: quadwild-bimdf quad retopology (--quad, shell-out)
 #include "im_retopo.hpp"               // rung 2 (default): Instant Meshes retopo (clean organic flow)
+#include "normal_bake.hpp"             // tangent-space normal map: dense high-poly detail -> retopo low-poly
+#ifdef PIXAL3D_PACK
+#include "glb_packed.hpp"              // packed writer (KTX2+meshopt) — the only textured writer that carries a normal map
+#endif
+#include <thread>
+#include <algorithm>
 #include "glb_writer.hpp"              // glb::write_glb (intermediate stage artifacts)
 #include "glb_reader.hpp"              // glb::read_glb (--from-refined resume)
 #include "../../sparse_spike/npy.hpp"
@@ -517,6 +523,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Dense high-poly kept for the normal-map bake (retopo/decimation drops fine relief — anime faces,
+    // fingers — which the retopo mesh then re-acquires as a tangent-space normal map baked from here).
+    std::vector<float>   nrm_src_verts;
+    std::vector<int64_t> nrm_src_faces;
+
     // ---------- [1a2/4] quad retopology (rung 2, quadwild-bimdf shell-out; CPU) ----------
     // Runs on the refined mesh (fresh-refine or --from-refined). Produces clean field-aligned quads,
     // TRIANGULATED into `mesh` for the tri-only bake/rig/glb path (the field-aligned edge flow survives
@@ -528,6 +539,7 @@ int main(int argc, char** argv) {
         svae::Mesh quad;
         bool ok = use_im ? imretopo::im_retopo(mesh, imcfg, quad) : qr::quad_retopo(mesh, qcfg, quad);
         if (!ok) { printf("FAIL: retopo (%s)\n", use_im ? "im" : "quadwild"); return 1; }
+        nrm_src_verts = mesh.verts; nrm_src_faces = mesh.faces;   // dense pre-retopo mesh -> normal-map source
         mesh = std::move(quad);
         decimate = 0;   // retopo mesh is the intended final topology — keep it through the bake
         printf("  [1a2/4] retopo: -> %d v / %d f  (%.1fs)\n", mesh.N, mesh.F, pix::now_s() - t_q);
@@ -543,6 +555,7 @@ int main(int argc, char** argv) {
         double t_pr = pix::now_s();
         printf("  [1b/4] part-retopo: P3-SAM segmenting %d faces (native CPU; slow, GPU port pending)...\n", mesh.F);
         auto fids = p3sam::segment_mesh(mesh.verts.data(), mesh.N, mesh.faces.data(), mesh.F, p3sam_w, in.seed);
+        nrm_src_verts = mesh.verts; nrm_src_faces = mesh.faces;   // dense pre-decimate mesh -> normal-map source
         glb::Mesh gm; gm.verts = mesh.verts; gm.faces = mesh.faces;
         glb::Mesh dec; std::vector<ppd::PartReport> rep;
         if (!ppd::per_part_decimate(gm, fids, obj_decimate, dec, rep)) { printf("FAIL: part-retopo\n"); return 1; }
@@ -664,15 +677,43 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---------- [1c/4] normal-map bake (the standard retopo detail lift) ----------
+    // The retopo/decimate mesh is intentionally low-poly and drops fine relief (Instant Meshes resamples
+    // anime faces to a blank egg; decimation coarsens fingers). Bake a TANGENT-SPACE normal map from the
+    // kept dense high-poly onto the low-poly UV atlas so it renders WITH the dense surface detail. Skipped
+    // when no retopo ran (nrm_src empty) or the bake has no UVs/normals. RETOPO_NO_NORMAL=1 forces off.
+    std::vector<uint8_t> nmap;
+    if (!nrm_src_verts.empty() && bt.normals.size() == bt.verts.size() && !bt.uvs.empty()
+        && !std::getenv("RETOPO_NO_NORMAL")) {
+        double t_nm = pix::now_s();
+        std::vector<uint32_t> nf(bt.faces.begin(), bt.faces.end());
+        nmap = nrmbake::bake_normal_map(bt.verts, bt.normals, bt.uvs, nf, nrm_src_verts, nrm_src_faces, bt.tw, bt.th);
+        printf("  [1c/4] normal map baked from dense high-poly (%zu v / %zu f) -> %dx%d  (%.1fs)\n",
+               nrm_src_verts.size()/3, nrm_src_faces.size()/3, bt.tw, bt.th, pix::now_s() - t_nm);
+    }
+
     // --no-rig: write the TEXTURED-only GLB (skip the 159s auto-rig) for fast mesh/texture A/B.
     if (no_rig) {
         std::vector<uint32_t> f32(bt.faces.begin(), bt.faces.end());
         bool have_nrm = bt.normals.size() == bt.verts.size();
-        bool okt = glb::write_glb_textured(out.c_str(), bt.verts, have_nrm ? bt.normals : std::vector<float>(),
-                                           bt.uvs, f32, bt.base_color, bt.metal_rough, bt.tw, bt.th);
-        if (!okt) { printf("FAIL: write_glb_textured\n"); return 1; }
-        printf("==== DONE (--no-rig, textured only) -> %s  (verts=%zu faces=%zu, %.1fs total) ====\n",
-               out.c_str(), bt.verts.size()/3, bt.faces.size()/3, pix::now_s() - t_geo);
+        bool okt;
+#ifdef PIXAL3D_PACK
+        if (!nmap.empty()) {
+            // packed writer carries the normal map (KTX2 + meshopt; model-viewer renders it).
+            int threads = (int)std::max(1u, std::thread::hardware_concurrency());
+            okt = glb::write_glb_textured_packed(out.c_str(), bt.verts, have_nrm ? bt.normals : std::vector<float>(),
+                                                 bt.uvs, f32, bt.base_color, bt.metal_rough, bt.tw, bt.th,
+                                                 /*uastc*/true, 192, threads, &nmap);
+        } else
+#endif
+        {
+            if (!nmap.empty()) printf("  NOTE: normal map baked but binary lacks PIXAL3D_PACK; writing uncompressed WITHOUT normal map\n");
+            okt = glb::write_glb_textured(out.c_str(), bt.verts, have_nrm ? bt.normals : std::vector<float>(),
+                                          bt.uvs, f32, bt.base_color, bt.metal_rough, bt.tw, bt.th);
+        }
+        if (!okt) { printf("FAIL: write textured GLB\n"); return 1; }
+        printf("==== DONE (--no-rig, textured only%s) -> %s  (verts=%zu faces=%zu, %.1fs total) ====\n",
+               nmap.empty() ? "" : " + normal map", out.c_str(), bt.verts.size()/3, bt.faces.size()/3, pix::now_s() - t_geo);
         return 0;
     }
 
