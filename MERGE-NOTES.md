@@ -3,6 +3,53 @@
 Worktree: `../longcat-avatar-mergewt`, branch `upstream-merge-2026-07-19`
 Strategy: **MERGE** (owner confirmed). ggml first, sd.cpp second.
 
+## ✅✅ TRACK A COMPLETE — all 5 upstream models ported + BUILD CLEAN (sm86;120 + SA3), 0 errors
+Each committed separately on `upstream-merge-2026-07-19`; sd-cli + sd-server link.
+- krea2         — 7502d89
+- boogu         — ca0d922
+- **hunyuan video 1.5 — f14b2b2** (needed shared-primitive adoptions: mmdit PatchEmbed 2D/3D
+  superset, Flux::LastLayer patch_volume, Rope::gen_hunyuan_video_pe; byt5 conditioner; video
+  frame conversions. The .hpp had MORE drift than the spec claimed — blocks did NOT port clean.)
+- **lingbot_video — d279a0c** (3 missing fork primitives ported: DiT::patchify_3d/unpatchify_3d,
+  Rope::gen_lingbot_video_pe+ids, GGMLRunnerContext::bind_backend_tensor_data; added the
+  get_learned_condition branch the research spec MISSED — would have GGML_ABORT'd at runtime.)
+- **minit2i — 785ba0d** (3 new classes: MiniT2IConditioner, MiniT2IFlowDenoiser+MINIT2I_FLOW_PRED,
+  MiniT2IDiffusionExtra; FakeVAE + uncond derivation.)
+Apply-ready per-model docs persisted in `.merge-port-specs/{hunyuan,lingbot_video,minit2i}-APPLY.md`.
+GPU validation (determinism + per-model smoke renders) still PENDING — no GPU slot used (build-only).
+DEFERRED (fork lacks infra, flagged for GPU pass): hunyuan/lingbot i2v VLM ref-image AREA-resize
+conditioning (fork ConditionerParams has no RefImageParams) — t2v unaffected.
+
+## TRACK B — "who did it better" shared-code pass: DONE (analysis) + 4 ADOPTED
+Owner steer (2026-07-19): "take upstream ideally — don't own anything we don't need; keep the stuff
+we do BETTER until upstream catches up." 3 agents categorized `git diff 19bdfe2 ea4e566` per shared
+file (reports → `.merge-port-specs/trackB-{io-loader,te-vae,runtime-diff-upscaler}.md`).
+
+**ADOPTED (self-contained, upstream better-or-equal, applied + built):**
+- Sharded safetensors `*.index.json` loading (model_io/safetensors_io.{h,cpp} + model_loader) —
+  ubiquitous multi-shard HF format the fork lacked; re-enters init_from_file per shard, zero
+  ModelManager coupling.
+- Safetensors header/offset bounds hardening — malformed-file guards, output-neutral.
+- t5.hpp `T5Config::detect_from_weights` — was a stub returning hardcoded defaults; now reads real
+  shapes (+ distinct `inner_dim` wired through T5Stack). Behavior-preserving for t5-xxl/umt5.
+- `BetaScheduler` (runtime/denoiser.hpp) — ComfyUI Beta sigma schedule; additive enum+str+switch.
+
+**FLAGGED — deferred to owner's GPU pass (either a regression risk or where the FORK is currently
+better for our target 3060):**
+- image-VAE encode tile factor 2.0 (upstream) vs fork 1.30539 — upstream = fewer image-encode seams
+  but RAISES 3060 encode VRAM. Fork's lower factor is "better for our hardware" → kept, owner decides.
+- Qwen3-VL vision patch-embed rework (llm.hpp split_patch_embed + combined bias) — touches a LIVE
+  path (hidream/qwen-image ref-image encode); which bias layout our checkpoints use can't be settled
+  statically. Risk of regressing working vision → hold, GPU-verify.
+- LogitNormalScheduler (ideogram4) — niche, 191L incl. ndtri quantile numerics; trivial future add.
+- CLIP `normalize_before_split`, guidance per-step `guidance_schedule` — output-changing / inert
+  without sampler wiring.
+
+**KEEP-FORK (unique value, do NOT shed):** graph-cut VRAM/offload runner convention
+(backend/params_backend vs upstream ModelManager/weight_manager), NVFP4/FP8 cuBLASLt GEMM,
+LTX/Wan/audio video engine + its VAEs/denoisers, SA3, longcat-avatar. Also deferred to the model-port
+tracks: AnimateDiff, streaming model-writer, name_conversion new-model maps, wan_vae 2D/Qwen-layered.
+
 ## Stage 1 — ggml merge ✅ DONE + BUILDS (committed 531a2c72, branch upstream-merge-2026-07-19)
 All 13 conflicts resolved. Builds clean two-arch (sm86;120) + GGML_SAGEATTENTION3=ON, 0 errors.
 fattn-sa3.cu compiles. GPU determinism/smoke tests PENDING (need GPU slot).
@@ -49,6 +96,43 @@ sm120 Blackwell determinism, VAE-decode kernels, fusion passes.
 - ggml-cpu: BUILDS ✓ (benign -Wswitch warnings: RMS_MODULATE/RMS_NORM_CHANNELS/F8_E4M3 not in some switches — pre-existing fork behavior, warnings not errors)
 - ggml-cuda: fixed 1 real break — upstream removed `ggml_backend_buft_is_cuda_split` + all split-buffer infra; fork had 4 callers. Re-added as stub returning false (replaced dead `ggml_cuda_op_mul_mat_t` typedef) + removed now-unused `const bool split` var. REBUILDING.
 - Build cmd: `docker run -v <wt>:/src longcat-avatar-dev:builder` → `cmake -S /src -B build-wtcuda -DSD_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=86;120` → `cmake --build --target ggml-base ggml-cpu ggml-cuda`. Logs in scratchpad ggml_build*.log.
+
+## 🎯 GOAL (owner): "fully up to date so next week's merge isn't a wall"
+- **Wall is ALREADY avoided:** both stages are proper 2-parent MERGE commits (ggml 531a2c72 parents
+  fork+9be31331; sd.cpp 6c0fdf2 parents fork+ea4e566). Future `git merge upstream/master` only brings
+  NEW commits since those tips — never the 400-commit backlog again.
+- **CATCH — to be GENUINELY up to date (not just git-cosmetic), finish these BEFORE landing to master:**
+  - **Track A — port the 3 remaining models** (hunyuan, lingbot, minit2i). Not gated by future merges;
+    the .hpp are committed + specs in .merge-port-specs/. Recipe below.
+  - **Track B — "who did it better" pass on SHARED code.** 6c0fdf2 took FORK for the ~60 sd.cpp hunks
+    + shared files (the take-fork default), so upstream's shared IMPROVEMENTS are marked-merged-but-
+    NOT-adopted and will be silently skipped. Re-examine each: `git diff 19bdfe2 ea4e566 -- <file>`
+    (upstream's change vs base) and adopt where upstream genuinely supersedes the fork hack; keep fork
+    where it's uniquely better (graph-cut VRAM/offload, NVFP4/FP8 GEMM, LTX/Wan/audio, SA3). The fork
+    tracks upstream closely so this delta is modest, but do it before landing or the improvements are
+    lost from future merges (recoverable only by manual diff, not re-merge).
+- **THEN:** GPU-validate (determinism + per-model smoke renders) → fast-forward master (ggml first,
+  push dbrain/ggml; then sd.cpp, push dbrain/hbd-longcat-avatar.cpp) → next week is a small merge.
+
+Port specs + build script persisted to `.merge-port-specs/` (durable; scratchpad is session-scoped).
+Templates: krea2 commit 7502d89, boogu commit ca0d922. Build: bash .merge-port-specs/build.sh (needs
+docker longcat-avatar-dev:builder; reconfigures build-wtcuda; sm86;120 + SA3). Fallback tag:
+wip-fork-plus-ggml-building.
+
+## 📋 INTENTIONAL OMISSIONS DECISION LOG — 12 upstream files ABSENT from the merged tree
+(`git diff --name-status HEAD upstream/master | awk '$1=="A"'` — the full, bounded list. All are
+retrievable from the merge's upstream parent `git show 6c0fdf2^2:<file>`. If upstream touches any of
+these later, next merge raises a VISIBLE modify/delete conflict — nothing is silent.)
+- SUPERSEDED BY FORK EQUIVALENT (removed to build; Track B should CONFIRM the keep-fork call):
+  - src/model_manager.{cpp,h}  → fork backend_for()/params_backend_for() + own loader (+offload/VRAM)
+  - src/core/backend_fit.{cpp,h}, src/core/layer_split_partition.{cpp,h}, src/weight_manager.h
+        → upstream MULTI-GPU split/fit; fork is single-GPU with graph-cut/offload
+  - src/runtime/imatrix.{cpp,h}  → fork has own imatrix (resolve_imatrix, nvfp4-twolevel)
+- GENUINELY-MISSING UPSTREAM FEATURES (fork has NO equivalent — port if owner wants them):
+  - src/detailer.{cpp,h}         → upstream ADetailer (face/detail enhance) — NOT in fork
+  - src/extensions/pulid_extension.cpp → upstream PuLID (ID-preserving gen) — NOT in fork
+NOTE: the tree is NOT a literal superset of upstream. Track B ("who did it better") must (a) confirm
+each superseded call is really keep-fork-better, and (b) decide whether to port ADetailer/PuLID.
 
 ## ✅✅ CORRECTED STRATEGY (owner, 2026-07-19) — this supersedes the pivot below
 **"Fork exists because upstream was slow/missing things. When upstream adds/does-better, ADOPT
@@ -101,10 +185,13 @@ Per-model wiring specs saved: /tmp/.../scratchpad/specs/*.json (detection/dispat
   FLUX_FLOW_PRED(1.15)/conditioner-QWEN3_VL.
 - **boogu (VERSION_BOOGU_IMAGE)** — wired (building). flux-VAE default, FLOW_PRED(3.16), QWEN3_VL vision,
   timestep t/TIMESTEPS, ref-latent-img-cfg. Like krea2.
-- **hunyuan (VERSION_HUNYUAN_VIDEO)** — MODERATE, not yet wired. Needs: new struct HunyuanVideoDiffusionExtra
-  in model.hpp + variant; a `sd_version_uses_hunyuan_video_vae` helper + HunyuanVideoVAERunner factory
-  branch; #include hunyuan.hpp + hunyuan_vae.hpp; detection (txt_in.individual_token_refiner...adaLN_modulation.1);
-  dispatch (LLMEmbedder + HunyuanVideoRunner(...,version)). Video model.
+- **hunyuan (VERSION_HUNYUAN_VIDEO)** — not wired. COMPILE needs: struct HunyuanVideoDiffusionExtra + variant
+  (model.hpp), sd_version_uses_hunyuan_video_vae helper + HunyuanVideoVAERunner factory branch, #include
+  hunyuan.hpp+hunyuan_vae.hpp, detection (txt_in.individual_token_refiner...adaLN_modulation.1), dispatch
+  (LLMEmbedder + HunyuanVideoRunner(...,version)). CORRECT RUNTIME also needs: HunyuanVideoDiffusionExtra
+  population + timestep_r/meanflow + latent_channel=32 in the denoise loop, and 3 LLMEmbedder branches ported
+  into conditioner.hpp (prompt template / hidden-state / byt5, upstream conditioner.hpp lines 1823/2107/2654).
+  Do NOT ship compile-only — it would load but render wrong. Video/i2v paths (upstream ~2800/3610/5667) as needed.
 - **lingbot_video (VERSION_LINGBOT_VIDEO)** — HARD, not wired. 3 primitives MISSING from fork shared engine
   (port from upstream): DiT::patchify_3d/unpatchify_3d (dit.hpp), Rope::gen_lingbot_video_pe (rope.hpp),
   GGMLRunnerContext::bind_backend_tensor_data + backing member (ggml_extend.hpp). Then WAN VAE branch +
