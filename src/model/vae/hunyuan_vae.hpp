@@ -817,8 +817,6 @@ namespace Hunyuan {
             };
             auto output = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
                                                                                      n_threads,
-                                                                                     true,
-                                                                                     true,
                                                                                      true),
                                                           graph_input.dim());
             if (!output.empty() && input.dim() == 4) {

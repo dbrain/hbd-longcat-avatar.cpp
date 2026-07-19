@@ -1614,6 +1614,7 @@ struct LLMEmbedder : public Conditioner {
     SDVersion version;
     std::shared_ptr<BPETokenizer> tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
+    std::shared_ptr<T5Runner> byt5;  // hunyuan-video glyph/text-render encoder (optional)
 
     LLMEmbedder(ggml_backend_t backend,
                 ggml_backend_t params_backend,
@@ -1651,14 +1652,29 @@ struct LLMEmbedder : public Conditioner {
                                                tensor_storage_map,
                                                "text_encoders.llm",
                                                enable_vision);
+        if (sd_version_is_hunyuan_video(version)) {
+            const std::string byt5_prefix = "text_encoders.t5xxl.transformer";
+            for (const auto& [name, _] : tensor_storage_map) {
+                if (starts_with(name, byt5_prefix + ".")) {
+                    byt5 = std::make_shared<T5Runner>(backend, params_backend, tensor_storage_map, byt5_prefix, false);
+                    break;
+                }
+            }
+        }
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         llm->get_param_tensors(tensors, "text_encoders.llm");
+        if (byt5) {
+            byt5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
+        }
     }
 
     bool alloc_params_buffer() override {
         if (!llm->alloc_params_buffer()) {
+            return false;
+        }
+        if (byt5 && !byt5->alloc_params_buffer()) {
             return false;
         }
         return true;
@@ -1666,34 +1682,55 @@ struct LLMEmbedder : public Conditioner {
 
     void free_params_buffer() override {
         llm->free_params_buffer();
+        if (byt5) {
+            byt5->free_params_buffer();
+        }
     }
 
     size_t get_params_buffer_size() override {
         size_t buffer_size = 0;
         buffer_size += llm->get_params_buffer_size();
+        if (byt5) {
+            buffer_size += byt5->get_params_buffer_size();
+        }
         return buffer_size;
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
         llm->set_max_graph_vram_bytes(max_vram_bytes);
+        if (byt5) {
+            byt5->set_max_graph_vram_bytes(max_vram_bytes);
+        }
     }
 
     void set_keep_params_resident(bool keep) override {
         llm->set_keep_params_resident(keep);
+        if (byt5) {
+            byt5->set_keep_params_resident(keep);
+        }
     }
 
     void set_stream_layers_enabled(bool enabled) override {
         llm->set_stream_layers_enabled(enabled);
+        if (byt5) {
+            byt5->set_stream_layers_enabled(enabled);
+        }
     }
 
 
     void set_flash_attention_enabled(bool enabled) override {
         llm->set_flash_attention_enabled(enabled);
+        if (byt5) {
+            byt5->set_flash_attention_enabled(enabled);
+        }
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
         if (llm) {
             llm->set_weight_adapter(adapter);
+        }
+        if (byt5) {
+            byt5->set_weight_adapter(adapter);
         }
     }
 
@@ -2118,6 +2155,23 @@ struct LLMEmbedder : public Conditioner {
             SDCondition result;
             result.c_crossattn = std::move(hidden_states);
             return result;
+        } else if (sd_version_is_hunyuan_video(version)) {
+            prompt_template_encode_start_idx = 98;
+            out_layers                       = {26};
+
+            prompt =
+                "<|im_start|>system\nYou are a helpful assistant. Describe the video by detailing the following aspects:\n"
+                "1. The main content and theme of the video.\n"
+                "2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.\n"
+                "3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.\n"
+                "4. background environment, light, style and atmosphere.\n"
+                "5. camera angles, movements, and transitions used in the video.<|im_end|>\n"
+                "<|im_start|>user\n";
+
+            prompt_attn_range.first = static_cast<int>(prompt.size());
+            prompt += conditioner_params.text;
+            prompt_attn_range.second = static_cast<int>(prompt.size());
+            prompt += "<|im_end|>\n<|im_start|>assistant\n";
         } else {
             GGML_ABORT("unknown version %d", version);
         }
@@ -2133,6 +2187,41 @@ struct LLMEmbedder : public Conditioner {
                                            spell_quotes,
                                            max_length);
         std::vector<sd::Tensor<float>> extra_hidden_states_vec;
+        if (sd_version_is_hunyuan_video(version) && byt5) {
+            std::vector<std::string> quoted_texts;
+            auto collect_quoted = [&](const std::string& open, const std::string& close) {
+                size_t begin = 0;
+                while ((begin = conditioner_params.text.find(open, begin)) != std::string::npos) {
+                    size_t content_begin = begin + open.size();
+                    size_t end           = conditioner_params.text.find(close, content_begin);
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    quoted_texts.push_back(conditioner_params.text.substr(content_begin, end - content_begin));
+                    begin = end + close.size();
+                }
+            };
+            collect_quoted("\"", "\"");
+            collect_quoted("\xE2\x80\x98", "\xE2\x80\x99");
+            collect_quoted("\xE2\x80\x9C", "\xE2\x80\x9D");
+
+            if (!quoted_texts.empty()) {
+                std::string byt5_text;
+                for (const auto& text : quoted_texts) {
+                    byt5_text += "Text \"" + text + "\". ";
+                }
+                std::vector<int> tokens;
+                tokens.reserve(byt5_text.size() + 1);
+                for (unsigned char byte : byt5_text) {
+                    tokens.push_back(static_cast<int>(byte) + 3);
+                }
+                tokens.push_back(1);
+                sd::Tensor<int32_t> input_ids({static_cast<int64_t>(tokens.size())}, tokens);
+                auto byt5_hidden_states = byt5->compute(n_threads, input_ids, sd::Tensor<float>());
+                GGML_ASSERT(!byt5_hidden_states.empty());
+                extra_hidden_states_vec.push_back(std::move(byt5_hidden_states));
+            }
+        }
         for (int i = 0; i < extra_prompts.size(); i++) {
             auto extra_hidden_states = encode_prompt(n_threads,
                                                      extra_prompts[i],

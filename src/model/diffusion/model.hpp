@@ -74,6 +74,13 @@ struct LongCatAvatarDiffusionExtra {
     int step = -1;  // sampler step index for the cond-frame K/V cache (lap-26); -1 = unknown
 };
 
+struct HunyuanVideoDiffusionExtra {
+    const sd::Tensor<float>* guidance   = nullptr;
+    const sd::Tensor<float>* byt5       = nullptr;
+    const sd::Tensor<float>* vision     = nullptr;
+    const sd::Tensor<float>* timestep_r = nullptr;
+};
+
 using DiffusionExtraParams = std::variant<std::monostate,
                                           UNetDiffusionExtra,
                                           SkipLayerDiffusionExtra,
@@ -82,7 +89,8 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           WanDiffusionExtra,
                                           HiDreamO1DiffusionExtra,
                                           LTXAVDiffusionExtra,
-                                          LongCatAvatarDiffusionExtra>;
+                                          LongCatAvatarDiffusionExtra,
+                                          HunyuanVideoDiffusionExtra>;
 
 struct DiffusionParams {
     const sd::Tensor<float>* x                        = nullptr;

@@ -33,6 +33,9 @@
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/ltxv.hpp"
 #include "model/diffusion/mmdit.hpp"
+// hunyuan.hpp pulls in mmdit.hpp's global ::modulate; include it AFTER ltxv.hpp so
+// LTXV::modulate is resolved before the global overload becomes visible (avoids ADL ambiguity).
+#include "model/diffusion/hunyuan.hpp"
 #include "model/diffusion/model.hpp"
 #include "model/diffusion/pid.hpp"
 #include "model/diffusion/qwen_image.hpp"
@@ -42,6 +45,7 @@
 #include "model/upscaler/esrgan.hpp"
 #include "model/upscaler/ltx_latent_upscaler.hpp"
 #include "model/vae/auto_encoder_kl.hpp"
+#include "model/vae/hunyuan_vae.hpp"
 #include "model/vae/ltx_audio_vae.hpp"
 #include "model/vae/ltx_vae.hpp"
 #include "model/vae/tae.hpp"
@@ -730,6 +734,18 @@ public:
                                                                             params_backend_for(SDBackendModule::DIFFUSION),
                                                                             tensor_storage_map,
                                                                             "model.diffusion_model");
+            } else if (sd_version_is_hunyuan_video(version)) {
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 params_backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 false);
+                diffusion_model  = std::make_shared<Hunyuan::HunyuanVideoRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                params_backend_for(SDBackendModule::DIFFUSION),
+                                                                                tensor_storage_map,
+                                                                                "model.diffusion_model",
+                                                                                version);
             } else if (sd_version_is_flux(version)) {
                 bool is_chroma = false;
                 for (auto pair : tensor_storage_map) {
@@ -1002,6 +1018,8 @@ public:
                 if (sd_version_is_wan(version) ||
                     sd_version_is_qwen_image(version) ||
                     sd_version_is_anima(version) ||
+                    sd_version_is_hunyuan_video(version) ||
+                    sd_version_is_lingbot_video(version) ||
                     sd_version_is_ltxav(version)) {
                     return std::make_shared<TinyVideoAutoEncoder>(backend_for(SDBackendModule::VAE),
                                                                   params_backend_for(SDBackendModule::VAE),
@@ -1039,6 +1057,13 @@ public:
                                                          "first_stage_model",
                                                          vae_decode_only,
                                                          version);
+                } else if (sd_version_uses_hunyuan_video_vae(version)) {
+                    return std::make_shared<Hunyuan::HunyuanVideoVAERunner>(backend_for(SDBackendModule::VAE),
+                                                                            params_backend_for(SDBackendModule::VAE),
+                                                                            tensor_storage_map,
+                                                                            "first_stage_model",
+                                                                            vae_decode_only,
+                                                                            version);
                 } else if (sd_version_is_wan(version) ||
                            sd_version_is_qwen_image(version) ||
                            sd_version_is_anima(version) ||
@@ -1605,6 +1630,7 @@ public:
                     }
                 } else if (sd_version_is_sd3(version) ||
                            sd_version_is_wan(version) ||
+                           sd_version_is_hunyuan_video(version) ||
                            sd_version_is_qwen_image(version) ||
                            version == VERSION_HIDREAM_O1 ||
                            sd_version_is_anima(version) ||
@@ -1617,6 +1643,8 @@ public:
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
                         default_flow_shift = 5.f;
+                    } else if (sd_version_is_hunyuan_video(version)) {
+                        default_flow_shift = 7.f;
                     } else if (sd_version_is_longcat_avatar(version)) {
                         default_flow_shift = 7.f;  // FlowMatchEulerDiscrete shift 7.0
                     } else if (sd_version_is_ernie_image(version)) {
@@ -3020,6 +3048,10 @@ public:
 
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
+            sd::Tensor<float> hunyuan_timestep_r_tensor;
+            if (sd_version_is_hunyuan_video(version) && step + 1 < sigmas.size()) {
+                hunyuan_timestep_r_tensor = sd::Tensor<float>({1}, std::vector<float>{sigmas[step + 1]});
+            }
             sd::Tensor<float> noised_input = x * c_in;
             if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || version == VERSION_WAN2_2_I2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version))) {
                 // ai2v: the first num_cond_latents temporal latent frames ARE the
@@ -3132,6 +3164,12 @@ public:
                     diffusion_params.extra = ltx_extra;
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};  // cond-frame K/V cache (lap-26)
+                } else if (sd_version_is_hunyuan_video(version)) {
+                    diffusion_params.extra = HunyuanVideoDiffusionExtra{
+                        &guidance_tensor,
+                        condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0],
+                        condition.c_vector.empty() ? nullptr : &condition.c_vector,
+                        hunyuan_timestep_r_tensor.empty() ? nullptr : &hunyuan_timestep_r_tensor};
                 } else {
                     diffusion_params.extra = std::monostate{};
                 }
@@ -3540,6 +3578,8 @@ public:
                 latent_channel = 128;
             } else if (version == VERSION_WAN2_2_TI2V) {
                 latent_channel = 48;
+            } else if (sd_version_is_hunyuan_video(version)) {
+                latent_channel = 32;
             } else if (version == VERSION_HIDREAM_O1) {
                 latent_channel = 3;
             } else if (version == VERSION_CHROMA_RADIANCE) {
@@ -3579,7 +3619,7 @@ public:
         int latent_frames = frames;
         if (sd_version_is_ltxav(version)) {
             latent_frames = ((frames - 1) / 8) + 1;
-        } else if (sd_version_is_wan(version) || sd_version_is_longcat_avatar(version)) {
+        } else if (sd_version_is_wan(version) || sd_version_is_longcat_avatar(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version)) {
             latent_frames = ((frames - 1) / 4) + 1;
         }
         return latent_frames;
@@ -3592,7 +3632,7 @@ public:
         if (sd_version_is_ltxav(version)) {
             return (latent_frames - 1) * 8 + 1;
         }
-        if (sd_version_is_wan(version) || sd_version_is_longcat_avatar(version)) {
+        if (sd_version_is_wan(version) || sd_version_is_longcat_avatar(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version)) {
             return (latent_frames - 1) * 4 + 1;
         }
         return latent_frames;
@@ -4494,7 +4534,7 @@ struct sd_ctx_t {
 };
 
 static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version);
+    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version);
 }
 
 static bool sd_version_supports_image_generation(SDVersion version) {

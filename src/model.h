@@ -221,6 +221,10 @@ static inline bool sd_version_uses_flux2_vae(SDVersion version) {
     return false;
 }
 
+static inline bool sd_version_uses_hunyuan_video_vae(SDVersion version) {
+    return sd_version_is_hunyuan_video(version);
+}
+
 static inline bool sd_version_is_inpaint(SDVersion version) {
     if (version == VERSION_SD1_INPAINT ||
         version == VERSION_SD2_INPAINT ||
