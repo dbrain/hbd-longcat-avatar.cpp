@@ -13858,6 +13858,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // LTX causal-VAE temporal: K latent frames decode to 1+(K-1)*8 pixel frames. That is
     // the head overlap we drop on seg>0 (the prior tail's re-render).
     int overlap_px = 1 + (K - 1) * 8;
+    // Extra frames the model takes to "settle" past the frozen guide before the smoothest seam.
+    // The content-adaptive auto-trim lands at ~overlap_px + this (measured 23-25 for K=3, guide 17);
+    // it seeds the FIRST continuation's drive-audio cold-start (see drop_pred below). koblem pads
+    // each continuation's render by the same guide+settle (its `overlap`≈24). Override via
+    // LTXAV_CHAIN_COLD_DROP if a model/K shifts it.
+    const int LTXAV_CONT_SETTLE_FRAMES = 7;
     if (overlap_px >= base_params->video_frames) {
         LOG_ERROR("generate_video_chain: cont_latent_frames (%d -> %d overlap pixel frames) must leave "
                   "new frames in video_frames (%d)",
@@ -14110,8 +14116,14 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             }
             int drop = (seg == 0) ? 0 : (legacy_head_r ? overlap_px : 0);
             if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
-                if (seg > 0) {
-                    drop = atoi(e);
+                // Value-gate (see the live-loop pin): empty string = UNPIN, not drop=0. Falls through
+                // to the length-pin below, which reproduces the banked kept-count regardless.
+                if (e[0] != '\0' && seg > 0) {
+                    char* end = nullptr;
+                    long  v   = strtol(e, &end, 10);
+                    if (end != nullptr && *end == '\0' && v >= 0) {
+                        drop = (int)v;
+                    }
                 }
             }
             // Length-pin: keep exactly the banked kept-count so the reloaded prefix reproduces the
@@ -14260,6 +14272,14 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  : base_params->video_frames;
         chain_latent_offset += (1 + (frames_s - 1) / 8) - K;
     }
+
+    // Most-recent continuation's MEASURED auto-trim drop, fed forward as the next segment's
+    // a-priori `drop_pred` (the drive-audio window has to be sliced BEFORE the render, but the
+    // real drop is only known AFTER it). Adjacent within-scene trims cluster tightly, so the
+    // previous segment's actual drop predicts this one far better than the fixed VAE overlap.
+    // -1 = no continuation measured yet (cold start → fall back to overlap_px). See the drive
+    // slice below.
+    int last_cont_drop = -1;
 
     for (int seg = start_seg; seg <= render_end; ++seg) {
         // The preceding segment has released its GPU-only chain residency, so a
@@ -14534,10 +14554,50 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             // point of moving this in-engine — the old client-side constant had no feedback path,
             // so its error compounded across every seam.
             const long long timeline_pos = flushed_total + (long long)stitched.size();
-            int drop_pred = (seg == 0 || segmented_relip || fresh_anchor) ? 0 : overlap_px;
+            // A-priori estimate of the head frames this segment will drop, used to shift the
+            // drive-audio window so segment-local frame `drop` carries timeline_pos's audio.
+            //  • fresh shot / relip anchor: 0 — a new scene re-anchors audio to its own start.
+            //  • continuation retake: the banked kept length pins the drop exactly (see the
+            //    RETAKE length-pin below), so we can predict it EXACTLY and slice perfectly.
+            //  • ordinary continuation: the previous continuation's MEASURED drop; a settle-inclusive
+            //    cold-start only before any continuation has been measured.
+            //
+            // Cold-start (first continuation, no measured drop yet): the content-adaptive trim lands
+            // a few frames ABOVE the guide overlap (overlap_px) — the model needs a short "settle"
+            // after the frozen guide before the smoothest cut. koblem pads each continuation's RENDER
+            // by exactly this guide+settle (its `overlap`≈24 for K=3), and the trim measures 23-25
+            // across content. Seeding the cold-start at overlap_px ALONE (guide only, 17) left the
+            // FIRST continuation's drive window ~6-7 frames early — its mouth ran AHEAD of the vocals
+            // (visible seg-1 lip lead) — while seg-2+ were already exact via last_cont_drop. Add the
+            // settle so seg-1 lands within ~1 frame. Overridable with LTXAV_CHAIN_COLD_DROP (value-gated).
+            int cold_drop = overlap_px + LTXAV_CONT_SETTLE_FRAMES;
+            if (const char* e = std::getenv("LTXAV_CHAIN_COLD_DROP")) {
+                if (e[0] != '\0') {
+                    char* end = nullptr;
+                    long  v   = strtol(e, &end, 10);
+                    if (end != nullptr && *end == '\0' && v >= 0) {
+                        cold_drop = (int)v;
+                    }
+                }
+            }
+            int drop_pred;
+            if (seg == 0 || segmented_relip || fresh_anchor) {
+                drop_pred = 0;
+            } else if (retake_active && seg == retake_seg &&
+                       getenv("LTXAV_RETAKE_NO_PIN_LENGTH") == nullptr &&
+                       chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+                int banked = read_seg_len(std::string(chain_params->save_dir) + "/seg_" +
+                                          std::to_string(seg) + ".len");
+                drop_pred = (banked >= 0 && banked <= (int)vp.video_frames)
+                                ? ((int)vp.video_frames - banked)
+                                : (last_cont_drop >= 0 ? last_cont_drop : cold_drop);
+            } else {
+                drop_pred = (last_cont_drop >= 0) ? last_cont_drop : cold_drop;
+            }
             if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
                 // Value-gate: "${VAR:-}" yields an EMPTY STRING and getenv returns non-null, so a
                 // bare presence check silently enables drop=0 via atoi(""). Only a real integer pins.
+                // Parity with the actual-drop pin below: when the trim is pinned, so is the estimate.
                 if (e[0] != '\0' && seg > 0 && !(segmented_relip || fresh_anchor)) {
                     char* end = nullptr;
                     long  v   = strtol(e, &end, 10);
@@ -14788,8 +14848,16 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             // Only pin the trim for genuine continuations. A fresh shot (scene cut / keyframe-fresh /
             // relip anchor) already resolved drop=0 above and must NOT be trimmed — else its brand-new
             // scene loses its opening frames and the whole timeline (and audio) shifts by the overlap.
-            if (seg > 0 && !(segmented_relip || fresh_anchor)) {
-                drop = atoi(e);
+            // VALUE-gate: compose sets "${VAR:-}" to an EMPTY STRING (set, not absent) to UNPIN, so
+            // getenv returns non-null "" — a bare presence check would `atoi("")==0` and silently
+            // force drop=0 (NO seam trim at all — worse than the fixed pin). Only a real integer pins;
+            // empty leaves the content-adaptive auto-trim above intact. Mirrors the drop_pred gate.
+            if (e[0] != '\0' && seg > 0 && !(segmented_relip || fresh_anchor)) {
+                char* end = nullptr;
+                long  v   = strtol(e, &end, 10);
+                if (end != nullptr && *end == '\0' && v >= 0) {
+                    drop = (int)v;
+                }
             }
         }
         // RETAKE length-pin: reproduce the ORIGINAL kept length for the retaken segment so the
@@ -14808,6 +14876,13 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         size_t kept_start = stitched.size();
         if (drop > seg_count) {
             drop = seg_count;
+        }
+        // Feed this continuation's MEASURED drop forward as the next segment's drive-audio
+        // estimate (drop_pred). Fresh shots / relip anchors carry no meaningful trim, so they
+        // do not update the running estimate — the next real continuation keeps predicting from
+        // the last genuine continuation.
+        if (seg > 0 && !fresh_anchor && !segmented_relip) {
+            last_cont_drop = drop;
         }
         // P1-C: tone-match this segment's kept frames to the prior segment's tail before stitching,
         // flattening the ~0.85-luma step at the seam (continuity correction, not a cross-fade). seg0
@@ -14935,7 +15010,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 drop = ltxav_auto_trim_drop(stitched.empty() ? sd_image_t{} : stitched.back(), fr, cnt, overlap_px);
             }
             if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
-                drop = atoi(e);
+                // Value-gate (see the live-loop pin): empty string = UNPIN, not drop=0. Falls through
+                // to the length-pin below, which reproduces each banked tail's kept-count regardless.
+                if (e[0] != '\0') {
+                    char* end = nullptr;
+                    long  v   = strtol(e, &end, 10);
+                    if (end != nullptr && *end == '\0' && v >= 0) {
+                        drop = (int)v;
+                    }
+                }
             }
             // RETAKE length-pin: reproduce each banked tail segment's ORIGINAL kept length so the
             // total timeline is unchanged (only segment retake_seg's pixels differ). Off via
