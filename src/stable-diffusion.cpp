@@ -11490,6 +11490,23 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             latents.ref_image_num < lat.shape()[2]) {
             lat = sd::ops::slice(lat, 2, latents.ref_image_num, lat.shape()[2]);
         }
+        // Continuation shots re-render the leading overlap at the HEAD of the target region:
+        // K = cont_latent_frames latent frames (== overlap_px = 1+(K-1)*8 pixel frames after
+        // decode) that ARE the prior segment's re-rendered tail. The FINAL output drops these
+        // at stitch (generate_video_chain's ltxav_auto_trim_drop), but that trim runs AFTER
+        // this preview is decoded+dispatched — so without this the per-stage preview leaks the
+        // previous shot's tail glued to the front. Both continuation layouts (keyframe-append
+        // warm-up re-render and LTXAV_CONT_LEGACY_HEAD head-place) put the overlap at the head.
+        // The content-adaptive stitch drop isn't known until stitch; the fixed K-frame overlap
+        // is the best preview approximation (within ~a frame of the auto-trim).
+        if (!final_latent_prestripped &&
+            sd_vid_gen_params->cont_latent != nullptr &&
+            sd_vid_gen_params->cont_latent_frames > 0) {
+            int64_t cont_k = sd_vid_gen_params->cont_latent_frames;
+            if (cont_k > 0 && cont_k < lat.shape()[2]) {
+                lat = sd::ops::slice(lat, 2, cont_k, lat.shape()[2]);
+            }
+        }
         if (lat.empty() || lat.shape()[2] <= 0) {
             return;
         }
