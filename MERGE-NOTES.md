@@ -95,6 +95,28 @@ From upstream/master:src/stable-diffusion.cpp, graft onto the fork engine:
 Krea2 example integration points in upstream sd.cpp: include@35, name@117, dispatch@1001-1008,
 conditioner@2915, timestep@3016.
 
+### PORT PROGRESS (fan-out workflow wf_4175e0fb-c83 → 7 agents adapted the .hpp Runners)
+Per-model wiring specs saved: /tmp/.../scratchpad/specs/*.json (detection/dispatch/vae/conditioner/extra).
+- **krea2** — ✅ DONE + BUILDS (commit 7502d89). enum/name/helper/is_dit/detection/dispatch/WAN-VAE/
+  FLUX_FLOW_PRED(1.15)/conditioner-QWEN3_VL.
+- **boogu (VERSION_BOOGU_IMAGE)** — wired (building). flux-VAE default, FLOW_PRED(3.16), QWEN3_VL vision,
+  timestep t/TIMESTEPS, ref-latent-img-cfg. Like krea2.
+- **hunyuan (VERSION_HUNYUAN_VIDEO)** — MODERATE, not yet wired. Needs: new struct HunyuanVideoDiffusionExtra
+  in model.hpp + variant; a `sd_version_uses_hunyuan_video_vae` helper + HunyuanVideoVAERunner factory
+  branch; #include hunyuan.hpp + hunyuan_vae.hpp; detection (txt_in.individual_token_refiner...adaLN_modulation.1);
+  dispatch (LLMEmbedder + HunyuanVideoRunner(...,version)). Video model.
+- **lingbot_video (VERSION_LINGBOT_VIDEO)** — HARD, not wired. 3 primitives MISSING from fork shared engine
+  (port from upstream): DiT::patchify_3d/unpatchify_3d (dit.hpp), Rope::gen_lingbot_video_pe (rope.hpp),
+  GGMLRunnerContext::bind_backend_tensor_data + backing member (ggml_extend.hpp). Then WAN VAE branch +
+  detection (patch_embedder.weight) + dispatch.
+- **minit2i (VERSION_MINIT2I)** — HARD, not wired. Needs a new MiniT2IConditioner class ported into
+  conditioner.hpp (T5-XXL + T5UniGramTokenizer, prompt_length 256) + FakeVAE at 3 sites + detection
+  (net.img_embedder.proj1.weight).
+- **sefi_image / animatediff** — NOT standalone models (helper structs / SD1.x motion module); no VERSION_
+  enum, not wired. (VERSION_SEFI_IMAGE proposed by agent but SKIPPED — would be a dangling version.)
+NOTE: the 5 real models' enum+helper+is_dit are ALREADY added (model.h); only krea2+boogu have
+detection/dispatch/include so only they compile-participate. The other 3 enums are inert until wired.
+
 ### REMAINING WORK (multi-session, ~the handoff's 1-week estimate)
 - Port the 7 models (recipe above), each building. [NOT STARTED]
 - Adopt upstream's genuine shared-code improvements (per-hunk, prefer-upstream-where-it-supersedes).

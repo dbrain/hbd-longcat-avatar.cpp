@@ -500,6 +500,9 @@ SDVersion ModelLoader::get_sd_version() {
             tensor_storage.name.find("model.diffusion_model.text_fusion.projector.weight") != std::string::npos) {
             return VERSION_KREA2;
         }
+        if (tensor_storage.name.find("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight") != std::string::npos) {
+            return VERSION_BOOGU_IMAGE;
+        }
         if (tensor_storage.name.find("model.diffusion_model.nerf_final_layer_conv.") != std::string::npos) {
             return VERSION_CHROMA_RADIANCE;
         }

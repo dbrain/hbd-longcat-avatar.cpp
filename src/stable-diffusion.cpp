@@ -29,6 +29,7 @@
 #include "model/diffusion/hidream_o1.hpp"
 #include "model/diffusion/ideogram4.hpp"
 #include "model/diffusion/krea2.hpp"
+#include "model/diffusion/boogu.hpp"
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/ltxv.hpp"
 #include "model/diffusion/mmdit.hpp"
@@ -135,7 +136,8 @@ static bool sd_version_supports_ref_latent_img_cfg(SDVersion version) {
            sd_version_is_flux2(version) ||
            sd_version_is_qwen_image(version) ||
            sd_version_is_longcat(version) ||
-           sd_version_is_z_image(version);
+           sd_version_is_z_image(version) ||
+           sd_version_is_boogu_image(version);
 }
 
 static bool sd_version_supports_img_cfg(SDVersion version, bool has_ref_images) {
@@ -717,6 +719,17 @@ public:
                                                                        params_backend_for(SDBackendModule::DIFFUSION),
                                                                        tensor_storage_map,
                                                                        "model.diffusion_model");
+            } else if (sd_version_is_boogu_image(version)) {
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 params_backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 true);
+                diffusion_model  = std::make_shared<Boogu::BooguImageRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                            params_backend_for(SDBackendModule::DIFFUSION),
+                                                                            tensor_storage_map,
+                                                                            "model.diffusion_model");
             } else if (sd_version_is_flux(version)) {
                 bool is_chroma = false;
                 for (auto pair : tensor_storage_map) {
@@ -1599,7 +1612,8 @@ public:
                            sd_version_is_longcat_avatar(version) ||
                            sd_version_is_z_image(version) ||
                            sd_version_is_pid(version) ||
-                           sd_version_is_ideogram4(version)) {
+                           sd_version_is_ideogram4(version) ||
+                           sd_version_is_boogu_image(version)) {
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
                         default_flow_shift = 5.f;
@@ -1611,6 +1625,8 @@ public:
                         default_flow_shift = 1.5f;
                     } else if (sd_version_is_ideogram4(version)) {
                         default_flow_shift = 1.0f;
+                    } else if (sd_version_is_boogu_image(version)) {
+                        default_flow_shift = 3.16f;
                     } else {
                         default_flow_shift = 3.f;
                     }
@@ -2635,7 +2651,7 @@ public:
             LOG_DEBUG("shifting timestep from %.2f to %" PRId64 " (sigma: %.4f)", t, shifted_t, sigma);
             return std::vector<float>{(float)shifted_t};
         }
-        if (sd_version_is_anima(version)) {
+        if (sd_version_is_anima(version) || sd_version_is_boogu_image(version)) {
             return std::vector<float>{t / static_cast<float>(TIMESTEPS)};
         }
         if (version == VERSION_HIDREAM_O1) {
