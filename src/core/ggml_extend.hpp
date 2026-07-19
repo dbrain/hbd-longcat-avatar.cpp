@@ -1797,42 +1797,40 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        // beat-comfy cast-reduction: keep the cuDNN attn output F16 in the LTX_DIT_F16
-        // stream. cuDNN already produces F16 internally and is selected exactly for the
-        // mask-free, F16-Q, D in {64,128} shape — matching this gate — so the only change
-        // is dropping the bhsd->F32 upcast (1.1% of DiT) and keeping the following to_out
-        // Linear on the cheaper F16 activation-quant path instead of the F32 one. F32
-        // accumulation is unchanged inside cuDNN; only the stored output is F16 (= what
-        // the residual stream already is). Env-gated, default OFF (prod/F32 untouched).
-        // NB: do NOT gate on q_in->type — under LTX_DIT_F16 the rope'd self-attn q is
-        // cast to F32 (rope_pe is F32-only), yet cuDNN still emits F16 internally and the
-        // to_out consumer is F16. The env is the dit_f16 opt-in; gate only on the cuDNN
-        // selection shape (mask-free, D in {64,128}). cuDNN casts an F32 q to F16 itself.
-        static const bool cudnn_f16_out_env = getenv("GGML_CUDNN_ATTN_F16_OUT") != nullptr;
-        // DEVICE-GATED (Blackwell-only). The F16 attention output only pays off when
-        // cuDNN SDPA (selected exclusively on cc >= Blackwell) stores it directly and the
-        // FP4 cuBLASLt GEMM consumes it. On non-Blackwell (e.g. sm86/RTX 3060) cuDNN is
-        // NOT selected — a native flash kernel runs, and retyping its output to F16 here
-        // leaves an F16 island the sm86 dispatch mishandles -> solid-white render. Gate on
-        // the active CUDA device so a single binary is correct on both GPUs. (CPU build:
-        // off — F16_OUT is a CUDA/cuDNN-only optimization.)
+        // beat-comfy cast-reduction: hand the to_out Linear its activation on the cheaper
+        // F16 activation-quant path (instead of F32). cuDNN F32-accumulates; only the value
+        // fed to to_out is F16 (= what the residual stream already is). Env-gated, default
+        // OFF (prod/F32 untouched). Device-gated to Blackwell: on non-Blackwell a native
+        // flash kernel runs and an F16 output island is mishandled -> solid-white render.
+        // NB: do NOT gate on q_in->type — under LTX_DIT_F16 the rope'd self-attn q is cast
+        // to F32 (rope_pe is F32-only); gate only on the cuDNN selection shape (mask-free,
+        // D in {64,128}).
+        static const bool cudnn_f16_out_env = [] {
+            const char * e = getenv("GGML_CUDNN_ATTN_F16_OUT");
+            return e != nullptr && atoi(e) != 0;
+        }();
 #ifdef SD_USE_CUDA
         const bool cudnn_f16_out = cudnn_f16_out_env && ggml_backend_cuda_device_has_blackwell_mma(0);
 #else
         const bool cudnn_f16_out = false;
 #endif
-        if (cudnn_f16_out && mask_in == nullptr && (d_head == 64 || d_head == 128)) {
-            // Retype the (contiguous) flash output F32->F16 and recompute its strides;
-            // ggml_flash_attn_ext hard-codes an F32 result, so nb[] is F32-sized and must
-            // be rebuilt for the half element size or downstream reads mis-stride.
-            out->type  = GGML_TYPE_F16;
-            out->nb[0] = ggml_type_size(GGML_TYPE_F16);
-            out->nb[1] = out->nb[0] * out->ne[0];
-            out->nb[2] = out->nb[1] * out->ne[1];
-            out->nb[3] = out->nb[2] * out->ne[2];
-        }
+        const bool want_f16_out = cudnn_f16_out && mask_in == nullptr && (d_head == 64 || d_head == 128);
+        // Restore the ×(1/kv_scale) FIRST, in F32. LTX uses kv_scale=1/256 (ltxv.hpp:934 —
+        // K/V scaled DOWN to stay in F16 range), so this restore is a ×256 amplification.
+        // Doing it while `out` is F16 overflows F16-max (65504) to ±inf -> NaN whenever a
+        // (nondeterministic) forward produced a large attention output, poisoning the whole
+        // DiT (found at transformer_blocks.12.attn2.to_out). Keeping the restore in F32
+        // leaves a diverged forward finite; a healthy output (|x|≲1e3) is unaffected.
+        // See LTX-DETERMINISM-FLAGS-FOLLOWUPS.md.
         if (kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+        }
+        if (want_f16_out) {
+            // Bound to the F16 range before the to_out F16 store: identity for a healthy
+            // output, but a pathological (already-diverged) value is clamped to a finite
+            // number instead of casting to ±inf. Then store F16 for to_out's cheap quant.
+            out = ggml_clamp(ctx, out, -65504.0f, 65504.0f);
+            out = ggml_cast(ctx, out, GGML_TYPE_F16);
         }
         return out;
     };
@@ -2809,11 +2807,21 @@ protected:
                     if (src != dst) {
                         const bool use_staging_copy = src->view_src != nullptr || !ggml_is_contiguous(src) || src->buffer == nullptr;
                         if (use_staging_copy) {
+                            // The graph producer runs on runtime_backend's CUDA stream.  The
+                            // legacy tensor_get/tensor_set path uses cudaStreamPerThread, which
+                            // has no dependency on that producer; fence before crossing to the
+                            // host staging stream.
+                            ggml_backend_synchronize(runtime_backend);
                             std::vector<uint8_t> host_data(ggml_nbytes(src));
                             ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
                             ggml_backend_tensor_set(dst, host_data.data(), 0, host_data.size());
                         } else {
-                            ggml_backend_tensor_copy(src, dst);
+                            // Keep the D2D cache hand-off on the same stream as the segment
+                            // producer.  ggml_backend_tensor_copy() dispatches through the
+                            // buffer API on cudaStreamPerThread, so its copy can otherwise race
+                            // the just-enqueued producer kernels.  Apart from restoring the
+                            // required dependency this keeps the same D2D copy and cache layout.
+                            ggml_backend_tensor_copy_async(runtime_backend, runtime_backend, src, dst);
                         }
                     }
                 }
@@ -2934,11 +2942,16 @@ protected:
             }
             const bool use_staging_copy = src->view_src != nullptr || !ggml_is_contiguous(src) || src->buffer == nullptr;
             if (use_staging_copy) {
+                // See the direct D2D branch below: a host staging stream is not ordered
+                // behind the runtime producer stream by itself.
+                ggml_backend_synchronize(runtime_backend);
                 std::vector<uint8_t> host_data(ggml_nbytes(src));
                 ggml_backend_tensor_get(src, host_data.data(), 0, host_data.size());
                 ggml_backend_tensor_set(dst, host_data.data(), 0, host_data.size());
             } else {
-                ggml_backend_tensor_copy(src, dst);
+                // Queue on the producer/consumer runtime stream rather than the independent
+                // cudaStreamPerThread used by the synchronous buffer-copy helper.
+                ggml_backend_tensor_copy_async(runtime_backend, runtime_backend, src, dst);
             }
         }
         ggml_backend_synchronize(runtime_backend);
@@ -2989,11 +3002,13 @@ protected:
         }
 
         sd::Tensor<T> result(sd::shape_from_ggml(tensor));
-        if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor) || tensor->buffer == nullptr) {
-            ggml_backend_tensor_get(tensor, result.data(), 0, ggml_nbytes(tensor));
-        } else {
-            ggml_backend_tensor_get(tensor, result.data(), 0, ggml_nbytes(tensor));
-        }
+        // The final graph result feeds the CPU sampler immediately.  The synchronous
+        // buffer helper uses cudaStreamPerThread, which is independent of the runtime
+        // graph stream and can therefore copy a still-producing result.  Queue the D2H
+        // transfer on the runtime stream, after the graph, then wait for precisely that
+        // ordered stream before returning host-visible data.
+        ggml_backend_tensor_get_async(runtime_backend, tensor, result.data(), 0, ggml_nbytes(tensor));
+        ggml_backend_synchronize(runtime_backend);
         return result;
     }
 
@@ -3044,7 +3059,19 @@ protected:
                 continue;
             }
 
-            ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor));
+            // These are graph leaves (including the changing sampler state).  On CUDA the
+            // synchronous buffer helper submits its H2D transfer on cudaStreamPerThread,
+            // whereas the immediately following graph runs on runtime_backend's stream.
+            // There is no ordering edge between those streams, so a graph-cut segment could
+            // consume a partly copied external input.  Queue the transfer on the consuming
+            // stream instead: the subsequent graph compute is ordered naturally, with no
+            // device-wide fence or extra allocation.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, tensor, data, 0, ggml_nbytes(tensor));
+            } else {
+                ggml_backend_tensor_set(tensor, data, 0, ggml_nbytes(tensor));
+            }
         }
 
         if (clear_after_copy) {
@@ -3086,7 +3113,15 @@ protected:
         ggml_tensor* offload_t = ggml_get_first_tensor(offload_ctx);
 
         while (t != nullptr && offload_t != nullptr) {
-            ggml_backend_tensor_copy(t, offload_t);
+            // The CPU-resident source must be uploaded on the stream that will
+            // consume this weight.  The synchronous buffer helper uses
+            // cudaStreamPerThread and has no ordering edge to runtime_backend.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, offload_t, t->data, 0, ggml_nbytes(t));
+            } else {
+                ggml_backend_tensor_copy(t, offload_t);
+            }
             std::swap(t->buffer, offload_t->buffer);
             std::swap(t->data, offload_t->data);
             std::swap(t->extra, offload_t->extra);
@@ -3792,7 +3827,15 @@ protected:
             ggml_tensor* tensor         = pair.first;
             ggml_tensor* offload_tensor = pair.second;
 
-            ggml_backend_tensor_copy(tensor, offload_tensor);
+            // As above, queue the per-segment H2D copy on the consuming runtime
+            // stream.  The pointer exchange below does not alter the already
+            // enqueued source/destination addresses.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, offload_tensor, tensor->data, 0, ggml_nbytes(tensor));
+            } else {
+                ggml_backend_tensor_copy(tensor, offload_tensor);
+            }
             std::swap(tensor->buffer, offload_tensor->buffer);
             std::swap(tensor->data, offload_tensor->data);
             std::swap(tensor->extra, offload_tensor->extra);
@@ -4208,7 +4251,14 @@ protected:
             if (data_it == backend_tensor_data_map.end() || data_it->second == nullptr) {
                 continue;
             }
-            ggml_backend_tensor_set(copy, data_it->second, 0, ggml_nbytes(copy));
+            // Persistent graph inputs are consumed by the following segmented
+            // CUDA graph; keep their H2D transfer on that same stream too.
+            if ((sd_backend_is(runtime_backend, "CUDA") || sd_backend_is(runtime_backend, "ROCm") ||
+                 sd_backend_is(runtime_backend, "SYCL")) && !sd_backend_is_cpu(runtime_backend)) {
+                ggml_backend_tensor_set_async(runtime_backend, copy, data_it->second, 0, ggml_nbytes(copy));
+            } else {
+                ggml_backend_tensor_set(copy, data_it->second, 0, ggml_nbytes(copy));
+            }
             original->buffer = copy->buffer;
             original->data   = copy->data;
             original->extra  = copy->extra;
