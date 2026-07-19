@@ -2217,6 +2217,7 @@ struct GGMLRunnerContext {
     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
+    std::function<void(ggml_tensor*, const void*)> set_backend_tensor_data;
     // LTX modulation token-collapse (VRAM win): when the conditioned LTXAV path feeds the
     // blocks a COMPACT AdaLN modulation (computed on just the few UNIQUE per-token timestep
     // values), this I32[L_video] tensor maps each video token back to its unique column so
@@ -2261,6 +2262,13 @@ struct GGMLRunnerContext {
             return;
         }
         cache_tensor(name, tensor);
+    }
+
+    void bind_backend_tensor_data(ggml_tensor* tensor, const void* data) const {
+        if (!set_backend_tensor_data || tensor == nullptr || data == nullptr) {
+            return;
+        }
+        set_backend_tensor_data(tensor, data);
     }
 };
 
@@ -5347,6 +5355,9 @@ public:
         };
         runner_ctx.cache_tensor = [this](const std::string& name, ggml_tensor* tensor) {
             this->cache(name, tensor);
+        };
+        runner_ctx.set_backend_tensor_data = [this](ggml_tensor* t, const void* d) {
+            this->set_backend_tensor_data(t, d);
         };
         return runner_ctx;
     }

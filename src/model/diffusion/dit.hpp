@@ -161,6 +161,74 @@ namespace DiT {
         x = ggml_reshape_4d(ctx, x, pw * w_len, ph * h_len, pt * t_len, C * N);  // [N*C, t_len*pt, h_len*ph, w_len*pw]
         return x;
     }
+    inline ggml_tensor* patchify_3d(ggml_context* ctx,
+                                    ggml_tensor* x,
+                                    int pt,
+                                    int ph,
+                                    int pw,
+                                    int64_t N       = 1,
+                                    bool patch_last = true) {
+        // x: [N*C, T, H, W]
+        int64_t C     = x->ne[3] / N;
+        int64_t T     = x->ne[2];
+        int64_t H     = x->ne[1];
+        int64_t W     = x->ne[0];
+        int64_t t_len = T / pt;
+        int64_t h_len = H / ph;
+        int64_t w_len = W / pw;
+
+        GGML_ASSERT(C * N == x->ne[3]);
+        GGML_ASSERT(t_len * pt == T && h_len * ph == H && w_len * pw == W);
+
+        x = ggml_reshape_4d(ctx, x, pw * w_len, ph * h_len, pt, t_len * C * N);
+        x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx, x, pw * w_len, pt, ph, h_len * t_len * C * N);
+        x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx, x, pw, w_len, ph * pt, h_len * t_len * C * N);
+        x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx, x, pw * ph * pt, w_len * h_len * t_len, C, N);
+        if (patch_last) {
+            x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        } else {
+            x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 2, 0, 1, 3));
+        }
+        x = ggml_reshape_4d(ctx, x, pw * ph * pt * C, w_len * h_len * t_len, N, 1);
+        return x;
+    }
+
+    inline ggml_tensor* unpatchify_3d(ggml_context* ctx,
+                                      ggml_tensor* x,
+                                      int64_t t_len,
+                                      int64_t h_len,
+                                      int64_t w_len,
+                                      int pt,
+                                      int ph,
+                                      int pw,
+                                      bool patch_last = true) {
+        // x: [N, t_len*h_len*w_len, C*pt*ph*pw] (patch_last) or [N, ..., pt*ph*pw*C]
+        // return: [N*C, t_len*pt, h_len*ph, w_len*pw]
+        int64_t N = x->ne[2];
+        int64_t C = x->ne[0] / pt / ph / pw;
+
+        GGML_ASSERT(C * pt * ph * pw == x->ne[0]);
+
+        if (patch_last) {
+            x = ggml_reshape_4d(ctx, x, pw * ph * pt, C, w_len * h_len * t_len, N);
+            x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        } else {
+            x = ggml_reshape_4d(ctx, x, C, pw * ph * pt, w_len * h_len * t_len, N);
+            x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 1, 2, 0, 3));
+        }
+
+        x = ggml_reshape_4d(ctx, x, pw, ph * pt, w_len, h_len * t_len * C * N);
+        x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx, x, pw * w_len, ph, pt, h_len * t_len * C * N);
+        x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx, x, pw * w_len, pt, ph * h_len, t_len * C * N);
+        x = ggml_ext_cont(ctx, ggml_ext_torch_permute(ctx, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx, x, pw * w_len, ph * h_len, pt * t_len, C * N);
+        return x;
+    }
 }  // namespace DiT
 
 #endif  // __SD_MODEL_DIFFUSION_DIT_HPP__

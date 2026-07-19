@@ -544,6 +544,9 @@ SDVersion ModelLoader::get_sd_version() {
         if (tensor_storage.name.find("model.diffusion_model.adaln_single.emb.timestep_embedder.linear_1.bias") != std::string::npos) {
             return VERSION_LTXAV;
         }
+        if (tensor_storage.name.find("model.diffusion_model.patch_embedder.weight") != std::string::npos) {
+            return VERSION_LINGBOT_VIDEO;
+        }
         if (tensor_storage.name.find("model.diffusion_model.blocks.0.cross_attn.norm_k.weight") != std::string::npos) {
             is_wan = true;
         }

@@ -36,6 +36,7 @@
 // hunyuan.hpp pulls in mmdit.hpp's global ::modulate; include it AFTER ltxv.hpp so
 // LTXV::modulate is resolved before the global overload becomes visible (avoids ADL ambiguity).
 #include "model/diffusion/hunyuan.hpp"
+#include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/model.hpp"
 #include "model/diffusion/pid.hpp"
 #include "model/diffusion/qwen_image.hpp"
@@ -746,6 +747,24 @@ public:
                                                                                 tensor_storage_map,
                                                                                 "model.diffusion_model",
                                                                                 version);
+            } else if (sd_version_is_lingbot_video(version)) {
+                bool enable_vision = false;
+                for (const auto& [name, _] : tensor_storage_map) {
+                    if (starts_with(name, "text_encoders.llm.visual.")) {
+                        enable_vision = true;
+                        break;
+                    }
+                }
+                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                 params_backend_for(SDBackendModule::TE),
+                                                                 tensor_storage_map,
+                                                                 version,
+                                                                 "",
+                                                                 enable_vision);
+                diffusion_model  = std::make_shared<LingBotVideo::LingBotVideoRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                     params_backend_for(SDBackendModule::DIFFUSION),
+                                                                                     tensor_storage_map,
+                                                                                     "model.diffusion_model");
             } else if (sd_version_is_flux(version)) {
                 bool is_chroma = false;
                 for (auto pair : tensor_storage_map) {
@@ -1068,7 +1087,8 @@ public:
                            sd_version_is_qwen_image(version) ||
                            sd_version_is_anima(version) ||
                            sd_version_is_longcat_avatar(version) ||
-                           sd_version_is_krea2(version)) {
+                           sd_version_is_krea2(version) ||
+                           sd_version_is_lingbot_video(version)) {
                     return std::make_shared<WAN::WanVAERunner>(backend_for(SDBackendModule::VAE),
                                                                params_backend_for(SDBackendModule::VAE),
                                                                tensor_storage_map,
@@ -1639,7 +1659,8 @@ public:
                            sd_version_is_z_image(version) ||
                            sd_version_is_pid(version) ||
                            sd_version_is_ideogram4(version) ||
-                           sd_version_is_boogu_image(version)) {
+                           sd_version_is_boogu_image(version) ||
+                           sd_version_is_lingbot_video(version)) {
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
                         default_flow_shift = 5.f;
@@ -3053,7 +3074,7 @@ public:
                 hunyuan_timestep_r_tensor = sd::Tensor<float>({1}, std::vector<float>{sigmas[step + 1]});
             }
             sd::Tensor<float> noised_input = x * c_in;
-            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || version == VERSION_WAN2_2_I2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version))) {
+            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || version == VERSION_WAN2_2_I2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version) || sd_version_is_lingbot_video(version))) {
                 // ai2v: the first num_cond_latents temporal latent frames ARE the
                 // VAE-encoded reference image and must be held fixed (mask=0) through
                 // the whole denoise loop; only the generated frames (mask=1) evolve.
@@ -3562,7 +3583,7 @@ public:
     int get_diffusion_model_down_factor() {
         int down_factor = 8;  // unet
         if (sd_version_is_dit(version)) {
-            if (sd_version_is_wan(version) || sd_version_is_longcat_avatar(version)) {
+            if (sd_version_is_wan(version) || sd_version_is_longcat_avatar(version) || sd_version_is_lingbot_video(version)) {
                 down_factor = 2;
             } else {
                 down_factor = 1;
@@ -9172,6 +9193,31 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
         int64_t t2 = ggml_time_ms();
         LOG_INFO("continuation latent conditioning prepared, taking %" PRId64 " ms", t2 - t1);
+    } else if (sd_version_is_lingbot_video(sd_ctx->sd->version) && !start_image.empty()) {
+        // LingBot Video IMG2VID: encode the start frame to the first temporal latent
+        // frame(s) and hold them fixed via the denoise mask (=0). Mirrors the proven
+        // longcat_avatar AI2V latent-prep. NOTE: upstream additionally feeds the start
+        // image to the VLM conditioner as a ref image with AREA resize; the fork's
+        // ConditionerParams has no RefImageParams/RefImageResizeMode, so that VLM
+        // ref-conditioning path is deferred (t2v is unaffected; i2v conditions on text).
+        LOG_INFO("LingBot Video IMG2VID (init-latent conditioning)");
+
+        int64_t t1             = ggml_time_ms();
+        auto init_img          = start_image.reshape({start_image.shape()[0], start_image.shape()[1], 1, start_image.shape()[2], 1});
+        auto init_image_latent = sd_ctx->sd->encode_first_stage(init_img);
+        if (init_image_latent.empty()) {
+            LOG_ERROR("failed to encode init video frame");
+            return std::nullopt;
+        }
+
+        latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+        sd::ops::slice_assign(&latents.init_latent, 2, 0, init_image_latent.shape()[2], init_image_latent);
+
+        latents.denoise_mask = sd::full<float>({latents.init_latent.shape()[0], latents.init_latent.shape()[1], latents.init_latent.shape()[2], 1, 1}, 1.f);
+        sd::ops::fill_slice(&latents.denoise_mask, 2, 0, init_image_latent.shape()[2], 0.0f);
+
+        int64_t t2 = ggml_time_ms();
+        LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
     } else if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !start_image.empty()) {
         // ai2v: the reference portrait is VAE-encoded to ONE temporal cond latent
         // (num_cond_latents = 1), prepended as the first latent frame; generated
