@@ -49,9 +49,15 @@ NATIVE_HIGH_ATLAS="${NATIVE_HIGH_ATLAS:-2048}"
 run_texture_level() {
   local name="$1" faces="$2" resolution="$3" atlas="$4"
   local out="$OUT/native_${name}_textured.glb"
+  local dump_args=()
+  # Retain the decoded native PBR volume when requested, enabling CPU-only rebakes of the exact
+  # same material later. Off by default because three LOD dumps are large; it never affects output.
+  if [[ "${NATIVE_TEXTURE_DUMP:-0}" != 0 ]]; then
+    dump_args=(--dump-dir "$OUT/native_${name}_texture_dump")
+  fi
   echo "== $LABEL: native $name (${faces} faces, ${atlas}px atlas) =="
   "$CP/shootout/native_texture_run.sh" "$REFINED" "$IMAGE" "$out" \
-    --resolution "$resolution" --texsize "$atlas" --decimate "$faces"
+    --resolution "$resolution" --texsize "$atlas" --decimate "$faces" "${dump_args[@]}"
   "$CP/mesh_topo" "$out"
 }
 
