@@ -1,291 +1,187 @@
-// voxelizer.hpp — C++ port of o_voxel.convert.mesh_to_flexible_dual_grid (the FORWARD
-// voxelizer / flexible dual-grid contouring) for the Pixal3D rung-1 native texturing path.
+// voxelizer.hpp — native, source-level port of o_voxel's flexible dual-grid
+// forward conversion.  This is the input contract for the native Pixal3D
+// texture path: no Python/o_voxel is used at production time.
 //
-// Produces the EXACT input the already-ported shape_slat_encoder.hpp consumes:
-//   coords [N,3] int32  (grid cell index, batch added by caller)
-//   dual_vertices [N,3] f32  in-cell offset in [0,1] (mesh vertex = (coord+dual)*voxel_size + aabb0)
-//   intersected [N,3] int8  per-axis quad flag (matches the inverse svae::flexible_dual_grid_to_mesh)
-//
-// Reference: o_voxel _C.mesh_to_flexible_dual_grid_cpu (closed .so). nm reveals it is a
-// per-cell QEF accumulated as Eigen 4x4 matrices and solved with ColPivHouseholderQR over a
-// 3x3, with face_qef (incident triangle planes), boundry_qef (boundary pull, weight bw) and
-// intersect_qef (edge-crossing flags + dual). We reproduce the same math in fp32:
-//   minimise  fw*sum_i (n_i . (x - p_i))^2  +  reg*||x - center||^2   (+ boundary, see below)
-//   normal eqns:  (fw*A + reg*I) x = fw*b + reg*center,  A = sum n n^T, b = sum n (n.p)
-// x is in local cell coords [0,1] (origin at the cell's min corner); clamp to [0,1].
-//
-// CONVENTIONS (matched to sparse_vae.hpp inverse + the captured golden):
-//   grid units: g = (vertex - aabb_min) / voxel_size  (voxel_size = (aabb_max-aabb_min)/grid_size)
-//   cell c occupies [c, c+1) in grid units; dual offset = x_local in [0,1]; coord = c.
-//   intersected[c][axis] = 1 iff the surface crosses the grid edge starting at the cell's
-//     min-corner going +axis (i.e. a triangle separates samples c and c+e_axis) -> the inverse
-//     emits a dual quad spanning the 4 cells around that edge.
-//
-// Header-only, fp32, OpenMP. No Eigen dependency (hand-rolled 3x3 solve via Cramer/cofactor
-// with a symmetric fallback) — the system is tiny (3x3 SPD after +reg*I).
+// The important detail is that o_voxel's active cells and QEFs come from three
+// passes: scan-line edge intersections (which establish topology and Hermite
+// samples), face QEFs, and optional open-boundary QEFs.  A triangle/AABB-only
+// approximation looks superficially similar but shifts the dual coordinates
+// enough to perturb the learned shape encoder.  Keep this in lockstep with
+// o-voxel/src/convert/flexible_dual_grid.cpp.
 #pragma once
-#include <cstdint>
-#include <cstddef>
-#include <cmath>
-#include <vector>
-#include <array>
-#include <unordered_map>
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
 
 namespace vox {
 
 struct VoxelOut {
-    std::vector<int32_t> coords;       // [N*3]
-    std::vector<float>   dual;         // [N*3]
-    std::vector<int8_t>  intersected;  // [N*3]
+    std::vector<int32_t> coords;       // [N,3]
+    std::vector<float> dual;           // [N,3], local offset in [0,1]
+    std::vector<int8_t> intersected;   // [N,3]
     int N = 0;
 };
 
-// 64-bit cell key (x,y,z) each < 2^20 (grid up to 1M) — matches svae::coord_key(0,x,y,z) shape.
 static inline int64_t cell_key(int32_t x, int32_t y, int32_t z) {
-    auto m = [](int32_t v) { return (int64_t)(v & 0xFFFFF); };
+    auto m=[](int32_t v){ return (int64_t)(v & 0xFFFFF); };
     return (((m(x) << 20) | m(y)) << 20) | m(z);
 }
 
-// Per-cell QEF accumulator (face term). A is symmetric 3x3 (upper stored), b is 3-vec.
+// Symmetric QEF stored as A (upper triangular) and b where the objective is
+// x^T A x - 2 b^T x + constant.  sum/count are o_voxel's intersect means.
 struct Cell {
-    double A[6];   // a00,a01,a02,a11,a12,a22
-    double b[3];
-    double mass[3];  // sum of plane through-points (local) -> mean is the regularization target
-    int    nplanes;
-    Cell() : A{0,0,0,0,0,0}, b{0,0,0}, mass{0,0,0}, nplanes(0) {}
-    inline void add_plane(const double n[3], double d, const double p[3]) {  // n.x = d
+    double A[6] = {0,0,0,0,0,0}; // 00,01,02,11,12,22
+    double b[3] = {0,0,0};
+    double sum[3] = {0,0,0};
+    int count = 0;
+    void add_plane(const double n[3], double d, const double p[3], bool sample) {
         A[0]+=n[0]*n[0]; A[1]+=n[0]*n[1]; A[2]+=n[0]*n[2];
         A[3]+=n[1]*n[1]; A[4]+=n[1]*n[2]; A[5]+=n[2]*n[2];
-        b[0]+=n[0]*d;    b[1]+=n[1]*d;    b[2]+=n[2]*d;
-        mass[0]+=p[0]; mass[1]+=p[1]; mass[2]+=p[2];
-        nplanes++;
+        b[0]+=n[0]*d; b[1]+=n[1]*d; b[2]+=n[2]*d;
+        if (sample) { for(int a=0;a<3;a++) sum[a]+=p[a]; ++count; }
+    }
+    void add_line(const double a[6], const double bb[3], double weight) {
+        for(int i=0;i<6;i++) A[i]+=weight*a[i];
+        for(int i=0;i<3;i++) b[i]+=weight*bb[i];
     }
 };
 
-// solve symmetric 3x3 (A stored upper) * x = b. A is SPD after +reg*I. Returns x.
-static inline void solve3x3_sym(const double A[6], const double b[3], double x[3]) {
-    // full matrix
-    double m[3][3] = {{A[0],A[1],A[2]},{A[1],A[3],A[4]},{A[2],A[4],A[5]}};
-    double det = m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
-               - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
-               + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
-    if (std::fabs(det) < 1e-20) { x[0]=x[1]=x[2]=0; return; }
-    double inv = 1.0/det;
-    // adjugate (symmetric) * b
-    double c00 =  (m[1][1]*m[2][2]-m[1][2]*m[2][1]);
-    double c01 = -(m[1][0]*m[2][2]-m[1][2]*m[2][0]);
-    double c02 =  (m[1][0]*m[2][1]-m[1][1]*m[2][0]);
-    double c11 =  (m[0][0]*m[2][2]-m[0][2]*m[2][0]);
-    double c12 = -(m[0][0]*m[2][1]-m[0][1]*m[2][0]);
-    double c22 =  (m[0][0]*m[1][1]-m[0][1]*m[1][0]);
-    // inverse = adj^T / det ; for symmetric input the cofactor matrix is symmetric
-    x[0] = inv*(c00*b[0] + c01*b[1] + c02*b[2]);
-    x[1] = inv*(c01*b[0] + c11*b[1] + c12*b[2]);
-    x[2] = inv*(c02*b[0] + c12*b[1] + c22*b[2]);
-}
-
-// Exact minimizer of a positive-definite QEF on the unit cell.  Clamping the
-// unconstrained 3D answer is not equivalent when only one/two axes cross the
-// cell boundary: the reference enumerates those active constraints and solves
-// the remaining 2D/1D QEF.  There are only 3^3 active sets, so this is both
-// robust and negligible beside triangle voxelization.
-static inline void solve_qef_unit_box(const double A[6], const double b[3], double out[3]) {
+static inline void solve3(const double A[6], const double b[3], double x[3]) {
     double m[3][3]={{A[0],A[1],A[2]},{A[1],A[3],A[4]},{A[2],A[4],A[5]}};
-    double best=1e300, bx[3]={0.5,0.5,0.5};
-    for (int sx=-1;sx<=1;sx++) for (int sy=-1;sy<=1;sy++) for (int sz=-1;sz<=1;sz++) {
-        int st[3]={sx,sy,sz}; double x[3]={0,0,0}; int free_ax[3], nf=0;
-        for(int a=0;a<3;a++) { if(st[a]<0) free_ax[nf++]=a; else x[a]=(double)st[a]; }
+    double det=m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+              -m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+              +m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+    if (std::fabs(det)<1e-20) { x[0]=x[1]=x[2]=0; return; }
+    double inv=1.0/det;
+    double c00=m[1][1]*m[2][2]-m[1][2]*m[2][1];
+    double c01=m[1][2]*m[2][0]-m[1][0]*m[2][2];
+    double c02=m[1][0]*m[2][1]-m[1][1]*m[2][0];
+    double c11=m[0][0]*m[2][2]-m[0][2]*m[2][0];
+    double c12=m[0][2]*m[1][0]-m[0][0]*m[2][1];
+    double c22=m[0][0]*m[1][1]-m[0][1]*m[1][0];
+    x[0]=inv*(c00*b[0]+c01*b[1]+c02*b[2]);
+    x[1]=inv*(c01*b[0]+c11*b[1]+c12*b[2]);
+    x[2]=inv*(c02*b[0]+c12*b[1]+c22*b[2]);
+}
+
+// Exact unit-cell constrained minimizer.  o_voxel tries each boundary
+// dimensionality after its unconstrained QR solve; enumerating all active sets
+// yields the same minimizer and is stable for the tiny regularized system.
+static inline void solve_unit_box(const double A[6], const double b[3], double out[3]) {
+    double m[3][3]={{A[0],A[1],A[2]},{A[1],A[3],A[4]},{A[2],A[4],A[5]}};
+    double best=1e300, ans[3]={.5,.5,.5};
+    for(int sx=-1;sx<=1;sx++) for(int sy=-1;sy<=1;sy++) for(int sz=-1;sz<=1;sz++) {
+        int st[3]={sx,sy,sz}, fr[3], nf=0; double x[3]={0,0,0};
+        for(int a=0;a<3;a++) { if(st[a]<0) fr[nf++]=a; else x[a]=(double)st[a]; }
         double rhs[3]={0,0,0};
-        for(int ii=0;ii<nf;ii++) { int a=free_ax[ii]; rhs[ii]=b[a]; for(int q=0;q<3;q++) if(st[q]>=0) rhs[ii]-=m[a][q]*x[q]; }
+        for(int i=0;i<nf;i++) { int a=fr[i]; rhs[i]=b[a]; for(int q=0;q<3;q++) if(st[q]>=0) rhs[i]-=m[a][q]*x[q]; }
         bool ok=true;
-        if(nf==1) { double d=m[free_ax[0]][free_ax[0]]; if(std::fabs(d)<1e-20) ok=false; else x[free_ax[0]]=rhs[0]/d; }
-        else if(nf==2) { int a=free_ax[0], c=free_ax[1]; double d=m[a][a]*m[c][c]-m[a][c]*m[a][c]; if(std::fabs(d)<1e-20) ok=false; else { x[a]=(rhs[0]*m[c][c]-m[a][c]*rhs[1])/d; x[c]=(m[a][a]*rhs[1]-m[a][c]*rhs[0])/d; } }
-        else if(nf==3) solve3x3_sym(A,rhs,x);
+        if(nf==1) { double d=m[fr[0]][fr[0]]; if(std::fabs(d)<1e-20) ok=false; else x[fr[0]]=rhs[0]/d; }
+        else if(nf==2) { int a=fr[0], c=fr[1]; double d=m[a][a]*m[c][c]-m[a][c]*m[a][c]; if(std::fabs(d)<1e-20) ok=false; else { x[a]=(rhs[0]*m[c][c]-m[a][c]*rhs[1])/d; x[c]=(m[a][a]*rhs[1]-m[a][c]*rhs[0])/d; } }
+        else if(nf==3) solve3(A,rhs,x);
         if(!ok) continue;
-        for(int a=0;a<3;a++) if(x[a] < -1e-9 || x[a] > 1.0+1e-9) ok=false;
+        for(int a=0;a<3;a++) if(x[a]<-1e-8 || x[a]>1.0+1e-8) ok=false;
         if(!ok) continue;
-        double q=0; for(int a=0;a<3;a++) { q-=2.0*b[a]*x[a]; for(int c=0;c<3;c++)q+=x[a]*m[a][c]*x[c]; }
-        if(q<best) { best=q; bx[0]=std::max(0.0,std::min(1.0,x[0])); bx[1]=std::max(0.0,std::min(1.0,x[1])); bx[2]=std::max(0.0,std::min(1.0,x[2])); }
+        double q=0; for(int a=0;a<3;a++) { q-=2*b[a]*x[a]; for(int c=0;c<3;c++) q+=x[a]*m[a][c]*x[c]; }
+        if(q<best) { best=q; for(int a=0;a<3;a++) ans[a]=std::max(0.0,std::min(1.0,x[a])); }
     }
-    out[0]=bx[0]; out[1]=bx[1]; out[2]=bx[2];
+    for(int a=0;a<3;a++) out[a]=ans[a];
 }
 
-// ---- triangle / axis-aligned cell-box overlap (Akenine-Moller SAT) ----
-// boxcenter in grid units, boxhalf = 0.5 (unit cell). tri verts in grid units relative to boxcenter.
-static inline bool plane_box_overlap(const double n[3], const double v[3], double maxbox) {
-    double vmin[3], vmax[3];
-    for (int q = 0; q < 3; q++) {
-        if (n[q] > 0) { vmin[q] = -maxbox - v[q]; vmax[q] = maxbox - v[q]; }
-        else          { vmin[q] =  maxbox - v[q]; vmax[q] = -maxbox - v[q]; }
-    }
-    if (n[0]*vmin[0]+n[1]*vmin[1]+n[2]*vmin[2] > 0) return false;
-    if (n[0]*vmax[0]+n[1]*vmax[1]+n[2]*vmax[2] >= 0) return true;
-    return false;
-}
-static inline bool tri_box_overlap(const double bc[3], double bh,
-                                   const double t0[3], const double t1[3], const double t2[3]) {
-    double v0[3],v1[3],v2[3],e0[3],e1[3],e2[3];
-    for (int i=0;i<3;i++){ v0[i]=t0[i]-bc[i]; v1[i]=t1[i]-bc[i]; v2[i]=t2[i]-bc[i]; }
-    for (int i=0;i<3;i++){ e0[i]=v1[i]-v0[i]; e1[i]=v2[i]-v1[i]; e2[i]=v0[i]-v2[i]; }
-    double fex,fey,fez,p0,p1,p2,rad,mn,mx;
-    #define AXISTEST_X(a,b,fa,fb,va,vb) \
-        p0=a*va[1]-b*va[2]; p2=a*vb[1]-b*vb[2]; mn=p0<p2?p0:p2; mx=p0<p2?p2:p0; \
-        rad=fa*bh+fb*bh; if(mn>rad||mx<-rad) return false;
-    #define AXISTEST_Y(a,b,fa,fb,va,vb) \
-        p0=-a*va[0]+b*va[2]; p2=-a*vb[0]+b*vb[2]; mn=p0<p2?p0:p2; mx=p0<p2?p2:p0; \
-        rad=fa*bh+fb*bh; if(mn>rad||mx<-rad) return false;
-    #define AXISTEST_Z(a,b,fa,fb,va,vb) \
-        p0=a*va[0]-b*va[1]; p2=a*vb[0]-b*vb[1]; mn=p0<p2?p0:p2; mx=p0<p2?p2:p0; \
-        rad=fa*bh+fb*bh; if(mn>rad||mx<-rad) return false;
-    fex=std::fabs(e0[0]); fey=std::fabs(e0[1]); fez=std::fabs(e0[2]);
-    AXISTEST_X(e0[2],e0[1],fez,fey,v0,v2) AXISTEST_Y(e0[2],e0[0],fez,fex,v0,v2) AXISTEST_Z(e0[1],e0[0],fey,fex,v1,v2)
-    fex=std::fabs(e1[0]); fey=std::fabs(e1[1]); fez=std::fabs(e1[2]);
-    AXISTEST_X(e1[2],e1[1],fez,fey,v0,v2) AXISTEST_Y(e1[2],e1[0],fez,fex,v0,v2) AXISTEST_Z(e1[1],e1[0],fey,fex,v0,v1)
-    fex=std::fabs(e2[0]); fey=std::fabs(e2[1]); fez=std::fabs(e2[2]);
-    AXISTEST_X(e2[2],e2[1],fez,fey,v0,v1) AXISTEST_Y(e2[2],e2[0],fez,fex,v0,v1) AXISTEST_Z(e2[1],e2[0],fey,fex,v1,v2)
-    #undef AXISTEST_X
-    #undef AXISTEST_Y
-    #undef AXISTEST_Z
-    for (int i=0;i<3;i++){
-        mn=mx=v0[i];
-        if(v1[i]<mn)mn=v1[i]; if(v1[i]>mx)mx=v1[i];
-        if(v2[i]<mn)mn=v2[i]; if(v2[i]>mx)mx=v2[i];
-        if(mn>bh||mx<-bh) return false;
-    }
-    double nrm[3]; nrm[0]=e0[1]*e1[2]-e0[2]*e1[1]; nrm[1]=e0[2]*e1[0]-e0[0]*e1[2]; nrm[2]=e0[0]*e1[1]-e0[1]*e1[0];
-    if(!plane_box_overlap(nrm,v0,bh)) return false;
-    return true;
+static inline double lerp(double a,double b,double t,double va,double vb) {
+    return a==b ? va : (1.0-(t-a)/(b-a))*va + ((t-a)/(b-a))*vb;
 }
 
-// Does the unit grid edge `o -> o + e_axis` pierce a triangle?  This is the
-// direct-mesh equivalent of o_voxel's `intersect_qef` edge walk.  The usual
-// Möller-Trumbore test is sufficient here: flags are a union across triangles,
-// so shared-edge hits are intentionally idempotent.
-static inline bool grid_edge_hits_tri(const double o[3], int axis,
-                                      const double p0[3], const double p1[3], const double p2[3]) {
-    double d[3]={0,0,0}; d[axis]=1;
-    double e1[3]={p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]};
-    double e2[3]={p2[0]-p0[0],p2[1]-p0[1],p2[2]-p0[2]};
-    double h[3]={d[1]*e2[2]-d[2]*e2[1],d[2]*e2[0]-d[0]*e2[2],d[0]*e2[1]-d[1]*e2[0]};
-    double det=e1[0]*h[0]+e1[1]*h[1]+e1[2]*h[2];
-    if(std::fabs(det)<1e-12) return false;
-    double inv=1.0/det, s[3]={o[0]-p0[0],o[1]-p0[1],o[2]-p0[2]};
-    double u=(s[0]*h[0]+s[1]*h[1]+s[2]*h[2])*inv;
-    if(u < -1e-8 || u > 1.0+1e-8) return false;
-    double q[3]={s[1]*e1[2]-s[2]*e1[1],s[2]*e1[0]-s[0]*e1[2],s[0]*e1[1]-s[1]*e1[0]};
-    double v=(d[0]*q[0]+d[1]*q[1]+d[2]*q[2])*inv;
-    if(v < -1e-8 || u+v > 1.0+1e-8) return false;
-    double t=(e2[0]*q[0]+e2[1]*q[1]+e2[2]*q[2])*inv;
-    return t >= -1e-8 && t <= 1.0+1e-8;
-}
-
-// Forward voxelizer. verts: V*3, faces: F*3. grid_size/aabb per-axis. fw/bw/reg as the pipeline.
 inline VoxelOut mesh_to_flexible_dual_grid(
         const float* verts, int V, const int32_t* faces, int F,
         const int grid_size[3], const float aabb_min[3], const float aabb_max[3],
         float face_weight, float boundary_weight, float regularization_weight) {
-    double vsize[3];
-    for (int a=0;a<3;a++) vsize[a] = (double)(aabb_max[a]-aabb_min[a]) / grid_size[a];
-
-    // verts -> grid units
+    // Work in grid units. This is algebraically the source's shifted-world
+    // formulation with voxel_size=(aabb_max-aabb_min)/grid_size.
+    double scale[3]; for(int a=0;a<3;a++) scale[a]=grid_size[a]/(double)(aabb_max[a]-aabb_min[a]);
     std::vector<double> g((size_t)V*3);
-    for (int i=0;i<V;i++) for (int a=0;a<3;a++)
-        g[(size_t)i*3+a] = ((double)verts[(size_t)i*3+a] - aabb_min[a]) / vsize[a];
+    for(int i=0;i<V;i++) for(int a=0;a<3;a++) g[(size_t)i*3+a]=((double)verts[(size_t)i*3+a]-aabb_min[a])*scale[a];
 
-    std::unordered_map<int64_t,int> idx;           // cell key -> index
-    idx.reserve((size_t)F*4);
-    std::vector<int32_t> cc;                        // cell coords [N*3]
-    std::vector<Cell>    cells;
-    cc.reserve((size_t)F*6); cells.reserve((size_t)F*6);
-
-    auto get_cell = [&](int32_t x,int32_t y,int32_t z)->int {
-        int64_t k = cell_key(x,y,z);
-        auto it = idx.find(k);
-        if (it!=idx.end()) return it->second;
-        int id=(int)cells.size();
-        idx.emplace(k,id);
-        cc.push_back(x); cc.push_back(y); cc.push_back(z);
-        cells.emplace_back();
-        return id;
+    std::unordered_map<int64_t,int> index; index.reserve((size_t)F*4);
+    std::vector<int32_t> coords; coords.reserve((size_t)F*6);
+    std::vector<Cell> cells; cells.reserve((size_t)F*6);
+    std::vector<int8_t> flags;
+    auto get_cell=[&](int x,int y,int z) {
+        int64_t k=cell_key(x,y,z); auto it=index.find(k); if(it!=index.end()) return it->second;
+        int id=(int)cells.size(); index.emplace(k,id); coords.push_back(x); coords.push_back(y); coords.push_back(z);
+        cells.emplace_back(); flags.insert(flags.end(),{0,0,0}); return id;
     };
 
-    for (int f=0; f<F; f++) {
-        int i0=faces[f*3+0], i1=faces[f*3+1], i2=faces[f*3+2];
-        const double *p0=&g[(size_t)i0*3], *p1=&g[(size_t)i1*3], *p2=&g[(size_t)i2*3];
-        // triangle plane in grid units: n.(x-p0)=0  => n.x = n.p0
-        double e0[3]={p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]};
-        double e1[3]={p2[0]-p0[0],p2[1]-p0[1],p2[2]-p0[2]};
-        double n[3]={e0[1]*e1[2]-e0[2]*e1[1], e0[2]*e1[0]-e0[0]*e1[2], e0[0]*e1[1]-e0[1]*e1[0]};
-        double nl = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
-        if (nl < 1e-30) continue;                  // degenerate
-        double nn[3]={n[0]/nl,n[1]/nl,n[2]/nl};
-        // bbox of triangle in cells
-        double mn[3],mx[3];
-        for (int a=0;a<3;a++){ mn[a]=std::min(p0[a],std::min(p1[a],p2[a])); mx[a]=std::max(p0[a],std::max(p1[a],p2[a])); }
-        int lo[3],hi[3];
-        for (int a=0;a<3;a++){
-            lo[a]=(int)std::floor(mn[a]); hi[a]=(int)std::floor(mx[a]);
-            if(lo[a]<0)lo[a]=0; if(hi[a]>=grid_size[a])hi[a]=grid_size[a]-1;
-        }
-        for (int z=lo[2]; z<=hi[2]; z++)
-        for (int y=lo[1]; y<=hi[1]; y++)
-        for (int x=lo[0]; x<=hi[0]; x++) {
-            double bc[3]={x+0.5,y+0.5,z+0.5};
-            if (!tri_box_overlap(bc,0.5,p0,p1,p2)) continue;
-            int id=get_cell(x,y,z);
-            // plane in LOCAL cell coords: cell min corner at (x,y,z); x_local = x_grid - corner.
-            // n . x_grid = d_grid (d_grid = nn.p0). local: n . (x_local + corner) = d_grid
-            //   => n . x_local = d_grid - n.corner
-            double d_local = (nn[0]*p0[0]+nn[1]*p0[1]+nn[2]*p0[2]) - (nn[0]*x + nn[1]*y + nn[2]*z);
-            // through-point: projection of cell center (0.5,0.5,0.5 local) onto the plane n.x=d_local
-            double cdot = nn[0]*0.5+nn[1]*0.5+nn[2]*0.5;
-            double t = d_local - cdot;
-            double pp[3] = {0.5+nn[0]*t, 0.5+nn[1]*t, 0.5+nn[2]*t};
-            cells[id].add_plane(nn, d_local, pp);
+    // o_voxel::intersect_qef: scan all three axis projections. Besides exact
+    // occupancy/intersection flags, these repeated plane samples are the QEF's
+    // primary term and its regularization target.
+    for(int fi=0;fi<F;fi++) {
+        const double* v0=&g[(size_t)faces[fi*3+0]*3]; const double* v1=&g[(size_t)faces[fi*3+1]*3]; const double* v2=&g[(size_t)faces[fi*3+2]*3];
+        double e0[3]={v1[0]-v0[0],v1[1]-v0[1],v1[2]-v0[2]}, e1[3]={v2[0]-v1[0],v2[1]-v1[1],v2[2]-v1[2]};
+        double n[3]={e0[1]*e1[2]-e0[2]*e1[1],e0[2]*e1[0]-e0[0]*e1[2],e0[0]*e1[1]-e0[1]*e1[0]};
+        double nl=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if(nl<1e-30) continue;
+        for(double& q:n) q/=nl;
+        double d=n[0]*v0[0]+n[1]*v0[1]+n[2]*v0[2];
+        for(int ax2=0;ax2<3;ax2++) {
+            int ax0=(ax2+1)%3, ax1=(ax2+2)%3;
+            struct T { double x,y,z; } t[3]={{v0[ax0],v0[ax1],v0[ax2]},{v1[ax0],v1[ax1],v1[ax2]},{v2[ax0],v2[ax1],v2[ax2]}};
+            std::sort(t,t+3,[](const T& a,const T& b){return a.y<b.y;});
+            int start=std::clamp((int)t[0].y,0,grid_size[ax1]-1), mid=std::clamp((int)t[1].y,0,grid_size[ax1]-1), end=std::clamp((int)t[2].y,0,grid_size[ax1]-1);
+            auto half=[&](int ys,int ye,const T& a,const T& b,const T& c) {
+                for(int yi=ys;yi<ye;yi++) {
+                    double y=yi+1; double t3x=lerp(a.y,b.y,y,a.x,b.x), t3z=lerp(a.y,b.y,y,a.z,b.z), t4x=lerp(a.y,c.y,y,a.x,c.x), t4z=lerp(a.y,c.y,y,a.z,c.z);
+                    if(t3x>t4x){std::swap(t3x,t4x);std::swap(t3z,t4z);} int xs=std::clamp((int)t3x,0,grid_size[ax0]-1), xe=std::clamp((int)t4x,0,grid_size[ax0]-1);
+                    for(int xi=xs;xi<xe;xi++) { double x=xi+1, z=lerp(t3x,t4x,x,t3z,t4z); int zi=(int)z; if(zi<0||zi>=grid_size[ax2]) continue;
+                        double p[3]; p[ax0]=x;p[ax1]=y;p[ax2]=z;
+                        for(int dx=0;dx<2;dx++) for(int dy=0;dy<2;dy++) { int cc[3];cc[ax0]=xi+dx;cc[ax1]=yi+dy;cc[ax2]=zi; int id=get_cell(cc[0],cc[1],cc[2]); cells[id].add_plane(n,d,p,true); if(dx==0&&dy==0) flags[(size_t)id*3+ax2]=1; }
+                    }
+                }
+            };
+            half(start,mid,t[0],t[1],t[2]); half(mid,end,t[2],t[1],t[0]);
         }
     }
 
-    int N=(int)cells.size();
-    VoxelOut out; out.N=N;
-    out.coords = std::move(cc);
-    out.dual.resize((size_t)N*3);
-    out.intersected.assign((size_t)N*3, 0);
-
-    // solve QEF per cell
-    const double reg = regularization_weight, fw = face_weight;
-#pragma omp parallel for schedule(static)
-    for (int i=0;i<N;i++) {
-        Cell& c=cells[i];
-        // regularize toward the mass point (mean of plane through-points) — Lindstrom QEF; this
-        // pins the under-constrained directions to the local surface position (matches o_voxel,
-        // whose dual tracks the surface, not the cell center).
-        double mp[3]={0.5,0.5,0.5};
-        if (c.nplanes>0){ mp[0]=c.mass[0]/c.nplanes; mp[1]=c.mass[1]/c.nplanes; mp[2]=c.mass[2]/c.nplanes; }
-        double A[6]={fw*c.A[0]+reg, fw*c.A[1], fw*c.A[2], fw*c.A[3]+reg, fw*c.A[4], fw*c.A[5]+reg};
-        double b[3]={fw*c.b[0]+reg*mp[0], fw*c.b[1]+reg*mp[1], fw*c.b[2]+reg*mp[2]};
-        double x[3]; solve_qef_unit_box(A,b,x);
-        for (int a=0;a<3;a++) out.dual[(size_t)i*3+a]=(float)x[a];
-    }
-    (void)boundary_weight;  // no topological boundary edges in the production meshes audited so far
-    // Mark the actual grid edges pierced by the input surface.  A flag is stored
-    // on the lower of the four dual cells around that edge (not on the edge's
-    // physical start cell): x -> start-(0,1,1), y -> start-(1,0,1),
-    // z -> start-(1,1,0).  This is exactly the offset table consumed by
-    // flexible_dual_grid_to_mesh.
-    for (int f=0; f<F; f++) {
-        const double *p0=&g[(size_t)faces[f*3+0]*3], *p1=&g[(size_t)faces[f*3+1]*3], *p2=&g[(size_t)faces[f*3+2]*3];
-        double mn[3],mx[3]; for(int a=0;a<3;a++){mn[a]=std::min(p0[a],std::min(p1[a],p2[a]));mx[a]=std::max(p0[a],std::max(p1[a],p2[a]));}
-        int lo[3],hi[3]; for(int a=0;a<3;a++){lo[a]=std::max(0,(int)std::floor(mn[a])-1);hi[a]=std::min(grid_size[a]-1,(int)std::ceil(mx[a])+1);}
-        for(int axis=0;axis<3;axis++)
-        for(int z=lo[2];z<=hi[2];z++) for(int y=lo[1];y<=hi[1];y++) for(int x=lo[0];x<=hi[0];x++) {
-            int fx=x-(axis!=0), fy=y-(axis!=1), fz=z-(axis!=2);
-            auto it=idx.find(cell_key(fx,fy,fz)); if(it==idx.end()) continue;
-            double o[3]={(double)x,(double)y,(double)z};
-            if(grid_edge_hits_tri(o,axis,p0,p1,p2)) out.intersected[(size_t)it->second*3+axis]=1;
+    // o_voxel::face_qef. The source uses face_weight as an on/off gate (the
+    // face Q itself is unscaled), so preserve that contract exactly.
+    if(face_weight>0) for(int fi=0;fi<F;fi++) {
+        const double* v0=&g[(size_t)faces[fi*3+0]*3]; const double* v1=&g[(size_t)faces[fi*3+1]*3]; const double* v2=&g[(size_t)faces[fi*3+2]*3];
+        double e0[3]={v1[0]-v0[0],v1[1]-v0[1],v1[2]-v0[2]}, e1[3]={v2[0]-v1[0],v2[1]-v1[1],v2[2]-v1[2]}, e2[3]={v0[0]-v2[0],v0[1]-v2[1],v0[2]-v2[2]};
+        double n[3]={e0[1]*e1[2]-e0[2]*e1[1],e0[2]*e1[0]-e0[0]*e1[2],e0[0]*e1[1]-e0[1]*e1[0]}, nl=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if(nl<1e-30) continue; for(double& q:n)q/=nl; double d=n[0]*v0[0]+n[1]*v0[1]+n[2]*v0[2];
+        int lo[3],hi[3]; for(int a=0;a<3;a++){lo[a]=std::max((int)std::min({v0[a],v1[a],v2[a]}),0);hi[a]=std::min((int)(std::max({v0[a],v1[a],v2[a]})+1),grid_size[a]);}
+        double c[3]={n[0]>0?1.0:0.0,n[1]>0?1.0:0.0,n[2]>0?1.0:0.0}, d1=n[0]*(c[0]-v0[0])+n[1]*(c[1]-v0[1])+n[2]*(c[2]-v0[2]), d2=n[0]*(1-c[0]-v0[0])+n[1]*(1-c[1]-v0[1])+n[2]*(1-c[2]-v0[2]);
+        int pairs[3][2]={{0,1},{1,2},{2,0}};
+        for(int z=lo[2];z<hi[2];z++)for(int y=lo[1];y<hi[1];y++)for(int x=lo[0];x<hi[0];x++) {
+            double p[3]={(double)x,(double)y,(double)z}, ndp=n[0]*x+n[1]*y+n[2]*z; if((ndp+d1)*(ndp+d2)>0) continue; bool pass=true;
+            // The three projected triangle half-space tests from source.
+            for(int proj=0;proj<3&&pass;proj++) { int a=pairs[proj][0],b=pairs[proj][1], drop=(proj+2)%3; int mul=n[drop]<0?-1:1; const double* vv[3]={v0,v1,v2}; const double* ee[3]={e0,e1,e2};
+                for(int k=0;k<3;k++){ double nx=-mul*ee[k][b], ny=mul*ee[k][a]; double dd=-(nx*vv[k][a]+ny*vv[k][b])+(nx>0?nx:0)+(ny>0?ny:0); if(nx*p[a]+ny*p[b]+dd<0){pass=false;break;} }
+            }
+            if(!pass) continue;
+            auto it=index.find(cell_key(x,y,z));
+            if(it!=index.end()) cells[it->second].add_plane(n,d,nullptr,false);
         }
     }
+
+    // Boundary line QEFs are relevant for open input meshes. Generated assets
+    // are normally closed, but retaining the source behaviour keeps this path
+    // model agnostic.
+    if(boundary_weight>0) {
+        std::unordered_map<uint64_t,int> edges; edges.reserve((size_t)F*3);
+        for(int fi=0;fi<F;fi++) for(int k=0;k<3;k++){ uint32_t a=(uint32_t)faces[fi*3+k],b=(uint32_t)faces[fi*3+(k+1)%3];if(a>b)std::swap(a,b);edges[((uint64_t)a<<32)|b]++; }
+        for(const auto& kv:edges) if(kv.second==1) { int ia=(int)(kv.first>>32),ib=(int)(uint32_t)kv.first; const double* p0=&g[(size_t)ia*3];const double* p1=&g[(size_t)ib*3]; double dir[3]={p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]}, len=std::sqrt(dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]);if(len<1e-6)continue;for(double& q:dir)q/=len;double aa[6]={1-dir[0]*dir[0],-dir[0]*dir[1],-dir[0]*dir[2],1-dir[1]*dir[1],-dir[1]*dir[2],1-dir[2]*dir[2]}, bb[3]={aa[0]*p0[0]+aa[1]*p0[1]+aa[2]*p0[2],aa[1]*p0[0]+aa[3]*p0[1]+aa[4]*p0[2],aa[2]*p0[0]+aa[4]*p0[1]+aa[5]*p0[2]};
+            int cur[3]={(int)std::floor(p0[0]),(int)std::floor(p0[1]),(int)std::floor(p0[2])}, step[3]={dir[0]>0?1:-1,dir[1]>0?1:-1,dir[2]>0?1:-1}; double tmax[3],tdelta[3]; for(int a=0;a<3;a++){if(dir[a]==0){tmax[a]=tdelta[a]=INFINITY;}else{tmax[a]=((cur[a]+(step[a]>0?1:0))-p0[a])/dir[a];tdelta[a]=1/std::fabs(dir[a]);}}
+            for(;;){auto it=index.find(cell_key(cur[0],cur[1],cur[2]));if(it!=index.end())cells[it->second].add_line(aa,bb,boundary_weight);int ax=(tmax[0]<tmax[1])?(tmax[0]<tmax[2]?0:2):(tmax[1]<tmax[2]?1:2);if(tmax[ax]>len)break;cur[ax]+=step[ax];tmax[ax]+=tdelta[ax];}
+        }
+    }
+
+    VoxelOut out; out.N=(int)cells.size(); out.coords=std::move(coords); out.dual.resize((size_t)out.N*3); out.intersected=std::move(flags);
+    for(int i=0;i<out.N;i++) { Cell& c=cells[i]; double A[6]={c.A[0],c.A[1],c.A[2],c.A[3],c.A[4],c.A[5]}, b[3]={c.b[0],c.b[1],c.b[2]}; if(regularization_weight>0&&c.count>0)for(int a=0;a<3;a++){A[a==0?0:a==1?3:5]+=regularization_weight*c.count;b[a]+=regularization_weight*c.sum[a];}
+        int32_t* cc=&out.coords[(size_t)i*3]; double local_b[3]={b[0]-(A[0]*cc[0]+A[1]*cc[1]+A[2]*cc[2]),b[1]-(A[1]*cc[0]+A[3]*cc[1]+A[4]*cc[2]),b[2]-(A[2]*cc[0]+A[4]*cc[1]+A[5]*cc[2])}, x[3]; solve_unit_box(A,local_b,x);for(int a=0;a<3;a++)out.dual[(size_t)i*3+a]=(float)x[a]; }
     return out;
 }
 
-}  // namespace vox
+} // namespace vox
