@@ -824,6 +824,12 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
                    nonmanifold_edges,Fin);
     }
     const bool effective_precluster=precluster || auto_precluster;
+    // On the pathological QEM case, even conformal per-island xatlas can be
+    // disproportionately slow.  Small normal-cone islands have bounded local
+    // distortion, pack quickly, and retain the direct PBR samples plus gutter
+    // repair.  Set ATL_AUTO_CONFORMAL=1 to spend the extra time on conformal
+    // parameterisation for a hero asset.
+    const bool auto_planar=auto_precluster && !std::getenv("ATL_AUTO_CONFORMAL");
 
     // ---- xatlas UV unwrap ----
     xatlas::Atlas* atlas = xatlas::Create();
@@ -857,7 +863,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             xatlas::PackCharts(atlas, po);
         }
     };
-    if (effective_precluster && !std::getenv("ATL_PLANAR")) {
+    if (effective_precluster && !(std::getenv("ATL_PLANAR") || auto_planar)) {
         double tp=_now();
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (std::getenv("ATL_PYREF_XATLAS") ? 90.f : cone_deg);
         std::vector<ClusterMesh> clusters;
@@ -940,7 +946,8 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         // planar UV islands. Fast, but folds on curved sheets; keep only for A/B with ATL_PLANAR=1.
         std::vector<float> uv; std::vector<int> uv2orig; std::vector<uint32_t> uvfaces, facemat; int ncl=0;
         double tp=_now();
-        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : cone_deg;
+        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_planar ? 25.f : cone_deg);
+        if (verbose && auto_planar) printf("[atlas] auto planar islands: cone %.0f° (set ATL_AUTO_CONFORMAL=1 for hero conformal charts)\n", cdeg);
         precluster_charts(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f), uv, uv2orig, uvfaces, facemat, ncl);
         if (verbose){ printf("[atlas] precluster: %d charts (cone %.0f°, %.2fs), %zu uv-verts\n",
                               ncl, cdeg, _now()-tp, uv2orig.size()); fflush(stdout); }
