@@ -239,6 +239,23 @@ static int ltxav_fifo_queue() {
     return 0;
 }
 
+// LTXAV_FIFO_CONTEXT = number of already-FINISHED (sigma 0, clean) frames to keep in the sliding
+// window BEHIND the in-flight diagonal, as frozen clean context. The bounded window otherwise spans
+// exactly the diagonal (window_frames == queue_depth == in-flight width, blocks=1), so a frame being
+// finalized attends only to peers that are MORE noised than itself — it has no clean past frame to
+// carry motion from, and each window regresses to the same static mean (the "slideshow of near-frozen
+// frames" pathology). The full-timeline pass (LTXAV_FIFO_WINDOW=0) keeps every finished frame resident,
+// which is why it sustains motion. Extending the window backward by CONTEXT clean frames restores that
+// clean past anchor while keeping the forward < T (bounded). -1 / unset => default (steps clean frames,
+// i.e. window ~= 2*queue_depth at blocks=1). 0 = the old diagonal-only window (no clean context).
+static int ltxav_fifo_context() {
+    if (const char* e = std::getenv("LTXAV_FIFO_CONTEXT"); e != nullptr && e[0] != '\0') {
+        int v = std::atoi(e);
+        if (v >= 0) return v;
+    }
+    return -1;  // sentinel: caller derives the default from the step count
+}
+
 // LTXAV_FIFO_LOOKAHEAD = 0/1 (default 0). Lookahead denoising processes 2x the window and keeps only
 // the back-half updates (extra compute for quality). Stubbed in this PoC; the prod per-frame-level
 // precedent suggests it may be skippable. See the FIFO loop for the stub.
@@ -3811,15 +3828,31 @@ public:
             // sigma 0 (popped/finished). Mid-flight frames (0 <= idx < N) get one euler_cfg_pp step.
             const int64_t last_enter  = (T - 1) / blocks;
             const int64_t total_iters = last_enter + N;
-            // FIXED window width = queue_depth frames (clamped to T). Every forward has the SAME shape, so
-            // the ggml CUDA graph and its VMM pool high-water are stable — a VARIABLE window (1..queue_depth
-            // frames near the sweep ends) forces the pool to accommodate many distinct graph sizes and
-            // fragments/retains a HIGHER high-water than a single fixed graph, which showed up as no
-            // nvidia-smi VRAM drop despite the smaller per-forward token count. The extra frames beyond the
-            // in-flight diagonal are FINISHED (sigma 0, clean) or NOT-YET-ENTERED (sigma_max) context: they
-            // are forwarded (attention context, in-distribution — same as the i2v clean+noisy precedent)
-            // but NOT advanced. window_frames <= T bounds the GPU working set below the full pass.
-            const int64_t window_frames = std::min<int64_t>(queue_depth, T);
+            // FIXED window width = queue_depth (the in-flight diagonal) + CONTEXT clean frames, clamped
+            // to T. Every forward has the SAME shape, so the ggml CUDA graph and its VMM pool high-water
+            // are stable — a VARIABLE window (1..queue_depth frames near the sweep ends) forces the pool
+            // to accommodate many distinct graph sizes and fragments/retains a HIGHER high-water than a
+            // single fixed graph, which showed up as no nvidia-smi VRAM drop despite the smaller
+            // per-forward token count. The frames beyond the in-flight diagonal are FINISHED (sigma 0,
+            // clean) or NOT-YET-ENTERED (sigma_max) context: they are forwarded (attention context,
+            // in-distribution — same as the i2v clean+noisy precedent) but NOT advanced.
+            //
+            // CONTEXT MATTERS FOR MOTION: with a diagonal-only window (context 0) a frame being finalized
+            // (idx near N, nearly clean) attends only to peers that are MORE noised than itself — it has
+            // no clean past frame to extrapolate motion from, so each window regresses to the same static
+            // mean and the output is a slideshow of near-frozen frames (measured: avg frame-diff ~30 vs
+            // the full-timeline pass's ~35 at T=13, worse at larger T). The clamp below anchors the
+            // window's RIGHT edge just past the last active frame, so the extra CONTEXT frames extend the
+            // LEFT edge backward into already-FINISHED clean frames — the exact clean past anchor the
+            // full-timeline pass keeps resident — restoring motion while the forward stays < T (bounded).
+            const int fifo_context_req = ltxav_fifo_context();
+            const int64_t fifo_context = fifo_context_req >= 0
+                                             ? static_cast<int64_t>(fifo_context_req)
+                                             : static_cast<int64_t>(N);  // default: `steps` clean frames
+            const int64_t window_frames = std::min<int64_t>(queue_depth + fifo_context, T);
+            LOG_INFO("LTX FIFO: window_frames=%lld = queue_depth %lld + clean-context %lld (req=%d) clamped to T=%lld",
+                     (long long)window_frames, (long long)queue_depth, (long long)fifo_context,
+                     fifo_context_req, (long long)T);
             int64_t emitted           = 0;
             int64_t peak_wlen         = 0;
             for (int64_t m = 0; m < total_iters; ++m) {
