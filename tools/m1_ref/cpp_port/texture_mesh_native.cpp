@@ -274,19 +274,32 @@ int main(int argc, char** argv) {
         }
         if (rgb_max-rgb_min < 1e-4f)
             throw std::runtime_error("PBR decoder collapsed to a neutral field (likely CUDA memory pressure)");
+        // Direct reference charts preserve the model's small details, so remove only genuinely
+        // isolated RGB voxels before they become atlas freckles.  This is a 3-D neighbourhood
+        // operation (not UV blur), and an explicit TEX_PBR_OUTLIER=0 remains a strict A/B opt-out.
+        const bool reference_unwrap = unwrap=="reference";
+        if (reference_unwrap) setenv("TEX_PBR_OUTLIER", "0.10", 0);
+        float pbr_outlier_threshold=0.f;
         if (const char* f=std::getenv("TEX_PBR_OUTLIER")) {
-            float threshold=(float)atof(f);
-            size_t changed=texatlas::filter_pbr_rgb_outliers(pbr,pbr_coords,threshold);
+            pbr_outlier_threshold=(float)atof(f);
+            size_t changed=texatlas::filter_pbr_rgb_outliers(pbr,pbr_coords,pbr_outlier_threshold);
             std::printf("[native-texture] PBR RGB outlier cleanup threshold=%.3f: %zu / %zu voxels\n",
-                        threshold,changed,pbr.size()/6);
+                        pbr_outlier_threshold,changed,pbr.size()/6);
         }
-        if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_pbr_coords.npy",pbr_coords,"<i4",{(int)pbr_coords.size()/4,4}); dump_npy(dump_dir+"/native_pbr_feats.npy",pbr,"<f4",{(int)pbr.size()/6,6}); }
+        if (!dump_dir.empty()) {
+            dump_npy(dump_dir+"/native_pbr_coords.npy",pbr_coords,"<i4",{(int)pbr_coords.size()/4,4});
+            dump_npy(dump_dir+"/native_pbr_feats.npy",pbr,"<f4",{(int)pbr.size()/6,6});
+            // LOD rebakes consume this already-cleaned PBR volume.  Persist the exact cleanup
+            // threshold so they do not accidentally apply a non-idempotent 3-D median twice.
+            std::ofstream cleanup_meta(dump_dir+"/native_pbr_outlier_threshold.txt", std::ios::trunc);
+            if (!cleanup_meta) throw std::runtime_error("could not write native PBR cleanup metadata");
+            cleanup_meta << pbr_outlier_threshold << '\n';
+        }
         std::printf("[native-texture] PBR volume: %zu voxels\\n", pbr.size()/6);
 
         // The production unwrap is deliberately fast and chart-safe for every model.  The
         // reference mode removes that pre-cluster and uses Pixal3D/CuMesh xatlas chart settings,
         // giving a like-for-like atlas-quality A/B while keeping all inference native.
-        const bool reference_unwrap = unwrap=="reference";
         if (reference_unwrap) {
             // These are the reference-quality bake defaults established by the native parity
             // harness. The old defaults protected pre-clustered, tiny-island atlases; direct

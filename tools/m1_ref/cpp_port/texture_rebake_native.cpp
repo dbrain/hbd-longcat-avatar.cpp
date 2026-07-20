@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -33,6 +34,15 @@ static void preprocess_mesh(std::vector<float>& v) {
 }
 static void restore_mesh_frame(std::vector<float>& v) {
     for (size_t i=0;i<v.size();i+=3) { float y=v[i+1],z=v[i+2]; v[i+1]=z; v[i+2]=-y; }
+}
+
+// High native dumps store PBR after their optional 3-D outlier cleanup.  The marker lets a LOD
+// rebake preserve that exact material instead of applying a second, non-idempotent median pass.
+static float recorded_pbr_outlier_threshold(const std::string& pdir) {
+    std::ifstream f(pdir+"/native_pbr_outlier_threshold.txt");
+    float threshold=-1.f;
+    if (f) f >> threshold;
+    return threshold;
 }
 
 int main(int argc,char**argv) {
@@ -62,16 +72,24 @@ int main(int argc,char**argv) {
         if(pc.descr=="<i4") std::memcpy(coords.data(),pc.i32(),coords.size()*sizeof(int32_t));
         else if(pc.descr=="<f4") for(size_t i=0;i<coords.size();i++) coords[i]=(int32_t)std::lround(pc.f32()[i]);
         else throw std::runtime_error("PBR coordinates must be int32 or float32");
+        // Keep a CPU LOD/rebake materially consistent with the direct-reference high bake.
+        // The default is deliberately applied before the filter; TEX_PBR_OUTLIER=0 opt outs.
+        const bool reference_unwrap = unwrap=="reference";
+        if (reference_unwrap) setenv("TEX_PBR_OUTLIER", "0.10", 0);
         if (const char* f=std::getenv("TEX_PBR_OUTLIER")) {
             float threshold=(float)atof(f);
-            size_t changed=texatlas::filter_pbr_rgb_outliers(pbr,coords,threshold);
-            std::printf("[native-rebake] PBR RGB outlier cleanup threshold=%.3f: %zu / %d voxels\n",threshold,changed,N);
+            float recorded=recorded_pbr_outlier_threshold(pdir);
+            if (threshold>0.f && std::fabs(recorded-threshold)<1e-6f) {
+                std::printf("[native-rebake] PBR RGB outlier cleanup threshold=%.3f: already applied by high material dump\n",threshold);
+            } else {
+                size_t changed=texatlas::filter_pbr_rgb_outliers(pbr,coords,threshold);
+                std::printf("[native-rebake] PBR RGB outlier cleanup threshold=%.3f: %zu / %d voxels\n",threshold,changed,N);
+            }
         }
         preprocess_mesh(mesh.verts);
         // `reference` removes the native pre-cluster stage and gives xatlas the same chart
         // parameters used by Pixal3D's CuMesh unwrap.  It intentionally retains the native
         // rasterizer and PBR sampling: this is an isolated, CPU-only unwrap/bake A/B.
-        const bool reference_unwrap = unwrap=="reference";
         if (reference_unwrap) {
             // CPU rebakes must keep the high native reference bake's coverage, seam, and
             // normal behaviour so high/medium/low differ only by their intended LOD budget.

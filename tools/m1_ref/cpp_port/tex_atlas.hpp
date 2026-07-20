@@ -417,13 +417,16 @@ static inline void blur_u8_gaussian_rgb(std::vector<uint8_t>& img, int W, int H,
     }
 }
 
-// Remove isolated generator speckle without blending across UV-chart gutters.  Unlike the optional
-// full-atlas Gaussian blur, this only samples texels that were actually rasterised from a surface
-// triangle; neighbouring charts and their inpainted gutters are excluded.  A 3x3 median preserves
-// material boundaries (buttons, hair silhouettes) while rejecting one-pixel dark/light freckles.
+// Remove isolated generator speckle without blending across UV charts.  Unlike the optional
+// full-atlas Gaussian blur, this only samples texels that were rasterised from the SAME connected
+// UV chart; that remains true even for the direct reference packer's zero-pixel chart padding.
+// A 3x3 median preserves material boundaries (buttons, hair silhouettes) while rejecting one-pixel
+// dark/light freckles.
 static inline void median_surface_rgb(std::vector<float>& atl, const std::vector<uint8_t>& surface_mask,
+                                      const std::vector<int32_t>& surface_chart,
                                       int W, int H, int radius) {
-    if (radius <= 0 || W <= 0 || H <= 0 || atl.size() != (size_t)W*H*6 || surface_mask.size() != (size_t)W*H) return;
+    if (radius <= 0 || W <= 0 || H <= 0 || atl.size() != (size_t)W*H*6 ||
+        surface_mask.size() != (size_t)W*H || surface_chart.size() != (size_t)W*H) return;
     const std::vector<float> src=atl;
     #pragma omp parallel for schedule(static)
     for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
@@ -436,7 +439,7 @@ static inline void median_surface_rgb(std::vector<float>& atl, const std::vector
                 int nx=x+dx, ny=y+dy;
                 if (nx<0 || ny<0 || nx>=W || ny>=H) continue;
                 size_t q=(size_t)ny*W+nx;
-                if (surface_mask[q]) values[n++]=src[q*6+c];
+                if (surface_mask[q] && surface_chart[q] == surface_chart[p]) values[n++]=src[q*6+c];
             }
             // Do not distort isolated slivers where a neighbourhood is not meaningful.
             if (n >= 5) {
@@ -999,11 +1002,39 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (verbose) printf("[atlas] welded output normals (%.2fs)\n", _now()-tn);
     }
 
+    // A chart is a connected component in xatlas' OUTPUT topology.  xatlas splits a shared
+    // source vertex at every UV seam, so faces that still share an output vertex are guaranteed
+    // to be safe neighbours in atlas space.  Keep this identity through rasterisation for the
+    // optional surface-only cleanup; a binary coverage mask alone is insufficient when direct
+    // reference packing deliberately uses zero chart padding.
+    std::vector<int32_t> face_parent((size_t)Fout);
+    for (int t=0;t<Fout;t++) face_parent[(size_t)t]=t;
+    auto face_root = [&](int32_t x) {
+        while (face_parent[(size_t)x] != x) {
+            face_parent[(size_t)x] = face_parent[(size_t)face_parent[(size_t)x]];
+            x = face_parent[(size_t)x];
+        }
+        return x;
+    };
+    std::vector<int32_t> first_face((size_t)Vout,-1);
+    for (int t=0;t<Fout;t++) for (int k=0;k<3;k++) {
+        const uint32_t v=bt.faces[(size_t)t*3+k];
+        int32_t& first=first_face[(size_t)v];
+        if (first<0) first=t;
+        else {
+            int32_t a=face_root(t), b=face_root(first);
+            if (a!=b) face_parent[(size_t)a]=b;
+        }
+    }
+    std::vector<int32_t> face_chart((size_t)Fout);
+    for (int t=0;t<Fout;t++) face_chart[(size_t)t]=face_root(t);
+
     // ---- rasterize (serial; writes per-texel 3D position + interpolated normal + mask) ----
     double t_ras = _now();
     std::vector<float> pos((size_t)W*Ht*3, 0.f);
     std::vector<float> nrm((size_t)W*Ht*3, 0.f);   // lap-18: texel normal for front-face reproject
     std::vector<uint8_t> mask((size_t)W*Ht, 0);
+    std::vector<int32_t> surface_chart((size_t)W*Ht, -1);
     int raster_ss = std::getenv("TEX_RASTER_SS") ? atoi(std::getenv("TEX_RASTER_SS")) : 1;
     raster_ss = std::max(1, std::min(4, raster_ss));
     if (verbose && raster_ss > 1) printf("[atlas] raster supersample: %dx%d\n", raster_ss, raster_ss);
@@ -1035,6 +1066,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             float* P=&pos[((size_t)y*W+x)*3]; float* Nn=&nrm[((size_t)y*W+x)*3];
             for (int d=0;d<3;d++){ P[d]=w0*Pa[d]+w1*Pb[d]+w2*Pc[d]; Nn[d]=w0*Na[d]+w1*Nb[d]+w2*Nc[d]; }
             mask[(size_t)y*W+x]=1;
+            surface_chart[(size_t)y*W+x]=face_chart[(size_t)t];
         }
     }
     int covered=0; for (auto m:mask) covered+=m;
@@ -1159,7 +1191,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         int radius=std::max(0,std::min(4,atoi(m)));
         if (radius > 0) {
             if (verbose) printf("[atlas] surface-only RGB median radius=%d\n", radius);
-            median_surface_rgb(atl, mask, W, Ht, radius);
+            median_surface_rgb(atl, mask, surface_chart, W, Ht, radius);
         }
     }
 
