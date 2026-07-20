@@ -54,8 +54,14 @@ export REMESH_CLOSE_R="${REMESH_CLOSE_R:-3}"
 # environment setting.  A cache made with a different seal radius is a
 # different reconstruction and must never be reused just because the source
 # image happens to be identical.
-GEOMETRY_RECIPE_VERSION=2
-GEOMETRY_RECIPE="moge-noquad-us16384-cross-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+GEOMETRY_RECIPE_VERSION=3
+# `image_to_rig` retains a PBR cache only for the explicitly optional
+# observed-view projection A/B and legacy-rig diagnostic.  Its installed
+# `proj` weights are used for that non-production cache; the deliverable
+# material is always generated later by texture_mesh_native.  Do not request
+# the absent legacy cross checkpoint here: it makes a new subject fail after
+# paying for all geometry diffusion.
+GEOMETRY_RECIPE="moge-noquad-us16384-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 [[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: PCI GPU 0 is '$GPU_NAME', expected RTX 3060" >&2; exit 1; }
 GPU_3060_UUID="$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0 | head -1)"
@@ -126,7 +132,7 @@ if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || ! -f "$C
     exec 9>"$LOCK"
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
     "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-      --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8 \
+      --no-quad --us-latents 16384 --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
       --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
   )
   printf 'geometry_recipe=%s\nremesh_close_r=%s\ngeometry_recipe_version=%s\n' \
