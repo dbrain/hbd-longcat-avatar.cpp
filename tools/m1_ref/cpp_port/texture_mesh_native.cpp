@@ -25,7 +25,7 @@
 static void usage() {
     std::printf("usage: texture_mesh_native --model <geo_gguf_dir> --mesh <in.glb> --image <matte.png> --out <out.glb>\n"
                 "                           [--resolution 512|1024] [--texsize N] [--seed N] [--decimate F] [--dump-dir DIR]\n"
-                "                           [--unwrap production|reference]\n");
+                "                           [--unwrap production|reference] [--atlas-out base_color.png]\n");
 }
 
 template<class T> static void dump_npy(const std::string& path, const std::vector<T>& data,
@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
     setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
     // Direct xatlas charts with Pixal3D's chart settings are the quality default.  The old
     // precluster path remains available as `production` for a deliberately faster fallback.
-    std::string model, mesh_path, image_path, out, dump_dir, unwrap="reference";
+    std::string model, mesh_path, image_path, out, dump_dir, atlas_out, unwrap="reference";
     bool condition_only=false;
     int resolution=512, texsize=2048, seed=42, decimate=0;
     for (int i=1;i<argc;i++) {
@@ -164,11 +164,13 @@ int main(int argc, char** argv) {
         else if (a=="--decimate" && i+1<argc) decimate=std::atoi(argv[++i]);
         else if (a=="--dump-dir" && i+1<argc) dump_dir=argv[++i];
         else if (a=="--unwrap" && i+1<argc) unwrap=argv[++i];
+        else if (a=="--atlas-out" && i+1<argc) atlas_out=argv[++i];
         else if (a=="--condition-only") condition_only=true;
         else { usage(); return 1; }
     }
     if (model.empty() || mesh_path.empty() || image_path.empty() || (out.empty() && !condition_only) ||
         (resolution!=512 && resolution!=1024) || (unwrap!="production" && unwrap!="reference")) { usage(); return 1; }
+    if (!condition_only && atlas_out.empty()) atlas_out=out+".atlas.png";
     setenv("PIXAL3D_GGUF_DIR", model.c_str(), 1);
 
     try {
@@ -279,7 +281,10 @@ int main(int argc, char** argv) {
         if (!glb::write_glb_textured(out.c_str(),baked.verts,baked.normals,baked.uvs,baked.faces,
                                      baked.base_color,baked.metal_rough,baked.tw,baked.th))
             throw std::runtime_error("could not write output GLB");
+        if (!stbi_write_png(atlas_out.c_str(), baked.tw, baked.th, 4, baked.base_color.data(), baked.tw*4))
+            throw std::runtime_error("could not write baseColor atlas: "+atlas_out);
         std::printf("[native-texture] DONE: %s (%d charts, %dx%d atlas)\\n",out.c_str(),baked.chart_count,baked.tw,baked.th);
+        std::printf("[native-texture] baseColor atlas: %s\\n",atlas_out.c_str());
     } catch (const std::exception& e) { std::fprintf(stderr,"FAIL: %s\\n",e.what()); return 1; }
     return 0;
 }

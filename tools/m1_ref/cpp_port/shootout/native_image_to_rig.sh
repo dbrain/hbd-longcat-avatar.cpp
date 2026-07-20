@@ -53,6 +53,7 @@ NATIVE_UNWRAP="${NATIVE_UNWRAP:-reference}"
 run_texture_level() {
   local name="$1" faces="$2" resolution="$3" atlas="$4"
   local out="$OUT/native_${name}_textured.glb"
+  local atlas_out="$OUT/native_${name}_textured_atlas.png"
   local dump_args=()
   # Retain the decoded native PBR volume when requested, enabling CPU-only rebakes of the exact
   # same material later. Off by default because three LOD dumps are large; it never affects output.
@@ -61,7 +62,9 @@ run_texture_level() {
   fi
   echo "== $LABEL: native $name (${faces} faces, ${atlas}px atlas) =="
   "$CP/shootout/native_texture_run.sh" "$REFINED" "$IMAGE" "$out" \
-    --resolution "$resolution" --texsize "$atlas" --decimate "$faces" --unwrap "$NATIVE_UNWRAP" "${dump_args[@]}"
+    --resolution "$resolution" --texsize "$atlas" --decimate "$faces" --unwrap "$NATIVE_UNWRAP" \
+    --atlas-out "$atlas_out" "${dump_args[@]}"
+  [[ -s "$atlas_out" ]] || { echo "native texture did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
   "$CP/mesh_topo" "$out"
 }
 

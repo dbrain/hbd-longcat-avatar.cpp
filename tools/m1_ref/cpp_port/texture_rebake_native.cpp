@@ -18,7 +18,7 @@
 static void usage() {
     std::printf("usage: texture_rebake_native --mesh refined.glb --pbr-dir native-dump --out out.glb\\n"
                 "                             [--resolution 512|1024] [--texsize N] [--decimate faces]\\n"
-                "                             [--unwrap production|reference]\\n");
+                "                             [--unwrap production|reference] [--atlas-out base_color.png]\\n");
 }
 
 // Matches texture_mesh_native's Trellis texturing frame exactly.
@@ -36,7 +36,7 @@ static void restore_mesh_frame(std::vector<float>& v) {
 }
 
 int main(int argc,char**argv) {
-    std::string mesh_path,pdir,out,unwrap="reference"; int resolution=512,texsize=2048,decimate=0;
+    std::string mesh_path,pdir,out,atlas_out,unwrap="reference"; int resolution=512,texsize=2048,decimate=0;
     for (int i=1;i<argc;i++) { std::string a=argv[i];
         if(a=="--mesh"&&i+1<argc) mesh_path=argv[++i];
         else if(a=="--pbr-dir"&&i+1<argc) pdir=argv[++i];
@@ -45,10 +45,12 @@ int main(int argc,char**argv) {
         else if(a=="--texsize"&&i+1<argc) texsize=atoi(argv[++i]);
         else if(a=="--decimate"&&i+1<argc) decimate=atoi(argv[++i]);
         else if(a=="--unwrap"&&i+1<argc) unwrap=argv[++i];
+        else if(a=="--atlas-out"&&i+1<argc) atlas_out=argv[++i];
         else { usage(); return 2; }
     }
     if(mesh_path.empty()||pdir.empty()||out.empty()||(resolution!=512&&resolution!=1024)||texsize<=0 ||
        (unwrap!="production" && unwrap!="reference")) { usage(); return 2; }
+    if (atlas_out.empty()) atlas_out=out+".atlas.png";
     try {
         glb::Mesh mesh; if(!glb::read_glb(mesh_path.c_str(),mesh)) throw std::runtime_error("cannot read mesh: "+mesh_path);
         NpyArray pf=npy_load(pdir+"/native_pbr_feats.npy"), pc=npy_load(pdir+"/native_pbr_coords.npy");
@@ -80,7 +82,10 @@ int main(int argc,char**argv) {
         if(!glb::write_glb_textured(out.c_str(),baked.verts,baked.normals,baked.uvs,baked.faces,
                                     baked.base_color,baked.metal_rough,baked.tw,baked.th))
             throw std::runtime_error("could not write output GLB");
+        if(!stbi_write_png(atlas_out.c_str(),baked.tw,baked.th,4,baked.base_color.data(),baked.tw*4))
+            throw std::runtime_error("could not write baseColor atlas: "+atlas_out);
         std::printf("[native-rebake] DONE: %s (%d charts, %dx%d atlas)\\n",out.c_str(),baked.chart_count,baked.tw,baked.th);
+        std::printf("[native-rebake] baseColor atlas: %s\\n",atlas_out.c_str());
     } catch(const std::exception&e) { std::fprintf(stderr,"FAIL: %s\\n",e.what()); return 1; }
     return 0;
 }
