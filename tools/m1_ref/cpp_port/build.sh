@@ -150,6 +150,19 @@ if [ "$BASE" = "retopo_bake" ]; then
   exit 0
 fi
 
+# native_pbr_audit_export: exact native-preprocessed/decimated mesh + saved PBR volume for an
+# offline Python-reference oracle. CPU only; never part of the production image-to-rig runbook.
+if [ "$BASE" = "native_pbr_audit_export" ]; then
+  TP="$HERE/../../../thirdparty"
+  echo ">> build native_pbr_audit_export (native same-input reference-audit bridge, CPU only)"
+  "${CXX:-/usr/bin/g++}" $COMMON -fopenmp "$HERE/$SRC" \
+    "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" "$TP/meshoptimizer/vertexcodec.cpp" \
+    "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
+    -o "$HERE/$BIN" -lm -lpthread
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # glb_pack_test: validate the in-process compressed-GLB writer (glb_packed.hpp = meshopt + KTX2).
 # Links libbasisu_enc.a + the meshopt codec TUs (encode/decode vertex+index). Toolchain g++.
 if [ "$BASE" = "glb_pack_test" ]; then

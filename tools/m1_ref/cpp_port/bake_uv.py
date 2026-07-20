@@ -27,6 +27,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--dump', default='.')
 ap.add_argument('--mesh', default='qem', choices=['qem','dense'])
 ap.add_argument('--texsize', type=int, default=2048)
+ap.add_argument('--grid-res', type=int, default=1024) # offline audit may use native 512 PBR lattice
 ap.add_argument('--out', default='out_uv.glb')
 ap.add_argument('--inpaint', type=int, default=3)   # cv2 TELEA radius for the gutter
 ap.add_argument('--ssaa', type=int, default=1)       # supersample: bake at texsize*ssaa, area-downsample → AA/smooth
@@ -35,6 +36,8 @@ ap.add_argument('--decimate', type=int, default=0)   # cumesh.simplify the DENSE
 ap.add_argument('--normal_offset', type=float, default=0.0)  # push each texel's sample point OUTWARD along the surface normal by N voxels before grid_sample — kills thin-shell interior bleed (teal slivers on the black skirt)
 ap.add_argument('--dilate', type=int, default=0)     # >0: fill the atlas gutter/background by TRUE nearest-valid (Voronoi) instead of cv2 TELEA — each chart bleeds its OWN colour into the gutter so a bilinear/mip read at a chart seam never pulls a teal->black diffusion ramp (the "teal slivers on the skirt" / hairline seam cracks)
 ap.add_argument('--bilateral', type=str, default='') # "d,sigmaColor,sigmaSpace" — edge-preserving smoothing on baseColor (applied at the supersample res, only inside covered texels). Evens out per-texel volume-sample noise on flat skin/cloth (the "immaculate porcelain" look) WITHOUT blurring crisp boundaries (eyes, hair/skin edges). e.g. 9,40,9
+ap.add_argument('--restore-native-frame', action='store_true') # audit output aligns with native GLB orientation
+ap.add_argument('--basecolor-srgb', action='store_true') # audit native's spec-correct glTF baseColor encoding
 a = ap.parse_args()
 TS = a.texsize * a.ssaa
 vbase = 'dump_mesh' if a.mesh == 'qem' else 'dump_dense'
@@ -70,16 +73,16 @@ if a.normal_offset != 0.0:
     nrm_t = torch.from_numpy(normals).float().cuda()
     nrm_i = dr.interpolate(nrm_t.unsqueeze(0), rast, ft)[0][0]
     nrm_i = nrm_i / (nrm_i.norm(dim=-1, keepdim=True) + 1e-8)
-    pos = pos + nrm_i * (a.normal_offset / RES)
+    pos = pos + nrm_i * (a.normal_offset / a.grid_res)
 feats_t = torch.from_numpy(feats).float().cuda(); coords_t = torch.from_numpy(coords).int().cuda()
 attrs = torch.zeros(TS, TS, 6, device='cuda')
 # chunk the grid_sample so very large atlases (8192^2) fit in 12 GB — peak scales with the chunk, not
 # the full covered-texel count.
-grid_all = ((pos[mask] + 0.5) * RES)            # [M,3]
+grid_all = ((pos[mask] + 0.5) * a.grid_res)     # [M,3]
 M = grid_all.shape[0]; CH = 6_000_000
 samp = torch.empty(M, 6, device='cuda')
 for i in range(0, M, CH):
-    samp[i:i+CH] = grid_sample_3d(feats_t, coords_t, shape=torch.Size([1,6,RES,RES,RES]),
+    samp[i:i+CH] = grid_sample_3d(feats_t, coords_t, shape=torch.Size([1,6,a.grid_res,a.grid_res,a.grid_res]),
                                   grid=grid_all[i:i+CH].reshape(1,-1,3), mode='trilinear')
 attrs[mask] = samp
 m = mask.cpu().numpy()
@@ -108,6 +111,13 @@ alpha = chan(LAYOUT['alpha'], 1)[..., None]
 if a.bilateral:
     bd, bsc, bss = (float(x) for x in a.bilateral.split(','))
     base = cv2.bilateralFilter(base, int(bd), bsc, bss)
+if a.basecolor_srgb:
+    # The decoder emits linear albedo, while glTF viewers sRGB-decode baseColorTexture.  Keep the
+    # reference-audit render colour-managed the same way as the native writer.
+    linear = base.astype(np.float32) / 255.0
+    base = np.clip(np.where(linear <= 0.0031308, 12.92 * linear,
+                            1.055 * np.power(np.clip(linear, 0, 1), 1/2.4) - 0.055) * 255 + 0.5,
+                   0, 255).astype(np.uint8)
 # gentle smoothing: optional gaussian blur (gutters are inpainted so no dark bleed), then
 # supersample-downsample to the target size (area-average AA across charts/texels).
 if a.blur > 0:
@@ -124,6 +134,11 @@ mat = trimesh.visual.material.PBRMaterial(
     metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metal), rough, metal], -1)),
     metallicFactor=1.0, roughnessFactor=1.0, alphaMode='OPAQUE', doubleSided=True)
 uvs2 = uvs.copy(); uvs2[:,1] = 1 - uvs2[:,1]
+if a.restore_native_frame:
+    # texture_mesh_native restores the canonical bake frame before writing its GLB.
+    verts[:,1], verts[:,2] = verts[:,2].copy(), -verts[:,1].copy()
+    normals = normals.copy()  # trimesh may expose its cached normals as a read-only view
+    normals[:,1], normals[:,2] = normals[:,2].copy(), -normals[:,1].copy()
 out = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=False,
                       visual=trimesh.visual.TextureVisuals(uv=uvs2, material=mat))
 out.export(a.out)
