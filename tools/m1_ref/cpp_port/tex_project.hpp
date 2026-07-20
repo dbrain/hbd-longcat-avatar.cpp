@@ -1603,12 +1603,17 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
 
             if (wsum > 1e-4f) {
                 // Blend in LINEAR light (a confidence-weighted mean of sRGB bytes would darken the seam).
-                // The sRGB->linear->sRGB round-trip is lossless to <1/255 for a single-source texel — and
-                // note that for a single view the weight CANCELS (acc/wsum = the sample itself), so the
-                // grazing ramp never tints a texel only one camera can see; it only sets hole-vs-painted
-                // and the relative weight between overlapping views.
+                // In the overlay recipe the confidence ramp must ALSO fade the observed image into the
+                // pre-existing volume albedo. Otherwise a front/back source stops abruptly at nz_lo and
+                // creates the hard side band the hybrid was meant to avoid. High-facing texels remain the
+                // exact source pixel; only grazing texels transition, so this cannot soften a face centre.
                 float* o = &rgb_lin[(size_t)p * 3];
-                for (int c = 0; c < 3; c++) o[c] = acc[c] / wsum;
+                const float overlay = cfg.preserve_base_for_holes ? std::min(1.f, wsum) : 1.f;
+                for (int c = 0; c < 3; c++) {
+                    const float projected = acc[c] / wsum;
+                    const float base = cfg.preserve_base_for_holes ? base_lin[(size_t)p * 3 + c] : 0.f;
+                    o[c] = overlay * projected + (1.f - overlay) * base;
+                }
                 valid[(size_t)p] = 1;
                 src_of[(size_t)p] = 1;
                 view_of[(size_t)p] = (uint8_t)best_v;
