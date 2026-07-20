@@ -109,12 +109,27 @@ int main(int argc, char** argv) {
     for(int i=0;i<o.N;i++){ auto it=gmap.find(key3(o.coords[i*3],o.coords[i*3+1],o.coords[i*3+2])); if(it==gmap.end())continue; int gj=it->second;
         for(int a=0;a<3;a++){int oo=o.intersected[i*3+a],gg=gin[gj*3+a]; if(oo&&gg)c11[a]++; else if(oo&&!gg)c10[a]++; else if(!oo&&gg)c01[a]++; else c00[a]++;}}
     for(int a=0;a<3;a++) printf("  axis %d: both1=%ld ours1golden0=%ld ours0golden1=%ld both0=%ld\n",a,c11[a],c10[a],c01[a],c00[a]);
+    // Diagnose coordinate convention for exact edge tests: find the native
+    // flag translation with the highest overlap against the reference.
+    for(int a=0;a<3;a++) {
+        long best=-1; int bx=0,by=0,bz=0;
+        for(int dz=-1;dz<=1;dz++) for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
+            long hit=0;
+            for(int j=0;j<M;j++) if(gin[j*3+a]) {
+                auto it=omap.find(key3(gco[j*3]+dx,gco[j*3+1]+dy,gco[j*3+2]+dz));
+                if(it!=omap.end() && o.intersected[it->second*3+a]) hit++;
+            }
+            if(hit>best){best=hit;bx=dx;by=dy;bz=dz;}
+        }
+        printf("  axis %d: best native flag shift vs golden = [%d %d %d], overlap %ld/%ld\n",a,bx,by,bz,best,c11[a]+c01[a]);
+    }
 
     if(getenv("DUMPN")){ int dn2=atoi(getenv("DUMPN")); int shown=0;
         for(int i=0;i<o.N && shown<dn2;i++){ auto it=gmap.find(key3(o.coords[i*3],o.coords[i*3+1],o.coords[i*3+2])); if(it==gmap.end())continue; int gj=it->second;
             printf("cell(%d,%d,%d) ours dual[%.4f %.4f %.4f] golden[%.4f %.4f %.4f] | ours int[%d%d%d] gold[%d%d%d]\n",
                 o.coords[i*3],o.coords[i*3+1],o.coords[i*3+2],
-                o.dual[i*3],o.dual[i*3+1],o.dual[i*3+2], gdu[gj*3],gdu[gj*3+1],gdu[gj*3+2],
+                o.dual[i*3],o.dual[i*3+1],o.dual[i*3+2],
+                gdu[gj*3]*grid-gco[gj*3], gdu[gj*3+1]*grid-gco[gj*3+1], gdu[gj*3+2]*grid-gco[gj*3+2],
                 o.intersected[i*3],o.intersected[i*3+1],o.intersected[i*3+2], gin[gj*3],gin[gj*3+1],gin[gj*3+2]);
             shown++; } }
 

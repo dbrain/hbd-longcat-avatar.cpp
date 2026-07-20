@@ -85,6 +85,32 @@ static inline void solve3x3_sym(const double A[6], const double b[3], double x[3
     x[2] = inv*(c02*b[0] + c12*b[1] + c22*b[2]);
 }
 
+// Exact minimizer of a positive-definite QEF on the unit cell.  Clamping the
+// unconstrained 3D answer is not equivalent when only one/two axes cross the
+// cell boundary: the reference enumerates those active constraints and solves
+// the remaining 2D/1D QEF.  There are only 3^3 active sets, so this is both
+// robust and negligible beside triangle voxelization.
+static inline void solve_qef_unit_box(const double A[6], const double b[3], double out[3]) {
+    double m[3][3]={{A[0],A[1],A[2]},{A[1],A[3],A[4]},{A[2],A[4],A[5]}};
+    double best=1e300, bx[3]={0.5,0.5,0.5};
+    for (int sx=-1;sx<=1;sx++) for (int sy=-1;sy<=1;sy++) for (int sz=-1;sz<=1;sz++) {
+        int st[3]={sx,sy,sz}; double x[3]={0,0,0}; int free_ax[3], nf=0;
+        for(int a=0;a<3;a++) { if(st[a]<0) free_ax[nf++]=a; else x[a]=(double)st[a]; }
+        double rhs[3]={0,0,0};
+        for(int ii=0;ii<nf;ii++) { int a=free_ax[ii]; rhs[ii]=b[a]; for(int q=0;q<3;q++) if(st[q]>=0) rhs[ii]-=m[a][q]*x[q]; }
+        bool ok=true;
+        if(nf==1) { double d=m[free_ax[0]][free_ax[0]]; if(std::fabs(d)<1e-20) ok=false; else x[free_ax[0]]=rhs[0]/d; }
+        else if(nf==2) { int a=free_ax[0], c=free_ax[1]; double d=m[a][a]*m[c][c]-m[a][c]*m[a][c]; if(std::fabs(d)<1e-20) ok=false; else { x[a]=(rhs[0]*m[c][c]-m[a][c]*rhs[1])/d; x[c]=(m[a][a]*rhs[1]-m[a][c]*rhs[0])/d; } }
+        else if(nf==3) solve3x3_sym(A,rhs,x);
+        if(!ok) continue;
+        for(int a=0;a<3;a++) if(x[a] < -1e-9 || x[a] > 1.0+1e-9) ok=false;
+        if(!ok) continue;
+        double q=0; for(int a=0;a<3;a++) { q-=2.0*b[a]*x[a]; for(int c=0;c<3;c++)q+=x[a]*m[a][c]*x[c]; }
+        if(q<best) { best=q; bx[0]=std::max(0.0,std::min(1.0,x[0])); bx[1]=std::max(0.0,std::min(1.0,x[1])); bx[2]=std::max(0.0,std::min(1.0,x[2])); }
+    }
+    out[0]=bx[0]; out[1]=bx[1]; out[2]=bx[2];
+}
+
 // ---- triangle / axis-aligned cell-box overlap (Akenine-Moller SAT) ----
 // boxcenter in grid units, boxhalf = 0.5 (unit cell). tri verts in grid units relative to boxcenter.
 static inline bool plane_box_overlap(const double n[3], const double v[3], double maxbox) {
@@ -130,6 +156,28 @@ static inline bool tri_box_overlap(const double bc[3], double bh,
     double nrm[3]; nrm[0]=e0[1]*e1[2]-e0[2]*e1[1]; nrm[1]=e0[2]*e1[0]-e0[0]*e1[2]; nrm[2]=e0[0]*e1[1]-e0[1]*e1[0];
     if(!plane_box_overlap(nrm,v0,bh)) return false;
     return true;
+}
+
+// Does the unit grid edge `o -> o + e_axis` pierce a triangle?  This is the
+// direct-mesh equivalent of o_voxel's `intersect_qef` edge walk.  The usual
+// Möller-Trumbore test is sufficient here: flags are a union across triangles,
+// so shared-edge hits are intentionally idempotent.
+static inline bool grid_edge_hits_tri(const double o[3], int axis,
+                                      const double p0[3], const double p1[3], const double p2[3]) {
+    double d[3]={0,0,0}; d[axis]=1;
+    double e1[3]={p1[0]-p0[0],p1[1]-p0[1],p1[2]-p0[2]};
+    double e2[3]={p2[0]-p0[0],p2[1]-p0[1],p2[2]-p0[2]};
+    double h[3]={d[1]*e2[2]-d[2]*e2[1],d[2]*e2[0]-d[0]*e2[2],d[0]*e2[1]-d[1]*e2[0]};
+    double det=e1[0]*h[0]+e1[1]*h[1]+e1[2]*h[2];
+    if(std::fabs(det)<1e-12) return false;
+    double inv=1.0/det, s[3]={o[0]-p0[0],o[1]-p0[1],o[2]-p0[2]};
+    double u=(s[0]*h[0]+s[1]*h[1]+s[2]*h[2])*inv;
+    if(u < -1e-8 || u > 1.0+1e-8) return false;
+    double q[3]={s[1]*e1[2]-s[2]*e1[1],s[2]*e1[0]-s[0]*e1[2],s[0]*e1[1]-s[1]*e1[0]};
+    double v=(d[0]*q[0]+d[1]*q[1]+d[2]*q[2])*inv;
+    if(v < -1e-8 || u+v > 1.0+1e-8) return false;
+    double t=(e2[0]*q[0]+e2[1]*q[1]+e2[2]*q[2])*inv;
+    return t >= -1e-8 && t <= 1.0+1e-8;
 }
 
 // Forward voxelizer. verts: V*3, faces: F*3. grid_size/aabb per-axis. fw/bw/reg as the pipeline.
@@ -216,24 +264,25 @@ inline VoxelOut mesh_to_flexible_dual_grid(
         if (c.nplanes>0){ mp[0]=c.mass[0]/c.nplanes; mp[1]=c.mass[1]/c.nplanes; mp[2]=c.mass[2]/c.nplanes; }
         double A[6]={fw*c.A[0]+reg, fw*c.A[1], fw*c.A[2], fw*c.A[3]+reg, fw*c.A[4], fw*c.A[5]+reg};
         double b[3]={fw*c.b[0]+reg*mp[0], fw*c.b[1]+reg*mp[1], fw*c.b[2]+reg*mp[2]};
-        double x[3]; solve3x3_sym(A,b,x);
-        for (int a=0;a<3;a++){ if(x[a]<0)x[a]=0; if(x[a]>1)x[a]=1; out.dual[(size_t)i*3+a]=(float)x[a]; }
+        double x[3]; solve_qef_unit_box(A,b,x);
+        for (int a=0;a<3;a++) out.dual[(size_t)i*3+a]=(float)x[a];
     }
-    (void)boundary_weight;
-
-    // intersected flags — APPROXIMATE (o_voxel's exact intersect_qef edge-walk is closed-source).
-    // Empirically (probing the golden) the flag is frontier-related: golden intersected[c][a]=1 is
-    // MORE likely when the +a neighbour cell is ABSENT and the cell carries surface (a quad/face is
-    // emitted toward the open boundary), not when it exists. We flag axis a iff the cell has face
-    // planes and its +a neighbour is missing. Agreement ~0.65 vs golden (current best black-box
-    // heuristic; the exact per-axis encoding is in the .so's intersect_qef — see VOXELIZER_PORT.md).
-    for (int i=0;i<N;i++) {
-        if (cells[i].nplanes==0) continue;
-        int32_t x=out.coords[i*3+0], y=out.coords[i*3+1], z=out.coords[i*3+2];
-        for (int a=0;a<3;a++) {
-            int32_t nx=x+(a==0), ny=y+(a==1), nz=z+(a==2);
-            if (idx.find(cell_key(nx,ny,nz))==idx.end())
-                out.intersected[(size_t)i*3+a]=1;
+    (void)boundary_weight;  // no topological boundary edges in the production meshes audited so far
+    // Mark the actual grid edges pierced by the input surface.  A flag is stored
+    // on the lower of the four dual cells around that edge (not on the edge's
+    // physical start cell): x -> start-(0,1,1), y -> start-(1,0,1),
+    // z -> start-(1,1,0).  This is exactly the offset table consumed by
+    // flexible_dual_grid_to_mesh.
+    for (int f=0; f<F; f++) {
+        const double *p0=&g[(size_t)faces[f*3+0]*3], *p1=&g[(size_t)faces[f*3+1]*3], *p2=&g[(size_t)faces[f*3+2]*3];
+        double mn[3],mx[3]; for(int a=0;a<3;a++){mn[a]=std::min(p0[a],std::min(p1[a],p2[a]));mx[a]=std::max(p0[a],std::max(p1[a],p2[a]));}
+        int lo[3],hi[3]; for(int a=0;a<3;a++){lo[a]=std::max(0,(int)std::floor(mn[a])-1);hi[a]=std::min(grid_size[a]-1,(int)std::ceil(mx[a])+1);}
+        for(int axis=0;axis<3;axis++)
+        for(int z=lo[2];z<=hi[2];z++) for(int y=lo[1];y<=hi[1];y++) for(int x=lo[0];x<=hi[0];x++) {
+            int fx=x-(axis!=0), fy=y-(axis!=1), fz=z-(axis!=2);
+            auto it=idx.find(cell_key(fx,fy,fz)); if(it==idx.end()) continue;
+            double o[3]={(double)x,(double)y,(double)z};
+            if(grid_edge_hits_tri(o,axis,p0,p1,p2)) out.intersected[(size_t)it->second*3+axis]=1;
         }
     }
     return out;

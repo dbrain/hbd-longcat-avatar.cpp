@@ -43,7 +43,9 @@ GLB = sys.argv[1] if len(sys.argv) > 1 else \
     '/home/dbrain/dev/longcat-sparse-spike/tools/m1_ref/cpp_port/us_native_69k.glb'
 OUT = sys.argv[2] if len(sys.argv) > 2 else '/mnt/hdd/pixal3d_tex/golden_voxel'
 DO_PREPROCESS = os.environ.get('PREPROCESS', '1') == '1'
-RES = 1024
+RES = int(sys.argv[3]) if len(sys.argv) > 3 else 1024
+BW = float(sys.argv[4]) if len(sys.argv) > 4 else 0.2
+REG = float(sys.argv[5]) if len(sys.argv) > 5 else 1e-2
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -83,14 +85,14 @@ def main():
         grid_size=RES,
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         face_weight=1.0,
-        boundary_weight=0.2,
-        regularization_weight=1e-2,
+        boundary_weight=BW,
+        regularization_weight=REG,
         timing=False,
     )
     coords = voxel_indices.cpu().numpy()
     dual = dual_vertices.cpu().numpy()
     inter = intersected.cpu().numpy()
-    print('\n=== RAW VOXELIZER OUTPUT @grid1024 ===')
+    print(f'\n=== RAW VOXELIZER OUTPUT @grid{RES} ===')
     print('coords', coords.shape, coords.dtype, 'min', coords.min(0), 'max', coords.max(0))
     print('dual  ', dual.shape, dual.dtype, 'min', dual.min(0), 'max', dual.max(0))
     print('inter ', inter.shape, inter.dtype, 'uniq', np.unique(inter), 'sum/axis', inter.reshape(-1,inter.shape[-1]).sum(0) if inter.ndim>1 else inter.sum())
