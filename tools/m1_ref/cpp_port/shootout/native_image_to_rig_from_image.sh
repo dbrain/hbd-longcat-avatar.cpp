@@ -164,6 +164,15 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
     fi
   done
   [[ -n "${LEGACY_RIG_LEVEL:-}" ]] || { echo "no native or legacy rig candidate passed the structural gate" >&2; exit 1; }
+  # native_image_to_rig.sh truthfully records that its own learned skeleton was rejected. Preserve that
+  # fact and also record the final generic-run outcome, rather than letting the top-level delivery
+  # manifest imply that no Hymotion hand-off exists after this explicitly named fallback succeeds.
+  [[ -f "$OUT/texture_delivery.txt" ]] || { echo "native texture delivery manifest missing after rig rejection" >&2; exit 1; }
+  {
+    printf 'final_generic_rig_state=explicit-legacy-fallback\n'
+    printf 'final_generic_rig_level=%s\n' "$LEGACY_RIG_LEVEL"
+    printf 'final_hymotion_rigged=hymotion_rigged.glb sha256=%s\n' "$(sha256sum "$OUT/hymotion_rigged.glb" | awk '{print $1}')"
+  } >>"$OUT/texture_delivery.txt"
   cat >"$OUT/stages.json" <<EOF
 {"subject":"$LABEL · native textured run with explicit legacy-rig fallback","input":"input.png","stages":[
  {"file":"hymotion_rigged.glb","label":"Hymotion-ready · legacy rig fallback ($LEGACY_RIG_LEVEL)","note":"all native skeleton candidates failed structural naming; clean native texture LODs remain the production texture assets"},
@@ -304,6 +313,7 @@ input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=image_to_rig --moge --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8 --no-rig
 texture_recipe=native high Trellis material + CPU medium/low rebakes from native_high_texture_dump + structural rig gate
+texture_delivery_manifest=$OUT/texture_delivery.txt
 rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
 gpu=PCI GPU 0 / RTX 3060 only
 EOF

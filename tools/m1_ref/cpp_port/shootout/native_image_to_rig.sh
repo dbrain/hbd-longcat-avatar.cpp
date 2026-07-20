@@ -52,6 +52,46 @@ NATIVE_UNWRAP="${NATIVE_UNWRAP:-reference}"
   echo "NATIVE_UNWRAP must be reference or production" >&2; exit 2;
 }
 
+# A texture can look plausible while being unusable in animation if a later LOD bake introduced a
+# boundary. `mesh_topo` position-welds split GLB vertices, so `open=0` is the meaningful invariant
+# rather than raw index adjacency. Preserve its full report in the delivery manifest too.
+assert_closed_mesh() {
+  local file="$1" report open
+  report="$("$CP/mesh_topo" "$file")" || { echo "could not inspect topology: $file" >&2; return 1; }
+  printf '%s\n' "$report"
+  [[ "$report" =~ open=([0-9]+) ]] || { echo "topology report lacks open-edge count: $file" >&2; return 1; }
+  open="${BASH_REMATCH[1]}"
+  (( open == 0 )) || { echo "REJECT: texture LOD has $open open edges: $file" >&2; return 1; }
+}
+
+# One durable hand-off record, written only after all three texture assets passed the structural
+# gate. It intentionally names the high texture as production even if medium/low supplied the best
+# skeleton: try_rig transfers that accepted skin onto high, so Hymotion does not silently inherit a
+# lower-resolution atlas.
+write_texture_delivery_manifest() {
+  local rig_state="$1" level="${2:-none}" name file atlas status topo
+  {
+    printf 'schema_version=1\n'
+    printf 'production_texture=native_high_textured.glb\n'
+    printf 'native_unwrap=%s\n' "$NATIVE_UNWRAP"
+    printf 'high_model_lattice=%s\nhigh_atlas_px=%s\n' "$NATIVE_HIGH_RESOLUTION" "$NATIVE_HIGH_ATLAS"
+    printf 'lod_material_contract=medium/low are CPU rebakes of native_high_texture_dump; no second texture inference\n'
+    printf 'topology_gate=position-welded open=0 for every texture LOD\n'
+    printf 'rig_state=%s\nselected_rig=%s\n' "$rig_state" "$level"
+    for name in high medium low; do
+      file="$OUT/native_${name}_textured.glb"
+      atlas="$OUT/native_${name}_textured_atlas.png"
+      status="${file}.run-status.txt"
+      topo="$("$CP/mesh_topo" "$file")"
+      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s topology="%s"\n' \
+        "$name" "$(basename "$file")" "$(sha256sum "$file" | awk '{print $1}')" \
+        "$(basename "$atlas")" "$(sha256sum "$atlas" | awk '{print $1}')" "$topo"
+      [[ ! -f "$status" ]] || printf 'lod=%s native_texture_status=%s\n' "$name" "$(basename "$status")"
+    done
+    [[ "$rig_state" != succeeded ]] || printf 'hymotion_rigged=hymotion_rigged.glb sha256=%s\n' "$(sha256sum "$OUT/hymotion_rigged.glb" | awk '{print $1}')"
+  } >"$OUT/texture_delivery.txt"
+}
+
 run_native_high() {
   local out="$OUT/native_high_textured.glb"
   local atlas_out="$OUT/native_high_textured_atlas.png"
@@ -64,7 +104,7 @@ run_native_high() {
   [[ -s "$dump/native_pbr_feats.npy" && -s "$dump/native_pbr_coords.npy" ]] || {
     echo "native high did not retain the authoritative PBR volume" >&2; return 1;
   }
-  "$CP/mesh_topo" "$out"
+  assert_closed_mesh "$out"
 }
 
 run_rebaked_lod() {
@@ -76,7 +116,7 @@ run_rebaked_lod() {
     --resolution "$NATIVE_HIGH_RESOLUTION" --texsize "$atlas" --decimate "$faces" --unwrap "$NATIVE_UNWRAP" \
     --atlas-out "$atlas_out"
   [[ -s "$atlas_out" ]] || { echo "native $name did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
-  "$CP/mesh_topo" "$out"
+  assert_closed_mesh "$out"
 }
 
 rig_ok() {
@@ -133,6 +173,7 @@ done
 # high/medium/low materials, and a rerun has an unambiguous reason for not
 # publishing a Hymotion asset.
 if [[ -z "$SELECTED_RIG" ]]; then
+  write_texture_delivery_manifest rejected
   cat >"$OUT/run-status.txt" <<EOF
 texture_lods=succeeded
 rig_state=rejected
@@ -158,6 +199,8 @@ selected_rig=$SELECTED_RIG
 rig_gate=maxfan <= 7; rig_score >= 0.50; named Mixamo core; bone-naming falsifier
 published_hymotion_rig=hymotion_rigged.glb
 EOF
+
+write_texture_delivery_manifest succeeded "$SELECTED_RIG"
 
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
