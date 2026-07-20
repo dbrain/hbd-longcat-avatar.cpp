@@ -13913,8 +13913,28 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (!final_latent_prestripped && latents.video_conditioning_frame_count > 0) {
         int64_t target_frames = latents.video_target_frame_count > 0 ? latents.video_target_frame_count
                                                                      : final_latent.shape()[2] - latents.video_conditioning_frame_count;
-        final_latent          = sd::ops::slice(final_latent, 2, 0, target_frames);
-        // mirror the same temporal trim on the base continuation latent (same Tl)
+        // final_latent may carry the LTXAV audio FLAT in the trailing channels over the WHOLE
+        // W*H*T grid (pack_ltxav_audio_and_video_latents). A raw frame-axis slice of the PACKED
+        // latent SHEARS that audio: it drops the audio values that live in the trimmed guide
+        // frames and leaves the audio-channel count sized for the pre-trim (target+guide) grid,
+        // so a later unpack on the returned latent under-reads (packed_values < required) and
+        // returns EMPTY. This broke the unified-refine per-segment audio recovery on every
+        // continuation segment (seg>0), where the returned latent is re-unpacked to assemble the
+        // joined audio timeline. Preserve the real audio: unpack it first (still intact here — the
+        // guide frames are present), slice VIDEO only, then repack over the trimmed target grid.
+        const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
+        sd::Tensor<float> preserved_audio;
+        if (latents.audio_length > 0 && final_latent.dim() > 3 && final_latent.shape()[3] > latent_channels) {
+            preserved_audio = unpack_ltxav_audio_latent(final_latent, latents.audio_length, (int)latent_channels);
+            final_latent    = sd::ops::slice(final_latent, 3, 0, latent_channels);
+        }
+        final_latent = sd::ops::slice(final_latent, 2, 0, target_frames);
+        if (!preserved_audio.empty()) {
+            final_latent = pack_ltxav_audio_and_video_latents(final_latent, preserved_audio);
+        }
+        // mirror the same temporal trim on the base continuation latent (same Tl). This latent is
+        // consumed VIDEO-only downstream (next-segment continuation strips audio), so a plain
+        // frame slice is fine here.
         if (!chain_base_latent.empty()) {
             chain_base_latent = sd::ops::slice(chain_base_latent, 2, 0, target_frames);
         }
