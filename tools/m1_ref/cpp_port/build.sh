@@ -456,7 +456,7 @@ if [ "$BASE" = "rig_skin_decoder_test" ]; then
     LIBS="-L$BUILD/src -L$BUILD/src/ggml-cuda -lggml -lggml-base -lggml-cpu -lggml-cuda"
     CUDALIBS="-L$TOOLLIB -lcudart -lcublas -L/usr/lib -lcuda"
     echo ">> CUDA build rig_skin_decoder_test (ggml-cuda + GGUF skin-VAE decoder)"
-    "$HOSTCXX" $COMMON -fopenmp -DM1_USE_CUDA $INC "$HERE/$SRC" -o "$HERE/$BIN" \
+    "$HOSTCXX" $COMMON -fopenmp -DM1_USE_CUDA $INC -I"$TOOL/include" "$HERE/$SRC" -o "$HERE/$BIN" \
       $LIBS $CUDALIBS -lm \
       -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
   else
@@ -484,7 +484,7 @@ if [ "$BASE" = "skintokens_e2e" ]; then
     LIBS="-L$BUILD/src -L$BUILD/src/ggml-cuda -lggml -lggml-base -lggml-cpu -lggml-cuda"
     CUDALIBS="-L$TOOLLIB -lcudart -lcublas -L/usr/lib -lcuda"
     echo ">> CUDA build skintokens_e2e (ggml-cuda + qwen3 AR core + skin-VAE decoder + GLB)"
-    "$HOSTCXX" $COMMON -fopenmp -DM1_USE_CUDA $INC "$HERE/$SRC" -o "$HERE/$BIN" \
+    "$HOSTCXX" $COMMON -fopenmp -DM1_USE_CUDA $INC -I"$TOOL/include" "$HERE/$SRC" -o "$HERE/$BIN" \
       $LIBS $CUDALIBS -lm \
       -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
   else

@@ -40,6 +40,7 @@
 #include <cmath>
 #include <fstream>
 #include <chrono>
+#include <filesystem>
 
 // Peak-VRAM sampling via the CUDA runtime — only available in the CUDA build (CPU build does NOT
 // link cudart). Guarded by M1_USE_CUDA (set by build.sh's cuda branch). Falls back to a no-op note.
@@ -146,6 +147,10 @@ static void npy_write(const std::string& path, const void* data, size_t elem_byt
 }
 
 int main(int argc, char** argv) {
+    // R3/R4/R5 dump arrays are the explicit hand-off to combine_rig_tex_main.
+    // A fresh host may not have the historical test directory, so create it
+    // before writing rather than reporting a successful dump of a dropped file.
+    std::filesystem::create_directories("/tmp/skintokens_e2e");
     std::string e2e = "/tmp/skintokens_e2e";
     std::string qwen3_w = "/tmp/qwen3_w";
     std::string out_glb = "/tmp/skintokens_e2e_out.glb";
@@ -404,7 +409,7 @@ int main(int argc, char** argv) {
         if (r3_mode == "tfprobe") {
             NpyArray sa = npy_load(e2e + "/output_ids_clean.npy");
             std::vector<int> seq(sa.numel());
-            for (size_t i = 0; i < sa.numel(); ++i) seq[i] = (int)((const int64_t*)sa.raw.data())[i];
+            for (size_t i = 0; i < (size_t)sa.numel(); ++i) seq[i] = (int)((const int64_t*)sa.raw.data())[i];
             int w = -1; for (int i = 0; i < (int)seq.size(); ++i) if (seq[i] == gspec.token_id_eos) { w = i; break; }
             printf("[tfprobe] golden len=%zu switch(258)@%d  n_cond=%d\n", seq.size(), w, n_cond);
             std::vector<int> seq_in(seq.begin(), seq.end() - 1);

@@ -22,6 +22,7 @@
 #include "glb_rigged_textured.hpp"
 #include "glb_writer.hpp"
 #include "rig_transfer.hpp"
+#include "rig_bone_names.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -226,11 +227,28 @@ int main(int argc, char** argv) {
                       ? "  (NOTE: stand-in rig — geometric mismatch expected)" : "");
     }
 
+    // --- derive standard humanoid names from the generated rest skeleton ---
+    // SkinTokens joint indices are mesh-dependent, so an index table would be
+    // a silent retargeting bug.  The naming pass uses the tree + rest pose and
+    // falsifies its own anatomical/chirality assumptions before we promise a
+    // Mixamo/Hymotion hand-off.
+    rig::NameOpts name_opts;
+    if (const char* facing = std::getenv("RIG_BONE_FACING")) {
+        if (std::strcmp(facing, "+z") == 0) name_opts.facing_override = +1;
+        else if (std::strcmp(facing, "-z") == 0) name_opts.facing_override = -1;
+        else { std::fprintf(stderr, "bad RIG_BONE_FACING '%s' (expected +z or -z)\n", facing); return 2; }
+    }
+    rig::BoneNaming named = rig::name_bones(joints, parents, name_opts);
+    if (!named.ok) { std::fprintf(stderr, "bone naming failed: %s\n", named.fail_reason.c_str()); return 1; }
+    if (rig::falsify_bone_names(joints, parents, named, true) != 0) {
+        std::fprintf(stderr, "bone naming falsifier failed; refusing ambiguous retarget asset\n"); return 1;
+    }
+
     // --- write the combined TEXTURED + RIGGED glb ---
     bool ok = glb::write_rigged_textured_glb(
         out_path.c_str(), mesh.verts, mesh.faces, mesh.uvs, joints, parents, dst_w,
         have_nrm ? &mesh.normals : nullptr,
-        tex_png.data(), tex_png.size(), tex_mime.c_str());
+        tex_png.data(), tex_png.size(), tex_mime.c_str(), &named.names);
     if (!ok) { std::fprintf(stderr, "write_rigged_textured_glb failed\n"); return 1; }
     long osz = file_size(out_path.c_str());
     std::printf("  wrote %s (%ld bytes, %.1f MB)\n", out_path.c_str(), osz, osz / 1e6);

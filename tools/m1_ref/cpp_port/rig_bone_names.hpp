@@ -239,6 +239,39 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
     for (int c : rc)
         if (c != spine_start && t.up_min[c] < jat(joints, t.root, AX_UP) - 1e-3f) legs.push_back(c);
     std::sort(legs.begin(), legs.end(), [&](int a, int b) { return t.lat_max[a] > t.lat_max[b]; });
+    // SkinTokens sometimes inserts a one-bone pelvis connector: the root has
+    // one descending child, and that child (not the root) fans into the two
+    // legs.  Treating this as a malformed humanoid discarded otherwise sound
+    // rigs.  Look for the *shallowest* bilateral descending fan below root;
+    // that preference selects the pelvis connector before the much deeper
+    // shoulder/arm fan (whose hands can also descend below the hips).
+    if (legs.size() < 2) {
+        std::vector<int> depth(J, -1), q{t.root}; depth[t.root] = 0;
+        for (size_t qi=0; qi<q.size(); qi++)
+            for (int c : t.ch[q[qi]]) { depth[c]=depth[q[qi]]+1; q.push_back(c); }
+        int hub = -1;
+        std::vector<int> hub_legs;
+        for (int n=0; n<J; n++) {
+            if (n == t.root || t.ch[n].size() < 2) continue;
+            std::vector<int> cand;
+            bool neg=false, pos=false;
+            for (int c : t.ch[n]) {
+                if (t.up_min[c] >= jat(joints, t.root, AX_UP) - 1e-3f) continue;
+                cand.push_back(c);
+                neg = neg || jat(joints,c,AX_LAT) < 0.f;
+                pos = pos || jat(joints,c,AX_LAT) > 0.f;
+            }
+            if (!neg || !pos || cand.size() < 2) continue;
+            std::sort(cand.begin(), cand.end(), [&](int a, int b) { return t.lat_max[a] > t.lat_max[b]; });
+            if (hub < 0 || depth[n] < depth[hub]) { hub=n; hub_legs.assign(cand.begin(), cand.begin()+2); }
+        }
+        if (hub >= 0) {
+            legs = std::move(hub_legs);
+            char b[160];
+            std::snprintf(b, sizeof(b), "legs found below root via pelvis connector joint %d", hub);
+            R.notes.push_back(b);
+        }
+    }
     if (legs.size() < 2) {
         char b[160];
         std::snprintf(b, sizeof(b), "expected 2 leg chains under the root, found %d", (int)legs.size());

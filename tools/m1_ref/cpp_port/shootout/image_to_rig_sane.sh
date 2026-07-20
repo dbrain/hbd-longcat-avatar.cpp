@@ -173,6 +173,11 @@ JSON
 }
 
 ensure_cache
+# The clay diagnostic must always show the exact cache that feeds the current
+# production levels.  Leaving an older `refined_geometry.glb` symlink behind
+# makes the eye-test diagnose a mesh we no longer use (and previously made the
+# sealed Miku/Gilly repairs appear to have been lost).
+ln -sfn "$CACHE/refined.glb" "$OUT_DIR/refined_geometry.glb"
 if [[ "$LEVEL" == all || "$LEVEL" == high ]]; then
   run_level high 300000 2048 0
   run_texture_variants
