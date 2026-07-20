@@ -867,7 +867,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             cluster_mode = "BFS";
             clusters = precluster_meshes(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f));
 #ifdef TEXATLAS_NATIVE_CUMESH
-        } else if (std::getenv("ATL_NATIVE_CUMESH")) {
+        } else if (std::getenv("ATL_NATIVE_CUMESH") || auto_precluster) {
             cluster_mode = "native-cumesh";
             use_cluster_sources = true;
             std::vector<native_cumesh::ClusterMesh> nc = native_cumesh::compute_clusters(
