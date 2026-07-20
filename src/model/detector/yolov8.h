@@ -321,9 +321,9 @@ struct YOLOv8Runner : public GGMLRunner {
     std::unique_ptr<YOLOv8Model> model;
 
     YOLOv8Runner(ggml_backend_t backend,
-                 const String2TensorStorage& tensor_storage_map,
-                 std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-        : GGMLRunner(backend, weight_manager),
+                 ggml_backend_t params_backend,
+                 const String2TensorStorage& tensor_storage_map)
+        : GGMLRunner(backend, params_backend),
           config(YOLOv8Config::detect_from_weights(tensor_storage_map)) {
         if (config.valid) {
             model = std::make_unique<YOLOv8Model>(config);
@@ -355,7 +355,7 @@ struct YOLOv8Runner : public GGMLRunner {
 
     sd::Tensor<float> compute(int n_threads, const sd::Tensor<float>& input) {
         auto get_graph = [&]() { return build_graph(input); };
-        return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false));
+        return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, false));
     }
 };
 

@@ -32,8 +32,12 @@ Full evidence: `.merge-port-specs/audit-core-io.md`, `audit-diffusion.md`, `audi
   - qwen_image_layered ORCHESTRATION (§8, deferred sub-milestone) — get_image_channels(), qwen_image_layers
     request field, 5-D/looped init-latent + per-layer RGBA decode, fork-wide 3→4 channel output audit. No fork
     anchor (video-first divergence) + no checkpoint. Land as its own milestone.
-  - ADetailer — needs a prep agent (detailer.{cpp,h} onto fork runner + orphaned yolov8.h as GGMLRunner;
-    inpaint pass reuses sd_ctx img2img; CLI ad_* params). Roadmap Batch 4.
+  - ADetailer ENGINE CORE — DONE, builds. apply-doc `.merge-port-specs/adetailer-APPLY.md`. New detailer.{cpp,h}
+    (CPU DSP verbatim), de-staled orphaned yolov8.h (ctor→(backend,params_backend), compute 3-bool→2-bool),
+    load off ModelManager→ModelLoader::load_tensors+alloc_params_buffer (UPSCALER slot reuse; get_metadata absent
+    →class labels degrade to class_N), inpaint via fork sd_image_t* generate_image + manual free, public C API in
+    stable-diffusion.h. REMAINING (optional §8): CLI ad_* params + main.cpp apply_adetailer + resource_owners.hpp
+    ADetailerCtxPtr; koblem/server field = Rust, owner. GPU-PENDING: no converted YOLOv8 .safetensors on-box.
   - PuLID — needs a prep agent (FluxDiffusionExtra pulid_id + flux.hpp block injection + before_diffusion
     hook + generation_extension + sd_pulid_params_t). Hardest (DiT-touching). Roadmap Batch 5.
   - streaming/bounded-mem convert — Batch 6 (TensorWritePlan into tensor_storage.h + re-weave nvfp4 imatrix).
