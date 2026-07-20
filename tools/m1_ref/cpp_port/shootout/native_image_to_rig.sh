@@ -37,13 +37,21 @@ ln -sfn "$IMAGE" "$OUT/input.png"
 # convention for the structural Mixamo-name mapper so left/right does not
 # depend on a weak toe cue from a stylised or partially reconstructed foot.
 export RIG_BONE_FACING="${RIG_BONE_FACING:-+z}"
+# 512/2048 is the clean, economical default.  1024/4096 is an explicitly
+# requested hero-detail tier: it takes materially longer on the reserved 3060
+# and must still pass the visual gate before publication.
+NATIVE_HIGH_RESOLUTION="${NATIVE_HIGH_RESOLUTION:-512}"
+NATIVE_HIGH_ATLAS="${NATIVE_HIGH_ATLAS:-2048}"
+[[ "$NATIVE_HIGH_RESOLUTION" == 512 || "$NATIVE_HIGH_RESOLUTION" == 1024 ]] || {
+  echo "NATIVE_HIGH_RESOLUTION must be 512 or 1024" >&2; exit 2;
+}
 
 run_texture_level() {
-  local name="$1" faces="$2" atlas="$3"
+  local name="$1" faces="$2" resolution="$3" atlas="$4"
   local out="$OUT/native_${name}_textured.glb"
   echo "== $LABEL: native $name (${faces} faces, ${atlas}px atlas) =="
   "$CP/shootout/native_texture_run.sh" "$REFINED" "$IMAGE" "$out" \
-    --resolution 512 --texsize "$atlas" --decimate "$faces"
+    --resolution "$resolution" --texsize "$atlas" --decimate "$faces"
   "$CP/mesh_topo" "$out"
 }
 
@@ -86,9 +94,9 @@ try_rig() {
   return 1
 }
 
-run_texture_level high   300000 2048
-run_texture_level medium 150000 1024
-run_texture_level low     50000 1024
+run_texture_level high   300000 "$NATIVE_HIGH_RESOLUTION" "$NATIVE_HIGH_ATLAS"
+run_texture_level medium 150000 512 1024
+run_texture_level low     50000 512 1024
 
 SELECTED_RIG=""
 for level in high medium low; do
@@ -99,7 +107,7 @@ done
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
  {"file":"hymotion_rigged.glb","label":"Hymotion-ready · native $SELECTED_RIG rig","note":"native Trellis texture; deterministic beam rig; maxfan ≤ 7 and rig_score ≥ 0.50"},
- {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · 2048 atlas"},
+ {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas"},
  {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas"},
  {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas"}
 ]}

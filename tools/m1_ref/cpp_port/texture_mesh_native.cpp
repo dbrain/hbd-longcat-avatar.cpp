@@ -216,29 +216,42 @@ int main(int argc, char** argv) {
         for (size_t i=0;i<slat.size();i++) slat[i]=(slat[i]-shape_mean[i%32])/shape_std[i%32];
         std::vector<int32_t> cxyz((size_t)M*3);
         for (int i=0;i<M;i++) for (int c=0;c<3;c++) cxyz[(size_t)i*3+c]=slat_coords[(size_t)i*4+c+1];
-        trandn::Generator gen((uint64_t)seed);
-        std::vector<float> noise=gen.randn((int64_t)M*32), x64((size_t)M*64);
-        // The two lattice sizes use separately trained texture-flow weights.  Selecting 1024 here
-        // for a 512 comparison quietly invalidates parity even if every operation is native.
-        const char* flow_weights = resolution==512 ? "weights_npy/trellis2_tex_512" : "weights_npy/trellis2_tex_1024";
-        M1Harness H(flow_weights, 4096, true);
-        ggml_context* ctx=H.ctx;
-        int64_t xn[4]={64,M,1,1}, tn[4]={1,1,1,1}, cn[4]={1024,(int64_t)cond.size()/1024,1,1};
-        ggml_tensor* xin=H.input("x",2,xn), *tin=H.input("t",1,tn), *cin=H.input("cond",2,cn);
-        ggml_tensor* pred=texdit::build_tex_dit_cross_forward(ctx,H,M,(int)cn[1],xin,tin,cin,cxyz.data());
-        ggml_set_output(pred); ggml_cgraph* graph=new_graph(ctx,65536); ggml_build_forward_expand(graph,pred);
-        H.alloc_and_upload(graph); H.upload_input_raw(cin,cond);
-        auto forward=[&](const std::vector<float>& x, float t, bool) {
-            for (int i=0;i<M;i++) for (int c=0;c<32;c++) { x64[(size_t)i*64+c]=x[(size_t)i*32+c]; x64[(size_t)i*64+c+32]=slat[(size_t)i*32+c]; }
-            H.upload_input_raw(xin,x64); H.upload_input_raw(tin,std::vector<float>{t}); H.compute(graph);
-            std::vector<float> r((size_t)M*32); ggml_backend_tensor_get(pred,r.data(),0,r.size()*sizeof(float)); return r;
-        };
-        std::vector<float> tex=geo::flow_sampler((int64_t)M*32,noise,1e-5f,1.f,0.f,3.f,.6,.9,12,forward,"native tex");
+        std::vector<float> tex;
+        {
+            trandn::Generator gen((uint64_t)seed);
+            std::vector<float> noise=gen.randn((int64_t)M*32), x64((size_t)M*64);
+            // The two lattice sizes use separately trained texture-flow weights.  Selecting 1024 here
+            // for a 512 comparison quietly invalidates parity even if every operation is native.
+            const char* flow_weights = resolution==512 ? "weights_npy/trellis2_tex_512" : "weights_npy/trellis2_tex_1024";
+            M1Harness H(flow_weights, 4096, true);
+            ggml_context* ctx=H.ctx;
+            int64_t xn[4]={64,M,1,1}, tn[4]={1,1,1,1}, cn[4]={1024,(int64_t)cond.size()/1024,1,1};
+            ggml_tensor* xin=H.input("x",2,xn), *tin=H.input("t",1,tn), *cin=H.input("cond",2,cn);
+            ggml_tensor* pred=texdit::build_tex_dit_cross_forward(ctx,H,M,(int)cn[1],xin,tin,cin,cxyz.data());
+            ggml_set_output(pred); ggml_cgraph* graph=new_graph(ctx,65536); ggml_build_forward_expand(graph,pred);
+            H.alloc_and_upload(graph); H.upload_input_raw(cin,cond);
+            auto forward=[&](const std::vector<float>& x, float t, bool) {
+                for (int i=0;i<M;i++) for (int c=0;c<32;c++) { x64[(size_t)i*64+c]=x[(size_t)i*32+c]; x64[(size_t)i*64+c+32]=slat[(size_t)i*32+c]; }
+                H.upload_input_raw(xin,x64); H.upload_input_raw(tin,std::vector<float>{t}); H.compute(graph);
+                std::vector<float> r((size_t)M*32); ggml_backend_tensor_get(pred,r.data(),0,r.size()*sizeof(float)); return r;
+            };
+            tex=geo::flow_sampler((int64_t)M*32,noise,1e-5f,1.f,0.f,3.f,.6,.9,12,forward,"native tex");
+        } // Release the large texture-flow graph and its GPU weights before M6 PBR decode.
         for (size_t i=0;i<tex.size();i++) tex[i]=tex[i]*tex_std[i%32]+tex_mean[i%32];
         if (!dump_dir.empty()) dump_npy(dump_dir+"/native_tex_slat_feats.npy",tex,"<f4",{M,32});
         std::vector<std::vector<uint8_t>> subs=senc::build_guide_subs(coords,slat_coords);
         std::vector<int32_t> pbr_coords;
         std::vector<float> pbr=svpg::m6_tex_decode(slat_coords,tex,subs,"weights_npy/tex_dec",&pbr_coords);
+        // A CUDA allocation failure used to be swallowed by the decoder and surfaced as a
+        // perfectly neutral (0.5, 0.5, 0.5) atlas.  That is never a useful generated texture;
+        // fail closed so a high-resolution run cannot silently replace a good production asset.
+        if (pbr.empty()) throw std::runtime_error("PBR decoder returned no voxels");
+        float rgb_min=1e30f, rgb_max=-1e30f;
+        for (size_t i=0;i<pbr.size();i+=6) for (int c=0;c<3;c++) {
+            rgb_min=std::min(rgb_min,pbr[i+c]); rgb_max=std::max(rgb_max,pbr[i+c]);
+        }
+        if (rgb_max-rgb_min < 1e-4f)
+            throw std::runtime_error("PBR decoder collapsed to a neutral field (likely CUDA memory pressure)");
         if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_pbr_coords.npy",pbr_coords,"<i4",{(int)pbr_coords.size()/4,4}); dump_npy(dump_dir+"/native_pbr_feats.npy",pbr,"<f4",{(int)pbr.size()/6,6}); }
         std::printf("[native-texture] PBR volume: %zu voxels\\n", pbr.size()/6);
 
