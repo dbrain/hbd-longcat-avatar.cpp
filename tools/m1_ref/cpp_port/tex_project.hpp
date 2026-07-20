@@ -330,6 +330,9 @@ struct Cfg {
     std::string front_img;             // REQUIRED — the --image matte (the frame the mesh was built from)
     std::string back_img;              // optional ("" = none) — sugar for a view at yaw=180
     std::vector<ViewSpec> views;       // optional EXTRA views (any yaw); front + back sugar are implicit
+    // Keep the volume bake for texels no supplied camera can observe. This prevents a front-only image
+    // from inventing noisy colour behind hair, under arms, or around a missing back/side view.
+    bool preserve_base_for_holes = false;
     bool verbose = true;
     std::string debug_dir;             // optional: dump z-buffers / confidence / align / fill-source PNGs
 };
@@ -353,6 +356,7 @@ struct Stats {
     int n_hole = 0;                    // covered texels no view could paint
     int n_fill3d = 0;                  // of those, filled by the 3D k-nearest fill
     int n_telea = 0;                   // of those, fell through to the atlas-space Telea/dilate
+    int n_base = 0;                    // of those, retained from the pre-projection volume bake
     // BUG 3 — THE SEAM. n_seam = 3D-fill texels whose k-NN spans >=2 views: that set IS the front/back
     // crossover, and it is the ONLY place the two views meet (the projection's confidence overlap band is
     // empty by construction — see Cam::facing). seam_absdiff = mean |viewA-viewB| there, in sRGB units;
@@ -1416,8 +1420,8 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
 
     // ---- 3. per-view subject mask + silhouette-bbox auto-align. THE FRONT IS INCLUDED NOW (BUG 1). ----
     // The mask serves BOTH jobs, so they cannot disagree: its bbox is the align target, and its eroded form
-    // is BUG 2's background-sample reject. The FRONT always uses the `black` detector (its matte is
-    // black-composited by construction — that is what make_matte emits) at its own, much lower threshold.
+    // is BUG 2's background-sample reject. A normal geometry matte is black-composited, while --tex-front
+    // can be an RGBA cutout in the SAME frame; that alpha is the only reliable subject mask for raw inputs.
     t0 = texatlas::_now();
     for (int i = 0; i < NV; i++) {
         View& v = views[i];
@@ -1428,7 +1432,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
         // silhouette-vs-subject IoU 0.857 and throws away 12.37% of the mesh's back silhouette (the
         // bearskin + boots, which touch the outline so the hole-fill guard cannot save them); alpha gives
         // IoU 0.945 / 2.73%, i.e. essentially the front's own 0.971 / 1.40%.
-        const std::string mode = is_front ? std::string("black")
+        const std::string mode = is_front ? (v.has_alpha ? std::string("alpha") : std::string("black"))
                                : (bg_mode == "auto" ? (v.has_alpha ? std::string("alpha") : std::string("black"))
                                                     : bg_mode);
         const float thr = is_front ? front_bg_thresh : bg_thresh;
@@ -1512,6 +1516,16 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
     // ---- 4-6. per texel: project through EVERY view, occlusion-test, confidence-weight, blend (LINEAR) ----
     t0 = texatlas::_now();
     std::vector<float> rgb_lin((size_t)W * H * 3, 0.f);
+    // Decode before projected samples replace it. This is the already-baked volume atlas, retained only
+    // where no real supplied view can vouch for the surface.
+    std::vector<float> base_lin;
+    if (cfg.preserve_base_for_holes) {
+        base_lin.resize((size_t)W * H * 3);
+        #pragma omp parallel for schedule(static)
+        for (int p = 0; p < W * H; p++)
+            for (int c = 0; c < 3; c++)
+                base_lin[(size_t)p * 3 + c] = srgb_to_linear(bt.base_color[(size_t)p * 4 + c] / 255.f);
+    }
     std::vector<uint8_t> valid((size_t)W * H, 0);
     // per-texel provenance for the fill-source debug PNG: 0=none 1=projected 2=3D-filled 3=telea/dilate
     std::vector<uint8_t> src_of((size_t)W * H, 0);
@@ -1644,6 +1658,24 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
     for (int i = 0; i < NV; i++) {
         views[i].n_painted = n_view[i]; views[i].n_bgrej = n_bgrej[i];
         views[i].bgrej_facing_sum = f_bgrej[i]; views[i].kept_facing_sum = f_kept[i];
+    }
+
+    // A front photo cannot see behind hair, under an arm, or around the back. Do not turn those visibility
+    // holes into nearest-neighbour/Telea noise: retain the coherent volume albedo. Supplied back/side
+    // views still replace it normally above. `n_hole` stays the honest source-coverage metric.
+    int n_base = 0;
+    if (cfg.preserve_base_for_holes) {
+        #pragma omp parallel for reduction(+:n_base) schedule(static)
+        for (int p = 0; p < T; p++) {
+            if (!mask[(size_t)p] || valid[(size_t)p]) continue;
+            for (int c = 0; c < 3; c++) rgb_lin[(size_t)p * 3 + c] = base_lin[(size_t)p * 3 + c];
+            valid[(size_t)p] = 1;
+            src_of[(size_t)p] = 4;
+            n_base++;
+        }
+        if (cfg.verbose)
+            std::printf("[texproj] hybrid fallback: retained volume base for %d / %d unobserved texels (%.1f%%)\n",
+                        n_base, n_hole, n_hole ? 100.0 * n_base / n_hole : 0.0);
     }
 
     // ---- 6b. 3D-AWARE HOLE FILL: k-nearest painted texel in 3D, normal-gated, inverse-distance blend ----
@@ -1781,7 +1813,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
         }
     }
     st.t_fill3d = texatlas::_now() - t0;
-    const int n_telea = n_hole - n_fill3d;
+    const int n_telea = n_hole - n_fill3d - n_base;
     if (cfg.verbose && fill3d)
         std::printf("[texproj] 3D fill: %d / %d holes filled (%.1f%%), %d fell through to telea (%.1f%%)  (%.2fs)\n",
                     n_fill3d, n_hole, n_hole ? 100.0 * n_fill3d / n_hole : 0.0,
@@ -1856,6 +1888,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
                     case 1: o[0] = 255; break;
                     case 2: o[1] = 255; break;
                     case 3: o[2] = 255; break;
+                    case 4: o[0] = 255; o[1] = 255; break; // yellow = original volume fallback
                     default: break;
                 }
             }
@@ -1930,7 +1963,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
     }
 
     st.covered = covered;
-    st.n_hole = n_hole; st.n_fill3d = n_fill3d; st.n_telea = n_telea;
+    st.n_hole = n_hole; st.n_fill3d = n_fill3d; st.n_telea = n_telea; st.n_base = n_base;
     st.front_pct = 100.0 * n_view[0] / covered;
     st.back_pct  = (back_i >= 0) ? 100.0 * n_view[back_i] / covered : 0.0;
     st.hole_pct  = 100.0 * n_hole / covered;

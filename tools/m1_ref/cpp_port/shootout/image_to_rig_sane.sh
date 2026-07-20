@@ -7,6 +7,12 @@
 # `all` emits the high/medium/low clean meshes, three high-detail texture A/Bs,
 # and selects a valid Hymotion rig by scoring high -> medium -> low candidates.
 # This decision is based on rig quality, never on the model name.
+# Optional source views are input properties, never model-specific branches:
+#   IMAGE_TO_RIG_TEX_FRONT=/absolute/front_same_frame_rgba.png
+#   IMAGE_TO_RIG_TEX_BACK=/absolute/back_rgba.png
+#   IMAGE_TO_RIG_TEX_VIEWS='90=/absolute/right.png -90=/absolute/left.png'
+# A projection is always a hybrid: real-image detail on genuinely observed texels, the
+# stable volume texture everywhere else. A single front photo is not a 360-degree texture.
 # All GPU work is deliberately bound to the physical RTX 3060 (PCI bus order).
 set -euo pipefail
 
@@ -21,8 +27,10 @@ case "$MODEL" in
     CACHE=/mnt/hdd/3d/avatar-shootout/_shootout_out/ab_part_retopo_tex/stage_adaptive
     ;;
   gilly)
-    IMAGE=/mnt/hdd/3d/avatar-shootout/assets/gilly.png
-    CACHE="$OUT_ROOT/gilly/cache"
+    # Gilly starts as an opaque RGB reference. Its 3060-generated same-frame RGBA cutout is converted
+    # once to this black matte; geometry and projection MUST consume this exact frame together.
+    IMAGE="$OUT_ROOT/gilly/gilly_matte.png"
+    CACHE="$OUT_ROOT/gilly/cache_matted"
     ;;
   soldier)
     IMAGE=/mnt/hdd/3d/avatar-shootout/_shootout_out/inline_soldier
@@ -53,6 +61,23 @@ flock -n 9 || { echo "another image_to_rig job owns the 3060 lock" >&2; exit 1; 
 
 BASE=("$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$IMAGE" --moge
       --no-quad --tex-dit cross --tex-volume-direct --tex-fallback-r 8)
+
+PROJECTION_VIEW_ARGS=()
+if [[ -n "${IMAGE_TO_RIG_TEX_FRONT:-}" ]]; then
+  [[ -f "$IMAGE_TO_RIG_TEX_FRONT" ]] || { echo "missing IMAGE_TO_RIG_TEX_FRONT: $IMAGE_TO_RIG_TEX_FRONT" >&2; exit 2; }
+  PROJECTION_VIEW_ARGS+=(--tex-front "$IMAGE_TO_RIG_TEX_FRONT")
+fi
+if [[ -n "${IMAGE_TO_RIG_TEX_BACK:-}" ]]; then
+  [[ -f "$IMAGE_TO_RIG_TEX_BACK" ]] || { echo "missing IMAGE_TO_RIG_TEX_BACK: $IMAGE_TO_RIG_TEX_BACK" >&2; exit 2; }
+  PROJECTION_VIEW_ARGS+=(--tex-back "$IMAGE_TO_RIG_TEX_BACK")
+fi
+if [[ -n "${IMAGE_TO_RIG_TEX_VIEWS:-}" ]]; then
+  for view in $IMAGE_TO_RIG_TEX_VIEWS; do
+    yaw="${view%%=*}"; path="${view#*=}"
+    [[ "$yaw" != "$view" && -f "$path" ]] || { echo "bad IMAGE_TO_RIG_TEX_VIEWS entry '$view' (expected yaw=/absolute/image.png)" >&2; exit 2; }
+    PROJECTION_VIEW_ARGS+=(--tex-view "$yaw" "$path")
+  done
+fi
 
 ensure_cache() {
   if [[ -f "$CACHE/refined.glb" && -f "$CACHE/pbr_feats.bin" && -f "$CACHE/pbr_coords.bin" ]]; then
@@ -108,16 +133,16 @@ try_rig() {
 run_texture_variants() {
   # These are comparison artifacts, not alternate production assets.  The explicit
   # cross DiT in BASE is the all-round production choice (never inherit the binary's
-  # mutable default); front projection is the detail ceiling and exposes its
-  # unobserved-back limitation; tex-dit=proj is the second generative texture model
-  # with identical geometry/UVs.
+  # mutable default). The projection A/B preserves the volume texture at every
+  # unobserved texel, and accepts any supplied back/side sources above. tex-dit=proj
+  # is the second generative texture model with identical geometry/UVs.
   echo "== $MODEL: high-resolution texture variants =="
   "${BASE[@]}" --from-refined "$CACHE" --stage-dir "$OUT_DIR" --decimate 300000 --texsize 2048 \
     --no-rig --tex-dit proj --out "$OUT_DIR/high_generative_proj.glb"
   "$CP/mesh_topo" "$OUT_DIR/high_generative_proj.glb"
   "${BASE[@]}" --from-refined "$CACHE" --stage-dir "$OUT_DIR" --decimate 300000 --texsize 2048 \
-    --no-rig --tex-project --out "$OUT_DIR/high_front_projected.glb"
-  "$CP/mesh_topo" "$OUT_DIR/high_front_projected.glb"
+    --no-rig --tex-project-overlay "${PROJECTION_VIEW_ARGS[@]}" --out "$OUT_DIR/high_hybrid_projected.glb"
+  "$CP/mesh_topo" "$OUT_DIR/high_hybrid_projected.glb"
 }
 
 write_manifest() {
@@ -130,7 +155,7 @@ write_manifest() {
  {"file":"medium_textured.glb","label":"MEDIUM · textured","note":"150k target faces · 1024 atlas"},
  {"file":"low_textured.glb","label":"LOW · textured","note":"50k target faces · 1024 atlas; QEM only, no quad retopo"},
  {"file":"high_generative_proj.glb","label":"Texture A/B · generative proj","note":"same high mesh; Pixal3D texture DiT"},
- {"file":"high_front_projected.glb","label":"Texture A/B · front projection","note":"same high mesh; sharp observed front, synthesized/unobserved back"}
+ {"file":"high_hybrid_projected.glb","label":"Texture A/B · observed-view hybrid","note":"same high mesh; source detail only where observed, volume retained under occlusions and missing views"}
 ]}
 JSON
 }

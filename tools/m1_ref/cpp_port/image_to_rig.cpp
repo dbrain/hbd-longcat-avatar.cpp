@@ -102,7 +102,7 @@ static void usage() {
            "                          sets the nearest-voxel search radius (default 8 in direct mode, 0 in\n"
            "                          the snap modes = today's behaviour); r=0 in direct mode reproduces\n"
            "                          the historic BLACK-TEXTURE bug.)\n"
-           "        [--tex-project] [--tex-front <img>] [--tex-back <img>] [--tex-view <yaw_deg> <img>]...\n"
+           "        [--tex-project] [--tex-project-overlay] [--tex-front <img>] [--tex-back <img>] [--tex-view <yaw_deg> <img>]...\n"
            "                         (texture by PROJECTING the real images into the UV atlas instead of\n"
            "                          sampling TRELLIS's soft PBR volume: front = --image (or --tex-front,\n"
            "                          a TEXTURE-ONLY front source in the SAME camera frame -- e.g. an\n"
@@ -120,7 +120,9 @@ static void usage() {
            "                          down the sides); TEXPROJ_BG_REJECT=0 to A/B. Keeps the volume\n"
            "                          metallicRoughness — see tex_project.hpp's METAL_ROUGH CAVEAT, but note\n"
            "                          the owner's gold complaint is REGISTRATION, not metalness.\n"
-           "                          Near-source detail on the front)\n"
+           "                          Near-source detail on the front. --tex-project-overlay retains the\n"
+           "                          baked volume texture for unobserved texels rather than inventing it;\n"
+           "                          use it for a partial turnaround / occluded hair-and-arms hybrid.)\n"
            "        [--quad] [--quadwild-repo <dir>]\n"
            "                         (rung-2 quad retopology via quadwild-bimdf on the refined mesh: clean\n"
            "                          field-aligned topology, triangulated for the downstream; shell-out, CPU)\n");
@@ -258,6 +260,7 @@ int main(int argc, char** argv) {
     // --tex-view is repeatable (the owner called out SIDE views as a problem area, so adding e.g.
     // `--tex-view 90 right.png --tex-view -90 left.png` needs no code change here).
     bool tex_project = false;
+    bool tex_project_overlay = false;
     std::string tex_back;
     // --tex-front: use a DIFFERENT image than --image as the front projection source. Geometry and
     // texturing already consume different tensors (geometry gets the resized + ImageNet-normalized
@@ -339,6 +342,7 @@ int main(int argc, char** argv) {
         else if (a == "--tex-volume-direct") tex_volume_direct = true;
         else if (a == "--tex-fallback-r" && i+1 < argc) tex_fallback_r = std::atoi(argv[++i]);
         else if (a == "--tex-project") tex_project = true;
+        else if (a == "--tex-project-overlay") { tex_project = true; tex_project_overlay = true; }
         else if (a == "--tex-front" && i+1 < argc) tex_front = argv[++i];
         else if (a == "--tex-back" && i+1 < argc) tex_back = argv[++i];
         else if (a == "--tex-view" && i+2 < argc) {
@@ -627,6 +631,7 @@ int main(int argc, char** argv) {
         pcfg.front_img = tex_front.empty() ? image : tex_front;
         pcfg.back_img  = tex_back;
         pcfg.views     = tex_views;              // extra non-front, non-back yaws (repeatable --tex-view)
+        pcfg.preserve_base_for_holes = tex_project_overlay;
         pcfg.verbose   = true;
         pcfg.debug_dir = stage_dir;              // empty = no debug dumps (env TEXPROJ_DEBUG_DIR overrides)
         texproj::Stats ps;
@@ -643,8 +648,9 @@ int main(int argc, char** argv) {
                 printf("         view %zu: yaw %+7.1fdeg painted %.1f%% of covered\n", v, ps.view_yaw[v], ps.view_pct[v]);
         // Hole accounting: 3D-filled = respects the surface; telea = the old atlas-space fill (the camo
         // risk). A high telea share on a big smooth region is what to look for in proj_fill_source.png.
-        printf("         holes: %d total -> %d 3D-filled (%.1f%%) / %d telea-fallback (%.1f%%)  [fill %.2fs]\n",
+        printf("         holes: %d total -> %d 3D-filled (%.1f%%) / %d volume-retained (%.1f%%) / %d telea-fallback (%.1f%%)  [fill %.2fs]\n",
                ps.n_hole, ps.n_fill3d, ps.n_hole ? 100.0*ps.n_fill3d/ps.n_hole : 0.0,
+               ps.n_base, ps.n_hole ? 100.0*ps.n_base/ps.n_hole : 0.0,
                ps.n_telea, ps.n_hole ? 100.0*ps.n_telea/ps.n_hole : 0.0, ps.t_fill3d);
         if (!tex_back.empty())
             printf("         back align: %s scale=%.4f translate=(%+.1f, %+.1f) px\n",
