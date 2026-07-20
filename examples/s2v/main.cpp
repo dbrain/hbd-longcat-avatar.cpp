@@ -42,6 +42,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "model.h"
+#include "model_manager.h"
 #include "stable-diffusion.h"
 #include "model/te/t5.hpp"
 #include "tensor.hpp"
@@ -288,53 +289,67 @@ int main(int argc, char** argv) {
     if (dit_path.empty()) { printf("ERROR: --dit required\n"); return 1; }
     printf("loading S2V DiT '%s'\n", dit_path.c_str());
     std::shared_ptr<WAN_S2V::WanS2VRunner> dit;
+    std::shared_ptr<ModelManager> dit_manager;
     {
-        ModelLoader loader;
+        dit_manager = std::make_shared<ModelManager>();
+        auto& loader = dit_manager->loader();
         if (!loader.init_from_file_and_convert_name(dit_path, "model.diffusion_model.")) {
             printf("ERROR: init loader %s\n", dit_path.c_str()); return 1;
         }
-        dit = std::make_shared<WAN_S2V::WanS2VRunner>(backend, dit_params_backend, loader.get_tensor_storage_map(), "model.diffusion_model");
-        dit->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        dit->get_param_tensors(tensors, "model.diffusion_model");
-        if (!loader.load_tensors(tensors)) { printf("ERROR: load DiT tensors\n"); return 1; }
+        dit = std::make_shared<WAN_S2V::WanS2VRunner>(backend, loader.get_tensor_storage_map(), "model.diffusion_model", dit_manager);
+        if (!dit_manager->register_runner_params("Wan S2V", *dit, "model.diffusion_model",
+                                                 ModelManager::ResidencyMode::ParamBackend,
+                                                 backend, dit_params_backend) ||
+            !dit_manager->validate_registered_tensors()) {
+            printf("ERROR: register S2V DiT tensors\n"); return 1;
+        }
         // Flash attention is REQUIRED here: the self-attn is over ~13k tokens x 40
         // heads; without FA the materialized scores tensor needs ~28 GB. FA keeps
         // the DiT compute buffer to a few GB. (L_k=13312 % 256 == 0, head_dim=128.)
         dit->set_flash_attention_enabled(getenv("S2V_NO_FLASH") == nullptr);
         if (dit_offload) {
+            dit->set_stream_layers_enabled(true);
             size_t budget = (size_t)(max_vram_gib * 1024.0 * 1024.0 * 1024.0);
             dit->set_max_graph_vram_bytes(budget);
             printf("S2V DiT graph-cut VRAM budget = %.2f GiB\n", max_vram_gib);
         }
-        printf("S2V DiT loaded (%zu tensors), flash_attn=%d\n", tensors.size(),
+        printf("S2V DiT registered (%zu tensors), flash_attn=%d\n", dit_manager->tensor_names().size(),
                getenv("S2V_NO_FLASH") == nullptr);
     }
 
     // ---- load wav2vec2 + casual audio encoder ----
     std::shared_ptr<WAV2VEC2::Wav2Vec2EncoderRunner> w2v;
     std::shared_ptr<WAV2VEC2::CausalAudioEncoderRunner> cae;
+    std::shared_ptr<ModelManager> w2v_manager;
+    std::shared_ptr<ModelManager> cae_manager;
     if (!w2v_path.empty()) {
         printf("loading wav2vec2 '%s'\n", w2v_path.c_str());
-        ModelLoader loader;
+        w2v_manager = std::make_shared<ModelManager>();
+        auto& loader = w2v_manager->loader();
         if (!loader.init_from_file_and_convert_name(w2v_path, "")) { printf("ERROR: init w2v loader\n"); return 1; }
-        w2v = std::make_shared<WAV2VEC2::Wav2Vec2EncoderRunner>(audio_backend, audio_backend, loader.get_tensor_storage_map(), "audio_encoder");
-        w2v->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        w2v->get_param_tensors(tensors, "audio_encoder");
-        if (!loader.load_tensors(tensors)) { printf("WARN: some wav2vec2 tensors failed to load\n"); }
-        printf("wav2vec2 loaded (%zu tensors)\n", tensors.size());
+        w2v = std::make_shared<WAV2VEC2::Wav2Vec2EncoderRunner>(audio_backend, loader.get_tensor_storage_map(), "audio_encoder", w2v_manager);
+        if (!w2v_manager->register_runner_params("wav2vec2", *w2v, "audio_encoder",
+                                                 ModelManager::ResidencyMode::ParamBackend,
+                                                 audio_backend, audio_backend) ||
+            !w2v_manager->validate_registered_tensors()) {
+            printf("ERROR: register wav2vec2 tensors\n"); return 1;
+        }
+        printf("wav2vec2 registered (%zu tensors)\n", w2v_manager->tensor_names().size());
     }
     if (!cae_path.empty()) {
         printf("loading casual_audio_encoder '%s'\n", cae_path.c_str());
-        ModelLoader loader;
+        cae_manager = std::make_shared<ModelManager>();
+        auto& loader = cae_manager->loader();
         if (!loader.init_from_file_and_convert_name(cae_path, "")) { printf("ERROR: init cae loader\n"); return 1; }
-        cae = std::make_shared<WAV2VEC2::CausalAudioEncoderRunner>(audio_backend, audio_backend, loader.get_tensor_storage_map(), "model.diffusion_model.casual_audio_encoder");
-        cae->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        cae->get_param_tensors(tensors, "model.diffusion_model.casual_audio_encoder");
-        if (!loader.load_tensors(tensors)) { printf("WARN: some casual_audio_encoder tensors failed to load\n"); }
-        printf("casual_audio_encoder loaded (%zu tensors)\n", tensors.size());
+        cae = std::make_shared<WAV2VEC2::CausalAudioEncoderRunner>(audio_backend, loader.get_tensor_storage_map(), "model.diffusion_model.casual_audio_encoder", cae_manager);
+        if (!cae_manager->register_runner_params("casual audio encoder", *cae,
+                                                 "model.diffusion_model.casual_audio_encoder",
+                                                 ModelManager::ResidencyMode::ParamBackend,
+                                                 audio_backend, audio_backend) ||
+            !cae_manager->validate_registered_tensors()) {
+            printf("ERROR: register casual audio encoder tensors\n"); return 1;
+        }
+        printf("casual_audio_encoder registered (%zu tensors)\n", cae_manager->tensor_names().size());
     }
 
     if (load_only) { printf("\n--load-only: all GGUFs loaded successfully. exiting.\n"); return 0; }
@@ -349,17 +364,23 @@ int main(int argc, char** argv) {
 
     // ---- VAE (encode ref image + final decode) ----
     std::shared_ptr<WAN::WanVAERunner> vae;
+    std::shared_ptr<ModelManager> vae_manager;
     if (!vae_path.empty()) {
         printf("loading VAE '%s'\n", vae_path.c_str());
-        vae = std::make_shared<WAN::WanVAERunner>(backend, backend, String2TensorStorage{}, "", /*decode_only=*/false, VERSION_WAN2);
-        ModelLoader loader;
+        vae_manager = std::make_shared<ModelManager>();
+        auto& loader = vae_manager->loader();
         if (!loader.init_from_file_and_convert_name(vae_path, "vae.")) { printf("ERROR: VAE loader init\n"); return 1; }
-        vae->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        vae->get_param_tensors(tensors, "first_stage_model");
-        if (!loader.load_tensors(tensors)) { printf("ERROR: VAE tensor load failed\n"); return 1; }
+        vae = std::make_shared<WAN::WanVAERunner>(backend, loader.get_tensor_storage_map(),
+                                                  "first_stage_model", /*decode_only=*/false,
+                                                  VERSION_WAN2, vae_manager);
+        if (!vae_manager->register_runner_params("S2V VAE", *vae,
+                                                 ModelManager::ResidencyMode::ParamBackend,
+                                                 backend, backend) ||
+            !vae_manager->validate_registered_tensors()) {
+            printf("ERROR: register VAE tensors\n"); return 1;
+        }
         vae->set_flash_attention_enabled(true);
-        printf("VAE loaded (%zu tensors)\n", tensors.size());
+        printf("VAE registered (%zu tensors)\n", vae_manager->tensor_names().size());
     }
 
     // ---- reference latent ----
@@ -432,15 +453,20 @@ int main(int argc, char** argv) {
         dump_stats("context(.bin)", context);
     } else if (!umt5_path.empty()) {
         printf("loading umT5 '%s' and encoding prompt: \"%s\"\n", umt5_path.c_str(), prompt.c_str());
-        ModelLoader loader;
+        auto t5_manager = std::make_shared<ModelManager>();
+        auto& loader = t5_manager->loader();
         if (!loader.init_from_file_and_convert_name(umt5_path, "text_encoders.t5xxl.transformer.")) {
             printf("ERROR: umT5 loader init\n"); return 1;
         }
-        auto t5 = std::make_shared<T5Embedder>(audio_backend, audio_backend, loader.get_tensor_storage_map(), "text_encoders.t5xxl.transformer", true);
-        t5->alloc_params_buffer();
-        std::map<std::string, ggml_tensor*> tensors;
-        t5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
-        if (!loader.load_tensors(tensors)) { printf("WARN: some umT5 tensors failed to load\n"); }
+        auto t5 = std::make_shared<T5Embedder>(audio_backend, loader.get_tensor_storage_map(),
+                                               "text_encoders.t5xxl.transformer", true, t5_manager);
+        if (!t5_manager->register_runner_params("S2V umT5", t5->model,
+                                                "text_encoders.t5xxl.transformer",
+                                                ModelManager::ResidencyMode::ParamBackend,
+                                                audio_backend, audio_backend) ||
+            !t5_manager->validate_registered_tensors()) {
+            printf("ERROR: register umT5 tensors\n"); return 1;
+        }
         // tokenize (no padding -> keep the real token count; the DiT pads to text_len=512).
         auto tw  = t5->tokenize(prompt, 512, false);
         auto ids = sd::Tensor<int32_t>::from_vector(std::get<0>(tw));
@@ -648,8 +674,7 @@ int main(int argc, char** argv) {
             std::string lp = out_dir + "/s2v_final_latent.bin";
             write_bin(lp, x, "s2v_final_latent");
         }
-        dit->free_params_buffer();
-        dit->free_compute_buffer();
+        dit->runner_done();
         printf("freed DiT before VAE decode\n");
     } else {
         // ---- M1 non-causal flow-match sampler ----
@@ -698,8 +723,7 @@ int main(int argc, char** argv) {
 
         // Free the DiT (~9.7 GB VRAM) before VAE decode — the decode compute buffer
         // needs several GB and won't coexist with the resident DiT on a 12 GB card.
-        dit->free_params_buffer();
-        dit->free_compute_buffer();
+        dit->runner_done();
         printf("freed DiT params/compute buffers before VAE decode\n");
     }
 

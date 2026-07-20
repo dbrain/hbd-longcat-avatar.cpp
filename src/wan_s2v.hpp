@@ -973,10 +973,10 @@ namespace WAN_S2V {
         std::string desc = "Wan2.2-S2V-14B";
 
         WanS2VRunner(ggml_backend_t backend,
-                     ggml_backend_t params_backend,
                      const String2TensorStorage& tensor_storage_map = {},
-                     const std::string prefix                       = "model.diffusion_model")
-            : GGMLRunner(backend, params_backend) {
+                     const std::string prefix                       = "model.diffusion_model",
+                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+            : GGMLRunner(backend, weight_manager) {
             dit = WanS2V(params);
             dit.init(params_ctx, tensor_storage_map, prefix);
         }

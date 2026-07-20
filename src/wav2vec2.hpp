@@ -340,10 +340,10 @@ namespace WAV2VEC2 {
         std::string desc = "wav2vec2-encoder";
 
         Wav2Vec2EncoderRunner(ggml_backend_t backend,
-                              ggml_backend_t params_backend,
                               const String2TensorStorage& tensor_storage_map = {},
-                              const std::string prefix                       = "audio_encoder")
-            : GGMLRunner(backend, params_backend) {
+                              const std::string prefix                       = "audio_encoder",
+                              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+            : GGMLRunner(backend, weight_manager) {
             encoder = Wav2Vec2Encoder(p);
             encoder.init(params_ctx, tensor_storage_map, prefix);
         }
@@ -619,10 +619,10 @@ namespace WAV2VEC2 {
         std::string desc = "casual-audio-encoder";
 
         CausalAudioEncoderRunner(ggml_backend_t backend,
-                                 ggml_backend_t params_backend,
                                  const String2TensorStorage& tensor_storage_map = {},
-                                 const std::string prefix                       = "casual_audio_encoder")
-            : GGMLRunner(backend, params_backend) {
+                                 const std::string prefix                       = "casual_audio_encoder",
+                                 std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+            : GGMLRunner(backend, weight_manager) {
             enc = CausalAudioEncoderBlock(p);
             enc.init(params_ctx, tensor_storage_map, prefix);
         }
