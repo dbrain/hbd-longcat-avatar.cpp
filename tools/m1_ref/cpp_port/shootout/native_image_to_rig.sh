@@ -21,7 +21,7 @@ LABEL="${4:-$(basename "$OUT")}"
 
 [[ -f "$REFINED" ]] || { echo "missing refined mesh: $REFINED" >&2; exit 2; }
 [[ -f "$IMAGE" ]] || { echo "missing source image: $IMAGE" >&2; exit 2; }
-for bin in native_texture_run.sh native_texture_rebake.sh texture_rebake_native mesh_sample_main rig_texture_chain.sh rig_score mesh_topo; do
+for bin in native_texture_run.sh native_texture_rebake.sh verify_native_texture_asset.sh texture_rebake_native mesh_sample_main rig_texture_chain.sh rig_score mesh_topo; do
   [[ -x "$CP/shootout/$bin" || -x "$CP/$bin" ]] || { echo "missing executable: $bin" >&2; exit 2; }
 done
 
@@ -149,6 +149,7 @@ run_native_high() {
   }
   assert_closed_mesh "$out"
   assert_texture_qc "$out"
+  "$CP/shootout/verify_native_texture_asset.sh" "$out" --execution gpu
 }
 
 run_rebaked_lod() {
@@ -162,6 +163,7 @@ run_rebaked_lod() {
   [[ -s "$atlas_out" ]] || { echo "native $name did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
   assert_closed_mesh "$out"
   assert_texture_qc "$out"
+  "$CP/shootout/verify_native_texture_asset.sh" "$out" --execution cpu
 }
 
 rig_ok() {
