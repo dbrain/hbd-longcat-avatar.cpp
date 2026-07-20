@@ -63,7 +63,51 @@ else
 fi
 
 [[ -f "$CACHE/refined.glb" ]] || { echo "geometry cache did not produce refined.glb" >&2; exit 1; }
-"$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$IMAGE" "$OUT" "$LABEL"
+NATIVE_RIG=1
+if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$IMAGE" "$OUT" "$LABEL"; then
+  NATIVE_RIG=0
+  # The clean native texture LODs may be valid even when the learned skeleton is not. Do not throw
+  # them away or publish an anonymous/malformed rig: use the older validated rig path only as a
+  # named, explicit animation fallback. This is how Gilly remains usable while its one-leg native
+  # beam sample is rejected by the same structural falsifier that protects every other subject.
+  for f in "$OUT/native_high_textured.glb" "$OUT/native_medium_textured.glb" "$OUT/native_low_textured.glb"; do
+    [[ -f "$f" ]] || { echo "native pipeline failed before producing clean LODs; no rig fallback" >&2; exit 1; }
+  done
+  LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
+  legacy_rig_ok() {
+    local file="$1" report fan total
+    report="$("$CP/rig_score" "$file" 55 2>&1 || true)"; printf '%s\n' "$report"
+    [[ "$report" =~ maxfan=([0-9]+) ]] || return 1; fan="${BASH_REMATCH[1]}"
+    [[ "$report" =~ TOTAL=([0-9.]+) ]] || return 1; total="${BASH_REMATCH[1]}"
+    (( fan <= 7 )) && awk "BEGIN { exit !($total >= 0.50) }" && grep -a -q 'mixamorig:Hips' "$file"
+  }
+  for level in high medium low; do
+    case "$level" in
+      high) faces=300000; tex=2048;; medium) faces=150000; tex=2048;; low) faces=50000; tex=2048;;
+    esac
+    candidate="$OUT/legacy_rig_fallback_${level}.glb"
+    echo "== $LABEL: native rig rejected; try explicit legacy-rig fallback $level =="
+    if (
+      exec 9>"$LOCK"; flock -n 9 || exit 75
+      "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$IMAGE" --moge \
+        --from-refined "$CACHE" --stage-dir "$OUT" --decimate "$faces" --texsize "$tex" \
+        --bone-facing +z --out "$candidate"
+    ) && legacy_rig_ok "$candidate"; then
+      cp -f "$candidate" "$OUT/hymotion_rigged.glb"
+      LEGACY_RIG_LEVEL="$level"
+      break
+    fi
+  done
+  [[ -n "${LEGACY_RIG_LEVEL:-}" ]] || { echo "no native or legacy rig candidate passed the structural gate" >&2; exit 1; }
+  cat >"$OUT/stages.json" <<EOF
+{"subject":"$LABEL · native textured run with explicit legacy-rig fallback","input":"input.png","stages":[
+ {"file":"hymotion_rigged.glb","label":"Hymotion-ready · legacy rig fallback ($LEGACY_RIG_LEVEL)","note":"all native skeleton candidates failed structural naming; clean native texture LODs remain the production texture assets"},
+ {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · native Trellis generated texture"},
+ {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · native Trellis generated texture"},
+ {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · native Trellis generated texture"}
+]}
+EOF
+fi
 
 # Projection is deliberately an A/B, never a replacement for native_high_textured.glb: the native
 # generated material remains responsible for every unobserved texel.  The cache's PBR is used only
@@ -109,6 +153,7 @@ source_sha256=$IMAGE_HASH
 geometry_cache=$CACHE
 geometry_recipe=image_to_rig --moge --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8 --no-rig
 texture_recipe=native_image_to_rig.sh (native Trellis texture + structural rig gate)
+rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
 gpu=PCI GPU 0 / RTX 3060 only
 EOF
 echo "== DONE: $OUT =="
