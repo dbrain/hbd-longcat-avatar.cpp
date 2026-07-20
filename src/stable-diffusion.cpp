@@ -246,6 +246,51 @@ static bool ltxav_fifo_lookahead() {
     const char* e = std::getenv("LTXAV_FIFO_LOOKAHEAD");
     return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
+
+// FIFO audio handling for the video PoC. Default "clean": the packed audio channels are zeroed and
+// given timestep 0 so the joint AV forward sees a consistent clean/silent audio stream while the video
+// diagonal denoises (the generate-audio latent otherwise stays frozen at max noise, and clean video
+// attending to max-noise audio is out-of-distribution → poisons the video x0). Set LTXAV_FIFO_AUDIO=freeze
+// to restore the original frozen-max-noise behavior for A/B.
+static bool ltxav_fifo_audio_freeze() {
+    const char* e = std::getenv("LTXAV_FIFO_AUDIO");
+    return e != nullptr && std::strcmp(e, "freeze") == 0;
+}
+
+// FIFO debug: log mean/std/min/max/nan/inf over the first `video_ch` channels of a [W,H,T,C] latent.
+// Optionally restrict to a single frame t (t<0 => all frames). Gated cheaply by LTXAV_FIFO_STATS.
+static void fifo_log_stats(const char* tag, const sd::Tensor<float>& t, int64_t video_ch, int64_t only_frame = -1) {
+    if (std::getenv("LTXAV_FIFO_STATS") == nullptr) return;
+    if (t.empty() || t.dim() < 4) { LOG_INFO("FIFO_STATS %s: empty/low-dim", tag); return; }
+    const int64_t W = t.shape()[0], H = t.shape()[1], T = t.shape()[2], C = t.shape()[3];
+    const int64_t plane = W * H;
+    video_ch = std::min<int64_t>(video_ch <= 0 ? C : video_ch, C);
+    const float* d = t.data();
+    double sum = 0.0, sq = 0.0;
+    float mn = 3.0e38f, mx = -3.0e38f;
+    int64_t cnt = 0, nan = 0, inf = 0;
+    for (int64_t c = 0; c < video_ch; ++c) {
+        for (int64_t tt = 0; tt < T; ++tt) {
+            if (only_frame >= 0 && tt != only_frame) continue;
+            const int64_t base = plane * (tt + T * c);
+            for (int64_t s = 0; s < plane; ++s) {
+                const float v = d[base + s];
+                if (std::isnan(v)) { ++nan; continue; }
+                if (std::isinf(v)) { ++inf; continue; }
+                sum += v; sq += (double)v * v;
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                ++cnt;
+            }
+        }
+    }
+    const double mean = cnt ? sum / cnt : 0.0;
+    double var = cnt ? sq / cnt - mean * mean : 0.0;
+    if (var < 0) var = 0;
+    LOG_INFO("FIFO_STATS %s: mean=%.5f std=%.5f min=%.5f max=%.5f nan=%lld inf=%lld n=%lld",
+             tag, mean, std::sqrt(var), (double)mn, (double)mx,
+             (long long)nan, (long long)inf, (long long)cnt);
+}
 // =================================================================================
 
 /*=============================================== StableDiffusionGGML ================================================*/
@@ -2999,28 +3044,44 @@ public:
         // instead of the scalar c_out. The FIFO loop (run_fifo_diagonal, below) rewrites it before each
         // forward. Length == x_t.shape()[2] when active.
         std::vector<float> fifo_sigma_per_frame;
+        // FIFO audio lockstep: the packed audio stream denoises alongside the video queue. This holds the
+        // audio's CURRENT global sigma (all audio tokens share it — the PoC treats audio as one stream
+        // that tracks the queue's progress rather than a per-token diagonal). The denoise closure feeds
+        // the DiT the matching audio timestep and scales the audio c_out with it. -1 => inactive.
+        float fifo_audio_sigma = -1.0f;
+        int64_t fifo_video_ch  = 0;  // #video channels (audio channels are the trailing C - fifo_video_ch)
 
         // Per-frame flow denoiser output scaling: x0_t = x_t + c_out_t * v_t, with c_out_t = -sigma_t
         // and c_skip = c_in = 1 (constant for the flow denoiser — only c_out is sigma-dependent). This
         // generalizes `denoised = v * c_out + x * c_skip` over the frame axis. Layout is frame-major
-        // per channel: for a [W,H,T,C] latent, element linear index i has frame t = (i/(W*H)) % T. The
-        // scaling is applied across ALL channels (video + packed audio); the FIFO loop only reads back
-        // the video channels, so scaling the trailing audio channels here is harmless.
+        // per channel: for a [W,H,T,C] latent, element linear index i has channel c = i/(W*H*T) and
+        // frame t = (i/(W*H)) % T. VIDEO channels (c < video_ch) use the per-frame diagonal sigma; the
+        // trailing AUDIO channels use the single global audio sigma so their x0 is formed at the audio
+        // stream's own (video-tracking) noise level rather than a meaningless frame-axis value.
         auto fifo_scale_cout = [](const sd::Tensor<float>& v,
                                   const sd::Tensor<float>& x,
-                                  const std::vector<float>& sigma_pf) -> sd::Tensor<float> {
+                                  const std::vector<float>& sigma_pf,
+                                  int64_t video_ch,
+                                  float audio_sigma) -> sd::Tensor<float> {
             sd::Tensor<float> out(v.shape());
-            const int64_t W     = v.shape()[0];
-            const int64_t H     = v.shape()[1];
-            const int64_t T     = v.shape()[2];
-            const int64_t plane = W * H;
-            const float* vp     = v.data();
-            const float* xp     = x.data();
-            float* op           = out.data();
-            const int64_t n     = v.numel();
+            const int64_t W       = v.shape()[0];
+            const int64_t H       = v.shape()[1];
+            const int64_t T       = v.shape()[2];
+            const int64_t plane   = W * H;
+            const int64_t plane_t = plane * T;
+            const float* vp       = v.data();
+            const float* xp       = x.data();
+            float* op             = out.data();
+            const int64_t n       = v.numel();
+            const bool has_audio  = audio_sigma >= 0.0f && video_ch > 0;
             for (int64_t i = 0; i < n; ++i) {
-                const int64_t t = (i / plane) % T;
-                op[i]           = xp[i] + (-sigma_pf[static_cast<size_t>(t)]) * vp[i];
+                float s;
+                if (has_audio && (i / plane_t) >= video_ch) {
+                    s = audio_sigma;
+                } else {
+                    s = sigma_pf[static_cast<size_t>((i / plane) % T)];
+                }
+                op[i] = xp[i] + (-s) * vp[i];
             }
             return out;
         };
@@ -3084,6 +3145,15 @@ public:
                                                                              denoise_mask,
                                                                              audio_length,
                                                                              ltxav_audio_fixed);
+                // FIFO audio lockstep: the audio stream denoises alongside the video queue, so feed the
+                // DiT the audio's CURRENT global timestep (sigma_to_t(fifo_audio_sigma)) instead of the
+                // frozen video sigma_max broadcast. Keeping the audio timestep pinned at max noise while
+                // the video cleans up is out-of-distribution for the joint AV attention and inflates the
+                // video x0 variance (numerically confirmed). LTXAV_FIFO_AUDIO=freeze restores the old
+                // frozen behavior for A/B.
+                if (fifo_active && !ltxav_fifo_audio_freeze() && fifo_audio_sigma >= 0.0f) {
+                    audio_ts.assign(1, denoiser->sigma_to_t(fifo_audio_sigma));
+                }
                 // GGML's audio adaLN treats dim-0 as the scalar/timestep
                 // component and dim-1 as the audio-token axis.  A one-element
                 // vector remains the legacy broadcast scalar; a mixed
@@ -3521,7 +3591,7 @@ public:
             // FIFO-Diffusion: scale the flow output PER FRAME (c_out_t = -sigma_t) so each frame's x0
             // estimate is formed at its own noise level along the diagonal. Non-FIFO renders keep the
             // scalar c_out exactly (fifo_active is false when the diagonal is disarmed).
-            denoised = fifo_active ? fifo_scale_cout(guided.pred, x, fifo_sigma_per_frame)
+            denoised = fifo_active ? fifo_scale_cout(guided.pred, x, fifo_sigma_per_frame, fifo_video_ch, fifo_audio_sigma)
                                    : guided.pred * c_out + x * c_skip;
             sd::guidance::GuiderOutput output;
             output.pred = denoised;
@@ -3530,7 +3600,7 @@ public:
                                                            ? img_uncond_out
                                                            : (!uncond_out.empty() ? uncond_out : cond_out);
                 output.pred_uncond                   = fifo_active
-                                                           ? fifo_scale_cout(base_uncond, x, fifo_sigma_per_frame)
+                                                           ? fifo_scale_cout(base_uncond, x, fifo_sigma_per_frame, fifo_video_ch, fifo_audio_sigma)
                                                            : base_uncond * c_out + x * c_skip;
             }
             if (cache_runtime.spectrum_enabled) {
@@ -3619,6 +3689,25 @@ public:
             // entry, so every frame's schedule-index 0 state is correct with no extra noising.
             fifo_sigma_per_frame.assign(static_cast<size_t>(T), sigmas[0]);
 
+            // Audio lockstep. Generate-audio packs the audio channels as a max-noise latent; the earlier
+            // PoC left them frozen while only VIDEO channels euler-stepped, so the joint AV forward saw
+            // clean video attending to permanently max-noise audio — OOD, which inflates the video x0
+            // variance (numerically confirmed: uniform-level FIFO with frozen audio still blew up to
+            // std~3.5 vs the reference's ~1.05). Instead we denoise the audio stream ALONGSIDE the video
+            // queue: audio is treated as a single stream at a global sigma that tracks the queue centre,
+            // stepped once per iteration down the same schedule. LTXAV_FIFO_AUDIO=freeze restores the old
+            // frozen behaviour for A/B; zeroing the audio latent is NOT viable (all-zero audio makes the
+            // DiT emit NaN).
+            const bool fifo_audio_freeze = ltxav_fifo_audio_freeze();
+            fifo_video_ch                = video_ch;
+            // The audio stream "enters" at the queue centre so its noise level sits in the middle of the
+            // in-flight video diagonal; for the uniform case (blocks>=T) this offset is 0 and audio
+            // denoises in exact lockstep with the video (== a normal joint AV render).
+            const int64_t audio_enter = (T - 1) / (2 * static_cast<int64_t>(blocks));
+            LOG_INFO("LTX FIFO: audio %s (video_ch=%lld, audio_enter_iter=%lld)",
+                     fifo_audio_freeze ? "FROZEN at max noise (LTXAV_FIFO_AUDIO=freeze)" : "lockstep",
+                     (long long)video_ch, (long long)audio_enter);
+
             const int64_t W     = x_t.shape()[0];
             const int64_t H     = x_t.shape()[1];
             const int64_t plane = W * H;
@@ -3638,18 +3727,52 @@ public:
                     idx                 = std::clamp(idx, 0, N);
                     fifo_sigma_per_frame[static_cast<size_t>(a)] = sigmas[static_cast<size_t>(idx)];
                 }
+                // Audio's global schedule index for this iteration (mirrors the per-frame `idx = m-enter`
+                // logic): raw index gates the advance (step only while 0<=idx<N); the clamped index picks
+                // the sigma the DiT sees (sigma_max before entry, 0 after finish). freeze mode disables
+                // the audio c_out scaling (fifo_audio_sigma<0) and skips the advance.
+                const int a_idx_raw = static_cast<int>(m - audio_enter);
+                const int a_idx_clamped = std::clamp(a_idx_raw, 0, N);
+                fifo_audio_sigma = fifo_audio_freeze ? -1.0f : sigmas[static_cast<size_t>(a_idx_clamped)];
                 const int step = static_cast<int>(m + 1);
+                if (std::getenv("LTXAV_FIFO_STATS") != nullptr) {
+                    std::string sig_dump = "FIFO_STATS iter " + std::to_string(m) + " sigma_pf=[";
+                    for (int64_t a = 0; a < T; ++a) sig_dump += std::to_string(fifo_sigma_per_frame[(size_t)a]) + (a + 1 < T ? "," : "");
+                    sig_dump += "]";
+                    LOG_INFO("%s", sig_dump.c_str());
+                    fifo_log_stats("x_t pre-forward", x_t, video_ch);
+                }
                 auto out       = denoise(x_t, sigmas[0] /* nominal; per-frame vector overrides */, step);
                 if (out.pred.empty() || out.pred_uncond.empty()) {
                     LOG_ERROR("LTX FIFO: forward failed at iteration %lld/%lld", (long long)m, (long long)total_iters);
                     return {};
                 }
+                if (std::getenv("LTXAV_FIFO_STATS") != nullptr) {
+                    fifo_log_stats("pred (cfg x0)", out.pred, video_ch);
+                    fifo_log_stats("pred_uncond x0", out.pred_uncond, video_ch);
+                }
                 const float* p0 = out.pred.data();          // per-frame x0 (cfg-combined, mask-pinned)
                 const float* pu = out.pred_uncond.data();   // per-frame uncond x0
                 float* xd       = x_t.data();
-                // Per-frame euler_cfg_pp advance, mirroring sample_euler_cfg_pp but each frame using ITS
-                // OWN (sigma, sigma_next): d = (x - uncond_x0)/sigma; x = x0 + d*sigma_next. Only VIDEO
-                // channels advance; the packed audio channels are frozen this PoC (TODO(fifo-audio)).
+                // Per-frame euler_ancestral_cfg_pp advance with each frame's OWN (sigma, sigma_next).
+                // CRITICAL: LTX's default sampler (Euler A CFG++, eta=0) for a FLOW denoiser does NOT use
+                // the raw-sigma update x = denoised + d*sigma_next — that over-guides ~2.5x and over-
+                // weights the denoised anchor (see sample_euler_ancestral_cfg_pp is_flow_denoiser branch),
+                // which is exactly what inflated the FIFO video x0 variance ~3x -> garbage. Use the VP-
+                // normalized deterministic flow step (eta=0 => sigma_down=sigma_next, no ancestral noise):
+                //   alpha_s = 1-sigma; alpha_t = 1-sigma_next
+                //   d = (x - uncond_x0*alpha_s)/sigma;  x = cfg_x0*alpha_t + d*sigma_next
+                // sigma_next==0 collapses to x = cfg_x0 (the final clean frame).
+                auto flow_step = [&](int64_t i, float sig, float sig_next) {
+                    if (sig_next == 0.0f) {
+                        xd[i] = p0[i];
+                        return;
+                    }
+                    const float alpha_s = 1.0f - sig;
+                    const float alpha_t = 1.0f - sig_next;
+                    const float d       = (xd[i] - pu[i] * alpha_s) / sig;
+                    xd[i]               = p0[i] * alpha_t + d * sig_next;
+                };
                 for (int64_t a = 0; a < T; ++a) {
                     const int64_t enter = a / blocks;
                     const int idx       = static_cast<int>(m - enter);
@@ -3661,17 +3784,32 @@ public:
                     for (int64_t c = 0; c < video_ch; ++c) {
                         const int64_t base = plane * (a + T * c);
                         for (int64_t s = 0; s < plane; ++s) {
-                            const int64_t i = base + s;
-                            const float d   = (xd[i] - pu[i]) / sig;
-                            xd[i]           = p0[i] + d * sig_next;
+                            flow_step(base + s, sig, sig_next);
                         }
                     }
                     if (idx + 1 == N) {
                         ++emitted;  // frame a reached sigma 0 this iteration (conceptual pop/emit)
                     }
                 }
+                // Audio lockstep advance: same VP-normalized flow step for the whole audio block using the
+                // audio's global (sigma, sigma_next). Skipped in freeze mode (fifo_audio_sigma<0 there).
+                if (!fifo_audio_freeze && a_idx_raw >= 0 && a_idx_raw < N) {
+                    const int64_t C        = x_t.shape()[3];
+                    const int64_t plane_t  = plane * T;
+                    const float a_sig      = sigmas[static_cast<size_t>(a_idx_raw)];
+                    const float a_sig_next = sigmas[static_cast<size_t>(a_idx_raw) + 1];
+                    for (int64_t c = video_ch; c < C; ++c) {
+                        const int64_t base = plane_t * c;
+                        for (int64_t s = 0; s < plane_t; ++s) {
+                            flow_step(base + s, a_sig, a_sig_next);
+                        }
+                    }
+                }
             }
+            fifo_audio_sigma = -1.0f;
+            fifo_video_ch    = 0;
             fifo_sigma_per_frame.clear();  // disarm the diagonal for any subsequent scalar use
+            fifo_log_stats("FINAL x0 (FIFO)", x_t, video_ch);
             LOG_INFO("LTX FIFO: complete — %lld/%lld frames emitted over %lld iterations",
                      (long long)emitted, (long long)T, (long long)total_iters);
             return x_t;
@@ -3725,6 +3863,9 @@ public:
                 x0 = std::move(denoised);
             } else if (inverse_noise_scaling) {
                 x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
+            }
+            if (sd_version_is_ltxav(version)) {
+                fifo_log_stats("FINAL x0 (REFERENCE)", x0, std::min<int64_t>(get_latent_channel(), x0.dim() >= 4 ? x0.shape()[3] : 0));
             }
         }
 
