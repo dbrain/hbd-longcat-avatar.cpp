@@ -19,13 +19,25 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
 static void usage() {
     std::printf("usage: texture_mesh_native --model <geo_gguf_dir> --mesh <in.glb> --image <matte.png> --out <out.glb>\n"
                 "                           [--resolution 512|1024] [--texsize N] [--seed N] [--decimate F] [--dump-dir DIR]\n"
-                "                           [--unwrap production|reference] [--atlas-out base_color.png]\n");
+                "                           [--unwrap production|reference] [--atlas-out base_color.png] [--status-file PATH]\n");
+}
+
+// The runner may be interrupted after this child has completed (for example a detached terminal
+// session).  Record the artifact outcome here, at the point that the GLB and atlas have actually
+// been written, so the final truth does not depend on the parent shell's exit status.
+static void append_artifact_status(const std::string& path, const char* state, int code) {
+    if (path.empty()) return;
+    std::ofstream f(path, std::ios::app);
+    if (!f) return;
+    f << "artifact_state=" << state << '\n';
+    f << "artifact_exit_code=" << code << '\n';
 }
 
 template<class T> static void dump_npy(const std::string& path, const std::vector<T>& data,
@@ -149,7 +161,7 @@ int main(int argc, char** argv) {
     setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
     // Direct xatlas charts with Pixal3D's chart settings are the quality default.  The old
     // precluster path remains available as `production` for a deliberately faster fallback.
-    std::string model, mesh_path, image_path, out, dump_dir, atlas_out, unwrap="reference";
+    std::string model, mesh_path, image_path, out, dump_dir, atlas_out, status_file, unwrap="reference";
     bool condition_only=false;
     int resolution=512, texsize=2048, seed=42, decimate=0;
     for (int i=1;i<argc;i++) {
@@ -165,6 +177,7 @@ int main(int argc, char** argv) {
         else if (a=="--dump-dir" && i+1<argc) dump_dir=argv[++i];
         else if (a=="--unwrap" && i+1<argc) unwrap=argv[++i];
         else if (a=="--atlas-out" && i+1<argc) atlas_out=argv[++i];
+        else if (a=="--status-file" && i+1<argc) status_file=argv[++i];
         else if (a=="--condition-only") condition_only=true;
         else { usage(); return 1; }
     }
@@ -192,7 +205,10 @@ int main(int argc, char** argv) {
         std::vector<float> cond=global;
         cond.insert(cond.end(), patchmap.begin(), patchmap.end());
         if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_cond.npy",cond,"<f4",{1,(int)cond.size()/1024,1024}); }
-        if (condition_only) { std::printf("[native-texture] condition-only complete\n"); return 0; }
+        if (condition_only) {
+            append_artifact_status(status_file, "succeeded", 0);
+            std::printf("[native-texture] condition-only complete\n"); return 0;
+        }
         std::printf("[native-texture] DINOv3: %zu conditioning tokens\\n", cond.size()/1024);
 
         std::vector<int32_t> faces(mesh.faces.size());
@@ -283,8 +299,12 @@ int main(int argc, char** argv) {
             throw std::runtime_error("could not write output GLB");
         if (!stbi_write_png(atlas_out.c_str(), baked.tw, baked.th, 4, baked.base_color.data(), baked.tw*4))
             throw std::runtime_error("could not write baseColor atlas: "+atlas_out);
+        append_artifact_status(status_file, "succeeded", 0);
         std::printf("[native-texture] DONE: %s (%d charts, %dx%d atlas)\\n",out.c_str(),baked.chart_count,baked.tw,baked.th);
         std::printf("[native-texture] baseColor atlas: %s\\n",atlas_out.c_str());
-    } catch (const std::exception& e) { std::fprintf(stderr,"FAIL: %s\\n",e.what()); return 1; }
+    } catch (const std::exception& e) {
+        append_artifact_status(status_file, "failed", 1);
+        std::fprintf(stderr,"FAIL: %s\\n",e.what()); return 1;
+    }
     return 0;
 }

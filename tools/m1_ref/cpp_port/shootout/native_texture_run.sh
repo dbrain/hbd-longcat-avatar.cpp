@@ -44,8 +44,12 @@ flock -n 9 || { echo "another image-to-rig job owns the 3060" >&2; exit 75; }
 write_status() {
   local state="$1" rc="${2:-0}"
   shift 2
+  # The child appends its artifact outcome after it has actually written outputs.  Preserve that
+  # authoritative record when the launcher refreshes or finalizes its own status fields.
+  local artifact_lines=""
+  if [[ -f "$STATUS_FILE" ]]; then artifact_lines="$(sed -n '/^artifact_/p' "$STATUS_FILE")"; fi
   {
-    printf 'state=%s\n' "$state"
+    printf 'launcher_state=%s\n' "$state"
     printf 'started_at=%s\n' "$STARTED_AT"
     printf 'updated_at=%s\n' "$(date -Is)"
     printf 'elapsed_seconds=%s\n' "$((SECONDS-START_SECONDS))"
@@ -55,6 +59,7 @@ write_status() {
     printf 'args='
     printf ' %q' "$@"
     printf '\n'
+    [[ -z "$artifact_lines" ]] || printf '%s\n' "$artifact_lines"
   } >"$STATUS_FILE"
 }
 finish_status() {
@@ -65,4 +70,16 @@ write_status running 0 "$@"
 trap 'finish_status "$@"' EXIT
 
 echo "== native texture: $(basename "$MESH") + $(basename "$IMAGE") -> $OUT =="
-"$BIN" --model "$WEIGHTS" --mesh "$MESH" --image "$IMAGE" --out "$OUT" "$@"
+"$BIN" --model "$WEIGHTS" --mesh "$MESH" --image "$IMAGE" --out "$OUT" --status-file "$STATUS_FILE" "$@" &
+CHILD_PID=$!
+# Long direct unwraps are CPU-bound after native inference.  Refresh the status artifact while
+# the child runs so operators never have to guess whether the 3060 lane or chart solve is alive.
+while kill -0 "$CHILD_PID" 2>/dev/null; do
+  write_status running 0 "$@"
+  sleep 10
+done
+set +e
+wait "$CHILD_PID"
+CHILD_RC=$?
+set -e
+exit "$CHILD_RC"
