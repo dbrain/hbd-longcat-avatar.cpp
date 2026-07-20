@@ -14699,11 +14699,14 @@ static void ltxav_latent_channel_affine_match(float*                    tail,
 // WITH LTXAV_FIFO=1 so the long-timeline refine stays VRAM-bounded. The segment boundary becomes an
 // internal point of one continuous refine instead of two independently-reinvented refines.
 //
-// AUDIO (first cut, flagged): LTXAV packs audio FLAT into the trailing channels over the whole
-// W*H*T grid (pack_ltxav_audio_and_video_latents), so a T-axis concat does NOT cleanly carry it.
-// We assemble the VIDEO latent exactly (concat + K-frame overlap drop) and pack a fresh empty audio
-// latent of the correct target length; the single refine then denoises audio jointly over the joined
-// timeline. Driving/lip-sync audio is NOT wired into the unified refine yet.
+// AUDIO: LTXAV packs audio FLAT into the trailing channels over the whole W*H*T grid
+// (pack_ltxav_audio_and_video_latents), so a T-axis concat does NOT carry it — we UNPACK each
+// segment's audio, ASSEMBLE the audio spans to match the video drop (K video latent frames ==
+// K*8 pixel frames == K*8*audio_rate/fps audio tokens, audio_rate=25), then REPACK the REAL audio
+// (snapped to the refine's expected length) into the assembled base. GENERATED audio (t2v) is
+// refined jointly (mask 1); HELD driving/lip-sync audio (a2v/lipdub, audio_fixed) is carried and
+// HELD (mask 0) through the single refine so lipsync is preserved. Driving path is architected to
+// mirror the per-generate --drive-audio path but UNTESTED here (seam.py is t2v-only).
 //
 // PROMPT (flagged): the one refine pass carries a single conditioning (base_params->prompt); the
 // per-segment director prompts are honoured for the BASE assembly but not re-applied inside the
@@ -14720,6 +14723,36 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
     const bool    has_audio = sd_ctx->sd->diffusion_model == nullptr ||
                               sd_ctx->sd->diffusion_model->has_audio_stream();
 
+    // FIFO's diagonal sampler ERASES evolving content (a new subject / scene change) whenever a frame's
+    // clean attention anchor differs from its own content: at staggered per-frame sigmas a frame denoises
+    // toward its earlier (already-clean) neighbours. In the unified chain BOTH phases hit this — the seg1
+    // BASE is a continuation whose backward anchor is seg0, and the joined SDEdit REFINE likewise regresses
+    // seg1→seg0. Proven by the green-donkey A/B (2026-07-21): FIFO on ⇒ the donkey that enters in seg1 is
+    // erased and seg1 reverts to seg0's empty scene; FIFO off ⇒ the donkey persists. These continuation
+    // segments are short and do NOT need FIFO windowing, so disable FIFO for the WHOLE unified path
+    // (base + refine) ⇒ uniform-sigma, content-preserving; VRAM stays bounded via temporal-blend tiling on
+    // the refine. Opt back into the diagonal (for experiments) with LTXAV_FIFO_REFINE=1.
+    struct FifoGuard {
+        std::string saved;
+        bool        restore = false;
+        FifoGuard() {
+            const char* fr     = std::getenv("LTXAV_FIFO_REFINE");
+            const bool  opt_in = fr != nullptr && fr[0] == '1' && fr[1] == '\0';
+            if (opt_in) return;
+            if (const char* e = std::getenv("LTXAV_FIFO")) {
+                saved   = e;
+                restore = true;
+                unsetenv("LTXAV_FIFO");
+                LOG_INFO("LTX unified-refine: FIFO disabled for the whole unified path (base+refine) — "
+                         "uniform-sigma preserves per-segment content (green-donkey A/B); "
+                         "set LTXAV_FIFO_REFINE=1 to force the diagonal");
+            }
+        }
+        ~FifoGuard() {
+            if (restore) setenv("LTXAV_FIFO", saved.c_str(), 1);
+        }
+    } fifo_guard;
+
     // Where to bank the assembled base (reusable by LTXAV_REFINE_FROM_LATENT for σ0 sweeps).
     std::string assembled_path;
     if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
@@ -14729,7 +14762,18 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
     }
 
     sd::Tensor<float> assembled_video;  // [W,H,T_total,video_ch] video-only base timeline
+    sd::Tensor<float> assembled_audio;  // [16,A_total,8,1] real base audio, assembled across the join
     int64_t           T_total = 0;
+
+    // Audio carry-through: the base's REAL generated audio (or, for a2v/lipdub, the HELD driving audio)
+    // is assembled to match the joined video timeline instead of regenerating fresh-empty audio.
+    const int         fps          = std::max(1, base_params->fps);
+    const char*       base_drive   = SAFE_STR(base_params->drive_audio_path);
+    // audio_fixed: driving/lip-sync audio supplied -> the assembled audio must be HELD (mask 0) through
+    // the single refine so lipsync is preserved (not renoised/regenerated). NOTE: untested (seam.py is
+    // t2v-only); architected to mirror the per-generate --drive-audio path.
+    const bool        audio_fixed  = has_audio && strlen(base_drive) > 0;
+    const int64_t     audio_rate   = 25;  // LTXAV audio latent tokens per second (16000/160/4).
 
     // ── REFINE-FROM-BANKED-BASE: skip base generation + assembly, load a banked base directly ──
     const char* refine_from = std::getenv("LTXAV_REFINE_FROM_LATENT");
@@ -14744,8 +14788,16 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
             const int64_t Wl = loaded.shape()[0], Hl = loaded.shape()[1];
             T_total          = loaded.shape()[2];
             const int64_t Cl = loaded.shape()[3];
-            // Keep only the VIDEO channels; audio is repacked fresh below for the requested length.
+            // Keep the VIDEO channels; also recover the banked audio (new banks carry REAL assembled
+            // audio in the trailing channels — preserve it rather than regenerating fresh-empty).
             assembled_video = (Cl > video_ch) ? sd::ops::slice(loaded, 3, 0, video_ch) : loaded;
+            if (has_audio && Cl > video_ch && T_total > 0) {
+                const int bank_pixel_frames = 1 + (int)(T_total - 1) * 8;
+                const int bank_audio_len    = get_ltxav_num_audio_latents(bank_pixel_frames, fps);
+                assembled_audio = unpack_ltxav_audio_latent(loaded, bank_audio_len, video_ch);
+                LOG_INFO("LTX unified-refine: refine-from-latent recovered banked audio len=%lld",
+                         (long long)(assembled_audio.empty() ? 0 : assembled_audio.shape()[1]));
+            }
             LOG_INFO("LTX unified-refine: refine-from-latent %s -> [%lld,%lld,%lld,%lld] (video ch kept)",
                      refine_from, (long long)Wl, (long long)Hl, (long long)T_total, (long long)Cl);
         } catch (const std::exception& e) {
@@ -14779,7 +14831,9 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
         }
 
         std::vector<sd::Tensor<float>> seg_bases;  // per-segment [W,H,T_seg,video_ch] base video latent
+        std::vector<sd::Tensor<float>> seg_audios; // per-segment [16,A_seg,8,1] base-generated audio latent
         seg_bases.reserve(n_chain);
+        seg_audios.reserve(n_chain);
         std::vector<float> cont_buf;               // last-K video tail feeding the next segment's base
         int                cont_Wl = 0, cont_Hl = 0;
 
@@ -14851,6 +14905,24 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
             // uses the 5D frame layout; a 4D latent trips a frame-indexing assert.
             sd::Tensor<float> vbase({(int64_t)lw, (int64_t)lh, (int64_t)lt, (int64_t)video_ch, (int64_t)1});
             std::memcpy(vbase.data(), lat_out, (size_t)lw * lh * lt * video_ch * sizeof(float));
+
+            // Also recover this segment's REAL (base-generated) audio from the trailing channels. The
+            // packed latent lays audio flat after the video block (pack_ltxav_audio_and_video_latents),
+            // so it must be UNPACKED here (a T-axis concat of the packed latent would shear it).
+            sd::Tensor<float> seg_audio_lat;
+            if (has_audio && lc > video_ch) {
+                const int seg_audio_len = get_ltxav_num_audio_latents(vp.video_frames, fps);
+                sd::Tensor<float> full_packed({(int64_t)lw, (int64_t)lh, (int64_t)lt, (int64_t)lc});
+                std::memcpy(full_packed.data(), lat_out, (size_t)lw * lh * lt * lc * sizeof(float));
+                seg_audio_lat = unpack_ltxav_audio_latent(full_packed, seg_audio_len, video_ch);
+                if (seg_audio_lat.empty()) {
+                    LOG_WARN("LTX unified-refine: seg %d audio unpack empty (want len=%d, lc=%d)",
+                             seg + 1, seg_audio_len, lc);
+                } else {
+                    LOG_INFO("LTX unified-refine: seg %d recovered base audio len=%lld",
+                             seg + 1, (long long)seg_audio_lat.shape()[1]);
+                }
+            }
             free(lat_out);
 
             // Capture the last-K video frames as the next segment's continuation tail.
@@ -14871,6 +14943,7 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
                 cont_Hl = lh;
             }
             seg_bases.emplace_back(std::move(vbase));
+            seg_audios.emplace_back(std::move(seg_audio_lat));
         }
         (void)cont_Wl;
         (void)cont_Hl;
@@ -14889,6 +14962,35 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
             }
         }
         T_total = assembled_video.shape()[2];
+
+        // Assemble the REAL base-generated audio to match the joined video (mirrors the video drop).
+        // Each dropped K video LATENT frames == K*8 PIXEL frames == K*8*audio_rate/fps audio tokens
+        // (same math as the base temporal-window slice at ~:11908). Concat the retained spans on the
+        // audio time axis (dim 1). The final length is snapped to the refine's expected length below.
+        if (has_audio && !seg_audios.empty() && !seg_audios[0].empty()) {
+            assembled_audio            = seg_audios[0];
+            const int64_t audio_drop   = ((int64_t)K * 8 * audio_rate) / fps;  // tokens for K dropped frames
+            for (int seg = 1; seg < n_chain; ++seg) {
+                if (seg >= (int)seg_audios.size() || seg_audios[seg].empty()) {
+                    LOG_WARN("LTX unified-refine: seg %d has no audio to assemble; audio span skipped", seg + 1);
+                    continue;
+                }
+                const int64_t A_seg = seg_audios[seg].shape()[1];
+                // Mirror the video assembly: if the video kept the whole segment (T_seg<=K, no drop),
+                // keep the whole audio span too; otherwise drop the overlap-frame audio tokens.
+                const bool    kept_whole = seg_bases[seg].shape()[2] <= K;
+                const int64_t start = kept_whole ? 0 : std::clamp<int64_t>(audio_drop, 0, A_seg);
+                if (start >= A_seg) {
+                    LOG_WARN("LTX unified-refine: seg %d audio drop=%lld >= A_seg=%lld; span skipped",
+                             seg + 1, (long long)audio_drop, (long long)A_seg);
+                    continue;
+                }
+                sd::Tensor<float> a_piece = sd::ops::slice(seg_audios[seg], 1, start, A_seg);
+                assembled_audio           = sd::ops::concat(assembled_audio, a_piece, 1);
+            }
+            LOG_INFO("LTX unified-refine: assembled base audio raw len=%lld (drop/seg=%lld)",
+                     (long long)assembled_audio.shape()[1], (long long)(((int64_t)K * 8 * audio_rate) / fps));
+        }
     }
 
     if (assembled_video.empty() || T_total <= 0) {
@@ -14907,15 +15009,42 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
     // Pixel-frame count whose causal-VAE latent length equals T_total (8:1 temporal ratio).
     const int unified_pixel_frames = 1 + (int)(T_total - 1) * 8;
 
-    // Pack a fresh empty audio latent of the exact length the refine will compute for this frame
-    // count, so the AV model's audio unpack lines up (first-cut approximation — audio regenerated).
+    // Pack the REAL audio for the joined timeline, snapped to the exact length the refine computes for
+    // this frame count (so the AV model's audio unpack lines up). Priority: (1) HELD driving/lipsync
+    // audio (a2v/lipdub) encoded from the supplied wav, held fixed in the refine; (2) the assembled
+    // base-GENERATED audio (Phase-2 assembly, or the banked audio on refine-from-latent); (3) as a
+    // last resort, fresh-empty. Length is forced to audio_len via resize (trim/zero-pad).
     sd::Tensor<float> packed = assembled_video;
     if (has_audio) {
-        int audio_len = get_ltxav_num_audio_latents(unified_pixel_frames, base_params->fps);
+        const int audio_len = get_ltxav_num_audio_latents(unified_pixel_frames, base_params->fps);
         if (audio_len > 0) {
-            packed = pack_ltxav_audio_and_video_latents(assembled_video, make_ltxav_empty_audio_latent(audio_len));
-            LOG_INFO("LTX unified-refine: packed empty audio latent (len=%d) for T_total=%lld / %d px frames",
-                     audio_len, (long long)T_total, unified_pixel_frames);
+            sd::Tensor<float> aud;
+            const char* audio_source = "empty";
+            if (audio_fixed) {
+                // Driving/lip-sync: encode the full wav to the joined length and HOLD it in the refine.
+                aud = encode_ltxav_drive_audio(sd_ctx, base_drive, audio_len);
+                if (aud.empty()) {
+                    LOG_WARN("LTX unified-refine: --drive-audio encode failed/unavailable; "
+                             "falling back to assembled generated audio (lipsync HOLD lost)");
+                } else {
+                    audio_source = "held-drive";
+                }
+            }
+            if (aud.empty() && !assembled_audio.empty()) {
+                aud          = assembled_audio;
+                audio_source = "assembled-generated";
+            }
+            if (aud.empty()) {
+                aud          = make_ltxav_empty_audio_latent(audio_len);
+                audio_source = "empty-fallback";
+                LOG_WARN("LTX unified-refine: no base audio recovered; packing fresh-empty audio");
+            }
+            const int64_t raw_len = aud.shape()[1];
+            aud                   = resize_ltxav_audio_latent(aud, audio_len);  // snap to refine length
+            packed = pack_ltxav_audio_and_video_latents(assembled_video, aud);
+            LOG_INFO("LTX unified-refine: packed %s audio (raw len=%lld -> snapped %d) for T_total=%lld / %d px frames%s",
+                     audio_source, (long long)raw_len, audio_len, (long long)T_total, unified_pixel_frames,
+                     audio_fixed ? " [HELD]" : " [generate]");
         }
     }
     try {
@@ -14951,7 +15080,10 @@ static bool generate_video_chain_unified_refine(sd_ctx_t*                    sd_
     refine_vp.control_frames_size = 0;
     refine_vp.v2v_mode            = 0;
     refine_vp.v2v_guide_latent_path = nullptr;
-    refine_vp.drive_audio_path    = nullptr;
+    // Driving/lip-sync: keep the drive wav on the refine so generate_video_ex sets latents.audio_fixed
+    // (=> audio denoise-mask 0), HOLDING the banked driving audio in x_t clean through the single refine
+    // (lipsync preserved). Generated-audio (no drive) => nullptr => audio_fixed false => audio refined.
+    refine_vp.drive_audio_path    = audio_fixed ? base_params->drive_audio_path : nullptr;
     refine_vp.seed                = base_params->seed;
     refine_vp.prompt              = base_params->prompt;
 
