@@ -13923,14 +13923,20 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         // joined audio timeline. Preserve the real audio: unpack it first (still intact here — the
         // guide frames are present), slice VIDEO only, then repack over the trimmed target grid.
         const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
-        sd::Tensor<float> preserved_audio;
         if (latents.audio_length > 0 && final_latent.dim() > 3 && final_latent.shape()[3] > latent_channels) {
-            preserved_audio = unpack_ltxav_audio_latent(final_latent, latents.audio_length, (int)latent_channels);
-            final_latent    = sd::ops::slice(final_latent, 3, 0, latent_channels);
-        }
-        final_latent = sd::ops::slice(final_latent, 2, 0, target_frames);
-        if (!preserved_audio.empty()) {
-            final_latent = pack_ltxav_audio_and_video_latents(final_latent, preserved_audio);
+            // Recover the (still-intact) audio, then rebuild VIDEO-only over the trimmed grid.
+            // Free the pre-trim packed buffer BEFORE repacking so the two full-size latents never
+            // coexist with the repacked result (keeps this bookkeeping's transient host footprint
+            // to ~one video latent instead of stacking packed + video + repacked copies).
+            sd::Tensor<float> preserved_audio = unpack_ltxav_audio_latent(final_latent, latents.audio_length, (int)latent_channels);
+            sd::Tensor<float> video_only      = sd::ops::slice(final_latent, 3, 0, latent_channels);
+            final_latent                      = {};  // drop the [W,H,target+guide,lc] packed latent now
+            video_only                        = sd::ops::slice(video_only, 2, 0, target_frames);
+            final_latent                      = preserved_audio.empty()
+                                                    ? std::move(video_only)
+                                                    : pack_ltxav_audio_and_video_latents(video_only, preserved_audio);
+        } else {
+            final_latent = sd::ops::slice(final_latent, 2, 0, target_frames);
         }
         // mirror the same temporal trim on the base continuation latent (same Tl). This latent is
         // consumed VIDEO-only downstream (next-segment continuation strips audio), so a plain
