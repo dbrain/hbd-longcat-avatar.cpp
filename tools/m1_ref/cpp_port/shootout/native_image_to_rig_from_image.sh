@@ -74,12 +74,19 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$IMAGE" "$OUT" 
     [[ -f "$f" ]] || { echo "native pipeline failed before producing clean LODs; no rig fallback" >&2; exit 1; }
   done
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
+  mixamo_core_ok() {
+    local file="$1" n
+    local core=(Hips LeftUpLeg RightUpLeg Spine LeftLeg RightLeg Spine1 LeftFoot RightFoot Spine2
+                LeftToeBase RightToeBase Neck LeftShoulder RightShoulder Head LeftArm RightArm
+                LeftForeArm RightForeArm LeftHand RightHand)
+    for n in "${core[@]}"; do grep -a -q "mixamorig:$n" "$file" || return 1; done
+  }
   legacy_rig_ok() {
     local file="$1" report fan total
     report="$("$CP/rig_score" "$file" 55 2>&1 || true)"; printf '%s\n' "$report"
     [[ "$report" =~ maxfan=([0-9]+) ]] || return 1; fan="${BASH_REMATCH[1]}"
     [[ "$report" =~ TOTAL=([0-9.]+) ]] || return 1; total="${BASH_REMATCH[1]}"
-    (( fan <= 7 )) && awk "BEGIN { exit !($total >= 0.50) }" && grep -a -q 'mixamorig:Hips' "$file"
+    (( fan <= 7 )) && awk "BEGIN { exit !($total >= 0.50) }" && mixamo_core_ok "$file"
   }
   for level in high medium low; do
     case "$level" in
