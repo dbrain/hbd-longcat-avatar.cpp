@@ -173,13 +173,15 @@ fi
 GEOMETRY_TOPOLOGY="$("$CP/mesh_topo" "$CACHE/refined.glb")" || { echo "could not inspect refined geometry" >&2; exit 1; }
 [[ "$GEOMETRY_TOPOLOGY" =~ open=([0-9]+) ]] || { echo "refined geometry topology report lacks open-edge count" >&2; exit 1; }
 GEOMETRY_OPEN="${BASH_REMATCH[1]}"
+GEOMETRY_GATE_RESULT=rejected
+if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
 {
   printf 'geometry_cache=%s\n' "$CACHE"
   printf 'geometry_recipe=%s\n' "$GEOMETRY_RECIPE"
   printf 'remesh_close_r=%s\n' "$REMESH_CLOSE_R"
   printf 'geometry_topology=%s\n' "$GEOMETRY_TOPOLOGY"
-  printf 'geometry_gate=position-welded open=0 before native texture inference\n'
-  printf 'geometry_gate_result=%s\n' "$([[ "$GEOMETRY_OPEN" == 0 ]] && echo passed || echo rejected)"
+  printf '%s\n' 'geometry_gate=position-welded open=0 before native texture inference'
+  printf 'geometry_gate_result=%s\n' "$GEOMETRY_GATE_RESULT"
 } >"$OUT/geometry_delivery.txt"
 (( GEOMETRY_OPEN == 0 )) || { echo "REJECT: refined geometry has $GEOMETRY_OPEN open edges; refusing texture/rig stages" >&2; exit 1; }
 NATIVE_RIG=1
