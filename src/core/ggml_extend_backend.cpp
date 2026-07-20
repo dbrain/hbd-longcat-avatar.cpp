@@ -106,7 +106,36 @@ static std::string resolve_first_device_by_type(enum ggml_backend_dev_type type)
     if (dev == nullptr) {
         return "";
     }
-    return ggml_backend_dev_name(dev);
+    const char* dev_name = ggml_backend_dev_name(dev);
+    if (dev_name != nullptr && dev_name[0] != '\0') {
+        return dev_name;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char* reg_name   = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+    return reg_name != nullptr ? reg_name : "";
+}
+
+static ggml_backend_dev_t resolve_first_device_by_registry_name(const std::string& name) {
+    std::string lower = lower_copy(trim_copy(name));
+    if (lower == "metal") {
+        lower = "mtl";
+    }
+    if (lower.empty()) {
+        return nullptr;
+    }
+    const size_t device_count = ggml_backend_dev_count();
+    for (size_t i = 0; i < device_count; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+        const char* reg_name = ggml_backend_reg_name(reg);
+        if (reg_name != nullptr && lower_copy(reg_name) == lower) {
+            return dev;
+        }
+    }
+    return nullptr;
 }
 
 static ggml_backend_buffer_t ggml_backend_tensor_buffer(const struct ggml_tensor* tensor) {
@@ -277,6 +306,18 @@ static std::string sd_resolve_backend_name(const std::string& name) {
         std::string dev_lower  = lower_copy(dev_name);
         if (dev_lower.rfind(lower, 0) == 0) {
             return dev_name;
+        }
+    }
+
+    if (ggml_backend_dev_t dev = resolve_first_device_by_registry_name(requested)) {
+        const char* dev_name = ggml_backend_dev_name(dev);
+        if (dev_name != nullptr && dev_name[0] != '\0') {
+            return dev_name;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char* reg_name   = reg != nullptr ? ggml_backend_reg_name(reg) : nullptr;
+        if (reg_name != nullptr) {
+            return reg_name;
         }
     }
 

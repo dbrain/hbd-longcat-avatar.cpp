@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <regex>
@@ -626,7 +627,7 @@ ArgOptions SDContextParams::get_options() {
 }
 
 void SDContextParams::build_embedding_map() {
-    static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt"};
+    static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt", ".ckpt"};
 
     if (!fs::exists(embedding_dir) || !fs::is_directory(embedding_dir)) {
         return;
@@ -1487,6 +1488,42 @@ ArgOptions SDGenerationParams::get_options() {
         return 1;
     };
 
+    auto on_prompt_file_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        const char* arg = argv[index];
+        std::ifstream f(arg, std::ios::binary);
+        try {
+            prompt = std::string(std::istreambuf_iterator<char>{f}, {});
+        } catch (const std::ios_base::failure&) {
+            f.setstate(std::ios_base::failbit);
+        }
+        if (f.fail()) {
+            LOG_ERROR("error: failed to read prompt file '%s'\n", arg);
+            return -1;
+        }
+        return 1;
+    };
+
+    auto on_negative_prompt_file_arg = [&](int argc, const char** argv, int index) {
+        if (++index >= argc) {
+            return -1;
+        }
+        const char* arg = argv[index];
+        std::ifstream f(arg, std::ios::binary);
+        try {
+            negative_prompt = std::string(std::istreambuf_iterator<char>{f}, {});
+        } catch (const std::ios_base::failure&) {
+            f.setstate(std::ios_base::failbit);
+        }
+        if (f.fail()) {
+            LOG_ERROR("error: failed to read negative prompt file '%s'\n", arg);
+            return -1;
+        }
+        return 1;
+    };
+
     options.manual_options = {
         {"-s",
          "--seed",
@@ -1560,6 +1597,14 @@ ArgOptions SDGenerationParams::get_options() {
          "--vae-relative-tile-size",
          "relative tile size for vae tiling, format [X]x[Y], in fraction of image size if < 1, in number of tiles per dim if >=1 (overrides --vae-tile-size)",
          on_relative_tile_size_arg},
+        {"",
+         "--prompt-file",
+         "path to the file containing the prompt to render",
+         on_prompt_file_arg},
+        {"",
+         "--negative-prompt-file",
+         "path to the file containing the negative prompt",
+         on_negative_prompt_file_arg},
 
     };
 
@@ -2124,7 +2169,7 @@ void SDGenerationParams::extract_and_remove_lora(const std::string& lora_model_d
         return;
     }
     static const std::regex re(R"(<lora:([^:>]+):([^>]+)>)");
-    static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt"};
+    static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt", ".ckpt"};
     std::smatch m;
 
     std::string tmp = prompt;
@@ -2370,7 +2415,7 @@ bool SDGenerationParams::resolve(const std::string& lora_model_dir, const std::s
     // be resolved is warned + skipped (fails safe to "no hires lora" rather than aborting).
     hires_lora_map.clear();
     if (!hires_lora_spec.empty() && !lora_model_dir.empty()) {
-        static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt"};
+        static const std::vector<std::string> valid_ext = {".gguf", ".safetensors", ".pt", ".ckpt"};
         std::string spec = hires_lora_spec;
         // strip any <lora: ... > wrappers to bare "name:strength" tokens
         for (char& c : spec) {

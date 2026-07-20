@@ -53,7 +53,13 @@ Full evidence: `.merge-port-specs/audit-core-io.md`, `audit-diffusion.md`, `audi
     (global g_convert_imatrix applies via load_tensor→convert_tensor). CLI --streaming flag NOT wired (koblem drives).
     GPU/convert-PENDING: no large model run → RSS bounding, quant round-trip, imatrix effect are Stage-4 CPU-convert
     validation. Streaming output NOT byte-identical to old writer (tensor order/header) — validate by round-trip.
-  - Batch 7 remaining adopts + niche + CLI + docs-wholesale.
+  - Batch 7 Stage 1 — DONE, builds. apply-doc batch7-APPLY.md. AlphaBlender::get_alpha graph-side (block.hpp +
+    auto_encoder_kl.hpp); Ideogram4 seamless/circular (rope embed_interleaved_mrope axis_wrap + ideogram4 pe/flags);
+    .ckpt in valid_ext (3 LoRA/embed sites); --prompt-file/--negative-prompt-file; backend registry-name resolve
+    robustness; docs wholesale (21 upstream docs; 12 already byte-identical=skipped). DEFERRED (flagged, need
+    GPU/checkpoint/server): §2 masked flash-attn ne[1]!=L_q repeat (fork mask layout diverged → adapt+A/B Chroma/T5
+    +LongCat BSA); §4 PixelDiT-1.5 pit_lq_inject (354-line gated variant, no checkpoint); §6c A1111 prepare_info_field
+    (server, koblem may own). RPC: fork ships docs/rpc.md but NO rpc code — owner decision w/ multi-GPU.
 - HOLD (GPU/checkpoint-verify, do NOT blind-adopt): qwen3-vl vision split_patch_embed bias; qwen rope txt_id_start.
 
 ## PULL-IN BATCHES (this phase)

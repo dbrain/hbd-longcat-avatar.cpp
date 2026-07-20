@@ -213,9 +213,9 @@ protected:
         params["mix_factor"] = ggml_new_tensor_1d(ctx, wtype, 1);
     }
 
-    float get_alpha() {
-        float alpha = ggml_ext_backend_tensor_get_f32(params["mix_factor"]);
-        return sigmoid(alpha);
+    ggml_tensor* get_alpha(GGMLRunnerContext* ctx) {
+        auto mix_factor = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, params["mix_factor"]);
+        return ggml_sigmoid(ctx->ggml_ctx, mix_factor);
     }
 
 public:
@@ -250,10 +250,12 @@ public:
 
         x = time_stack->forward(ctx, x);  // b t c (h w)
 
-        float alpha = get_alpha();
-        x           = ggml_add(ctx->ggml_ctx,
-                               ggml_ext_scale(ctx->ggml_ctx, x, alpha),
-                               ggml_ext_scale(ctx->ggml_ctx, x_mix, 1.0f - alpha));
+        auto alpha = get_alpha(ctx);
+        x          = ggml_add(ctx->ggml_ctx,
+                              x_mix,
+                              ggml_mul(ctx->ggml_ctx,
+                                       ggml_sub(ctx->ggml_ctx, x, x_mix),
+                                       alpha));
 
         x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // b c t (h w) -> b t c (h w)
         x = ggml_reshape_4d(ctx->ggml_ctx, x, W, H, C, T * B);                     // b t c (h w) -> (b t) c h w
