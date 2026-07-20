@@ -91,7 +91,7 @@ write_status() {
     printf 'unwrap_mode=%s\n' "$UNWRAP_MODE"
     [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
     if [[ "$UNWRAP_MODE" == reference ]]; then
-      printf 'clean_material_contract=direct xatlas parity charts; 2x raster; topology normals; full gutter repair; PBR RGB outlier default 0.10 unless explicitly overridden\n'
+      printf 'clean_material_contract=adaptive xatlas parity charts (direct clean mesh / conformal local islands for high curvature); 2x raster; topology normals; full gutter repair; PBR RGB outlier default 0.10 unless explicitly overridden\n'
     fi
     printf 'args='
     printf ' %q' "$@"
