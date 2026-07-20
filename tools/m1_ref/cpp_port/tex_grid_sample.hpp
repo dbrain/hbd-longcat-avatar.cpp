@@ -25,35 +25,50 @@ static inline int64_t key3(int x, int y, int z) {
 // offset `xoff` (4-wide [b,x,y,z] -> xoff=1; 3-wide [x,y,z] -> xoff=0).
 struct VolIndex {
     std::unordered_map<int64_t,int> map;
-    VolIndex(const int32_t* coords, int N, int stride, int xoff) {
+    // Nearest-voxel fallback is used by the atlas baker when a decimated surface lies just
+    // outside the sparse PBR shell.  Probing every lattice point in an 8-voxel cube costs up to
+    // 4,913 hash lookups per texel.  Keep 4^3-cell buckets so the exact same search considers
+    // only occupied candidates in the requested neighbourhood instead.
+    std::unordered_map<int64_t,std::vector<int>> near_buckets;
+    const int32_t* coords = nullptr;
+    int stride = 0, xoff = 0;
+    VolIndex(const int32_t* coords_in, int N, int stride_in, int xoff_in)
+        : coords(coords_in), stride(stride_in), xoff(xoff_in) {
         map.reserve((size_t)N * 2);
-        for (int i = 0; i < N; i++)
-            map[key3(coords[(size_t)i*stride+xoff], coords[(size_t)i*stride+xoff+1], coords[(size_t)i*stride+xoff+2])] = i;
+        near_buckets.reserve((size_t)N / 2);
+        for (int i = 0; i < N; i++) {
+            const int x=coords[(size_t)i*stride+xoff], y=coords[(size_t)i*stride+xoff+1], z=coords[(size_t)i*stride+xoff+2];
+            map[key3(x,y,z)] = i;
+            near_buckets[key3(x >> 2, y >> 2, z >> 2)].push_back(i);
+        }
     }
     inline int find(int x, int y, int z) const {
         auto it = map.find(key3(x,y,z));
         return it == map.end() ? -1 : it->second;
     }
-    // nearest occupied voxel to (qx,qy,qz) within Chebyshev radius Rmax (expanding-shell search,
-    // returns the Euclidean-nearest within the first non-empty shell + one extra shell). -1 if none.
+    // Exact nearest occupied voxel to (qx,qy,qz) within Chebyshev radius Rmax.  The old expanding
+    // lattice-shell implementation repeated a sparse-map lookup for every empty coordinate; the
+    // coarse buckets retain the same radius/Euclidean contract while visiting only occupied cells.
     // Used by the REMESH texture bake: the remeshed surface sits a few voxels off the sparse PBR
     // shell, so the 8 trilinear neighbours are all empty → fall back to the nearest shell voxel.
     inline int find_nearest(float qx, float qy, float qz, int Rmax) const {
         int bx=(int)std::lround(qx-0.5f), by=(int)std::lround(qy-0.5f), bz=(int)std::lround(qz-0.5f);
-        int best=-1; float bestd=1e30f; int found_r=-1;
-        for (int r=0; r<=Rmax; r++) {
-            if (found_r>=0 && r>found_r+1) break;     // one shell past the first hit is enough
-            // iterate the Chebyshev shell of radius r (faces of the r-box)
-            for (int dx=-r; dx<=r; dx++) for (int dy=-r; dy<=r; dy++) for (int dz=-r; dz<=r; dz++) {
-                if (std::max(std::max(std::abs(dx),std::abs(dy)),std::abs(dz)) != r) continue;
-                int idx = find(bx+dx, by+dy, bz+dz);
-                if (idx<0) continue;
-                float cx=bx+dx+0.5f, cy=by+dy+0.5f, cz=bz+dz+0.5f;
-                float d=(cx-qx)*(cx-qx)+(cy-qy)*(cy-qy)+(cz-qz)*(cz-qz);
-                if (d<bestd){ bestd=d; best=idx; }
-            }
-            if (best>=0 && found_r<0) found_r=r;
-        }
+        auto floor4=[](int v) { return v >= 0 ? v/4 : -(((-v)+3)/4); };
+        const int xmin=bx-Rmax, xmax=bx+Rmax, ymin=by-Rmax, ymax=by+Rmax, zmin=bz-Rmax, zmax=bz+Rmax;
+        int best=-1; float bestd=1e30f;
+        for (int ux=floor4(xmin); ux<=floor4(xmax); ux++)
+            for (int uy=floor4(ymin); uy<=floor4(ymax); uy++)
+                for (int uz=floor4(zmin); uz<=floor4(zmax); uz++) {
+                    auto it=near_buckets.find(key3(ux,uy,uz));
+                    if (it==near_buckets.end()) continue;
+                    for (int idx : it->second) {
+                        const int x=coords[(size_t)idx*stride+xoff], y=coords[(size_t)idx*stride+xoff+1], z=coords[(size_t)idx*stride+xoff+2];
+                        if (x<xmin || x>xmax || y<ymin || y>ymax || z<zmin || z>zmax) continue;
+                        float dx=x+0.5f-qx, dy=y+0.5f-qy, dz=z+0.5f-qz;
+                        float d=dx*dx+dy*dy+dz*dz;
+                        if (d<bestd){ bestd=d; best=idx; }
+                    }
+                }
         return best;
     }
 };
