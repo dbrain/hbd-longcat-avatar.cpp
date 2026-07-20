@@ -69,7 +69,10 @@ static inline void drop_small_components(svae::Mesh& m, float min_frac) {
 
 struct RefineCfg {
     int     octree      = 512;      // dense decode grid (octree_resolution); OCT=256 = the toy default
-    int     num_latents = 8192;     // token_num / latent voxels (prod)
+    // 8192 samples only ~24% of a typical full-body occupied voxel set and was eye-tested to create
+    // malformed thin/detail regions (hands, boots, and facial boundaries). 16384 is the validated
+    // quality floor and 3060 ceiling; do not silently regress this to the old speed baseline.
+    int     num_latents = 16384;    // token_num / latent voxels (production quality floor)
     int     steps       = 50;       // flow-matching Euler steps
     float   guidance    = 7.5f;     // CFG scale (pipelines.py single-CFG default)
     int64_t chunk       = 2048;     // dense-decode query chunk (VRAM lever)

@@ -24,13 +24,14 @@ LEVEL="${2:-all}"
 case "$MODEL" in
   miku)
     IMAGE=/mnt/hdd/3d/avatar-shootout/_shootout_out/miku_prod1536_matte.png
-    CACHE=/mnt/hdd/3d/avatar-shootout/_shootout_out/ab_part_retopo_tex/stage_adaptive
+    # Never reuse the historic 8192-latent cache: its refined clay has the known torn-face failure.
+    CACHE="$OUT_ROOT/miku/cache_n16384"
     ;;
   gilly)
     # Gilly starts as an opaque RGB reference. Its 3060-generated same-frame RGBA cutout is converted
     # once to this black matte; geometry and projection MUST consume this exact frame together.
     IMAGE="$OUT_ROOT/gilly/gilly_matte.png"
-    CACHE="$OUT_ROOT/gilly/cache_matted"
+    CACHE="$OUT_ROOT/gilly/cache_matted_n16384"
     ;;
   soldier)
     IMAGE=/mnt/hdd/3d/avatar-shootout/_shootout_out/inline_soldier
@@ -60,7 +61,7 @@ exec 9>"$OUT_ROOT/.3060-image-to-rig.lock"
 flock -n 9 || { echo "another image_to_rig job owns the 3060 lock" >&2; exit 1; }
 
 BASE=("$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$IMAGE" --moge
-      --no-quad --tex-dit cross --tex-volume-direct --tex-fallback-r 8)
+      --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8)
 
 PROJECTION_VIEW_ARGS=()
 if [[ -n "${IMAGE_TO_RIG_TEX_FRONT:-}" ]]; then
