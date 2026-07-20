@@ -82,6 +82,7 @@ static void usage() {
            "        [--us-gguf <dir>] [--us-dit-w <dir>] [--us-vae-w <dir>] [--us-cnd-w <dir>] [--us-meta <npy>]\n"
            "        [--stage-dir <dir>]   (emit coarse/refined/decimated GLB intermediates + resume caches)\n"
            "        [--from-refined <dir>] (resume: skip geometry+refine, load refined.glb + PBR cache)\n"
+           "        [--geometry-only]      (write the clean refined geometry cache; skip legacy PBR/atlas/rig)\n"
            "        [--tex-dit proj|cross] [--tex-dit-w <dir>]\n"
            "                         (WHICH generative tex DiT paints the PBR volume. cross = DEFAULT =\n"
            "                          trellis2_tex_1024 (TRELLIS-2 texturing model, full 4101-token DINOv3\n"
@@ -205,6 +206,7 @@ int main(int argc, char** argv) {
     // diffusion. --no-rig writes a textured-only GLB (skips the 159s auto-rig) for fast mesh/texture A/B.
     std::string dump_geo, from_geo;
     bool no_rig = false;
+    bool geometry_only = false;
     uint64_t rig_seed = 0;
     // Standard bone naming (ON by default -- an anonymous bone_N rig cannot take a Mixamo or
     // AMASS clip without a human hand-mapping it, which is the whole point of rigging).
@@ -382,12 +384,14 @@ int main(int argc, char** argv) {
         else if (a == "--dump-geo" && i+1 < argc) dump_geo = argv[++i];
         else if (a == "--from-geo" && i+1 < argc) from_geo = argv[++i];
         else if (a == "--no-rig") no_rig = true;
+        else if (a == "--geometry-only") geometry_only = true;
         // geometry sampler knobs (forwarded to ChainInput; defaults already = inference.py)
         else if (a == "--guidance" && i+1 < argc) { float g=nextf(i); in.ss.guidance=g; in.shape.guidance=g; }
         else if (a == "--steps" && i+1 < argc) { int s=std::atoi(argv[++i]); in.ss.steps=in.shape.steps=in.tex.steps=s; }
         else { printf("unknown/incomplete arg: %s\n", a.c_str()); usage(); return 1; }
     }
     if (model.empty() || image.empty() || out.empty()) { usage(); return 1; }
+    if (geometry_only && stage_dir.empty()) { printf("--geometry-only requires --stage-dir\n"); return 1; }
     if (fast) { setenv("PIXAL3D_FAST", "1", 1); setenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F", "1", 1); }
 
     printf("==== image_to_rig (inline native image -> textured+rigged GLB) ====\n");
@@ -416,7 +420,10 @@ int main(int argc, char** argv) {
         in.img1024_raw = imgio::load_chw(image, 1024);
     } catch (const std::exception& e) { printf("image load failed: %s\n", e.what()); return 1; }
     in.cam = cam; in.dist = dist; in.ms = ms; in.use_cuda = use_cuda; in.verbose = true;
-    in.textured = true; in.watertight = true; in.remesh = false;
+    // The clean-image entrypoint needs the refined mesh, not the historical Pixal texture volume.
+    // Keeping this false avoids loading/running a second generative texture model before the native
+    // production texture pass, and makes a new geometry cache independent of legacy texture weights.
+    in.textured = !geometry_only; in.watertight = true; in.remesh = false;
     in.mc_remesh = clean; in.mc_stride = mc_stride; in.mc_blur = mc_blur; in.mc_post_smooth = mc_smooth;
     in.norm_mean = load_norm(model, "shape_slat", "mean");
     in.norm_std  = load_norm(model, "shape_slat", "std");
@@ -478,7 +485,10 @@ int main(int argc, char** argv) {
         if (!clean) { printf("FAIL: --from-geo only supports the clean (MC-remesh) path\n"); return 1; }
         mesh = pix::build_mc_remesh(coords1024, in.resolution, mc_stride, mc_blur, mc_smooth, true);
     } else {
-        mesh = pix::run_geometry(in, &st, nullptr, &pbr_feats, &pbr_coords, dump_geo.empty() ? nullptr : &coords1024);
+        mesh = pix::run_geometry(in, &st, nullptr,
+                                 geometry_only ? nullptr : &pbr_feats,
+                                 geometry_only ? nullptr : &pbr_coords,
+                                 dump_geo.empty() ? nullptr : &coords1024);
         printf("  [1/4] geometry: N1=%d M=%d verts=%d faces=%d  (%.1fs)\n",
                st.N1, st.M, mesh.N, mesh.F, pix::now_s() - t_geo);
         if (!dump_geo.empty()) {
@@ -525,6 +535,17 @@ int main(int argc, char** argv) {
             printf("  [stage] wrote %s/refined.glb + pbr cache (resume: --from-refined %s)\n",
                    stage_dir.c_str(), stage_dir.c_str());
         }
+    }
+
+    if (geometry_only) {
+        // The stage cache is the delivery boundary for the native texture runner.  No legacy UV bake,
+        // PNG atlas, or skeleton is generated here, so those artefacts cannot be accidentally promoted.
+        if (!did_refine_load && !refine) {
+            glb::write_glb((stage_dir + "/refined.glb").c_str(), mesh.verts, mesh.faces);
+        }
+        printf("==== DONE (--geometry-only) -> %s/refined.glb  (verts=%d faces=%d, %.1fs total) ====\n",
+               stage_dir.c_str(), mesh.N, mesh.F, pix::now_s() - t_geo);
+        return 0;
     }
 
     // Dense high-poly kept for the normal-map bake (retopo/decimation drops fine relief — anime faces,

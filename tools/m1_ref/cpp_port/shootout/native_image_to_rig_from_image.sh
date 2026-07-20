@@ -54,14 +54,24 @@ export REMESH_CLOSE_R="${REMESH_CLOSE_R:-3}"
 # environment setting.  A cache made with a different seal radius is a
 # different reconstruction and must never be reused just because the source
 # image happens to be identical.
-GEOMETRY_RECIPE_VERSION=3
-# `image_to_rig` retains a PBR cache only for the explicitly optional
-# observed-view projection A/B and legacy-rig diagnostic.  Its installed
-# `proj` weights are used for that non-production cache; the deliverable
-# material is always generated later by texture_mesh_native.  Do not request
-# the absent legacy cross checkpoint here: it makes a new subject fail after
-# paying for all geometry diffusion.
-GEOMETRY_RECIPE="moge-noquad-us16384-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+GEOMETRY_RECIPE_VERSION=4
+# The clean default creates geometry only.  It must not pay for, or depend on,
+# Pixal's legacy PBR decoder before texture_mesh_native makes the production
+# material.  A caller requesting an observed-view projection has explicitly
+# asked for that legacy PBR cache as an A/B support artefact; it remains
+# non-production and cache-keyed separately.
+LEGACY_PBR_CACHE="${IMAGE_TO_RIG_LEGACY_PBR_CACHE:-0}"
+[[ "$LEGACY_PBR_CACHE" == 0 || "$LEGACY_PBR_CACHE" == 1 ]] || {
+  echo "IMAGE_TO_RIG_LEGACY_PBR_CACHE must be 0 or 1" >&2; exit 2;
+}
+if [[ "${IMAGE_TO_RIG_PROJECT:-0}" != 0 || -n "${IMAGE_TO_RIG_TEX_FRONT:-}" || -n "${IMAGE_TO_RIG_TEX_BACK:-}" || -n "${IMAGE_TO_RIG_TEX_VIEWS:-}" || -n "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-}" ]]; then
+  LEGACY_PBR_CACHE=1
+fi
+if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
+  GEOMETRY_RECIPE="moge-noquad-us16384-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+else
+  GEOMETRY_RECIPE="moge-noquad-us16384-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+fi
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 [[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: PCI GPU 0 is '$GPU_NAME', expected RTX 3060" >&2; exit 1; }
 GPU_3060_UUID="$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0 | head -1)"
@@ -124,19 +134,29 @@ cache_recipe_matches=0
 if [[ -f "$CACHE/geometry_recipe.txt" ]] && grep -Fqx "geometry_recipe=$GEOMETRY_RECIPE" "$CACHE/geometry_recipe.txt"; then
   cache_recipe_matches=1
 fi
-if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || ! -f "$CACHE/pbr_feats.bin" || ! -f "$CACHE/pbr_coords.bin" || "$cache_recipe_matches" != 1 ]]; then
+cache_pbr_ready=1
+if [[ "$LEGACY_PBR_CACHE" == 1 && ( ! -f "$CACHE/pbr_feats.bin" || ! -f "$CACHE/pbr_coords.bin" ) ]]; then
+  cache_pbr_ready=0
+fi
+if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || "$cache_pbr_ready" != 1 || "$cache_recipe_matches" != 1 ]]; then
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   mkdir -p "$CACHE" "$OUT_ROOT"
   echo "== $LABEL: create clean geometry cache ${CACHE##*/} on the RTX 3060 =="
   (
     exec 9>"$LOCK"
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
-    "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-      --no-quad --us-latents 16384 --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
-      --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
+    if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
+      "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+        --no-quad --us-latents 16384 --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
+        --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
+    else
+      "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+        --no-quad --us-latents 16384 --geometry-only --stage-dir "$CACHE" \
+        --out "$CACHE/geometry_only_unused.glb"
+    fi
   )
-  printf 'geometry_recipe=%s\nremesh_close_r=%s\ngeometry_recipe_version=%s\n' \
-    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$GEOMETRY_RECIPE_VERSION" >"$CACHE/geometry_recipe.txt"
+  printf 'geometry_recipe=%s\nremesh_close_r=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
+    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
 else
   echo "== $LABEL: reuse image-keyed clean geometry cache ${CACHE##*/} =="
 fi
@@ -169,6 +189,10 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
   for f in "$OUT/native_high_textured.glb" "$OUT/native_medium_textured.glb" "$OUT/native_low_textured.glb"; do
     [[ -f "$f" ]] || { echo "native pipeline failed before producing clean LODs; no rig fallback" >&2; exit 1; }
   done
+  [[ "$LEGACY_PBR_CACHE" == 1 ]] || {
+    echo "native rig rejected; clean geometry-only cache intentionally has no legacy PBR fallback. Re-run with IMAGE_TO_RIG_LEGACY_PBR_CACHE=1 only to evaluate that explicit fallback." >&2
+    exit 1
+  }
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   mixamo_core_ok() {
     local file="$1" n
@@ -351,6 +375,7 @@ input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=$GEOMETRY_RECIPE
 geometry_delivery_manifest=$OUT/geometry_delivery.txt
+legacy_pbr_cache=$LEGACY_PBR_CACHE
 texture_recipe=native high Trellis material + CPU medium/low rebakes from native_high_texture_dump + structural rig gate
 texture_delivery_manifest=$OUT/texture_delivery.txt
 rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
