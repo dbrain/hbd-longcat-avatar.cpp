@@ -42,8 +42,12 @@ export RIG_BONE_FACING="${RIG_BONE_FACING:-+z}"
 # and must still pass the visual gate before publication.
 NATIVE_HIGH_RESOLUTION="${NATIVE_HIGH_RESOLUTION:-512}"
 NATIVE_HIGH_ATLAS="${NATIVE_HIGH_ATLAS:-2048}"
+NATIVE_UNWRAP="${NATIVE_UNWRAP:-reference}"
 [[ "$NATIVE_HIGH_RESOLUTION" == 512 || "$NATIVE_HIGH_RESOLUTION" == 1024 ]] || {
   echo "NATIVE_HIGH_RESOLUTION must be 512 or 1024" >&2; exit 2;
+}
+[[ "$NATIVE_UNWRAP" == reference || "$NATIVE_UNWRAP" == production ]] || {
+  echo "NATIVE_UNWRAP must be reference or production" >&2; exit 2;
 }
 
 run_texture_level() {
@@ -57,7 +61,7 @@ run_texture_level() {
   fi
   echo "== $LABEL: native $name (${faces} faces, ${atlas}px atlas) =="
   "$CP/shootout/native_texture_run.sh" "$REFINED" "$IMAGE" "$out" \
-    --resolution "$resolution" --texsize "$atlas" --decimate "$faces" "${dump_args[@]}"
+    --resolution "$resolution" --texsize "$atlas" --decimate "$faces" --unwrap "$NATIVE_UNWRAP" "${dump_args[@]}"
   "$CP/mesh_topo" "$out"
 }
 
@@ -113,9 +117,9 @@ done
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
  {"file":"hymotion_rigged.glb","label":"Hymotion-ready · native $SELECTED_RIG rig","note":"native Trellis texture; deterministic beam rig; maxfan ≤ 7 and rig_score ≥ 0.50"},
- {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas"},
- {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas"},
- {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas"}
+ {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas · ${NATIVE_UNWRAP} unwrap"},
+ {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas · ${NATIVE_UNWRAP} unwrap"},
+ {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas · ${NATIVE_UNWRAP} unwrap"}
 ]}
 JSON
 echo "== DONE: $OUT (native $SELECTED_RIG rig selected) =="

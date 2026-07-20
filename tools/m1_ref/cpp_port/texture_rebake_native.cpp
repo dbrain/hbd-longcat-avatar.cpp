@@ -17,7 +17,8 @@
 
 static void usage() {
     std::printf("usage: texture_rebake_native --mesh refined.glb --pbr-dir native-dump --out out.glb\\n"
-                "                             [--resolution 512|1024] [--texsize N] [--decimate faces]\\n");
+                "                             [--resolution 512|1024] [--texsize N] [--decimate faces]\\n"
+                "                             [--unwrap production|reference]\\n");
 }
 
 // Matches texture_mesh_native's Trellis texturing frame exactly.
@@ -35,7 +36,7 @@ static void restore_mesh_frame(std::vector<float>& v) {
 }
 
 int main(int argc,char**argv) {
-    std::string mesh_path,pdir,out; int resolution=512,texsize=2048,decimate=0;
+    std::string mesh_path,pdir,out,unwrap="reference"; int resolution=512,texsize=2048,decimate=0;
     for (int i=1;i<argc;i++) { std::string a=argv[i];
         if(a=="--mesh"&&i+1<argc) mesh_path=argv[++i];
         else if(a=="--pbr-dir"&&i+1<argc) pdir=argv[++i];
@@ -43,9 +44,11 @@ int main(int argc,char**argv) {
         else if(a=="--resolution"&&i+1<argc) resolution=atoi(argv[++i]);
         else if(a=="--texsize"&&i+1<argc) texsize=atoi(argv[++i]);
         else if(a=="--decimate"&&i+1<argc) decimate=atoi(argv[++i]);
+        else if(a=="--unwrap"&&i+1<argc) unwrap=argv[++i];
         else { usage(); return 2; }
     }
-    if(mesh_path.empty()||pdir.empty()||out.empty()||(resolution!=512&&resolution!=1024)||texsize<=0) { usage(); return 2; }
+    if(mesh_path.empty()||pdir.empty()||out.empty()||(resolution!=512&&resolution!=1024)||texsize<=0 ||
+       (unwrap!="production" && unwrap!="reference")) { usage(); return 2; }
     try {
         glb::Mesh mesh; if(!glb::read_glb(mesh_path.c_str(),mesh)) throw std::runtime_error("cannot read mesh: "+mesh_path);
         NpyArray pf=npy_load(pdir+"/native_pbr_feats.npy"), pc=npy_load(pdir+"/native_pbr_coords.npy");
@@ -63,7 +66,16 @@ int main(int argc,char**argv) {
             std::printf("[native-rebake] PBR RGB outlier cleanup threshold=%.3f: %zu / %d voxels\n",threshold,changed,N);
         }
         preprocess_mesh(mesh.verts);
-        texatlas::BakedTexture baked=texatlas::bake(mesh.verts,mesh.faces,pbr,coords,resolution,texsize,decimate,4,true,8,true);
+        // `reference` removes the native pre-cluster stage and gives xatlas the same chart
+        // parameters used by Pixal3D's CuMesh unwrap.  It intentionally retains the native
+        // rasterizer and PBR sampling: this is an isolated, CPU-only unwrap/bake A/B.
+        const bool reference_unwrap = unwrap=="reference";
+        if (reference_unwrap) {
+            setenv("ATL_PYREF_XATLAS", "1", 1);
+            std::printf("[native-rebake] reference unwrap: direct mesh xatlas, Pixal3D chart settings\\n");
+        }
+        texatlas::BakedTexture baked=texatlas::bake(mesh.verts,mesh.faces,pbr,coords,resolution,texsize,decimate,
+                                                    reference_unwrap ? 0 : 4,true,8,!reference_unwrap);
         restore_mesh_frame(baked.verts); restore_mesh_frame(baked.normals);
         if(!glb::write_glb_textured(out.c_str(),baked.verts,baked.normals,baked.uvs,baked.faces,
                                     baked.base_color,baked.metal_rough,baked.tw,baked.th))

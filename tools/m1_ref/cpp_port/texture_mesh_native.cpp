@@ -24,7 +24,8 @@
 
 static void usage() {
     std::printf("usage: texture_mesh_native --model <geo_gguf_dir> --mesh <in.glb> --image <matte.png> --out <out.glb>\n"
-                "                           [--resolution 512|1024] [--texsize N] [--seed N] [--decimate F] [--dump-dir DIR]\n");
+                "                           [--resolution 512|1024] [--texsize N] [--seed N] [--decimate F] [--dump-dir DIR]\n"
+                "                           [--unwrap production|reference]\n");
 }
 
 template<class T> static void dump_npy(const std::string& path, const std::vector<T>& data,
@@ -146,7 +147,9 @@ static imgio::Image load_texture_image(const std::string& path) {
 
 int main(int argc, char** argv) {
     setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
-    std::string model, mesh_path, image_path, out, dump_dir;
+    // Direct xatlas charts with Pixal3D's chart settings are the quality default.  The old
+    // precluster path remains available as `production` for a deliberately faster fallback.
+    std::string model, mesh_path, image_path, out, dump_dir, unwrap="reference";
     bool condition_only=false;
     int resolution=512, texsize=2048, seed=42, decimate=0;
     for (int i=1;i<argc;i++) {
@@ -160,11 +163,12 @@ int main(int argc, char** argv) {
         else if (a=="--seed" && i+1<argc) seed=std::atoi(argv[++i]);
         else if (a=="--decimate" && i+1<argc) decimate=std::atoi(argv[++i]);
         else if (a=="--dump-dir" && i+1<argc) dump_dir=argv[++i];
+        else if (a=="--unwrap" && i+1<argc) unwrap=argv[++i];
         else if (a=="--condition-only") condition_only=true;
         else { usage(); return 1; }
     }
     if (model.empty() || mesh_path.empty() || image_path.empty() || (out.empty() && !condition_only) ||
-        (resolution!=512 && resolution!=1024)) { usage(); return 1; }
+        (resolution!=512 && resolution!=1024) || (unwrap!="production" && unwrap!="reference")) { usage(); return 1; }
     setenv("PIXAL3D_GGUF_DIR", model.c_str(), 1);
 
     try {
@@ -261,7 +265,16 @@ int main(int argc, char** argv) {
         if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_pbr_coords.npy",pbr_coords,"<i4",{(int)pbr_coords.size()/4,4}); dump_npy(dump_dir+"/native_pbr_feats.npy",pbr,"<f4",{(int)pbr.size()/6,6}); }
         std::printf("[native-texture] PBR volume: %zu voxels\\n", pbr.size()/6);
 
-        texatlas::BakedTexture baked=texatlas::bake(mesh.verts,mesh.faces,pbr,pbr_coords,resolution,texsize,decimate,4,true,8,true);
+        // The production unwrap is deliberately fast and chart-safe for every model.  The
+        // reference mode removes that pre-cluster and uses Pixal3D/CuMesh xatlas chart settings,
+        // giving a like-for-like atlas-quality A/B while keeping all inference native.
+        const bool reference_unwrap = unwrap=="reference";
+        if (reference_unwrap) {
+            setenv("ATL_PYREF_XATLAS", "1", 1);
+            std::printf("[native-texture] reference unwrap: direct mesh xatlas, Pixal3D chart settings\\n");
+        }
+        texatlas::BakedTexture baked=texatlas::bake(mesh.verts,mesh.faces,pbr,pbr_coords,resolution,texsize,decimate,
+                                                    reference_unwrap ? 0 : 4,true,8,!reference_unwrap);
         restore_mesh_frame(baked.verts); restore_mesh_frame(baked.normals);
         if (!glb::write_glb_textured(out.c_str(),baked.verts,baked.normals,baked.uvs,baked.faces,
                                      baked.base_color,baked.metal_rough,baked.tw,baked.th))
