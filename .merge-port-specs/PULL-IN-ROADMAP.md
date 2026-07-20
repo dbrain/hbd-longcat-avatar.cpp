@@ -17,9 +17,26 @@ Full evidence: `.merge-port-specs/audit-core-io.md`, `audit-diffusion.md`, `audi
 - Models ported onto fork runner: krea2 7502d89, boogu ca0d922, hunyuan f14b2b2, lingbot d279a0c, minit2i 785ba0d.
 - Track B initial adopts 3ac6af4 (sharded safetensors, t5 detect, Beta scheduler, bounds hardening).
 
+## PULL-IN PROGRESS (2026-07-20)
+- Batch 1 self-contained adopts — DONE, commit 3e76178.
+- Batch 2 RefImageParams resize + lingbot bugfix — DONE, commit c58a01d.
+- Batch 3a AnimateDiff (graph eaf8f3d + glue 2b9d689) — DONE, builds. GPU-PENDING: frame-expansion no-op check.
+- Batch 3b sefi_image — DONE, commit de2dd4a, builds. GPU-PENDING: dual-schedule render + ref-image path.
+- REMAINING (apply-docs / roadmap ready; wire like the above, one build+commit each):
+  - qwen_image_layered — apply-doc `.merge-port-specs/qwen_image_layered-APPLY.md` (VAE-2D gated additive =
+    safe; wire A model-plumbing + B addition_t_cond + C wan_vae is_2D; ALSO fix QwenImageRunner's
+    uninitialized `version` member. Full layered RGBA orchestration = deferred sub-milestone.)
+  - ADetailer — needs a prep agent (detailer.{cpp,h} onto fork runner + orphaned yolov8.h as GGMLRunner;
+    inpaint pass reuses sd_ctx img2img; CLI ad_* params). Roadmap Batch 4.
+  - PuLID — needs a prep agent (FluxDiffusionExtra pulid_id + flux.hpp block injection + before_diffusion
+    hook + generation_extension + sd_pulid_params_t). Hardest (DiT-touching). Roadmap Batch 5.
+  - streaming/bounded-mem convert — Batch 6 (TensorWritePlan into tensor_storage.h + re-weave nvfp4 imatrix).
+  - Batch 7 remaining adopts + niche + CLI + docs-wholesale.
+- HOLD (GPU/checkpoint-verify, do NOT blind-adopt): qwen3-vl vision split_patch_embed bias; qwen rope txt_id_start.
+
 ## PULL-IN BATCHES (this phase)
 
-### Batch 1 — self-contained adopts  [APPLIED, building]
+### Batch 1 — self-contained adopts  [DONE 3e76178]
 - lora.hpp LoKr `lokr_w2_a_name` insert bug (line 615 dup) — FIXED.
 - control.hpp `CONTROL_NET_GRAPH_SIZE = MAX_GRAPH_SIZE` — large SDXL ControlNet fit.
 - vae.hpp image-encode tile factor 2.0 (video VAEs keep 1.30539) — ⚠ raises 3060 image-encode VRAM; GPU-validate.
