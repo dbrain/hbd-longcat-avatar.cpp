@@ -470,7 +470,7 @@ int main(int argc, char** argv) {
     sd::Tensor<float> audio_tokens, audio_global;
     if (w2v && cae && !wav_path.empty()) {
         std::vector<float> wav;
-        if (!LONGCAT_AUDIO::load_wav_16k_mono(wav_path, wav)) { printf("ERROR: load wav\n"); return 1; }
+        if (!sd::audio::load_wav_16k_mono(wav_path, wav)) { printf("ERROR: load wav\n"); return 1; }
         {
             double s=0,s2=0; for (float v : wav) { s+=v; s2+=(double)v*v; }
             printf("loaded wav '%s': n=%zu mean=%.5f rms=%.5f\n", wav_path.c_str(),

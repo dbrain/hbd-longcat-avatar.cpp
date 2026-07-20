@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "ggml_extend.hpp"
-#include "longcat_audio.hpp"  // reuse load_wav_16k_mono
+#include "audio_utils.hpp"
 #include "model.h"
 
 // ---------------------------------------------------------------------------

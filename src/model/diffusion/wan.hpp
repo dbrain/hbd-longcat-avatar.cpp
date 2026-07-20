@@ -177,8 +177,8 @@ namespace WAN {
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L_blk, 1);
             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L_blk, 1);
 
-            auto q_roped = Rope::apply_rope(ctx->ggml_ctx, q, pe, true, ctx->allow_fused_rope);  // [d_head, L_blk, n_head]
-            auto k_roped = Rope::apply_rope(ctx->ggml_ctx, k, pe, true, ctx->allow_fused_rope);  // [d_head, L_blk, n_head]
+            auto q_roped = Rope::apply_rope(ctx->ggml_ctx, q, pe, true);  // [d_head, L_blk, n_head]
+            auto k_roped = Rope::apply_rope(ctx->ggml_ctx, k, pe, true);  // [d_head, L_blk, n_head]
             auto v_flat  = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));  // [d_head, L_blk, n_head]
 
             new_kc = k_roped;
@@ -237,7 +237,7 @@ namespace WAN {
             auto v = v_proj->forward(ctx, x);
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_heads, L, 1);
             v = ggml_reshape_4d(ctx->ggml_ctx, v, head_dim, num_heads, L, 1);
-            kc = Rope::apply_rope(ctx->ggml_ctx, k, pe_cond, true, ctx->allow_fused_rope);  // [d_head, L, n_head]
+            kc = Rope::apply_rope(ctx->ggml_ctx, k, pe_cond, true);  // [d_head, L, n_head]
             vc = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, v, 0, 2, 1, 3));      // [d_head, L, n_head]
         }
     };
