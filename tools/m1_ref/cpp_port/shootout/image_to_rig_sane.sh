@@ -2,12 +2,11 @@
 # Locked, repeatable image -> clean textured mesh -> Hymotion-ready rig shootout.
 #
 # Usage:
-#   image_to_rig_sane.sh <miku|gilly|soldier> [all|high|medium|low] [--rig-all]
+#   image_to_rig_sane.sh <miku|gilly|soldier> [all|high|medium|low]
 #
 # `all` emits the high/medium/low clean meshes, three high-detail texture A/Bs,
-# and a validated rig.  Miku rigs at medium density: its 300k conditioning sample
-# has a known branch-fan failure, while its 150k sample is clean and Hymotion-ready.
-# `--rig-all` additionally rigs the non-production LODs where that is known sane.
+# and selects a valid Hymotion rig by scoring high -> medium -> low candidates.
+# This decision is based on rig quality, never on the model name.
 # All GPU work is deliberately bound to the physical RTX 3060 (PCI bus order).
 set -euo pipefail
 
@@ -15,8 +14,6 @@ CP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_ROOT="${IMAGE_TO_RIG_OUT_ROOT:-/mnt/hdd/3d/avatar-shootout/_shootout_out/runbook_image_to_rig}"
 MODEL="${1:?model: miku, gilly, or soldier}"
 LEVEL="${2:-all}"
-RIG_ALL=0
-[[ "${3:-}" == "--rig-all" ]] && RIG_ALL=1
 
 case "$MODEL" in
   miku)
@@ -67,17 +64,45 @@ ensure_cache() {
 }
 
 run_level() {
-  local name="$1" faces="$2" texsize="$3" rig="$4"
-  local out="$OUT_DIR/${name}_$([[ "$rig" == 1 ]] && echo rigged || echo textured).glb"
+  local name="$1" faces="$2" texsize="$3" rig="$4" stem="${5:-$1}"
+  local out="$OUT_DIR/${stem}_$([[ "$rig" == 1 ]] && echo rigged || echo textured).glb"
   local rig_args=(--no-rig)
+  local bone_args=()
   [[ "$rig" == 1 ]] && rig_args=()
+  # Canonicalized image-to-rig meshes use +Z forward. The automatic facing finder
+  # cannot reliably infer that from generated leg topology, so pin the convention.
+  [[ "$rig" == 1 ]] && bone_args=(--bone-facing +z)
   echo "== $MODEL: $name (${faces} target faces, ${texsize}px atlas, rig=$rig) =="
   "${BASE[@]}" --from-refined "$CACHE" --stage-dir "$OUT_DIR" --decimate "$faces" --texsize "$texsize" \
-    "${rig_args[@]}" --out "$out"
+    "${rig_args[@]}" "${bone_args[@]}" --out "$out"
   "$CP/mesh_topo" "$out"
   if [[ "$rig" == 1 && -x "$CP/rig_score" ]]; then
     "$CP/rig_score" "$out" 55 || true
   fi
+}
+
+rig_ok() {
+  local file="$1" report fan total
+  report="$("$CP/rig_score" "$file" 55 2>&1 || true)"
+  printf '%s\n' "$report"
+  [[ "$report" =~ maxfan=([0-9]+) ]] || return 1; fan="${BASH_REMATCH[1]}"
+  [[ "$report" =~ TOTAL=([0-9.]+) ]] || return 1; total="${BASH_REMATCH[1]}"
+  (( fan <= 6 )) && awk "BEGIN { exit !($total >= 0.50) }" \
+    && strings "$file" | grep -q 'mixamorig:Hips'
+}
+
+SELECTED_RIG=""
+try_rig() {
+  local name="$1" faces="$2" texsize="$3"
+  local candidate="$OUT_DIR/rig_candidate_${name}_rigged.glb"
+  run_level "$name" "$faces" "$texsize" 1 "rig_candidate_$name"
+  if rig_ok "$candidate"; then
+    cp -f "$candidate" "$OUT_DIR/hymotion_rigged.glb"
+    SELECTED_RIG="$name"
+    return 0
+  fi
+  echo "== $MODEL: rejected $name rig candidate; trying the next conditioning rung ==" >&2
+  return 1
 }
 
 run_texture_variants() {
@@ -96,15 +121,11 @@ run_texture_variants() {
 }
 
 write_manifest() {
-  local rig_file=high_rigged.glb rig_label="HIGH · rigged production" rig_note="300k target faces · 2048 atlas · direct volume texture"
-  if [[ "$MODEL" == miku ]]; then
-    rig_file=medium_rigged.glb
-    rig_label="Hymotion-ready · MEDIUM rig"
-    rig_note="150k target faces · 1024 atlas; Miku high-density conditioning is rejected when it branch-fans"
-  fi
+  local rig_label="Hymotion-ready · ${SELECTED_RIG:-unvalidated} rig"
+  local rig_note="selected by maxfan ≤ 6, rig_score ≥ 0.50, and a Mixamo Hips root; source candidate retained for audit"
   cat >"$OUT_DIR/stages.json" <<JSON
 {"subject":"$MODEL · locked image-to-rig runbook","input":"input.png","stages":[
- {"file":"$rig_file","label":"$rig_label","note":"$rig_note"},
+ {"file":"hymotion_rigged.glb","label":"$rig_label","note":"$rig_note"},
  {"file":"high_textured.glb","label":"HIGH · textured","note":"300k target faces · 2048 atlas"},
  {"file":"medium_textured.glb","label":"MEDIUM · textured","note":"150k target faces · 1024 atlas"},
  {"file":"low_textured.glb","label":"LOW · textured","note":"50k target faces · 1024 atlas; QEM only, no quad retopo"},
@@ -118,16 +139,16 @@ ensure_cache
 if [[ "$LEVEL" == all || "$LEVEL" == high ]]; then
   run_level high 300000 2048 0
   run_texture_variants
-  # The 300k Miku rig produces a reproducible J≈177/maxfan≈166 branch fan.
-  # Keep the clean high mesh, but condition its skeleton at the validated 150k rung.
-  [[ "$MODEL" == miku ]] || run_level high 300000 2048 1
+  try_rig high 300000 2048 || true
 fi
 if [[ "$LEVEL" == all || "$LEVEL" == medium ]]; then
   run_level medium 150000 1024 0
-  if [[ "$MODEL" == miku || "$RIG_ALL" == 1 ]]; then run_level medium 150000 1024 1; fi
+  [[ -n "$SELECTED_RIG" ]] || try_rig medium 150000 1024 || true
 fi
 if [[ "$LEVEL" == all || "$LEVEL" == low ]]; then
-  run_level low 50000 1024 "$RIG_ALL"
+  run_level low 50000 1024 0
+  [[ -n "$SELECTED_RIG" ]] || try_rig low 50000 1024 || true
 fi
+[[ -n "$SELECTED_RIG" ]] || { echo "FAIL: no rig candidate passed the quality gate" >&2; exit 1; }
 write_manifest
 echo "== DONE: $OUT_DIR =="
