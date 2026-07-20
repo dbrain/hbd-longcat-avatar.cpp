@@ -10,9 +10,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
+#include <algorithm>
 #include <vector>
 
 int main(int argc, char** argv) {
+    if (argc == 3 && !std::strcmp(argv[1], "--inspect-input")) {
+        int W, H, C;
+        unsigned char* d = stbi_load(argv[2], &W, &H, &C, 4);
+        if (!d) { std::fprintf(stderr, "make_matte: load failed %s (%s)\n", argv[2], stbi_failure_reason()); return 1; }
+        bool transparent = false, visible = false;
+        for (int i=0; i<W*H; i++) {
+            const unsigned char a=d[(size_t)i*4+3];
+            transparent = transparent || a < 255;
+            visible = visible || a > 8;
+        }
+        int border=0, black=0;
+        for (int y=0; y<H; y++) for (int x=0; x<W; x++) if (x==0 || y==0 || x==W-1 || y==H-1) {
+            border++;
+            const unsigned char* p=&d[(size_t)(y*W+x)*4];
+            if (std::max({p[0],p[1],p[2]}) <= 8) black++;
+        }
+        const char* kind = (transparent && visible) ? "rgba-cutout" : (border && black*100 >= border*95 ? "black-matte" : "opaque");
+        std::printf("input_kind=%s\n", kind);
+        std::printf("source_channels=%d\n", C);
+        std::printf("black_border_percent=%d\n", border ? black*100/border : 0);
+        stbi_image_free(d);
+        return 0;
+    }
     if (argc < 3) { printf("usage: make_matte <src.png> <out_matte.png> [margin=0.05] [alpha_thresh=8]\n"); return 1; }
     const char* src = argv[1];
     const char* out = argv[2];
