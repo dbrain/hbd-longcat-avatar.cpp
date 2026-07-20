@@ -222,6 +222,9 @@ int main(int argc, char** argv) {
         std::vector<float> feats6((size_t)voxels.N*6);
         for (int i=0;i<voxels.N;i++) for (int c=0;c<3;c++) {
             coords[(size_t)i*4+c+1]=voxels.coords[(size_t)i*3+c];
+            // FlexiDualGridVaeEncoder applies this centring itself before its sparse backbone.
+            // This C++ port feeds that backbone directly, so preserve the upstream centred contract
+            // here rather than passing the raw [0,1] o_voxel values a second time.
             feats6[(size_t)i*6+c]=voxels.dual[(size_t)i*3+c]-.5f;
             feats6[(size_t)i*6+c+3]=(float)voxels.intersected[(size_t)i*3+c]-.5f;
         }
