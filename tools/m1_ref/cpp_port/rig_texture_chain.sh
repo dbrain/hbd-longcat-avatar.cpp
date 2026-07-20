@@ -68,6 +68,6 @@ echo "== [2/2] combine textured mesh + rig -> textured+skinned GLB =="
     --sampled "$RIG_IN/vertices.npy" \
     --skin    "$DUMP/gen_skin_pred.npy" \
     --joints  "$DUMP/gen_joints.npy" \
-    --parents "$DUMP/gen_parents.npy"
+    --parents "$DUMP/gen_parents.npy" 2>&1 | tee -a "$LOG"
 
 echo "== DONE -> $OUT =="

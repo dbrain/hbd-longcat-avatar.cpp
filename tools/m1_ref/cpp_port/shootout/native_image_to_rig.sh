@@ -126,7 +126,38 @@ SELECTED_RIG=""
 for level in high medium low; do
   try_rig "$level" && break || echo "== $LABEL: rejected native $level rig; trying next LOD ==" >&2
 done
-[[ -n "$SELECTED_RIG" ]] || { echo "FAIL: no native rig candidate passed quality gate" >&2; exit 1; }
+
+# Texture delivery is independent of learned-skeleton acceptance.  Preserve a
+# small, authoritative manifest even when the structural gate correctly
+# refuses every candidate: the eye-test page can still compare the successful
+# high/medium/low materials, and a rerun has an unambiguous reason for not
+# publishing a Hymotion asset.
+if [[ -z "$SELECTED_RIG" ]]; then
+  cat >"$OUT/run-status.txt" <<EOF
+texture_lods=succeeded
+rig_state=rejected
+rig_gate=maxfan <= 7; rig_score >= 0.50; named Mixamo core; bone-naming falsifier
+rig_logs=rig_candidate_native_{high,medium,low}.rig.log
+published_hymotion_rig=none
+EOF
+  cat >"$OUT/stages.json" <<JSON
+{"subject":"$LABEL · native textured run (rig rejected)","input":"input.png","stages":[
+ {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas · ${NATIVE_UNWRAP} unwrap · authoritative native material"},
+ {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas · CPU rebake of the high native material"},
+ {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas · CPU rebake of the high native material"}
+]}
+JSON
+  echo "FAIL: texture LODs succeeded, but no native rig candidate passed the structural gate; see $OUT/run-status.txt" >&2
+  exit 1
+fi
+
+cat >"$OUT/run-status.txt" <<EOF
+texture_lods=succeeded
+rig_state=succeeded
+selected_rig=$SELECTED_RIG
+rig_gate=maxfan <= 7; rig_score >= 0.50; named Mixamo core; bone-naming falsifier
+published_hymotion_rig=hymotion_rigged.glb
+EOF
 
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
