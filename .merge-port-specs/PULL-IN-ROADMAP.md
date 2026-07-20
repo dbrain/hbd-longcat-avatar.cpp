@@ -22,10 +22,16 @@ Full evidence: `.merge-port-specs/audit-core-io.md`, `audit-diffusion.md`, `audi
 - Batch 2 RefImageParams resize + lingbot bugfix — DONE, commit c58a01d.
 - Batch 3a AnimateDiff (graph eaf8f3d + glue 2b9d689) — DONE, builds. GPU-PENDING: frame-expansion no-op check.
 - Batch 3b sefi_image — DONE, commit de2dd4a, builds. GPU-PENDING: dual-schedule render + ref-image path.
+- Batch (qwen_image_layered A+B+C) — DONE, builds. Wired A model-plumbing (§1-4 enum/fold/str/detection),
+  B addition_t_cond (§5 gated additive, default OFF), C wan_vae is_2D (§7 Conv2dBut3d + fully is_2D-gated
+  Residual/Encoder/Decoder/WanVAE/Runner), conditioner vision gate (§9). Fixed QwenImageRunner uninitialised
+  `version` member. §6 rope = NO edit (single-4D-forward design → layer temporal id 0). GPU-PENDING: no
+  layered checkpoint on-box → Conv2dBut3d axis-swap orientation, decoder.conv1.weight ne[2]>3 detection,
+  input_channels=4 all UNVERIFIED. Non-disturbance: every non-layered path byte-identical (is_2D=false).
 - REMAINING (apply-docs / roadmap ready; wire like the above, one build+commit each):
-  - qwen_image_layered — apply-doc `.merge-port-specs/qwen_image_layered-APPLY.md` (VAE-2D gated additive =
-    safe; wire A model-plumbing + B addition_t_cond + C wan_vae is_2D; ALSO fix QwenImageRunner's
-    uninitialized `version` member. Full layered RGBA orchestration = deferred sub-milestone.)
+  - qwen_image_layered ORCHESTRATION (§8, deferred sub-milestone) — get_image_channels(), qwen_image_layers
+    request field, 5-D/looped init-latent + per-layer RGBA decode, fork-wide 3→4 channel output audit. No fork
+    anchor (video-first divergence) + no checkpoint. Land as its own milestone.
   - ADetailer — needs a prep agent (detailer.{cpp,h} onto fork runner + orphaned yolov8.h as GGMLRunner;
     inpaint pass reuses sd_ctx img2img; CLI ad_* params). Roadmap Batch 4.
   - PuLID — needs a prep agent (FluxDiffusionExtra pulid_id + flux.hpp block injection + before_diffusion
