@@ -15,7 +15,7 @@ COMMON="-O2 -std=c++17 -Wall -Wno-unused-variable"
 
 # geometry_e2e / pixal3d are the FULL chain: ggml-cuda graphs (DINOv3/NAF/DiT/VAE) + the spike
 # CUDA conv (M3a/M4). Links both ggml-cuda and sparse_subm_conv.o; defines M1_USE_CUDA + M3A_USE_CUDA.
-if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "image_to_rig" ]; } && [ "$MODE" = "cuda" ]; then
+if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "image_to_rig" ] || [ "$BASE" = "texture_mesh_native" ]; } && [ "$MODE" = "cuda" ]; then
   TOOL="${PIXAL3D_CUDA_ROOT:-/mnt/hdd/3d/avatar-shootout/toolchain-cuda13.3}"
   # Host compiler for nvcc. NOT the system gcc: nvcc 13.3 hard-errors above gcc 15 and this box
   # ships gcc 16. gcc15 is the stock Arch package (side-by-side, does not touch the default).
@@ -43,8 +43,16 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "ima
   # basisu static lib on demand and link it + the meshopt codec TUs; define PIXAL3D_PACK to compile in
   # the glb_packed.hpp path. basisu KTX2 defines are needed for the pixal3d TU that includes ktx2_encode.hpp.
   BU="$HERE/../../../thirdparty/basis_universal"
-  "$HERE/build_basisu.sh"
-  PACK_DEFS="-DPIXAL3D_PACK -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
+  # The texture-only native parity command writes ordinary PNG-in-GLB assets and does not use the
+  # optional KTX2 packer.  Avoid rebuilding Basis Universal here: its inherited nproc-wide build can
+  # exhaust this shared host while the 3060 run lane is otherwise idle.
+  PACK_DEFS=""
+  BASISU_LIB=""
+  if [ "$BASE" != "texture_mesh_native" ]; then
+    "$HERE/build_basisu.sh"
+    PACK_DEFS="-DPIXAL3D_PACK -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
+    BASISU_LIB="$BU/build/libbasisu_enc.a"
+  fi
   # image_to_rig --part-retopo: GPU P3-SAM seg/iou heads (cuBLAS). Compile the kernels + define
   # P3SAM_USE_CUDA so p3sam_postprocess.hpp routes the heads through the GPU (else they run ~30min CPU).
   P3SAM_OBJ=""; P3SAM_DEF=""
@@ -57,7 +65,7 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "ima
     "$HERE/$SRC" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
     "$TP/meshoptimizer/vertexcodec.cpp" "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
     "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" $CUMESH_OBJS $P3SAM_OBJ \
-    "$BU/build/libbasisu_enc.a" -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
+    $BASISU_LIB -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
     -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
   exit 0
