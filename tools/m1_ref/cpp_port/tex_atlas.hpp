@@ -946,7 +946,12 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         // planar UV islands. Fast, but folds on curved sheets; keep only for A/B with ATL_PLANAR=1.
         std::vector<float> uv; std::vector<int> uv2orig; std::vector<uint32_t> uvfaces, facemat; int ncl=0;
         double tp=_now();
-        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_planar ? 25.f : cone_deg);
+        // 40° remains safely planar (every face retains at least cos(40°) = 0.766 of its
+        // projected area) but avoids exploding a 300k-face, non-manifold LOD into hundreds of
+        // thousands of tiny islands.  The earlier 25° automatic guard was robust but made
+        // xatlas packing pathological on dense hair/clothing meshes such as Miku.  A caller can
+        // still request a tighter or wider explicit A/B cone with ATL_CONE.
+        float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_planar ? 40.f : cone_deg);
         if (verbose && auto_planar) printf("[atlas] auto planar islands: cone %.0f° (set ATL_AUTO_CONFORMAL=1 for hero conformal charts)\n", cdeg);
         precluster_charts(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f), uv, uv2orig, uvfaces, facemat, ncl);
         if (verbose){ printf("[atlas] precluster: %d charts (cone %.0f°, %.2fs), %zu uv-verts\n",
