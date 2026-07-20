@@ -73,7 +73,17 @@ int main(int argc,char**argv) {
         // rasterizer and PBR sampling: this is an isolated, CPU-only unwrap/bake A/B.
         const bool reference_unwrap = unwrap=="reference";
         if (reference_unwrap) {
+            // CPU rebakes must keep the high native reference bake's coverage, seam, and
+            // normal behaviour so high/medium/low differ only by their intended LOD budget.
+            // An explicit environment A/B setting still wins.
+            auto bake_default=[](const char* key, const char* value) { setenv(key, value, 0); };
             setenv("ATL_PYREF_XATLAS", "1", 1);
+            bake_default("TEX_RASTER_SS", "2");
+            bake_default("TEX_TOPO_NORMALS", "1");
+            bake_default("TEX_TELEA_INPAINT", "1");
+            bake_default("TEX_TELEA_RADIUS", "4");
+            bake_default("TEX_INPAINT_ITERS", "16");
+            bake_default("TEX_FILL_BACKGROUND", "1");
             std::printf("[native-rebake] reference unwrap: direct mesh xatlas, Pixal3D chart settings\\n");
         }
         texatlas::BakedTexture baked=texatlas::bake(mesh.verts,mesh.faces,pbr,coords,resolution,texsize,decimate,
