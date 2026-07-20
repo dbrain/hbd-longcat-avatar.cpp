@@ -420,10 +420,10 @@ int main(int argc, char** argv) {
         in.img1024_raw = imgio::load_chw(image, 1024);
     } catch (const std::exception& e) { printf("image load failed: %s\n", e.what()); return 1; }
     in.cam = cam; in.dist = dist; in.ms = ms; in.use_cuda = use_cuda; in.verbose = true;
-    // The clean-image entrypoint needs the refined mesh, not the historical Pixal texture volume.
-    // Keeping this false avoids loading/running a second generative texture model before the native
-    // production texture pass, and makes a new geometry cache independent of legacy texture weights.
-    in.textured = !geometry_only; in.watertight = true; in.remesh = false;
+    // Keep the established M4 mesh-decode layout (including its auxiliary subdivision output) exactly
+    // as the textured path. Geometry-only suppresses M6 by passing no texture output buffers below;
+    // flipping this flag changes M4's CUDA path and is not a harmless performance optimisation.
+    in.textured = true; in.watertight = true; in.remesh = false;
     in.mc_remesh = clean; in.mc_stride = mc_stride; in.mc_blur = mc_blur; in.mc_post_smooth = mc_smooth;
     in.norm_mean = load_norm(model, "shape_slat", "mean");
     in.norm_std  = load_norm(model, "shape_slat", "std");
