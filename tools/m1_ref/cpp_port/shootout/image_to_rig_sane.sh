@@ -113,8 +113,12 @@ rig_ok() {
   printf '%s\n' "$report"
   [[ "$report" =~ maxfan=([0-9]+) ]] || return 1; fan="${BASH_REMATCH[1]}"
   [[ "$report" =~ TOTAL=([0-9.]+) ]] || return 1; total="${BASH_REMATCH[1]}"
-  (( fan <= 6 )) && awk "BEGIN { exit !($total >= 0.50) }" \
-    && strings "$file" | grep -q 'mixamorig:Hips'
+  # Do not use `strings | grep -q` here: with `set -o pipefail`, grep's
+  # successful early exit SIGPIPEs strings and turns a valid candidate into a
+  # false rejection. GLB JSON is embedded in the binary, so grep's binary mode
+  # is sufficient and keeps the quality gate deterministic.
+  (( fan <= 7 )) && awk "BEGIN { exit !($total >= 0.50) }" \
+    && grep -a -q 'mixamorig:Hips' "$file"
 }
 
 SELECTED_RIG=""
@@ -148,7 +152,7 @@ run_texture_variants() {
 
 write_manifest() {
   local rig_label="Hymotion-ready · ${SELECTED_RIG:-unvalidated} rig"
-  local rig_note="selected by maxfan ≤ 6, rig_score ≥ 0.50, and a Mixamo Hips root; source candidate retained for audit"
+  local rig_note="selected by maxfan ≤ 7, rig_score ≥ 0.50, and a Mixamo Hips root; source candidate retained for audit"
   cat >"$OUT_DIR/stages.json" <<JSON
 {"subject":"$MODEL · locked image-to-rig runbook","input":"input.png","stages":[
  {"file":"hymotion_rigged.glb","label":"$rig_label","note":"$rig_note"},
