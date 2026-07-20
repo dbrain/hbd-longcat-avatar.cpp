@@ -1351,6 +1351,54 @@ bool ModelLoader::load_tensors(std::map<std::string, ggml_tensor*>& tensors,
     return true;
 }
 
+bool ModelLoader::load_tensor(const TensorStorage& tensor_storage, ggml_tensor* dst_tensor) {
+    if (dst_tensor == nullptr || dst_tensor->data == nullptr) {
+        LOG_ERROR("load tensor failed: null destination for '%s'", tensor_storage.name.c_str());
+        return false;
+    }
+
+    bool loaded           = false;
+    auto on_new_tensor_cb = [&](const TensorStorage& current_tensor_storage, ggml_tensor** out_tensor) -> bool {
+        *out_tensor = nullptr;
+        if (current_tensor_storage.name != tensor_storage.name) {
+            return true;  // skip: fork loop continues without reading
+        }
+        if (current_tensor_storage.file_index != tensor_storage.file_index ||
+            current_tensor_storage.offset != tensor_storage.offset ||
+            current_tensor_storage.index_in_zip != tensor_storage.index_in_zip) {
+            LOG_ERROR("load tensor failed: storage mismatch for '%s'", tensor_storage.name.c_str());
+            return false;
+        }
+        if (current_tensor_storage.n_dims != tensor_storage.n_dims ||
+            current_tensor_storage.nelements() != tensor_storage.nelements()) {
+            LOG_ERROR("load tensor failed: metadata changed for '%s'", tensor_storage.name.c_str());
+            return false;
+        }
+        for (int i = 0; i < current_tensor_storage.n_dims; i++) {
+            if (current_tensor_storage.ne[i] != dst_tensor->ne[i]) {
+                LOG_ERROR("load tensor failed: shape mismatch for '%s'", tensor_storage.name.c_str());
+                return false;
+            }
+        }
+        *out_tensor = dst_tensor;
+        loaded      = true;
+        return true;
+    };
+
+    // n_threads=1: this runs *inside* the streaming worker pool (convert.cpp). Forcing a
+    // single inner thread avoids nested thread-pool explosion (N workers each spinning up
+    // N loader threads). use_mmap=false: streaming pre-disables mmap.
+    if (!load_tensors(on_new_tensor_cb, /*n_threads=*/1, /*use_mmap=*/false)) {
+        LOG_ERROR("load tensor failed: '%s'", tensor_storage.name.c_str());
+        return false;
+    }
+    if (!loaded) {
+        LOG_ERROR("load tensor failed: tensor '%s' not found", tensor_storage.name.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) {
     const std::string& name = tensor_storage.name;
     if (type != GGML_TYPE_COUNT) {

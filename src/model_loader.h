@@ -71,6 +71,11 @@ public:
                       int n_threads                        = 0,
                       bool use_mmap                        = false);
 
+    // Selectively load a single tensor (by storage identity) into an already-
+    // allocated dst tensor, converting to dst->type via the shared convert_tensor
+    // path (so the active g_convert_imatrix applies). Used by streaming convert.
+    bool load_tensor(const TensorStorage& tensor_storage, ggml_tensor* dst_tensor);
+
     std::vector<std::string> get_tensor_names() const {
         std::vector<std::string> names;
         for (const auto& [name, tensor_storage] : tensor_storage_map) {

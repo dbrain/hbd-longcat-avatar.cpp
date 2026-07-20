@@ -46,7 +46,13 @@ Full evidence: `.merge-port-specs/audit-core-io.md`, `audit-diffusion.md`, `audi
     --pulid-id-embedding/--pulid-id-weight; fixed the positional sd_ctx_params_t init the new field shifted).
     GPU-PENDING: no PuLID checkpoint / id-gguf on-box → CA names, id shape [2048,32], VRAM of ~20 CA blocks
     UNVERIFIED. VERIFY non-PuLID flux stays bit-exact (pulid_enabled=false ⇒ no blocks/injection).
-  - streaming/bounded-mem convert — Batch 6 (TensorWritePlan into tensor_storage.h + re-weave nvfp4 imatrix).
+  - streaming/bounded-mem convert (Batch 6) — DONE, builds. apply-doc streaming-convert-APPLY.md. Added
+    TensorWritePlan (un-orphaned streaming_writer.h) + ModelLoader::load_tensor (singular selective, n_threads=1) +
+    GGUF/Safetensors StreamingWriter + convert.cpp streaming path (collect/load/stream per-tensor under 1GB budget)
+    + public convert_with_components. OLD convert() UNTOUCHED (default byte-identical). imatrix re-weave = free
+    (global g_convert_imatrix applies via load_tensor→convert_tensor). CLI --streaming flag NOT wired (koblem drives).
+    GPU/convert-PENDING: no large model run → RSS bounding, quant round-trip, imatrix effect are Stage-4 CPU-convert
+    validation. Streaming output NOT byte-identical to old writer (tensor order/header) — validate by round-trip.
   - Batch 7 remaining adopts + niche + CLI + docs-wholesale.
 - HOLD (GPU/checkpoint-verify, do NOT blind-adopt): qwen3-vl vision split_patch_embed bias; qwen rope txt_id_start.
 
