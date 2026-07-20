@@ -230,6 +230,7 @@ typedef struct {
     bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
     const char* backend;
     const char* params_backend;
+    const char* motion_module_path;  // AnimateDiff SD1.5 motion module (optional; "" = none)
 } sd_ctx_params_t;
 
 typedef struct {

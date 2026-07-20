@@ -393,6 +393,10 @@ ArgOptions SDContextParams::get_options() {
          "path to control net model",
          &control_net_path},
         {"",
+         "--motion-module",
+         "path to an AnimateDiff SD1.5 motion module (enables --video-frames on SD1.5)",
+         &motion_module_path},
+        {"",
          "--embd-dir",
          "embeddings directory",
          &embedding_dir},
@@ -818,6 +822,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool vae_decode_only, bool f
         stream_layers,
         backend.c_str(),
         params_backend.c_str(),
+        motion_module_path.c_str(),
     };
     return sd_ctx_params;
 }

@@ -131,6 +131,7 @@ struct SDContextParams {
     std::string taesd_path;
     std::string esrgan_path;
     std::string control_net_path;
+    std::string motion_module_path;
     std::string embedding_dir;
     std::string photo_maker_path;
     sd_type_t wtype = SD_TYPE_COUNT;
