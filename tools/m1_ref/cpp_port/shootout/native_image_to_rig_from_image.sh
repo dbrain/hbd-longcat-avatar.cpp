@@ -36,6 +36,9 @@ for bin in image_to_rig mesh_topo make_matte; do
   [[ -x "$CP/$bin" ]] || { echo "missing executable: $bin (build it first)" >&2; exit 2; }
 done
 [[ -x "$CP/shootout/native_image_to_rig.sh" ]] || { echo "missing native image-to-rig driver" >&2; exit 2; }
+# Detached production runs write their C++ progress to a file.  Force line buffering so stage logs say
+# what the 3060 is actually doing instead of appearing frozen until libc's file buffer fills.
+IMAGE_TO_RIG_CMD=(stdbuf -oL -eL "$CP/image_to_rig")
 
 # A cache name tied to file content prevents a stale Miku/Soldier-style cache from silently being
 # reused for a different source image. The model-facing matte is recorded separately, so the eye
@@ -146,11 +149,11 @@ if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || "$cache_
     exec 9>"$LOCK"
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
     if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
-      "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
         --no-quad --us-latents 16384 --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
         --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
     else
-      "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
         --no-quad --us-latents 16384 --geometry-only --stage-dir "$CACHE" \
         --out "$CACHE/geometry_only_unused.glb"
     fi
@@ -216,7 +219,7 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
     echo "== $LABEL: native rig rejected; try explicit legacy-rig fallback $level =="
     if (
       exec 9>"$LOCK"; flock -n 9 || exit 75
-      "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
         --from-refined "$CACHE" --stage-dir "$OUT" --decimate "$faces" --texsize "$tex" \
         --bone-facing +z --out "$candidate"
     ) && legacy_rig_ok "$candidate"; then
@@ -348,7 +351,7 @@ if [[ "$PROJECT" != 0 ]]; then
   (
     exec 9>"$LOCK"
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
-    "$CP/image_to_rig" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+    "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
       --from-refined "$CACHE" --stage-dir "$OUT" --decimate 300000 --texsize 2048 --no-rig \
       --tex-project-overlay "${PROJ_ARGS[@]}" --out "$OUT/high_hybrid_projected.glb"
   )
