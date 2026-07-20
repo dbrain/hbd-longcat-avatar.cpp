@@ -1786,7 +1786,7 @@ struct LLMEmbedder : public Conditioner {
             arch = LLM::LLMArch::GPT_OSS_20B;
         } else if (sd_version_is_pid(version)) {
             arch = LLM::LLMArch::GEMMA2_2B;
-        } else if (sd_version_is_ideogram4(version) || sd_version_is_krea2(version) || sd_version_is_boogu_image(version) || sd_version_is_lingbot_video(version)) {
+        } else if (sd_version_is_ideogram4(version) || sd_version_is_krea2(version) || sd_version_is_boogu_image(version) || sd_version_is_lingbot_video(version) || sd_version_is_sefi_image(version)) {
             arch = LLM::LLMArch::QWEN3_VL;
         } else if (sd_version_is_z_image(version) || version == VERSION_OVIS_IMAGE || version == VERSION_FLUX2_KLEIN) {
             arch = LLM::LLMArch::QWEN3;
@@ -2151,6 +2151,18 @@ struct LLMEmbedder : public Conditioner {
             prompt_attn_range.second = static_cast<int>(prompt.size());
 
             prompt += "[/INST]";
+        } else if (sd_version_is_sefi_image(version)) {
+            prompt_template_encode_start_idx = 0;
+            min_length                       = 1024;
+            out_layers                       = {9, 18, 27};
+
+            prompt = "<|im_start|>user\n";
+
+            prompt_attn_range.first = static_cast<int>(prompt.size());
+            prompt += conditioner_params.text;
+            prompt_attn_range.second = static_cast<int>(prompt.size());
+
+            prompt += "<|im_end|>\n<|im_start|>assistant\n";
         } else if (sd_version_is_ideogram4(version)) {
             prompt_template_encode_start_idx = 0;
             out_layers                       = {1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34, 36};

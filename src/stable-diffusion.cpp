@@ -112,6 +112,7 @@ const char* model_version_to_str[] = {
     "MiniT2I",
     "HunyuanVideo 1.5",
     "LingBot Video",
+    "SEFI Image",
 };
 
 const char* sampling_methods_str[] = {
@@ -826,7 +827,7 @@ public:
                                                                      "model.diffusion_model",
                                                                      version,
                                                                      sd_ctx_params->chroma_use_dit_mask);
-            } else if (sd_version_is_flux2(version)) {
+            } else if (sd_version_is_flux2(version) || sd_version_is_sefi_image(version)) {
                 bool is_chroma   = false;
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  params_backend_for(SDBackendModule::TE),
@@ -1724,6 +1725,8 @@ public:
                     }
                 } else if (sd_version_is_flux2(version)) {
                     pred_type = FLUX2_FLOW_PRED;
+                } else if (sd_version_is_sefi_image(version)) {
+                    pred_type = SEFI_FLOW_PRED;
                 } else if (sd_version_is_minit2i(version)) {
                     pred_type = MINIT2I_FLOW_PRED;
                 } else {
@@ -1761,6 +1764,11 @@ public:
                 case FLUX2_FLOW_PRED: {
                     LOG_INFO("running in Flux2 FLOW mode");
                     denoiser = std::make_shared<Flux2FlowDenoiser>();
+                    break;
+                }
+                case SEFI_FLOW_PRED: {
+                    LOG_INFO("running in SEFI FLOW mode");
+                    denoiser = std::make_shared<SefiFlowDenoiser>();
                     break;
                 }
                 case MINIT2I_FLOW_PRED: {
@@ -2472,7 +2480,16 @@ public:
 
     std::vector<float> process_timesteps(const std::vector<float>& timesteps,
                                          const sd::Tensor<float>& init_latent,
-                                         const sd::Tensor<float>& denoise_mask) {
+                                         const sd::Tensor<float>& denoise_mask,
+                                         int step = 0) {
+        if (auto sefi_denoiser = std::dynamic_pointer_cast<SefiFlowDenoiser>(denoiser)) {
+            int sched_idx = step > 0 ? step - 1 : 0;
+            if (sched_idx >= static_cast<int>(sefi_denoiser->tex_timesteps.size())) {
+                sched_idx = static_cast<int>(sefi_denoiser->tex_timesteps.size()) - 1;
+            }
+            return {sefi_denoiser->sem_timesteps[sched_idx],
+                    sefi_denoiser->tex_timesteps[sched_idx]};
+        }
         if (diffusion_model->get_desc() == "Wan2.2-TI2V-5B" || sd_version_is_longcat_avatar(version) ||
             (version == VERSION_WAN2_2_I2V && !denoise_mask.empty())) {
             // Per-frame timesteps. The avatar sets EVERY fixed-cond latent frame's
@@ -3087,7 +3104,7 @@ public:
                                              ? sd::Tensor<float>({1, static_cast<int64_t>(audio_ts.size())}, audio_ts)
                                              : sd::Tensor<float>({1}, audio_ts);
             } else {
-                timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask);
+                timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask, step);
             }
             const std::vector<float>& scaling_timesteps_vec = (sd_version_is_ltxav(version) && !denoise_mask.empty())
                                                                   ? base_timesteps_vec
@@ -3178,7 +3195,7 @@ public:
                     diffusion_params.extra = UNetDiffusionExtra{nvf, &controls, control_strength};
                 } else if (sd_version_is_sd3(version)) {
                     diffusion_params.extra = SkipLayerDiffusionExtra{local_skip_layers};
-                } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version)) {
+                } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
                     diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
                                                                 local_skip_layers};
                 } else if (sd_version_is_anima(version)) {
@@ -3570,7 +3587,7 @@ public:
             return output;
         };
 
-        auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args);
+        auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args, denoiser);
         if (x0_opt.empty()) {
             LOG_ERROR("Diffusion model sampling failed");
             if (control_net) {
@@ -3643,6 +3660,8 @@ public:
                 latent_channel = 3;
             } else if (sd_version_is_minit2i(version)) {
                 latent_channel = 3;
+            } else if (sd_version_is_sefi_image(version)) {
+                latent_channel = 144;
             } else if (sd_version_uses_flux2_vae(version)) {
                 latent_channel = 128;
             } else {
@@ -4073,6 +4092,7 @@ const char* prediction_to_str[] = {
     "flux_flow",
     "flux2_flow",
     "minit2i_flow",
+    "sefi_flow",
 };
 
 const char* sd_prediction_name(enum prediction_t prediction) {
