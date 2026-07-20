@@ -6306,117 +6306,6 @@ static bool ltxav_pin_refine_overlap(sd::Tensor<float>* latent,
     return true;
 }
 
-// LTXAV_REFINE_SEAM_RAMP (value-gated, default off = byte-identical).
-//
-// The DETERMINISM-INDEPENDENT alternative to the pin. The pin FREEZES the overlap to seg0's
-// transported refined tail — which needs the two segments' forwards to AGREE over that region, and
-// under our single-forward nondeterminism (fork-local CUDA fusions + GGML_FP8_FFN) they cannot; it
-// also smears moving content (freezing a walking figure). Instead, softly BIND this segment's
-// leading frames toward its OWN clean upscaled base (init_latent, which IS continuous across the
-// cut — the base holds) with a per-frame weight that FADES OUT over the first `ramp_len` frames.
-// The join then MORPHS gradually instead of hard-switching to an "alternate dimension"; the segment
-// interior keeps the full sigma0=0.85 detail. No x_t overwrite, no seg0 tail, no cross-forward
-// matching -> nondeterminism cannot touch it, and because it binds toward the CONTINUOUS BASE (not a
-// frozen past) the seam frames still re-diffuse -> no freeze-smear.
-//
-// Mechanics: the refine's init_latent IS the clean upscaled base (sample() forms the working latent
-// as x = noise_scaling(sigma0, noise, init_latent), :2832), so the standard masked restore
-// noised_input = x*mask + init_latent*(1-mask) (:2998) pulls a frame toward the continuous base by
-// (1-mask), and its per-token timestep = mask*t0 (:2959) so a partially-bound frame also denoises at
-// a reduced sigma. We set, for frame f in [0, ramp_len):
-//     mask(f) = 1 - w0 * (1 - f/ramp_len)     (mask(0)=1-w0 strongest bind; mask(ramp_len)->1 free)
-// w0 = LTXAV_REFINE_SEAM_RAMP in (0,1]; ramp_len = LTXAV_REFINE_SEAM_RAMP_FRAMES (default 6). The
-// 1-channel video mask broadcasts over the packed audio channels too, so the seam frames' audio is
-// bound toward the (continuous) base audio by the same weight — benign and consistent with the pin.
-static float ltxav_refine_seam_ramp_weight() {
-    if (const char* e = std::getenv("LTXAV_REFINE_SEAM_RAMP"); e != nullptr && e[0] != '\0') {
-        return std::clamp(static_cast<float>(atof(e)), 0.f, 1.f);
-    }
-    return 0.f;
-}
-static int ltxav_refine_seam_ramp_frames() {
-    if (const char* e = std::getenv("LTXAV_REFINE_SEAM_RAMP_FRAMES"); e != nullptr && e[0] != '\0') {
-        return std::max(1, atoi(e));
-    }
-    return 6;
-}
-// Fill the refine denoise mask with a fading seam ramp over [0, ramp_len). Creates a video-only mask
-// if empty (the pure-continuation refine path leaves it empty). Returns true only if a ramp was written.
-static bool ltxav_apply_refine_seam_ramp(sd::Tensor<float>* latent,
-                                         sd::Tensor<float>* mask,
-                                         int64_t video_ch,
-                                         int64_t target_frames,
-                                         int64_t overlap_frames,
-                                         float w0,
-                                         int ramp_len,
-                                         const char* stage_label) {
-    if (latent == nullptr || mask == nullptr || latent->empty() || latent->dim() != 5 || video_ch <= 0) {
-        return false;
-    }
-    if (w0 <= 0.f) {
-        return false;
-    }
-    const int64_t W     = latent->shape()[0];
-    const int64_t H     = latent->shape()[1];
-    const int64_t T_all = latent->shape()[2];
-    // video_target_frame_count owns the [target | guide] split — ramp the TARGET's own frames only.
-    const int64_t T_tgt = (target_frames > 0 && target_frames < T_all) ? target_frames : T_all;
-    // FRAME GEOMETRY: the target frames [0,K) re-render the prior segment's tail and are DROPPED at
-    // stitch, so the FIRST VISIBLE frame of this segment is frame K. Peak-bind must therefore PLATEAU
-    // over the (dropped, but attention-seeding) overlap [0,K) and only begin fading at the first visible
-    // frame K, over `ramp_len` frames -> [K, K+ramp_len). Fade starting at 0 would waste the strong bind
-    // on dropped frames and leave the visible join weakly held.
-    const int64_t K  = std::clamp<int64_t>(overlap_frames, 0, T_tgt);
-    const int64_t rl = std::min<int64_t>(ramp_len, std::max<int64_t>(T_tgt - K, 0));
-    if (K + rl <= 0) {
-        return false;
-    }
-    // Mask handling mirrors the pin (:6248-6291): stage 0's plain continuation refine leaves it EMPTY
-    // (create a video-only [W,H,T,1,1] all-ones mask); stage N always has one built already, which may
-    // be PACKED with audio-mask channels (slice the video channels, fill, assign back so the audio mask
-    // is untouched); a video-only existing mask is filled directly. Any unexpected shape -> WARN + skip.
-    const bool mask_created = mask->empty();
-    bool mask_packed = false;
-    sd::Tensor<float> video_mask;
-    if (mask_created) {
-        video_mask = make_ltxav_video_denoise_mask(*latent, 1.f);
-    } else if (mask->dim() != 5 || mask->shape()[0] != W || mask->shape()[1] != H ||
-               mask->shape()[2] != T_all) {
-        LOG_WARN("LTXAV_REFINE_SEAM_RAMP (%s): SKIPPED - unexpected existing denoise mask shape "
-                 "(rank %d, [%lld,%lld,%lld]) - refuse to corrupt",
-                 stage_label, (int)mask->dim(),
-                 (long long)(mask->dim() > 0 ? mask->shape()[0] : 0),
-                 (long long)(mask->dim() > 1 ? mask->shape()[1] : 0),
-                 (long long)(mask->dim() > 2 ? mask->shape()[2] : 0));
-        return false;
-    } else if (mask->shape()[3] > video_ch) {
-        video_mask  = sd::ops::slice(*mask, 3, 0, video_ch);
-        mask_packed = true;
-    } else {
-        video_mask = *mask;
-    }
-    // Plateau at w0 over the dropped overlap [0,K); fade w0 -> 0 over the first visible frames [K,K+rl).
-    for (int64_t f = 0; f < K + rl; ++f) {
-        const float w = (f < K) ? w0
-                                : w0 * (1.f - static_cast<float>(f - K) / static_cast<float>(rl));
-        const float m = 1.f - w;  // 1-w0 (peak bind) -> 1 (free)
-        sd::ops::fill_slice(&video_mask, 2, f, f + 1, m);
-    }
-    if (mask_packed) {
-        sd::ops::slice_assign(mask, 3, 0, video_ch, video_mask);
-    } else {
-        *mask = std::move(video_mask);
-    }
-    LOG_INFO("LTXAV_REFINE_SEAM_RAMP (%s): plateau [0,%lld) + fade [%lld,%lld) of %lld target frames, peak "
-             "w0=%.3f (denoise mask %.3f on overlap & first-visible frame -> 1.0 by f%lld), %s -> soft-bind "
-             "to CONTINUOUS BASE (no freeze, determinism-independent)",
-             stage_label, (long long)K, (long long)K, (long long)(K + rl), (long long)T_tgt, w0, 1.f - w0,
-             (long long)(K + rl),
-             mask_created ? "mask CREATED all-ones" : (mask_packed ? "existing packed (video ch only)"
-                                                                    : "existing video-only"));
-    return true;
-}
-
 // LTXAV CONTINUATION via the ComfyUI LTX-Director keyframe convention: append the prior
 // segment's motion-carrying guide latent as EXTRA tokens at the TAIL of the sequence (NOT
 // overwriting output frames 0..K), give those guide tokens their OWN true-past-timeline RoPE
@@ -12101,25 +11990,6 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                      "stage 0");
         }
 
-        // LTXAV_REFINE_SEAM_RAMP (stage 0): determinism-independent alternative to the pin — soft-bind
-        // this continuation segment's leading frames toward the CONTINUOUS clean base (init_latent)
-        // with a fading per-frame weight so the join MORPHS instead of hard-switching, WITHOUT freezing.
-        // Same pure-continuation gate as the pin, and mutually exclusive with it (both write the mask
-        // over the head frames). cont_src != nullptr marks this as a continuation segment (seg>0) — the
-        // only place a seam exists — though the ramp itself does NOT use the transported tail.
-        if (!ltxav_pin_refine_overlap_enabled() && ltxav_refine_seam_ramp_weight() > 0.f &&
-            sd_version_is_ltxav(sd_ctx->sd->version) && !latents.relip_twostage &&
-            cont_src != nullptr && cont_src_frames > 0 &&
-            sd_vid_gen_params->init_image.data == nullptr &&
-            sd_vid_gen_params->end_image.data == nullptr &&
-            (sd_vid_gen_params->keyframes == nullptr || sd_vid_gen_params->keyframes_size == 0)) {
-            ltxav_apply_refine_seam_ramp(&x_t, &hires_denoise_mask, sd_ctx->sd->get_latent_channel(),
-                                         latents.video_target_frame_count,
-                                         sd_vid_gen_params->cont_latent_frames,
-                                         ltxav_refine_seam_ramp_weight(), ltxav_refine_seam_ramp_frames(),
-                                         "stage 0");
-        }
-
         // LTX_REFINE_CONST_SEED (chain identity-stability): the chain gives each segment a DISTINCT
         // seed (base+seg, sd:10183) for base-motion variety, but the stage-2 refine INHERITS that
         // per-segment RNG -> each segment's refine adds DIFFERENT noise -> re-denoises the face/skin
@@ -13023,24 +12893,6 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                          sd_vid_gen_params->cont_latent_frames,
                                          latents.video_target_frame_count,
                                          stage_label);
-            }
-            // LTXAV_REFINE_SEAM_RAMP (stage N): determinism-independent alternative to the pin (see the
-            // stage-0 site + helper). Binds this continuation stage's leading frames toward its own
-            // continuous base with a fading weight; mutually exclusive with the pin.
-            if (!ltxav_pin_refine_overlap_enabled() && ltxav_refine_seam_ramp_weight() > 0.f &&
-                sd_version_is_ltxav(sd_ctx->sd->version) && !latents.relip_twostage &&
-                sd_vid_gen_params->cont_refine_latent != nullptr &&
-                sd_vid_gen_params->cont_refine_latent_frames > 0 &&
-                sd_vid_gen_params->init_image.data == nullptr &&
-                sd_vid_gen_params->end_image.data == nullptr &&
-                (sd_vid_gen_params->keyframes == nullptr || sd_vid_gen_params->keyframes_size == 0)) {
-                char ramp_label[32];
-                snprintf(ramp_label, sizeof(ramp_label), "stage %d", stage_index);
-                ltxav_apply_refine_seam_ramp(&stage_latent, &mask, latent_channels,
-                                             latents.video_target_frame_count,
-                                             sd_vid_gen_params->cont_latent_frames,
-                                             ltxav_refine_seam_ramp_weight(),
-                                             ltxav_refine_seam_ramp_frames(), ramp_label);
             }
             // LTXAV_SHARED_REFINE_NOISE (see stage 0): the offset is in LATENT FRAMES, which are
             // temporal and therefore resolution-independent — this stage's [W,H] have doubled since
@@ -14374,37 +14226,6 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 cont_Cv = cv;
                 K         = keep;
                 start_seg = resume_k;
-                // Restore the banked refined tail (seg_<i>.refine.bin) so the resumed segment's refine
-                // gets seg0's stage-2 continuation reference. Absent on older jobs -> base-only
-                // continuation (unchanged behaviour). Owner fast-iteration path (2026-07-19).
-                std::string prt = sd_dir + "/seg_" + std::to_string(resume_k - 1) + ".refine.bin";
-                FILE* prt_probe = fopen(prt.c_str(), "rb");
-                if (prt_probe != nullptr) {
-                    fclose(prt_probe);
-                    try {
-                        sd::Tensor<float> rtl = sd::load_tensor_from_file_as_tensor<float>(prt);
-                        const int rlw = (int)rtl.shape()[0], rlh = (int)rtl.shape()[1];
-                        const int rlt = (int)rtl.shape()[2], rlc = (int)rtl.shape()[3];
-                        const int rkeep = std::min(hires_ref_K, rlt);
-                        const size_t rplane = (size_t)rlw * rlh;
-                        cont_refine_buf.assign(rplane * (size_t)rkeep * (size_t)rlc, 0.f);
-                        const float* rs = rtl.data();
-                        for (int c = 0; c < rlc; ++c) {
-                            for (int nf = 0; nf < rkeep; ++nf) {
-                                const int st = rlt - rkeep + nf;
-                                std::memcpy(cont_refine_buf.data() + ((size_t)c * rkeep + nf) * rplane,
-                                            rs + ((size_t)c * rlt + st) * rplane, rplane * sizeof(float));
-                            }
-                        }
-                        cont_refine_Wl = rlw;
-                        cont_refine_Hl = rlh;
-                        cont_refine_Cv = rlc;
-                        LOG_INFO("resume: restored banked refined tail [%d,%d,%d,%d] for seg %d stage-2 reference",
-                                 rlw, rlh, rkeep, rlc, resume_k);
-                    } catch (const std::exception& e) {
-                        LOG_WARN("resume: refined tail reload failed (%s): %s -> base-only continuation", prt.c_str(), e.what());
-                    }
-                }
             } catch (const std::exception& e) {
                 LOG_ERROR("generate_video_chain: resume cont-latent load failed (%s): %s", ptail.c_str(), e.what());
                 prefix_ok = false;
@@ -14535,20 +14356,6 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (chain_params->segment_video_frames != nullptr &&
             chain_params->segment_video_frames[seg] > 0) {
             vp.video_frames = chain_params->segment_video_frames[seg];
-        }
-        // FORWARD LOOK-AHEAD (LTXAV_FWD_LOOKAHEAD=N px): each NON-LAST segment renders N extra frames
-        // beyond its display length. Those N tail frames are DROPPED from THIS segment's display (below)
-        // but their base+refined latents are transported to the next segment as its REAL leading frames
-        // (denoise_mask=0, inherited not re-rendered) so it continues seg0's forward motion with no
-        // overlap re-render, no A/B conflict, no frozen-past smear. 0 = off (byte-identical).
-        int fwd_lookahead = 0;
-        if (const char* e = std::getenv("LTXAV_FWD_LOOKAHEAD"); e != nullptr && e[0] != '\0') {
-            fwd_lookahead = std::max(0, atoi(e));
-        }
-        if (fwd_lookahead > 0 && seg < n_chain - 1) {
-            vp.video_frames += fwd_lookahead;
-            LOG_INFO("generate_video_chain: FWD_LOOKAHEAD seg %d renders +%d frames (%d total) as next-seg hand-off",
-                     seg, fwd_lookahead, vp.video_frames);
         }
         // RETAKE end-pin never leaks onto a non-retake segment: cleared here, set only for retake_seg.
         vp.end_cont_latent        = nullptr;
@@ -14978,47 +14785,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             cont_Cv = cv;
             K = keep;  // K passed to the next segment must equal the frames actually captured
         }
-        // LTXAV_REFINE_REENCODE_REF (owner 2026-07-19): the refined tail shipped to seg1's refine as
-        // its x_t reference is the RAW refined DMD-x0 latent (refined_out). Frozen as conditioning it
-        // decodes off-manifold/blurry (same failure the base's LONGCAT_CONT_REENCODE fixes, comment
-        // above). VAE RE-ENCODE seg0's ACTUAL refined PIXELS (seg_video tail) so the reference sits on
-        // the VAE manifold and decodes clean -> seg1 can reproduce seg0's real refined frames and
-        // continue from them. Value-gated. On failure, falls through to the raw-latent path below.
-        bool refine_ref_reencoded = false;
-        if (chain_hires_reference && want_latent && seg_video != nullptr && seg_count > 0) {
-            const char* rr = std::getenv("LTXAV_REFINE_REENCODE_REF");
-            if (rr != nullptr && rr[0] == '1' && rr[1] == '\0') {
-                const int tail_px = std::min((hires_ref_K - 1) * 8 + 1, seg_count);
-                int ew = 0, eh = 0, et = 0, ec = 0;
-                float* enc = sd_ctx_encode_video_frames(sd_ctx, seg_video + (seg_count - tail_px), tail_px,
-                                                        seg_video[0].width, seg_video[0].height,
-                                                        &ew, &eh, &et, &ec);
-                if (enc != nullptr && et > 0 && ew > 0 && eh > 0) {
-                    const int    keep  = std::min(hires_ref_K, et);
-                    const int    cv    = std::min(LTXAV_VIDEO_LATENT_CHANNELS, ec);
-                    const size_t plane = (size_t)ew * eh;
-                    cont_refine_buf.assign(plane * (size_t)keep * (size_t)cv, 0.f);
-                    for (int c = 0; c < cv; ++c) {
-                        for (int nf = 0; nf < keep; ++nf) {
-                            const int src_t = et - keep + nf;
-                            std::memcpy(cont_refine_buf.data() + ((size_t)c * keep + nf) * plane,
-                                        enc + ((size_t)c * et + src_t) * plane, plane * sizeof(float));
-                        }
-                    }
-                    cont_refine_Wl = ew;
-                    cont_refine_Hl = eh;
-                    cont_refine_Cv = cv;
-                    refine_ref_reencoded = true;
-                    LOG_INFO("LTXAV_REFINE_REENCODE_REF: VAE re-encoded %d refined tail px -> %d latent frame(s) [%d,%d,%d] (clean VAE-manifold stage-2 reference)",
-                             tail_px, keep, ew, eh, cv);
-                }
-                free(enc);
-                if (!refine_ref_reencoded) {
-                    LOG_WARN("LTXAV_REFINE_REENCODE_REF: re-encode failed; falling back to raw refined latent");
-                }
-            }
-        }
-        if (!refine_ref_reencoded && chain_hires_reference && want_latent && refined_out != nullptr && rw > 0 && rh > 0 && rt > 0 && rc == LTXAV_VIDEO_LATENT_CHANNELS) {
+        if (chain_hires_reference && want_latent && refined_out != nullptr && rw > 0 && rh > 0 && rt > 0 && rc == LTXAV_VIDEO_LATENT_CHANNELS) {
             const int keep = std::min(hires_ref_K, rt);
             const size_t plane = (size_t)rw * rh;
             cont_refine_buf.assign(plane * (size_t)keep * (size_t)rc, 0.f);
@@ -15035,32 +14802,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             cont_refine_Cv = rc;
             LOG_INFO("generate_video_chain: captured %d high-res refined VIDEO tail frames [%d,%d,%d] for next stage-2 reference",
                      keep, rw, rh, rc);
-        } else if (!refine_ref_reencoded && chain_hires_reference && want_latent && base_params->hires.enabled) {
+        } else if (chain_hires_reference && want_latent && base_params->hires.enabled) {
             LOG_WARN("generate_video_chain: missing/invalid high-res refined continuation state; stage-2 will use base-only continuation");
             cont_refine_buf.clear();
             cont_refine_Wl = cont_refine_Hl = cont_refine_Cv = 0;
-        }
-        // Bank the refined tail alongside seg_<i>.bin so RESUME/RETAKE (which reloads only the BASE
-        // latent) can restore the stage-2 continuation reference WITHOUT re-rendering seg0's refine.
-        // Enables fast seg1 iteration against a fixed seg0 (owner 2026-07-19). Best-effort.
-        if (chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0' &&
-            !cont_refine_buf.empty() && cont_refine_Wl > 0 && cont_refine_Hl > 0 && cont_refine_Cv > 0) {
-            const int64_t rframes = (int64_t)cont_refine_buf.size() /
-                                    ((int64_t)cont_refine_Wl * cont_refine_Hl * cont_refine_Cv);
-            if (rframes > 0) {
-                sd::Tensor<float> rt({(int64_t)cont_refine_Wl, (int64_t)cont_refine_Hl, rframes,
-                                      (int64_t)cont_refine_Cv, 1});
-                std::memcpy(rt.data(), cont_refine_buf.data(), (size_t)rt.numel() * sizeof(float));
-                try {
-                    sd::save_tensor_to_file<float>(std::string(chain_params->save_dir) + "/seg_" +
-                                                       std::to_string(seg) + ".refine.bin",
-                                                   rt, "ltxav_refine_tail");
-                    LOG_INFO("generate_video_chain: banked refined tail seg_%d.refine.bin [%lld,%lld,%lld,%lld] for resume/retake",
-                             seg, (long long)cont_refine_Wl, (long long)cont_refine_Hl, (long long)rframes, (long long)cont_refine_Cv);
-                } catch (const std::exception& e) {
-                    LOG_WARN("generate_video_chain: failed to bank refined tail for seg %d: %s", seg, e.what());
-                }
-            }
         }
         // Parallel capture of the STAGE-0 (lower-res) refined tail for the next segment's FIRST hires
         // stage. Only exported by generate_video_ex on a >=2-stage chain, so on the single-stage (2x)
@@ -15191,15 +14936,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (const char* e = getenv("LTXAV_SEAM_CROSSFADE"); e != nullptr && seg > 0 && !stitched.empty()) {
             ltxav_seam_crossfade(stitched, seg_video, drop, atoi(e));
         }
-        // FWD_LOOKAHEAD: drop the last `fwd_lookahead` frames from a NON-LAST segment's DISPLAY (they
-        // are this shot's look-ahead into the next, transported below as its leading frames). The
-        // transported tail latent still carries them, so the next segment inherits them as real content.
-        const int tail_drop = (fwd_lookahead > 0 && seg < n_chain - 1)
-                                  ? std::min(fwd_lookahead, seg_count - drop)
-                                  : 0;
         for (int i = 0; i < seg_count; ++i) {
-            if (i < drop || i >= seg_count - tail_drop) {
-                free(seg_video[i].data);  // discard head overlap OR look-ahead tail
+            if (i < drop) {
+                free(seg_video[i].data);  // discard re-rendered overlap frame
             } else {
                 stitched.push_back(seg_video[i]);  // adopt ownership of .data
             }
