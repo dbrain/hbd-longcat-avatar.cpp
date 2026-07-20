@@ -25,13 +25,13 @@ case "$MODEL" in
   miku)
     IMAGE=/mnt/hdd/3d/avatar-shootout/_shootout_out/miku_prod1536_matte.png
     # Never reuse the historic 8192-latent cache: its refined clay has the known torn-face failure.
-    CACHE="$OUT_ROOT/miku/cache_n16384"
+    CACHE="$OUT_ROOT/miku/cache_n16384_seal3"
     ;;
   gilly)
     # Gilly starts as an opaque RGB reference. Its 3060-generated same-frame RGBA cutout is converted
     # once to this black matte; geometry and projection MUST consume this exact frame together.
     IMAGE="$OUT_ROOT/gilly/gilly_matte.png"
-    CACHE="$OUT_ROOT/gilly/cache_matted_n16384"
+    CACHE="$OUT_ROOT/gilly/cache_matted_n16384_seal3"
     ;;
   soldier)
     IMAGE=/mnt/hdd/3d/avatar-shootout/_shootout_out/inline_soldier
@@ -46,6 +46,9 @@ case "$LEVEL" in all|high|medium|low) ;; *) echo "unknown level '$LEVEL'" >&2; e
 # where index 0 is the 3060 and index 1 is the owner's busy 5060 Ti.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
+# The eye-tested seal eliminates the visibly ripply/sliced shell. Keep it explicit
+# in the runbook so a process environment cannot silently restore the legacy leak.
+export REMESH_CLOSE_R=3
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 if [[ "$GPU_NAME" != *"RTX 3060"* ]]; then
   echo "refusing to run: PCI GPU 0 is '$GPU_NAME', not the reserved RTX 3060" >&2
@@ -122,6 +125,10 @@ rig_ok() {
 }
 
 SELECTED_RIG=""
+# Rig compatibility is selected independently from display LOD.  A low-face rig
+# may be the only Hymotion-valid skeleton, but it must not inherit the low
+# 1024px atlas: retain a 2048px source atlas for close-up animated use.
+RIG_TEXSIZE=2048
 try_rig() {
   local name="$1" faces="$2" texsize="$3"
   local candidate="$OUT_DIR/rig_candidate_${name}_rigged.glb"
@@ -173,11 +180,11 @@ if [[ "$LEVEL" == all || "$LEVEL" == high ]]; then
 fi
 if [[ "$LEVEL" == all || "$LEVEL" == medium ]]; then
   run_level medium 150000 1024 0
-  [[ -n "$SELECTED_RIG" ]] || try_rig medium 150000 1024 || true
+  [[ -n "$SELECTED_RIG" ]] || try_rig medium 150000 "$RIG_TEXSIZE" || true
 fi
 if [[ "$LEVEL" == all || "$LEVEL" == low ]]; then
   run_level low 50000 1024 0
-  [[ -n "$SELECTED_RIG" ]] || try_rig low 50000 1024 || true
+  [[ -n "$SELECTED_RIG" ]] || try_rig low 50000 "$RIG_TEXSIZE" || true
 fi
 [[ -n "$SELECTED_RIG" ]] || { echo "FAIL: no rig candidate passed the quality gate" >&2; exit 1; }
 write_manifest

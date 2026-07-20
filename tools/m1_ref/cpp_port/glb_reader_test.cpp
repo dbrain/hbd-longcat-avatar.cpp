@@ -15,6 +15,23 @@ static int g_fail = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { std::fprintf(stderr, "FAIL: %s\n", msg); g_fail++; } } while (0)
 
 int main(int argc, char** argv) {
+    if (argc == 4 && std::strcmp(argv[2], "--extract-basecolor") == 0) {
+        std::vector<uint8_t> png;
+        std::string mime;
+        if (!glb::read_glb_basecolor_png(argv[1], png, mime)) {
+            std::fprintf(stderr, "extract: no embedded baseColor texture in '%s'\n", argv[1]);
+            return 2;
+        }
+        FILE* f = std::fopen(argv[3], "wb");
+        if (!f || std::fwrite(png.data(), 1, png.size(), f) != png.size()) {
+            if (f) std::fclose(f);
+            std::fprintf(stderr, "extract: cannot write '%s'\n", argv[3]);
+            return 2;
+        }
+        std::fclose(f);
+        std::printf("extract: wrote %zu bytes (%s) -> %s\n", png.size(), mime.c_str(), argv[3]);
+        return 0;
+    }
     // ---- unit cube: 8 verts, 12 triangles ----
     std::vector<float> verts = {
         0,0,0,  1,0,0,  1,1,0,  0,1,0,   // z=0 face
