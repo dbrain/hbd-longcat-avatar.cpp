@@ -69,23 +69,44 @@ assert_closed_mesh() {
 # skeleton: try_rig transfers that accepted skin onto high, so Hymotion does not silently inherit a
 # lower-resolution atlas.
 write_texture_delivery_manifest() {
-  local rig_state="$1" level="${2:-none}" name file atlas status topo
+  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha topo
+  # `reference` is a material recipe, not a promise that all meshes can use a
+  # single global xatlas solve.  Record the measured route from the stage log:
+  # direct for clean topology; conformal local islands where sharp/high-curvature
+  # geometry would otherwise make the global solve pathological.
+  atlas_route_for() {
+    local stage_file="$1"
+    if [[ ! -f "$stage_file" ]]; then
+      printf 'unknown-no-stage-log'
+    elif grep -q 'stage=atlas_unwrap_islands_begin' "$stage_file"; then
+      printf 'adaptive-conformal-local-islands'
+    elif grep -q 'stage=atlas_unwrap_direct_begin' "$stage_file"; then
+      printf 'direct-parity-charts'
+    else
+      printf 'unknown-incomplete-stage-log'
+    fi
+  }
   {
-    printf 'schema_version=1\n'
+    printf 'schema_version=2\n'
     printf 'production_texture=native_high_textured.glb\n'
     printf 'native_unwrap=%s\n' "$NATIVE_UNWRAP"
     printf 'high_model_lattice=%s\nhigh_atlas_px=%s\n' "$NATIVE_HIGH_RESOLUTION" "$NATIVE_HIGH_ATLAS"
-    printf 'lod_material_contract=medium/low are CPU rebakes of native_high_texture_dump; no second texture inference\n'
+    printf 'lod_material_contract=medium/low are CPU rebakes of native_high_texture_dump; no second texture inference; adaptive xatlas uses direct parity charts for clean topology or conformal local islands for high curvature\n'
     printf 'topology_gate=position-welded open=0 for every texture LOD\n'
     printf 'rig_state=%s\nselected_rig=%s\n' "$rig_state" "$level"
     for name in high medium low; do
       file="$OUT/native_${name}_textured.glb"
       atlas="$OUT/native_${name}_textured_atlas.png"
       status="${file}.run-status.txt"
+      stage="${file}.stage-log.txt"
+      route="$(atlas_route_for "$stage")"
+      stage_sha="missing"
+      [[ ! -f "$stage" ]] || stage_sha="$(sha256sum "$stage" | awk '{print $1}')"
       topo="$("$CP/mesh_topo" "$file")"
-      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s topology="%s"\n' \
+      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s atlas_route=%s stage_log=%s stage_log_sha256=%s topology="%s"\n' \
         "$name" "$(basename "$file")" "$(sha256sum "$file" | awk '{print $1}')" \
-        "$(basename "$atlas")" "$(sha256sum "$atlas" | awk '{print $1}')" "$topo"
+        "$(basename "$atlas")" "$(sha256sum "$atlas" | awk '{print $1}')" "$route" \
+        "$(basename "$stage")" "$stage_sha" "$topo"
       [[ ! -f "$status" ]] || printf 'lod=%s native_texture_status=%s\n' "$name" "$(basename "$status")"
     done
     [[ "$rig_state" != succeeded ]] || printf 'hymotion_rigged=hymotion_rigged.glb sha256=%s\n' "$(sha256sum "$OUT/hymotion_rigged.glb" | awk '{print $1}')"
