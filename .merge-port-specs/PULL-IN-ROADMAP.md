@@ -38,8 +38,14 @@ Full evidence: `.merge-port-specs/audit-core-io.md`, `audit-diffusion.md`, `audi
     →class labels degrade to class_N), inpaint via fork sd_image_t* generate_image + manual free, public C API in
     stable-diffusion.h. REMAINING (optional §8): CLI ad_* params + main.cpp apply_adetailer + resource_owners.hpp
     ADetailerCtxPtr; koblem/server field = Rust, owner. GPU-PENDING: no converted YOLOv8 .safetensors on-box.
-  - PuLID — needs a prep agent (FluxDiffusionExtra pulid_id + flux.hpp block injection + before_diffusion
-    hook + generation_extension + sd_pulid_params_t). Hardest (DiT-touching). Roadmap Batch 5.
+  - PuLID — DONE, builds (all 4 stages). apply-doc `.merge-port-specs/pulid-APPLY.md`. Fork's flux.hpp was
+    upstream-minus-pulid, so §4 = clean re-insertion (3 conventions: increase_ref_index bool, (backend,
+    params_backend) ctor, 3-arg compute). Stage1 params/FluxDiffusionExtra/before_diffusion hook; Stage2 weights
+    merge + registration + prepare plumbing; Stage3 new pulid_extension.cpp (verbatim) + denoise hook; Stage4
+    flux.hpp CA-block build + double/single injection + threading. CLI (§9) fully wired (--pulid-weights/
+    --pulid-id-embedding/--pulid-id-weight; fixed the positional sd_ctx_params_t init the new field shifted).
+    GPU-PENDING: no PuLID checkpoint / id-gguf on-box → CA names, id shape [2048,32], VRAM of ~20 CA blocks
+    UNVERIFIED. VERIFY non-PuLID flux stays bit-exact (pulid_enabled=false ⇒ no blocks/injection).
   - streaming/bounded-mem convert — Batch 6 (TensorWritePlan into tensor_storage.h + re-weave nvfp4 imatrix).
   - Batch 7 remaining adopts + niche + CLI + docs-wholesale.
 - HOLD (GPU/checkpoint-verify, do NOT blind-adopt): qwen3-vl vision split_patch_embed bias; qwen rope txt_id_start.

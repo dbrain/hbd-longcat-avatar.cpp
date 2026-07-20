@@ -134,6 +134,7 @@ struct SDContextParams {
     std::string motion_module_path;
     std::string embedding_dir;
     std::string photo_maker_path;
+    std::string pulid_weights_path;
     sd_type_t wtype = SD_TYPE_COUNT;
     std::string tensor_type_rules;
     std::string lora_model_dir = ".";
@@ -275,6 +276,9 @@ struct SDGenerationParams {
     std::string pm_id_images_dir;
     std::string pm_id_embed_path;
     float pm_style_strength = 20.f;
+
+    std::string pulid_id_embedding_path;
+    float pulid_id_weight = 1.0f;
 
     int upscale_repeats   = 1;
     int upscale_tile_size = 128;

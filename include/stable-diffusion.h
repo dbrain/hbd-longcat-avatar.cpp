@@ -200,6 +200,7 @@ typedef struct {
     const sd_embedding_t* embeddings;
     uint32_t embedding_count;
     const char* photo_maker_path;
+    const char* pulid_weights_path;
     const char* tensor_type_rules;
     bool vae_decode_only;
     bool free_params_immediately;
@@ -282,6 +283,11 @@ typedef struct {
     const char* id_embed_path;
     float style_strength;
 } sd_pm_params_t;  // photo maker
+
+typedef struct {
+    const char* id_embedding_path;
+    float id_weight;
+} sd_pulid_params_t;
 
 enum sd_cache_mode_t {
     SD_CACHE_DISABLED = 0,
@@ -389,6 +395,7 @@ typedef struct {
     sd_image_t control_image;
     float control_strength;
     sd_pm_params_t pm_params;
+    sd_pulid_params_t pulid_params;
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
