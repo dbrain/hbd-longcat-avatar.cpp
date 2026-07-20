@@ -4,7 +4,8 @@
 #include "model/common/block.hpp"
 #include "model_loader.h"
 
-#define CONTROL_NET_GRAPH_SIZE 1536
+// Match main UNet's MAX_GRAPH_SIZE so SDXL ControlNet (transformer_depth={1,2,10}) fits.
+#define CONTROL_NET_GRAPH_SIZE MAX_GRAPH_SIZE
 
 /*
     =================================== ControlNet ===================================

@@ -4031,6 +4031,7 @@ const char* scheduler_to_str[] = {
     "ltx2",
     "linear_quadratic",
     "beta",
+    "logit_normal",
 };
 
 const char* sd_scheduler_name(enum scheduler_t scheduler) {
