@@ -92,6 +92,47 @@ struct BakedTexture {
     int chart_count = 0, atlas_count = 0;
 };
 
+// Sparse 3-D colour outlier cleanup for a decoded PBR surface. Texture-flow occasionally emits
+// isolated black/bright voxels inside otherwise coherent cloth or skin; UV-space filtering cannot
+// reliably remove those once a chart has been split. Only RGB is touched, and only when a voxel
+// differs materially from its occupied 3x3x3-neighbour median.
+static inline size_t filter_pbr_rgb_outliers(std::vector<float>& pbr, const std::vector<int32_t>& coords,
+                                             float threshold) {
+    const size_t N=coords.size()/4;
+    if (threshold<=0.f || N==0 || pbr.size()!=N*6) return 0;
+    auto key=[](int x,int y,int z)->uint64_t {
+        return (uint64_t)(uint32_t)(x+2048) | ((uint64_t)(uint32_t)(y+2048)<<13) |
+               ((uint64_t)(uint32_t)(z+2048)<<26);
+    };
+    std::unordered_map<uint64_t,uint32_t> index;
+    index.reserve(N*2);
+    for (uint32_t i=0;i<(uint32_t)N;i++)
+        index.emplace(key(coords[(size_t)i*4+1],coords[(size_t)i*4+2],coords[(size_t)i*4+3]),i);
+    const std::vector<float> src=pbr;
+    std::vector<uint8_t> replace(N,0);
+    std::vector<std::array<float,3>> med(N);
+    #pragma omp parallel for schedule(static)
+    for (int64_t ii=0;ii<(int64_t)N;ii++) {
+        size_t i=(size_t)ii;
+        float vals[3][27]; int n=0;
+        const int x=coords[i*4+1],y=coords[i*4+2],z=coords[i*4+3];
+        for(int dz=-1;dz<=1;dz++) for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
+            auto it=index.find(key(x+dx,y+dy,z+dz)); if(it==index.end()) continue;
+            const float* q=&src[(size_t)it->second*6];
+            for(int c=0;c<3;c++) vals[c][n]=q[c];
+            n++;
+        }
+        if (n<7) continue;
+        float delta=0.f;
+        for(int c=0;c<3;c++) { std::nth_element(vals[c],vals[c]+n/2,vals[c]+n); med[i][c]=vals[c][n/2];
+            delta=std::max(delta,std::fabs(src[i*6+c]-med[i][c])); }
+        replace[i]=delta>threshold;
+    }
+    size_t changed=0;
+    for(size_t i=0;i<N;i++) if(replace[i]) { for(int c=0;c<3;c++) pbr[i*6+c]=med[i][c]; changed++; }
+    return changed;
+}
+
 // area-weighted per-vertex normals (matches glb_writer; robust to dual-grid winding)
 static inline std::vector<float> vert_normals(const std::vector<float>& v, const std::vector<int64_t>& f) {
     const size_t V=v.size()/3, F=f.size()/3;
@@ -372,6 +413,36 @@ static inline void blur_u8_gaussian_rgb(std::vector<uint8_t>& img, int W, int H,
                 acc += k[(size_t)(dy+r)] * tmp[((size_t)yy*W+x)*C+c];
             }
             img[((size_t)y*W+x)*C+c] = (uint8_t)std::max(0.f, std::min(255.f, acc + 0.5f));
+        }
+    }
+}
+
+// Remove isolated generator speckle without blending across UV-chart gutters.  Unlike the optional
+// full-atlas Gaussian blur, this only samples texels that were actually rasterised from a surface
+// triangle; neighbouring charts and their inpainted gutters are excluded.  A 3x3 median preserves
+// material boundaries (buttons, hair silhouettes) while rejecting one-pixel dark/light freckles.
+static inline void median_surface_rgb(std::vector<float>& atl, const std::vector<uint8_t>& surface_mask,
+                                      int W, int H, int radius) {
+    if (radius <= 0 || W <= 0 || H <= 0 || atl.size() != (size_t)W*H*6 || surface_mask.size() != (size_t)W*H) return;
+    const std::vector<float> src=atl;
+    #pragma omp parallel for schedule(static)
+    for (int y=0;y<H;y++) for (int x=0;x<W;x++) {
+        const size_t p=(size_t)y*W+x;
+        if (!surface_mask[p]) continue;
+        float values[81];
+        for (int c=0;c<3;c++) {
+            int n=0;
+            for (int dy=-radius;dy<=radius;dy++) for (int dx=-radius;dx<=radius;dx++) {
+                int nx=x+dx, ny=y+dy;
+                if (nx<0 || ny<0 || nx>=W || ny>=H) continue;
+                size_t q=(size_t)ny*W+nx;
+                if (surface_mask[q]) values[n++]=src[q*6+c];
+            }
+            // Do not distort isolated slivers where a neighbourhood is not meaningful.
+            if (n >= 5) {
+                std::nth_element(values, values+n/2, values+n);
+                atl[p*6+c]=values[n/2];
+            }
         }
     }
 }
@@ -1070,6 +1141,13 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (verbose) printf("[atlas] filling remaining atlas background by nearest valid dilation\n");
         dilate_background(atl, mask2, W, Ht, C);
     }
+    if (const char* m = std::getenv("TEX_BASE_MEDIAN")) {
+        int radius=std::max(0,std::min(4,atoi(m)));
+        if (radius > 0) {
+            if (verbose) printf("[atlas] surface-only RGB median radius=%d\n", radius);
+            median_surface_rgb(atl, mask, W, Ht, radius);
+        }
+    }
 
     // ---- pack to uint8 textures (Python layout) ----
     // baseColor colourspace lever (owner judges — do not declare a winner). The tex-DiT baseColor sits
@@ -1083,7 +1161,8 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     const bool bc_srgb = bc_srgb_env ? (std::atoi(bc_srgb_env) != 0) : true;
     const float bc_gamma = std::getenv("ATL_BASECOLOR_GAMMA") ? (float)atof(std::getenv("ATL_BASECOLOR_GAMMA")) : 0.f;
     auto enc_bc = [&](float c)->float{
-        if (c<0.f) c=0.f; if (c>1.f) c=1.f;
+        if (c<0.f) c=0.f;
+        if (c>1.f) c=1.f;
         if (bc_srgb) return c<=0.0031308f ? 12.92f*c : 1.055f*std::pow(c,1.f/2.4f)-0.055f;
         if (bc_gamma>0.f) return std::pow(c, bc_gamma);
         return c;

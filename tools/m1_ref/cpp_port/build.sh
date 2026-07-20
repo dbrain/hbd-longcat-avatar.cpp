@@ -389,7 +389,7 @@ fi
 
 # tex_bake_test: UV-atlas bake (xatlas + CPU raster + grid_sample). No ggml, no CUDA — just
 # xatlas.cpp + stb_image_write + OpenMP. (grid_sample_test uses the default ggml-linked path.)
-if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "tex_bake_trellis" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ] || [ "$BASE" = "texproj_probe" ]; then
+if [ "$BASE" = "tex_bake_test" ] || [ "$BASE" = "tex_bake_trellis" ] || [ "$BASE" = "texture_rebake_native" ] || [ "$BASE" = "remesh_test" ] || [ "$BASE" = "tex_bake_dump" ] || [ "$BASE" = "tex_reproject" ] || [ "$BASE" = "texproj_probe" ]; then
   if [ "$MODE" = "cuda" ] && [ "$BASE" = "tex_reproject" ]; then
     TOOL="${PIXAL3D_CUDA_ROOT:-/mnt/hdd/3d/avatar-shootout/toolchain-cuda13.3}"
   # Host compiler for nvcc. NOT the system gcc: nvcc 13.3 hard-errors above gcc 15 and this box

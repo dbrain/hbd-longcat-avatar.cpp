@@ -252,6 +252,12 @@ int main(int argc, char** argv) {
         }
         if (rgb_max-rgb_min < 1e-4f)
             throw std::runtime_error("PBR decoder collapsed to a neutral field (likely CUDA memory pressure)");
+        if (const char* f=std::getenv("TEX_PBR_OUTLIER")) {
+            float threshold=(float)atof(f);
+            size_t changed=texatlas::filter_pbr_rgb_outliers(pbr,pbr_coords,threshold);
+            std::printf("[native-texture] PBR RGB outlier cleanup threshold=%.3f: %zu / %zu voxels\n",
+                        threshold,changed,pbr.size()/6);
+        }
         if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_pbr_coords.npy",pbr_coords,"<i4",{(int)pbr_coords.size()/4,4}); dump_npy(dump_dir+"/native_pbr_feats.npy",pbr,"<f4",{(int)pbr.size()/6,6}); }
         std::printf("[native-texture] PBR volume: %zu voxels\\n", pbr.size()/6);
 
