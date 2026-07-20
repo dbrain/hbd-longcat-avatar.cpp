@@ -295,6 +295,23 @@ static void fifo_log_stats(const char* tag, const sd::Tensor<float>& t, int64_t 
 
 /*=============================================== StableDiffusionGGML ================================================*/
 
+// Forward declarations: these packed-AV latent helpers are defined further down in the file but are
+// needed earlier by StableDiffusionGGML::sample()'s FIFO sliding-window forward, which slices the video
+// window out of the packed timeline latent and repacks it with (full) audio per iteration. Defaults live
+// on these declarations; the out-of-line definitions below drop them (a default may appear once only).
+static sd::Tensor<float> build_ltxav_window_video_positions(int64_t width, int64_t height,
+                                                            int64_t latent_start, int64_t latent_frames,
+                                                            int fps, int spatial_scale, int temporal_scale = 8);
+static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<float>& video_latent,
+                                                            const sd::Tensor<float>& audio_latent);
+static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
+                                                                 const sd::Tensor<float>& video_latent,
+                                                                 const sd::Tensor<float>& audio_latent,
+                                                                 float audio_mask_value             = 1.f,
+                                                                 const sd::Tensor<float>* per_audio_mask = nullptr);
+static sd::Tensor<float> unpack_ltxav_audio_latent(const sd::Tensor<float>& packed_latent,
+                                                   int audio_length, int video_channels);
+
 class StableDiffusionGGML {
 public:
     std::vector<MmapTensorStore> mmap_tensor_store;
@@ -3051,6 +3068,21 @@ public:
         float fifo_audio_sigma = -1.0f;
         int64_t fifo_video_ch  = 0;  // #video channels (audio channels are the trailing C - fifo_video_ch)
 
+        // ---- FIFO VRAM-bounded sliding-window forward state ----
+        // When fifo_windowed is set (only ever inside run_fifo_diagonal), the denoise closure forwards a
+        // BOUNDED window of video frames (the in-flight diagonal) rather than the whole timeline, so the
+        // GPU working set drops from T frames to queue_depth frames. The window's init_latent (its SHAPE
+        // drives the per-frame timestep grid, its values pin any hard-conditioning frames), video-token
+        // denoise mask, and ABSOLUTE-time video RoPE positions differ from the full-timeline captures, so
+        // the closure consults these overrides instead. Audio is kept FULL (its token count is tiny =>
+        // negligible VRAM) so audio_length/audio_positions are NOT overridden — only the VIDEO frame axis
+        // is windowed. Empty/false in every non-FIFO render => the eff_* aliases resolve to the original
+        // captures and the forward is byte-identical.
+        bool fifo_windowed = false;
+        sd::Tensor<float> fifo_win_init_latent;
+        sd::Tensor<float> fifo_win_denoise_mask;
+        sd::Tensor<float> fifo_win_video_positions;
+
         // Per-frame flow denoiser output scaling: x0_t = x_t + c_out_t * v_t, with c_out_t = -sigma_t
         // and c_skip = c_in = 1 (constant for the flow denoiser — only c_out is sigma-dependent). This
         // generalizes `denoised = v * c_out + x * c_skip` over the frame axis. Layout is frame-major
@@ -3119,6 +3151,13 @@ public:
             float c_out  = scaling[1];
             float c_in   = scaling[2];
 
+            // FIFO sliding-window: when the diagonal armed a bounded window, the per-frame timestep grid,
+            // mask pinning and video RoPE use the WINDOW's init_latent/mask/positions (matching the
+            // windowed `x` handed in). Otherwise these alias the full-timeline captures (byte-identical).
+            const sd::Tensor<float>& eff_init_latent     = fifo_windowed ? fifo_win_init_latent : init_latent;
+            const sd::Tensor<float>& eff_denoise_mask    = fifo_windowed ? fifo_win_denoise_mask : denoise_mask;
+            const sd::Tensor<float>& eff_video_positions = fifo_windowed ? fifo_win_video_positions : video_positions;
+
             std::vector<float> base_timesteps_vec = prepare_sample_timesteps(sigma, shifted_timestep);
             std::vector<float> timesteps_vec      = base_timesteps_vec;
             sd::Tensor<float> audio_timesteps_tensor;
@@ -3134,8 +3173,8 @@ public:
                     fifo_per_frame_t[fi] = denoiser->sigma_to_t(fifo_sigma_per_frame[fi]);
                 }
             }
-            if (sd_version_is_ltxav(version) && (!denoise_mask.empty() || fifo_active)) {
-                timesteps_vec = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask,
+            if (sd_version_is_ltxav(version) && (!eff_denoise_mask.empty() || fifo_active)) {
+                timesteps_vec = process_ltxav_video_timesteps(base_timesteps_vec, eff_init_latent, eff_denoise_mask,
                                                               fifo_active ? &fifo_per_frame_t : nullptr);
                 // Per-token audio timesteps mirror the audio denoise mask.  This
                 // matters for LipDub's appended clean reference block, while
@@ -3165,7 +3204,7 @@ public:
             } else {
                 timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask);
             }
-            const std::vector<float>& scaling_timesteps_vec = (sd_version_is_ltxav(version) && !denoise_mask.empty())
+            const std::vector<float>& scaling_timesteps_vec = (sd_version_is_ltxav(version) && !eff_denoise_mask.empty())
                                                                   ? base_timesteps_vec
                                                                   : timesteps_vec;
             adjust_sample_step_scalings(shifted_timestep, scaling_timesteps_vec, c_in, &c_skip, &c_out);
@@ -3173,25 +3212,25 @@ public:
             sd::Tensor<float> timesteps_tensor({static_cast<int64_t>(timesteps_vec.size())}, timesteps_vec);
             sd::Tensor<float> guidance_tensor({1}, std::vector<float>{guidance.distilled_guidance});
             sd::Tensor<float> noised_input = x * c_in;
-            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || version == VERSION_WAN2_2_I2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version))) {
+            if (!eff_denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || version == VERSION_WAN2_2_I2V || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version))) {
                 // ai2v: the first num_cond_latents temporal latent frames ARE the
                 // VAE-encoded reference image and must be held fixed (mask=0) through
                 // the whole denoise loop; only the generated frames (mask=1) evolve.
                 // (pipeline keeps latents[:,:,:1] = cond_latents every step.)
                 if (cond_noise_scale > 0.0f && cond_noise_rng && sd_version_is_ltxav(version)) {
-                    sd::Tensor<float> cond_eps    = sd::randn_like<float>(init_latent, cond_noise_rng);
+                    sd::Tensor<float> cond_eps    = sd::randn_like<float>(eff_init_latent, cond_noise_rng);
                     float             s           = cond_noise_scale * sigma * sigma;
-                    sd::Tensor<float> cond_latent = init_latent + cond_eps * s;
-                    noised_input = noised_input * denoise_mask + cond_latent * (1.0f - denoise_mask);
+                    sd::Tensor<float> cond_latent = eff_init_latent + cond_eps * s;
+                    noised_input = noised_input * eff_denoise_mask + cond_latent * (1.0f - eff_denoise_mask);
                 } else {
-                    noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
+                    noised_input = noised_input * eff_denoise_mask + eff_init_latent * (1.0f - eff_denoise_mask);
                 }
             }
 
             if (cache_runtime.spectrum_enabled && cache_runtime.spectrum.should_predict()) {
                 cache_runtime.spectrum.predict(&denoised);
-                if (!denoise_mask.empty()) {
-                    denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
+                if (!eff_denoise_mask.empty()) {
+                    denoised = denoised * eff_denoise_mask + eff_init_latent * (1.0f - eff_denoise_mask);
                 }
                 if (sd_should_preview_denoised() && preview.callback != nullptr) {
                     preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
@@ -3268,7 +3307,7 @@ public:
                         audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
                         audio_length,
                         frame_rate,
-                        video_positions.empty() ? nullptr : &video_positions,
+                        eff_video_positions.empty() ? nullptr : &eff_video_positions,
                         audio_positions.empty() ? nullptr : &audio_positions,
                         skip_a2v_pass,
                         video_reference.empty() ? nullptr : &video_reference};
@@ -3606,8 +3645,8 @@ public:
             if (cache_runtime.spectrum_enabled) {
                 cache_runtime.spectrum.update(denoised);
             }
-            if (!denoise_mask.empty()) {
-                denoised = denoised * denoise_mask + init_latent * (1.0f - denoise_mask);
+            if (!eff_denoise_mask.empty()) {
+                denoised = denoised * eff_denoise_mask + eff_init_latent * (1.0f - eff_denoise_mask);
             }
             // [STEP_DELTA] non-perturbing: log relative-L1 change of the denoised x0
             // estimate between consecutive sampler steps. Measures DMD-step reuse window
@@ -3636,16 +3675,17 @@ public:
         };
 
         // ---------------------------- FIFO-Diffusion sampler loop ----------------------------
-        // Replaces the standard uniform-sigma sampler (sample_k_diffusion) with a diagonal queue. The
-        // whole timeline latent x_t is held; each outer iteration runs ONE forward on it with a
-        // per-frame sigma vector, advances each in-flight frame one euler_cfg_pp notch down its OWN
-        // schedule, pops frames that reach sigma=0 and pushes fresh-noise frames at sigma_max — modelled
-        // as a schedule-index SWEEP over the frames (no data motion needed, the diagonal advances in
-        // place). Attention is never cut => no seam. NOTE (PoC scope): this variant does NOT frame-slice
-        // the forward, so peak VRAM is that of the full timeline, not the queue depth. It exercises the
-        // full diagonal MECHANIC (per-frame graded sigma + euler_cfg_pp) so the seam-free video verdict
-        // can be taken first; the VRAM-bounded sliding-window forward (which must unpack/slice/repack the
-        // packed-AV latent per window, mirroring the base_temporal_window machinery) is the next step.
+        // Replaces the standard uniform-sigma sampler (sample_k_diffusion) with a diagonal queue. The full
+        // timeline latent x_t stays HOST-RESIDENT; each outer iteration slices out only the in-flight
+        // diagonal window (the frames whose schedule index is in [0,N)) and runs ONE bounded forward on
+        // that window with a per-frame sigma vector, advances each windowed frame one euler_cfg_pp notch
+        // down its OWN schedule, writes the result back into x_t, then slides the window by `blocks` frames
+        // (pops sigma=0 frames off the front, admits fresh sigma_max frames at the back). Attention is
+        // never cut across the queue => no seam, and the GPU working set is bounded by the window width
+        // (<= queue_depth = blocks*N) instead of T — that is the VRAM win over the full-timeline pass.
+        // The packed-AV latent is unpacked/sliced/repacked per window so the audio channel packing (which
+        // depends on the window frame count) stays correct; audio is kept full (tiny) and advanced as a
+        // global lockstep stream. LTXAV_FIFO_WINDOW=0 forces a single full-timeline window for A/B.
         auto run_fifo_diagonal = [&]() -> sd::Tensor<float> {
             const int N = static_cast<int>(steps);            // sampler steps: sigmas[0..N], sigmas[N]=0
             if (N < 1 || x_t.dim() < 4) {
@@ -3680,13 +3720,14 @@ public:
                      (long long)T, N, blocks, (long long)queue_depth, requested_queue,
                      (long long)video_ch, (long long)x_t.shape()[3], (int)lookahead);
             if (requested_queue > 0 && requested_queue != static_cast<int>(queue_depth)) {
-                LOG_INFO("LTX FIFO: requested queue=%d differs from derived blocks*steps=%lld; the full "
-                         "timeline is held this PoC so the derived depth is used",
+                LOG_INFO("LTX FIFO: requested queue=%d differs from derived blocks*steps=%lld; the derived "
+                         "depth (the sliding-window width) is used",
                          requested_queue, (long long)queue_depth);
             }
 
-            // x_t already holds every frame noise-scaled at sigmas[0] (= sigma_max) from sample()'s
-            // entry, so every frame's schedule-index 0 state is correct with no extra noising.
+            // x_t already holds every frame noise-scaled at sigmas[0] (= sigma_max) from sample()'s entry,
+            // so every frame's schedule-index 0 state is correct with no extra noising. fifo_sigma_per_frame
+            // is reassigned to the WINDOW length each iteration below; this seed just marks the diagonal armed.
             fifo_sigma_per_frame.assign(static_cast<size_t>(T), sigmas[0]);
 
             // Audio lockstep. Generate-audio packs the audio channels as a max-noise latent; the earlier
@@ -3711,6 +3752,57 @@ public:
             const int64_t W     = x_t.shape()[0];
             const int64_t H     = x_t.shape()[1];
             const int64_t plane = W * H;
+            const int64_t C     = x_t.shape()[3];
+
+            // ---- VRAM-bounded sliding window ----
+            // Each outer iteration forwards ONLY the in-flight diagonal (the contiguous frame range whose
+            // schedule index idx = m - a/blocks lies in [0,N)). Frames before it are finished (sigma 0),
+            // frames after it are untouched (sigma_max); neither is forwarded, so the GPU working set is
+            // bounded by the window width (<= queue_depth) instead of T. VIDEO is sliced out of the
+            // host-resident full latent x_t; AUDIO is kept FULL (its token count is tiny => negligible
+            // VRAM) and advanced as a single global lockstep stream, then packed back at the end.
+            const int vae_scale = get_vae_scale_factor();
+            const int fps_i     = std::max(1, static_cast<int>(std::lround(frame_rate)));
+            // A/B escape hatch: LTXAV_FIFO_WINDOW=0 forces a single full-timeline window (window == [0,T))
+            // — the pre-windowing behaviour. Default = bounded sliding window (the VRAM win).
+            const bool force_full_window = [] {
+                const char* e = std::getenv("LTXAV_FIFO_WINDOW");
+                return e != nullptr && std::string(e) == "0";
+            }();
+            sd::Tensor<float> audio_state;   // full audio latent, advanced in place across iterations
+            int64_t audio_values = 0;
+            if (C > video_ch && audio_length > 0) {
+                audio_state  = unpack_ltxav_audio_latent(x_t, static_cast<int>(audio_length), static_cast<int>(video_ch));
+                audio_values = audio_state.numel();
+            }
+            const bool pack_audio        = audio_values > 0;  // audio must be present or the DiT emits NaN
+            const float audio_mask_value = ltxav_audio_fixed ? 0.0f : 1.0f;
+
+            // Slice the leading video_ch channels' frames [wstart, wstart+wlen) out of a packed [W,H,T,*]
+            // tensor into a compact [W,H,wlen,video_ch] block (per-channel window frames are contiguous).
+            auto slice_vid = [&](const sd::Tensor<float>& packed, int64_t wstart, int64_t wlen) -> sd::Tensor<float> {
+                sd::Tensor<float> v({W, H, wlen, video_ch});
+                const float* sp = packed.data();
+                float* dp       = v.data();
+                for (int64_t c = 0; c < video_ch; ++c) {
+                    for (int64_t l = 0; l < wlen; ++l) {
+                        std::memcpy(dp + plane * (l + wlen * c),
+                                    sp + plane * (wstart + l + T * c),
+                                    static_cast<size_t>(plane) * sizeof(float));
+                    }
+                }
+                return v;
+            };
+            // VP-normalized deterministic flow euler step (eta=0), value form. See the derivation kept
+            // below: alpha_s=1-sigma, alpha_t=1-sigma_next; d=(x - uncond_x0*alpha_s)/sigma;
+            // x = cfg_x0*alpha_t + d*sigma_next. sigma_next==0 collapses to x = cfg_x0.
+            auto flow_val = [](float xv, float p0v, float puv, float sig, float sig_next) -> float {
+                if (sig_next == 0.0f) return p0v;
+                const float alpha_s = 1.0f - sig;
+                const float alpha_t = 1.0f - sig_next;
+                const float d       = (xv - puv * alpha_s) / sig;
+                return p0v * alpha_t + d * sig_next;
+            };
 
             // Frame a "enters" the diagonal (receives its first notch) at outer iteration a/blocks and
             // finishes N notches later. The last frame enters at (T-1)/blocks, so the sweep runs
@@ -3719,99 +3811,155 @@ public:
             // sigma 0 (popped/finished). Mid-flight frames (0 <= idx < N) get one euler_cfg_pp step.
             const int64_t last_enter  = (T - 1) / blocks;
             const int64_t total_iters = last_enter + N;
+            // FIXED window width = queue_depth frames (clamped to T). Every forward has the SAME shape, so
+            // the ggml CUDA graph and its VMM pool high-water are stable — a VARIABLE window (1..queue_depth
+            // frames near the sweep ends) forces the pool to accommodate many distinct graph sizes and
+            // fragments/retains a HIGHER high-water than a single fixed graph, which showed up as no
+            // nvidia-smi VRAM drop despite the smaller per-forward token count. The extra frames beyond the
+            // in-flight diagonal are FINISHED (sigma 0, clean) or NOT-YET-ENTERED (sigma_max) context: they
+            // are forwarded (attention context, in-distribution — same as the i2v clean+noisy precedent)
+            // but NOT advanced. window_frames <= T bounds the GPU working set below the full pass.
+            const int64_t window_frames = std::min<int64_t>(queue_depth, T);
             int64_t emitted           = 0;
+            int64_t peak_wlen         = 0;
             for (int64_t m = 0; m < total_iters; ++m) {
+                // In-flight diagonal = contiguous frames with 0 <= m - a/blocks < N.
+                int64_t active_lo = -1, active_hi = -1;
                 for (int64_t a = 0; a < T; ++a) {
-                    const int64_t enter = a / blocks;
-                    int idx             = static_cast<int>(m - enter);
-                    idx                 = std::clamp(idx, 0, N);
-                    fifo_sigma_per_frame[static_cast<size_t>(a)] = sigmas[static_cast<size_t>(idx)];
+                    const int idx = static_cast<int>(m - a / blocks);
+                    if (idx >= 0 && idx < N) {
+                        if (active_lo < 0) active_lo = a;
+                        active_hi = a;
+                    }
                 }
-                // Audio's global schedule index for this iteration (mirrors the per-frame `idx = m-enter`
-                // logic): raw index gates the advance (step only while 0<=idx<N); the clamped index picks
-                // the sigma the DiT sees (sigma_max before entry, 0 after finish). freeze mode disables
-                // the audio c_out scaling (fifo_audio_sigma<0) and skips the advance.
-                const int a_idx_raw = static_cast<int>(m - audio_enter);
+                if (active_lo < 0) {
+                    continue;  // no in-flight frames this iteration (should not happen mid-sweep)
+                }
+                // Expand the in-flight set to the fixed window width, sliding it to keep the active frames
+                // covered while staying inside [0,T). The in-flight width is <= window_frames, so the
+                // active set always fits.
+                int64_t wstart = std::clamp<int64_t>(active_hi + 1 - window_frames, 0, T - window_frames);
+                int64_t wend   = wstart + window_frames;
+                if (force_full_window) {
+                    wstart = 0;
+                    wend   = T;
+                }
+                const int64_t wlen = wend - wstart;
+                peak_wlen          = std::max(peak_wlen, wlen);
+
+                // Window per-frame sigma diagonal (length == wlen == eff_init_latent frame count).
+                fifo_sigma_per_frame.assign(static_cast<size_t>(wlen), sigmas[0]);
+                for (int64_t a = wstart; a < wend; ++a) {
+                    int idx = static_cast<int>(m - a / blocks);
+                    idx     = std::clamp(idx, 0, N);
+                    fifo_sigma_per_frame[static_cast<size_t>(a - wstart)] = sigmas[static_cast<size_t>(idx)];
+                }
+                // Audio's global schedule index (mirrors the per-frame `idx = m-enter` logic): raw index
+                // gates the advance (step only while 0<=idx<N); the clamped index picks the sigma the DiT
+                // sees. freeze mode disables the audio c_out scaling (fifo_audio_sigma<0) and the advance.
+                const int a_idx_raw     = static_cast<int>(m - audio_enter);
                 const int a_idx_clamped = std::clamp(a_idx_raw, 0, N);
                 fifo_audio_sigma = fifo_audio_freeze ? -1.0f : sigmas[static_cast<size_t>(a_idx_clamped)];
                 const int step = static_cast<int>(m + 1);
-                if (std::getenv("LTXAV_FIFO_STATS") != nullptr) {
-                    std::string sig_dump = "FIFO_STATS iter " + std::to_string(m) + " sigma_pf=[";
-                    for (int64_t a = 0; a < T; ++a) sig_dump += std::to_string(fifo_sigma_per_frame[(size_t)a]) + (a + 1 < T ? "," : "");
-                    sig_dump += "]";
-                    LOG_INFO("%s", sig_dump.c_str());
-                    fifo_log_stats("x_t pre-forward", x_t, video_ch);
+
+                // Build the bounded window forward tensors. Video sliced from x_t; audio full; RoPE
+                // positions ABSOLUTE (build_ltxav_window_video_positions, start=wstart — NOT rebased to 0).
+                sd::Tensor<float> video_window = slice_vid(x_t, wstart, wlen);
+                sd::Tensor<float> win_latent   = pack_audio
+                                                     ? pack_ltxav_audio_and_video_latents(video_window, audio_state)
+                                                     : video_window;
+                sd::Tensor<float> win_init_vid = (!init_latent.empty() && init_latent.shape()[2] == T)
+                                                     ? slice_vid(init_latent, wstart, wlen)
+                                                     : video_window;
+                fifo_win_init_latent = pack_audio
+                                           ? pack_ltxav_audio_and_video_latents(win_init_vid, audio_state)
+                                           : win_init_vid;
+                if (!denoise_mask.empty() && denoise_mask.shape()[2] == T) {
+                    sd::Tensor<float> win_mask_vid = slice_vid(denoise_mask, wstart, wlen);
+                    fifo_win_denoise_mask = pack_audio
+                                                ? pack_ltxav_audio_and_video_denoise_mask(win_mask_vid, video_window,
+                                                                                          audio_state, audio_mask_value)
+                                                : win_mask_vid;
+                } else {
+                    fifo_win_denoise_mask = sd::Tensor<float>();
                 }
-                auto out       = denoise(x_t, sigmas[0] /* nominal; per-frame vector overrides */, step);
+                fifo_win_video_positions = build_ltxav_window_video_positions(W, H, wstart, wlen, fps_i, vae_scale);
+
+                LOG_INFO("LTX FIFO: window [%lld,%lld) len=%lld/%lld (queue_depth=%lld) iter %lld/%lld sigma[%.4f..%.4f] audio_sigma=%.4f",
+                         (long long)wstart, (long long)wend, (long long)wlen, (long long)T,
+                         (long long)queue_depth, (long long)m, (long long)total_iters,
+                         fifo_sigma_per_frame.front(), fifo_sigma_per_frame.back(), fifo_audio_sigma);
+                if (std::getenv("LTXAV_FIFO_STATS") != nullptr) {
+                    fifo_log_stats("x_t pre-forward (full)", x_t, video_ch);
+                }
+
+                fifo_windowed = true;
+                auto out      = denoise(win_latent, sigmas[0] /* nominal; per-frame vector overrides */, step);
+                fifo_windowed = false;
                 if (out.pred.empty() || out.pred_uncond.empty()) {
-                    LOG_ERROR("LTX FIFO: forward failed at iteration %lld/%lld", (long long)m, (long long)total_iters);
+                    LOG_ERROR("LTX FIFO: window forward failed at iteration %lld/%lld", (long long)m, (long long)total_iters);
                     return {};
                 }
                 if (std::getenv("LTXAV_FIFO_STATS") != nullptr) {
-                    fifo_log_stats("pred (cfg x0)", out.pred, video_ch);
-                    fifo_log_stats("pred_uncond x0", out.pred_uncond, video_ch);
+                    fifo_log_stats("pred (cfg x0, window)", out.pred, video_ch);
                 }
-                const float* p0 = out.pred.data();          // per-frame x0 (cfg-combined, mask-pinned)
-                const float* pu = out.pred_uncond.data();   // per-frame uncond x0
+
+                // Per-frame VP-normalized flow euler advance of the window's video frames, written back
+                // into the host-resident full latent x_t at ABSOLUTE frame positions.
+                const float* p0 = out.pred.data();          // window x0 (cfg-combined)
+                const float* pu = out.pred_uncond.data();   // window uncond x0
                 float* xd       = x_t.data();
-                // Per-frame euler_ancestral_cfg_pp advance with each frame's OWN (sigma, sigma_next).
-                // CRITICAL: LTX's default sampler (Euler A CFG++, eta=0) for a FLOW denoiser does NOT use
-                // the raw-sigma update x = denoised + d*sigma_next — that over-guides ~2.5x and over-
-                // weights the denoised anchor (see sample_euler_ancestral_cfg_pp is_flow_denoiser branch),
-                // which is exactly what inflated the FIFO video x0 variance ~3x -> garbage. Use the VP-
-                // normalized deterministic flow step (eta=0 => sigma_down=sigma_next, no ancestral noise):
-                //   alpha_s = 1-sigma; alpha_t = 1-sigma_next
-                //   d = (x - uncond_x0*alpha_s)/sigma;  x = cfg_x0*alpha_t + d*sigma_next
-                // sigma_next==0 collapses to x = cfg_x0 (the final clean frame).
-                auto flow_step = [&](int64_t i, float sig, float sig_next) {
-                    if (sig_next == 0.0f) {
-                        xd[i] = p0[i];
-                        return;
-                    }
-                    const float alpha_s = 1.0f - sig;
-                    const float alpha_t = 1.0f - sig_next;
-                    const float d       = (xd[i] - pu[i] * alpha_s) / sig;
-                    xd[i]               = p0[i] * alpha_t + d * sig_next;
-                };
-                for (int64_t a = 0; a < T; ++a) {
-                    const int64_t enter = a / blocks;
-                    const int idx       = static_cast<int>(m - enter);
+                for (int64_t a = wstart; a < wend; ++a) {
+                    const int idx = static_cast<int>(m - a / blocks);
                     if (idx < 0 || idx >= N) {
-                        continue;  // not entered yet, or already finished — leave frame untouched
+                        continue;  // frozen carry-context inside the window (force_full only) — leave as-is
                     }
-                    const float sig      = sigmas[static_cast<size_t>(idx)];       // > 0 for idx in [0,N-1]
-                    const float sig_next = sigmas[static_cast<size_t>(idx) + 1];   // 0 at the last notch
+                    const float sig      = sigmas[static_cast<size_t>(idx)];
+                    const float sig_next = sigmas[static_cast<size_t>(idx) + 1];
+                    const int64_t local  = a - wstart;
                     for (int64_t c = 0; c < video_ch; ++c) {
-                        const int64_t base = plane * (a + T * c);
+                        const int64_t xt_base  = plane * (a + T * c);
+                        const int64_t win_base = plane * (local + wlen * c);
                         for (int64_t s = 0; s < plane; ++s) {
-                            flow_step(base + s, sig, sig_next);
+                            xd[xt_base + s] = flow_val(xd[xt_base + s], p0[win_base + s], pu[win_base + s], sig, sig_next);
                         }
                     }
                     if (idx + 1 == N) {
                         ++emitted;  // frame a reached sigma 0 this iteration (conceptual pop/emit)
                     }
                 }
-                // Audio lockstep advance: same VP-normalized flow step for the whole audio block using the
-                // audio's global (sigma, sigma_next). Skipped in freeze mode (fifo_audio_sigma<0 there).
-                if (!fifo_audio_freeze && a_idx_raw >= 0 && a_idx_raw < N) {
-                    const int64_t C        = x_t.shape()[3];
-                    const int64_t plane_t  = plane * T;
-                    const float a_sig      = sigmas[static_cast<size_t>(a_idx_raw)];
-                    const float a_sig_next = sigmas[static_cast<size_t>(a_idx_raw) + 1];
-                    for (int64_t c = video_ch; c < C; ++c) {
-                        const int64_t base = plane_t * c;
-                        for (int64_t s = 0; s < plane_t; ++s) {
-                            flow_step(base + s, a_sig, a_sig_next);
+                // Audio global lockstep advance from the window forward's (full) audio x0. Skipped in
+                // freeze mode and while the audio has not entered / has finished.
+                if (pack_audio && !fifo_audio_freeze && a_idx_raw >= 0 && a_idx_raw < N) {
+                    sd::Tensor<float> a_p0 = unpack_ltxav_audio_latent(out.pred, static_cast<int>(audio_length), static_cast<int>(video_ch));
+                    sd::Tensor<float> a_pu = unpack_ltxav_audio_latent(out.pred_uncond, static_cast<int>(audio_length), static_cast<int>(video_ch));
+                    if (!a_p0.empty() && !a_pu.empty() && a_p0.numel() == audio_values) {
+                        const float a_sig      = sigmas[static_cast<size_t>(a_idx_raw)];
+                        const float a_sig_next = sigmas[static_cast<size_t>(a_idx_raw) + 1];
+                        float* as              = audio_state.data();
+                        const float* ap0       = a_p0.data();
+                        const float* apu       = a_pu.data();
+                        for (int64_t i = 0; i < audio_values; ++i) {
+                            as[i] = flow_val(as[i], ap0[i], apu[i], a_sig, a_sig_next);
                         }
                     }
                 }
             }
+            // Pack the advanced audio stream back into the host latent's packed audio region.
+            if (pack_audio) {
+                std::memcpy(x_t.data() + static_cast<size_t>(video_ch) * static_cast<size_t>(plane) * static_cast<size_t>(T),
+                            audio_state.data(), static_cast<size_t>(audio_values) * sizeof(float));
+            }
             fifo_audio_sigma = -1.0f;
             fifo_video_ch    = 0;
             fifo_sigma_per_frame.clear();  // disarm the diagonal for any subsequent scalar use
+            fifo_windowed    = false;
+            fifo_win_init_latent     = sd::Tensor<float>();
+            fifo_win_denoise_mask    = sd::Tensor<float>();
+            fifo_win_video_positions = sd::Tensor<float>();
             fifo_log_stats("FINAL x0 (FIFO)", x_t, video_ch);
-            LOG_INFO("LTX FIFO: complete — %lld/%lld frames emitted over %lld iterations",
-                     (long long)emitted, (long long)T, (long long)total_iters);
+            LOG_INFO("LTX FIFO: complete — %lld/%lld frames emitted over %lld iterations, peak window=%lld frames (full T=%lld)",
+                     (long long)emitted, (long long)T, (long long)total_iters, (long long)peak_wlen, (long long)T);
             return x_t;
         };
         // -------------------------------------------------------------------------------------
@@ -5662,7 +5810,7 @@ static sd::Tensor<float> build_ltxav_window_video_positions(int64_t width,
                                                             int64_t latent_frames,
                                                             int fps,
                                                             int spatial_scale,
-                                                            int temporal_scale = 8) {
+                                                            int temporal_scale) {
     GGML_ASSERT(width > 0 && height > 0 && latent_frames > 0 && fps > 0);
     sd::Tensor<float> positions({2, 3, width * height * latent_frames, 1});
     int64_t token = 0;
@@ -6289,8 +6437,8 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<flo
 static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
                                                                  const sd::Tensor<float>& video_latent,
                                                                  const sd::Tensor<float>& audio_latent,
-                                                                 float audio_mask_value = 1.f,
-                                                                 const sd::Tensor<float>* per_audio_mask = nullptr) {
+                                                                 float audio_mask_value,
+                                                                 const sd::Tensor<float>* per_audio_mask) {
     if (video_mask.empty() || audio_latent.empty()) {
         return video_mask;
     }
