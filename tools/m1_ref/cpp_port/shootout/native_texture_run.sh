@@ -27,6 +27,9 @@ OUT_ROOT="${IMAGE_TO_RIG_OUT_ROOT:-/mnt/hdd/3d/avatar-shootout/_shootout_out/run
 [[ -f "$MESH" ]] || { echo "missing mesh: $MESH" >&2; exit 2; }
 [[ -f "$IMAGE" ]] || { echo "missing image: $IMAGE" >&2; exit 2; }
 mkdir -p "$(dirname "$OUT")" "$OUT_ROOT"
+STATUS_FILE="${OUT}.run-status.txt"
+STARTED_AT="$(date -Is)"
+START_SECONDS=$SECONDS
 
 # PCI order is stable: physical GPU 0 is the reserved 3060.  Do not remove
 # CUDA_DEVICE_ORDER: a bare CVD=0 has historically selected the owner's 5060.
@@ -37,6 +40,29 @@ GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 
 exec 9>"$OUT_ROOT/.3060-image-to-rig.lock"
 flock -n 9 || { echo "another image-to-rig job owns the 3060" >&2; exit 75; }
+
+write_status() {
+  local state="$1" rc="${2:-0}"
+  shift 2
+  {
+    printf 'state=%s\n' "$state"
+    printf 'started_at=%s\n' "$STARTED_AT"
+    printf 'updated_at=%s\n' "$(date -Is)"
+    printf 'elapsed_seconds=%s\n' "$((SECONDS-START_SECONDS))"
+    printf 'exit_code=%s\n' "$rc"
+    printf 'gpu=PCI GPU 0 / %s\n' "$GPU_NAME"
+    printf 'mesh=%s\nimage=%s\nout=%s\n' "$MESH" "$IMAGE" "$OUT"
+    printf 'args='
+    printf ' %q' "$@"
+    printf '\n'
+  } >"$STATUS_FILE"
+}
+finish_status() {
+  local rc=$?
+  if (( rc == 0 )); then write_status succeeded 0 "$@"; else write_status failed "$rc" "$@"; fi
+}
+write_status running 0 "$@"
+trap 'finish_status "$@"' EXIT
 
 echo "== native texture: $(basename "$MESH") + $(basename "$IMAGE") -> $OUT =="
 "$BIN" --model "$WEIGHTS" --mesh "$MESH" --image "$IMAGE" --out "$OUT" "$@"
