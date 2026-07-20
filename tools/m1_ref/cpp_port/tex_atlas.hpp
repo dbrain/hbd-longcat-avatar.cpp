@@ -933,9 +933,23 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (e != xatlas::AddMeshError::Success) { fprintf(stderr,"[atlas] AddMesh error: %s\n", xatlas::StringForEnum(e)); }
         xatlas::AddMeshJoin(atlas);
         xatlas::ChartOptions co;
-        co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
-        co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
-        co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
+        if (std::getenv("ATL_PYREF_XATLAS")) {
+            // Reference mode must match CuMesh's *chart* parameters as well as its
+            // pack settings.  This direct-mesh branch previously retained the loose
+            // historic C++ values, so the advertised reference unwrap was not actually
+            // the same recipe as the Python reference.
+            co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 2.0f;
+            co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 2.0f;
+            co.normalSeamWeight = getenv("ATL_NSW") ? atof(getenv("ATL_NSW")) : 4.0f;
+            co.straightnessWeight = getenv("ATL_SW") ? atof(getenv("ATL_SW")) : 6.0f;
+            co.roundnessWeight = getenv("ATL_RW") ? atof(getenv("ATL_RW")) : 0.01f;
+            co.textureSeamWeight = getenv("ATL_TSW") ? atof(getenv("ATL_TSW")) : 0.5f;
+            co.maxIterations = getenv("ATL_XITERS") ? atoi(getenv("ATL_XITERS")) : 1;
+        } else {
+            co.maxCost = getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
+            co.normalDeviationWeight = getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
+            co.normalSeamWeight = 1.0f; co.straightnessWeight = 1.0f; co.roundnessWeight = 0.1f; co.maxIterations = 1;
+        }
         if (verbose){ printf("[atlas] unwrapping %d verts / %d faces ...\n", Vin, Fin); fflush(stdout); }
         xatlas::ComputeCharts(atlas, co);
         pack_charts();
