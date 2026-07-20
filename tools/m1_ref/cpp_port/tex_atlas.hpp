@@ -800,6 +800,31 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     std::vector<uint32_t> idx32((size_t)Fin*3);
     for (size_t i=0;i<idx32.size();i++) idx32[i]=(uint32_t)in_faces[i];
 
+    // Direct xatlas segmentation is excellent on the normal closed meshes, but a QEM/sloppy
+    // decimation can leave a large non-manifold edge fan.  On those meshes its half-edge build
+    // grows pathologically (minutes for Miku) even though the material is sampled directly from
+    // the PBR volume.  Detect the condition on the *actual decimated bake mesh*, then use the
+    // existing conformal pre-cluster path: xatlas still parameterizes each disconnected island,
+    // but never sees the bad global topology.  This is topology-driven, not model-name-driven.
+    bool auto_precluster=false;
+    size_t nonmanifold_edges=0;
+    if (!precluster && deci && !std::getenv("ATL_FORCE_DIRECT") && !std::getenv("ATL_AUTO_PRECLUSTER_OFF")) {
+        std::unordered_map<uint64_t,uint32_t> edge_use;
+        edge_use.reserve((size_t)Fin*3);
+        for (int f=0;f<Fin;f++) for (int k=0;k<3;k++) {
+            uint32_t a=(uint32_t)in_faces[(size_t)f*3+k];
+            uint32_t b=(uint32_t)in_faces[(size_t)f*3+(k+1)%3];
+            if (a>b) std::swap(a,b);
+            ++edge_use[((uint64_t)a<<32)|b];
+        }
+        for (const auto& e:edge_use) if (e.second>2) ++nonmanifold_edges;
+        auto_precluster=nonmanifold_edges > std::max<size_t>(2048,(size_t)Fin/100);
+        if (verbose && auto_precluster)
+            printf("[atlas] auto precluster: %zu non-manifold edges / %d faces (direct xatlas safety gate)\n",
+                   nonmanifold_edges,Fin);
+    }
+    const bool effective_precluster=precluster || auto_precluster;
+
     // ---- xatlas UV unwrap ----
     xatlas::Atlas* atlas = xatlas::Create();
     if (verbose) xatlas::SetProgressCallback(atlas, _xatlas_progress, nullptr);
@@ -832,7 +857,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             xatlas::PackCharts(atlas, po);
         }
     };
-    if (precluster && !std::getenv("ATL_PLANAR")) {
+    if (effective_precluster && !std::getenv("ATL_PLANAR")) {
         double tp=_now();
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (std::getenv("ATL_PYREF_XATLAS") ? 90.f : cone_deg);
         std::vector<ClusterMesh> clusters;
@@ -910,7 +935,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             xatlas::ComputeCharts(atlas, co);
         }
         pack_charts();
-    } else if (precluster) {
+    } else if (effective_precluster) {
         // Legacy diagnostic path: build our own charts (normal-cone region-grow), hand xatlas pre-made
         // planar UV islands. Fast, but folds on curved sheets; keep only for A/B with ATL_PLANAR=1.
         std::vector<float> uv; std::vector<int> uv2orig; std::vector<uint32_t> uvfaces, facemat; int ncl=0;
