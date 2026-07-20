@@ -5971,6 +5971,20 @@ static bool ltxav_shared_refine_noise_enabled() {
     return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
 
+// Temporal MultiDiffusion refine (step-synchronous shared-latent consensus). The freeze/temporal-blend
+// path (LTX_REFINE_TEMPORAL_BLEND) fully denoises each window then FREEZES its overlap into the next —
+// two finished trajectories stitched after they have already diverged (nondeterminism + context
+// mismatch => the seam). MultiDiffusion instead keeps ONE shared timeline latent and reconciles the
+// overlapping windows at EVERY sigma step: each window takes one cfg_pp step, the overlapping stepped
+// latents are feather-averaged into the shared latent, and every window re-slices from that same
+// latent next step. Windows cannot drift apart. VRAM-neutral vs the freeze path — the DiT still only
+// sees one window per forward; the shared timeline latent stays host-resident. VALUE-gated (never
+// presence-gated: compose passes "${VAR:-}" => empty string => getenv non-null).
+static bool ltxav_refine_multidiffusion_enabled() {
+    const char* e = std::getenv("LTXAV_REFINE_MULTIDIFFUSION");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+
 // Chain-CONSTANT base seed for the position-keyed noise. It must NOT depend on the segment: the chain
 // gives each segment seed = base + seg (generate_video_chain) precisely so base motion varies, and
 // inheriting that here would hand the same absolute frame a different seed in each segment — defeating the whole
@@ -12276,6 +12290,46 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                       latents.audio_fixed || latents.audio_reference_conditioning,
                                       window_video_reference);
         };
+        // Temporal-MultiDiffusion single sub-step: take exactly ONE cfg_pp sampler step over a window
+        // that is ALREADY noised to sub_sigmas[0]. Empty noise => sample() skips its own renoise and
+        // uses window_latent directly as x_t (:2830). inverse_noise_scaling=false + return_denoised
+        // (default) false => the raw stepped latent x_{sub_sigmas[1]} comes back, which is what the
+        // MultiDiffusion consensus averages. Same DiT/cfg_pp/audio/RoPE machinery as the full refine.
+        auto sample_refine_one_step = [&](const sd::Tensor<float>& window_latent,
+                                          const sd::Tensor<float>& window_mask,
+                                          const sd::Tensor<float>& window_video_positions,
+                                          const sd::Tensor<float>& window_audio_positions,
+                                          const sd::Tensor<float>& window_video_reference,
+                                          const std::vector<float>& sub_sigmas) {
+            return sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+                                      false,
+                                      window_latent,
+                                      sd::Tensor<float>(),
+                                      embeds.cond,
+                                      hires_needs_uncond ? embeds.uncond : SDCondition(),
+                                      embeds.img_uncond,
+                                      sd::Tensor<float>(),
+                                      0.f,
+                                      hires_guidance,
+                                      hires_eta,
+                                      sd_vid_gen_params->sample_params.shifted_timestep,
+                                      hires_sample_method,
+                                      sd_ctx->sd->is_flow_denoiser(),
+                                      plan.extra_sample_args,
+                                      sub_sigmas,
+                                      std::vector<sd::Tensor<float>>{},
+                                      false,
+                                      window_mask,
+                                      sd::Tensor<float>(),
+                                      hires_request.vace_strength,
+                                      latents.audio_length,
+                                      static_cast<float>(hires_request.fps),
+                                      hires_request.cache_params,
+                                      window_video_positions,
+                                      window_audio_positions,
+                                      latents.audio_fixed || latents.audio_reference_conditioning,
+                                      window_video_reference);
+        };
 
         // Continuation's high-res guide has the same spatial grid as the
         // stage-2 target. It is safe to reuse for every temporal refine tile
@@ -12300,7 +12354,197 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                              // Keep the existing temporal-blend alternate path out of the
                                              // strictly-gated ComfyUI two-pass workflow.
                                              !hires_continue_mode;
-        if (!temporal_refine_enabled) {
+        // Unlike the temporal-blend gate above, MD does NOT exclude hires_continue_mode: that exclusion
+        // exists only to keep the default-ON temporal-blend byte-identical on the ver3 two-pass path.
+        // MD is default-OFF (value-gated) and is a pure refine-sampler replacement operating on x_t
+        // after it is formed, so it is compatible with the ver3 continue path (which is the real prod
+        // refine we need to fix) and only ever changes output when explicitly enabled.
+        const bool multidiffusion_enabled =
+            ltxav_refine_multidiffusion_enabled() &&
+            sd_version_is_ltxav(sd_ctx->sd->version) &&
+            (hires_video_positions.empty() || refine_reference_windowable) &&
+            x_t.dim() == 5 && x_t.shape()[2] > 1;
+        if (multidiffusion_enabled) {
+            // === Temporal MultiDiffusion refine (step-synchronous shared-latent consensus) ===
+            int md_window  = 8;
+            int md_overlap = 4;
+            if (const char* e = std::getenv("LTXAV_MD_WINDOW"); e != nullptr && e[0] != '\0') {
+                md_window = std::max(2, std::atoi(e));
+            }
+            if (const char* e = std::getenv("LTXAV_MD_OVERLAP"); e != nullptr && e[0] != '\0') {
+                md_overlap = std::max(1, std::atoi(e));
+            }
+            const int64_t total_frames   = x_t.shape()[2];
+            md_window  = std::clamp(md_window, 2, static_cast<int>(total_frames));
+            md_overlap = std::clamp(md_overlap, 1, md_window - 1);
+            const int64_t stride          = md_window - md_overlap;
+            const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
+            const bool has_audio          = latents.audio_length > 0 && x_t.shape()[3] > latent_channels;
+            const int64_t plane           = x_t.shape()[0] * x_t.shape()[1];
+            const size_t  n_steps         = hires_sigma_sched.size() - 1;
+
+            // Renoise the WHOLE timeline once at sigma0 (flow: x = init*(1-s) + noise*s), matching the
+            // DiscreteFlowDenoiser::noise_scaling that sample() would otherwise apply per window.
+            const float md_sigma0    = hires_sigma_sched.front();
+            sd::Tensor<float> x_shared = x_t * (1.0f - md_sigma0) + noise * md_sigma0;
+
+            // Host-resident split into a video timeline + a global audio latent.
+            sd::Tensor<float> x_video = sd::ops::slice(x_shared, 3, 0, latent_channels);
+            sd::Tensor<float> audio_latent;
+            bool md_ok = true;
+            if (has_audio) {
+                audio_latent = unpack_ltxav_audio_latent(x_shared, latents.audio_length,
+                                                         static_cast<int>(latent_channels));
+                if (audio_latent.empty()) {
+                    LOG_ERROR("LTX MultiDiffusion refine could not unpack packed audio latent");
+                    md_ok = false;
+                }
+            }
+            // Preserve any locked i2v/keyframe conditioning mask (video channels only), exactly as the
+            // temporal-blend path does; empty for plain t2v => every frame refined free.
+            sd::Tensor<float> full_video_denoise_mask;
+            if (!hires_denoise_mask.empty()) {
+                const int64_t mask_video_ch = std::min<int64_t>(latent_channels, hires_denoise_mask.shape()[3]);
+                full_video_denoise_mask     = sd::ops::slice(hires_denoise_mask, 3, 0, mask_video_ch);
+            }
+            const sd::Tensor<float> md_audio_positions =
+                latents.audio_positions.empty() && has_audio
+                    ? build_ltxav_window_audio_positions(0, latents.audio_length)
+                    : latents.audio_positions;
+
+            LOG_INFO("LTX MultiDiffusion refine: T=%lld window=%d overlap=%d stride=%lld steps=%zu sigma0=%.5f%s",
+                     (long long)total_frames, md_window, md_overlap, (long long)stride, n_steps, md_sigma0,
+                     has_audio ? " +audio" : "");
+
+            for (size_t step = 0; md_ok && step < n_steps; ++step) {
+                const std::vector<float> sub_sigmas = {hires_sigma_sched[step], hires_sigma_sched[step + 1]};
+                sd::Tensor<float> accum_v(x_video.shape());
+                accum_v.fill_(0.0f);
+                std::vector<float> wsum_v(static_cast<size_t>(total_frames), 0.0f);
+                sd::Tensor<float> accum_a;
+                int audio_windows = 0;
+                if (has_audio) {
+                    accum_a = sd::Tensor<float>(audio_latent.shape());
+                    accum_a.fill_(0.0f);
+                }
+                int tile_index = 0;
+                for (int64_t start = 0;; start += stride, ++tile_index) {
+                    const int64_t tile_start = start + md_window >= total_frames
+                                                   ? std::max<int64_t>(0, total_frames - md_window)
+                                                   : start;
+                    const int64_t end    = std::min<int64_t>(total_frames, tile_start + md_window);
+                    const int64_t length = end - tile_start;
+                    auto video_tile      = sd::ops::slice(x_video, 2, tile_start, end);
+                    auto video_mask      = full_video_denoise_mask.empty()
+                                               ? make_ltxav_video_denoise_mask(video_tile, 1.0f)
+                                               : sd::ops::slice(full_video_denoise_mask, 2, tile_start, end);
+                    auto refine_video_positions = refine_reference_windowable
+                        ? build_ltxav_window_video_positions_with_reference(video_tile.shape()[0],
+                                                                            video_tile.shape()[1],
+                                                                            tile_start,
+                                                                            length,
+                                                                            hires_video_reference.shape()[2],
+                                                                            hires_request.fps,
+                                                                            hires_request.vae_scale_factor)
+                        : build_ltxav_window_video_positions(video_tile.shape()[0],
+                                                             video_tile.shape()[1],
+                                                             tile_start,
+                                                             length,
+                                                             hires_request.fps,
+                                                             hires_request.vae_scale_factor);
+                    sd::Tensor<float> md_empty_guide;
+                    const sd::Tensor<float>& identity_guide =
+                        refine_reference_windowable ? hires_video_reference : md_empty_guide;
+                    sd::Tensor<float> latent_tile = video_tile;
+                    sd::Tensor<float> mask_tile   = video_mask;
+                    if (has_audio) {
+                        latent_tile = pack_ltxav_audio_and_video_latents(video_tile, audio_latent);
+                        mask_tile   = pack_ltxav_audio_and_video_denoise_mask(
+                            video_mask, video_tile, audio_latent, latents.audio_fixed ? 0.0f : 1.0f);
+                    }
+                    auto stepped = sample_refine_one_step(latent_tile, mask_tile, refine_video_positions,
+                                                          md_audio_positions, identity_guide, sub_sigmas);
+                    if (stepped.empty()) {
+                        md_ok = false;
+                        break;
+                    }
+                    auto stepped_v = sd::ops::slice(stepped, 3, 0, latent_channels);
+                    // Feather-average the stepped latent into the shared timeline. Tent weight
+                    // min(local+1, length-local) peaks mid-window (>=1 at edges, so no frame is ever
+                    // zero-weighted) => a smooth crossfade in every overlap, self-normalising at the
+                    // clip borders via wsum.
+                    const float* sp = stepped_v.data();
+                    float*       ap = accum_v.data();
+                    for (int64_t local = 0; local < length; ++local) {
+                        const int64_t global = tile_start + local;
+                        const float   w      = static_cast<float>(std::min<int64_t>(local + 1, length - local));
+                        wsum_v[static_cast<size_t>(global)] += w;
+                        for (int64_t channel = 0; channel < latent_channels; ++channel) {
+                            const float* s = sp + plane * (local + length * channel);
+                            float*       a = ap + plane * (global + total_frames * channel);
+                            for (int64_t pixel = 0; pixel < plane; ++pixel) {
+                                a[pixel] += w * s[pixel];
+                            }
+                        }
+                    }
+                    if (has_audio) {
+                        auto stepped_a = unpack_ltxav_audio_latent(stepped, latents.audio_length,
+                                                                   static_cast<int>(latent_channels));
+                        if (stepped_a.empty()) {
+                            LOG_ERROR("LTX MultiDiffusion refine could not unpack stepped audio latent");
+                            md_ok = false;
+                            break;
+                        }
+                        const float* asp = stepped_a.data();
+                        float*       aap = accum_a.data();
+                        const int64_t an = accum_a.numel();
+                        for (int64_t i = 0; i < an; ++i) {
+                            aap[i] += asp[i];
+                        }
+                        ++audio_windows;
+                    }
+                    if (end == total_frames) {
+                        break;
+                    }
+                }
+                if (!md_ok) {
+                    break;
+                }
+                // Normalise the consensus back into the shared timeline for the next sigma step.
+                float*       xv = x_video.data();
+                const float* ap = accum_v.data();
+                for (int64_t global = 0; global < total_frames; ++global) {
+                    const float inv = wsum_v[static_cast<size_t>(global)] > 0.0f
+                                          ? 1.0f / wsum_v[static_cast<size_t>(global)]
+                                          : 0.0f;
+                    for (int64_t channel = 0; channel < latent_channels; ++channel) {
+                        float*       x = xv + plane * (global + total_frames * channel);
+                        const float* a = ap + plane * (global + total_frames * channel);
+                        for (int64_t pixel = 0; pixel < plane; ++pixel) {
+                            x[pixel] = a[pixel] * inv;
+                        }
+                    }
+                }
+                if (has_audio && audio_windows > 0) {
+                    float*       xa  = audio_latent.data();
+                    const float* aa  = accum_a.data();
+                    const int64_t an = audio_latent.numel();
+                    const float   inv = 1.0f / static_cast<float>(audio_windows);
+                    for (int64_t i = 0; i < an; ++i) {
+                        xa[i] = aa[i] * inv;
+                    }
+                }
+                LOG_INFO("LTX MultiDiffusion refine: completed sigma step %zu/%zu (%.5f -> %.5f)",
+                         step + 1, n_steps, sub_sigmas[0], sub_sigmas[1]);
+            }
+            if (md_ok) {
+                final_latent = has_audio
+                                   ? pack_ltxav_audio_and_video_latents(x_video, audio_latent)
+                                   : std::move(x_video);
+            } else {
+                final_latent = {};
+            }
+        } else if (!temporal_refine_enabled) {
             final_latent = sample_refine_window(x_t,
                                                 std::move(noise),
                                                 hires_denoise_mask,
