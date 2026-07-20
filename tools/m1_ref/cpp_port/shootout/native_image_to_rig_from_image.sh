@@ -47,6 +47,15 @@ ln -sfn "$IMAGE" "$OUT/source_image"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 export REMESH_CLOSE_R="${REMESH_CLOSE_R:-3}"
+[[ "$REMESH_CLOSE_R" =~ ^[1-9][0-9]*$ ]] || {
+  echo "REMESH_CLOSE_R must be a positive integer (the clean-production default is 3)" >&2; exit 2;
+}
+# This is deliberately a versioned *geometry* recipe rather than an informal
+# environment setting.  A cache made with a different seal radius is a
+# different reconstruction and must never be reused just because the source
+# image happens to be identical.
+GEOMETRY_RECIPE_VERSION=2
+GEOMETRY_RECIPE="moge-noquad-us16384-cross-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 [[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: PCI GPU 0 is '$GPU_NAME', expected RTX 3060" >&2; exit 1; }
 GPU_3060_UUID="$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0 | head -1)"
@@ -91,9 +100,9 @@ esac
 [[ -f "$PIPELINE_IMAGE" ]] || { echo "missing model-facing matte: $PIPELINE_IMAGE" >&2; exit 1; }
 MATTE_HASH="$(sha256sum "$PIPELINE_IMAGE" | awk '{print substr($1,1,16)}')"
 # The cache key includes both the uploaded bytes and the exact model-facing matte bytes. This prevents
-# a changed matting service, alpha cutout, or framing recipe from silently reusing geometry made from a
-# different image frame.
-CACHE="$OUT/cache_${IMAGE_HASH}_${MATTE_HASH}_n16384_seal3"
+# a changed matting service, alpha cutout, framing recipe, or clean-geometry
+# recipe from silently reusing geometry made from a different image frame.
+CACHE="$OUT/cache_${IMAGE_HASH}_${MATTE_HASH}_n16384_seal${REMESH_CLOSE_R}_geom${GEOMETRY_RECIPE_VERSION}"
 ln -sfn "$PIPELINE_IMAGE" "$OUT/input.png"
 printf 'source_image=%s\nsource_sha256=%s\ninput_kind=%s\ninput_mode=%s\nmodel_image=%s\nmodel_image_sha256=%s\n' \
   "$IMAGE" "$IMAGE_HASH" "$INPUT_KIND" "$INPUT_MODE" "$PIPELINE_IMAGE" "$MATTE_HASH" >"$OUT/preprocess_source.txt"
@@ -105,7 +114,11 @@ fi
 # Keep this geometry cache deliberately separate from the final native texture outputs.  `image_to_rig`
 # is used only for its native MoGe + geometry + UltraShape stages; its legacy texture/rig result is never
 # promoted over the native textured assets produced below.
-if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || ! -f "$CACHE/pbr_feats.bin" || ! -f "$CACHE/pbr_coords.bin" ]]; then
+cache_recipe_matches=0
+if [[ -f "$CACHE/geometry_recipe.txt" ]] && grep -Fqx "geometry_recipe=$GEOMETRY_RECIPE" "$CACHE/geometry_recipe.txt"; then
+  cache_recipe_matches=1
+fi
+if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || ! -f "$CACHE/pbr_feats.bin" || ! -f "$CACHE/pbr_coords.bin" || "$cache_recipe_matches" != 1 ]]; then
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   mkdir -p "$CACHE" "$OUT_ROOT"
   echo "== $LABEL: create clean geometry cache ${CACHE##*/} on the RTX 3060 =="
@@ -116,11 +129,30 @@ if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || ! -f "$C
       --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8 \
       --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
   )
+  printf 'geometry_recipe=%s\nremesh_close_r=%s\ngeometry_recipe_version=%s\n' \
+    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$GEOMETRY_RECIPE_VERSION" >"$CACHE/geometry_recipe.txt"
 else
   echo "== $LABEL: reuse image-keyed clean geometry cache ${CACHE##*/} =="
 fi
 
 [[ -f "$CACHE/refined.glb" ]] || { echo "geometry cache did not produce refined.glb" >&2; exit 1; }
+# Do this before native material inference: a closed, inspectable geometry is
+# a prerequisite for a clean texture delivery, not a fact to discover after
+# consuming the reserved GPU.  Nonmanifold edges are retained as diagnostic
+# evidence (UltraShape output can include seam contacts); an actual boundary
+# is a hard stop because it will make both bake and animation visibly fail.
+GEOMETRY_TOPOLOGY="$("$CP/mesh_topo" "$CACHE/refined.glb")" || { echo "could not inspect refined geometry" >&2; exit 1; }
+[[ "$GEOMETRY_TOPOLOGY" =~ open=([0-9]+) ]] || { echo "refined geometry topology report lacks open-edge count" >&2; exit 1; }
+GEOMETRY_OPEN="${BASH_REMATCH[1]}"
+{
+  printf 'geometry_cache=%s\n' "$CACHE"
+  printf 'geometry_recipe=%s\n' "$GEOMETRY_RECIPE"
+  printf 'remesh_close_r=%s\n' "$REMESH_CLOSE_R"
+  printf 'geometry_topology=%s\n' "$GEOMETRY_TOPOLOGY"
+  printf 'geometry_gate=position-welded open=0 before native texture inference\n'
+  printf 'geometry_gate_result=%s\n' "$([[ "$GEOMETRY_OPEN" == 0 ]] && echo passed || echo rejected)"
+} >"$OUT/geometry_delivery.txt"
+(( GEOMETRY_OPEN == 0 )) || { echo "REJECT: refined geometry has $GEOMETRY_OPEN open edges; refusing texture/rig stages" >&2; exit 1; }
 NATIVE_RIG=1
 if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE" "$OUT" "$LABEL"; then
   NATIVE_RIG=0
@@ -311,7 +343,8 @@ model_image=$PIPELINE_IMAGE
 input_kind=$INPUT_KIND
 input_mode=$INPUT_MODE
 geometry_cache=$CACHE
-geometry_recipe=image_to_rig --moge --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8 --no-rig
+geometry_recipe=$GEOMETRY_RECIPE
+geometry_delivery_manifest=$OUT/geometry_delivery.txt
 texture_recipe=native high Trellis material + CPU medium/low rebakes from native_high_texture_dump + structural rig gate
 texture_delivery_manifest=$OUT/texture_delivery.txt
 rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
