@@ -11,7 +11,7 @@
 #
 # Optional:
 #   NATIVE_HIGH_RESOLUTION=1024 NATIVE_HIGH_ATLAS=4096  hero-detail high A/B
-#   NATIVE_TEXTURE_DUMP=1                               retain PBR dumps for CPU rebakes
+#   (the generic runner always retains native_high_texture_dump for CPU LOD rebakes)
 #   IMAGE_TO_RIG_REFRESH=1                              recompute even if this image's cache exists
 #   IMAGE_TO_RIG_PROJECT=1                               create observed-view projection A/B
 #   IMAGE_TO_RIG_TEX_BACK=/abs/back.png
@@ -159,7 +159,7 @@ source_image=$IMAGE
 source_sha256=$IMAGE_HASH
 geometry_cache=$CACHE
 geometry_recipe=image_to_rig --moge --no-quad --us-latents 16384 --tex-dit cross --tex-volume-direct --tex-fallback-r 8 --no-rig
-texture_recipe=native_image_to_rig.sh (native Trellis texture + structural rig gate)
+texture_recipe=native high Trellis material + CPU medium/low rebakes from native_high_texture_dump + structural rig gate
 rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
 gpu=PCI GPU 0 / RTX 3060 only
 EOF

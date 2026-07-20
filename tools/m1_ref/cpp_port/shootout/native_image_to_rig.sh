@@ -4,8 +4,10 @@
 # Usage:
 #   native_image_to_rig.sh <refined.glb> <same-frame-rgba-or-black-matte.png> <out-dir> [label]
 #
-# Produces three independently baked native Trellis assets (high/medium/low),
-# then deterministically rigs the highest quality candidate that passes the
+# Produces one authoritative native Trellis material, then CPU-rebakes it onto
+# high/medium/low meshes.  This keeps every LOD's appearance consistent and
+# avoids spending the reserved 3060 three times on the same source image.
+# It then deterministically rigs the highest quality candidate that passes the
 # structural gate.  The source image and refined mesh must share a frame; a
 # front-only image is deliberately not treated as a 360-degree observation.
 # All model inference is bound to physical PCI GPU 0 (the RTX 3060).
@@ -19,7 +21,7 @@ LABEL="${4:-$(basename "$OUT")}"
 
 [[ -f "$REFINED" ]] || { echo "missing refined mesh: $REFINED" >&2; exit 2; }
 [[ -f "$IMAGE" ]] || { echo "missing source image: $IMAGE" >&2; exit 2; }
-for bin in native_texture_run.sh mesh_sample_main rig_texture_chain.sh rig_score mesh_topo; do
+for bin in native_texture_run.sh native_texture_rebake.sh texture_rebake_native mesh_sample_main rig_texture_chain.sh rig_score mesh_topo; do
   [[ -x "$CP/shootout/$bin" || -x "$CP/$bin" ]] || { echo "missing executable: $bin" >&2; exit 2; }
 done
 
@@ -50,21 +52,30 @@ NATIVE_UNWRAP="${NATIVE_UNWRAP:-reference}"
   echo "NATIVE_UNWRAP must be reference or production" >&2; exit 2;
 }
 
-run_texture_level() {
-  local name="$1" faces="$2" resolution="$3" atlas="$4"
+run_native_high() {
+  local out="$OUT/native_high_textured.glb"
+  local atlas_out="$OUT/native_high_textured_atlas.png"
+  local dump="$OUT/native_high_texture_dump"
+  echo "== $LABEL: native high (300000 faces, ${NATIVE_HIGH_ATLAS}px atlas, one 3060 inference) =="
+  "$CP/shootout/native_texture_run.sh" "$REFINED" "$IMAGE" "$out" \
+    --resolution "$NATIVE_HIGH_RESOLUTION" --texsize "$NATIVE_HIGH_ATLAS" --decimate 300000 --unwrap "$NATIVE_UNWRAP" \
+    --atlas-out "$atlas_out" --dump-dir "$dump"
+  [[ -s "$atlas_out" ]] || { echo "native high did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
+  [[ -s "$dump/native_pbr_feats.npy" && -s "$dump/native_pbr_coords.npy" ]] || {
+    echo "native high did not retain the authoritative PBR volume" >&2; return 1;
+  }
+  "$CP/mesh_topo" "$out"
+}
+
+run_rebaked_lod() {
+  local name="$1" faces="$2" atlas="$3"
   local out="$OUT/native_${name}_textured.glb"
   local atlas_out="$OUT/native_${name}_textured_atlas.png"
-  local dump_args=()
-  # Retain the decoded native PBR volume when requested, enabling CPU-only rebakes of the exact
-  # same material later. Off by default because three LOD dumps are large; it never affects output.
-  if [[ "${NATIVE_TEXTURE_DUMP:-0}" != 0 ]]; then
-    dump_args=(--dump-dir "$OUT/native_${name}_texture_dump")
-  fi
-  echo "== $LABEL: native $name (${faces} faces, ${atlas}px atlas) =="
-  "$CP/shootout/native_texture_run.sh" "$REFINED" "$IMAGE" "$out" \
-    --resolution "$resolution" --texsize "$atlas" --decimate "$faces" --unwrap "$NATIVE_UNWRAP" \
-    --atlas-out "$atlas_out" "${dump_args[@]}"
-  [[ -s "$atlas_out" ]] || { echo "native texture did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
+  echo "== $LABEL: native $name (${faces} faces, ${atlas}px atlas, CPU rebake of high material) =="
+  "$CP/shootout/native_texture_rebake.sh" "$REFINED" "$OUT/native_high_texture_dump" "$out" \
+    --resolution "$NATIVE_HIGH_RESOLUTION" --texsize "$atlas" --decimate "$faces" --unwrap "$NATIVE_UNWRAP" \
+    --atlas-out "$atlas_out"
+  [[ -s "$atlas_out" ]] || { echo "native $name did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
   "$CP/mesh_topo" "$out"
 }
 
@@ -107,9 +118,9 @@ try_rig() {
   return 1
 }
 
-run_texture_level high   300000 "$NATIVE_HIGH_RESOLUTION" "$NATIVE_HIGH_ATLAS"
-run_texture_level medium 150000 512 1024
-run_texture_level low     50000 512 1024
+run_native_high
+run_rebaked_lod medium 150000 1024
+run_rebaked_lod low     50000 1024
 
 SELECTED_RIG=""
 for level in high medium low; do
@@ -120,9 +131,9 @@ done
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
  {"file":"hymotion_rigged.glb","label":"Hymotion-ready · native $SELECTED_RIG rig","note":"native Trellis texture; deterministic beam rig; maxfan ≤ 7 and rig_score ≥ 0.50"},
- {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas · ${NATIVE_UNWRAP} unwrap"},
- {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas · ${NATIVE_UNWRAP} unwrap"},
- {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas · ${NATIVE_UNWRAP} unwrap"}
+ {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas · ${NATIVE_UNWRAP} unwrap · authoritative native material"},
+ {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas · CPU rebake of the high native material"},
+ {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas · CPU rebake of the high native material"}
 ]}
 JSON
 echo "== DONE: $OUT (native $SELECTED_RIG rig selected) =="
