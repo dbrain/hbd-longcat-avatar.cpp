@@ -1772,6 +1772,11 @@ protected:
     std::map<std::string, ggml_tensor*> cache_tensor_map;  // name -> tensor
     std::vector<std::pair<ggml_tensor*, std::string>> debug_tensors;
     const std::string final_result_name = "ggml_runner_final_result_tensor";
+    // Fork-only causal runners export per-segment K/V tensors to host while their
+    // graph-cut allocation is still live. Keep this as a narrow runner callback:
+    // upstream owns planning, residency, and parameter lifecycle; the callback only
+    // observes a successfully computed graph before its transient buffer is released.
+    std::function<void(ggml_cgraph*)> segment_readback_hook_ = nullptr;
 
     bool flash_attn_enabled    = false;
     bool conv2d_direct_enabled = false;
@@ -2830,6 +2835,10 @@ protected:
                 auto debug_tensor = sd::make_sd_tensor_from_ggml<float>(tensor);
                 print_sd_tensor(debug_tensor, false, entry.second.c_str());
             }
+        }
+
+        if (segment_readback_hook_) {
+            segment_readback_hook_(gf);
         }
 
         if (!copy_cache_tensors_to_cache_buffer(cache_keep_names)) {
