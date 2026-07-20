@@ -28,10 +28,20 @@
 #include <cstring>
 #include <queue>
 #include <limits>
+#include <fstream>
 
 namespace texatlas {
 
 static inline double _now(){ using namespace std::chrono; return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count(); }
+// The native launcher samples this tiny append-only log into its live status file.  It is
+// deliberately independent of stdout: a detached runner must still reveal whether a long bake is
+// in xatlas, rasterisation, sparse sampling, or inpainting.
+static inline void _stage(const char* name) {
+    const char* path=std::getenv("TEX_STAGE_LOG");
+    if (!path || !*path) return;
+    std::ofstream f(path,std::ios::app);
+    if (f) f << "t=" << _now() << " stage=" << name << '\n';
+}
 static double _phase_t0 = 0;
 static bool _xatlas_progress(xatlas::ProgressCategory cat, int progress, void*) {
     if (progress==0) { _phase_t0=_now(); }
@@ -522,7 +532,7 @@ static inline void precluster_charts(const std::vector<float>& V, const std::vec
 // folding planar UVs.
 static inline void precluster_split_mesh(const std::vector<float>& V, const std::vector<int64_t>& F,
         float cone_cos, std::vector<float>& out_v, std::vector<uint32_t>& out_f,
-        std::vector<int>& split2orig, int& n_charts) {
+        std::vector<int>& split2orig, int& n_charts, std::vector<uint32_t>* face_materials=nullptr) {
     const int64_t Nf = (int64_t)F.size()/3;
     std::vector<float> fn((size_t)Nf*3);
     for (int64_t t=0;t<Nf;t++){ const float*a=&V[F[t*3]*3],*b=&V[F[t*3+1]*3],*c=&V[F[t*3+2]*3];
@@ -546,9 +556,11 @@ static inline void precluster_split_mesh(const std::vector<float>& V, const std:
     }
 
     out_v.clear(); out_f.resize((size_t)Nf*3); split2orig.clear();
+    if (face_materials) face_materials->resize((size_t)Nf);
     out_v.reserve(V.size()); split2orig.reserve(V.size()/3);
     std::unordered_map<int64_t,int> seen; seen.reserve((size_t)Nf*3);
     for (int64_t t=0;t<Nf;t++){ int c=chart[t];
+        if (face_materials) (*face_materials)[(size_t)t]=(uint32_t)c;
         for(int k=0;k<3;k++){ int64_t ov=F[t*3+k]; int64_t key=((int64_t)c<<34)^ov;
             auto it=seen.find(key); int id;
             if(it==seen.end()){ id=(int)split2orig.size(); seen[key]=id; split2orig.push_back((int)ov);
@@ -796,6 +808,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     const std::vector<int64_t>& in_faces = deci ? dfaces : in_faces0;
 
     const int Vin=(int)in_verts.size()/3, Fin=(int)in_faces.size()/3, C=6;
+    _stage("atlas_mesh_ready");
     std::vector<float> in_norm = vert_normals(in_verts, in_faces);
     std::vector<uint32_t> idx32((size_t)Fin*3);
     for (size_t i=0;i<idx32.size();i++) idx32[i]=(uint32_t)in_faces[i];
@@ -807,31 +820,78 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     // existing conformal pre-cluster path: xatlas still parameterizes each disconnected island,
     // but never sees the bad global topology.  This is topology-driven, not model-name-driven.
     bool auto_precluster=false;
-    size_t nonmanifold_edges=0;
+    size_t boundary_edges=0, nonmanifold_edges=0, sharp_edges=0;
     if (!precluster && deci && !std::getenv("ATL_FORCE_DIRECT") && !std::getenv("ATL_AUTO_PRECLUSTER_OFF")) {
-        std::unordered_map<uint64_t,uint32_t> edge_use;
+        // Retain each edge's first face while counting it.  This gives the direct-unwrap safety
+        // gate a geometric signal as well as a manifoldness signal: a dense folded surface can be
+        // topologically valid yet make CPU xatlas split itself into an impractical number of charts.
+        std::vector<float> fn((size_t)Fin*3);
+        for (int f=0;f<Fin;f++) {
+            const float* a=&in_verts[(size_t)in_faces[(size_t)f*3]*3];
+            const float* b=&in_verts[(size_t)in_faces[(size_t)f*3+1]*3];
+            const float* c=&in_verts[(size_t)in_faces[(size_t)f*3+2]*3];
+            const float e1x=b[0]-a[0], e1y=b[1]-a[1], e1z=b[2]-a[2];
+            const float e2x=c[0]-a[0], e2y=c[1]-a[1], e2z=c[2]-a[2];
+            float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+            float nl=std::sqrt(nx*nx+ny*ny+nz*nz); if (nl<1e-20f) nl=1.f;
+            fn[(size_t)f*3]=nx/nl; fn[(size_t)f*3+1]=ny/nl; fn[(size_t)f*3+2]=nz/nl;
+        }
+        std::unordered_map<uint64_t,uint64_t> edge_use;
         edge_use.reserve((size_t)Fin*3);
         for (int f=0;f<Fin;f++) for (int k=0;k<3;k++) {
             uint32_t a=(uint32_t)in_faces[(size_t)f*3+k];
             uint32_t b=(uint32_t)in_faces[(size_t)f*3+(k+1)%3];
             if (a>b) std::swap(a,b);
-            ++edge_use[((uint64_t)a<<32)|b];
+            uint64_t& use=edge_use[((uint64_t)a<<32)|b];
+            const uint32_t count=(uint32_t)use;
+            if (count==0) use=((uint64_t)(uint32_t)(f+1)<<32)|1u;
+            else {
+                if (count==1) {
+                    const int first=(int)(uint32_t)(use>>32)-1;
+                    float dot=fn[(size_t)first*3]*fn[(size_t)f*3]+fn[(size_t)first*3+1]*fn[(size_t)f*3+1]+fn[(size_t)first*3+2]*fn[(size_t)f*3+2];
+                    if (dot<0.5f) ++sharp_edges; // >60° dihedral: chart-complexity evidence
+                }
+                ++use;
+            }
         }
-        for (const auto& e:edge_use) if (e.second>2) ++nonmanifold_edges;
-        auto_precluster=nonmanifold_edges > std::max<size_t>(2048,(size_t)Fin/100);
+        for (const auto& e:edge_use) {
+            const uint32_t count=(uint32_t)e.second;
+            if (count==1) ++boundary_edges;
+            else if (count>2) ++nonmanifold_edges;
+        }
+        // xatlas' half-edge chart solver assumes a well-formed closed surface.  A QEM result can
+        // be *mostly* manifold while still containing thousands of open cuts; counting only
+        // >2-edge fans missed that case on Miku and sent it into an unbounded direct chart solve.
+        // Treat either kind of irregular edge as topology evidence, with a deliberately small
+        // absolute floor: ordinary clean generated meshes have none, while a few isolated cuts do
+        // not need to discard the higher-quality direct chart route.
+        const size_t irregular_edges=boundary_edges+nonmanifold_edges;
+        const size_t irregular_limit=std::max<size_t>(128,(size_t)Fin/2000);
+        // A high fraction of >60° face joins means that direct xatlas spends its time repeatedly
+        // splitting a valid-but-folded surface.  This caught Miku's otherwise nearly-manifold
+        // decimated mesh (13,257 / 300k sharp joins) before the CPU solver entered its multi-minute
+        // charting path.  The threshold is deliberately a fraction of faces, so it generalises
+        // across resolutions instead of naming an asset.
+        const size_t sharp_limit=std::max<size_t>(2048,(size_t)Fin/33);
+        auto_precluster=irregular_edges > irregular_limit || sharp_edges > sharp_limit;
         if (verbose && auto_precluster)
-            printf("[atlas] auto precluster: %zu non-manifold edges / %d faces (direct xatlas safety gate)\n",
-                   nonmanifold_edges,Fin);
+            printf("[atlas] auto precluster: %zu boundary + %zu non-manifold + %zu sharp edges / %d faces (limits %zu irregular, %zu sharp; direct xatlas safety gate)\n",
+                   boundary_edges,nonmanifold_edges,sharp_edges,Fin,irregular_limit,sharp_limit);
+        else if (verbose && irregular_edges)
+            printf("[atlas] direct topology: %zu boundary + %zu non-manifold edges / %d faces (below auto-island limit %zu)\n",
+                   boundary_edges,nonmanifold_edges,Fin,irregular_limit);
+        if (verbose) printf("[atlas] direct chart complexity: %zu sharp (>60 degrees) manifold edges / %d faces\n",sharp_edges,Fin);
     }
     const bool effective_precluster=precluster || auto_precluster;
-    // On the pathological QEM case, even conformal per-island xatlas can be
-    // disproportionately slow.  Small normal-cone islands have bounded local
-    // distortion, pack quickly, and retain the direct PBR samples plus gutter
-    // repair.  Set ATL_AUTO_CONFORMAL=1 to spend the extra time on conformal
-    // parameterisation for a hero asset.
-    const bool auto_planar=auto_precluster && !std::getenv("ATL_AUTO_CONFORMAL");
+    // High-curvature safety meshes need a conformal result, not a raw planar projection: the
+    // latter is quick but visibly streaks long thin triangles.  One material-separated split mesh
+    // lets xatlas parameterize every local island without the global direct solve or a join of
+    // thousands of individual meshes.  ATL_AUTO_PLANAR=1 retains the fast diagnostic fallback.
+    const bool auto_planar=auto_precluster && std::getenv("ATL_AUTO_PLANAR") != nullptr;
+    const bool conformal_islands=(auto_precluster && !auto_planar) || std::getenv("ATL_CONFORMAL_ISLANDS") != nullptr;
 
     // ---- xatlas UV unwrap ----
+    _stage(effective_precluster ? "atlas_unwrap_islands_begin" : "atlas_unwrap_direct_begin");
     xatlas::Atlas* atlas = xatlas::Create();
     if (verbose) xatlas::SetProgressCallback(atlas, _xatlas_progress, nullptr);
     std::vector<std::vector<int>> xref_maps;   // per xatlas mesh: output xref -> original in_verts index
@@ -863,7 +923,41 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             xatlas::PackCharts(atlas, po);
         }
     };
-    if (effective_precluster && !(std::getenv("ATL_PLANAR") || auto_planar)) {
+    if (effective_precluster && conformal_islands) {
+        double tp=_now();
+        float cdeg=getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_precluster ? 45.f : cone_deg);
+        std::vector<float> split_v; std::vector<uint32_t> split_f, face_materials;
+        std::vector<int> split2orig; int ncl=0;
+        precluster_split_mesh(in_verts,in_faces,std::cos(cdeg*3.14159265f/180.f),
+                              split_v,split_f,split2orig,ncl,&face_materials);
+        if (verbose) { printf("[atlas] conformal islands: %d material-separated charts (cone %.0f°, %.2fs), %zu split-verts\n",
+                              ncl,cdeg,_now()-tp,split2orig.size()); fflush(stdout); }
+        xatlas::MeshDecl md;
+        md.vertexCount=(uint32_t)split2orig.size(); md.vertexPositionData=split_v.data();
+        md.vertexPositionStride=3*sizeof(float); md.indexCount=(uint32_t)split_f.size();
+        md.indexData=split_f.data(); md.indexFormat=xatlas::IndexFormat::UInt32;
+        md.faceMaterialData=face_materials.data();
+        xatlas::AddMeshError e=xatlas::AddMesh(atlas,md);
+        if (e!=xatlas::AddMeshError::Success) fprintf(stderr,"[atlas] AddMesh(conformal islands) error: %s\n",xatlas::StringForEnum(e));
+        xatlas::AddMeshJoin(atlas);
+        xatlas::ChartOptions co;
+        if (std::getenv("ATL_PYREF_XATLAS")) {
+            co.maxCost=getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 2.0f;
+            co.normalDeviationWeight=getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 2.0f;
+            co.normalSeamWeight=getenv("ATL_NSW") ? atof(getenv("ATL_NSW")) : 4.0f;
+            co.straightnessWeight=getenv("ATL_SW") ? atof(getenv("ATL_SW")) : 6.0f;
+            co.roundnessWeight=getenv("ATL_RW") ? atof(getenv("ATL_RW")) : 0.01f;
+            co.textureSeamWeight=getenv("ATL_TSW") ? atof(getenv("ATL_TSW")) : 0.5f;
+            co.maxIterations=getenv("ATL_XITERS") ? atoi(getenv("ATL_XITERS")) : 1;
+        } else {
+            co.maxCost=getenv("ATL_MAXCOST") ? atof(getenv("ATL_MAXCOST")) : 16.0f;
+            co.normalDeviationWeight=getenv("ATL_NDW") ? atof(getenv("ATL_NDW")) : 1.0f;
+            co.normalSeamWeight=1.0f; co.straightnessWeight=1.0f; co.roundnessWeight=0.1f; co.maxIterations=1;
+        }
+        xatlas::ComputeCharts(atlas,co);
+        pack_charts();
+        xref_maps.push_back(std::move(split2orig));
+    } else if (effective_precluster && !(std::getenv("ATL_PLANAR") || auto_planar)) {
         double tp=_now();
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (std::getenv("ATL_PYREF_XATLAS") ? 90.f : cone_deg);
         std::vector<ClusterMesh> clusters;
@@ -952,7 +1046,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         // xatlas packing pathological on dense hair/clothing meshes such as Miku.  A caller can
         // still request a tighter or wider explicit A/B cone with ATL_CONE.
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_planar ? 40.f : cone_deg);
-        if (verbose && auto_planar) printf("[atlas] auto planar islands: cone %.0f° (set ATL_AUTO_CONFORMAL=1 for hero conformal charts)\n", cdeg);
+        if (verbose && auto_planar) printf("[atlas] auto planar islands: cone %.0f° (diagnostic fallback; omit ATL_AUTO_PLANAR for conformal islands)\n", cdeg);
         precluster_charts(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f), uv, uv2orig, uvfaces, facemat, ncl);
         if (verbose){ printf("[atlas] precluster: %d charts (cone %.0f°, %.2fs), %zu uv-verts\n",
                               ncl, cdeg, _now()-tp, uv2orig.size()); fflush(stdout); }
@@ -996,6 +1090,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         xref_maps.emplace_back(Vin); for (int i=0;i<Vin;i++) xref_maps.back()[i]=i;
     }
     int W=(int)atlas->width, Ht=(int)atlas->height;
+    _stage("atlas_unwrap_complete");
     uint32_t total_v=0,total_i=0; for(uint32_t mi=0; mi<atlas->meshCount; mi++){ total_v+=atlas->meshes[mi].vertexCount; total_i+=atlas->meshes[mi].indexCount; }
     if (verbose) printf("[atlas] %ux%u  charts=%u sub-atlases=%u meshes=%u out: %u verts / %u tris\n",
                         atlas->width, atlas->height, atlas->chartCount, atlas->atlasCount,
@@ -1038,6 +1133,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         bt.normals = welded_vert_normals(bt.verts, bt.faces);
         if (verbose) printf("[atlas] welded output normals (%.2fs)\n", _now()-tn);
     }
+    _stage("atlas_normals_complete");
 
     // A chart is a connected component in xatlas' OUTPUT topology.  xatlas splits a shared
     // source vertex at every UV seam, so faces that still share an output vertex are guaranteed
@@ -1107,6 +1203,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         }
     }
     int covered=0; for (auto m:mask) covered+=m;
+    _stage("atlas_raster_complete");
     if (verbose) printf("[atlas] rasterized: %d / %d texels covered (%.1f%%) (%.2fs)\n", covered, W*Ht, 100.0*covered/(W*Ht), _now()-t_ras);
     double t_attr = _now();
 
@@ -1188,6 +1285,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     }
 
     if (verbose) printf("[atlas] per-texel attr (%s): (%.2fs)\n", do_reproject?"reproject":"grid_sample", _now()-t_attr);
+    _stage("atlas_sample_complete");
     double t_inp = _now();
 
     // ---- inpaint: gutter + INTERIOR HOLES. A texel can be covered (inside a chart triangle) yet
@@ -1224,6 +1322,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (verbose) printf("[atlas] filling remaining atlas background by nearest valid dilation\n");
         dilate_background(atl, mask2, W, Ht, C);
     }
+    _stage("atlas_inpaint_complete");
     if (const char* m = std::getenv("TEX_BASE_MEDIAN")) {
         int radius=std::max(0,std::min(4,atoi(m)));
         if (radius > 0) {
@@ -1286,6 +1385,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         blur_u8_gaussian_rgb(bt.base_color, bt.tw, bt.th, 4, sigma);
     }
     xatlas::Destroy(atlas);
+    _stage("atlas_encode_complete");
     if (verbose) printf("[atlas] inpaint+encode+resize (%.2fs)\n", _now()-t_inp);
     return bt;
 }

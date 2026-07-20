@@ -40,6 +40,13 @@ static void append_artifact_status(const std::string& path, const char* state, i
     f << "artifact_exit_code=" << code << '\n';
 }
 
+static void native_stage(const char* name) {
+    const char* path=std::getenv("TEX_STAGE_LOG");
+    if (!path || !*path) return;
+    std::ofstream f(path,std::ios::app);
+    if (f) f << "stage=" << name << '\n';
+}
+
 template<class T> static void dump_npy(const std::string& path, const std::vector<T>& data,
                                        const char* descr, const std::vector<int>& shape) {
     std::string dims="(";
@@ -184,15 +191,23 @@ int main(int argc, char** argv) {
     if (model.empty() || mesh_path.empty() || image_path.empty() || (out.empty() && !condition_only) ||
         (resolution!=512 && resolution!=1024) || (unwrap!="production" && unwrap!="reference")) { usage(); return 1; }
     if (!condition_only && atlas_out.empty()) atlas_out=out+".atlas.png";
+    if (!condition_only && !std::getenv("TEX_STAGE_LOG")) {
+        const std::string stage_log=out+".stage-log.txt";
+        std::ofstream clear(stage_log,std::ios::trunc);
+        if (!clear) { std::fprintf(stderr,"FAIL: cannot create stage log: %s\n",stage_log.c_str()); return 1; }
+        setenv("TEX_STAGE_LOG",stage_log.c_str(),1);
+    }
     setenv("PIXAL3D_GGUF_DIR", model.c_str(), 1);
 
     try {
+        native_stage("start");
         glb::Mesh mesh;
         if (!glb::read_glb(mesh_path.c_str(), mesh) || mesh.verts.empty() || mesh.faces.empty())
             throw std::runtime_error("could not read mesh GLB");
         std::printf("[native-texture] mesh %zu v / %zu f, resolution=%d, atlas=%d\\n",
                     mesh.verts.size()/3, mesh.faces.size()/3, resolution, texsize);
         preprocess_mesh(mesh.verts);
+        native_stage("mesh_preprocessed");
 
         imgio::Image source=load_texture_image(image_path);
         if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_proc_image_chw.npy",imgio::to_chw(source),"<f4",{3,source.h,source.w}); }
@@ -202,6 +217,7 @@ int main(int argc, char** argv) {
         std::vector<float> img_norm=pix::imagenet_norm(img_chw, resolution);
         std::vector<float> global, patchmap;
         pix::run_dinov3(img_norm, resolution==512 ? dino::CFG512 : dino::CFG1024, true, global, patchmap);
+        native_stage("dino_complete");
         std::vector<float> cond=global;
         cond.insert(cond.end(), patchmap.begin(), patchmap.end());
         if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_cond.npy",cond,"<f4",{1,(int)cond.size()/1024,1024}); }
@@ -217,6 +233,7 @@ int main(int argc, char** argv) {
         const float amin[3]={-.5f,-.5f,-.5f}, amax[3]={.5f,.5f,.5f};
         vox::VoxelOut voxels=vox::mesh_to_flexible_dual_grid(mesh.verts.data(), (int)mesh.verts.size()/3,
             faces.data(), (int)faces.size()/3, gs, amin, amax, 1.f, .2f, 1e-2f);
+        native_stage("voxel_complete");
         if (!voxels.N) throw std::runtime_error("voxelizer returned no surface cells");
         std::vector<int32_t> coords((size_t)voxels.N*4);
         std::vector<float> feats6((size_t)voxels.N*6);
@@ -231,6 +248,7 @@ int main(int argc, char** argv) {
         if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_voxel_coords.npy",coords,"<i4",{voxels.N,4}); dump_npy(dump_dir+"/native_voxel_feats6.npy",feats6,"<f4",{voxels.N,6}); }
         std::vector<int32_t> slat_coords;
         std::vector<float> slat=senc::shape_slat_encode(coords, feats6, "weights_npy/shape_enc", true, &slat_coords);
+        native_stage("shape_slat_complete");
         const int M=(int)slat_coords.size()/4;
         if (!M) throw std::runtime_error("shape encoder returned no SLat tokens");
         if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_shape_slat_coords.npy",slat_coords,"<i4",{M,4}); dump_npy(dump_dir+"/native_shape_slat_feats.npy",slat,"<f4",{M,32}); }
@@ -262,11 +280,13 @@ int main(int argc, char** argv) {
             };
             tex=geo::flow_sampler((int64_t)M*32,noise,1e-5f,1.f,0.f,3.f,.6,.9,12,forward,"native tex");
         } // Release the large texture-flow graph and its GPU weights before M6 PBR decode.
+        native_stage("texture_flow_complete");
         for (size_t i=0;i<tex.size();i++) tex[i]=tex[i]*tex_std[i%32]+tex_mean[i%32];
         if (!dump_dir.empty()) dump_npy(dump_dir+"/native_tex_slat_feats.npy",tex,"<f4",{M,32});
         std::vector<std::vector<uint8_t>> subs=senc::build_guide_subs(coords,slat_coords);
         std::vector<int32_t> pbr_coords;
         std::vector<float> pbr=svpg::m6_tex_decode(slat_coords,tex,subs,"weights_npy/tex_dec",&pbr_coords);
+        native_stage("pbr_decode_complete");
         // A CUDA allocation failure used to be swallowed by the decoder and surfaced as a
         // perfectly neutral (0.5, 0.5, 0.5) atlas.  That is never a useful generated texture;
         // fail closed so a high-resolution run cannot silently replace a good production asset.
@@ -320,12 +340,14 @@ int main(int argc, char** argv) {
         }
         texatlas::BakedTexture baked=texatlas::bake(mesh.verts,mesh.faces,pbr,pbr_coords,resolution,texsize,decimate,
                                                     reference_unwrap ? 0 : 4,true,8,!reference_unwrap);
+        native_stage("atlas_complete");
         restore_mesh_frame(baked.verts); restore_mesh_frame(baked.normals);
         if (!glb::write_glb_textured(out.c_str(),baked.verts,baked.normals,baked.uvs,baked.faces,
                                      baked.base_color,baked.metal_rough,baked.tw,baked.th))
             throw std::runtime_error("could not write output GLB");
         if (!stbi_write_png(atlas_out.c_str(), baked.tw, baked.th, 4, baked.base_color.data(), baked.tw*4))
             throw std::runtime_error("could not write baseColor atlas: "+atlas_out);
+        native_stage("write_complete");
         append_artifact_status(status_file, "succeeded", 0);
         std::printf("[native-texture] DONE: %s (%d charts, %dx%d atlas)\\n",out.c_str(),baked.chart_count,baked.tw,baked.th);
         std::printf("[native-texture] baseColor atlas: %s\\n",atlas_out.c_str());

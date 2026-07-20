@@ -28,6 +28,7 @@ OUT_ROOT="${IMAGE_TO_RIG_OUT_ROOT:-/mnt/hdd/3d/avatar-shootout/_shootout_out/run
 [[ -f "$IMAGE" ]] || { echo "missing image: $IMAGE" >&2; exit 2; }
 mkdir -p "$(dirname "$OUT")" "$OUT_ROOT"
 STATUS_FILE="${OUT}.run-status.txt"
+STAGE_FILE="${OUT}.stage-log.txt"
 STARTED_AT="$(date -Is)"
 START_SECONDS=$SECONDS
 STATUS_INITIALIZED=0
@@ -65,12 +66,16 @@ write_status() {
   # The child appends its artifact outcome after it has actually written outputs. Preserve that
   # authoritative record when this launcher's status refreshes or finalizes its own fields.
   local artifact_lines=""
+  local stage_line=""
   # The child appends completion truth while this launcher refreshes the status every ten seconds.
   # Retain that truth only after THIS invocation has written its initial record: otherwise a rerun
   # over the same output inherits a stale `artifact_state=succeeded` from the prior child while the
   # new inference is still live.
   if [[ "$STATUS_INITIALIZED" == 1 && -f "$STATUS_FILE" ]]; then
     artifact_lines="$(sed -n '/^artifact_/p' "$STATUS_FILE")"
+  fi
+  if [[ -f "$STAGE_FILE" ]]; then
+    stage_line="$(tail -n 1 "$STAGE_FILE" || true)"
   fi
   {
     printf 'launcher_state=%s\n' "$state"
@@ -84,6 +89,7 @@ write_status() {
       "$MESH_SHA256" "$IMAGE_SHA256" "$BIN_SHA256" "$SOURCE_REVISION"
     printf 'texture_model=TRELLIS-2 Texturing cross-attention (trellis2_tex_%s); native C++ only\n' "$TEXTURE_RESOLUTION"
     printf 'unwrap_mode=%s\n' "$UNWRAP_MODE"
+    [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
     if [[ "$UNWRAP_MODE" == reference ]]; then
       printf 'clean_material_contract=direct xatlas parity charts; 2x raster; topology normals; full gutter repair; PBR RGB outlier default 0.10 unless explicitly overridden\n'
     fi
