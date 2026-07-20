@@ -342,8 +342,9 @@ namespace WAV2VEC2 {
         Wav2Vec2EncoderRunner(ggml_backend_t backend,
                               const String2TensorStorage& tensor_storage_map = {},
                               const std::string prefix                       = "audio_encoder",
-                              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
-            : GGMLRunner(backend, weight_manager) {
+                              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                              Wav2Vec2Params params = {})
+            : GGMLRunner(backend, weight_manager), p(std::move(params)) {
             encoder = Wav2Vec2Encoder(p);
             encoder.init(params_ctx, tensor_storage_map, prefix);
         }
