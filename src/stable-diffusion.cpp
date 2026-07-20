@@ -196,6 +196,58 @@ static void load_nvfp4_weight_globals(const std::string& path, std::map<std::str
     gguf_free(gctx);
 }
 
+// ============================ FIFO-Diffusion (LTX-2.3) ============================
+// FIFO-Diffusion (Kim et al. 2024): instead of denoising every latent frame at the SAME sigma each
+// step (normal sampler) or tiling in space/time (windowing, which chops attention => seam), keep a
+// diagonal QUEUE of frames each at a MONOTONICALLY DIFFERENT noise level. One DiT forward denoises the
+// whole queue with a PER-FRAME sigma vector; each frame advances one notch down its schedule; the
+// front frame pops once it reaches sigma=0 (emitted) and a fresh-noise frame pushes in at the back at
+// sigma_max. Attention is never cut (no seam) and the in-flight working set is bounded by the queue
+// depth. The LTX DiT already embeds a distinct timestep PER latent frame (per-token adaLN), so a graded
+// per-frame sigma is in-distribution — the prod i2v/continuation path already runs mixed per-frame
+// levels (cond frames at t=0, generated frames at t=sigma*1000) in a single forward.
+//
+// All gates are VALUE-gated, never presence-gated: docker-compose passes "${VAR:-}" which yields an
+// EMPTY STRING for which getenv() returns non-null. A presence check would silently enable FIFO on
+// every render. Matches the ltxav_refine_multidiffusion_enabled / ltxav_shared_refine_noise_enabled
+// pattern. Default OFF => the sampler is byte-identical to the current production path.
+static bool ltxav_fifo_enabled() {
+    const char* e = std::getenv("LTXAV_FIFO");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+
+// LTXAV_FIFO_BLOCKS = latent-partition count n (frames that share the same schedule notch). The
+// diagonal's per-frame sigma gap shrinks as n grows (n frames per notch), at the cost of a wider
+// in-flight window (queue depth = n * steps). Default 1 (one frame per notch, the vanilla diagonal).
+static int ltxav_fifo_blocks() {
+    if (const char* e = std::getenv("LTXAV_FIFO_BLOCKS"); e != nullptr && e[0] != '\0') {
+        int v = std::atoi(e);
+        if (v >= 1) return v;
+    }
+    return 1;
+}
+
+// LTXAV_FIFO_QUEUE = requested in-flight queue depth (frames). In this first PoC the FULL timeline is
+// held resident and the forward is NOT frame-sliced, so the effective queue depth is blocks*steps and
+// this value is only logged/validated (the VRAM-bounded sliding-window variant that honors it is the
+// next increment). 0 / unset => derive from blocks*steps.
+static int ltxav_fifo_queue() {
+    if (const char* e = std::getenv("LTXAV_FIFO_QUEUE"); e != nullptr && e[0] != '\0') {
+        int v = std::atoi(e);
+        if (v >= 1) return v;
+    }
+    return 0;
+}
+
+// LTXAV_FIFO_LOOKAHEAD = 0/1 (default 0). Lookahead denoising processes 2x the window and keeps only
+// the back-half updates (extra compute for quality). Stubbed in this PoC; the prod per-frame-level
+// precedent suggests it may be skippable. See the FIFO loop for the stub.
+static bool ltxav_fifo_lookahead() {
+    const char* e = std::getenv("LTXAV_FIFO_LOOKAHEAD");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+// =================================================================================
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 class StableDiffusionGGML {
@@ -2392,32 +2444,53 @@ public:
         }
     }
 
+    // Build the per-token (frame-major) LTXAV video timestep vector. Normally every video token gets
+    // the single scalar `timesteps[0]` gated 0/1 by the denoise mask (frozen cond frames -> 0). For
+    // FIFO-Diffusion `per_frame_t` (length == video frames) supplies a DISTINCT timestep for each
+    // frame — the diagonal — so token (w,h,t) receives mask * per_frame_t[t]. When `per_frame_t` is
+    // null (every non-FIFO caller, via the default argument) the behaviour is byte-identical to before,
+    // including the empty-mask early return.
     std::vector<float> process_ltxav_video_timesteps(const std::vector<float>& timesteps,
                                                      const sd::Tensor<float>& init_latent,
-                                                     const sd::Tensor<float>& denoise_mask) {
-        if (timesteps.empty() || denoise_mask.empty() || init_latent.dim() < 4 || denoise_mask.dim() < 4) {
+                                                     const sd::Tensor<float>& denoise_mask,
+                                                     const std::vector<float>* per_frame_t = nullptr) {
+        if (per_frame_t == nullptr) {
+            if (timesteps.empty() || denoise_mask.empty() || init_latent.dim() < 4 || denoise_mask.dim() < 4) {
+                return timesteps;
+            }
+        } else if (init_latent.dim() < 4) {
             return timesteps;
         }
 
         int64_t width  = init_latent.shape()[0];
         int64_t height = init_latent.shape()[1];
         int64_t frames = init_latent.shape()[2];
-        if (denoise_mask.shape()[0] != width ||
-            denoise_mask.shape()[1] != height ||
-            denoise_mask.shape()[2] != frames ||
-            denoise_mask.shape()[3] < 1) {
-            LOG_WARN("unexpected LTXAV denoise mask shape for timestep processing");
+        // FIFO: the mask is OPTIONAL (plain t2v has none). When present it still gates frozen tokens to
+        // 0; when absent every video token is active (mask=1). The scalar path keeps requiring a mask.
+        const bool have_mask = !denoise_mask.empty() && denoise_mask.dim() >= 4 &&
+                               denoise_mask.shape()[0] == width && denoise_mask.shape()[1] == height &&
+                               denoise_mask.shape()[2] == frames && denoise_mask.shape()[3] >= 1;
+        if (per_frame_t == nullptr) {
+            if (!have_mask) {
+                LOG_WARN("unexpected LTXAV denoise mask shape for timestep processing");
+                return timesteps;
+            }
+        } else if (static_cast<int64_t>(per_frame_t->size()) != frames) {
+            LOG_WARN("LTX FIFO: per-frame timestep vector length %zu != %lld video frames; falling back",
+                     per_frame_t->size(), (long long)frames);
             return timesteps;
         }
 
         std::vector<float> video_timesteps(static_cast<size_t>(width * height * frames));
         size_t idx = 0;
         for (int64_t t = 0; t < frames; ++t) {
+            const float frame_t = per_frame_t != nullptr ? (*per_frame_t)[static_cast<size_t>(t)] : timesteps[0];
             for (int64_t h = 0; h < height; ++h) {
                 for (int64_t w = 0; w < width; ++w) {
-                    float mask             = denoise_mask.dim() == 5 ? denoise_mask.index(w, h, t, 0, 0)
-                                                                     : denoise_mask.index(w, h, t, 0);
-                    video_timesteps[idx++] = mask * timesteps[0];
+                    float mask             = !have_mask ? 1.0f
+                                             : denoise_mask.dim() == 5 ? denoise_mask.index(w, h, t, 0, 0)
+                                                                       : denoise_mask.index(w, h, t, 0);
+                    video_timesteps[idx++] = mask * frame_t;
                 }
             }
         }
@@ -2919,6 +2992,39 @@ public:
             return h;
         };
 
+        // ---- FIFO-Diffusion diagonal state (empty in every non-FIFO render => byte-identical) ----
+        // When non-empty this holds ONE sigma per VIDEO latent frame (the queue's diagonal). The
+        // denoise closure consults it to (1) build per-frame DiT timesteps via
+        // process_ltxav_video_timesteps and (2) apply a per-frame flow output scaling c_out=-sigma_t
+        // instead of the scalar c_out. The FIFO loop (run_fifo_diagonal, below) rewrites it before each
+        // forward. Length == x_t.shape()[2] when active.
+        std::vector<float> fifo_sigma_per_frame;
+
+        // Per-frame flow denoiser output scaling: x0_t = x_t + c_out_t * v_t, with c_out_t = -sigma_t
+        // and c_skip = c_in = 1 (constant for the flow denoiser — only c_out is sigma-dependent). This
+        // generalizes `denoised = v * c_out + x * c_skip` over the frame axis. Layout is frame-major
+        // per channel: for a [W,H,T,C] latent, element linear index i has frame t = (i/(W*H)) % T. The
+        // scaling is applied across ALL channels (video + packed audio); the FIFO loop only reads back
+        // the video channels, so scaling the trailing audio channels here is harmless.
+        auto fifo_scale_cout = [](const sd::Tensor<float>& v,
+                                  const sd::Tensor<float>& x,
+                                  const std::vector<float>& sigma_pf) -> sd::Tensor<float> {
+            sd::Tensor<float> out(v.shape());
+            const int64_t W     = v.shape()[0];
+            const int64_t H     = v.shape()[1];
+            const int64_t T     = v.shape()[2];
+            const int64_t plane = W * H;
+            const float* vp     = v.data();
+            const float* xp     = x.data();
+            float* op           = out.data();
+            const int64_t n     = v.numel();
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t t = (i / plane) % T;
+                op[i]           = xp[i] + (-sigma_pf[static_cast<size_t>(t)]) * vp[i];
+            }
+            return out;
+        };
+
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
             // Cooperative cancel: client disconnected mid-render. Bail before launching
             // this step's DiT compute. An empty pred makes sample_k_diffusion yield an
@@ -2955,8 +3061,21 @@ public:
             std::vector<float> base_timesteps_vec = prepare_sample_timesteps(sigma, shifted_timestep);
             std::vector<float> timesteps_vec      = base_timesteps_vec;
             sd::Tensor<float> audio_timesteps_tensor;
-            if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
-                timesteps_vec = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask);
+            // FIFO-Diffusion: when the diagonal is armed, map each video frame's sigma to its DiT
+            // timestep (sigma_to_t) so process_ltxav_video_timesteps builds a per-frame timestep grid
+            // instead of the scalar broadcast. Only the VIDEO timesteps go diagonal; audio keeps the
+            // legacy held/scalar path in this PoC. TODO(fifo-audio): diagonalize audio too.
+            const bool fifo_active = !fifo_sigma_per_frame.empty() && sd_version_is_ltxav(version);
+            std::vector<float> fifo_per_frame_t;
+            if (fifo_active) {
+                fifo_per_frame_t.resize(fifo_sigma_per_frame.size());
+                for (size_t fi = 0; fi < fifo_sigma_per_frame.size(); ++fi) {
+                    fifo_per_frame_t[fi] = denoiser->sigma_to_t(fifo_sigma_per_frame[fi]);
+                }
+            }
+            if (sd_version_is_ltxav(version) && (!denoise_mask.empty() || fifo_active)) {
+                timesteps_vec = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask,
+                                                              fifo_active ? &fifo_per_frame_t : nullptr);
                 // Per-token audio timesteps mirror the audio denoise mask.  This
                 // matters for LipDub's appended clean reference block, while
                 // retaining the legacy all-fixed behaviour for driven A2V.
@@ -3399,14 +3518,20 @@ public:
                 return {};
             }
 
-            denoised = guided.pred * c_out + x * c_skip;
+            // FIFO-Diffusion: scale the flow output PER FRAME (c_out_t = -sigma_t) so each frame's x0
+            // estimate is formed at its own noise level along the diagonal. Non-FIFO renders keep the
+            // scalar c_out exactly (fifo_active is false when the diagonal is disarmed).
+            denoised = fifo_active ? fifo_scale_cout(guided.pred, x, fifo_sigma_per_frame)
+                                   : guided.pred * c_out + x * c_skip;
             sd::guidance::GuiderOutput output;
             output.pred = denoised;
             if (needs_uncond_denoised) {
                 const sd::Tensor<float>& base_uncond = !img_uncond_out.empty()
                                                            ? img_uncond_out
                                                            : (!uncond_out.empty() ? uncond_out : cond_out);
-                output.pred_uncond                   = base_uncond * c_out + x * c_skip;
+                output.pred_uncond                   = fifo_active
+                                                           ? fifo_scale_cout(base_uncond, x, fifo_sigma_per_frame)
+                                                           : base_uncond * c_out + x * c_skip;
             }
             if (cache_runtime.spectrum_enabled) {
                 cache_runtime.spectrum.update(denoised);
@@ -3440,31 +3565,167 @@ public:
             return output;
         };
 
-        auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args);
-        if (x0_opt.empty()) {
-            LOG_ERROR("Diffusion model sampling failed");
-            if (control_net) {
-                control_net->free_control_ctx();
-                control_net->free_compute_buffer();
+        // ---------------------------- FIFO-Diffusion sampler loop ----------------------------
+        // Replaces the standard uniform-sigma sampler (sample_k_diffusion) with a diagonal queue. The
+        // whole timeline latent x_t is held; each outer iteration runs ONE forward on it with a
+        // per-frame sigma vector, advances each in-flight frame one euler_cfg_pp notch down its OWN
+        // schedule, pops frames that reach sigma=0 and pushes fresh-noise frames at sigma_max — modelled
+        // as a schedule-index SWEEP over the frames (no data motion needed, the diagonal advances in
+        // place). Attention is never cut => no seam. NOTE (PoC scope): this variant does NOT frame-slice
+        // the forward, so peak VRAM is that of the full timeline, not the queue depth. It exercises the
+        // full diagonal MECHANIC (per-frame graded sigma + euler_cfg_pp) so the seam-free video verdict
+        // can be taken first; the VRAM-bounded sliding-window forward (which must unpack/slice/repack the
+        // packed-AV latent per window, mirroring the base_temporal_window machinery) is the next step.
+        auto run_fifo_diagonal = [&]() -> sd::Tensor<float> {
+            const int N = static_cast<int>(steps);            // sampler steps: sigmas[0..N], sigmas[N]=0
+            if (N < 1 || x_t.dim() < 4) {
+                LOG_ERROR("LTX FIFO: need >=1 step and a >=4D video latent");
+                return {};
             }
-            if (work_diffusion_model) {
-                work_diffusion_model->free_compute_buffer();
+            if (method != EULER_CFG_PP_SAMPLE_METHOD && method != EULER_A_CFG_PP_SAMPLE_METHOD) {
+                // The per-frame advance below is euler_cfg_pp (needs the uncond x0). Other samplers do
+                // not populate pred_uncond, so refuse rather than silently mis-step.
+                LOG_ERROR("LTX FIFO: requires a cfg_pp sampler (euler_cfg_pp); got method %d", (int)method);
+                return {};
             }
-            return {};
-        }
+            if (shifted_timestep > 0) {
+                LOG_WARN("LTX FIFO: shifted_timestep=%d is ignored (per-frame c_out uses -sigma directly)",
+                         shifted_timestep);
+            }
+            const int64_t T   = x_t.shape()[2];               // packed video frame count (diagonal axis)
+            int blocks        = ltxav_fifo_blocks();
+            blocks            = static_cast<int>(std::clamp<int64_t>(blocks, 1, std::max<int64_t>(1, T)));
+            const int64_t queue_depth = static_cast<int64_t>(blocks) * N;   // in-flight frames (diagonal width)
+            const int requested_queue = ltxav_fifo_queue();
+            const bool lookahead      = ltxav_fifo_lookahead();
+            if (lookahead) {
+                // TODO(fifo-lookahead): process 2x the window and keep only the back-half updates. The
+                // prod mixed-per-frame-level precedent suggests the diagonal may already be coherent
+                // enough to skip this; left as a no-op stub so the flag can be wired without a rebuild.
+                LOG_WARN("LTX FIFO: LTXAV_FIFO_LOOKAHEAD=1 requested but lookahead is a no-op stub in this PoC");
+            }
+            const int64_t video_ch = std::min<int64_t>(get_latent_channel(), x_t.shape()[3]);
+            LOG_INFO("LTX FIFO: T=%lld frames, N=%d steps, blocks=%d, queue_depth=%lld (requested=%d), "
+                     "video_ch=%lld/%lld, lookahead=%d",
+                     (long long)T, N, blocks, (long long)queue_depth, requested_queue,
+                     (long long)video_ch, (long long)x_t.shape()[3], (int)lookahead);
+            if (requested_queue > 0 && requested_queue != static_cast<int>(queue_depth)) {
+                LOG_INFO("LTX FIFO: requested queue=%d differs from derived blocks*steps=%lld; the full "
+                         "timeline is held this PoC so the derived depth is used",
+                         requested_queue, (long long)queue_depth);
+            }
 
-        auto x0 = std::move(x0_opt);
-        sd_sample::log_sample_cache_summary(cache_runtime, steps);
-        // ComfyUI's SamplerCustomAdvanced exposes both the sampler trajectory
-        // (`output`) and the last model x0 prediction (`denoised_output`).  A
-        // partial LCM trajectory is not an x0 estimate: LCM has just mixed fresh
-        // noise into it for its next sigma.  The LTX ver3 two-stage graph feeds
-        // denoised_output to its learned latent upsampler, so expose that same
-        // value for the narrowly-gated hires path below.
-        if (return_denoised) {
-            x0 = std::move(denoised);
-        } else if (inverse_noise_scaling) {
-            x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
+            // x_t already holds every frame noise-scaled at sigmas[0] (= sigma_max) from sample()'s
+            // entry, so every frame's schedule-index 0 state is correct with no extra noising.
+            fifo_sigma_per_frame.assign(static_cast<size_t>(T), sigmas[0]);
+
+            const int64_t W     = x_t.shape()[0];
+            const int64_t H     = x_t.shape()[1];
+            const int64_t plane = W * H;
+
+            // Frame a "enters" the diagonal (receives its first notch) at outer iteration a/blocks and
+            // finishes N notches later. The last frame enters at (T-1)/blocks, so the sweep runs
+            // (T-1)/blocks + N iterations. At iteration m, frame a has received idx = m - a/blocks
+            // notches (clamped to [0,N]): idx==0 => sigma_max (waiting or freshly pushed), idx==N =>
+            // sigma 0 (popped/finished). Mid-flight frames (0 <= idx < N) get one euler_cfg_pp step.
+            const int64_t last_enter  = (T - 1) / blocks;
+            const int64_t total_iters = last_enter + N;
+            int64_t emitted           = 0;
+            for (int64_t m = 0; m < total_iters; ++m) {
+                for (int64_t a = 0; a < T; ++a) {
+                    const int64_t enter = a / blocks;
+                    int idx             = static_cast<int>(m - enter);
+                    idx                 = std::clamp(idx, 0, N);
+                    fifo_sigma_per_frame[static_cast<size_t>(a)] = sigmas[static_cast<size_t>(idx)];
+                }
+                const int step = static_cast<int>(m + 1);
+                auto out       = denoise(x_t, sigmas[0] /* nominal; per-frame vector overrides */, step);
+                if (out.pred.empty() || out.pred_uncond.empty()) {
+                    LOG_ERROR("LTX FIFO: forward failed at iteration %lld/%lld", (long long)m, (long long)total_iters);
+                    return {};
+                }
+                const float* p0 = out.pred.data();          // per-frame x0 (cfg-combined, mask-pinned)
+                const float* pu = out.pred_uncond.data();   // per-frame uncond x0
+                float* xd       = x_t.data();
+                // Per-frame euler_cfg_pp advance, mirroring sample_euler_cfg_pp but each frame using ITS
+                // OWN (sigma, sigma_next): d = (x - uncond_x0)/sigma; x = x0 + d*sigma_next. Only VIDEO
+                // channels advance; the packed audio channels are frozen this PoC (TODO(fifo-audio)).
+                for (int64_t a = 0; a < T; ++a) {
+                    const int64_t enter = a / blocks;
+                    const int idx       = static_cast<int>(m - enter);
+                    if (idx < 0 || idx >= N) {
+                        continue;  // not entered yet, or already finished — leave frame untouched
+                    }
+                    const float sig      = sigmas[static_cast<size_t>(idx)];       // > 0 for idx in [0,N-1]
+                    const float sig_next = sigmas[static_cast<size_t>(idx) + 1];   // 0 at the last notch
+                    for (int64_t c = 0; c < video_ch; ++c) {
+                        const int64_t base = plane * (a + T * c);
+                        for (int64_t s = 0; s < plane; ++s) {
+                            const int64_t i = base + s;
+                            const float d   = (xd[i] - pu[i]) / sig;
+                            xd[i]           = p0[i] + d * sig_next;
+                        }
+                    }
+                    if (idx + 1 == N) {
+                        ++emitted;  // frame a reached sigma 0 this iteration (conceptual pop/emit)
+                    }
+                }
+            }
+            fifo_sigma_per_frame.clear();  // disarm the diagonal for any subsequent scalar use
+            LOG_INFO("LTX FIFO: complete — %lld/%lld frames emitted over %lld iterations",
+                     (long long)emitted, (long long)T, (long long)total_iters);
+            return x_t;
+        };
+        // -------------------------------------------------------------------------------------
+
+        const bool fifo_run = ltxav_fifo_enabled() && sd_version_is_ltxav(version) &&
+                              x_t.dim() >= 4 && x_t.shape()[2] > 1;
+
+        sd::Tensor<float> x0;
+        if (fifo_run) {
+            x0 = run_fifo_diagonal();
+            if (x0.empty()) {
+                LOG_ERROR("LTX FIFO diffusion sampling failed");
+                if (control_net) {
+                    control_net->free_control_ctx();
+                    control_net->free_compute_buffer();
+                }
+                if (work_diffusion_model) {
+                    work_diffusion_model->free_compute_buffer();
+                }
+                return {};
+            }
+            sd_sample::log_sample_cache_summary(cache_runtime, steps);
+            // FIFO lands every frame at sigma=0, so inverse_noise_scaling(sigma=0) is a no-op and the
+            // return_denoised (hires-feed) trajectory/x0 distinction does not apply; return the assembled
+            // full latent directly.
+        } else {
+            auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args);
+            if (x0_opt.empty()) {
+                LOG_ERROR("Diffusion model sampling failed");
+                if (control_net) {
+                    control_net->free_control_ctx();
+                    control_net->free_compute_buffer();
+                }
+                if (work_diffusion_model) {
+                    work_diffusion_model->free_compute_buffer();
+                }
+                return {};
+            }
+
+            x0 = std::move(x0_opt);
+            sd_sample::log_sample_cache_summary(cache_runtime, steps);
+            // ComfyUI's SamplerCustomAdvanced exposes both the sampler trajectory
+            // (`output`) and the last model x0 prediction (`denoised_output`).  A
+            // partial LCM trajectory is not an x0 estimate: LCM has just mixed fresh
+            // noise into it for its next sigma.  The LTX ver3 two-stage graph feeds
+            // denoised_output to its learned latent upsampler, so expose that same
+            // value for the narrowly-gated hires path below.
+            if (return_denoised) {
+                x0 = std::move(denoised);
+            } else if (inverse_noise_scaling) {
+                x0 = denoiser->inverse_noise_scaling(sigmas[sigmas.size() - 1], x0);
+            }
         }
 
         if (control_net) {
