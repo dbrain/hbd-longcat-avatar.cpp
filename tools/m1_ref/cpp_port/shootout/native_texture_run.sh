@@ -29,9 +29,17 @@ OUT_ROOT="${IMAGE_TO_RIG_OUT_ROOT:-/mnt/hdd/3d/avatar-shootout/_shootout_out/run
 mkdir -p "$(dirname "$OUT")" "$OUT_ROOT"
 STATUS_FILE="${OUT}.run-status.txt"
 STAGE_FILE="${OUT}.stage-log.txt"
+QC_FILE="${OUT}.texture-qc.txt"
 STARTED_AT="$(date -Is)"
 START_SECONDS=$SECONDS
 STATUS_INITIALIZED=0
+
+# The executable writes QC only after it has written both GLB and atlas. Preserve
+# a previous sidecar for audit rather than letting a live rerun appear to inherit
+# a prior success in its status file.
+if [[ -e "$QC_FILE" ]]; then
+  mv -f "$QC_FILE" "${QC_FILE}.prior-$(date +%Y%m%dT%H%M%S%z)"
+fi
 
 # A visual result is only useful if its material recipe can be reconstructed later.  Compute these
 # once (rather than in the ten-second status refresh) and retain them alongside the live PID/status.
@@ -67,6 +75,7 @@ write_status() {
   # authoritative record when this launcher's status refreshes or finalizes its own fields.
   local artifact_lines=""
   local stage_line=""
+  local qc_lines=""
   # The child appends completion truth while this launcher refreshes the status every ten seconds.
   # Retain that truth only after THIS invocation has written its initial record: otherwise a rerun
   # over the same output inherits a stale `artifact_state=succeeded` from the prior child while the
@@ -76,6 +85,9 @@ write_status() {
   fi
   if [[ -f "$STAGE_FILE" ]]; then
     stage_line="$(tail -n 1 "$STAGE_FILE" || true)"
+  fi
+  if [[ -s "$QC_FILE" ]]; then
+    qc_lines="$(sed -n '/^sampling_verdict=/p;/^source_missing_fraction_before_repair=/p;/^unresolved_surface_texels_after_chart_repair=/p' "$QC_FILE")"
   fi
   {
     printf 'launcher_state=%s\n' "$state"
@@ -90,6 +102,7 @@ write_status() {
     printf 'texture_model=TRELLIS-2 Texturing cross-attention (trellis2_tex_%s); native C++ only\n' "$TEXTURE_RESOLUTION"
     printf 'unwrap_mode=%s\n' "$UNWRAP_MODE"
     [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
+    [[ -z "$qc_lines" ]] || printf '%s\n' "$qc_lines"
     if [[ "$UNWRAP_MODE" == reference ]]; then
       printf 'clean_material_contract=adaptive xatlas parity charts (direct clean mesh / conformal local islands for high curvature); 2x raster; topology normals; full gutter repair; PBR RGB outlier default 0.10 unless explicitly overridden\n'
     fi

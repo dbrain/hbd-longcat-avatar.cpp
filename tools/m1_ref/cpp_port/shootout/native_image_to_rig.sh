@@ -64,12 +64,26 @@ assert_closed_mesh() {
   (( open == 0 )) || { echo "REJECT: texture LOD has $open open edges: $file" >&2; return 1; }
 }
 
+# A filled PNG alone is insufficient proof of a usable material: retain and gate
+# the native bake's original-surface sampling report.  Chart-local repair may
+# fix sparse misses, but no covered texel may remain unresolved before the
+# cosmetic whole-atlas background dilation.
+assert_texture_qc() {
+  local file="$1" qc unresolved
+  qc="${file}.texture-qc.txt"
+  [[ -s "$qc" ]] || { echo "missing native texture QC: $qc" >&2; return 1; }
+  unresolved="$(awk -F= '$1=="unresolved_surface_texels_after_chart_repair" {print $2; exit}' "$qc")"
+  [[ "$unresolved" =~ ^[0-9]+$ ]] || { echo "texture QC lacks unresolved-surface count: $qc" >&2; return 1; }
+  (( unresolved == 0 )) || { echo "REJECT: texture bake leaves $unresolved unresolved surface texels: $qc" >&2; return 1; }
+  printf 'texture QC: %s\n' "$(tr '\n' ' ' <"$qc")"
+}
+
 # One durable hand-off record, written only after all three texture assets passed the structural
 # gate. It intentionally names the high texture as production even if medium/low supplied the best
 # skeleton: try_rig transfers that accepted skin onto high, so Hymotion does not silently inherit a
 # lower-resolution atlas.
 write_texture_delivery_manifest() {
-  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha topo
+  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha qc qc_sha qc_verdict qc_missing topo
   # `reference` is a material recipe, not a promise that all meshes can use a
   # single global xatlas solve.  Record the measured route from the stage log:
   # direct for clean topology; conformal local islands where sharp/high-curvature
@@ -93,6 +107,7 @@ write_texture_delivery_manifest() {
     printf 'high_model_lattice=%s\nhigh_atlas_px=%s\n' "$NATIVE_HIGH_RESOLUTION" "$NATIVE_HIGH_ATLAS"
     printf 'lod_material_contract=medium/low are CPU rebakes of native_high_texture_dump; no second texture inference; adaptive xatlas uses direct parity charts for clean topology or conformal local islands for high curvature\n'
     printf 'topology_gate=position-welded open=0 for every texture LOD\n'
+    printf 'texture_qc_gate=zero unresolved rasterised surface texels after chart-local repair; source-missing count is retained for eye-test audit\n'
     printf 'rig_state=%s\nselected_rig=%s\n' "$rig_state" "$level"
     for name in high medium low; do
       file="$OUT/native_${name}_textured.glb"
@@ -102,11 +117,18 @@ write_texture_delivery_manifest() {
       route="$(atlas_route_for "$stage")"
       stage_sha="missing"
       [[ ! -f "$stage" ]] || stage_sha="$(sha256sum "$stage" | awk '{print $1}')"
+      qc="${file}.texture-qc.txt"
+      qc_sha="missing"; qc_verdict="missing"; qc_missing="missing"
+      if [[ -f "$qc" ]]; then
+        qc_sha="$(sha256sum "$qc" | awk '{print $1}')"
+        qc_verdict="$(awk -F= '$1=="sampling_verdict" {print $2; exit}' "$qc")"
+        qc_missing="$(awk -F= '$1=="source_missing_fraction_before_repair" {print $2; exit}' "$qc")"
+      fi
       topo="$("$CP/mesh_topo" "$file")"
-      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s atlas_route=%s stage_log=%s stage_log_sha256=%s topology="%s"\n' \
+      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s atlas_route=%s stage_log=%s stage_log_sha256=%s texture_qc=%s texture_qc_sha256=%s sampling_verdict=%s source_missing_fraction_before_repair=%s topology="%s"\n' \
         "$name" "$(basename "$file")" "$(sha256sum "$file" | awk '{print $1}')" \
         "$(basename "$atlas")" "$(sha256sum "$atlas" | awk '{print $1}')" "$route" \
-        "$(basename "$stage")" "$stage_sha" "$topo"
+        "$(basename "$stage")" "$stage_sha" "$(basename "$qc")" "$qc_sha" "$qc_verdict" "$qc_missing" "$topo"
       [[ ! -f "$status" ]] || printf 'lod=%s native_texture_status=%s\n' "$name" "$(basename "$status")"
     done
     [[ "$rig_state" != succeeded ]] || printf 'hymotion_rigged=hymotion_rigged.glb sha256=%s\n' "$(sha256sum "$OUT/hymotion_rigged.glb" | awk '{print $1}')"
@@ -126,6 +148,7 @@ run_native_high() {
     echo "native high did not retain the authoritative PBR volume" >&2; return 1;
   }
   assert_closed_mesh "$out"
+  assert_texture_qc "$out"
 }
 
 run_rebaked_lod() {
@@ -138,6 +161,7 @@ run_rebaked_lod() {
     --atlas-out "$atlas_out"
   [[ -s "$atlas_out" ]] || { echo "native $name did not produce its baseColor atlas: $atlas_out" >&2; return 1; }
   assert_closed_mesh "$out"
+  assert_texture_qc "$out"
 }
 
 rig_ok() {

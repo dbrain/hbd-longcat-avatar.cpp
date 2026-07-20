@@ -29,6 +29,7 @@ mkdir -p "$(dirname "$OUT")"
 # actually ran rather than guessing from the requested unwrap mode.
 STATUS_FILE="${OUT}.run-status.txt"
 STAGE_FILE="${TEX_STAGE_LOG:-${OUT}.stage-log.txt}"
+QC_FILE="${OUT}.texture-qc.txt"
 export TEX_STAGE_LOG="$STAGE_FILE"
 : >"$STAGE_FILE"
 STARTED_AT="$(date -Is)"
@@ -36,21 +37,29 @@ START_SECONDS=$SECONDS
 MESH_SHA256="$(sha256sum "$MESH" | awk '{print $1}')"
 DUMP_FEATS_SHA256="$(sha256sum "$DUMP/native_pbr_feats.npy" | awk '{print $1}')"
 DUMP_COORDS_SHA256="$(sha256sum "$DUMP/native_pbr_coords.npy" | awk '{print $1}')"
+BINARY_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
 SOURCE_REVISION="$(git -C "$CP" rev-parse --verify HEAD 2>/dev/null || printf unknown)"
+if [[ -e "$QC_FILE" ]]; then
+  mv -f "$QC_FILE" "${QC_FILE}.prior-$(date +%Y%m%dT%H%M%S%z)"
+fi
 
 write_status() {
-  local state="$1" rc="${2:-0}" stage_line=""
+  local state="$1" rc="${2:-0}" stage_line="" qc_lines=""
   shift 2
   [[ -f "$STAGE_FILE" ]] && stage_line="$(tail -n 1 "$STAGE_FILE" || true)"
+  if [[ -s "$QC_FILE" ]]; then
+    qc_lines="$(sed -n '/^sampling_verdict=/p;/^source_missing_fraction_before_repair=/p;/^unresolved_surface_texels_after_chart_repair=/p' "$QC_FILE")"
+  fi
   {
     printf 'launcher_state=%s\n' "$state"
     printf 'started_at=%s\nupdated_at=%s\nelapsed_seconds=%s\nexit_code=%s\n' \
       "$STARTED_AT" "$(date -Is)" "$((SECONDS-START_SECONDS))" "$rc"
     printf 'execution=CPU-only native re-atlas; no GPU reserved\n'
     printf 'mesh=%s\npbr_dump=%s\nout=%s\nstage_log=%s\n' "$MESH" "$DUMP" "$OUT" "$STAGE_FILE"
-    printf 'mesh_sha256=%s\npbr_feats_sha256=%s\npbr_coords_sha256=%s\nsource_revision=%s\n' \
-      "$MESH_SHA256" "$DUMP_FEATS_SHA256" "$DUMP_COORDS_SHA256" "$SOURCE_REVISION"
+    printf 'mesh_sha256=%s\npbr_feats_sha256=%s\npbr_coords_sha256=%s\nbinary_sha256=%s\nsource_revision=%s\n' \
+      "$MESH_SHA256" "$DUMP_FEATS_SHA256" "$DUMP_COORDS_SHA256" "$BINARY_SHA256" "$SOURCE_REVISION"
     [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
+    [[ -z "$qc_lines" ]] || printf '%s\n' "$qc_lines"
     [[ "$state" != succeeded ]] || printf 'artifact_state=succeeded\n'
     [[ "$state" != failed ]] || printf 'artifact_state=failed\n'
     printf 'args='

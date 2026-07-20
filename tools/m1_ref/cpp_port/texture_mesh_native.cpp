@@ -347,10 +347,13 @@ int main(int argc, char** argv) {
             throw std::runtime_error("could not write output GLB");
         if (!stbi_write_png(atlas_out.c_str(), baked.tw, baked.th, 4, baked.base_color.data(), baked.tw*4))
             throw std::runtime_error("could not write baseColor atlas: "+atlas_out);
+        if (!texatlas::write_quality_report(out+".texture-qc.txt", baked))
+            throw std::runtime_error("could not write texture quality report: "+out+".texture-qc.txt");
         native_stage("write_complete");
         append_artifact_status(status_file, "succeeded", 0);
         std::printf("[native-texture] DONE: %s (%d charts, %dx%d atlas)\\n",out.c_str(),baked.chart_count,baked.tw,baked.th);
         std::printf("[native-texture] baseColor atlas: %s\\n",atlas_out.c_str());
+        std::printf("[native-texture] texture QC: %s.texture-qc.txt\\n",out.c_str());
     } catch (const std::exception& e) {
         append_artifact_status(status_file, "failed", 1);
         std::fprintf(stderr,"FAIL: %s\\n",e.what()); return 1;

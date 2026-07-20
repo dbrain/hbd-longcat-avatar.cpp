@@ -100,7 +100,41 @@ struct BakedTexture {
     std::vector<float> uvs;             // [Vout*2]  normalized [0,1], glTF convention
     std::vector<uint32_t> faces;        // [Fout*3]
     int chart_count = 0, atlas_count = 0;
+    // Sampling provenance describes the original rasterised surface, not the
+    // later filled atlas background. A visually complete PNG must not conceal
+    // that the decoded PBR volume missed part of the actual mesh.
+    size_t surface_texels = 0;
+    size_t source_sampled_texels = 0;
+    size_t source_missing_texels = 0;
+    size_t unresolved_surface_texels = 0;
 };
+
+// Native-only bake evidence, written after the GLB and PNG have succeeded by
+// both executables. `missing` is before chart-local repair; `unresolved` is
+// after it and before optional full-background dilation.
+static inline bool write_quality_report(const std::string& path, const BakedTexture& bt) {
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) return false;
+    const size_t atlas_texels=(size_t)bt.tw*(size_t)bt.th;
+    const double coverage=atlas_texels ? (double)bt.surface_texels/(double)atlas_texels : 0.0;
+    const double missing=bt.surface_texels ? (double)bt.source_missing_texels/(double)bt.surface_texels : 0.0;
+    const double unresolved=bt.surface_texels ? (double)bt.unresolved_surface_texels/(double)bt.surface_texels : 0.0;
+    f << "schema_version=1\n"
+      << "atlas_width=" << bt.tw << '\n'
+      << "atlas_height=" << bt.th << '\n'
+      << "atlas_texels=" << atlas_texels << '\n'
+      << "chart_count=" << bt.chart_count << '\n'
+      << "atlas_count=" << bt.atlas_count << '\n'
+      << "surface_texels=" << bt.surface_texels << '\n'
+      << "surface_coverage_fraction=" << coverage << '\n'
+      << "source_sampled_texels=" << bt.source_sampled_texels << '\n'
+      << "source_missing_texels_before_repair=" << bt.source_missing_texels << '\n'
+      << "source_missing_fraction_before_repair=" << missing << '\n'
+      << "unresolved_surface_texels_after_chart_repair=" << bt.unresolved_surface_texels << '\n'
+      << "unresolved_surface_fraction_after_chart_repair=" << unresolved << '\n'
+      << "sampling_verdict=" << (bt.unresolved_surface_texels==0 ? "complete-after-chart-repair" : "residual-unresolved") << '\n';
+    return (bool)f;
+}
 
 // Sparse 3-D colour outlier cleanup for a decoded PBR surface. Texture-flow occasionally emits
 // isolated black/bright voxels inside otherwise coherent cloth or skin; UV-space filtering cannot
@@ -1302,6 +1336,9 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     }
     if (verbose && holes) printf("[atlas] interior holes (covered but unsampled): %zu (%.2f%% of covered) -> inpainting\n",
                                  holes, 100.0*holes/(double)covered);
+    bt.surface_texels=(size_t)covered;
+    bt.source_missing_texels=holes;
+    bt.source_sampled_texels=(size_t)covered-holes;
     // Gutter dilation. NON-precluster (few large charts, far apart): a big fill (64) also seals
     // interior grid_sample-miss holes. PRECLUSTER (thousands of tiny charts packed ~padding apart):
     // a big fill BLEEDS each chart's colour across the gutter into its neighbours → teal "peeking
@@ -1318,6 +1355,10 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     } else {
         inpaint(atl, mask2, W, Ht, C, precluster ? inp_iters : std::max(padding+2, inp_iters));
     }
+    // Count original surface texels before the optional whole-atlas dilation.
+    // That dilation is for safe mip/bilinear sampling, not evidence that the
+    // model supplied a texture value for the mesh itself.
+    for (size_t p=0;p<(size_t)W*Ht;p++) if (mask[p] && !mask2[p]) ++bt.unresolved_surface_texels;
     if (std::getenv("TEX_FILL_BACKGROUND")) {
         if (verbose) printf("[atlas] filling remaining atlas background by nearest valid dilation\n");
         dilate_background(atl, mask2, W, Ht, C);
