@@ -139,14 +139,18 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
         printf("  [US] refine: N=%d steps=%d guidance=%.2f octree=%d chunk=%lld scale=%.6f vox_res=%d\n",
                N, steps, GUID, OCT, (long long)CHUNK, scale_factor, vox_res);
 
-    // ---- point PIXAL3D_GGUF_DIR at the UltraShape gguf (dit.gguf F16), restore on scope exit ----
+    // ---- Preserve the caller's GGUF setting, but do not expose it to the NPY-only conditioner/VAE. ----
+    // `M1Harness` treats PIXAL3D_GGUF_DIR as authoritative for *every* named model.  Leaving it pointed
+    // at refine/gguf therefore makes the conditioner look for a nonexistent conditioner.gguf instead
+    // of its installed NPY tensors.  The UltraShape DiT is the sole GGUF consumer, so scope that override
+    // to its sampling block below.
     std::string prev_gguf; bool had_prev = false;
     if (const char* p = std::getenv("PIXAL3D_GGUF_DIR")) { prev_gguf = p; had_prev = true; }
-    setenv("PIXAL3D_GGUF_DIR", cfg.gguf_dir.c_str(), 1);
     struct EnvRestore {
         bool had; std::string prev;
         ~EnvRestore(){ if (had) setenv("PIXAL3D_GGUF_DIR", prev.c_str(), 1); else unsetenv("PIXAL3D_GGUF_DIR"); }
     } _restore{had_prev, prev_gguf};
+    unsetenv("PIXAL3D_GGUF_DIR");
 
     // ---- conditioner (scoped: GPU weights free before DiT) ----
     double t_c0 = now_s();
@@ -173,6 +177,10 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
 
     // ---- DiT sampling (scope frees the 6.1GB F16 weights before the VAE harness) ----
     {
+        // Only this model has the retained F16/Q8 GGUF. Clear it again on scope exit so the following
+        // VAE harness deliberately loads its NPY weights rather than probing for a nonexistent vae.gguf.
+        setenv("PIXAL3D_GGUF_DIR", cfg.gguf_dir.c_str(), 1);
+        struct ClearRefineGGUF { ~ClearRefineGGUF(){ unsetenv("PIXAL3D_GGUF_DIR"); } } _clear_refine_gguf;
         UsDitCfg dcfg;
         const int hidden = dcfg.hidden, ich = dcfg.in_channels;
         M1Harness Hd(cfg.dit_w, 8192, use_cuda);
