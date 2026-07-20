@@ -16,6 +16,9 @@
 #   IMAGE_TO_RIG_PROJECT=1                               create observed-view projection A/B
 #   IMAGE_TO_RIG_TEX_BACK=/abs/back.png
 #   IMAGE_TO_RIG_TEX_VIEWS='90=/abs/right.png -90=/abs/left.png'
+#   IMAGE_TO_RIG_TEX_VIEWS_FILE=/abs/turnaround.tsv       robust 1--8 view manifest (yaw<TAB>absolute path)
+#                                                          yaw 0/180 replace the front/back source; all other
+#                                                          yaws are passed as --tex-view. Blank/# lines are ignored.
 #   IMAGE_TO_RIG_INPUT_MODE=auto|matte                   auto: preserve a cutout/matte or RMBG a raw photo
 #   MATTING_URL=http://localhost:18898                   native RMBG-2.0 service (raw-photo input only)
 #   IMAGE_TO_RIG_PREPARE_ONLY=1                          emit/audit input.png, without geometry inference
@@ -174,23 +177,100 @@ fi
 # Projection is deliberately an A/B, never a replacement for native_high_textured.glb: the native
 # generated material remains responsible for every unobserved texel.  The cache's PBR is used only
 # to build an independently inspectable observed-view hybrid when the caller has real extra views.
+#
+# IMAGE_TO_RIG_TEX_VIEWS is retained for shell convenience, but it cannot represent paths containing
+# whitespace and is awkward for a real 4--8 camera turnaround.  The TSV manifest is the production
+# contract: one canonical camera yaw and one absolute source path per line.  Normalising yaws before
+# invoking image_to_rig prevents an accidental `180`/`-180` duplicate camera and makes the recorded
+# evidence unambiguous.
 PROJ_ARGS=()
 PROJECT="${IMAGE_TO_RIG_PROJECT:-0}"
+declare -A PROJ_PATH_BY_YAW=()
+declare -A PROJ_ORIGIN_BY_YAW=()
+declare -A PROJ_LABEL_BY_YAW=()
+PROJ_COUNT=0
+
+normalise_yaw() {
+  awk -v yaw="$1" 'BEGIN {
+    if (yaw !~ /^[-+]?[0-9]*([.][0-9]+)?$/) exit 1
+    y = yaw + 0
+    y = y - 360 * int(y / 360)
+    if (y < 0) y += 360
+    if (y >= 360) y -= 360
+    if (y == 0) y = 0
+    printf "%.6g", y
+  }'
+}
+
+add_projection_view() {
+  local raw_yaw="$1" path="$2" origin="$3" yaw
+  yaw="$(normalise_yaw "$raw_yaw")" || { echo "bad projection yaw '$raw_yaw' from $origin" >&2; exit 2; }
+  [[ "$path" = /* ]] || { echo "projection path must be absolute ($origin): $path" >&2; exit 2; }
+  [[ -f "$path" ]] || { echo "missing projection image ($origin): $path" >&2; exit 2; }
+  [[ -z "${PROJ_PATH_BY_YAW[$yaw]:-}" ]] || {
+    echo "duplicate projection yaw $yaw: ${PROJ_ORIGIN_BY_YAW[$yaw]} and $origin" >&2; exit 2;
+  }
+  (( PROJ_COUNT < 8 )) || { echo "projection supports at most 8 cameras (including front/back)" >&2; exit 2; }
+  PROJ_PATH_BY_YAW[$yaw]="$path"
+  PROJ_ORIGIN_BY_YAW[$yaw]="$origin"
+  if [[ "$yaw" == 0 ]]; then
+    PROJ_LABEL_BY_YAW[$yaw]=front
+  elif [[ "$yaw" == 180 ]]; then
+    PROJ_LABEL_BY_YAW[$yaw]=back
+  else
+    PROJ_LABEL_BY_YAW[$yaw]="yaw$yaw"
+  fi
+  ((PROJ_COUNT += 1))
+}
+
 if [[ -n "${IMAGE_TO_RIG_TEX_FRONT:-}" ]]; then
-  [[ -f "$IMAGE_TO_RIG_TEX_FRONT" ]] || { echo "missing IMAGE_TO_RIG_TEX_FRONT: $IMAGE_TO_RIG_TEX_FRONT" >&2; exit 2; }
-  PROJ_ARGS+=(--tex-front "$IMAGE_TO_RIG_TEX_FRONT"); PROJECT=1
+  add_projection_view 0 "$IMAGE_TO_RIG_TEX_FRONT" IMAGE_TO_RIG_TEX_FRONT; PROJECT=1
 fi
 if [[ -n "${IMAGE_TO_RIG_TEX_BACK:-}" ]]; then
-  [[ -f "$IMAGE_TO_RIG_TEX_BACK" ]] || { echo "missing IMAGE_TO_RIG_TEX_BACK: $IMAGE_TO_RIG_TEX_BACK" >&2; exit 2; }
-  PROJ_ARGS+=(--tex-back "$IMAGE_TO_RIG_TEX_BACK"); PROJECT=1
+  add_projection_view 180 "$IMAGE_TO_RIG_TEX_BACK" IMAGE_TO_RIG_TEX_BACK; PROJECT=1
 fi
 if [[ -n "${IMAGE_TO_RIG_TEX_VIEWS:-}" ]]; then
   for view in $IMAGE_TO_RIG_TEX_VIEWS; do
     yaw="${view%%=*}"; path="${view#*=}"
-    [[ "$yaw" != "$view" && -f "$path" ]] || { echo "bad IMAGE_TO_RIG_TEX_VIEWS '$view' (expected yaw=/absolute/image.png)" >&2; exit 2; }
-    PROJ_ARGS+=(--tex-view "$yaw" "$path"); PROJECT=1
+    [[ "$yaw" != "$view" ]] || { echo "bad IMAGE_TO_RIG_TEX_VIEWS '$view' (expected yaw=/absolute/image.png)" >&2; exit 2; }
+    add_projection_view "$yaw" "$path" IMAGE_TO_RIG_TEX_VIEWS; PROJECT=1
   done
 fi
+if [[ -n "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-}" ]]; then
+  VIEW_MANIFEST="$IMAGE_TO_RIG_TEX_VIEWS_FILE"
+  [[ "$VIEW_MANIFEST" = /* && -f "$VIEW_MANIFEST" ]] || {
+    echo "IMAGE_TO_RIG_TEX_VIEWS_FILE must name an existing absolute TSV manifest" >&2; exit 2;
+  }
+  line_no=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_no += 1))
+    [[ -z "${line//[[:space:]]/}" || "$line" == \#* ]] && continue
+    IFS=$'\t' read -r yaw path extra <<<"$line"
+    [[ -n "$yaw" && -n "$path" && -z "${extra:-}" ]] || {
+      echo "bad $VIEW_MANIFEST:$line_no (expected yaw<TAB>/absolute/path.png)" >&2; exit 2;
+    }
+    add_projection_view "$yaw" "$path" "$VIEW_MANIFEST:$line_no"
+    PROJECT=1
+  done <"$VIEW_MANIFEST"
+fi
+
+# The normalised map is the one source of truth. The front defaults to the model-facing matte if
+# no explicit yaw=0 source was supplied; it still counts as a camera for the eight-view bound.
+if [[ -z "${PROJ_PATH_BY_YAW[0]:-}" ]]; then
+  PROJ_PATH_BY_YAW[0]="$PIPELINE_IMAGE"
+  PROJ_ORIGIN_BY_YAW[0]=model_input
+  PROJ_LABEL_BY_YAW[0]=front
+fi
+TOTAL_PROJ_CAMERAS="${#PROJ_PATH_BY_YAW[@]}"
+(( TOTAL_PROJ_CAMERAS <= 8 )) || { echo "projection supports at most 8 cameras including default front" >&2; exit 2; }
+for yaw in $(printf '%s\n' "${!PROJ_PATH_BY_YAW[@]}" | LC_ALL=C sort -n); do
+  path="${PROJ_PATH_BY_YAW[$yaw]}"
+  case "$yaw" in
+    0) PROJ_ARGS+=(--tex-front "$path");;
+    180) PROJ_ARGS+=(--tex-back "$path");;
+    *) PROJ_ARGS+=(--tex-view "$yaw" "$path");;
+  esac
+done
 if [[ "$PROJECT" != 0 ]]; then
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   echo "== $LABEL: observed-view projection A/B (native texture remains default) =="
@@ -201,12 +281,18 @@ if [[ "$PROJECT" != 0 ]]; then
       --from-refined "$CACHE" --stage-dir "$OUT" --decimate 300000 --texsize 2048 --no-rig \
       --tex-project-overlay "${PROJ_ARGS[@]}" --out "$OUT/high_hybrid_projected.glb"
   )
-  cat >"$OUT/projection_source.txt" <<EOF
-mode=observed-view hybrid A/B; native_high_textured.glb remains production default
-front=${IMAGE_TO_RIG_TEX_FRONT:-$PIPELINE_IMAGE}
-back=${IMAGE_TO_RIG_TEX_BACK:-none}
-views=${IMAGE_TO_RIG_TEX_VIEWS:-none}
-EOF
+  {
+    printf 'mode=observed-view hybrid A/B; native_high_textured.glb remains production default\n'
+    printf 'camera_count=%s\n' "$TOTAL_PROJ_CAMERAS"
+    printf 'blend=real observed pixels in linear light; z-buffer + eroded-subject-mask reject; native generated base retained for unobserved texels\n'
+    printf 'manifest=%s\n' "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-none}"
+    for yaw in $(printf '%s\n' "${!PROJ_PATH_BY_YAW[@]}" | LC_ALL=C sort -n); do
+      path="${PROJ_PATH_BY_YAW[$yaw]}"
+      printf 'view yaw=%s label=%s path=%s sha256=%s origin=%s\n' \
+        "$yaw" "${PROJ_LABEL_BY_YAW[$yaw]}" "$path" "$(sha256sum "$path" | awk '{print $1}')" \
+        "${PROJ_ORIGIN_BY_YAW[$yaw]}"
+    done
+  } >"$OUT/projection_source.txt"
 fi
 
 cat >"$OUT/runbook_source.txt" <<EOF
