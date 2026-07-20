@@ -30,6 +30,7 @@ mkdir -p "$(dirname "$OUT")" "$OUT_ROOT"
 STATUS_FILE="${OUT}.run-status.txt"
 STARTED_AT="$(date -Is)"
 START_SECONDS=$SECONDS
+STATUS_INITIALIZED=0
 
 # A visual result is only useful if its material recipe can be reconstructed later.  Compute these
 # once (rather than in the ten-second status refresh) and retain them alongside the live PID/status.
@@ -61,10 +62,16 @@ flock -n 9 || { echo "another image-to-rig job owns the 3060" >&2; exit 75; }
 write_status() {
   local state="$1" rc="${2:-0}"
   shift 2
-  # The child appends its artifact outcome after it has actually written outputs.  Preserve that
-  # authoritative record when the launcher refreshes or finalizes its own status fields.
+  # The child appends its artifact outcome after it has actually written outputs. Preserve that
+  # authoritative record when this launcher's status refreshes or finalizes its own fields.
   local artifact_lines=""
-  if [[ -f "$STATUS_FILE" ]]; then artifact_lines="$(sed -n '/^artifact_/p' "$STATUS_FILE")"; fi
+  # The child appends completion truth while this launcher refreshes the status every ten seconds.
+  # Retain that truth only after THIS invocation has written its initial record: otherwise a rerun
+  # over the same output inherits a stale `artifact_state=succeeded` from the prior child while the
+  # new inference is still live.
+  if [[ "$STATUS_INITIALIZED" == 1 && -f "$STATUS_FILE" ]]; then
+    artifact_lines="$(sed -n '/^artifact_/p' "$STATUS_FILE")"
+  fi
   {
     printf 'launcher_state=%s\n' "$state"
     printf 'started_at=%s\n' "$STARTED_AT"
@@ -91,6 +98,7 @@ finish_status() {
   if (( rc == 0 )); then write_status succeeded 0 "$@"; else write_status failed "$rc" "$@"; fi
 }
 write_status running 0 "$@"
+STATUS_INITIALIZED=1
 trap 'finish_status "$@"' EXIT
 
 echo "== native texture: $(basename "$MESH") + $(basename "$IMAGE") -> $OUT =="
