@@ -1287,7 +1287,9 @@ the public server is CUDA-free and proxies generation to one child process. `GET
 unload returns `503` with `cuda_context_released:false`; callers must not schedule
 a competing GPU workload. `POST /v1/admin/load` reopens admission; the next
 generation lazily starts a new child. A child is also killed when its supervisor
-dies, so stopping the public service cannot leave a CUDA worker orphaned.
+dies, so stopping the public service cannot leave a CUDA worker orphaned. The
+filesystem-only `DELETE /ltx/v1/job` cleanup call is handled by the supervisor
+without spawning a child, so Director-bank cleanup remains safe after unload.
 
 ### LongCat Avatar compatibility endpoint
 

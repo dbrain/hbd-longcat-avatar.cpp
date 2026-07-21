@@ -5,6 +5,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <thread>
 
@@ -20,6 +22,7 @@
 namespace {
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;
 
 bool truthy(const char* value) {
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
@@ -44,6 +47,59 @@ bool is_generation_request(const httplib::Request& request) {
            request.path == "/generate" || request.path == "/sdapi/v1/txt2img" ||
            request.path == "/sdapi/v1/img2img" || request.path == "/v1/images/generations" ||
            request.path == "/v1/images/edits";
+}
+
+bool valid_ltx_bank_id(const std::string& id) {
+    return !id.empty() && id.size() <= 128 &&
+           std::all_of(id.begin(), id.end(), [](unsigned char ch) {
+               return std::isalnum(ch) || ch == '_' || ch == '-';
+           });
+}
+
+std::vector<fs::path> ltx_bank_roots() {
+    const char* jobs_env = std::getenv("LTX_JOB_DIR");
+    const char* persist_env = std::getenv("LTX_PERSIST_DIR");
+    const fs::path jobs = jobs_env != nullptr && jobs_env[0] != '\0'
+        ? jobs_env : "/var/lib/ltx-video/jobs";
+    const fs::path persist = persist_env != nullptr && persist_env[0] != '\0'
+        ? persist_env : "/var/lib/ltx-video/persist";
+    return persist == jobs ? std::vector<fs::path>{jobs} : std::vector<fs::path>{persist, jobs};
+}
+
+bool delete_ltx_bank(const std::string& job_id, bool& deleted, std::string& error_message) {
+    if (!valid_ltx_bank_id(job_id)) {
+        error_message = "id must be an LTX job id";
+        return false;
+    }
+    for (const fs::path& root : ltx_bank_roots()) {
+        const fs::path requested_dir = root / job_id;
+        std::error_code error;
+        if (!fs::is_directory(requested_dir, error)) continue;
+        std::string bank_id = job_id;
+        std::ifstream reference(requested_dir / "bank_id");
+        if (reference.is_open()) {
+            std::getline(reference, bank_id);
+            if (!valid_ltx_bank_id(bank_id)) {
+                error_message = "invalid LTX bank reference";
+                return false;
+            }
+        }
+        const uintmax_t bank_removed = fs::remove_all(root / bank_id, error);
+        if (error) {
+            error_message = error.message();
+            return false;
+        }
+        uintmax_t alias_removed = 0;
+        if (bank_id != job_id) {
+            alias_removed = fs::remove_all(requested_dir, error);
+            if (error) {
+                error_message = error.message();
+                return false;
+            }
+        }
+        deleted = deleted || bank_removed > 0 || alias_removed > 0;
+    }
+    return true;
 }
 
 void copy_response(const httplib::Response& source, httplib::Response& destination) {
@@ -494,6 +550,25 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
             return httplib::Server::HandlerResponse::Handled;
         }
         if (is_admin_path(request.path)) return httplib::Server::HandlerResponse::Unhandled;
+        // Durable LTX cleanup is metadata/filesystem-only. Let Koblem delete a
+        // retired Director bank after /unload without cold-starting a CUDA child.
+        if (request.method == "DELETE" && request.path == "/ltx/v1/job") {
+            if (supervisor.in_flight() > 0) {
+                response.status = 409;
+                response.set_content(R"({"error":"cannot delete an active LTX job"})", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            bool deleted = false;
+            std::string error;
+            if (!delete_ltx_bank(request.get_param_value("id"), deleted, error)) {
+                response.status = 400;
+                response.set_content(json({{"error", error}}).dump(), "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            response.set_content(json({{"status", deleted ? "deleted" : "missing"}, {"deleted", deleted}}).dump(),
+                                 "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
         supervisor.proxy(request, response, WorkerSupervisor::request_model(request));
         return httplib::Server::HandlerResponse::Handled;
     });
