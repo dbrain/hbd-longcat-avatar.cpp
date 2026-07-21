@@ -139,7 +139,10 @@ struct SDContextParams {
     std::string pulid_weights_path;
     sd_type_t wtype = SD_TYPE_COUNT;
     std::string tensor_type_rules;
-    std::string lora_model_dir = ".";
+    // A server without an explicit LoRA directory has no LoRAs.  Using "."
+    // makes request-time cache refresh walk the server working directory
+    // (including /proc in the worker container).
+    std::string lora_model_dir;
     std::string hires_upscalers_dir;
 
     std::map<std::string, std::string> embedding_map;
