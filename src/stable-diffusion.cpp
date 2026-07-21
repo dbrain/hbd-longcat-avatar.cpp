@@ -6536,6 +6536,21 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
         LOG_INFO("LTX_LOAD_LATENT: decoding %s", path);
     }
     // auto z = sd::load_tensor_from_file_as_tensor<float>("ltx_vae_z.bin");
+    // LTX_LOAD_LATENT (diagnostic): replace the just-sampled diffusion latent with one
+    // saved earlier via WAN_SAVE_LATENT, so the SAME latent can be decoded through
+    // different VAE weights/precisions for an airtight VAE-only A/B (the nvfp4/fp8 DiT is
+    // not bit-deterministic run-to-run). No effect on prod (unset).
+    if (const char* lp = getenv("LTX_LOAD_LATENT"); lp != nullptr && lp[0] != '\0') {
+        try {
+            video_latent = sd::load_tensor_from_file_as_tensor<float>(lp);
+            LOG_INFO("LTX_LOAD_LATENT: decoding saved latent (%dx%dx%dx%d) from %s",
+                     (int)video_latent.shape()[0], (int)video_latent.shape()[1],
+                     (int)video_latent.shape()[2],
+                     (int)(video_latent.dim() > 3 ? video_latent.shape()[3] : 1), lp);
+        } catch (const std::exception& e) {
+            LOG_ERROR("LTX_LOAD_LATENT failed: %s", e.what());
+        }
+    }
     int64_t t4            = ggml_time_ms();
     sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(video_latent, true);
     int64_t t5            = ggml_time_ms();
