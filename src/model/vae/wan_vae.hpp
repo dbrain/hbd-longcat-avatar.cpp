@@ -100,11 +100,20 @@ namespace WAN {
             }
 
             x = ggml_ext_pad_ext(ctx->ggml_ctx, ctx->backend, x, lp0, rp0, lp1, rp1, lp2, rp2, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
+            const bool head_f32 = force_prec_f32 && wan_vae_head_f32_enabled();
+            // ggml_ext_conv_3d chooses its im2col element type from the weight.  Merely
+            // requesting F32 matmul precision still leaves that column buffer F16 when
+            // the checkpoint weight is F16, which preserves the 2x2 unpatchify grid.
+            // Promote the small final head's weight too, so this diagnostic path is a
+            // genuinely F32 convolution from input through output.
+            if (head_f32 && w->type != GGML_TYPE_F32) {
+                w = ggml_cast(ctx->ggml_ctx, w, GGML_TYPE_F32);
+            }
             return ggml_ext_conv_3d(ctx->ggml_ctx, ctx->backend, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
                                     std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
-                                    force_prec_f32 && wan_vae_head_f32_enabled());
+                                    head_f32);
         }
     };
 
