@@ -579,7 +579,7 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
         supervisor.reopen();
         response.set_content(json({{"status", "ok"}, {"loaded", supervisor.loaded()}}).dump(), "application/json");
     });
-    server.set_pre_routing_handler([&supervisor](const httplib::Request& request, httplib::Response& response) {
+    server.set_pre_routing_handler([](const httplib::Request& request, httplib::Response& response) {
         std::string origin = request.get_header_value("Origin");
         if (origin.empty()) origin = "*";
         response.set_header("Access-Control-Allow-Origin", origin);
@@ -590,27 +590,38 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
             response.status = 204;
             return httplib::Server::HandlerResponse::Handled;
         }
-        if (is_admin_path(request.path)) return httplib::Server::HandlerResponse::Unhandled;
+        // cpp-httplib invokes this hook before it consumes a request body.
+        // Leave normal requests unhandled so the regular route handlers below
+        // receive JSON and multipart payloads intact.
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    server.Delete("/ltx/v1/job", [&supervisor](const httplib::Request& request, httplib::Response& response) {
         // Durable LTX cleanup is metadata/filesystem-only. Let Koblem delete a
         // retired Director bank after /unload without cold-starting a CUDA child.
-        if (request.method == "DELETE" && request.path == "/ltx/v1/job") {
-            if (supervisor.in_flight() > 0) {
-                response.status = 409;
-                response.set_content(R"({"error":"cannot delete an active LTX job"})", "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            bool deleted = false;
-            std::string error;
-            if (!delete_ltx_bank(request.get_param_value("id"), deleted, error)) {
-                response.status = 400;
-                response.set_content(json({{"error", error}}).dump(), "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            response.set_content(json({{"status", deleted ? "deleted" : "missing"}, {"deleted", deleted}}).dump(),
-                                 "application/json");
-            return httplib::Server::HandlerResponse::Handled;
+        if (supervisor.in_flight() > 0) {
+            response.status = 409;
+            response.set_content(R"({"error":"cannot delete an active LTX job"})", "application/json");
+            return;
         }
-        supervisor.proxy(request, response, WorkerSupervisor::request_model(request));
-        return httplib::Server::HandlerResponse::Handled;
+        bool deleted = false;
+        std::string error;
+        if (!delete_ltx_bank(request.get_param_value("id"), deleted, error)) {
+            response.status = 400;
+            response.set_content(json({{"error", error}}).dump(), "application/json");
+            return;
+        }
+        response.set_content(json({{"status", deleted ? "deleted" : "missing"}, {"deleted", deleted}}).dump(),
+                             "application/json");
     });
+
+    const auto proxy_request = [&supervisor](const httplib::Request& request, httplib::Response& response) {
+        supervisor.proxy(request, response, WorkerSupervisor::request_model(request));
+    };
+    constexpr const char* kAnyPath = R"(/.*)";
+    server.Get(kAnyPath, proxy_request);
+    server.Post(kAnyPath, proxy_request);
+    server.Put(kAnyPath, proxy_request);
+    server.Patch(kAnyPath, proxy_request);
+    server.Delete(kAnyPath, proxy_request);
 }
