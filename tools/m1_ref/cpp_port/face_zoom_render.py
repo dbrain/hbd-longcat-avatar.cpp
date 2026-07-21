@@ -10,6 +10,7 @@ paths = sys.argv[1:-1]
 out = sys.argv[-1]
 YAW = float(os.environ.get("FACE_YAW", "0"))
 TARGET_Y = float(os.environ.get("FACE_TARGET_Y", "0.30"))
+FOV_DEG = float(os.environ.get("FACE_FOV_DEG", "18"))
 if len(paths) < 1:
     print("usage: face_zoom_render.py a.glb [b.glb c.glb] out.png")
     raise SystemExit(1)
@@ -52,7 +53,7 @@ def render(path, yaw_deg=0):
     yaw = np.radians(yaw_deg)
     target = np.array([0.0, TARGET_Y, 0.0])
     eye = target + np.array([1.10*np.sin(yaw), 0.02, 1.10*np.cos(yaw)])
-    cam = pyrender.PerspectiveCamera(yfov=np.radians(18))
+    cam = pyrender.PerspectiveCamera(yfov=np.radians(FOV_DEG))
     pose = look_at(eye, target)
     scene.add(cam, pose=pose)
     scene.add(pyrender.DirectionalLight(color=[1,1,1], intensity=2.0), pose=pose)

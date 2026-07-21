@@ -43,6 +43,20 @@ for key in cam_angle_x_rad camera_distance mesh_scale; do
   [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "REJECT: camera provenance lacks numeric $key" >&2; exit 1; }
 done
 
+LOG_NAME="$(sed -n 's/^projection_log=\([^ ]*\) sha256=.*/\1/p' "$SRC")"
+LOG_HASH="$(sed -n 's/^projection_log=.* sha256=\([0-9a-f]*\)$/\1/p' "$SRC")"
+LOG="$(dirname "$SRC")/$LOG_NAME"
+[[ -s "$LOG" && "$LOG_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "REJECT: missing projection log provenance" >&2; exit 1; }
+[[ "$(sha256sum "$LOG" | awk '{print $1}')" == "$LOG_HASH" ]] || { echo "REJECT: projection log changed" >&2; exit 1; }
+# The projector explicitly measures whether rejected source samples are on the
+# grazing silhouette (expected) or inside the subject (a bad fit/mask). A
+# candidate with the latter warning is not clean enough for an eye-test A/B,
+# much less promotion: it would bake background/noise into visible material.
+if rg -q '\[WARN: rejected texels are NOT grazing — mask/fit suspect' "$LOG"; then
+  echo "REJECT: projection mask/fit suspect; inspect source framing or camera provenance: $LOG" >&2
+  exit 1
+fi
+
 CAMERAS="$(awk -F= '$1=="camera_count" {print $2; exit}' "$SRC")"
 [[ "$CAMERAS" =~ ^[1-8]$ ]] || { echo "REJECT: invalid camera count" >&2; exit 1; }
 declare -A seen=()
