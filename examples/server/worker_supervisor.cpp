@@ -619,7 +619,7 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
         supervisor.reopen();
         response.set_content(json({{"status", "ok"}, {"loaded", supervisor.loaded()}}).dump(), "application/json");
     });
-    server.set_pre_routing_handler([](const httplib::Request& request, httplib::Response& response) {
+    server.set_pre_routing_handler([&supervisor](const httplib::Request& request, httplib::Response& response) {
         std::string origin = request.get_header_value("Origin");
         if (origin.empty()) origin = "*";
         response.set_header("Access-Control-Allow-Origin", origin);
@@ -628,6 +628,36 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
         response.set_header("Access-Control-Allow-Headers", "*");
         if (request.method == "OPTIONS") {
             response.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        // cpp-httplib attempts to read a POST body before ordinary route dispatch.
+        // A perfectly valid `POST /v1/admin/unload` with no Content-Length can
+        // therefore wait forever for a body that the client did not send.  Handle
+        // the established empty-body unload contract here; requests with JSON
+        // (notably {"force":true}) continue to the regular handler below.
+        const std::string content_length = request.get_header_value("Content-Length");
+        if (request.method == "POST" && request.path == "/v1/admin/unload" &&
+            (content_length.empty() || content_length == "0")) {
+            const int in_flight = supervisor.in_flight();
+            if (in_flight > 0) {
+                response.set_content(json({{"status", "busy (pass force=true to cancel + unload)"},
+                                           {"busy", true}, {"in_flight", in_flight}}).dump(),
+                                     "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            const bool was_loaded = supervisor.loaded();
+            if (!supervisor.unload()) {
+                response.status = 503;
+                response.set_content(json({{"status", "unload failed"}, {"loaded", supervisor.loaded()},
+                                           {"worker_pid", supervisor.worker_pid()},
+                                           {"cuda_context_released", false}}).dump(),
+                                     "application/json");
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            response.set_content(json({{"status", was_loaded ? "unloaded" : "idle"},
+                                       {"unloaded", was_loaded}, {"cuda_context_released", true},
+                                       {"worker_pid", nullptr}, {"forced", false}}).dump(),
+                                 "application/json");
             return httplib::Server::HandlerResponse::Handled;
         }
         // cpp-httplib invokes this hook before it consumes a request body.
