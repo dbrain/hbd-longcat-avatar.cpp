@@ -15,6 +15,7 @@
 #   IMAGE_TO_RIG_REFRESH=1                              recompute even if this image's cache exists
 #   IMAGE_TO_RIG_US_STEPS=50|80                          explicit UltraShape geometry-detail recipe (80 is a labelled face/detail A/B)
 #   IMAGE_TO_RIG_GEO_RESOLUTION=1024|1536                Pixal3D seed lattice; 1536 is the true high-geometry A/B
+#   IMAGE_TO_RIG_GEOMETRY_CAMERA=moge|default             geometry camera contract; default-camera is an explicit historical A/B
 #   IMAGE_TO_RIG_SKIP_ULTRASHAPE=1                       stop after the Pixal3D seed (coarse clay review)
 #   IMAGE_TO_RIG_GEOMETRY_REVIEW_ONLY=1                  publish clay-stage aliases/gate, then stop before texture or rig
 #   IMAGE_TO_RIG_PROJECT=1                               create native-base observed-view texture A/B (CPU-only)
@@ -104,6 +105,10 @@ GEOMETRY_RESOLUTION="${IMAGE_TO_RIG_GEO_RESOLUTION:-1024}"
 [[ "$GEOMETRY_RESOLUTION" == 1024 || "$GEOMETRY_RESOLUTION" == 1536 ]] || {
   echo "IMAGE_TO_RIG_GEO_RESOLUTION must be 1024 or 1536" >&2; exit 2;
 }
+GEOMETRY_CAMERA="${IMAGE_TO_RIG_GEOMETRY_CAMERA:-moge}"
+[[ "$GEOMETRY_CAMERA" == moge || "$GEOMETRY_CAMERA" == default ]] || {
+  echo "IMAGE_TO_RIG_GEOMETRY_CAMERA must be moge or default" >&2; exit 2;
+}
 SKIP_ULTRASHAPE="${IMAGE_TO_RIG_SKIP_ULTRASHAPE:-0}"
 [[ "$SKIP_ULTRASHAPE" == 0 || "$SKIP_ULTRASHAPE" == 1 ]] || {
   echo "IMAGE_TO_RIG_SKIP_ULTRASHAPE must be 0 or 1" >&2; exit 2;
@@ -140,6 +145,14 @@ if [[ "$SKIP_ULTRASHAPE" == 1 ]]; then
   PIXAL_RECIPE_SUFFIX+="-coarse-only"
   GEOMETRY_CACHE_SUFFIX+="-coarse-only"
 fi
+if [[ "$GEOMETRY_CAMERA" == default ]]; then
+  # The upstream/default camera contract is a distinct reconstruction: camera
+  # projection feeds Pixal's high-resolution M3b conditioning, so this is not
+  # merely a viewer/FOV choice. Preserve the established MoGe v4 cache key.
+  GEOMETRY_RECIPE_VERSION=7
+  PIXAL_RECIPE_SUFFIX+="-defaultcam"
+  GEOMETRY_CACHE_SUFFIX+="-defaultcam"
+fi
 # The clean default creates geometry only. It must not pay for, or depend on,
 # Pixal's legacy PBR decoder before texture_mesh_native makes the production
 # material. Native observed-image overlay works over the generated native atlas
@@ -149,10 +162,10 @@ LEGACY_PBR_CACHE="${IMAGE_TO_RIG_LEGACY_PBR_CACHE:-0}"
   echo "IMAGE_TO_RIG_LEGACY_PBR_CACHE must be 0 or 1" >&2; exit 2;
 }
 if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
-  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}${PIXAL_RECIPE_SUFFIX}-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_RECIPE="${GEOMETRY_CAMERA}-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}${PIXAL_RECIPE_SUFFIX}-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=legacy-pbr-cache
 else
-  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}${PIXAL_RECIPE_SUFFIX}-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_RECIPE="${GEOMETRY_CAMERA}-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}${PIXAL_RECIPE_SUFFIX}-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=geometry-only
 fi
 if [[ "$GEOMETRY_REVIEW_ONLY" == 1 && "$LEGACY_PBR_CACHE" == 1 ]]; then
@@ -245,18 +258,20 @@ if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || "$cache_
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
     ULTRASHAPE_ARGS=()
     if [[ "$SKIP_ULTRASHAPE" == 1 ]]; then ULTRASHAPE_ARGS+=(--no-refine); fi
+    CAMERA_ARGS=()
+    if [[ "$GEOMETRY_CAMERA" == moge ]]; then CAMERA_ARGS+=(--moge); fi
     if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
-      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" "${CAMERA_ARGS[@]}" \
         --resolution "$GEOMETRY_RESOLUTION" --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" "${ULTRASHAPE_ARGS[@]}" --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
         --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
     else
-      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
+      "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" "${CAMERA_ARGS[@]}" \
         --resolution "$GEOMETRY_RESOLUTION" --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" "${ULTRASHAPE_ARGS[@]}" --geometry-only --stage-dir "$CACHE" \
         --out "$CACHE/geometry_only_unused.glb"
     fi
   )
-  printf 'geometry_recipe=%s\nremesh_close_r=%s\npixal_resolution=%s\nultrashape_steps=%s\nultrashape_skipped=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
-    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$GEOMETRY_RESOLUTION" "$ULTRASHAPE_STEPS" "$SKIP_ULTRASHAPE" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
+  printf 'geometry_recipe=%s\ngeometry_camera_request=%s\nremesh_close_r=%s\npixal_resolution=%s\nultrashape_steps=%s\nultrashape_skipped=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
+    "$GEOMETRY_RECIPE" "$GEOMETRY_CAMERA" "$REMESH_CLOSE_R" "$GEOMETRY_RESOLUTION" "$ULTRASHAPE_STEPS" "$SKIP_ULTRASHAPE" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
 else
   echo "== $LABEL: reuse image-keyed clean geometry cache ${CACHE##*/} =="
 fi
@@ -281,6 +296,7 @@ if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
 {
   printf 'geometry_cache=%s\n' "$CACHE"
   printf 'geometry_recipe=%s\n' "$GEOMETRY_RECIPE"
+  printf 'geometry_camera_request=%s\n' "$GEOMETRY_CAMERA"
   printf '%s\n' 'clay_stage_aliases=coarse_geometry.glb (when available), refined_geometry.glb (exact texture source)'
   printf 'remesh_close_r=%s\n' "$REMESH_CLOSE_R"
   printf 'pixal_resolution=%s\n' "$GEOMETRY_RESOLUTION"
@@ -300,6 +316,7 @@ input_kind=$INPUT_KIND
 input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=$GEOMETRY_RECIPE
+geometry_camera_request=$GEOMETRY_CAMERA
 pixal_resolution=$GEOMETRY_RESOLUTION
 ultrashape_steps=$ULTRASHAPE_STEPS
 ultrashape_skipped=$SKIP_ULTRASHAPE
@@ -529,6 +546,7 @@ input_kind=$INPUT_KIND
 input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=$GEOMETRY_RECIPE
+geometry_camera_request=$GEOMETRY_CAMERA
 pixal_resolution=$GEOMETRY_RESOLUTION
 ultrashape_steps=$ULTRASHAPE_STEPS
 ultrashape_skipped=$SKIP_ULTRASHAPE
