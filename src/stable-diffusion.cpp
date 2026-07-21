@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <set>
 #include <tuple>
 #include <type_traits>
@@ -7146,12 +7147,22 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
                 const int first_keep = continuation ? std::min(overlap, count) : 0;
                 const int last_keep = continuation ? std::max(first_keep, count - discard) : count;
                 if (segment + 1 == chain_params->start_segment) {
-                    auto latent = sd::load_tensor_from_file_as_tensor<float>(path);
-                    latent_width = static_cast<int>(latent.shape()[0]);
-                    latent_height = static_cast<int>(latent.shape()[1]);
-                    latent_frames = static_cast<int>(latent.shape()[2]);
-                    latent_channels = static_cast<int>(latent.shape()[3]);
-                    prior_latent.assign(latent.data(), latent.data() + latent.numel());
+                    try {
+                        auto latent = sd::load_tensor_from_file_as_tensor<float>(path);
+                        if (latent.empty() || latent.dim() < 4) {
+                            throw std::runtime_error("invalid latent shape");
+                        }
+                        latent_width = static_cast<int>(latent.shape()[0]);
+                        latent_height = static_cast<int>(latent.shape()[1]);
+                        latent_frames = static_cast<int>(latent.shape()[2]);
+                        latent_channels = static_cast<int>(latent.shape()[3]);
+                        prior_latent.assign(latent.data(), latent.data() + latent.numel());
+                    } catch (const std::exception& error) {
+                        LOG_ERROR("generate_wan_vace_chain: could not restore latent %s: %s", path.c_str(), error.what());
+                        for (int i = 0; i < count; ++i) free(frames[i].data);
+                        free(frames);
+                        return fail();
+                    }
                     const int tail_start = std::max(first_keep, last_keep - overlap);
                     for (int frame = tail_start; frame < last_keep; ++frame) {
                         sd_image_t copy = copy_video_frame(frames[frame]);

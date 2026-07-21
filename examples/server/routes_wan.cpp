@@ -1,6 +1,9 @@
 #include "routes.h"
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -15,6 +18,49 @@ fs::path wan_bank_root() {
         return configured;
     }
     return "/var/lib/wan-vace/jobs";
+}
+
+bool valid_wan_bank_id(const std::string& id) {
+    return !id.empty() && id.size() <= 128 &&
+           std::all_of(id.begin(), id.end(), [](unsigned char ch) {
+               return std::isalnum(ch) || ch == '_' || ch == '-';
+           });
+}
+
+// A resumed request gets a fresh async-job ID for polling.  Preserve the
+// original durable bank behind that ID so it remains a usable resume token
+// after the in-memory job record expires or the server restarts.
+bool resolve_wan_bank_dir(const std::string& requested_id, fs::path& bank_dir, std::string& bank_id) {
+    if (!valid_wan_bank_id(requested_id)) {
+        return false;
+    }
+    bank_id = requested_id;
+    std::ifstream reference(wan_bank_root() / requested_id / "bank_id");
+    if (reference.is_open()) {
+        std::string referenced_id;
+        std::getline(reference, referenced_id);
+        if (!valid_wan_bank_id(referenced_id)) {
+            return false;
+        }
+        bank_id = std::move(referenced_id);
+    }
+    bank_dir = wan_bank_root() / bank_id;
+    return true;
+}
+
+bool write_wan_bank_reference(const std::string& job_id, const std::string& bank_id) {
+    if (job_id == bank_id) {
+        return true;
+    }
+    std::error_code error;
+    const fs::path reference_dir = wan_bank_root() / job_id;
+    fs::create_directories(reference_dir, error);
+    if (error) {
+        return false;
+    }
+    std::ofstream reference(reference_dir / "bank_id", std::ios::trunc);
+    reference << bank_id << '\n';
+    return reference.good();
 }
 
 bool parse_wan_video_request(const json& body,
@@ -149,8 +195,13 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
                 fs::path bank_dir;
+                std::string bank_id;
                 if (!resume_job_id.empty()) {
-                    bank_dir = wan_bank_root() / resume_job_id;
+                    if (!resolve_wan_bank_dir(resume_job_id, bank_dir, bank_id)) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"invalid resume_job_id"})", "application/json");
+                        return;
+                    }
                     const auto prior = manager.jobs.find(resume_job_id);
                     if (prior != manager.jobs.end() &&
                         (prior->second->status == AsyncJobStatus::Queued || prior->second->status == AsyncJobStatus::Generating)) {
@@ -167,6 +218,7 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 } else {
                     job->id = make_async_job_id(manager);
                     bank_dir = wan_bank_root() / job->id;
+                    bank_id = job->id;
                 }
                 std::error_code error;
                 fs::create_directories(bank_dir, error);
@@ -176,7 +228,13 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
                 if (job->id.empty()) job->id = make_async_job_id(manager);
+                if (!write_wan_bank_reference(job->id, bank_id)) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"could not persist Wan bank reference"})", "application/json");
+                    return;
+                }
                 job->wan_vace_bank_dir = bank_dir.string();
+                job->wan_vace_bank_id = bank_id;
                 job->wan_vace_resume_from = resume_from;
                 manager.jobs[job->id] = job;
                 manager.queue.push_back(job->id);
@@ -190,7 +248,8 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                                   {"poll_url", "/sdcpp/v1/jobs/" + job->id},
                                   {"media_url", "/sdcpp/v1/jobs/" + job->id + "/media"},
                                   {"segments", static_cast<int>(job->wan_vace_prompts.size())},
-                                  {"resume_from", resume_from}})
+                                  {"resume_from", resume_from},
+                                  {"resume_job_id", job->wan_vace_bank_id}})
                                 .dump(),
                             "application/json");
         } catch (const json::parse_error& error) {
