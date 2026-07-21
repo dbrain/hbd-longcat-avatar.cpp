@@ -8,6 +8,8 @@ from PIL import Image, ImageDraw
 
 paths = sys.argv[1:-1]
 out = sys.argv[-1]
+YAW = float(os.environ.get("FACE_YAW", "0"))
+TARGET_Y = float(os.environ.get("FACE_TARGET_Y", "0.30"))
 if len(paths) < 1:
     print("usage: face_zoom_render.py a.glb [b.glb c.glb] out.png")
     raise SystemExit(1)
@@ -48,7 +50,7 @@ def render(path, yaw_deg=0):
     scene = pyrender.Scene(bg_color=[0.04, 0.045, 0.05, 1], ambient_light=[0.75, 0.75, 0.75])
     scene.add(pm)
     yaw = np.radians(yaw_deg)
-    target = np.array([0.0, 0.30, 0.0])
+    target = np.array([0.0, TARGET_Y, 0.0])
     eye = target + np.array([1.10*np.sin(yaw), 0.02, 1.10*np.cos(yaw)])
     cam = pyrender.PerspectiveCamera(yfov=np.radians(18))
     pose = look_at(eye, target)
@@ -65,7 +67,7 @@ def render(path, yaw_deg=0):
 
 imgs = []
 for p in paths:
-    im = render(p, 0)
+    im = render(p, YAW)
     draw = ImageDraw.Draw(im)
     draw.rectangle([0,0,639,24], fill=(5,5,8))
     draw.text((8,5), os.path.basename(p), fill=(230,230,230))

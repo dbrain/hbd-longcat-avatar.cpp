@@ -13,6 +13,7 @@
 #   NATIVE_HIGH_RESOLUTION=1024 NATIVE_HIGH_ATLAS=4096  hero-detail high A/B
 #   (the generic runner always retains native_high_texture_dump for CPU LOD rebakes)
 #   IMAGE_TO_RIG_REFRESH=1                              recompute even if this image's cache exists
+#   IMAGE_TO_RIG_US_STEPS=50|80                          explicit UltraShape geometry-detail recipe (80 is a labelled face/detail A/B)
 #   IMAGE_TO_RIG_PROJECT=1                               create native-base observed-view texture A/B (CPU-only)
 #   IMAGE_TO_RIG_TEX_BACK=/abs/back.png
 #   IMAGE_TO_RIG_TEX_VIEWS='90=/abs/right.png -90=/abs/left.png'
@@ -92,11 +93,23 @@ export REMESH_CLOSE_R="${REMESH_CLOSE_R:-3}"
 [[ "$REMESH_CLOSE_R" =~ ^[1-9][0-9]*$ ]] || {
   echo "REMESH_CLOSE_R must be a positive integer (the clean-production default is 3)" >&2; exit 2;
 }
+ULTRASHAPE_STEPS="${IMAGE_TO_RIG_US_STEPS:-50}"
+[[ "$ULTRASHAPE_STEPS" =~ ^[1-9][0-9]*$ ]] && (( ULTRASHAPE_STEPS >= 40 && ULTRASHAPE_STEPS <= 100 )) || {
+  echo "IMAGE_TO_RIG_US_STEPS must be an integer in [40,100] (50 production default; 80 detail A/B)" >&2; exit 2;
+}
 # This is deliberately a versioned *geometry* recipe rather than an informal
 # environment setting.  A cache made with a different seal radius is a
 # different reconstruction and must never be reused just because the source
 # image happens to be identical.
+# Existing v4 clean caches used the same 50-step UltraShape default. Keep that
+# exact cache identity reusable; any non-default quality A/B gets a new,
+# explicit recipe version and cannot be mistaken for the baseline.
 GEOMETRY_RECIPE_VERSION=4
+ULTRASHAPE_RECIPE_SUFFIX=""
+if (( ULTRASHAPE_STEPS != 50 )); then
+  GEOMETRY_RECIPE_VERSION=5
+  ULTRASHAPE_RECIPE_SUFFIX="-ussteps${ULTRASHAPE_STEPS}"
+fi
 # The clean default creates geometry only. It must not pay for, or depend on,
 # Pixal's legacy PBR decoder before texture_mesh_native makes the production
 # material. Native observed-image overlay works over the generated native atlas
@@ -106,10 +119,10 @@ LEGACY_PBR_CACHE="${IMAGE_TO_RIG_LEGACY_PBR_CACHE:-0}"
   echo "IMAGE_TO_RIG_LEGACY_PBR_CACHE must be 0 or 1" >&2; exit 2;
 }
 if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
-  GEOMETRY_RECIPE="moge-noquad-us16384-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=legacy-pbr-cache
 else
-  GEOMETRY_RECIPE="moge-noquad-us16384-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=geometry-only
 fi
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
@@ -196,16 +209,16 @@ if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || "$cache_
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
     if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
       "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-        --no-quad --us-latents 16384 --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
+        --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
         --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
     else
       "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-        --no-quad --us-latents 16384 --geometry-only --stage-dir "$CACHE" \
+        --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" --geometry-only --stage-dir "$CACHE" \
         --out "$CACHE/geometry_only_unused.glb"
     fi
   )
-  printf 'geometry_recipe=%s\nremesh_close_r=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
-    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
+  printf 'geometry_recipe=%s\nremesh_close_r=%s\nultrashape_steps=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
+    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$ULTRASHAPE_STEPS" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
 else
   echo "== $LABEL: reuse image-keyed clean geometry cache ${CACHE##*/} =="
 fi
@@ -225,6 +238,7 @@ if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
   printf 'geometry_cache=%s\n' "$CACHE"
   printf 'geometry_recipe=%s\n' "$GEOMETRY_RECIPE"
   printf 'remesh_close_r=%s\n' "$REMESH_CLOSE_R"
+  printf 'ultrashape_steps=%s\n' "$ULTRASHAPE_STEPS"
   printf 'geometry_topology=%s\n' "$GEOMETRY_TOPOLOGY"
   printf '%s\n' 'geometry_gate=position-welded open=0 before native texture inference'
   printf 'geometry_gate_result=%s\n' "$GEOMETRY_GATE_RESULT"
@@ -444,6 +458,7 @@ input_kind=$INPUT_KIND
 input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=$GEOMETRY_RECIPE
+ultrashape_steps=$ULTRASHAPE_STEPS
 geometry_delivery_manifest=$OUT/geometry_delivery.txt
 camera_provenance=$CACHE/camera_provenance.txt
 legacy_pbr_cache=$LEGACY_PBR_CACHE
