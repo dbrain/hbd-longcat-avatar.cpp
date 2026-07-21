@@ -337,6 +337,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
             job->ltx_cont_latent_frames = continuation_frames;
+            job->ltx_emit_segments = body.value("emit_segments", false);
             const std::string resume_job_id = body.value("resume_job_id", std::string());
             if (body.contains("audio_offset_frames") && !body["audio_offset_frames"].is_number_integer()) {
                 res.status = 400;
@@ -507,5 +508,31 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             res.status = 500;
             res.set_content(json({{"error", "server_error"}, {"message", error.what()}}).dump(), "application/json");
         }
+    });
+
+    // Progressive LTX shot artifact.  This is deliberately durable-bank based
+    // rather than RAM-job based, so Koblem can retrieve a published segment
+    // after its in-memory job record has expired or after a route restart.
+    svr.Get(R"(/sdcpp/v1/jobs/([^/]+)/segments/(\d+))",
+            [](const httplib::Request& req, httplib::Response& res) {
+        const std::string job_id = req.matches[1];
+        const std::string segment = req.matches[2];
+        fs::path bank_dir;
+        std::string bank_id;
+        if (!resolve_ltx_bank_dir(job_id, bank_dir, bank_id)) {
+            res.status = 404;
+            res.set_content(R"({"error":"unknown LTX job"})", "application/json");
+            return;
+        }
+        const fs::path artifact = bank_dir / ("seg_" + segment + ".webm");
+        std::error_code error;
+        if (!fs::is_regular_file(artifact, error)) {
+            res.status = 404;
+            res.set_content(R"({"error":"segment webm not available"})", "application/json");
+            return;
+        }
+        std::ifstream input(artifact, std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        res.set_content(bytes, "video/webm");
     });
 }

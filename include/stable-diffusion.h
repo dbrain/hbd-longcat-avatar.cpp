@@ -501,6 +501,14 @@ typedef struct {
     // Kept for the Koblem relip/window API; whole-timeline chain_audio_full
     // takes precedence when both forms are supplied.
     const char* chain_audio_dir;
+    // Optional notification after a complete segment has been sampled and
+    // decoded. The frame storage remains owned by the chain and is valid only
+    // for the callback; consumers that need it asynchronously must copy it.
+    void (*on_segment)(int segment_index,
+                       const sd_image_t* frames,
+                       int frame_count,
+                       void* user);
+    void* on_segment_user;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

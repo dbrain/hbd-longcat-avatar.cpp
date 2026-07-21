@@ -3,13 +3,118 @@
 #include "async_jobs.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 #include "common/log.h"
 #include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
+
+namespace fs = std::filesystem;
+
+namespace {
+
+// A single bounded CPU encoder for progressive LTX segments.  The core owns
+// and frees its decoded frames, so the callback copies one segment at a time;
+// back-pressure prevents previews accumulating while a long chain samples.
+struct SegmentPreviewWriter {
+    std::string directory;
+    int fps = 24;
+    int quality = 90;
+    std::mutex mutex;
+    std::condition_variable cv;
+    int segment = -1;
+    std::vector<sd_image_t> frames;
+    bool pending = false;
+    bool busy = false;
+    bool stop = false;
+    std::thread thread;
+
+    void start() {
+        thread = std::thread([this] {
+            for (;;) {
+                int queued_segment = -1;
+                std::vector<sd_image_t> queued_frames;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [&] { return stop || pending; });
+                    if (!pending && stop) break;
+                    queued_segment = segment;
+                    queued_frames = std::move(frames);
+                    pending = false;
+                    busy = true;
+                }
+                const auto bytes = create_video_from_sd_images_to_vector(
+                    "webm", queued_frames.data(), static_cast<int>(queued_frames.size()), fps, quality, nullptr);
+                if (!bytes.empty()) {
+                    const fs::path final_path = fs::path(directory) /
+                                                ("seg_" + std::to_string(queued_segment) + ".webm");
+                    const fs::path temp_path = final_path.string() + ".tmp";
+                    std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+                    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                    output.close();
+                    if (output.good()) {
+                        std::error_code error;
+                        fs::rename(temp_path, final_path, error);
+                    }
+                }
+                for (auto& frame : queued_frames) free(frame.data);
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    busy = false;
+                }
+                cv.notify_all();
+            }
+        });
+    }
+
+    void enqueue(int index, const sd_image_t* source, int count) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return stop || (!pending && !busy); });
+        if (stop) return;
+        std::vector<sd_image_t> copies;
+        copies.reserve(static_cast<size_t>(count));
+        for (int frame = 0; frame < count; ++frame) {
+            sd_image_t copy = source[frame];
+            const size_t size = static_cast<size_t>(copy.width) * copy.height * copy.channel;
+            copy.data = static_cast<uint8_t*>(malloc(size));
+            if (copy.data == nullptr || source[frame].data == nullptr) {
+                for (auto& allocated : copies) free(allocated.data);
+                return;
+            }
+            memcpy(copy.data, source[frame].data, size);
+            copies.push_back(copy);
+        }
+        segment = index;
+        frames = std::move(copies);
+        pending = true;
+        lock.unlock();
+        cv.notify_all();
+    }
+
+    void finish() {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] { return !pending && !busy; });
+            stop = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+};
+
+void write_segment_preview(int segment, const sd_image_t* frames, int count, void* user) {
+    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, frames, count);
+}
+
+}  // namespace
 
 const char* async_job_kind_name(AsyncJobKind kind) {
     switch (kind) {
@@ -162,6 +267,26 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
         result["error"]  = nullptr;
     }
 
+    // Koblem polls this optional list and fetches the URLs best-effort.  The
+    // files are atomically published by SegmentPreviewWriter, so a listed
+    // segment is always a complete, playable WebM rather than a partial write.
+    if (job.ltx_emit_segments && !job.ltx_bank_dir.empty() &&
+        (job.status == AsyncJobStatus::Generating || job.status == AsyncJobStatus::Completed)) {
+        json partials = json::array();
+        for (size_t segment = 0; segment < job.ltx_prompts.size(); ++segment) {
+            std::error_code error;
+            const fs::path path = fs::path(job.ltx_bank_dir) / ("seg_" + std::to_string(segment) + ".webm");
+            if (fs::is_regular_file(path, error)) {
+                partials.push_back({
+                    {"segment_index", static_cast<int>(segment)},
+                    {"stage", 4},
+                    {"url", "/sdcpp/v1/jobs/" + job.id + "/segments/" + std::to_string(segment)},
+                });
+            }
+        }
+        if (!partials.empty()) result["partials"] = std::move(partials);
+    }
+
     return result;
 }
 
@@ -301,6 +426,16 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         }
     }
 
+    SegmentPreviewWriter segment_writer;
+    const bool write_segment_previews = !job.ltx_prompts.empty() && job.ltx_emit_segments &&
+                                        !job.ltx_bank_dir.empty();
+    if (write_segment_previews) {
+        segment_writer.directory = job.ltx_bank_dir;
+        segment_writer.fps = params.fps;
+        segment_writer.quality = job.vid_gen.output_compression;
+        segment_writer.start();
+    }
+
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
@@ -329,6 +464,8 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.chain_audio_track = job.ltx_chain_audio_track.empty() ? nullptr : job.ltx_chain_audio_track.c_str();
             chain.chain_audio_offset_frames = job.ltx_chain_audio_offset_frames;
             chain.chain_audio_dir = job.ltx_chain_audio_dir.empty() ? nullptr : job.ltx_chain_audio_dir.c_str();
+            chain.on_segment = write_segment_previews ? write_segment_preview : nullptr;
+            chain.on_segment_user = write_segment_previews ? &segment_writer : nullptr;
             generated = generate_video_chain(runtime.sd_ctx,
                                               &params,
                                               &chain,
@@ -359,6 +496,9 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             runtime.gpu_sharing->diffusion_loaded.store(true);
         }
         results.adopt(raw_results, num_results);
+    }
+    if (write_segment_previews) {
+        segment_writer.finish();
     }
 
     num_results = results.count();

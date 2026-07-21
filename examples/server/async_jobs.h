@@ -62,6 +62,7 @@ struct AsyncGenerationJob {
     int ltx_chain_audio_offset_frames = 0;
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;
+    bool ltx_emit_segments = false;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;

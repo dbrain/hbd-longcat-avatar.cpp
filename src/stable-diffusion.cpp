@@ -7756,6 +7756,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             free(latent);
             return fail();
         }
+        if (chain_params->on_segment != nullptr) {
+            chain_params->on_segment(segment,
+                                     segment_frames,
+                                     segment_count,
+                                     chain_params->on_segment_user);
+        }
         free(latent);
         const int audio_drop = segment == 0 || fresh_scene ? 0 : std::min(overlap_frames, segment_count);
         append_audio(segment_audio, audio_drop, segment_count - audio_drop);

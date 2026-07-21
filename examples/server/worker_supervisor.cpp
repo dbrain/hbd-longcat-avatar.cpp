@@ -330,6 +330,16 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
     if (is_generation_request(request)) {
         active_generation_requests_.fetch_add(1);
         active_guard.counter = &active_generation_requests_;
+    } else if (!loaded()) {
+        // An unload is a strict residency boundary.  In particular, Koblem may
+        // issue one final job/media poll after the gate has evicted a service;
+        // that read must never lazily recreate a CUDA context and make VRAM
+        // reappear.  Only a new generation request is allowed to cold-start a
+        // worker after /unload (or after a normal idle shutdown).
+        response.status = 410;
+        response.set_content(R"({"error":"worker is unloaded; submit a new generation request to start it"})",
+                             "application/json");
+        return true;
     }
     int worker_port = 0;
     {
