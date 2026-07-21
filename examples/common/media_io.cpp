@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -34,6 +35,13 @@
 #ifdef SD_USE_WEBM
 #include "mkvmuxer/mkvmuxer.h"
 #include "mkvmuxer/mkvwriter.h"
+#ifdef SD_USE_OPUS
+#include <opus/opus.h>
+#endif
+#ifdef SD_USE_VPX
+#include <vpx/vp8cx.h>
+#include <vpx/vpx_encoder.h>
+#endif
 #endif
 
 namespace fs = std::filesystem;
@@ -1143,6 +1151,181 @@ int create_animated_webp_from_sd_images(const char* filename, sd_image_t* images
 #endif
 
 #ifdef SD_USE_WEBM
+namespace {
+
+struct EncodedWebmPacket {
+    std::vector<uint8_t> data;
+    bool keyframe = false;
+};
+
+#ifdef SD_USE_VPX
+class Vp9Encoder {
+public:
+    ~Vp9Encoder() {
+        if (initialized_) {
+            vpx_codec_destroy(&codec_);
+        }
+        if (image_allocated_) {
+            vpx_img_free(&image_);
+        }
+    }
+
+    bool init(int width, int height, int fps) {
+        if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
+            fprintf(stderr, "Error: VP9 requires positive, even dimensions.\\n");
+            return false;
+        }
+        width_ = width;
+        height_ = height;
+        vpx_codec_enc_cfg_t cfg{};
+        if (vpx_codec_enc_config_default(vpx_codec_vp9_cx(), &cfg, 0) != VPX_CODEC_OK) {
+            return false;
+        }
+        cfg.g_w = static_cast<unsigned int>(width);
+        cfg.g_h = static_cast<unsigned int>(height);
+        cfg.g_timebase.num = 1;
+        cfg.g_timebase.den = fps > 0 ? fps : 24;
+        cfg.g_profile = 2;
+        cfg.g_bit_depth = VPX_BITS_10;
+        cfg.g_input_bit_depth = 10;
+        cfg.g_pass = VPX_RC_ONE_PASS;
+        cfg.g_lag_in_frames = 0;
+        cfg.rc_end_usage = VPX_Q;
+        cfg.rc_target_bitrate = 0;
+        cfg.kf_mode = VPX_KF_AUTO;
+        cfg.kf_max_dist = static_cast<unsigned int>(std::max(1, (fps > 0 ? fps : 24) * 2));
+        cfg.g_threads = std::max(1U, std::min(8U, std::thread::hardware_concurrency()));
+        if (vpx_codec_enc_init(&codec_, vpx_codec_vp9_cx(), &cfg, VPX_CODEC_USE_HIGHBITDEPTH) != VPX_CODEC_OK) {
+            fprintf(stderr, "Error: Failed to initialize VP9 encoder: %s\\n", vpx_codec_error(&codec_));
+            return false;
+        }
+        initialized_ = true;
+        vpx_codec_control(&codec_, VP8E_SET_CPUUSED, 4);
+        vpx_codec_control(&codec_, VP8E_SET_CQ_LEVEL, 20);
+        vpx_codec_control(&codec_, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
+        vpx_codec_control(&codec_, VP9E_SET_COLOR_RANGE, VPX_CR_STUDIO_RANGE);
+        if (vpx_img_alloc(&image_, VPX_IMG_FMT_I42016, width, height, 1) == nullptr) {
+            fprintf(stderr, "Error: Failed to allocate VP9 image.\\n");
+            return false;
+        }
+        image_.bit_depth = 10;
+        image_allocated_ = true;
+        return true;
+    }
+
+    bool encode(const sd_image_t& source, std::vector<EncodedWebmPacket>& packets) {
+        if (!initialized_ || source.data == nullptr || static_cast<int>(source.width) != width_ ||
+            static_cast<int>(source.height) != height_) {
+            return false;
+        }
+        const int channels = std::max(1, static_cast<int>(source.channel));
+        auto sample = [&](int x, int y, int channel) -> float {
+            const uint8_t* pixel = source.data + (static_cast<size_t>(y) * width_ + x) * channels;
+            return pixel[std::min(channel, channels - 1)] / 255.0f;
+        };
+        for (int y = 0; y < height_; ++y) {
+            auto* row = reinterpret_cast<uint16_t*>(image_.planes[VPX_PLANE_Y] + static_cast<size_t>(y) * image_.stride[VPX_PLANE_Y]);
+            for (int x = 0; x < width_; ++x) {
+                const float r = sample(x, y, 0);
+                const float g = sample(x, y, 1);
+                const float b = sample(x, y, 2);
+                row[x] = static_cast<uint16_t>(std::clamp(64.0f + 876.0f * (0.2126f * r + 0.7152f * g + 0.0722f * b) + 0.5f, 0.0f, 1023.0f));
+            }
+        }
+        for (int y = 0; y < height_; y += 2) {
+            auto* urow = reinterpret_cast<uint16_t*>(image_.planes[VPX_PLANE_U] + static_cast<size_t>(y / 2) * image_.stride[VPX_PLANE_U]);
+            auto* vrow = reinterpret_cast<uint16_t*>(image_.planes[VPX_PLANE_V] + static_cast<size_t>(y / 2) * image_.stride[VPX_PLANE_V]);
+            for (int x = 0; x < width_; x += 2) {
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
+                    r += sample(x + dx, y + dy, 0); g += sample(x + dx, y + dy, 1); b += sample(x + dx, y + dy, 2);
+                }
+                r *= .25f; g *= .25f; b *= .25f;
+                const float luma = .2126f * r + .7152f * g + .0722f * b;
+                urow[x / 2] = static_cast<uint16_t>(std::clamp(512.0f + 896.0f * ((b - luma) / 1.8556f) + .5f, 0.0f, 1023.0f));
+                vrow[x / 2] = static_cast<uint16_t>(std::clamp(512.0f + 896.0f * ((r - luma) / 1.5748f) + .5f, 0.0f, 1023.0f));
+            }
+        }
+        if (vpx_codec_encode(&codec_, &image_, pts_++, 1, 0, VPX_DL_GOOD_QUALITY) != VPX_CODEC_OK) {
+            fprintf(stderr, "Error: VP9 frame encoding failed: %s\\n", vpx_codec_error(&codec_));
+            return false;
+        }
+        return drain(packets);
+    }
+
+    bool finish(std::vector<EncodedWebmPacket>& packets) {
+        return vpx_codec_encode(&codec_, nullptr, pts_, 1, 0, VPX_DL_GOOD_QUALITY) == VPX_CODEC_OK && drain(packets);
+    }
+
+private:
+    bool drain(std::vector<EncodedWebmPacket>& packets) {
+        vpx_codec_iter_t iterator = nullptr;
+        while (const auto* packet = vpx_codec_get_cx_data(&codec_, &iterator)) {
+            if (packet->kind == VPX_CODEC_CX_FRAME_PKT) {
+                const auto* bytes = static_cast<const uint8_t*>(packet->data.frame.buf);
+                packets.push_back({std::vector<uint8_t>(bytes, bytes + packet->data.frame.sz),
+                                   (packet->data.frame.flags & VPX_FRAME_IS_KEY) != 0});
+            }
+        }
+        return true;
+    }
+    vpx_codec_ctx_t codec_{};
+    vpx_image_t image_{};
+    bool initialized_ = false;
+    bool image_allocated_ = false;
+    int width_ = 0;
+    int height_ = 0;
+    vpx_codec_pts_t pts_ = 0;
+};
+
+bool webm_vp9_enabled() {
+    const char* codec = getenv("LTXAV_WEBM_CODEC");
+    return codec == nullptr || (strcmp(codec, "vp8") != 0 && strcmp(codec, "VP8") != 0);
+}
+#endif
+
+#ifdef SD_USE_OPUS
+struct OpusPacket { uint64_t timestamp_ns; std::vector<uint8_t> data; };
+
+bool encode_audio_to_opus(const sd_audio_t* audio, std::vector<OpusPacket>& packets,
+                          std::vector<uint8_t>& header, uint64_t& codec_delay_ns, uint32_t& channels) {
+    if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 || audio->channels == 0 || audio->sample_rate == 0) return false;
+    channels = audio->channels == 1 ? 1 : 2;
+    const uint64_t output_samples = (audio->sample_count * 48000ULL + audio->sample_rate - 1) / audio->sample_rate;
+    std::vector<int16_t> pcm(static_cast<size_t>(output_samples * channels));
+    for (uint64_t i = 0; i < output_samples; ++i) {
+        const uint64_t input = std::min<uint64_t>(audio->sample_count - 1,
+                                                  (i * static_cast<uint64_t>(audio->sample_rate)) / 48000ULL);
+        for (uint32_t c = 0; c < channels; ++c) {
+            const uint32_t input_channel = audio->channels == 1 ? 0 : std::min(c, audio->channels - 1);
+            pcm[static_cast<size_t>(i * channels + c)] = static_cast<int16_t>(std::lrint(std::clamp(audio->data[input * audio->channels + input_channel], -1.0f, 1.0f) * 32767.0f));
+        }
+    }
+    int error = OPUS_OK;
+    OpusEncoder* encoder = opus_encoder_create(48000, static_cast<int>(channels), OPUS_APPLICATION_AUDIO, &error);
+    if (encoder == nullptr || error != OPUS_OK) return false;
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(channels == 1 ? 96000 : 128000));
+    opus_int32 lookahead = 0;
+    opus_encoder_ctl(encoder, OPUS_GET_LOOKAHEAD(&lookahead));
+    std::vector<uint8_t> encoded(4000);
+    for (uint64_t offset = 0; offset < output_samples; offset += 960) {
+        int16_t frame[1920]{};
+        const size_t available = static_cast<size_t>(std::min<uint64_t>(960, output_samples - offset));
+        memcpy(frame, pcm.data() + offset * channels, available * channels * sizeof(int16_t));
+        const int size = opus_encode(encoder, frame, 960, encoded.data(), static_cast<opus_int32>(encoded.size()));
+        if (size < 0) { opus_encoder_destroy(encoder); return false; }
+        packets.push_back({offset * 1000000000ULL / 48000ULL, std::vector<uint8_t>(encoded.begin(), encoded.begin() + size)});
+    }
+    opus_encoder_destroy(encoder);
+    header = {'O','p','u','s','H','e','a','d', 1, static_cast<uint8_t>(channels),
+              static_cast<uint8_t>(lookahead & 0xff), static_cast<uint8_t>((lookahead >> 8) & 0xff),
+              0x80, 0xbb, 0, 0, 0, 0, 0};
+    codec_delay_ns = static_cast<uint64_t>(lookahead) * 1000000000ULL / 48000ULL;
+    return !packets.empty();
+}
+#endif
+}  // namespace
+
 std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio) {
     if (num_images == 0) {
         fprintf(stderr, "Error: Image array is empty.\n");
@@ -1159,6 +1342,28 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         fprintf(stderr, "Error: Invalid frame dimensions.\n");
         return {};
     }
+
+    bool use_vp9 = false;
+    std::vector<EncodedWebmPacket> vp9_packets;
+#ifdef SD_USE_VPX
+    use_vp9 = webm_vp9_enabled();
+    if (use_vp9) {
+        Vp9Encoder encoder;
+        if (!encoder.init(width, height, fps)) {
+            return {};
+        }
+        vp9_packets.reserve(static_cast<size_t>(num_images));
+        for (int i = 0; i < num_images; ++i) {
+            if (!encoder.encode(images[i], vp9_packets)) {
+                return {};
+            }
+        }
+        if (!encoder.finish(vp9_packets) || static_cast<int>(vp9_packets.size()) != num_images) {
+            fprintf(stderr, "Error: VP9 encoder did not emit one packet per frame.\n");
+            return {};
+        }
+    }
+#endif
 
     MemoryMkvWriter writer;
 
@@ -1187,11 +1392,49 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
             video_track->set_display_width(static_cast<uint64_t>(width));
             video_track->set_display_height(static_cast<uint64_t>(height));
             video_track->set_frame_rate(static_cast<double>(fps));
+            if (use_vp9) {
+                video_track->set_codec_id("V_VP9");
+                mkvmuxer::Colour colour;
+                colour.set_matrix_coefficients(1);
+                colour.set_range(1);
+                colour.set_primaries(1);
+                colour.set_transfer_characteristics(1);
+                colour.set_bits_per_channel(10);
+                colour.set_chroma_subsampling_horz(1);
+                colour.set_chroma_subsampling_vert(1);
+                if (!video_track->SetColour(colour)) {
+                    fprintf(stderr, "Error: Failed to set VP9 colour metadata.\n");
+                    return -1;
+                }
+            }
         }
 
         uint64_t audio_track_number    = 0;
+        bool use_opus = false;
+#ifdef SD_USE_OPUS
+        std::vector<OpusPacket> opus_packets;
+        std::vector<uint8_t> opus_header;
+        uint64_t opus_codec_delay_ns = 0;
+        uint32_t opus_channels = 0;
+        use_opus = encode_audio_to_opus(audio, opus_packets, opus_header, opus_codec_delay_ns, opus_channels);
+#endif
         std::vector<uint8_t> audio_pcm = audio_to_pcm16_bytes(audio);
-        if (audio != nullptr && !audio_pcm.empty()) {
+        if (use_opus) {
+#ifdef SD_USE_OPUS
+            audio_track_number = segment.AddAudioTrack(48000, static_cast<int32_t>(opus_channels), 0);
+            auto* audio_track = static_cast<mkvmuxer::AudioTrack*>(segment.GetTrackByNumber(audio_track_number));
+            if (audio_track_number == 0 || audio_track == nullptr) {
+                fprintf(stderr, "Error: Failed to add Opus audio track.\n");
+                return -1;
+            }
+            audio_track->set_codec_id("A_OPUS");
+            audio_track->SetCodecPrivate(opus_header.data(), opus_header.size());
+            audio_track->set_sample_rate(48000.0);
+            audio_track->set_channels(opus_channels);
+            audio_track->set_codec_delay(opus_codec_delay_ns);
+            audio_track->set_seek_pre_roll(80000000ULL);
+#endif
+        } else if (audio != nullptr && !audio_pcm.empty()) {
             audio_track_number = segment.AddAudioTrack(static_cast<int32_t>(audio->sample_rate), static_cast<int32_t>(audio->channels), 0);
             if (audio_track_number == 0) {
                 fprintf(stderr, "Error: Failed to add audio track.\n");
@@ -1213,6 +1456,9 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         const uint64_t frame_duration_ns = std::max<uint64_t>(
             1, static_cast<uint64_t>(std::llround(1000000000.0 / static_cast<double>(fps))));
         uint64_t timestamp_ns = 0;
+#ifdef SD_USE_OPUS
+        size_t opus_index = 0;
+#endif
 
         for (int i = 0; i < num_images; ++i) {
             const sd_image_t& image = images[i];
@@ -1221,22 +1467,37 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
                 return -1;
             }
 
-            std::vector<uint8_t> vp8_frame;
-            if (!encode_sd_image_to_vp8_frame(image, quality, vp8_frame)) {
+            std::vector<uint8_t> encoded_frame;
+            bool keyframe = true;
+            if (use_vp9) {
+                encoded_frame = std::move(vp9_packets[static_cast<size_t>(i)].data);
+                keyframe = vp9_packets[static_cast<size_t>(i)].keyframe;
+            } else if (!encode_sd_image_to_vp8_frame(image, quality, encoded_frame)) {
                 fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
                 return -1;
             }
 
-            if (!segment.AddFrame(vp8_frame.data(),
-                                  static_cast<uint64_t>(vp8_frame.size()),
+            if (!segment.AddFrame(encoded_frame.data(),
+                                  static_cast<uint64_t>(encoded_frame.size()),
                                   track_number,
                                   timestamp_ns,
-                                  true)) {
+                                  keyframe)) {
                 fprintf(stderr, "Error: Failed to mux frame %d into WebM.\n", i);
                 return -1;
             }
 
-            if (audio_track_number != 0) {
+            if (audio_track_number != 0 && use_opus) {
+#ifdef SD_USE_OPUS
+                const uint64_t next_video_timestamp = timestamp_ns + frame_duration_ns;
+                while (opus_index < opus_packets.size() && opus_packets[opus_index].timestamp_ns < next_video_timestamp) {
+                    const auto& packet = opus_packets[opus_index++];
+                    if (!segment.AddFrame(packet.data.data(), packet.data.size(), audio_track_number, packet.timestamp_ns, true)) {
+                        fprintf(stderr, "Error: Failed to mux Opus packet.\n");
+                        return -1;
+                    }
+                }
+#endif
+            } else if (audio_track_number != 0) {
                 auto [audio_begin, audio_end] = audio_sample_range_for_video_frame(audio, i, num_images, fps);
                 const uint64_t frame_samples  = audio_end - audio_begin;
                 if (frame_samples > 0) {
@@ -1255,6 +1516,18 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
 
             timestamp_ns += frame_duration_ns;
         }
+
+#ifdef SD_USE_OPUS
+        if (use_opus && audio_track_number != 0) {
+            for (; opus_index < opus_packets.size(); ++opus_index) {
+                const auto& packet = opus_packets[opus_index];
+                if (!segment.AddFrame(packet.data.data(), packet.data.size(), audio_track_number, packet.timestamp_ns, true)) {
+                    fprintf(stderr, "Error: Failed to mux trailing Opus packet.\n");
+                    return -1;
+                }
+            }
+        }
+#endif
 
         if (!segment.Finalize()) {
             fprintf(stderr, "Error: Failed to finalize WebM output.\n");
