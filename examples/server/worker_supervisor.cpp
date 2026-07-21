@@ -306,7 +306,13 @@ bool WorkerSupervisor::wait_until_ready_locked(std::string& error) {
         int status = 0;
         if (::waitpid(pid_, &status, WNOHANG) == pid_) {
             pid_ = -1;
-            error = "worker exited during startup";
+            if (WIFEXITED(status)) {
+                error = "worker exited during startup (exit " + std::to_string(WEXITSTATUS(status)) + ")";
+            } else if (WIFSIGNALED(status)) {
+                error = "worker died during startup (signal " + std::to_string(WTERMSIG(status)) + ")";
+            } else {
+                error = "worker exited during startup";
+            }
             return false;
         }
         const auto response = client.Get("/health");
@@ -359,7 +365,7 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
         // Explicit /unload still waits for this PID, but parent-death signalling
         // covers every other exit path as well.
         if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() == 1) {
-            ::_exit(127);
+            ::_exit(126);
         }
         ::setenv("SD_SERVER_WORKER_CHILD", "1", 1);
         // The child receives the selected DiT as --diffusion-model, so retain
