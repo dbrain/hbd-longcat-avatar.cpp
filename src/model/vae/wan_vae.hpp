@@ -1,7 +1,6 @@
 #ifndef __SD_MODEL_VAE_WAN_VAE_HPP__
 #define __SD_MODEL_VAE_WAN_VAE_HPP__
 
-#include <cstdlib>
 #include <map>
 #include <memory>
 #include <utility>
@@ -13,19 +12,6 @@
 namespace WAN {
 
     constexpr int CACHE_T = 2;
-
-    // Keep the result of the first RMS transpose in channels-first form until
-    // SiLU.  SiLU materializes a contiguous channels-last result for the
-    // following convolution, eliminating the otherwise redundant transpose
-    // back. This is value-identical and opt-in while it is A/B validated
-    // against the dedicated upstream ggml kernel path.
-    inline bool wan_vae_rms_cf_enabled() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("WAN_VAE_RMS_CF");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        return enabled;
-    }
 
     class CausalConv3d : public GGMLBlock {
     protected:
@@ -112,23 +98,15 @@ namespace WAN {
         RMS_norm(int64_t dim)
             : dim(dim) {}
 
-        ggml_tensor* forward_channels_first(GGMLRunnerContext* ctx, ggml_tensor* x) {
-            ggml_tensor* w = params["gamma"];
-            w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
-            auto h         = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 3, 0, 1, 2));
-            h              = ggml_rms_norm(ctx->ggml_ctx, h, 1e-12f);
-            return ggml_mul(ctx->ggml_ctx, h, w);
-        }
-
-        static ggml_tensor* channels_first_to_whtc_view(GGMLRunnerContext* ctx, ggml_tensor* x) {
-            return ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 2, 3, 0);
-        }
-
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             // x: [N*IC, ID, IH, IW], IC == dim
             // assert N == 1
 
-            auto h         = forward_channels_first(ctx, x);  // [ID, IH, IW, N*IC]
+            ggml_tensor* w = params["gamma"];
+            w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
+            auto h         = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 3, 0, 1, 2));  // [ID, IH, IW, N*IC]
+            h              = ggml_rms_norm(ctx->ggml_ctx, h, 1e-12f);
+            h              = ggml_mul(ctx->ggml_ctx, h, w);
             h              = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, h, 1, 2, 3, 0));
 
             return h;
@@ -427,16 +405,10 @@ namespace WAN {
                 }
             }
 
-            bool x_is_channels_first = false;
             for (int i = 0; i < 7; i++) {
                 if (i == 0 || i == 3) {  // RMS_norm
                     auto layer = std::dynamic_pointer_cast<RMS_norm>(blocks["residual." + std::to_string(i)]);
-                    if (wan_vae_rms_cf_enabled()) {
-                        x                   = layer->forward_channels_first(ctx, x);
-                        x_is_channels_first = true;
-                    } else {
-                        x = layer->forward(ctx, x);
-                    }
+                    x          = layer->forward(ctx, x);
                 } else if (i == 2 || i == 6) {  // CausalConv3d
                     auto layer = std::dynamic_pointer_cast<CausalConv3d>(blocks["residual." + std::to_string(i)]);
 
@@ -461,10 +433,6 @@ namespace WAN {
                         feat_idx += 1;
                     }
                 } else if (i == 1 || i == 4) {
-                    if (x_is_channels_first) {
-                        x                   = RMS_norm::channels_first_to_whtc_view(ctx, x);
-                        x_is_channels_first = false;
-                    }
                     x = ggml_silu(ctx->ggml_ctx, x);
                 } else {  // i == 5
                     // nn.Dropout(), ignore
@@ -816,12 +784,7 @@ namespace WAN {
             // sd::ggml_graph_cut::mark_graph_cut(x, "wan_vae.encoder.mid", "x");
 
             // head
-            if (wan_vae_rms_cf_enabled()) {
-                x = head_0->forward_channels_first(ctx, x);
-                x = RMS_norm::channels_first_to_whtc_view(ctx, x);
-            } else {
-                x = head_0->forward(ctx, x);
-            }
+            x = head_0->forward(ctx, x);
             x = ggml_silu(ctx->ggml_ctx, x);
             if (is_2D) {
                 auto head_2 = std::dynamic_pointer_cast<Conv2dBut3d>(blocks["head.2"]);
