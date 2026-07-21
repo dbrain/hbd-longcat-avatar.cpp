@@ -397,8 +397,12 @@ int main(int argc, char** argv) {
     printf("==== image_to_rig (inline native image -> textured+rigged GLB) ====\n");
     printf("  model=%s\n  image=%s\n  out=%s\n  cam: fov=%.4frad dist=%.4f scale=%.2f  backend=%s\n",
            model.c_str(), image.c_str(), out.c_str(), cam, dist, ms, use_cuda ? "cuda" : "cpu");
-    printf("  tex-dit=%s%s%s\n", in.tex_proj ? "proj (slat_flow_imgshape2tex_1024)" : "cross (trellis2_tex_1024)",
-           in.tex_flow_w.empty() ? "" : " w=", in.tex_flow_w.c_str());
+    if (geometry_only) {
+        printf("  geometry-only=yes (legacy PBR material, UV bake, and rig are skipped)\n");
+    } else {
+        printf("  tex-dit=%s%s%s\n", in.tex_proj ? "proj (slat_flow_imgshape2tex_1024)" : "cross (trellis2_tex_1024)",
+               in.tex_flow_w.empty() ? "" : " w=", in.tex_flow_w.c_str());
+    }
 
     // ---------- [0/4] native MoGe camera estimation (image -> FOV), 100% camera-native ----------
     if (use_moge) {

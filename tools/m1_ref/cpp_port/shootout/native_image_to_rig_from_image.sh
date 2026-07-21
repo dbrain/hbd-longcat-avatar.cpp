@@ -47,6 +47,41 @@ IMAGE_HASH="$(sha256sum "$IMAGE" | awk '{print substr($1,1,16)}')"
 mkdir -p "$OUT" "$OUT_ROOT"
 ln -sfn "$IMAGE" "$OUT/source_image"
 
+# A detached run must leave one small, atomic, human-readable answer to
+# "which stage is this actually in?".  The launcher log remains the detailed
+# evidence; this sidecar makes an interrupted process distinguishable from a
+# completed cache or a silent texture failure without guessing from file dates.
+PIPELINE_STATUS="$OUT/pipeline-status.txt"
+PIPELINE_STAGE=initialising
+PIPELINE_COMPLETED=0
+write_pipeline_status() {
+  local state="$1" detail="${2:-}"
+  {
+    printf 'schema_version=1\n'
+    printf 'state=%s\n' "$state"
+    printf 'stage=%s\n' "$PIPELINE_STAGE"
+    printf 'detail=%s\n' "$detail"
+    printf 'updated_at=%s\n' "$(date -Is)"
+    printf 'label=%s\n' "$LABEL"
+    printf 'source_image=%s\n' "$IMAGE"
+    printf 'source_sha256=%s\n' "$IMAGE_HASH"
+    printf 'model_image=%s\n' "${PIPELINE_IMAGE:-pending}"
+    printf 'geometry_cache=%s\n' "${CACHE:-pending}"
+    printf 'geometry_recipe=%s\n' "${GEOMETRY_RECIPE:-pending}"
+    printf 'gpu=PCI GPU 0 / %s\n' "${GPU_NAME:-pending}"
+  } >"$PIPELINE_STATUS.tmp"
+  mv -f "$PIPELINE_STATUS.tmp" "$PIPELINE_STATUS"
+}
+pipeline_on_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( PIPELINE_COMPLETED == 0 )); then
+    write_pipeline_status failed "exit_code=$rc" || true
+  fi
+  return "$rc"
+}
+trap pipeline_on_exit EXIT
+
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES=0
 export REMESH_CLOSE_R="${REMESH_CLOSE_R:-3}"
@@ -72,8 +107,10 @@ if [[ "${IMAGE_TO_RIG_PROJECT:-0}" != 0 || -n "${IMAGE_TO_RIG_TEX_FRONT:-}" || -
 fi
 if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
   GEOMETRY_RECIPE="moge-noquad-us16384-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_CACHE_MODE=legacy-pbr-cache
 else
   GEOMETRY_RECIPE="moge-noquad-us16384-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_CACHE_MODE=geometry-only
 fi
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 [[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: PCI GPU 0 is '$GPU_NAME', expected RTX 3060" >&2; exit 1; }
@@ -121,11 +158,18 @@ MATTE_HASH="$(sha256sum "$PIPELINE_IMAGE" | awk '{print substr($1,1,16)}')"
 # The cache key includes both the uploaded bytes and the exact model-facing matte bytes. This prevents
 # a changed matting service, alpha cutout, framing recipe, or clean-geometry
 # recipe from silently reusing geometry made from a different image frame.
-CACHE="$OUT/cache_${IMAGE_HASH}_${MATTE_HASH}_n16384_seal${REMESH_CLOSE_R}_geom${GEOMETRY_RECIPE_VERSION}"
+# The cache directory itself is part of the provenance contract.  In
+# particular, geometry-only caches intentionally contain no usable legacy PBR
+# volume, so they must never share a name with the opt-in legacy-PBR/projection
+# cache for the same image.
+CACHE="$OUT/cache_${IMAGE_HASH}_${MATTE_HASH}_n16384_${GEOMETRY_CACHE_MODE}_seal${REMESH_CLOSE_R}_geom${GEOMETRY_RECIPE_VERSION}"
 ln -sfn "$PIPELINE_IMAGE" "$OUT/input.png"
 printf 'source_image=%s\nsource_sha256=%s\ninput_kind=%s\ninput_mode=%s\nmodel_image=%s\nmodel_image_sha256=%s\n' \
   "$IMAGE" "$IMAGE_HASH" "$INPUT_KIND" "$INPUT_MODE" "$PIPELINE_IMAGE" "$MATTE_HASH" >"$OUT/preprocess_source.txt"
 if [[ "${IMAGE_TO_RIG_PREPARE_ONLY:-0}" != 0 ]]; then
+  PIPELINE_STAGE=prepared-input
+  PIPELINE_COMPLETED=1
+  write_pipeline_status succeeded 'prepare-only; no geometry or texture inference requested'
   echo "== DONE: prepared model input $PIPELINE_IMAGE (no geometry/texture inference) =="
   exit 0
 fi
@@ -141,6 +185,8 @@ cache_pbr_ready=1
 if [[ "$LEGACY_PBR_CACHE" == 1 && ( ! -f "$CACHE/pbr_feats.bin" || ! -f "$CACHE/pbr_coords.bin" ) ]]; then
   cache_pbr_ready=0
 fi
+PIPELINE_STAGE=geometry-cache
+write_pipeline_status running 'geometry cache create or reuse; native material inference has not started'
 if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || "$cache_pbr_ready" != 1 || "$cache_recipe_matches" != 1 ]]; then
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   mkdir -p "$CACHE" "$OUT_ROOT"
@@ -184,6 +230,8 @@ if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
   printf 'geometry_gate_result=%s\n' "$GEOMETRY_GATE_RESULT"
 } >"$OUT/geometry_delivery.txt"
 (( GEOMETRY_OPEN == 0 )) || { echo "REJECT: refined geometry has $GEOMETRY_OPEN open edges; refusing texture/rig stages" >&2; exit 1; }
+PIPELINE_STAGE=native-texture-lods-rig
+write_pipeline_status running 'geometry gate passed; native high texture, CPU LOD rebakes, then structural rig gate'
 NATIVE_RIG=1
 if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE" "$OUT" "$LABEL"; then
   NATIVE_RIG=0
@@ -348,6 +396,8 @@ for yaw in $(printf '%s\n' "${!PROJ_PATH_BY_YAW[@]}" | LC_ALL=C sort -n); do
   esac
 done
 if [[ "$PROJECT" != 0 ]]; then
+  PIPELINE_STAGE=observed-view-projection-ab
+  write_pipeline_status running 'native textured delivery exists; generating optional observed-view A/B only'
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   echo "== $LABEL: observed-view projection A/B (native texture remains default) =="
   (
@@ -386,4 +436,7 @@ texture_delivery_manifest=$OUT/texture_delivery.txt
 rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
 gpu=PCI GPU 0 / RTX 3060 only
 EOF
+PIPELINE_STAGE=complete
+PIPELINE_COMPLETED=1
+write_pipeline_status succeeded 'geometry, native texture LODs, and published rig/projection stages completed'
 echo "== DONE: $OUT =="
