@@ -6524,6 +6524,17 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
               (int)video_latent.shape()[1],
               (int)video_latent.shape()[2],
               (int)video_latent.shape()[3]);
+    // Diagnostic-only latent handoff.  Sampling with NVFP4/FP8 is intentionally
+    // not bit-stable across implementations, so a visual VAE A/B must decode
+    // the exact same diffusion-space tensor.
+    if (const char* path = std::getenv("WAN_SAVE_LATENT"); path != nullptr && path[0] != '\0') {
+        sd::save_tensor_to_file<float>(path, video_latent, "wan_video_latent");
+        LOG_INFO("WAN_SAVE_LATENT: wrote %s", path);
+    }
+    if (const char* path = std::getenv("LTX_LOAD_LATENT"); path != nullptr && path[0] != '\0') {
+        video_latent = sd::load_tensor_from_file_as_tensor<float>(path);
+        LOG_INFO("LTX_LOAD_LATENT: decoding %s", path);
+    }
     // auto z = sd::load_tensor_from_file_as_tensor<float>("ltx_vae_z.bin");
     int64_t t4            = ggml_time_ms();
     sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(video_latent, true);
