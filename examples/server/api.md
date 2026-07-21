@@ -1257,9 +1257,12 @@ containing exactly one frame for every requested output frame. This is SDEdit V2
 source is VAE-encoded, treated as a fresh shot, and denoised according to optional
 `v2v_guide_strength` (`0..1`; otherwise normal `strength`). `v2v_mode: 2` is the
 same edit mechanism with an optional trusted `v2v_source_latent_path`: it must name
-an existing `seg_<n>.bin` beneath `$LTX_JOB_DIR`, avoiding a pixel decode/re-encode
-for a prior LTX render. Mode 2 accepts either that path or `control_frames`, never
-both; other paths and modes are rejected.
+an existing `seg_<n>.bin` beneath an LTX bank root, avoiding a pixel decode/re-encode
+for a prior LTX render. Prefer the portable form `v2v_source_job_id` plus
+`v2v_source_segment`; the server resolves that opaque reference in its transient or
+persistent bank roots, so Koblem never sends a host filesystem path. Mode 2 accepts
+one of those latent forms or `control_frames`, never both; other paths and modes are
+rejected.
 
 The server keeps sampled video-only LTX latents in `$LTX_JOB_DIR/<resume_job_id>`
 (default `/var/lib/ltx-video/jobs`) and uses them to continue a later request without
@@ -1267,6 +1270,24 @@ re-rendering its completed prefix. Set `resume_job_id` to the prior response's s
 `resume_job_id`; `cont_latent_frames` selects the carried latent overlap (default `3`).
 The request's segment list must include the complete prefix plus new tail because the
 server reconstructs the stitched media from the durable banks.
+
+Set `persist:true` on a new LTX request to store its bank under `$LTX_PERSIST_DIR`
+(default `/var/lib/ltx-video/persist`) instead of the FIFO `$LTX_JOB_DIR`; resumes
+and V2V job references search both roots. `DELETE /ltx/v1/job?id=<engine-job-id>`
+removes an inactive bank (including the requested resume alias) and is idempotent.
+
+### Worker-isolation lifecycle
+
+When `SD_SERVER_WORKER_ISOLATION` (or a service-specific isolation flag) is enabled,
+the public server is CUDA-free and proxies generation to one child process. `GET
+/health` and `GET /v1/gpu/status` include `loaded` and `worker_pid`; the PID is
+`null` while unloaded. `POST /v1/admin/drain` rejects new generation requests, and
+`POST /v1/admin/unload` kills and waits for the child before replying with
+`cuda_context_released:true` and `worker_pid:null`. If that exit cannot be proved,
+unload returns `503` with `cuda_context_released:false`; callers must not schedule
+a competing GPU workload. `POST /v1/admin/load` reopens admission; the next
+generation lazily starts a new child. A child is also killed when its supervisor
+dies, so stopping the public service cannot leave a CUDA worker orphaned.
 
 ### LongCat Avatar compatibility endpoint
 

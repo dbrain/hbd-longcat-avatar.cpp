@@ -20,6 +20,22 @@ fs::path ltx_bank_root() {
     return "/var/lib/ltx-video/jobs";
 }
 
+fs::path ltx_persist_root() {
+    if (const char* configured = getenv("LTX_PERSIST_DIR"); configured != nullptr && configured[0] != '\0') {
+        return configured;
+    }
+    return "/var/lib/ltx-video/persist";
+}
+
+std::vector<fs::path> ltx_bank_roots() {
+    std::vector<fs::path> roots;
+    const fs::path persist = ltx_persist_root();
+    const fs::path transient = ltx_bank_root();
+    roots.push_back(persist);
+    if (transient != persist) roots.push_back(transient);
+    return roots;
+}
+
 bool valid_ltx_bank_id(const std::string& id) {
     return !id.empty() && id.size() <= 128 &&
            std::all_of(id.begin(), id.end(), [](unsigned char ch) {
@@ -27,30 +43,47 @@ bool valid_ltx_bank_id(const std::string& id) {
            });
 }
 
-bool resolve_ltx_bank_dir(const std::string& requested_id, fs::path& bank_dir, std::string& bank_id) {
+bool resolve_ltx_bank_dir(const std::string& requested_id,
+                          fs::path& bank_dir,
+                          std::string& bank_id,
+                          fs::path* bank_root = nullptr) {
     if (!valid_ltx_bank_id(requested_id)) {
         return false;
     }
-    bank_id = requested_id;
-    std::ifstream reference(ltx_bank_root() / requested_id / "bank_id");
-    if (reference.is_open()) {
-        std::string referenced_id;
-        std::getline(reference, referenced_id);
-        if (!valid_ltx_bank_id(referenced_id)) {
+    for (const fs::path& root : ltx_bank_roots()) {
+        const fs::path requested_dir = root / requested_id;
+        std::error_code error;
+        if (!fs::is_directory(requested_dir, error)) {
+            continue;
+        }
+        std::string resolved_id = requested_id;
+        std::ifstream reference(requested_dir / "bank_id");
+        if (reference.is_open()) {
+            std::string referenced_id;
+            std::getline(reference, referenced_id);
+            if (!valid_ltx_bank_id(referenced_id)) {
+                return false;
+            }
+            resolved_id = std::move(referenced_id);
+        }
+        const fs::path resolved_dir = root / resolved_id;
+        if (!fs::is_directory(resolved_dir, error)) {
             return false;
         }
-        bank_id = std::move(referenced_id);
+        bank_id = std::move(resolved_id);
+        bank_dir = resolved_dir;
+        if (bank_root != nullptr) *bank_root = root;
+        return true;
     }
-    bank_dir = ltx_bank_root() / bank_id;
-    return true;
+    return false;
 }
 
-bool write_ltx_bank_reference(const std::string& job_id, const std::string& bank_id) {
+bool write_ltx_bank_reference(const fs::path& root, const std::string& job_id, const std::string& bank_id) {
     if (job_id == bank_id) {
         return true;
     }
     std::error_code error;
-    const fs::path reference_dir = ltx_bank_root() / job_id;
+    const fs::path reference_dir = root / job_id;
     fs::create_directories(reference_dir, error);
     if (error) {
         return false;
@@ -62,13 +95,21 @@ bool write_ltx_bank_reference(const std::string& job_id, const std::string& bank
 
 bool resolve_ltx_guide_latent_path(const std::string& requested_path, std::string& resolved_path) {
     std::error_code error;
-    const fs::path root = fs::weakly_canonical(ltx_bank_root(), error);
-    if (error) return false;
     const fs::path candidate = fs::weakly_canonical(requested_path, error);
     if (error || !fs::is_regular_file(candidate, error)) return false;
-    const fs::path relative = candidate.lexically_relative(root);
-    if (relative.empty() || relative.is_absolute() || relative.begin() == relative.end() ||
-        relative.begin()->string() == "..") return false;
+    bool within_bank_root = false;
+    for (const fs::path& bank_root : ltx_bank_roots()) {
+        error.clear();
+        const fs::path root = fs::weakly_canonical(bank_root, error);
+        if (error) continue;
+        const fs::path relative = candidate.lexically_relative(root);
+        if (!relative.empty() && !relative.is_absolute() && relative.begin() != relative.end() &&
+            relative.begin()->string() != "..") {
+            within_bank_root = true;
+            break;
+        }
+    }
+    if (!within_bank_root) return false;
     const std::string filename = candidate.filename().string();
     if (filename.size() <= 8 || filename.rfind("seg_", 0) != 0 ||
         filename.compare(filename.size() - 4, 4, ".bin") != 0 ||
@@ -76,6 +117,18 @@ bool resolve_ltx_guide_latent_path(const std::string& requested_path, std::strin
                      [](unsigned char ch) { return std::isdigit(ch); })) {
         return false;
     }
+    resolved_path = candidate.string();
+    return true;
+}
+
+bool resolve_ltx_guide_latent_reference(const std::string& job_id, int segment, std::string& resolved_path) {
+    if (segment < 0) return false;
+    fs::path bank_dir;
+    std::string bank_id;
+    if (!resolve_ltx_bank_dir(job_id, bank_dir, bank_id)) return false;
+    std::error_code error;
+    const fs::path candidate = bank_dir / ("seg_" + std::to_string(segment) + ".bin");
+    if (!fs::is_regular_file(candidate, error)) return false;
     resolved_path = candidate.string();
     return true;
 }
@@ -229,7 +282,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             return;
                         }
                         std::string guide_latent_path;
-                        if (segment.contains("v2v_source_latent_path")) {
+                        const bool has_legacy_guide_path = segment.contains("v2v_source_latent_path");
+                        const bool has_guide_reference = segment.contains("v2v_source_job_id") ||
+                                                         segment.contains("v2v_source_segment");
+                        if (has_legacy_guide_path && has_guide_reference) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"provide either v2v_source_latent_path or v2v_source_job_id plus v2v_source_segment"})", "application/json");
+                            return;
+                        }
+                        if (has_legacy_guide_path) {
                             if (!segment["v2v_source_latent_path"].is_string() ||
                                 !resolve_ltx_guide_latent_path(segment["v2v_source_latent_path"].get<std::string>(), guide_latent_path)) {
                                 res.status = 400;
@@ -239,6 +300,22 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             if (v2v_mode != 2) {
                                 res.status = 400;
                                 res.set_content(R"({"error":"v2v_source_latent_path requires v2v_mode 2"})", "application/json");
+                                return;
+                            }
+                        }
+                        if (has_guide_reference) {
+                            if (!segment.contains("v2v_source_job_id") || !segment["v2v_source_job_id"].is_string() ||
+                                !segment.contains("v2v_source_segment") || !segment["v2v_source_segment"].is_number_integer() ||
+                                !resolve_ltx_guide_latent_reference(segment["v2v_source_job_id"].get<std::string>(),
+                                                                    segment["v2v_source_segment"].get<int>(),
+                                                                    guide_latent_path)) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"v2v_source_job_id plus v2v_source_segment must identify an existing LTX banked latent"})", "application/json");
+                                return;
+                            }
+                            if (v2v_mode != 2) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"v2v_source_job_id requires v2v_mode 2"})", "application/json");
                                 return;
                             }
                         }
@@ -265,7 +342,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         }
                         if (!controls.empty() && !guide_latent_path.empty()) {
                             res.status = 400;
-                            res.set_content(R"({"error":"guide edit accepts either control_frames or v2v_source_latent_path, not both"})", "application/json");
+                            res.set_content(R"({"error":"guide edit accepts either control_frames or a banked LTX guide source, not both"})", "application/json");
                             return;
                         }
                         const float v2v_strength = segment.value("v2v_guide_strength", -1.f);
@@ -366,6 +443,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
             job->ltx_cont_latent_frames = continuation_frames;
             job->ltx_emit_segments = body.value("emit_segments", false);
+            const bool persist_bank = body.value("persist", false);
             const std::string resume_job_id = body.value("resume_job_id", std::string());
             if (body.contains("audio_offset_frames") && !body["audio_offset_frames"].is_number_integer()) {
                 res.status = 400;
@@ -389,6 +467,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
                 fs::path bank_dir;
+                fs::path bank_root;
                 std::string bank_id;
                 if (!resume_job_id.empty()) {
                     if (!drive_audio_bytes.empty() || !track_audio_bytes.empty() || !legacy_audio_parts.empty()) {
@@ -396,7 +475,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         res.set_content(R"({"error":"resumed LTX jobs reuse their banked audio; do not upload new audio"})", "application/json");
                         return;
                     }
-                    if (!resolve_ltx_bank_dir(resume_job_id, bank_dir, bank_id)) {
+                    if (!resolve_ltx_bank_dir(resume_job_id, bank_dir, bank_id, &bank_root)) {
                         res.status = 400;
                         res.set_content(R"({"error":"invalid resume_job_id"})", "application/json");
                         return;
@@ -416,7 +495,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     }
                 } else {
                     job->id = make_async_job_id(manager);
-                    bank_dir = ltx_bank_root() / job->id;
+                    bank_root = persist_bank ? ltx_persist_root() : ltx_bank_root();
+                    bank_dir = bank_root / job->id;
                     bank_id = job->id;
                 }
                 std::error_code error;
@@ -427,7 +507,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
                 if (job->id.empty()) job->id = make_async_job_id(manager);
-                if (!write_ltx_bank_reference(job->id, bank_id)) {
+                if (!write_ltx_bank_reference(bank_root, job->id, bank_id)) {
                     res.status = 500;
                     res.set_content(R"({"error":"could not persist LTX bank reference"})", "application/json");
                     return;
@@ -562,5 +642,57 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         std::ifstream input(artifact, std::ios::binary);
         const std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         res.set_content(bytes, "video/webm");
+    });
+
+    // Explicit lifecycle cleanup for Koblem Director projects. The client only
+    // sends an opaque engine job id; never accept a host path. A durable bank
+    // may have a resume alias, so remove the requested alias and its bank
+    // payload together.
+    svr.Delete("/ltx/v1/job", [runtime](const httplib::Request& req, httplib::Response& res) {
+        const std::string job_id = req.get_param_value("id");
+        if (!valid_ltx_bank_id(job_id)) {
+            res.status = 400;
+            res.set_content(R"({"error":"id must be an LTX job id"})", "application/json");
+            return;
+        }
+        {
+            AsyncJobManager& manager = *runtime->async_job_manager;
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            const auto it = manager.jobs.find(job_id);
+            if (it != manager.jobs.end() &&
+                (it->second->status == AsyncJobStatus::Queued || it->second->status == AsyncJobStatus::Generating)) {
+                res.status = 409;
+                res.set_content(R"({"error":"cannot delete an active LTX job"})", "application/json");
+                return;
+            }
+        }
+
+        fs::path bank_dir;
+        fs::path bank_root;
+        std::string bank_id;
+        if (!resolve_ltx_bank_dir(job_id, bank_dir, bank_id, &bank_root)) {
+            res.set_content(json({{"status", "missing"}, {"deleted", false}}).dump(), "application/json");
+            return;
+        }
+        std::error_code error;
+        uintmax_t removed = 0;
+        for (const fs::path& root : ltx_bank_roots()) {
+            if (root == bank_root) {
+                removed += fs::remove_all(root / bank_id, error);
+                if (error) break;
+            }
+            if (job_id != bank_id) {
+                error.clear();
+                removed += fs::remove_all(root / job_id, error);
+                if (error) break;
+            }
+        }
+        if (error) {
+            res.status = 500;
+            res.set_content(json({{"error", "could not delete LTX job bank"}, {"message", error.message()}}).dump(),
+                            "application/json");
+            return;
+        }
+        res.set_content(json({{"status", "deleted"}, {"deleted", removed > 0}}).dump(), "application/json");
     });
 }
