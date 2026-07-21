@@ -155,6 +155,16 @@ bool parse_avatar_video_request(const json& body,
         error_message = "invalid generation parameters";
         return false;
     }
+    // LongCat's established API exposes segment_frames/video_frames at the
+    // top level.  Keep this explicit after generic parameter resolution: the
+    // generic parser otherwise preserves the server's 65-frame default here,
+    // while Avatar's audio projector is sized from the requested frame count.
+    if (body.contains("video_frames") && body["video_frames"].is_number_integer()) {
+        request.gen_params.video_frames = body["video_frames"].get<int>();
+    }
+    if (body.contains("fps") && body["fps"].is_number_integer()) {
+        request.gen_params.fps = body["fps"].get<int>();
+    }
     request.output_format = "webm";
     request.output_compression = body.value("output_compression", 100);
     return true;
