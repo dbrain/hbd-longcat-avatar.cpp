@@ -473,6 +473,61 @@ namespace WAN {
 
             return x;
         }
+
+        // Causal streaming variant used by ShotStream. The attention cache is
+        // deliberately supplied by the caller so the standard Wan model remains
+        // stateless and ModelManager-owned.
+        ggml_tensor* forward_causal(GGMLRunnerContext* ctx,
+                                    ggml_tensor* x,
+                                    ggml_tensor* e,
+                                    ggml_tensor* pe,
+                                    ggml_tensor* context,
+                                    ggml_tensor* prev_kc,
+                                    ggml_tensor* prev_vc,
+                                    ggml_tensor* cond_kc,
+                                    ggml_tensor* cond_vc,
+                                    ggml_tensor*& new_kc,
+                                    ggml_tensor*& new_vc,
+                                    int64_t context_img_len = 0) {
+            auto modulation = params["modulation"];
+            e               = ggml_add(ctx->ggml_ctx, e, modulation);
+            auto es         = ggml_ext_chunk(ctx->ggml_ctx, e, 6, 1);
+
+            auto norm1      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm1"]);
+            auto self_attn  = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            auto norm3      = std::dynamic_pointer_cast<UnaryBlock>(blocks["norm3"]);
+            auto cross_attn = std::dynamic_pointer_cast<WanCrossAttention>(blocks["cross_attn"]);
+            auto norm2      = std::dynamic_pointer_cast<LayerNorm>(blocks["norm2"]);
+            auto ffn_0      = std::dynamic_pointer_cast<Linear>(blocks["ffn.0"]);
+            auto ffn_2      = std::dynamic_pointer_cast<Linear>(blocks["ffn.2"]);
+
+            auto y = norm1->forward(ctx, x);
+            y      = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[1]));
+            y      = modulate_add(ctx->ggml_ctx, y, es[0]);
+            y      = self_attn->forward_kv_cache(ctx, y, pe, prev_kc, prev_vc, cond_kc, cond_vc, new_kc, new_vc);
+            x      = ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[2]));
+
+            x = ggml_add(ctx->ggml_ctx,
+                         x,
+                         cross_attn->forward(ctx, norm3->forward(ctx, x), context, context_img_len));
+
+            y = norm2->forward(ctx, x);
+            y = ggml_add(ctx->ggml_ctx, y, modulate_mul(ctx->ggml_ctx, y, es[4]));
+            y = modulate_add(ctx->ggml_ctx, y, es[3]);
+            y = ffn_0->forward(ctx, y);
+            y = ggml_ext_gelu(ctx->ggml_ctx, y, true);
+            y = ffn_2->forward(ctx, y);
+            return ggml_add(ctx->ggml_ctx, x, modulate_mul(ctx->ggml_ctx, y, es[5]));
+        }
+
+        ggml_tensor* selfattn_only(GGMLRunnerContext* ctx,
+                                   ggml_tensor* x,
+                                   ggml_tensor* pe,
+                                   ggml_tensor*& new_kc,
+                                   ggml_tensor*& new_vc) {
+            auto self_attn = std::dynamic_pointer_cast<WanSelfAttention>(blocks["self_attn"]);
+            return self_attn->forward_kv_cache(ctx, x, pe, nullptr, nullptr, nullptr, nullptr, new_kc, new_vc);
+        }
     };
 
     class VaceWanAttentionBlock : public WanAttentionBlock {
@@ -833,6 +888,83 @@ namespace WAN {
             x = head->forward(ctx, x, e);  // [N, t_len*h_len*w_len, pt*ph*pw*out_dim]
 
             return x;
+        }
+
+        // Causal ShotStream forward. This is a compact wrapper around the normal
+        // Wan blocks that threads caller-owned local and global K/V caches through
+        // each self-attention layer.
+        ggml_tensor* forward_causal_block(GGMLRunnerContext* ctx,
+                                          ggml_tensor* x_chunk,
+                                          ggml_tensor* timestep,
+                                          ggml_tensor* context,
+                                          ggml_tensor* pe_block,
+                                          const std::vector<ggml_tensor*>& prev_kc,
+                                          const std::vector<ggml_tensor*>& prev_vc,
+                                          const std::vector<ggml_tensor*>& cond_kc,
+                                          const std::vector<ggml_tensor*>& cond_vc,
+                                          std::vector<ggml_tensor*>& new_kc,
+                                          std::vector<ggml_tensor*>& new_vc) {
+            constexpr int64_t N = 1;
+            auto patch_embedding  = std::dynamic_pointer_cast<Conv3d>(blocks["patch_embedding"]);
+            auto text_embedding_0 = std::dynamic_pointer_cast<Linear>(blocks["text_embedding.0"]);
+            auto text_embedding_2 = std::dynamic_pointer_cast<Linear>(blocks["text_embedding.2"]);
+            auto time_embedding_0 = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.0"]);
+            auto time_embedding_2 = std::dynamic_pointer_cast<Linear>(blocks["time_embedding.2"]);
+            auto time_projection_1 = std::dynamic_pointer_cast<Linear>(blocks["time_projection.1"]);
+            auto head             = std::dynamic_pointer_cast<Head>(blocks["head"]);
+
+            int64_t T = x_chunk->ne[2], H = x_chunk->ne[1], W = x_chunk->ne[0];
+            int64_t t_len = (T + std::get<0>(config.patch_size) / 2) / std::get<0>(config.patch_size);
+            int64_t h_len = (H + std::get<1>(config.patch_size) / 2) / std::get<1>(config.patch_size);
+            int64_t w_len = (W + std::get<2>(config.patch_size) / 2) / std::get<2>(config.patch_size);
+
+            auto x = patch_embedding->forward(ctx, x_chunk);
+            x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1] * x->ne[2], x->ne[3] / N, N);
+            x = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));
+
+            auto e = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, config.freq_dim);
+            e      = time_embedding_0->forward(ctx, e);
+            e      = ggml_silu_inplace(ctx->ggml_ctx, e);
+            e      = time_embedding_2->forward(ctx, e);
+            auto e0 = ggml_silu(ctx->ggml_ctx, e);
+            e0      = time_projection_1->forward(ctx, e0);
+            e0      = ggml_reshape_4d(ctx->ggml_ctx, e0, e0->ne[0] / 6, 6, e0->ne[1], e0->ne[2]);
+
+            context = text_embedding_0->forward(ctx, context);
+            context = ggml_ext_gelu(ctx->ggml_ctx, context);
+            context = text_embedding_2->forward(ctx, context);
+
+            sd::ggml_graph_cut::mark_graph_cut(x, "shotstream.prelude", "x");
+            sd::ggml_graph_cut::mark_graph_cut(e0, "shotstream.prelude", "e0");
+            sd::ggml_graph_cut::mark_graph_cut(context, "shotstream.prelude", "ctx");
+            if (pe_block != nullptr) {
+                sd::ggml_graph_cut::mark_graph_cut(pe_block, "shotstream.prelude", "pe");
+            }
+
+            new_kc.assign(config.num_layers, nullptr);
+            new_vc.assign(config.num_layers, nullptr);
+            for (int i = 0; i < config.num_layers; i++) {
+                auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
+                x = block->forward_causal(ctx, x, e0, pe_block, context,
+                                          prev_kc.empty() ? nullptr : prev_kc[i],
+                                          prev_vc.empty() ? nullptr : prev_vc[i],
+                                          cond_kc.empty() ? nullptr : cond_kc[i],
+                                          cond_vc.empty() ? nullptr : cond_vc[i],
+                                          new_kc[i], new_vc[i]);
+                sd::ggml_graph_cut::mark_graph_cut(x, "shotstream.blocks." + std::to_string(i) + ".out", "x");
+            }
+
+            auto out = head->forward(ctx, x, e);
+            return unpatchify(ctx->ggml_ctx, out, t_len, h_len, w_len);
+        }
+
+        ggml_tensor* forward_block0_selfattn(GGMLRunnerContext* ctx,
+                                              ggml_tensor* x,
+                                              ggml_tensor* pe,
+                                              ggml_tensor*& new_kc,
+                                              ggml_tensor*& new_vc) {
+            auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks.0"]);
+            return block->selfattn_only(ctx, x, pe, new_kc, new_vc);
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
