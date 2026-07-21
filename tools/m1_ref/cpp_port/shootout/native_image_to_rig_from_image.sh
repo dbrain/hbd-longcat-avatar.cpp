@@ -252,7 +252,11 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
     local core=(Hips LeftUpLeg RightUpLeg Spine LeftLeg RightLeg Spine1 LeftFoot RightFoot Spine2
                 LeftToeBase RightToeBase Neck LeftShoulder RightShoulder Head LeftArm RightArm
                 LeftForeArm RightForeArm LeftHand RightHand)
-    for n in "${core[@]}"; do grep -a -q "mixamorig:$n" "$file" || return 1; done
+    # Match a complete node name: `Spine1` must not satisfy the required
+    # `Spine` core bone in an explicit legacy fallback.
+    for n in "${core[@]}"; do
+      grep -a -F -q "\"name\":\"mixamorig:$n\"" "$file" || return 1
+    done
   }
   legacy_rig_ok() {
     local file="$1" report fan total

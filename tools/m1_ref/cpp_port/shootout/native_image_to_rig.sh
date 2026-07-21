@@ -171,7 +171,11 @@ mixamo_core_ok() {
   local core=(Hips LeftUpLeg RightUpLeg Spine LeftLeg RightLeg Spine1 LeftFoot RightFoot Spine2
               LeftToeBase RightToeBase Neck LeftShoulder RightShoulder Head LeftArm RightArm
               LeftForeArm RightForeArm LeftHand RightHand)
-  for n in "${core[@]}"; do grep -a -q "mixamorig:$n" "$file" || return 1; done
+  # Match the entire JSON node name.  A substring test makes `Spine` falsely
+  # pass when a malformed rig contains only `Spine1`/`Spine2`.
+  for n in "${core[@]}"; do
+    grep -a -F -q "\"name\":\"mixamorig:$n\"" "$file" || return 1
+  done
 }
 
 rig_ok() {
