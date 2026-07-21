@@ -48,14 +48,13 @@ private:
     std::vector<std::string> child_args(const std::string& model, int port) const;
     static std::string request_gpu(const httplib::Request& request);
     bool child_busy() const;
+    static bool child_busy_on_port(int port);
     static std::map<std::string, std::string> build_variants(const std::string& base_model,
                                                               const std::string& edit_model,
                                                               const std::string& variants_spec);
 
     std::string argv0_;
     std::vector<std::string> original_args_;
-    std::string base_model_;
-    std::string edit_model_;
     std::map<std::string, std::string> variants_;
     std::string default_gpu_;
     mutable std::mutex mutex_;

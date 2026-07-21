@@ -67,9 +67,7 @@ WorkerSupervisor::WorkerSupervisor(std::string argv0,
                                    std::string default_gpu)
     : argv0_(std::move(argv0)),
       original_args_(std::move(original_args)),
-      base_model_(std::move(base_model)),
-      edit_model_(std::move(edit_model)),
-      variants_(build_variants(base_model_, edit_model_, variants_spec)),
+      variants_(build_variants(base_model, edit_model, variants_spec)),
       default_gpu_(std::move(default_gpu)) {}
 
 WorkerSupervisor::~WorkerSupervisor() {
@@ -225,6 +223,14 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
     }
     const std::string gpu = requested_gpu.empty() ? default_gpu_ : requested_gpu;
     if (pid_ > 0 && active_model_ == model && active_gpu_ == gpu) return true;
+    // Switching must be a full process recycle to release the prior CUDA primary
+    // context.  Do not make that cleanup destructive to an existing render: the
+    // Koblem contract drains/unloads before a switch, and direct callers receive
+    // a retryable conflict instead of a silent cancelled job.
+    if (pid_ > 0 && (active_generation_requests_.load() > 1 || child_busy_on_port(port_))) {
+        error = "model or GPU switch requires the active worker to be idle";
+        return false;
+    }
     unload_locked();
 
     port_ = reserve_loopback_port();
@@ -260,13 +266,8 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
     return true;
 }
 
-bool WorkerSupervisor::child_busy() const {
-    int port = 0;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (pid_ <= 0 || port_ <= 0) return false;
-        port = port_;
-    }
+bool WorkerSupervisor::child_busy_on_port(int port) {
+    if (port <= 0) return false;
     httplib::Client client("127.0.0.1", port);
     client.set_connection_timeout(1, 0);
     client.set_read_timeout(1, 0);
@@ -277,6 +278,11 @@ bool WorkerSupervisor::child_busy() const {
     } catch (...) {
         return false;
     }
+}
+
+bool WorkerSupervisor::child_busy() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pid_ > 0 && child_busy_on_port(port_);
 }
 
 int WorkerSupervisor::in_flight() const {
@@ -330,7 +336,7 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
         std::lock_guard<std::mutex> lock(mutex_);
         std::string error;
         if (!ensure_worker_locked(requested_model, request_gpu(request), error)) {
-            response.status = 503;
+            response.status = error == "model or GPU switch requires the active worker to be idle" ? 409 : 503;
             response.set_content(json({{"error", "worker unavailable"}, {"message", error}}).dump(), "application/json");
             return true;
         }
