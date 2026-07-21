@@ -166,6 +166,14 @@ run_rebaked_lod() {
   "$CP/shootout/verify_native_texture_asset.sh" "$out" --execution cpu
 }
 
+mixamo_core_ok() {
+  local file="$1" n
+  local core=(Hips LeftUpLeg RightUpLeg Spine LeftLeg RightLeg Spine1 LeftFoot RightFoot Spine2
+              LeftToeBase RightToeBase Neck LeftShoulder RightShoulder Head LeftArm RightArm
+              LeftForeArm RightForeArm LeftHand RightHand)
+  for n in "${core[@]}"; do grep -a -q "mixamorig:$n" "$file" || return 1; done
+}
+
 rig_ok() {
   local file="$1" report fan total
   report="$("$CP/rig_score" "$file" 55 2>&1 || true)"
@@ -173,7 +181,7 @@ rig_ok() {
   [[ "$report" =~ maxfan=([0-9]+) ]] || return 1; fan="${BASH_REMATCH[1]}"
   [[ "$report" =~ TOTAL=([0-9.]+) ]] || return 1; total="${BASH_REMATCH[1]}"
   (( fan <= 7 )) && awk "BEGIN { exit !($total >= 0.50) }" \
-    && grep -a -q 'mixamorig:Hips' "$file"
+    && mixamo_core_ok "$file"
 }
 
 try_rig() {
@@ -224,7 +232,7 @@ if [[ -z "$SELECTED_RIG" ]]; then
   cat >"$OUT/run-status.txt" <<EOF
 texture_lods=succeeded
 rig_state=rejected
-rig_gate=maxfan <= 7; rig_score >= 0.50; named Mixamo core; bone-naming falsifier
+rig_gate=maxfan <= 7; rig_score >= 0.50; full 22-bone Mixamo core; bone-naming falsifier
 rig_logs=rig_candidate_native_{high,medium,low}.rig.log
 published_hymotion_rig=none
 EOF
@@ -243,7 +251,7 @@ cat >"$OUT/run-status.txt" <<EOF
 texture_lods=succeeded
 rig_state=succeeded
 selected_rig=$SELECTED_RIG
-rig_gate=maxfan <= 7; rig_score >= 0.50; named Mixamo core; bone-naming falsifier
+rig_gate=maxfan <= 7; rig_score >= 0.50; full 22-bone Mixamo core; bone-naming falsifier
 published_hymotion_rig=hymotion_rigged.glb
 EOF
 
@@ -251,7 +259,7 @@ write_texture_delivery_manifest succeeded "$SELECTED_RIG"
 
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
- {"file":"hymotion_rigged.glb","label":"Hymotion-ready · native $SELECTED_RIG rig","note":"native Trellis texture; deterministic beam rig; maxfan ≤ 7 and rig_score ≥ 0.50"},
+ {"file":"hymotion_rigged.glb","label":"Hymotion-ready · native $SELECTED_RIG rig","note":"native Trellis texture; deterministic beam rig; maxfan ≤ 7, rig_score ≥ 0.50, and full 22-bone Mixamo core"},
  {"file":"native_high_textured.glb","label":"HIGH · native textured","note":"300k target faces · ${NATIVE_HIGH_RESOLUTION}px model · ${NATIVE_HIGH_ATLAS} atlas · ${NATIVE_UNWRAP} unwrap · authoritative native material"},
  {"file":"native_medium_textured.glb","label":"MEDIUM · native textured","note":"150k target faces · 1024 atlas · CPU rebake of the high native material"},
  {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · 1024 atlas · CPU rebake of the high native material"}
