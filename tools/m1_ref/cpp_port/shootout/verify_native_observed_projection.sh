@@ -67,4 +67,21 @@ done < <(sed -n 's/^view yaw=.* painted_percent=\([^ ]*\).*/\1/p' "$QC")
 (( PAINTED == CAMERAS )) || { echo "REJECT: per-view paint evidence missing ($PAINTED/$CAMERAS)" >&2; exit 1; }
 TOPO="$($CP/mesh_topo "$GLB")"
 [[ "$TOPO" =~ open=([0-9]+) ]] && (( BASH_REMATCH[1] == 0 )) || { echo "REJECT: candidate topology invalid: $TOPO" >&2; exit 1; }
+RIGGED_GLB="$(sed -n 's/^rigged_candidate_glb=\([^ ]*\) sha256=.*/\1/p' "$SRC")"
+if [[ -n "$RIGGED_GLB" ]]; then
+  RIGGED_HASH="$(sed -n 's/^rigged_candidate_glb=.* sha256=\([0-9a-f]*\)$/\1/p' "$SRC")"
+  RIGGED_GLB="$(dirname "$SRC")/$RIGGED_GLB"
+  [[ -s "$RIGGED_GLB" && "$RIGGED_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "REJECT: missing rigged observed candidate" >&2; exit 1; }
+  [[ "$(sha256sum "$RIGGED_GLB" | awk '{print $1}')" == "$RIGGED_HASH" ]] || { echo "REJECT: rigged observed candidate hash changed" >&2; exit 1; }
+  RIGGED_TOPO="$($CP/mesh_topo "$RIGGED_GLB")"
+  [[ "$RIGGED_TOPO" =~ open=([0-9]+) ]] && (( BASH_REMATCH[1] == 0 )) || { echo "REJECT: rigged candidate topology invalid: $RIGGED_TOPO" >&2; exit 1; }
+  for node in Hips LeftUpLeg RightUpLeg Spine LeftLeg RightLeg Spine1 LeftFoot RightFoot Spine2 LeftToeBase RightToeBase Neck LeftShoulder RightShoulder Head LeftArm RightArm LeftForeArm RightForeArm LeftHand RightHand; do
+    grep -a -F -q "\"name\":\"mixamorig:$node\"" "$RIGGED_GLB" || { echo "REJECT: rigged candidate lacks exact Mixamo node: $node" >&2; exit 1; }
+  done
+  RIG_SCORE="$($CP/rig_score "$RIGGED_GLB" 55 2>&1 || true)"
+  [[ "$RIG_SCORE" =~ maxfan=([0-9]+) ]] && (( BASH_REMATCH[1] <= 7 )) || { echo "REJECT: rigged candidate fanout invalid: $RIG_SCORE" >&2; exit 1; }
+  [[ "$RIG_SCORE" =~ TOTAL=([0-9.]+) ]] && awk -v total="${BASH_REMATCH[1]}" 'BEGIN { exit !(total >= 0.50) }' || {
+    echo "REJECT: rigged candidate score invalid: $RIG_SCORE" >&2; exit 1;
+  }
+fi
 printf 'VERIFIED native observed projection candidate: views=%s native-base=%s telea=0 seam=%s/255\n' "$CAMERAS" "$NATIVE_BASE" "$SEAM"

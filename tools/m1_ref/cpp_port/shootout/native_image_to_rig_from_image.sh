@@ -419,8 +419,12 @@ if [[ "$PROJECT" != 0 ]]; then
     echo "native observed projection needs camera provenance from this geometry cache; rerun geometry with IMAGE_TO_RIG_REFRESH=1" >&2; exit 1;
   }
   echo "== $LABEL: native-base observed-view projection A/B (native texture remains default) =="
+  RIGGED_PROJECT_ARGS=()
+  if [[ -s "$OUT/hymotion_rigged.glb" ]]; then
+    RIGGED_PROJECT_ARGS=(--rigged-source "$OUT/hymotion_rigged.glb")
+  fi
   "$CP/shootout/native_observed_atlas_project.sh" "$OUT/native_high_textured.glb" "$CAMERA_PROVENANCE" "$OUT" \
-    "${NATIVE_PROJ_ARGS[@]}"
+    "${NATIVE_PROJ_ARGS[@]}" "${RIGGED_PROJECT_ARGS[@]}"
   NATIVE_PROJ_GLB="$OUT/native_high_textured_observed_projected_ab.glb"
   if [[ "$PROJECT_PROMOTE" == 1 ]]; then
     (( TOTAL_PROJ_CAMERAS >= 4 )) || { echo "promotion validation needs 4--8 observed cameras" >&2; exit 1; }

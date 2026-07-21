@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
         std::printf("[repack] simplify: target=%d actual=%u faces verts=%u err=%.4f\n", target_faces, F3 / 3, V, err);
     }
 
-    std::vector<uint8_t> img0, img1;
+    std::vector<uint8_t> img0, img1, replacement_png;
     auto image_bytes = [&](int ii) {
         const json& im = j["images"][ii];
         const json& bv = j["bufferViews"][(int)im["bufferView"]];
@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
         return std::vector<uint8_t>(bin.begin() + off, bin.begin() + off + len);
     };
     if (const char* replacement = std::getenv("GLB_REPACK_BASE_COLOR_PNG")) {
-        std::vector<uint8_t> replacement_png = read_file(replacement);
+        replacement_png = read_file(replacement);
         int rw=0,rh=0,rc=0;
         uint8_t* rp=stbi_load_from_memory(replacement_png.data(),(int)replacement_png.size(),&rw,&rh,&rc,4);
         if (!rp || rw<1 || rh<1) { std::fprintf(stderr,"replacement baseColor PNG decode failed: %s\n",replacement); return 1; }
@@ -203,6 +203,65 @@ int main(int argc, char** argv) {
         img0 = maybe_resize_png(replacement_png, tex_max, 4);
         std::printf("[repack] using replacement native baseColor atlas: %s\n", replacement);
     } else img0 = maybe_resize_png(image_bytes(0), tex_max, 4);
+
+    // Replace only the embedded base-colour image and retain every other
+    // container feature (skin, inverse bind matrices, joints, node graph,
+    // animations, extras). This makes an observed-atlas A/B usable on an
+    // otherwise valid Hymotion hand-off instead of silently stripping its rig.
+    // It is deliberately exact-image/no-simplification mode: changing any
+    // geometry or texture dimensions belongs to the ordinary repack path.
+    if (std::getenv("GLB_REPACK_PRESERVE_CONTAINER")) {
+        if (replacement_png.empty()) { std::fprintf(stderr, "preserve-container mode requires GLB_REPACK_BASE_COLOR_PNG\n"); return 1; }
+        if (tex_max != 0 || target_faces != 0) { std::fprintf(stderr, "preserve-container mode cannot resize textures or simplify geometry\n"); return 1; }
+        int material = prim.value("material", 0);
+        if (material < 0 || material >= (int)j["materials"].size()) { std::fprintf(stderr, "invalid primitive material\n"); return 1; }
+        const json& pbr = j["materials"][material]["pbrMetallicRoughness"];
+        if (!pbr.contains("baseColorTexture")) { std::fprintf(stderr, "material has no baseColorTexture\n"); return 1; }
+        int texture = pbr["baseColorTexture"]["index"];
+        if (texture < 0 || texture >= (int)j["textures"].size()) { std::fprintf(stderr, "invalid baseColor texture\n"); return 1; }
+        int image = j["textures"][texture]["source"];
+        if (image < 0 || image >= (int)j["images"].size() || !j["images"][image].contains("bufferView")) {
+            std::fprintf(stderr, "baseColor image is not embedded\n"); return 1;
+        }
+        int bv_index = j["images"][image]["bufferView"];
+        if (bv_index < 0 || bv_index >= (int)j["bufferViews"].size()) { std::fprintf(stderr, "invalid baseColor bufferView\n"); return 1; }
+        const json& old_bv = j["bufferViews"][bv_index];
+        size_t old_off = (size_t)old_bv.value("byteOffset", 0);
+        size_t old_len = (size_t)old_bv["byteLength"];
+        if (old_off + old_len > bin.size()) { std::fprintf(stderr, "baseColor bufferView outside BIN\n"); return 1; }
+        ptrdiff_t delta = (ptrdiff_t)replacement_png.size() - (ptrdiff_t)old_len;
+        std::vector<uint8_t> outbin;
+        outbin.reserve((size_t)((ptrdiff_t)bin.size() + delta));
+        outbin.insert(outbin.end(), bin.begin(), bin.begin() + old_off);
+        outbin.insert(outbin.end(), replacement_png.begin(), replacement_png.end());
+        outbin.insert(outbin.end(), bin.begin() + old_off + old_len, bin.end());
+        for (size_t b = 0; b < j["bufferViews"].size(); ++b) {
+            json& bv = j["bufferViews"][b];
+            size_t off = (size_t)bv.value("byteOffset", 0);
+            if ((int)b == bv_index) bv["byteLength"] = replacement_png.size();
+            else if (off >= old_off + old_len) bv["byteOffset"] = (ptrdiff_t)off + delta;
+            else if (off > old_off) { std::fprintf(stderr, "overlapping baseColor bufferView unsupported\n"); return 1; }
+        }
+        size_t old_buffer_len = (size_t)j["buffers"][0].value("byteLength", bin.size());
+        j["buffers"][0]["byteLength"] = (ptrdiff_t)old_buffer_len + delta;
+        std::string js = j.dump();
+        auto pad4 = [](uint32_t n) { return (4u - (n & 3u)) & 3u; };
+        uint32_t json_len = (uint32_t)js.size(), json_pad = pad4(json_len), json_chunk = json_len + json_pad;
+        uint32_t raw_bin_len = (uint32_t)outbin.size(), bin_pad = pad4(raw_bin_len), bin_chunk = raw_bin_len + bin_pad;
+        uint32_t total = 12 + 8 + json_chunk + 8 + bin_chunk;
+        FILE* f = std::fopen(argv[2], "wb");
+        if (!f) { std::fprintf(stderr, "open failed: %s\n", argv[2]); return 1; }
+        auto w32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+        w32(0x46546C67u); w32(2u); w32(total);
+        w32(json_chunk); w32(0x4E4F534Au); std::fwrite(js.data(), 1, json_len, f);
+        for (uint32_t p = 0; p < json_pad; ++p) std::fputc(' ', f);
+        w32(bin_chunk); w32(0x004E4942u); std::fwrite(outbin.data(), 1, outbin.size(), f);
+        for (uint32_t p = 0; p < bin_pad; ++p) std::fputc(0, f);
+        std::fclose(f);
+        std::printf("[repack] %s -> %s | preserved GLB container, replaced baseColor image %zu -> %zu bytes\n",
+                    argv[1], argv[2], old_len, replacement_png.size());
+        return 0;
+    }
     img1 = maybe_resize_png(image_bytes(1), tex_max, 3);
 
     // A native-atlas projection must remain inspectable by the ordinary GLB
