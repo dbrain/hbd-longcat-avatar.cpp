@@ -547,6 +547,8 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `fps` | `integer` |
 | `moe_boundary` | `number` |
 | `vace_strength` | `number` |
+| `audio_path` | `string \| null` |
+| `audio_frame_offset` | `integer` |
 | `high_noise_sample_params` | `object` |
 | `high_noise_sample_params.scheduler` | `string` |
 | `high_noise_sample_params.sample_method` | `string` |
@@ -959,7 +961,7 @@ Compared with `img_gen`, the `vid_gen` request body:
 
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
 - `ref_images`, `mask_image`, `control_image`, `control_strength`, and `embed_image_metadata` are not part of the request schema
-- `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, and `vace_strength`
+- `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, `vace_strength`, and LongCat Avatar's `audio_path` / `audio_frame_offset`
 
 Example:
 
@@ -976,6 +978,8 @@ Example:
   "fps": 16,
   "moe_boundary": 0.875,
   "vace_strength": 1.0,
+  "audio_path": null,
+  "audio_frame_offset": 0,
 
   "init_image": null,
   "end_image": null,
@@ -1091,6 +1095,8 @@ Top-level scalar fields:
 | `fps` | `integer` |
 | `moe_boundary` | `number` |
 | `vace_strength` | `number` |
+| `audio_path` | `string \| null` |
+| `audio_frame_offset` | `integer` |
 
 Image and frame fields:
 

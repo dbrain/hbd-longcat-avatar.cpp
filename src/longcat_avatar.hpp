@@ -4,7 +4,6 @@
 #include "core/ggml_extend.hpp"
 #include "model.h"
 #include "model/common/rope.hpp"
-#include "ggml-cuda.h"  // ggml_cuda_set_longcat_fa_bsa_bitmap (lap-31.2)
 #include "model/diffusion/model.hpp"  // DiffusionModelRunner + LongCatAvatarDiffusionExtra (sd.cpp #1569)
 
 // LongCat-Video-Avatar 1.5 DiT port (mirrors src/wan.hpp).
@@ -1325,22 +1324,13 @@ namespace LONGCAT_AVATAR {
         std::vector<ggml_tensor*> xattn_text_v_vec;  // [n_layers] each [hidden_size, n_ctx, Nb] F16
         int64_t xattn_text_nctx                = -1;
 
-        // LongCat lap-28.4 (BSA): persistent host-built F32 mask tensor for the
+        // LongCat BSA: persistent host-built F16 mask tensor for the
         // consume-step self-attention. Computed once per resolution: each query token
         // attends to its 3x3 spatial-cube neighborhood + all tokens in the cond frame
         // (ref anchor). Quality trade, env-gated (LONGCAT_BSA=1) — default-off ⇒ dense.
         ggml_context*         bsa_ctx           = nullptr;
         ggml_backend_buffer_t bsa_buf           = nullptr;
         ggml_tensor*          bsa_mask_tensor   = nullptr;
-        // LongCat lap-31.2 Stage 2: CPU-precomputed per-(Q-tile, K-tile) all-deny bitmap.
-        // Shape [n_words_per_qtile, n_qtiles] I32-as-F32-bitwise. Bit `b` of word `w`
-        // for Q-tile `jt` set ⇒ K-tile (w*32+b) within jt has ≥1 allowed cell.
-        // Replaces the lap-29.2 in-iter mask scan with a constant-time L1 lookup +
-        // eliminates iter dispatch for fully-denied K-tiles (lap-30 v2 +2.8s ceiling
-        // unlocked without the +10.95s in-kernel scan tax).
-        ggml_tensor*          bsa_bitmap_tensor = nullptr;
-        int                   bsa_cached_n_qtiles  = -1;
-        int                   bsa_cached_n_kwords  = -1;
         int64_t               bsa_cached_n_token = -1;
         int64_t               bsa_cached_n_noise = -1;
 
@@ -1348,9 +1338,6 @@ namespace LONGCAT_AVATAR {
             if (bsa_buf) { ggml_backend_buffer_free(bsa_buf); bsa_buf = nullptr; }
             if (bsa_ctx) { ggml_free(bsa_ctx); bsa_ctx = nullptr; }
             bsa_mask_tensor   = nullptr;
-            bsa_bitmap_tensor = nullptr;
-            bsa_cached_n_qtiles = -1;
-            bsa_cached_n_kwords = -1;
             bsa_cached_n_token = -1;
             bsa_cached_n_noise = -1;
         }
@@ -1384,23 +1371,9 @@ namespace LONGCAT_AVATAR {
             // cast (~3 ms each), dominating any sparse-attention savings.
             bsa_mask_tensor = ggml_new_tensor_2d(bsa_ctx, GGML_TYPE_F16, n_token, n_noise);
             ggml_set_name(bsa_mask_tensor, "bsa_mask");
-            // LongCat lap-31.2: also allocate the per-(Q-tile, K-tile) all-deny bitmap.
-            // Sized to match the FA template config the consume self-attn dispatches to:
-            // DKQ=DV=128, ncols=64, nbatch_fa=64 (ampere case `(128,128,64,128,3,64,...)`).
-            // If those change, ggml_cuda_fattn_mma_get_config_ampere needs to change with it.
-            constexpr int kNcols1   = 64;
-            constexpr int kNbatchFa = 64;
-            const int n_qtiles      = (int)((n_noise + kNcols1 - 1)   / kNcols1);
-            const int n_ktiles      = (int)((n_token + kNbatchFa - 1) / kNbatchFa);
-            const int n_kwords      = (n_ktiles + 31) / 32;  // 32 K-tile bits per uint32
-            // Tensor laid out as [n_kwords, n_qtiles] F32 (4-byte-per-word, bit-cast).
-            bsa_bitmap_tensor = ggml_new_tensor_2d(bsa_ctx, GGML_TYPE_F32, n_kwords, n_qtiles);
-            ggml_set_name(bsa_bitmap_tensor, "bsa_bitmap");
             bsa_buf            = ggml_backend_alloc_ctx_tensors(bsa_ctx, runtime_backend);
             bsa_cached_n_token = n_token;
             bsa_cached_n_noise = n_noise;
-            bsa_cached_n_qtiles = n_qtiles;
-            bsa_cached_n_kwords = n_kwords;
 
             // Build CPU-side. Token layout (per patch_embed): t outer, h middle, w inner.
             // Token offset n_token-n_noise = n_cond_tokens (cond frames precede noise).
@@ -1436,59 +1409,13 @@ namespace LONGCAT_AVATAR {
             }
             ggml_backend_tensor_set(bsa_mask_tensor, data.data(), 0, ggml_nbytes(bsa_mask_tensor));
 
-            // LongCat lap-31.2: derive the per-(Q-tile, K-tile) all-deny bitmap from the
-            // mask we just built. A bit is set if at least one cell in the (jt × kb0)
-            // cube is ALLOW; cleared if every cell in the cube is DENY (-INF). The FA
-            // kernel skips iter dispatch entirely for cleared bits.
-            //
-            // Mask layout: data[qi * n_token + ki] = MASK_ALLOW or MASK_DENY (F16).
-            // For Q-tile jt the Q-row range is [jt*kNcols1, min((jt+1)*kNcols1, n_noise)).
-            // For K-tile kb the K-col range is [kb*kNbatchFa, min((kb+1)*kNbatchFa, n_token)).
-            std::vector<uint32_t> bitmap((size_t) n_qtiles * n_kwords, 0u);
-            for (int jt = 0; jt < n_qtiles; ++jt) {
-                const int64_t qi_lo = (int64_t) jt * kNcols1;
-                const int64_t qi_hi = std::min<int64_t>((int64_t)(jt + 1) * kNcols1, n_noise);
-                if (qi_lo >= qi_hi) continue;
-                for (int kb = 0; kb < n_ktiles; ++kb) {
-                    const int64_t ki_lo = (int64_t) kb * kNbatchFa;
-                    const int64_t ki_hi = std::min<int64_t>((int64_t)(kb + 1) * kNbatchFa, n_token);
-                    if (ki_lo >= ki_hi) continue;
-                    bool any_allow = false;
-                    for (int64_t qi = qi_lo; qi < qi_hi && !any_allow; ++qi) {
-                        const ggml_fp16_t* row = data.data() + (size_t) qi * n_token;
-                        for (int64_t ki = ki_lo; ki < ki_hi; ++ki) {
-                            if (row[ki] != MASK_DENY) { any_allow = true; break; }
-                        }
-                    }
-                    if (any_allow) {
-                        const int word_idx = kb >> 5;
-                        const int bit_idx  = kb & 31;
-                        bitmap[(size_t) jt * n_kwords + word_idx] |= (1u << bit_idx);
-                    }
-                }
-            }
-            // Bit-cast upload: the tensor is F32-typed but holds 32-bit bitmap words.
-            ggml_backend_tensor_set(bsa_bitmap_tensor, bitmap.data(), 0,
-                                    ggml_nbytes(bsa_bitmap_tensor));
-
-            // Quick stats: how many K-tiles per Q-tile are LIVE (bit set). Useful for
-            // sanity-checking the skip rate at runtime.
-            int total_bits_set = 0;
-            for (size_t i = 0; i < bitmap.size(); ++i) {
-                total_bits_set += __builtin_popcount(bitmap[i]);
-            }
-            const double live_frac = (double) total_bits_set / ((double) n_qtiles * (double) n_ktiles);
-
             bsa_cached_self_frame = sfa_i;
             bsa_cached_bookend    = bka_i;
             bsa_cached_radius     = radius;
-            LOG_INFO("[BSA] mask built: n_noise=%lld n_token=%lld cube=[%d,%d] radius=%d self_frame=%d bookend=%d mask=%.1f MiB bitmap=%dx%d live=%.1f%% (%d/%d)",
+            LOG_INFO("[BSA] mask built: n_noise=%lld n_token=%lld cube=[%d,%d] radius=%d self_frame=%d bookend=%d mask=%.1f MiB",
                      (long long) n_noise, (long long) n_token, cube_h, cube_w, radius,
                      sfa_i, bka_i,
-                     (double) ggml_nbytes(bsa_mask_tensor) / (1024.0 * 1024.0),
-                     n_qtiles, n_kwords,
-                     100.0 * live_frac,
-                     total_bits_set, n_qtiles * n_ktiles);
+                     (double) ggml_nbytes(bsa_mask_tensor) / (1024.0 * 1024.0));
         }
 
         void free_condkv_cache() {
@@ -1727,37 +1654,6 @@ namespace LONGCAT_AVATAR {
                                         eff_bsa_self_frame, eff_bsa_bookend);
                         if (cur_step > 1) {
                             runner_ctx.bsa_mask = bsa_mask_tensor;
-                            // LongCat lap-31.2: thread the CPU-precomputed bitmap into the
-                            // FA kernel via the ggml-cuda device-resident setter. DEFAULT ON
-                            // when BSA is enabled (bit-exact -1.98s wall in measurements);
-                            // opt out via LONGCAT_NO_BSA_BITMAP=1 if the FA template's
-                            // ncols1/nbatch_fa ever changes from the (64,64) the bitmap is
-                            // sized for. The setter call is host-side; the device read
-                            // happens inside the FA K-tile loop and is bit-exact (skipping
-                            // a fully-denied K-tile is mathematically identical to running
-                            // it — its softmax weights are all exp(-INF)=0).
-#ifdef SD_USE_CUDA
-                            static const bool bsa_bitmap_disabled = []{
-                                const char* s = getenv("LONGCAT_NO_BSA_BITMAP");
-                                if (s && s[0] == '1') return true;
-                                const char* s2 = getenv("LONGCAT_BSA_BITMAP");
-                                return s2 && s2[0] == '0';
-                            }();
-                            if (!bsa_bitmap_disabled && bsa_bitmap_tensor != nullptr &&
-                                bsa_cached_n_qtiles > 0 && bsa_cached_n_kwords > 0) {
-                                ggml_cuda_set_longcat_fa_bsa_bitmap(
-                                    bsa_bitmap_tensor->data,
-                                    bsa_cached_n_qtiles, bsa_cached_n_kwords);
-                            } else {
-                                ggml_cuda_set_longcat_fa_bsa_bitmap(nullptr, 0, 0);
-                            }
-#endif
-                        } else {
-                            // Step 1 (or pre-consume): no BSA mask in flight → ensure the
-                            // FA bitmap state is clear so prior renders' state doesn't leak.
-#ifdef SD_USE_CUDA
-                            ggml_cuda_set_longcat_fa_bsa_bitmap(nullptr, 0, 0);
-#endif
                         }
                     } else {
                         LOG_WARN("[BSA] disabled — latent h=%lld w=%lld not divisible by cube [%d,%d]",

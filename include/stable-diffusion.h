@@ -405,6 +405,21 @@ typedef struct {
     int video_frames;
     int fps;
     float vace_strength;
+    // LongCat-Video-Avatar 1.5 driving audio.  This is a WAV file consumed by
+    // the Whisper audio encoder; the same source track is returned as optional
+    // generated audio, trimmed to the rendered clip.
+    const char* audio_path;
+    // Start position in the driving-audio timeline, measured at the Avatar
+    // model's fixed 25 fps.  Zero is the normal single-clip case.
+    int audio_frame_offset;
+    // LongCat Avatar block-sparse attention mask. Dense is the default;
+    // enabling BSA changes the temporal/spatial attention receptive field.
+    int bsa_enabled;
+    int bsa_radius;
+    int bsa_self_frame;
+    int bsa_bookend;
+    int bsa_cube_h;
+    int bsa_cube_w;
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;

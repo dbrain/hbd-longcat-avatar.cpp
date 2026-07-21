@@ -618,12 +618,14 @@ namespace LONGCAT_AUDIO {
         WhisperEncoderParams p;
         WhisperEncoder encoder;
         std::string desc = "whisper-encoder";
+        std::string tensor_prefix;
 
         WhisperEncoderRunner(ggml_backend_t backend,
                              const String2TensorStorage& tensor_storage_map = {},
                              const std::string prefix                       = "audio_encoder",
                              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
             : GGMLRunner(backend, weight_manager) {
+            tensor_prefix = prefix;
             encoder = WhisperEncoder(p);
             encoder.init(params_ctx, tensor_storage_map, prefix);
         }
@@ -634,6 +636,10 @@ namespace LONGCAT_AUDIO {
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
             encoder.get_param_tensors(tensors, prefix);
+        }
+
+        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) {
+            encoder.get_param_tensors(tensors, tensor_prefix);
         }
 
         ggml_cgraph* build_graph(const sd::Tensor<float>& mel_tensor) {

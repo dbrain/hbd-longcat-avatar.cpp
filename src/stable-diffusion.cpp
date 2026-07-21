@@ -36,6 +36,7 @@
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/ltxv.hpp"
+#include "longcat_audio.hpp"
 #include "longcat_avatar.hpp"
 #include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/mmdit.hpp"
@@ -218,6 +219,7 @@ public:
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<VAE> preview_vae;
     std::shared_ptr<LTXV::LTXAudioVAERunner> audio_vae_model;
+    std::shared_ptr<LONGCAT_AUDIO::WhisperEncoderRunner> whisper_encoder_model;
     std::shared_ptr<ControlNet> control_net;
     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
     std::vector<std::shared_ptr<LoraModel>> runtime_lora_models;
@@ -1415,7 +1417,22 @@ public:
                 }
             }
 
-            if (use_audio_vae) {
+            if (use_audio_vae && sd_version_is_longcat_avatar(version)) {
+                // For LongCat Avatar, audio_vae_path identifies its Whisper
+                // encoder GGUF rather than an LTX audio VAE.
+                use_audio_vae = false;
+                whisper_encoder_model = std::make_shared<LONGCAT_AUDIO::WhisperEncoderRunner>(backend_for(SDBackendModule::TE),
+                                                                                               tensor_storage_map,
+                                                                                               "audio_encoder",
+                                                                                               model_manager);
+                whisper_encoder_model->set_flash_attention_enabled(false);
+                if (!register_runner_params("LongCat Avatar Whisper encoder",
+                                            whisper_encoder_model,
+                                            SDBackendModule::TE,
+                                            &text_encoder_params_mem_size)) {
+                    return false;
+                }
+            } else if (use_audio_vae) {
                 audio_vae_model = std::make_shared<LTXV::LTXAudioVAERunner>(backend_for(SDBackendModule::VAE),
                                                                             tensor_storage_map,
                                                                             "",
@@ -2491,7 +2508,7 @@ public:
                 hunyuan_timestep_r_tensor = sd::Tensor<float>::from_vector({sigmas[step + 1]});
             }
             sd::Tensor<float> noised_input = x * c_in;
-            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version) || sd_version_is_lingbot_video(version))) {
+            if (!denoise_mask.empty() && (version == VERSION_WAN2_2_TI2V || sd_version_is_ltxav(version) || sd_version_is_lingbot_video(version) || sd_version_is_longcat_avatar(version))) {
                 noised_input = noised_input * denoise_mask + init_latent * (1.0f - denoise_mask);
             }
 
@@ -2584,6 +2601,8 @@ public:
                         audio_length,
                         frame_rate,
                         video_positions.empty() ? nullptr : &video_positions};
+                } else if (sd_version_is_longcat_avatar(version)) {
+                    diffusion_params.extra = LongCatAvatarDiffusionExtra{step};
                 } else if (sd_version_is_minit2i(version)) {
                     diffusion_params.extra = MiniT2IDiffusionExtra{
                         condition.c_vector.empty() ? nullptr : &condition.c_vector};
@@ -2747,7 +2766,7 @@ public:
     int get_diffusion_model_down_factor() {
         int down_factor = 8;  // unet
         if (sd_version_is_dit(version)) {
-            if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version)) {
+            if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_longcat_avatar(version)) {
                 down_factor = 2;
             } else {
                 down_factor = 1;
@@ -2812,7 +2831,7 @@ public:
         int latent_frames = frames;
         if (sd_version_is_ltxav(version)) {
             latent_frames = ((frames - 1) / 8) + 1;
-        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
+        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version) || sd_version_is_longcat_avatar(version)) {
             latent_frames = ((frames - 1) / 4) + 1;
         }
         return latent_frames;
@@ -2825,7 +2844,7 @@ public:
         if (sd_version_is_ltxav(version)) {
             return (latent_frames - 1) * 8 + 1;
         }
-        if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version)) {
+        if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_hunyuan_video(version) || sd_version_is_longcat_avatar(version)) {
             return (latent_frames - 1) * 4 + 1;
         }
         return latent_frames;
@@ -3601,6 +3620,14 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->fps                                   = 16;
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
+    sd_vid_gen_params->audio_path                            = nullptr;
+    sd_vid_gen_params->audio_frame_offset                    = 0;
+    sd_vid_gen_params->bsa_enabled                           = 0;
+    sd_vid_gen_params->bsa_radius                            = 1;
+    sd_vid_gen_params->bsa_self_frame                        = 1;
+    sd_vid_gen_params->bsa_bookend                           = 0;
+    sd_vid_gen_params->bsa_cube_h                            = 4;
+    sd_vid_gen_params->bsa_cube_w                            = 6;
     sd_vid_gen_params->vae_tiling_params                     = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     sd_vid_gen_params->hires.enabled                         = false;
     sd_vid_gen_params->hires.upscaler                        = SD_HIRES_UPSCALER_LATENT;
@@ -3622,7 +3649,7 @@ struct sd_ctx_t {
 };
 
 static bool sd_version_supports_video_generation(SDVersion version) {
-    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version);
+    return version == VERSION_SVD || sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_lingbot_video(version) || sd_version_is_ltxav(version) || sd_version_is_longcat_avatar(version);
 }
 
 static bool sd_version_supports_image_generation(SDVersion version) {
@@ -5581,6 +5608,18 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     ImageGenerationLatents latents;
     int64_t prepare_start_ms = ggml_time_ms();
 
+    if (sd_version_is_longcat_avatar(sd_ctx->sd->version)) {
+        if (auto avatar_model = std::dynamic_pointer_cast<LongCatAvatarModel>(sd_ctx->sd->diffusion_model)) {
+            avatar_model->cont_num_ref_latents = 0;
+            avatar_model->bsa_enabled          = sd_vid_gen_params->bsa_enabled != 0;
+            avatar_model->bsa_radius           = sd_vid_gen_params->bsa_radius;
+            avatar_model->bsa_self_frame       = sd_vid_gen_params->bsa_self_frame != 0;
+            avatar_model->bsa_bookend          = sd_vid_gen_params->bsa_bookend != 0;
+            avatar_model->bsa_cube_h           = sd_vid_gen_params->bsa_cube_h;
+            avatar_model->bsa_cube_w           = sd_vid_gen_params->bsa_cube_w;
+        }
+    }
+
     sd::Tensor<float> start_image;
     sd::Tensor<float> end_image;
 
@@ -5869,6 +5908,32 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         sd::ops::fill_slice(&latents.denoise_mask, 2, 0, init_image_latent.shape()[2], 0.0f);
 
         latents.ref_images.push_back(start_image);
+
+        int64_t t2 = ggml_time_ms();
+        LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
+    } else if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !start_image.empty()) {
+        // Avatar AI2V conditions its portrait in the first VAE latent frame and
+        // pins that frame throughout sampling.  The DiT derives the cond split
+        // from the leading zero timestep entries.
+        LOG_INFO("LongCat Avatar AI2V (reference-image conditioning)");
+
+        int64_t t1             = ggml_time_ms();
+        auto init_img          = start_image.reshape({start_image.shape()[0], start_image.shape()[1], 1, start_image.shape()[2], 1});
+        auto init_image_latent = sd_ctx->sd->encode_first_stage(init_img);
+        if (init_image_latent.empty()) {
+            LOG_ERROR("failed to encode LongCat Avatar reference image");
+            return std::nullopt;
+        }
+
+        latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+        sd::ops::slice_assign(&latents.init_latent, 2, 0, init_image_latent.shape()[2], init_image_latent);
+        latents.denoise_mask = sd::full<float>({latents.init_latent.shape()[0],
+                                                latents.init_latent.shape()[1],
+                                                latents.init_latent.shape()[2],
+                                                1,
+                                                1},
+                                                1.f);
+        sd::ops::fill_slice(&latents.denoise_mask, 2, 0, init_image_latent.shape()[2], 0.0f);
 
         int64_t t2 = ggml_time_ms();
         LOG_INFO("encode_first_stage completed, taking %" PRId64 " ms", t2 - t1);
@@ -6369,6 +6434,88 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
 
     sd::Tensor<float> x_t   = latents.init_latent;
     sd::Tensor<float> noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+    std::vector<float> avatar_input_wav;
+
+    // LongCat Avatar's speech pathway is intentionally outside DiffusionParams:
+    // Whisper creates the fixed per-frame inputs and the Avatar runner consumes
+    // them from its audio projection blocks on every DiT forward.
+    if (sd_version_is_longcat_avatar(sd_ctx->sd->version)) {
+        auto avatar_model = std::dynamic_pointer_cast<LongCatAvatarModel>(sd_ctx->sd->diffusion_model);
+        if (avatar_model == nullptr) {
+            LOG_ERROR("LongCat Avatar model runner is unavailable");
+            return false;
+        }
+        avatar_model->avatar.audio_first  = {};
+        avatar_model->avatar.audio_latter = {};
+
+        const char* audio_path = SAFE_STR(sd_vid_gen_params->audio_path);
+        if (strlen(audio_path) > 0) {
+            if (sd_ctx->sd->whisper_encoder_model == nullptr) {
+                LOG_ERROR("LongCat Avatar audio_path requires audio_vae_path with the Whisper encoder GGUF");
+                return false;
+            }
+            struct RunnerDoneOnExit {
+                GGMLRunner* runner = nullptr;
+                ~RunnerDoneOnExit() {
+                    if (runner != nullptr) {
+                        runner->runner_done();
+                    }
+                }
+            } whisper_runner_done{sd_ctx->sd->whisper_encoder_model.get()};
+            if (!LONGCAT_AUDIO::load_wav_16k_mono(audio_path, avatar_input_wav)) {
+                return false;
+            }
+
+            LONGCAT_AUDIO::WhisperMel mel_extractor;
+            int n_mel_frames = 0;
+            std::vector<float> log_mel = mel_extractor.log_mel(avatar_input_wav, n_mel_frames);
+            if (n_mel_frames <= 0) {
+                LOG_ERROR("LongCat Avatar audio has no usable mel frames");
+                return false;
+            }
+
+            const int n_mels = LONGCAT_AUDIO::WhisperMel::kNMels;
+            sd::Tensor<float> mel({static_cast<int64_t>(n_mel_frames), static_cast<int64_t>(n_mels), 1});
+            float* mel_data = mel.data();
+            for (int m = 0; m < n_mels; ++m) {
+                for (int t = 0; t < n_mel_frames; ++t) {
+                    mel_data[static_cast<size_t>(m) * n_mel_frames + t] = log_mel[static_cast<size_t>(m) * n_mel_frames + t];
+                }
+            }
+
+            auto whisper = sd_ctx->sd->whisper_encoder_model->compute(sd_ctx->sd->n_threads, mel);
+            if (whisper.empty()) {
+                LOG_ERROR("LongCat Avatar Whisper encoder failed");
+                return false;
+            }
+
+            constexpr int avatar_fps = 25;
+            LONGCAT_AUDIO::AudioWindowConfig audio_config;
+            audio_config.fps = static_cast<float>(avatar_fps);
+            const int video_length = std::max(1, static_cast<int>(avatar_input_wav.size() * avatar_fps / 16000));
+            auto full_audio = LONGCAT_AUDIO::build_full_audio_emb(whisper, video_length, audio_config);
+            sd::Tensor<float> first;
+            sd::Tensor<float> latter;
+            const int latent_audio_frames = LONGCAT_AUDIO::build_proj_inputs(full_audio,
+                                                                               request.frames,
+                                                                               audio_config,
+                                                                               first,
+                                                                               latter,
+                                                                               sd_vid_gen_params->audio_frame_offset);
+            if (latent_audio_frames != T) {
+                LOG_ERROR("LongCat Avatar audio window produced %d latent frames; video requires %d",
+                          latent_audio_frames,
+                          T);
+                return false;
+            }
+            avatar_model->avatar.audio_first  = std::move(first);
+            avatar_model->avatar.audio_latter = std::move(latter);
+            LOG_INFO("LongCat Avatar audio conditioning: %d mel frames, %d video frames, %d latent frames",
+                     n_mel_frames,
+                     request.frames,
+                     T);
+        }
+    }
 
     if (plan.high_noise_sample_steps > 0) {
         if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
@@ -6627,6 +6774,30 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         }
         int64_t audio_latent_decode_end = ggml_time_ms();
         LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_latent_decode_end - audio_latent_decode_start) * 1.0f / 1000);
+    }
+    if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !avatar_input_wav.empty()) {
+        constexpr uint32_t sample_rate = 16000;
+        const int output_fps = request.fps > 0 ? request.fps : 25;
+        const size_t start = std::min(avatar_input_wav.size(),
+                                      static_cast<size_t>(std::max(0, sd_vid_gen_params->audio_frame_offset)) * sample_rate / 25);
+        const size_t requested_samples = static_cast<size_t>(request.frames) * sample_rate / output_fps;
+        const size_t count = std::min(requested_samples, avatar_input_wav.size() - start);
+        generated_audio = (sd_audio_t*)calloc(1, sizeof(sd_audio_t));
+        if (generated_audio == nullptr) {
+            LOG_WARN("LongCat Avatar could not allocate output audio; continuing with video");
+        } else {
+            generated_audio->sample_rate  = sample_rate;
+            generated_audio->channels     = 1;
+            generated_audio->sample_count = count;
+            generated_audio->data         = (float*)malloc(count * sizeof(float));
+            if (generated_audio->data == nullptr) {
+                free(generated_audio);
+                generated_audio = nullptr;
+                LOG_WARN("LongCat Avatar could not allocate output audio samples; continuing with video");
+            } else {
+                std::memcpy(generated_audio->data, avatar_input_wav.data() + start, count * sizeof(float));
+            }
+        }
     }
 
     if (latents.video_conditioning_frame_count > 0) {

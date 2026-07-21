@@ -974,6 +974,11 @@ ArgOptions SDGenerationParams::get_options() {
          0,
          &control_video_path},
         {"",
+         "--audio",
+         "path to a WAV file for LongCat Avatar audio-driven lip-sync",
+         0,
+         &audio_path},
+        {"",
          "--pm-id-images-dir",
          "path to PHOTOMAKER input id images dir",
          0,
@@ -1046,6 +1051,10 @@ ArgOptions SDGenerationParams::get_options() {
          "--video-frames",
          "video frames (default: 1)",
          &video_frames},
+        {"",
+         "--audio-frame-offset",
+         "LongCat Avatar driving-audio offset in the model's 25 fps timeline (default: 0)",
+         &audio_frame_offset},
         {"",
          "--fps",
          "fps (default: 24)",
@@ -1888,6 +1897,8 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("control_strength", control_strength);
     load_if_exists("moe_boundary", moe_boundary);
     load_if_exists("vace_strength", vace_strength);
+    load_if_exists("audio_path", audio_path);
+    load_if_exists("audio_frame_offset", audio_frame_offset);
 
     load_if_exists("auto_resize_ref_image", auto_resize_ref_image);
     load_if_exists("increase_ref_index", increase_ref_index);
@@ -2346,6 +2357,11 @@ bool SDGenerationParams::validate(SDMode mode) {
         return false;
     }
 
+    if (mode == VID_GEN && audio_frame_offset < 0) {
+        LOG_ERROR("error: audio_frame_offset must be non-negative");
+        return false;
+    }
+
     if (sample_params.shifted_timestep < 0 || sample_params.shifted_timestep > 1000) {
         LOG_ERROR("error: shifted_timestep must be in range [0, 1000]");
         return false;
@@ -2568,6 +2584,8 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.video_frames              = video_frames;
     params.fps                       = fps;
     params.vace_strength             = vace_strength;
+    params.audio_path                = audio_path.empty() ? nullptr : audio_path.c_str();
+    params.audio_frame_offset        = audio_frame_offset;
     params.vae_tiling_params         = vae_tiling_params;
     params.cache                     = cache_params;
     params.hires.enabled             = hires_enabled;
@@ -2636,6 +2654,7 @@ std::string SDGenerationParams::to_string() const {
         << "  control_image_path: \"" << control_image_path << "\",\n"
         << "  ref_image_paths: " << vec_str_to_string(ref_image_paths) << ",\n"
         << "  control_video_path: \"" << control_video_path << "\",\n"
+        << "  audio_path: \"" << audio_path << "\",\n"
         << "  auto_resize_ref_image: " << (auto_resize_ref_image ? "true" : "false") << ",\n"
         << "  increase_ref_index: " << (increase_ref_index ? "true" : "false") << ",\n"
         << "  pm_id_images_dir: \"" << pm_id_images_dir << "\",\n"
@@ -2657,6 +2676,7 @@ std::string SDGenerationParams::to_string() const {
         << "  video_frames: " << video_frames << ",\n"
         << "  fps: " << fps << ",\n"
         << "  vace_strength: " << vace_strength << ",\n"
+        << "  audio_frame_offset: " << audio_frame_offset << ",\n"
         << "  strength: " << strength << ",\n"
         << "  control_strength: " << control_strength << ",\n"
         << "  seed: " << seed << ",\n"
@@ -2799,6 +2819,10 @@ std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
         };
         root["moe_boundary"]        = gen_params.moe_boundary;
         root["vace_strength"]       = gen_params.vace_strength;
+        if (!gen_params.audio_path.empty()) {
+            root["audio_path"] = gen_params.audio_path;
+        }
+        root["audio_frame_offset"] = gen_params.audio_frame_offset;
         root["high_noise_sampling"] = build_sampling_metadata_json(gen_params.high_noise_sample_params,
                                                                    gen_params.high_noise_skip_layers);
     }

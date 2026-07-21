@@ -210,6 +210,8 @@ struct SDGenerationParams {
     std::string control_image_path;
     std::vector<std::string> ref_image_paths;
     std::string control_video_path;
+    // LongCat-Video-Avatar driving audio (WAV; resampled/downmixed to 16 kHz).
+    std::string audio_path;
 
     sd_sample_params_t sample_params;
     sd_sample_params_t high_noise_sample_params;
@@ -230,6 +232,7 @@ struct SDGenerationParams {
     int video_frames                     = 1;
     int fps                              = 16;
     float vace_strength                  = 1.f;
+    int audio_frame_offset                = 0;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
 
