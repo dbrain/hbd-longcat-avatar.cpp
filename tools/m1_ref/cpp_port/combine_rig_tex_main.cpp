@@ -156,10 +156,14 @@ int main(int argc, char** argv) {
     if (!load_npy_i64(parents_npy, parents_i64, sh)) return 1;
     if ((int)parents_i64.size() != J) { std::fprintf(stderr, "parents count %zu != J=%d\n", parents_i64.size(), J); return 1; }
     std::vector<int> parents(parents_i64.begin(), parents_i64.end());
-    std::string spine_repair;
+    std::string spine_repair, head_repair;
     if (rig::synthesize_missing_mixamo_spine(joints, parents, src_w, Ns, &spine_repair)) {
         J++;
         std::printf("  rig normalization: %s (J=%d)\n", spine_repair.c_str(), J);
+    }
+    if (rig::synthesize_missing_mixamo_head(joints, parents, src_w, src_pts, Ns, &head_repair)) {
+        J++;
+        std::printf("  rig normalization: %s (J=%d)\n", head_repair.c_str(), J);
     }
 
     // --- load the TEXTURED full mesh (geometry + uvs) ---

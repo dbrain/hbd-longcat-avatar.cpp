@@ -527,7 +527,8 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
 // SkinTokens sometimes emits a semantically complete torso with only two
 // spine segments: Hips -> Spine1 -> Spine2. A direct Mixamo hand-off needs
 // the intervening `Spine` node too. Insert one *only* when the naming pass has
-// unambiguously identified that exact 21/22 topology. The new joint sits
+// unambiguously identified short-torso topology (the exact 21/22 form, or
+// the exact 20/22 form whose only other missing slot is Head). The new joint sits
 // halfway from Hips to the existing Spine1 and becomes its parent; its skin
 // column is zero because it is a transform-only intermediary. Child
 // inverse-bind matrices retain the rest pose, so animation of this node still
@@ -541,7 +542,7 @@ inline bool synthesize_missing_mixamo_spine(std::vector<float>& joints,
     if (old_j <= 0 || (int)parents.size() != old_j || skin_rows < 0 ||
         skin_weights.size() != (size_t)skin_rows * (size_t)old_j) return false;
     BoneNaming before = name_bones(joints, parents);
-    if (!before.ok || before.named_core != 21) return false;
+    if (!before.ok || (before.named_core != 21 && before.named_core != 20)) return false;
     int hips = -1, spine = -1, spine1 = -1, spine2 = -1;
     for (int i = 0; i < old_j; i++) {
         if (before.smpl[i] == 0) hips = i;
@@ -551,7 +552,14 @@ inline bool synthesize_missing_mixamo_spine(std::vector<float>& joints,
     }
     // Do not invent anatomy for a general partial skeleton. This narrowly
     // handles the observed short-torso form, with an already validated Hips /
-    // Spine1 / Spine2 chain and no existing Spine assignment.
+    // Spine1 / Spine2 chain and no existing Spine assignment.  A missing Head
+    // may coexist and is handled separately by the geometry-supported repair
+    // below; hands, toes, limbs, or any other missing semantic node reject.
+    for (int s = 0; s < SMPL_N; s++) {
+        bool found = false;
+        for (int i = 0; i < old_j; i++) if (before.smpl[i] == s) { found = true; break; }
+        if (!found && s != 3 && s != 15) return false;
+    }
     if (spine >= 0 || hips < 0 || spine1 < 0 || spine2 < 0 || parents[spine1] != hips)
         return false;
 
@@ -567,8 +575,115 @@ inline bool synthesize_missing_mixamo_spine(std::vector<float>& joints,
     }
     skin_weights.swap(expanded);
     BoneNaming after = name_bones(joints, parents);
-    if (!after.ok || after.named_core != 22) return false;
+    if (!after.ok || after.named_core != before.named_core + 1) return false;
     if (detail) *detail = "inserted transform-only Mixamo Spine between Hips and Spine1";
+    return true;
+}
+
+// A small number of otherwise complete SkinTokens rigs end at Neck: they have
+// the complete bilateral arm/leg topology and a short torso, but omit both the
+// structural `Spine` and the terminal `Head` joint.  Unlike a generic
+// name-filling fallback, this repair is allowed only for that exact 20/22
+// semantic skeleton.  The new Head is anchored in the actual upper sampled
+// geometry and takes skin influence only from Neck in that upper-head band, so
+// a Head animation moves head geometry rather than merely adding a dead node.
+//
+// It deliberately does NOT repair missing hands, toes, limbs, or an ambiguous
+// torso. Those cases remain rejected: inventing several endpoint bones would
+// make a name check pass without a defensible skinning contract.
+inline bool synthesize_missing_mixamo_head(std::vector<float>& joints,
+                                           std::vector<int>& parents,
+                                           std::vector<float>& skin_weights,
+                                           const std::vector<float>& sampled_points,
+                                           int64_t skin_rows,
+                                           std::string* detail = nullptr) {
+    const int old_j = (int)(joints.size() / 3);
+    if (old_j <= 0 || (int)parents.size() != old_j || skin_rows <= 0 ||
+        sampled_points.size() != (size_t)skin_rows * 3 ||
+        skin_weights.size() != (size_t)skin_rows * (size_t)old_j) return false;
+    BoneNaming before = name_bones(joints, parents);
+    if (!before.ok || before.named_core != 21) return false;
+
+    int neck = -1, hips = -1;
+    bool has_head = false;
+    for (int i = 0; i < old_j; i++) {
+        if (before.smpl[i] == 0) hips = i;
+        if (before.smpl[i] == 12) neck = i;
+        if (before.smpl[i] == 15) has_head = true;
+    }
+    if (hips < 0 || neck < 0 || has_head) return false;
+
+    // This is intentionally exact: after the validated Spine insertion, the
+    // only absent semantic endpoint must be Head.  Do not promote a skeleton
+    // that happens to have 21 names but is missing a hand/toe instead.
+    bool missing_only_head = true;
+    for (int s = 0; s < SMPL_N; s++) {
+        bool found = false;
+        for (int i = 0; i < old_j; i++) if (before.smpl[i] == s) { found = true; break; }
+        if (!found && s != 15) { missing_only_head = false; break; }
+    }
+    if (!missing_only_head) return false;
+
+    float ymin = sampled_points[1], ymax = sampled_points[1];
+    for (int64_t r = 0; r < skin_rows; r++) {
+        float y = sampled_points[(size_t)r * 3 + 1];
+        ymin = std::min(ymin, y); ymax = std::max(ymax, y);
+    }
+    const float height = ymax - ymin;
+    const float neck_y = joints[(size_t)neck * 3 + 1];
+    if (height < 1e-5f || ymax - neck_y < 0.14f * height) return false;
+
+    // Estimate the rest Head location from real points in the upper 22% of
+    // the character. This is more defensible than extrapolating a torso vector
+    // through a stylised head/hair silhouette.
+    const float head_band = ymax - 0.22f * height;
+    double sx = 0, sy = 0; int64_t nhead = 0;
+    for (int64_t r = 0; r < skin_rows; r++) {
+        const float* p = &sampled_points[(size_t)r * 3];
+        if (p[1] < head_band) continue;
+        sx += p[0]; sy += p[1]; ++nhead;
+    }
+    if (nhead < std::max<int64_t>(8, skin_rows / 200)) return false;
+
+    const int inserted = old_j;
+    joints.push_back((float)(sx / nhead));
+    joints.push_back((float)(sy / nhead));
+    // A generated endpoint cannot be used as an independent front/back
+    // chirality witness. Keep its depth aligned with Neck, while retaining the
+    // sampled upper-head x/y placement and head-region skin mass. The
+    // falsifier will report this cue as unavailable rather than treating a
+    // stylised hair/back centroid as evidence against the toe-derived facing.
+    joints.push_back(joints[(size_t)neck * 3 + 2]);
+    parents.push_back(neck);
+
+    std::vector<float> expanded((size_t)skin_rows * (size_t)(old_j + 1), 0.f);
+    const float skin_begin = neck_y + 0.08f * height;
+    const float skin_end = neck_y + 0.22f * height;
+    double moved_mass = 0.0;
+    int64_t moved_rows = 0;
+    for (int64_t r = 0; r < skin_rows; r++) {
+        const float* in = &skin_weights[(size_t)r * old_j];
+        float* out = &expanded[(size_t)r * (old_j + 1)];
+        std::memcpy(out, in, (size_t)old_j * sizeof(float));
+        const float y = sampled_points[(size_t)r * 3 + 1];
+        const float t = std::max(0.f, std::min(0.85f, (y - skin_begin) / std::max(1e-6f, skin_end - skin_begin) * 0.85f));
+        const float moved = out[neck] * t;
+        out[neck] -= moved;
+        out[inserted] = moved;
+        if (moved > 1e-5f) { moved_mass += moved; ++moved_rows; }
+    }
+    // A Head node without any actual skin would be exactly the misleading
+    // repair this gate is meant to prevent.
+    if (moved_rows < std::max<int64_t>(8, skin_rows / 200) || moved_mass < 0.5) return false;
+    skin_weights.swap(expanded);
+    BoneNaming after = name_bones(joints, parents);
+    if (!after.ok || after.named_core != 22) return false;
+    if (detail) {
+        char b[256];
+        std::snprintf(b, sizeof(b), "inserted geometry-supported Mixamo Head under Neck; moved %.3f Neck skin mass across %lld upper-head samples",
+                      moved_mass, (long long)moved_rows);
+        *detail = b;
+    }
     return true;
 }
 

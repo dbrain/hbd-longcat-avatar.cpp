@@ -51,7 +51,15 @@ flock -n 9 || { echo "another image-to-rig job owns the 3060" >&2; exit 75; }
 for f in "$R1W_SRC"/*.npy; do
     [[ -e "$f" ]] && ln -sfn "$f" "$R1W/$(basename "$f")"
 done
-cp -f "$RIG_IN/sampled_pc.npy" "$RIG_IN/sampled_feats.npy" "$R1W/"
+# `sampled_pc` / `sampled_feats` are mesh-specific inputs, not shared R1
+# weights.  They are initially linked by the loop above, so a plain `cp` would
+# follow the destination link and overwrite the shared source file. Replace
+# just those known local links with owned copies before every run.
+for f in sampled_pc.npy sampled_feats.npy; do
+    [[ -f "$RIG_IN/$f" ]] || { echo "missing mesh-specific R1 input: $RIG_IN/$f" >&2; exit 2; }
+    rm -f "$R1W/$f"
+    cp -f -- "$RIG_IN/$f" "$R1W/$f"
+done
 
 echo "== [1/2] DETERMINISTIC auto-rig (REAL mesh conditioning, beams=$BEAMS, fp32) =="
 "$CP/skintokens_e2e" "$RIG_IN" "$QW" "$RIG_GLB" cuda beam nosample prec=fp32 \
