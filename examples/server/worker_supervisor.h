@@ -35,23 +35,25 @@ public:
     // could not prove the CUDA-owning worker is gone, so callers must not admit
     // a competing GPU workload.
     bool unload();
-    bool loaded() const;
-    int worker_pid() const;
+    bool loaded();
+    int worker_pid();
     void drain();
     void reopen();
     bool draining() const;
-    std::string active_model() const;
-    std::string active_gpu() const;
-    int in_flight() const;
+    std::string active_model();
+    std::string active_gpu();
+    int in_flight();
 
 private:
     bool ensure_worker_locked(const std::string& model, const std::string& gpu, std::string& error);
+    bool reap_exited_locked();
+    void clear_worker_locked();
     bool unload_locked();
     bool wait_until_ready_locked(std::string& error);
     int reserve_loopback_port() const;
     std::vector<std::string> child_args(const std::string& model, int port) const;
     static std::string request_gpu(const httplib::Request& request);
-    bool child_busy() const;
+    bool child_busy();
     static bool child_busy_on_port(int port);
     static std::map<std::string, std::string> build_variants(const std::string& base_model,
                                                               const std::string& edit_model,

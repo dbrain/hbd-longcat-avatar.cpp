@@ -131,13 +131,15 @@ WorkerSupervisor::~WorkerSupervisor() {
     (void)unload();
 }
 
-bool WorkerSupervisor::loaded() const {
+bool WorkerSupervisor::loaded() {
     std::lock_guard<std::mutex> lock(mutex_);
+    reap_exited_locked();
     return pid_ > 0;
 }
 
-int WorkerSupervisor::worker_pid() const {
+int WorkerSupervisor::worker_pid() {
     std::lock_guard<std::mutex> lock(mutex_);
+    reap_exited_locked();
     return pid_ > 0 ? pid_ : 0;
 }
 
@@ -153,13 +155,15 @@ void WorkerSupervisor::reopen() {
     draining_.store(false);
 }
 
-std::string WorkerSupervisor::active_model() const {
+std::string WorkerSupervisor::active_model() {
     std::lock_guard<std::mutex> lock(mutex_);
+    reap_exited_locked();
     return active_model_;
 }
 
-std::string WorkerSupervisor::active_gpu() const {
+std::string WorkerSupervisor::active_gpu() {
     std::lock_guard<std::mutex> lock(mutex_);
+    reap_exited_locked();
     return active_gpu_;
 }
 
@@ -184,7 +188,27 @@ std::map<std::string, std::string> WorkerSupervisor::build_variants(const std::s
     return variants;
 }
 
+void WorkerSupervisor::clear_worker_locked() {
+    pid_ = -1;
+    port_ = 0;
+    active_model_.clear();
+    active_gpu_.clear();
+}
+
+bool WorkerSupervisor::reap_exited_locked() {
+    if (pid_ <= 0) return false;
+    int status = 0;
+    const pid_t waited = ::waitpid(pid_, &status, WNOHANG);
+    if (waited == 0) return false;
+    if (waited == pid_ || (waited < 0 && errno == ECHILD)) {
+        clear_worker_locked();
+        return true;
+    }
+    return false;
+}
+
 bool WorkerSupervisor::unload_locked() {
+    reap_exited_locked();
     if (pid_ <= 0) {
         return true;
     }
@@ -203,10 +227,7 @@ bool WorkerSupervisor::unload_locked() {
     if (waited != pid && !(waited < 0 && (errno == ECHILD || errno == ESRCH))) {
         return false;
     }
-    pid_ = -1;
-    port_ = 0;
-    active_model_.clear();
-    active_gpu_.clear();
+    clear_worker_locked();
     return true;
 }
 
@@ -294,6 +315,7 @@ bool WorkerSupervisor::wait_until_ready_locked(std::string& error) {
 bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
                                              const std::string& requested_gpu,
                                              std::string& error) {
+    reap_exited_locked();
     const std::string model = requested_model.empty() ?
         (active_model_.empty() ? std::string("base") : active_model_) : requested_model;
     if (variants_.find(model) == variants_.end()) {
@@ -377,12 +399,13 @@ bool WorkerSupervisor::child_busy_on_port(int port) {
     }
 }
 
-bool WorkerSupervisor::child_busy() const {
+bool WorkerSupervisor::child_busy() {
     std::lock_guard<std::mutex> lock(mutex_);
+    reap_exited_locked();
     return pid_ > 0 && child_busy_on_port(port_);
 }
 
-int WorkerSupervisor::in_flight() const {
+int WorkerSupervisor::in_flight() {
     return active_generation_requests_.load() + (child_busy() ? 1 : 0);
 }
 
