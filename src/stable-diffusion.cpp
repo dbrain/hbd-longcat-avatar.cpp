@@ -7177,7 +7177,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     int tail_width = 0;
     int tail_height = 0;
     int tail_channels = 0;
-    sd_audio_t* chain_audio = nullptr;
+    uint32_t chain_audio_rate = 0;
+    uint32_t chain_audio_channels = 0;
+    std::vector<float> chain_audio_samples;
 
     auto release_stitched = [&]() {
         for (auto& frame : stitched) {
@@ -7187,8 +7189,34 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     };
     auto fail = [&]() {
         release_stitched();
-        free_sd_audio(chain_audio);
         return false;
+    };
+    auto append_audio = [&](const sd_audio_t* audio, int drop_frames, int kept_frames) {
+        if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 ||
+            audio->sample_rate == 0 || audio->channels == 0) {
+            return;
+        }
+        if (chain_audio_channels == 0) {
+            chain_audio_rate = audio->sample_rate;
+            chain_audio_channels = audio->channels;
+        }
+        if (audio->sample_rate != chain_audio_rate || audio->channels != chain_audio_channels) {
+            LOG_WARN("generate_video_chain: ignoring segment audio with incompatible format %u Hz x%u",
+                     audio->sample_rate,
+                     audio->channels);
+            return;
+        }
+        const int fps = std::max(1, base_params->fps);
+        const uint64_t start = std::min<uint64_t>(audio->sample_count,
+                                                   static_cast<uint64_t>(std::llround(
+                                                       static_cast<double>(std::max(0, drop_frames)) *
+                                                       audio->sample_rate / fps)));
+        const uint64_t wanted = static_cast<uint64_t>(std::llround(
+            static_cast<double>(std::max(0, kept_frames)) * audio->sample_rate / fps));
+        const uint64_t count = std::min<uint64_t>(wanted, audio->sample_count - start);
+        const size_t begin = static_cast<size_t>(start) * audio->channels;
+        const size_t end = static_cast<size_t>(start + count) * audio->channels;
+        chain_audio_samples.insert(chain_audio_samples.end(), audio->data + begin, audio->data + end);
     };
     auto adopt_frames = [&](sd_image_t* segment_frames, int count, int segment) {
         const int drop = segment == 0 ? 0 : std::min(overlap_frames, count);
@@ -7355,11 +7383,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return fail();
         }
         free(latent);
-        if (chain_audio == nullptr && segment == 0) {
-            chain_audio = segment_audio;
-        } else {
-            free_sd_audio(segment_audio);
-        }
+        const int audio_drop = segment == 0 ? 0 : std::min(overlap_frames, segment_count);
+        append_audio(segment_audio, audio_drop, segment_count - audio_drop);
+        free_sd_audio(segment_audio);
         adopt_frames(segment_frames, segment_count, segment);
     }
 
@@ -7373,10 +7399,21 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     std::memcpy(output, stitched.data(), stitched.size() * sizeof(sd_image_t));
     *frames_out = output;
     *num_frames_out = static_cast<int>(stitched.size());
-    if (audio_out != nullptr) {
-        *audio_out = chain_audio;
-    } else {
-        free_sd_audio(chain_audio);
+    if (audio_out != nullptr && chain_audio_channels != 0 && !chain_audio_samples.empty()) {
+        auto* chain_audio = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
+        if (chain_audio != nullptr) {
+            chain_audio->sample_rate = chain_audio_rate;
+            chain_audio->channels = chain_audio_channels;
+            chain_audio->sample_count = chain_audio_samples.size() / chain_audio_channels;
+            chain_audio->data = static_cast<float*>(malloc(chain_audio_samples.size() * sizeof(float)));
+            if (chain_audio->data != nullptr) {
+                std::memcpy(chain_audio->data, chain_audio_samples.data(), chain_audio_samples.size() * sizeof(float));
+                *audio_out = chain_audio;
+            } else {
+                free(chain_audio);
+                LOG_WARN("generate_video_chain: could not allocate stitched audio");
+            }
+        }
     }
     LOG_INFO("generate_video_chain: stitched %d LTX windows -> %d frames",
              chain_params->n_segments,
