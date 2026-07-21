@@ -224,6 +224,12 @@ else
 fi
 
 [[ -f "$CACHE/refined.glb" ]] || { echo "geometry cache did not produce refined.glb" >&2; exit 1; }
+# Stable eye-test aliases: texture/rig stages must be judged against the exact
+# coarse and refined meshes that produced them, not an old cache with a
+# subject-specific hash in its path.  These links are diagnostic-only and do
+# not alter the geometry cache or production mesh.
+ln -sfn "$CACHE/refined.glb" "$OUT/refined_geometry.glb"
+[[ ! -f "$CACHE/coarse.glb" ]] || ln -sfn "$CACHE/coarse.glb" "$OUT/coarse_geometry.glb"
 # Do this before native material inference: a closed, inspectable geometry is
 # a prerequisite for a clean texture delivery, not a fact to discover after
 # consuming the reserved GPU.  Nonmanifold edges are retained as diagnostic
@@ -237,6 +243,7 @@ if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
 {
   printf 'geometry_cache=%s\n' "$CACHE"
   printf 'geometry_recipe=%s\n' "$GEOMETRY_RECIPE"
+  printf '%s\n' 'clay_stage_aliases=coarse_geometry.glb (when available), refined_geometry.glb (exact texture source)'
   printf 'remesh_close_r=%s\n' "$REMESH_CLOSE_R"
   printf 'ultrashape_steps=%s\n' "$ULTRASHAPE_STEPS"
   printf 'geometry_topology=%s\n' "$GEOMETRY_TOPOLOGY"

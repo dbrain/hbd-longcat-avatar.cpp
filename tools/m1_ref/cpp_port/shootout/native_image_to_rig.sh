@@ -220,6 +220,10 @@ try_rig() {
       --sampled "$samples/vertices.npy" --skin /tmp/skintokens_e2e/gen_skin_pred.npy \
       --joints /tmp/skintokens_e2e/gen_joints.npy --parents /tmp/skintokens_e2e/gen_parents.npy
   fi
+  # Keep every attempted skeleton on a stable, level-labelled path for the
+  # clay-stage eye test.  A failed structural gate is still useful geometry
+  # evidence; this alias never promotes it to a Hymotion hand-off.
+  ln -sfn "$candidate" "$OUT/rig_candidate_${name}.glb"
   "$CP/mesh_topo" "$candidate"
   if rig_ok "$candidate"; then
     cp -f "$candidate" "$OUT/hymotion_rigged.glb"
