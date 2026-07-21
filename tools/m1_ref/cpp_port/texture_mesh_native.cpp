@@ -92,7 +92,13 @@ static void restore_mesh_frame(std::vector<float>& v) {
 // Trellis2TexturingPipeline receives a PIL image, optionally crops its transparent subject, then
 // DinoV3FeatureExtractor does the final square Lanczos resize.  The runbook inputs are already
 // matted; this keeps their transparent padding from changing the image conditioning.
-static imgio::Image load_texture_image(const std::string& path) {
+static bool env_enabled(const char* key, bool default_value) {
+    const char* value=std::getenv(key);
+    if (!value || !*value) return default_value;
+    return std::strcmp(value,"0") && std::strcmp(value,"false") && std::strcmp(value,"False");
+}
+
+static imgio::Image load_texture_image(const std::string& path, std::string* input_contract=nullptr) {
     int w=0,h=0,c=0;
     unsigned char* p=stbi_load(path.c_str(), &w, &h, &c, 4);
     if (!p) throw std::runtime_error("cannot read image: " + path);
@@ -104,23 +110,35 @@ static imgio::Image load_texture_image(const std::string& path) {
     }
     bool has_alpha=false;
     for (int i=0;i<w*h;i++) if (p[i*4+3] != 255) { has_alpha=true; break; }
-    // The runbook's common "matte" input is opaque RGB with a black background.  Python routes
-    // that through RMBG before it crops; until the learned matte model is ported, recover this
-    // lossless case natively instead of conditioning DINO on a large black border.  Only enable it
-    // when the border is overwhelmingly near-black, so ordinary dark photographs are untouched.
+    // The runbook's canonical geometry frame is often an opaque RGB black matte.  Its black
+    // background is *not* an alpha channel: synthesising alpha from RGB brightness erased black
+    // hair, pupils, eyeliner, boots and dark clothing before DINO saw them.  Preserve the exact
+    // canonical frame by default; the geometry and texture conditioners then see the same image.
+    // Actual RGBA sources still use their true alpha/crop contract.  The old luminance-mask path
+    // remains an explicit diagnostic compatibility A/B only.
+    bool black_matte=false;
     if (!has_alpha) {
         int border=0, black=0;
         for (int y=0;y<h;y++) for (int x=0;x<w;x++) if (x==0||y==0||x==w-1||y==h-1) {
             border++; const float* q=&im.rgb[((size_t)y*w+x)*3];
             if (std::max({q[0],q[1],q[2]}) < .035f) black++;
         }
-        if (border && black > border*95/100) {
+        black_matte=border && black > border*95/100;
+        if (black_matte && !env_enabled("TEX_BLACK_MATTE_PRESERVE",true)) {
             for (size_t i=0;i<alpha01.size();i++) {
                 const float* q=&im.rgb[i*3]; float m=std::max({q[0],q[1],q[2]});
                 alpha01[i]=std::max(0.f,std::min(1.f,(m-.01f)/.06f));
             }
             has_alpha=true;
+            if (input_contract) *input_contract="opaque-black-matte-luminance-alpha-compat";
+        } else if (black_matte) {
+            if (input_contract) *input_contract="opaque-black-matte-preserved";
+            std::printf("[native-texture] input: preserve opaque black matte (no luminance-derived alpha)\n");
+        } else if (input_contract) {
+            *input_contract="opaque-image-full-frame";
         }
+    } else if (input_contract) {
+        *input_contract="rgba-alpha-crop";
     }
     // preprocess_image downsizes BEFORE finding the alpha bbox.  Resize alpha through the same
     // Lanczos kernel (as three identical channels) so the subsequent threshold/crop matches PIL.
@@ -209,8 +227,16 @@ int main(int argc, char** argv) {
         preprocess_mesh(mesh.verts);
         native_stage("mesh_preprocessed");
 
-        imgio::Image source=load_texture_image(image_path);
-        if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_proc_image_chw.npy",imgio::to_chw(source),"<f4",{3,source.h,source.w}); }
+        std::string texture_input_contract;
+        imgio::Image source=load_texture_image(image_path,&texture_input_contract);
+        if (!dump_dir.empty()) {
+            std::filesystem::create_directories(dump_dir);
+            dump_npy(dump_dir+"/native_proc_image_chw.npy",imgio::to_chw(source),"<f4",{3,source.h,source.w});
+            std::ofstream input_meta(dump_dir+"/native_input_contract.txt",std::ios::trunc);
+            if (!input_meta) throw std::runtime_error("could not write input contract metadata");
+            input_meta << texture_input_contract << '\n';
+        }
+        std::printf("[native-texture] texture input contract: %s\n",texture_input_contract.c_str());
         imgio::Image resized=imgio::resize_lanczos3(source, resolution, resolution);
         std::vector<float> img_chw=imgio::to_chw(resized);
         if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_dino_input_chw.npy",img_chw,"<f4",{3,resolution,resolution}); }
