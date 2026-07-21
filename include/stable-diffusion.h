@@ -447,10 +447,10 @@ typedef struct {
     bool circular_y;
 } sd_vid_gen_params_t;
 
-// LTX multi-window render and durable continuation. Completed windows can be
-// saved as `seg_<n>.bin` under `bank_dir`; a non-zero `start_segment` restores
-// that prefix and renders only the remaining windows. Output ownership matches
-// generate_video.
+// LTX or LongCat Avatar multi-window render and durable continuation. Completed
+// windows can be saved as `seg_<n>.bin` under `bank_dir`; a non-zero
+// `start_segment` restores that prefix and renders only the remaining windows.
+// Output ownership matches generate_video.
 typedef struct {
     int n_segments;
     const char* const* segment_prompts;

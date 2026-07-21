@@ -11,7 +11,6 @@
 
 #include "async_jobs.h"
 #include "common/media_io.h"
-#include "longcat_audio.hpp"
 
 namespace {
 
@@ -65,27 +64,78 @@ bool decode_avatar_blob(const std::string& value, std::vector<uint8_t>& bytes) {
     return base64_decode(encoded, bytes) && !bytes.empty();
 }
 
-sd_audio_t* load_avatar_output_audio(const std::string& path, int frame_count, int fps) {
-    std::vector<float> samples;
-    if (!LONGCAT_AUDIO::load_wav_16k_mono(path, samples) || samples.empty()) {
+uint16_t read_u16_le(const uint8_t* data) {
+    return static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8);
+}
+
+uint32_t read_u32_le(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) |
+           (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) |
+           (static_cast<uint32_t>(data[3]) << 24);
+}
+
+sd_audio_t* load_avatar_output_audio(const std::vector<uint8_t>& wav, int frame_count, int fps) {
+    if (wav.size() < 12 || std::memcmp(wav.data(), "RIFF", 4) != 0 || std::memcmp(wav.data() + 8, "WAVE", 4) != 0) {
         return nullptr;
     }
-    const int safe_fps = std::max(1, fps);
-    const size_t count = std::min(samples.size(),
-                                  static_cast<size_t>(std::max(0, frame_count)) * 16000 / safe_fps);
+    uint16_t format = 0;
+    uint16_t channels = 0;
+    uint32_t sample_rate = 0;
+    uint16_t bits_per_sample = 0;
+    const uint8_t* samples = nullptr;
+    size_t sample_bytes = 0;
+    for (size_t offset = 12; offset + 8 <= wav.size();) {
+        const uint32_t size = read_u32_le(wav.data() + offset + 4);
+        const size_t content = offset + 8;
+        if (content + size > wav.size()) {
+            return nullptr;
+        }
+        if (std::memcmp(wav.data() + offset, "fmt ", 4) == 0 && size >= 16) {
+            format = read_u16_le(wav.data() + content);
+            channels = read_u16_le(wav.data() + content + 2);
+            sample_rate = read_u32_le(wav.data() + content + 4);
+            bits_per_sample = read_u16_le(wav.data() + content + 14);
+        } else if (std::memcmp(wav.data() + offset, "data", 4) == 0) {
+            samples = wav.data() + content;
+            sample_bytes = size;
+        }
+        offset = content + size + (size & 1U);
+    }
+    if (samples == nullptr || channels == 0 || sample_rate == 0 ||
+        !((format == 1 && (bits_per_sample == 16 || bits_per_sample == 32)) ||
+          (format == 3 && bits_per_sample == 32))) {
+        return nullptr;
+    }
+    const size_t bytes_per_sample = bits_per_sample / 8;
+    const size_t total_frames = sample_bytes / (static_cast<size_t>(channels) * bytes_per_sample);
+    const size_t count = std::min(total_frames,
+                                  static_cast<size_t>(std::max(0, frame_count)) * sample_rate / std::max(1, fps));
     auto* audio = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
     if (audio == nullptr) {
         return nullptr;
     }
-    audio->sample_rate = 16000;
-    audio->channels = 1;
+    audio->sample_rate = sample_rate;
+    audio->channels = channels;
     audio->sample_count = count;
-    audio->data = static_cast<float*>(malloc(count * sizeof(float)));
-    if (audio->data == nullptr) {
+    const size_t value_count = count * channels;
+    audio->data = value_count == 0 ? nullptr : static_cast<float*>(malloc(value_count * sizeof(float)));
+    if (value_count != 0 && audio->data == nullptr) {
         free(audio);
         return nullptr;
     }
-    std::memcpy(audio->data, samples.data(), count * sizeof(float));
+    for (size_t i = 0; i < value_count; ++i) {
+        const uint8_t* source = samples + i * bytes_per_sample;
+        if (format == 1 && bits_per_sample == 16) {
+            audio->data[i] = static_cast<float>(static_cast<int16_t>(read_u16_le(source))) / 32768.f;
+        } else if (format == 1) {
+            audio->data[i] = static_cast<float>(static_cast<int32_t>(read_u32_le(source))) / 2147483648.f;
+        } else {
+            float value = 0.f;
+            std::memcpy(&value, source, sizeof(value));
+            audio->data[i] = value;
+        }
+    }
     return audio;
 }
 
@@ -248,7 +298,7 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
             }
             if (segment_count > 1) {
                 free_sd_audio(generated_audio);
-                generated_audio = load_avatar_output_audio(audio_file.string(), frames.count(), request.gen_params.fps);
+                generated_audio = load_avatar_output_audio(audio_bytes, frames.count(), request.gen_params.fps);
             }
             if (frames.count() <= 0) {
                 free_sd_audio(generated_audio);
