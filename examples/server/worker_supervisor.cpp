@@ -499,7 +499,6 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
     proxied.path = request.path;
     proxied.params = request.params;
     proxied.body = request.body;
-    LOG_DEBUG("isolated worker proxy: %s %s body=%zu bytes", request.method.c_str(), request.path.c_str(), proxied.body.size());
     for (const auto& header : request.headers) {
         if (header.first != "Host" && header.first != "Connection" && header.first != "Content-Length") {
             proxied.headers.emplace(header.first, header.second);
