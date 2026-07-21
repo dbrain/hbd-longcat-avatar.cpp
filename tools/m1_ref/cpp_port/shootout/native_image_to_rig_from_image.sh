@@ -14,6 +14,9 @@
 #   (the generic runner always retains native_high_texture_dump for CPU LOD rebakes)
 #   IMAGE_TO_RIG_REFRESH=1                              recompute even if this image's cache exists
 #   IMAGE_TO_RIG_US_STEPS=50|80                          explicit UltraShape geometry-detail recipe (80 is a labelled face/detail A/B)
+#   IMAGE_TO_RIG_GEO_RESOLUTION=1024|1536                Pixal3D seed lattice; 1536 is the true high-geometry A/B
+#   IMAGE_TO_RIG_SKIP_ULTRASHAPE=1                       stop after the Pixal3D seed (coarse clay review)
+#   IMAGE_TO_RIG_GEOMETRY_REVIEW_ONLY=1                  publish clay-stage aliases/gate, then stop before texture or rig
 #   IMAGE_TO_RIG_PROJECT=1                               create native-base observed-view texture A/B (CPU-only)
 #   IMAGE_TO_RIG_TEX_BACK=/abs/back.png
 #   IMAGE_TO_RIG_TEX_VIEWS='90=/abs/right.png -90=/abs/left.png'
@@ -97,6 +100,18 @@ ULTRASHAPE_STEPS="${IMAGE_TO_RIG_US_STEPS:-50}"
 [[ "$ULTRASHAPE_STEPS" =~ ^[1-9][0-9]*$ ]] && (( ULTRASHAPE_STEPS >= 40 && ULTRASHAPE_STEPS <= 100 )) || {
   echo "IMAGE_TO_RIG_US_STEPS must be an integer in [40,100] (50 production default; 80 detail A/B)" >&2; exit 2;
 }
+GEOMETRY_RESOLUTION="${IMAGE_TO_RIG_GEO_RESOLUTION:-1024}"
+[[ "$GEOMETRY_RESOLUTION" == 1024 || "$GEOMETRY_RESOLUTION" == 1536 ]] || {
+  echo "IMAGE_TO_RIG_GEO_RESOLUTION must be 1024 or 1536" >&2; exit 2;
+}
+SKIP_ULTRASHAPE="${IMAGE_TO_RIG_SKIP_ULTRASHAPE:-0}"
+[[ "$SKIP_ULTRASHAPE" == 0 || "$SKIP_ULTRASHAPE" == 1 ]] || {
+  echo "IMAGE_TO_RIG_SKIP_ULTRASHAPE must be 0 or 1" >&2; exit 2;
+}
+GEOMETRY_REVIEW_ONLY="${IMAGE_TO_RIG_GEOMETRY_REVIEW_ONLY:-0}"
+[[ "$GEOMETRY_REVIEW_ONLY" == 0 || "$GEOMETRY_REVIEW_ONLY" == 1 ]] || {
+  echo "IMAGE_TO_RIG_GEOMETRY_REVIEW_ONLY must be 0 or 1" >&2; exit 2;
+}
 # This is deliberately a versioned *geometry* recipe rather than an informal
 # environment setting.  A cache made with a different seal radius is a
 # different reconstruction and must never be reused just because the source
@@ -110,6 +125,21 @@ if (( ULTRASHAPE_STEPS != 50 )); then
   GEOMETRY_RECIPE_VERSION=5
   ULTRASHAPE_RECIPE_SUFFIX="-ussteps${ULTRASHAPE_STEPS}"
 fi
+PIXAL_RECIPE_SUFFIX=""
+GEOMETRY_CACHE_SUFFIX=""
+if [[ "$GEOMETRY_RESOLUTION" != 1024 ]]; then
+  # Resolution is the semantic mesh seed, not a texture/LOD knob.  It must be
+  # visible in both the recipe and cache name so a 1024 Minecraft-like seed is
+  # never silently presented as the 1536 A/B.
+  GEOMETRY_RECIPE_VERSION=6
+  PIXAL_RECIPE_SUFFIX="-pixal${GEOMETRY_RESOLUTION}"
+  GEOMETRY_CACHE_SUFFIX="-pixal${GEOMETRY_RESOLUTION}"
+fi
+if [[ "$SKIP_ULTRASHAPE" == 1 ]]; then
+  GEOMETRY_RECIPE_VERSION=6
+  PIXAL_RECIPE_SUFFIX+="-coarse-only"
+  GEOMETRY_CACHE_SUFFIX+="-coarse-only"
+fi
 # The clean default creates geometry only. It must not pay for, or depend on,
 # Pixal's legacy PBR decoder before texture_mesh_native makes the production
 # material. Native observed-image overlay works over the generated native atlas
@@ -119,11 +149,17 @@ LEGACY_PBR_CACHE="${IMAGE_TO_RIG_LEGACY_PBR_CACHE:-0}"
   echo "IMAGE_TO_RIG_LEGACY_PBR_CACHE must be 0 or 1" >&2; exit 2;
 }
 if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
-  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}${PIXAL_RECIPE_SUFFIX}-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=legacy-pbr-cache
 else
-  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
+  GEOMETRY_RECIPE="moge-noquad-us16384${ULTRASHAPE_RECIPE_SUFFIX}${PIXAL_RECIPE_SUFFIX}-geometry-only-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=geometry-only
+fi
+if [[ "$GEOMETRY_REVIEW_ONLY" == 1 && "$LEGACY_PBR_CACHE" == 1 ]]; then
+  echo "geometry-review-only requires IMAGE_TO_RIG_LEGACY_PBR_CACHE=0" >&2; exit 2;
+fi
+if [[ "$SKIP_ULTRASHAPE" == 1 && "$LEGACY_PBR_CACHE" == 1 ]]; then
+  echo "IMAGE_TO_RIG_SKIP_ULTRASHAPE requires IMAGE_TO_RIG_LEGACY_PBR_CACHE=0" >&2; exit 2;
 fi
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
 [[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: PCI GPU 0 is '$GPU_NAME', expected RTX 3060" >&2; exit 1; }
@@ -175,7 +211,7 @@ MATTE_HASH="$(sha256sum "$PIPELINE_IMAGE" | awk '{print substr($1,1,16)}')"
 # particular, geometry-only caches intentionally contain no usable legacy PBR
 # volume, so they must never share a name with the opt-in legacy-PBR/projection
 # cache for the same image.
-CACHE="$OUT/cache_${IMAGE_HASH}_${MATTE_HASH}_n16384_${GEOMETRY_CACHE_MODE}_seal${REMESH_CLOSE_R}_geom${GEOMETRY_RECIPE_VERSION}"
+CACHE="$OUT/cache_${IMAGE_HASH}_${MATTE_HASH}_n16384_${GEOMETRY_CACHE_MODE}_seal${REMESH_CLOSE_R}_geom${GEOMETRY_RECIPE_VERSION}${GEOMETRY_CACHE_SUFFIX}"
 ln -sfn "$PIPELINE_IMAGE" "$OUT/input.png"
 printf 'source_image=%s\nsource_sha256=%s\ninput_kind=%s\ninput_mode=%s\nmodel_image=%s\nmodel_image_sha256=%s\n' \
   "$IMAGE" "$IMAGE_HASH" "$INPUT_KIND" "$INPUT_MODE" "$PIPELINE_IMAGE" "$MATTE_HASH" >"$OUT/preprocess_source.txt"
@@ -207,18 +243,20 @@ if [[ "${IMAGE_TO_RIG_REFRESH:-0}" != 0 || ! -f "$CACHE/refined.glb" || "$cache_
   (
     exec 9>"$LOCK"
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
+    ULTRASHAPE_ARGS=()
+    if [[ "$SKIP_ULTRASHAPE" == 1 ]]; then ULTRASHAPE_ARGS+=(--no-refine); fi
     if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
       "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-        --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
+        --resolution "$GEOMETRY_RESOLUTION" --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" "${ULTRASHAPE_ARGS[@]}" --tex-dit proj --tex-volume-direct --tex-fallback-r 8 \
         --no-rig --stage-dir "$CACHE" --out "$CACHE/legacy_geometry_texture_ab.glb"
     else
       "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-        --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" --geometry-only --stage-dir "$CACHE" \
+        --resolution "$GEOMETRY_RESOLUTION" --no-quad --us-latents 16384 --us-steps "$ULTRASHAPE_STEPS" "${ULTRASHAPE_ARGS[@]}" --geometry-only --stage-dir "$CACHE" \
         --out "$CACHE/geometry_only_unused.glb"
     fi
   )
-  printf 'geometry_recipe=%s\nremesh_close_r=%s\nultrashape_steps=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
-    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$ULTRASHAPE_STEPS" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
+  printf 'geometry_recipe=%s\nremesh_close_r=%s\npixal_resolution=%s\nultrashape_steps=%s\nultrashape_skipped=%s\ngeometry_recipe_version=%s\nlegacy_pbr_cache=%s\n' \
+    "$GEOMETRY_RECIPE" "$REMESH_CLOSE_R" "$GEOMETRY_RESOLUTION" "$ULTRASHAPE_STEPS" "$SKIP_ULTRASHAPE" "$GEOMETRY_RECIPE_VERSION" "$LEGACY_PBR_CACHE" >"$CACHE/geometry_recipe.txt"
 else
   echo "== $LABEL: reuse image-keyed clean geometry cache ${CACHE##*/} =="
 fi
@@ -245,12 +283,38 @@ if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
   printf 'geometry_recipe=%s\n' "$GEOMETRY_RECIPE"
   printf '%s\n' 'clay_stage_aliases=coarse_geometry.glb (when available), refined_geometry.glb (exact texture source)'
   printf 'remesh_close_r=%s\n' "$REMESH_CLOSE_R"
+  printf 'pixal_resolution=%s\n' "$GEOMETRY_RESOLUTION"
   printf 'ultrashape_steps=%s\n' "$ULTRASHAPE_STEPS"
+  printf 'ultrashape_skipped=%s\n' "$SKIP_ULTRASHAPE"
   printf 'geometry_topology=%s\n' "$GEOMETRY_TOPOLOGY"
   printf '%s\n' 'geometry_gate=position-welded open=0 before native texture inference'
   printf 'geometry_gate_result=%s\n' "$GEOMETRY_GATE_RESULT"
 } >"$OUT/geometry_delivery.txt"
 (( GEOMETRY_OPEN == 0 )) || { echo "REJECT: refined geometry has $GEOMETRY_OPEN open edges; refusing texture/rig stages" >&2; exit 1; }
+if [[ "$GEOMETRY_REVIEW_ONLY" == 1 ]]; then
+  cat >"$OUT/runbook_source.txt" <<EOF
+source_image=$IMAGE
+source_sha256=$IMAGE_HASH
+model_image=$PIPELINE_IMAGE
+input_kind=$INPUT_KIND
+input_mode=$INPUT_MODE
+geometry_cache=$CACHE
+geometry_recipe=$GEOMETRY_RECIPE
+pixal_resolution=$GEOMETRY_RESOLUTION
+ultrashape_steps=$ULTRASHAPE_STEPS
+ultrashape_skipped=$SKIP_ULTRASHAPE
+geometry_delivery_manifest=$OUT/geometry_delivery.txt
+camera_provenance=$CACHE/camera_provenance.txt
+texture_recipe=not run: geometry-review-only clay gate
+rig_mode=not run: geometry-review-only clay gate
+gpu=PCI GPU 0 / RTX 3060 only
+EOF
+  PIPELINE_STAGE=geometry-review-ready
+  PIPELINE_COMPLETED=1
+  write_pipeline_status succeeded 'geometry review-only; native texture and rig intentionally not run'
+  echo "== DONE: geometry review aliases ready (Pixal3D ${GEOMETRY_RESOLUTION}, ultrashape_skipped=${SKIP_ULTRASHAPE}) =="
+  exit 0
+fi
 PIPELINE_STAGE=native-texture-lods-rig
 write_pipeline_status running 'geometry gate passed; native high texture, CPU LOD rebakes, then structural rig gate'
 NATIVE_RIG=1
@@ -465,7 +529,9 @@ input_kind=$INPUT_KIND
 input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=$GEOMETRY_RECIPE
+pixal_resolution=$GEOMETRY_RESOLUTION
 ultrashape_steps=$ULTRASHAPE_STEPS
+ultrashape_skipped=$SKIP_ULTRASHAPE
 geometry_delivery_manifest=$OUT/geometry_delivery.txt
 camera_provenance=$CACHE/camera_provenance.txt
 legacy_pbr_cache=$LEGACY_PBR_CACHE
