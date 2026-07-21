@@ -8,18 +8,15 @@
 
 // LongCat-Video-Avatar 1.5 DiT port (mirrors src/wan.hpp).
 //
-// MILESTONE SCOPE: build green + load all gguf tensors + run a forward pass
-// without crashing. The audio path (audio_cross_attn / audio_proj /
-// audio_adaLN_modulation) tensors are LOADED so init_params resolves every
-// gguf tensor, but the audio cross-attn is NOT wired into the forward yet
-// (see TODO(audio) markers). Numerical correctness is a later task; the 3D
-// RoPE convention in particular is an assumption flagged below.
+// The runner includes the Avatar DiT's text/audio conditioning, AudioProjModel,
+// continuation-aware RoPE, and cache paths. Numerical/GPU validation remains
+// separate from this source integration.
 namespace LONGCAT_AVATAR {
 
     // Per-block single-stream block:
     //   x = x + gate_msa * attn(modulate(mod_norm_attn(x), shift_msa, scale_msa))
     //   x = x + cross_attn(pre_crs_attn_norm(x), y)                  (text, UNGATED)
-    //   [audio cross-attn]  -- TODO(audio), tensors loaded but path stubbed
+    //   x = x + audio_gate * audio_cross_attn(...)
     //   x = x + gate_mlp * ffn(modulate(mod_norm_ffn(x), shift_mlp, scale_mlp))
     //
     // mod_norm_attn / mod_norm_ffn : LayerNorm fp32, NO affine.
@@ -106,7 +103,7 @@ namespace LONGCAT_AVATAR {
             blocks["cross_attn.q_norm"]    = std::shared_ptr<GGMLBlock>(new RMSNorm(head_dim, eps));
             blocks["cross_attn.k_norm"]    = std::shared_ptr<GGMLBlock>(new RMSNorm(head_dim, eps));
 
-            // audio cross-attention (loaded, forward stubbed for this milestone)
+            // audio cross-attention
             blocks["audio_cross_attn.q_linear"]  = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size, true, false, pf32));
             blocks["audio_cross_attn.kv_linear"] = std::shared_ptr<GGMLBlock>(new Linear(audio_dim, 2 * hidden_size, true, false, pf32));
             blocks["audio_cross_attn.proj"]      = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, hidden_size, true, false, pf32));
