@@ -494,17 +494,48 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
     client.set_connection_timeout(5, 0);
     client.set_read_timeout(60 * 60, 0);
     client.set_write_timeout(60 * 60, 0);
-    httplib::Request proxied;
-    proxied.method = request.method;
-    proxied.path = request.path;
-    proxied.params = request.params;
-    proxied.body = request.body;
+    httplib::Headers headers;
     for (const auto& header : request.headers) {
-        if (header.first != "Host" && header.first != "Connection" && header.first != "Content-Length") {
-            proxied.headers.emplace(header.first, header.second);
+        if (header.first != "Host" && header.first != "Connection" && header.first != "Content-Length" &&
+            header.first != "Content-Type") {
+            headers.emplace(header.first, header.second);
         }
     }
-    const auto result = client.send(proxied);
+    httplib::Result result;
+    if (request.is_multipart_form_data()) {
+        // cpp-httplib parses multipart requests into `form` and intentionally
+        // leaves Request::body empty.  Re-encode the parsed fields/files for
+        // the child instead of forwarding an empty body with the caller's
+        // stale multipart boundary.  This is the Koblem contract for LTX,
+        // Wan-VACE and LongCat Avatar (request JSON plus image/audio files).
+        httplib::UploadFormDataItems items;
+        items.reserve(request.form.fields.size() + request.form.files.size());
+        for (const auto& field : request.form.fields) {
+            items.push_back({field.second.name, field.second.content, "", ""});
+        }
+        for (const auto& file : request.form.files) {
+            items.push_back({file.second.name, file.second.content, file.second.filename, file.second.content_type});
+        }
+        if (request.method == "POST") {
+            result = client.Post(request.path, headers, items);
+        } else if (request.method == "PUT") {
+            result = client.Put(request.path, headers, items);
+        } else if (request.method == "PATCH") {
+            result = client.Patch(request.path, headers, items);
+        } else {
+            response.status = 405;
+            response.set_content(R"({"error":"multipart proxy method is unsupported"})", "application/json");
+            return true;
+        }
+    } else {
+        httplib::Request proxied;
+        proxied.method = request.method;
+        proxied.path = request.path;
+        proxied.params = request.params;
+        proxied.body = request.body;
+        proxied.headers = std::move(headers);
+        result = client.send(proxied);
+    }
     if (!result) {
         response.status = 502;
         response.set_content(json({{"error", "worker proxy failed"}, {"detail", httplib::to_string(result.error())}}).dump(), "application/json");
