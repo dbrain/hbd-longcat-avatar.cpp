@@ -1246,8 +1246,11 @@ The completed job payload includes the actual decoded `frame_count`.
 ### LTX multi-segment generation
 
 `POST /ltx/v1/generate` accepts the normal video-generation fields plus a non-empty
-`segments` array (objects with a `prompt` field) or `prompts` string array. It returns
-the same asynchronous job and media URLs as `/sdcpp/v1/vid_gen`.
+`segments` array (objects with a `prompt` field) or `prompts` string array. A segment
+object may supply `frames` (a positive `8k+1` LTX window length), `scene_cut: true`
+for a prompt-only fresh shot, or `init_image` for a fresh image-pinned shot. Fresh shots
+are stitched without trimming the preceding continuation overlap. It returns the same
+asynchronous job and media URLs as `/sdcpp/v1/vid_gen`.
 
 The server keeps sampled video-only LTX latents in `$LTX_JOB_DIR/<resume_job_id>`
 (default `/var/lib/ltx-video/jobs`) and uses them to continue a later request without
