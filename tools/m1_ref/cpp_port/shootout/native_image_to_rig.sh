@@ -85,7 +85,8 @@ assert_texture_qc() {
 # skeleton: try_rig transfers that accepted skin onto high, so Hymotion does not silently inherit a
 # lower-resolution atlas.
 write_texture_delivery_manifest() {
-  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha qc qc_sha qc_verdict qc_missing qc_schema qc_recovery_texels qc_mae qc_rmse qc_psnr topo
+  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha qc qc_sha qc_verdict qc_missing qc_schema qc_recovery_texels qc_mae qc_rmse qc_psnr topo manifest_tmp
+  manifest_tmp="$OUT/.texture_delivery.txt.$$"
   # `reference` is a material recipe, not a promise that all meshes can use a
   # single global xatlas solve.  Record the measured route from the stage log:
   # direct for clean topology; conformal local islands where sharp/high-curvature
@@ -142,7 +143,8 @@ write_texture_delivery_manifest() {
       [[ ! -f "$status" ]] || printf 'lod=%s native_texture_status=%s\n' "$name" "$(basename "$status")"
     done
     [[ "$rig_state" != succeeded ]] || printf 'hymotion_rigged=hymotion_rigged.glb sha256=%s\n' "$(sha256sum "$OUT/hymotion_rigged.glb" | awk '{print $1}')"
-  } >"$OUT/texture_delivery.txt"
+  } >"$manifest_tmp"
+  mv -f "$manifest_tmp" "$OUT/texture_delivery.txt"
 }
 
 run_native_high() {
