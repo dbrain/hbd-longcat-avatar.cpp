@@ -2230,6 +2230,24 @@ struct GGMLRunnerContext {
     // amplify lip-sync. Default false = audio cross-attn runs normally (legacy behavior).
     bool ltx_skip_a2v                      = false;
 
+    // P2 video self-attention sliding window (VRAM). When > 0, the LTXAV video self-attn (attn1)
+    // runs windowed over the token axis with this many VIDEO tokens per query tile, each tile also
+    // attending to `ltx_video_selfattn_overlap` extra key tokens on each side; 0 = off (full
+    // O(N^2) attention, byte-identical legacy path). Audio self-attn and every cross-attention
+    // (audio<->video, text) stay full-timeline so generated audio remains globally coherent. Set
+    // in LTXAVRunner::build_graph from the per-render frame counts (frames * W*H), and only when
+    // the clip's frame count actually exceeds the window. See ltxv.hpp CrossAttention::forward_windowed.
+    int ltx_video_selfattn_window          = 0;
+    int ltx_video_selfattn_overlap         = 0;
+    // P2 global anchor / attention-sink for the windowed video self-attn. When windowing is active,
+    // every query tile ALSO attends to `ltx_video_selfattn_global` global VIDEO tokens (a strided,
+    // evenly-spaced subset of ALL frames, always including frame 0), sliced from the already-RoPE'd
+    // K/V and shared across every tile. This restores the cross-window identity/scene/motion context
+    // that pure-local windows lose. `ltx_video_selfattn_plane` = tokens per latent frame (W*H), used
+    // to select whole frames. Both 0 => no global anchor (pure local windows). Sized O(window) tokens.
+    int ltx_video_selfattn_global          = 0;
+    int ltx_video_selfattn_plane           = 0;
+
     // NAG (Normalized Attention Guidance) params, carried from LTXAVRunner::build_graph to the LTX
     // CrossAttention. When ltx_nag_scale != 0 AND a nag_context is threaded to the video text
     // cross-attn, that attn computes the negative attention output and NAG-blends it. Default 0 =>

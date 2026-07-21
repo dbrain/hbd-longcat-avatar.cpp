@@ -2739,6 +2739,57 @@ public:
                                                                                            denoiser.get(),
                                                                                            sigmas);
 
+        // P2: decide once per render whether the LTXAV VIDEO self-attention (attn1) should run as a
+        // sliding temporal window (bounds its O(N^2) VRAM on long clips). Enable ONLY when the engine
+        // is GENERATING audio and this is a plain video grid — so audio + all cross-attention stay
+        // global over the full timeline and generated audio remains coherent:
+        //   * audio is generated, not supplied: audio_length>0 && !ltxav_audio_fixed (excludes direct
+        //     drive-audio) && audio_positions.empty() (excludes the lipdub audio-reference mode);
+        //   * plain render: no vace_context, no char/relip reference (video_reference), no past-anchor
+        //     / keyframe guide (video_positions) — those append tokens or need global context.
+        // build_graph additionally requires frames > window (else it stays full, byte-identical).
+        // Override with LTXAV_AUDIO_WINDOW_SELFATTN: unset/auto = the gate above; 0 = force off;
+        // 1 = force on (bypass the gate, for A/B testing). Window/overlap frames reuse
+        // LTX_BASE_TEMPORAL_WINDOW (default 20) / LTX_BASE_TEMPORAL_OVERLAP (default 4).
+        int ltx_selfattn_window_frames  = 0;
+        int ltx_selfattn_overlap_frames = 0;
+        int ltx_selfattn_global_frames  = 0;
+        if (sd_version_is_ltxav(version)) {
+            int mode = -1;  // -1 = auto, 0 = force off, 1 = force on
+            if (const char* we = std::getenv("LTXAV_AUDIO_WINDOW_SELFATTN"); we != nullptr && we[0] != '\0') {
+                mode = std::atoi(we);
+            }
+            const bool audio_generated = audio_length > 0 && !ltxav_audio_fixed && audio_positions.empty();
+            const bool plain_render    = vace_context.empty() && video_reference.empty() && video_positions.empty();
+            const bool gate_on         = (mode == 1) || (mode != 0 && audio_generated && plain_render);
+            if (gate_on) {
+                int win = 20;
+                if (const char* e = std::getenv("LTX_BASE_TEMPORAL_WINDOW"); e != nullptr && e[0] != '\0') {
+                    win = std::max(2, std::atoi(e));
+                }
+                int ov = 4;
+                if (const char* e = std::getenv("LTX_BASE_TEMPORAL_OVERLAP"); e != nullptr && e[0] != '\0') {
+                    ov = std::max(1, std::atoi(e));
+                }
+                ov = std::clamp(ov, 1, win - 1);
+                // Global anchor / attention-sink frame count. Pure local windows lose all cross-window
+                // context (identity/scene/motion drift), so by default every window also attends to a
+                // shared set of ~one window's worth of evenly-spaced global frames (incl. frame 0). Set
+                // LTXAV_SELFATTN_GLOBAL_FRAMES to tune it; 0 = pure local windows (the collapse mode,
+                // kept for A/B). Sized O(window) so VRAM stays bounded independent of clip length.
+                int gf = win;
+                if (const char* e = std::getenv("LTXAV_SELFATTN_GLOBAL_FRAMES"); e != nullptr && e[0] != '\0') {
+                    gf = std::max(0, std::atoi(e));
+                }
+                ltx_selfattn_window_frames  = win;
+                ltx_selfattn_overlap_frames = ov;
+                ltx_selfattn_global_frames  = gf;
+                LOG_INFO("LTXAV P2 window self-attn ARMED: window=%d overlap=%d global=%d frames (mode=%d, "
+                         "audio_generated=%d plain=%d)",
+                         win, ov, gf, mode, (int)audio_generated, (int)plain_render);
+            }
+        }
+
         bool needs_uncond_denoised = method == EULER_CFG_PP_SAMPLE_METHOD || method == EULER_A_CFG_PP_SAMPLE_METHOD;
         // Spectrum cache is not supported for CFG++ samplers
         if (needs_uncond_denoised) {
@@ -3083,6 +3134,12 @@ public:
                         audio_positions.empty() ? nullptr : &audio_positions,
                         skip_a2v_pass,
                         video_reference.empty() ? nullptr : &video_reference};
+                    // P2 windowed video self-attn (frames; 0 = off). Computed once above; build_graph
+                    // converts to tokens and gates on frames > window. Applied to every forward pass
+                    // (cond/uncond/skip-a2v) so the per-window VRAM bound is uniform across the step.
+                    ltx_extra.video_selfattn_window_frames  = ltx_selfattn_window_frames;
+                    ltx_extra.video_selfattn_overlap_frames = ltx_selfattn_overlap_frames;
+                    ltx_extra.video_selfattn_global_frames  = ltx_selfattn_global_frames;
                     // NAG: only on the primary cond forward (nag_pass), only while sigma is high
                     // enough (the workflow applies NAG to the high-noise sub-stage), and only when a
                     // negative context is actually available. Otherwise NAG stays off (legacy).
@@ -7613,6 +7670,15 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         // Video-only classic LTX-Video 0.9.x checkpoints have no audio stream — synthesizing an
         // audio latent here would feed the DiT an audio stream it has no tensors for (null deref).
         bool ltxav_has_audio = sd_ctx->sd->diffusion_model == nullptr || sd_ctx->sd->diffusion_model->has_audio_stream();
+        // LTXAV_NO_AUDIO=1 forces a VIDEO-ONLY render on an AV checkpoint (audio_length=0, no audio
+        // latent). Why this exists: base temporal windowing (LTX_BASE_TEMPORAL_WINDOW) tiles the
+        // video to bound VRAM, but native audio is generated JOINTLY across the whole timeline as a
+        // separate latent — the windowed loop can only slice PACKED fixed driving audio per tile,
+        // not the joint generated stream. So a plain t2v with generated audio can't window; dropping
+        // audio (video-only) lets a long plain t2v tile cleanly. (Also handy for pure-video output.)
+        if (const char* na = std::getenv("LTXAV_NO_AUDIO"); na != nullptr && na[0] != '\0' && std::string(na) != "0") {
+            ltxav_has_audio = false;
+        }
         if (ltxav_has_audio) {
             latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
             const char* drive_wav = SAFE_STR(sd_vid_gen_params->drive_audio_path);

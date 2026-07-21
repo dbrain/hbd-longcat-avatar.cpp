@@ -1035,6 +1035,152 @@ namespace LTXV {
 
             return to_out_0->forward(ctx, out);
         }
+
+        // P2 sliding-WINDOW self-attention (video attn1 only). Everything up to the attention
+        // matmul — to_q/to_k/to_v, q/k RMS-norm, RoPE, the protective kv_scale, and the optional
+        // attention gate — is IDENTICAL to forward(). The ONLY change: instead of one full
+        // O(N^2) attention over all T tokens, the (already-RoPE'd) q/k/v are sliced along the
+        // token axis (ne[1]) into disjoint query tiles of `win_tokens`, each attending to its own
+        // tile PLUS `halo_tokens` of key context on each side; the per-tile outputs are
+        // concatenated back in order.
+        //
+        // Why RoPE-then-slice is EXACT (no per-window rope re-indexing needed): apply_hidden_rope
+        // rotates every token by its ABSOLUTE grid position, so slicing the roped tensors keeps
+        // each token's rope phase. Windowing only restricts which keys a query dots against — a
+        // property of the attention matmul, which happens AFTER rope. So this never touches
+        // v_pe / v_pe_compact_index. When the whole clip fits one tile it reduces to the exact
+        // full attention (bit-identical to forward()).
+        //
+        // Self-attention ONLY: context == x, no attention mask (self_attention_mask is null on the
+        // AV path), and no NAG (attn1 is never a NAG call). Callers must gate this to attn1.
+        //
+        // GLOBAL ANCHOR (attention-sink) — restores cross-window coherence. Pure disjoint local
+        // windows have NO shared context: each query tile only self-attends to its own frames (+halo),
+        // so nothing pins later windows to the same subject/scene/motion the first window established —
+        // the DiT is free to re-invent a different person walking the other way (the observed collapse;
+        // more halo does NOT fix it — it is missing GLOBAL context, not a blurred boundary). Fix: every
+        // tile ALSO attends to `global_tokens` worth of SHARED global video keys — `global_tokens/
+        // plane_tokens` evenly-spaced anchor frames spanning the whole clip (always including frame 0
+        // as a persistent sink). The global K/V is sliced from the SAME full-sequence-RoPE'd k/v used
+        // for the local tiles, so each anchor carries its absolute grid phase (rope alignment is exact,
+        // consistent between windows) and is built ONCE and reused across every tile. The K/V key set
+        // per tile is (window + 2*halo + global) tokens with global ~= one window => O(window), so VRAM
+        // stays bounded independent of clip length. global_tokens<=0 => pure local windows (A/B / off).
+        ggml_tensor* forward_windowed(GGMLRunnerContext* ctx,
+                                      ggml_tensor* x,
+                                      ggml_tensor* pe,
+                                      ggml_tensor* compact_pe_index,
+                                      int64_t win_tokens,
+                                      int64_t halo_tokens,
+                                      int64_t global_tokens = 0,
+                                      int64_t plane_tokens  = 0) {
+            auto gc = ctx->ggml_ctx;
+
+            auto to_q     = std::dynamic_pointer_cast<Linear>(blocks["to_q"]);
+            auto to_k     = std::dynamic_pointer_cast<Linear>(blocks["to_k"]);
+            auto to_v     = std::dynamic_pointer_cast<Linear>(blocks["to_v"]);
+            auto q_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+            auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+            auto to_out_0 = std::dynamic_pointer_cast<Linear>(blocks["to_out.0"]);
+
+            const int64_t T = x->ne[1];
+
+            // Full-sequence projection + norm + RoPE — byte-identical to forward()'s q/k prep.
+            auto q = to_q->forward(ctx, x);
+            q      = q_norm->forward(ctx, q);
+            if (pe != nullptr) {
+                q = apply_hidden_rope(gc, q, pe, compact_pe_index, heads, dim_head, rope_interleaved);
+            }
+            auto k = to_k->forward(ctx, x);
+            auto v = to_v->forward(ctx, x);
+            k      = k_norm->forward(ctx, k);
+            if (pe != nullptr) {
+                k = apply_hidden_rope(gc, k, pe, compact_pe_index, heads, dim_head, rope_interleaved);
+            }
+
+            // Same protective kv_scale as forward(); self-attn has no real mask so skip_kv_pad.
+            float kv_scale = 1.0f / 256.0f;
+            if (const char* e = std::getenv("LTX_ATTN_KV_SCALE")) {
+                float d = (float)atof(e);
+                if (d > 0.0f) kv_scale = 1.0f / d;
+            }
+            const bool skip_kv_pad = true;
+
+            auto attend_slice = [&](ggml_tensor* qs, ggml_tensor* ks, ggml_tensor* vs) -> ggml_tensor* {
+                return ggml_ext_attention_ext(gc, ctx->backend, qs, ks, vs, heads,
+                                              nullptr, false, ctx->flash_attn_enabled,
+                                              kv_scale, skip_kv_pad);
+            };
+
+            ggml_tensor* out = nullptr;
+            if (win_tokens <= 0 || T <= win_tokens) {
+                // Single tile => exactly the full attention (bit-identical to forward()). No global
+                // anchor is added here, so a clip that fits one window stays byte-identical to legacy.
+                out = attend_slice(q, k, v);
+            } else {
+                // Build the SHARED global-anchor K/V once (reused by every tile). Select
+                // `G = global_tokens / plane_tokens` evenly-spaced whole frames across [0, F), always
+                // including frame 0 and the last frame; slice each frame's plane out of the already-
+                // RoPE'd k/v and concat along the token axis. Global tokens keep their absolute rope
+                // phase (sliced from the full-sequence-roped k/v), so no per-window re-indexing.
+                ggml_tensor* gk = nullptr;
+                ggml_tensor* gv = nullptr;
+                if (global_tokens > 0 && plane_tokens > 0) {
+                    const int64_t F = T / plane_tokens;               // latent frames (frame-major layout)
+                    int64_t G       = std::min<int64_t>(global_tokens / plane_tokens, F);
+                    int64_t prev    = -1;
+                    for (int64_t i = 0; i < G; ++i) {
+                        // even spread over [0, F-1] inclusive; G==1 -> just frame 0.
+                        const int64_t f = (G <= 1) ? 0 : (i * (F - 1)) / (G - 1);
+                        if (f == prev) {
+                            continue;  // dedup rounding collisions (keeps the set strictly increasing)
+                        }
+                        prev            = f;
+                        const int64_t t0 = f * plane_tokens;
+                        const int64_t t1 = t0 + plane_tokens;
+                        auto gks         = ggml_ext_slice(gc, k, 1, t0, t1);
+                        auto gvs         = ggml_ext_slice(gc, v, 1, t0, t1);
+                        gk               = gk == nullptr ? gks : ggml_concat(gc, gk, gks, 1);
+                        gv               = gv == nullptr ? gvs : ggml_concat(gc, gv, gvs, 1);
+                    }
+                }
+
+                for (int64_t q0 = 0; q0 < T; q0 += win_tokens) {
+                    const int64_t q1 = std::min<int64_t>(T, q0 + win_tokens);
+                    const int64_t k0 = std::max<int64_t>(0, q0 - halo_tokens);
+                    const int64_t k1 = std::min<int64_t>(T, q1 + halo_tokens);
+                    auto qs = ggml_ext_slice(gc, q, 1, q0, q1);
+                    auto ks = ggml_ext_slice(gc, k, 1, k0, k1);
+                    auto vs = ggml_ext_slice(gc, v, 1, k0, k1);
+                    // Append the shared global anchor keys/values. Softmax attention is permutation-
+                    // invariant over the key axis, so concat order is irrelevant as long as K and V
+                    // match. An anchor frame that also lies inside [k0,k1) is duplicated in the key set
+                    // (a small, benign self-weight bump); it is not masked out.
+                    if (gk != nullptr) {
+                        ks = ggml_concat(gc, ks, gk, 1);
+                        vs = ggml_concat(gc, vs, gv, 1);
+                    }
+                    auto os = attend_slice(qs, ks, vs);
+                    out     = out == nullptr ? os : ggml_concat(gc, out, os, 1);
+                }
+            }
+
+            // Optional attention gate — identical math to forward()'s apply_gate_if_any, applied to
+            // the full stitched output (the gate is a per-token function of x only, so windowing the
+            // attention does not change it).
+            if (blocks.count("to_gate_logits") != 0) {
+                auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
+                auto gate_logits    = to_gate_logits->forward(ctx, x);
+                auto gates          = ggml_sigmoid(gc, gate_logits);
+                gates               = ggml_ext_scale(gc, gates, 2.0f, true);
+                gates               = ggml_reshape_4d(gc, gates, 1, heads, gate_logits->ne[1], gate_logits->ne[2]);
+                auto out4           = ggml_reshape_4d(gc, out, dim_head, heads, out->ne[1], out->ne[2]);
+                gates               = ggml_repeat(gc, gates, out4);
+                out4                = ggml_mul(gc, out4, gates);
+                out                 = ggml_reshape_3d(gc, out4, heads * dim_head, out4->ne[2], out4->ne[3]);
+            }
+            return to_out_0->forward(ctx, out);
+        }
     };
 
     struct BasicTransformerBlock : public GGMLBlock {
@@ -1609,7 +1755,25 @@ namespace LTXV {
                 v_norm = rms_norm(ctx->ggml_ctx, vx);
                 v_norm = modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             }
-            auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe, nullptr, nullptr, v_pe_compact_index);
+            // P2: window the VIDEO self-attention (attn1) when enabled — bounds its O(N^2) VRAM
+            // on long clips. The audio→video cross-attn below reads the video hidden state K/V
+            // AFTER attn1, so attn1 must still run; only its key set is restricted to a temporal
+            // window. Audio self-attn + every cross-attention (a2v/v2a/text) and the ffn stay
+            // full-timeline. Gated to the self-attn path with no real mask (self_attention_mask is
+            // null on the AV path) and to clips whose token count actually exceeds the window
+            // (else the full path runs, byte-identical).
+            ggml_tensor* v_sa = nullptr;
+            if (ctx->ltx_video_selfattn_window > 0 &&
+                self_attention_mask == nullptr &&
+                v_norm->ne[1] > ctx->ltx_video_selfattn_window) {
+                v_sa = attn1->forward_windowed(ctx, v_norm, v_pe, v_pe_compact_index,
+                                               ctx->ltx_video_selfattn_window,
+                                               ctx->ltx_video_selfattn_overlap,
+                                               ctx->ltx_video_selfattn_global,
+                                               ctx->ltx_video_selfattn_plane);
+            } else {
+                v_sa = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe, nullptr, nullptr, v_pe_compact_index);
+            }
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
             if (stop_at_subop == 0) {
                 return {vx, ax};  // truncate after video self-attn (attn1)
@@ -2295,6 +2459,11 @@ namespace LTXV {
         sd::Tensor<float> v_timestep_compact_cache;  // [U] unique video timesteps
         std::vector<int32_t> v_token_sel_vec;        // [L_video] token -> unique-column index
         bool skip_a2v_cross_attn_ = false;           // A2V modality-guidance "mod" pass (set per compute)
+        // P2 video self-attn sliding window (set per compute from LTXAVDiffusionExtra; in FRAMES).
+        // build_graph converts to a token count (frames * W*H) and only enables when frames > window.
+        int video_selfattn_window_frames_  = 0;
+        int video_selfattn_overlap_frames_ = 0;
+        int video_selfattn_global_frames_  = 0;  // P2 global anchor frame count (0 = pure local windows)
         // NAG (Normalized Attention Guidance) params, set per-compute from LTXAVDiffusionExtra and
         // forwarded to the runner ctx in build_graph. nag_scale_ == 0 => NAG off (default).
         float nag_scale_ = 0.0f;
@@ -2713,6 +2882,31 @@ namespace LTXV {
             auto runner_ctx                 = get_context();
             runner_ctx.ltx_video_token_sel  = v_token_sel_input;  // null unless modulation collapse active
             runner_ctx.ltx_skip_a2v         = skip_a2v_cross_attn_;  // A2V modality-guidance "mod" pass
+            // P2: enable windowed video self-attn only for a plain video grid (no appended reference
+            // tokens — ref_token_count!=0 breaks the frame-major token layout the window math assumes)
+            // whose frame count exceeds the window. Convert the FRAME window/overlap to a TOKEN count
+            // (tokens are frame-major, W*H per frame). Left 0 (off) otherwise => legacy full attention.
+            runner_ctx.ltx_video_selfattn_window  = 0;
+            runner_ctx.ltx_video_selfattn_overlap = 0;
+            runner_ctx.ltx_video_selfattn_global  = 0;
+            runner_ctx.ltx_video_selfattn_plane   = 0;
+            if (video_selfattn_window_frames_ > 0 && ref_token_count == 0 &&
+                vx->ne[2] > video_selfattn_window_frames_) {
+                const int64_t plane = vx->ne[0] * vx->ne[1];  // tokens per latent frame (W*H)
+                // Global anchor is capped at the total frame count so it can never exceed O(timeline);
+                // in practice global_frames ~= window, so the anchor set stays O(window) tokens.
+                const int64_t gframes = std::min<int64_t>(video_selfattn_global_frames_, vx->ne[2]);
+                runner_ctx.ltx_video_selfattn_window  = static_cast<int>(video_selfattn_window_frames_ * plane);
+                runner_ctx.ltx_video_selfattn_overlap = static_cast<int>(video_selfattn_overlap_frames_ * plane);
+                runner_ctx.ltx_video_selfattn_global  = static_cast<int>(gframes * plane);
+                runner_ctx.ltx_video_selfattn_plane   = static_cast<int>(plane);
+                LOG_INFO("LTXAV P2 windowed video self-attn: %lld frames, window=%d overlap=%d global=%lld frames "
+                         "(%d/%d/%d tokens, plane=%lld)",
+                         (long long)vx->ne[2], video_selfattn_window_frames_, video_selfattn_overlap_frames_,
+                         (long long)gframes, runner_ctx.ltx_video_selfattn_window,
+                         runner_ctx.ltx_video_selfattn_overlap, runner_ctx.ltx_video_selfattn_global,
+                         (long long)plane);
+            }
             // NAG (Normalized Attention Guidance): carry the scale/alpha/tau to the cross-attn.
             // nag_context is null (and these unused) on every non-NAG forward, so the block-level
             // gate `nag_context != nullptr && ctx->ltx_nag_scale != 0` keeps legacy byte-identical.
@@ -2764,6 +2958,10 @@ namespace LTXV {
             GGML_ASSERT(diffusion_params.timesteps != nullptr);
             const auto* extra   = diffusion_extra_as<LTXAVDiffusionExtra>(diffusion_params);
             skip_a2v_cross_attn_ = extra->skip_a2v;  // consumed by build_graph -> runner_ctx.ltx_skip_a2v
+            // P2 video self-attn window (frames); converted to tokens + gated on frames>window in build_graph.
+            video_selfattn_window_frames_  = extra->video_selfattn_window_frames;
+            video_selfattn_overlap_frames_ = extra->video_selfattn_overlap_frames;
+            video_selfattn_global_frames_  = extra->video_selfattn_global_frames;
             // NAG: pull the per-step scale/alpha/tau + negative context off the extra. nag_context
             // is null (nag_scale 0) on every non-NAG step, so this is a no-op then.
             nag_scale_ = extra->nag_scale;

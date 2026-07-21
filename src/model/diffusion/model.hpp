@@ -68,6 +68,18 @@ struct LTXAVDiffusionExtra {
     float nag_scale                      = 0.0f;
     float nag_alpha                      = 0.35f;
     float nag_tau                        = 2.5f;
+    // P2 video self-attention sliding window (VRAM). > 0 = window attn1 with this many VIDEO
+    // LATENT FRAMES per query tile; 0 = off. overlap = extra frames of key context per side.
+    // Computed once per render in sample() (generated-audio gate); LTXAVRunner::build_graph
+    // converts frames -> tokens (frames * W*H) and only enables when frames > window. Placed at
+    // the END of the struct so the positional aggregate-init in stable-diffusion.cpp is unaffected.
+    int video_selfattn_window_frames     = 0;
+    int video_selfattn_overlap_frames    = 0;
+    // P2 global anchor / attention-sink: number of evenly-spaced VIDEO frames (incl. frame 0)
+    // whose K/V every window additionally attends to, so cross-window identity/scene/motion are
+    // preserved. 0 = pure local windows (no global context — the coherence-collapse mode). Sized
+    // O(window) so VRAM stays bounded. See CrossAttention::forward_windowed.
+    int video_selfattn_global_frames     = 0;
 };
 
 struct LongCatAvatarDiffusionExtra {
