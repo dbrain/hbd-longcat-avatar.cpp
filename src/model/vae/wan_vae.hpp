@@ -1,6 +1,7 @@
 #ifndef __SD_MODEL_VAE_WAN_VAE_HPP__
 #define __SD_MODEL_VAE_WAN_VAE_HPP__
 
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <utility>
@@ -12,6 +13,18 @@
 namespace WAN {
 
     constexpr int CACHE_T = 2;
+
+    // The custom ggml op is deliberately decode-only: encoder graphs include
+    // less common layouts and do not need this VACE output-path optimization.
+    inline thread_local bool wan_vae_building_decode_graph = false;
+
+    inline bool wan_vae_rms_kernel_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("WAN_VAE_RMS_KERNEL");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
+        return enabled;
+    }
 
     class CausalConv3d : public GGMLBlock {
     protected:
@@ -98,9 +111,19 @@ namespace WAN {
         RMS_norm(int64_t dim)
             : dim(dim) {}
 
+        ggml_tensor* forward_channels_kernel(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            ggml_tensor* gamma = params["gamma"];
+            gamma              = ggml_reshape_1d(ctx->ggml_ctx, gamma, ggml_nelements(gamma));
+            return ggml_rms_norm_channels(ctx->ggml_ctx, x, gamma, 1e-12f);
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
             // x: [N*IC, ID, IH, IW], IC == dim
             // assert N == 1
+
+            if (wan_vae_building_decode_graph && wan_vae_rms_kernel_enabled()) {
+                return forward_channels_kernel(ctx, x);
+            }
 
             ggml_tensor* w = params["gamma"];
             w              = ggml_reshape_1d(ctx->ggml_ctx, w, ggml_nelements(w));
@@ -1339,7 +1362,10 @@ namespace WAN {
 
             auto runner_ctx = get_context();
 
+            const bool previous_decode_graph = wan_vae_building_decode_graph;
+            wan_vae_building_decode_graph = decode_graph;
             ggml_tensor* out = decode_graph ? ae.decode(&runner_ctx, z) : ae.encode(&runner_ctx, z);
+            wan_vae_building_decode_graph = previous_decode_graph;
 
             ggml_build_forward_expand(gf, out);
 
@@ -1360,7 +1386,10 @@ namespace WAN {
 
             auto runner_ctx = get_context();
 
+            const bool previous_decode_graph = wan_vae_building_decode_graph;
+            wan_vae_building_decode_graph = decode_graph;
             ggml_tensor* out = decode_graph ? ae.decode_partial(&runner_ctx, z, i) : ae.encode(&runner_ctx, z);
+            wan_vae_building_decode_graph = previous_decode_graph;
 
             for (size_t feat_idx = 0; feat_idx < ae._feat_map.size(); feat_idx++) {
                 ggml_tensor* feat_cache = ae._feat_map[feat_idx];
