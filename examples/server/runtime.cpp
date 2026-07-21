@@ -52,6 +52,39 @@ std::string base64_encode(const std::vector<uint8_t>& bytes) {
     return ret;
 }
 
+bool base64_decode(const std::string& text, std::vector<uint8_t>& bytes) {
+    bytes.clear();
+    int accumulator = 0;
+    int bits = -8;
+    for (unsigned char c : text) {
+        if (c == '=') {
+            break;
+        }
+        int value = -1;
+        if (c >= 'A' && c <= 'Z') {
+            value = c - 'A';
+        } else if (c >= 'a' && c <= 'z') {
+            value = c - 'a' + 26;
+        } else if (c >= '0' && c <= '9') {
+            value = c - '0' + 52;
+        } else if (c == '+') {
+            value = 62;
+        } else if (c == '/') {
+            value = 63;
+        }
+        if (value < 0) {
+            return false;
+        }
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if (bits >= 0) {
+            bytes.push_back(static_cast<uint8_t>((accumulator >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return true;
+}
+
 std::string normalize_output_format(std::string output_format) {
     std::transform(output_format.begin(), output_format.end(), output_format.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

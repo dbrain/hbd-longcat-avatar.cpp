@@ -557,6 +557,32 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         res.set_content(make_async_job_json(manager, *it->second).dump(), "application/json");
     });
 
+    svr.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/media)", [runtime](const httplib::Request& req, httplib::Response& res) {
+        AsyncJobManager& manager = *runtime->async_job_manager;
+        std::lock_guard<std::mutex> lock(manager.mutex);
+        purge_expired_jobs(manager);
+        const auto it = manager.jobs.find(req.matches[1]);
+        if (it == manager.jobs.end()) {
+            res.status = manager.expired_jobs.count(req.matches[1]) ? 410 : 404;
+            res.set_content(R"({"error":"job not found or expired"})", "application/json");
+            return;
+        }
+        const auto& job = *it->second;
+        if (job.status != AsyncJobStatus::Completed || job.kind != AsyncJobKind::VidGen) {
+            res.status = 409;
+            res.set_content(R"({"error":"video job is not complete"})", "application/json");
+            return;
+        }
+        std::vector<uint8_t> media;
+        if (!base64_decode(job.result_media_b64, media)) {
+            res.status = 500;
+            res.set_content(R"({"error":"stored video result is invalid"})", "application/json");
+            return;
+        }
+        res.status = 200;
+        res.set_content(reinterpret_cast<const char*>(media.data()), media.size(), job.result_media_mime_type);
+    });
+
     svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
@@ -588,8 +614,10 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
 
         if (job.status == AsyncJobStatus::Generating) {
-            res.status = 409;
-            res.set_content(R"({"error":"job is currently generating and cannot be interrupted yet"})", "application/json");
+            job.cancel_requested = true;
+            sd_cancel_generation(runtime->sd_ctx, SD_CANCEL_ALL);
+            res.status = 202;
+            res.set_content(json({{"id", job.id}, {"status", "cancelling"}}).dump(), "application/json");
             return;
         }
 

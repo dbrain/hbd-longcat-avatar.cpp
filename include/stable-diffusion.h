@@ -405,6 +405,17 @@ typedef struct {
     int video_frames;
     int fps;
     float vace_strength;
+    // Wan-VACE continuation input.  When provided, the leading temporal latent
+    // frames of the VACE inactive context are replaced from this prior sampled
+    // video latent, avoiding a lossy pixel decode/re-encode at a chain seam.
+    // This is consumed only by Wan VACE models.
+    const float* vace_cont_latent;
+    int vace_cont_latent_width;
+    int vace_cont_latent_height;
+    int vace_cont_latent_frames;
+    int vace_cont_latent_channels;
+    int vace_cont_frames;
+    int vace_cont_latent_drop_tail;
     // LongCat-Video-Avatar 1.5 driving audio.  This is a WAV file consumed by
     // the Whisper audio encoder; the same source track is returned as optional
     // generated audio, trimmed to the rendered clip.
@@ -510,6 +521,41 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_image_t** frames_out,
                            int* num_frames_out,
                            sd_audio_t** audio_out);
+
+// Like generate_video, and additionally returns a malloc-owned copy of the
+// sampled video latent before VAE decoding.  The shape is ggml-ne ordered
+// [width, height, frames, channels, 1].  It is primarily the lossless hand-off
+// used by Wan-VACE continuation; any output pointer may be NULL.
+SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
+                              const sd_vid_gen_params_t* sd_vid_gen_params,
+                              sd_image_t** frames_out,
+                              int* num_frames_out,
+                              sd_audio_t** audio_out,
+                              float** final_latent_out,
+                              int* latent_width_out,
+                              int* latent_height_out,
+                              int* latent_frames_out,
+                              int* latent_channels_out);
+
+// Wan2.2-VACE multi-window continuation.  Each window carries both its kept
+// decoded pixel tail and the prior sampled latent directly in memory.  The
+// overlap/discard values are pixel-frame counts; zero selects the production
+// defaults (5, 4, and 1 respectively).  Output ownership matches
+// generate_video.
+typedef struct {
+    int n_segments;
+    const char* const* segment_prompts;
+    int overlap_frames;
+    int discard_tail_frames;
+    int drop_latent_tail_frames;
+} sd_wan_vace_chain_params_t;
+
+SD_API bool generate_wan_vace_chain(sd_ctx_t*                          sd_ctx,
+                                    const sd_vid_gen_params_t*         base_params,
+                                    const sd_wan_vace_chain_params_t*  chain_params,
+                                    sd_image_t**                       frames_out,
+                                    int*                               num_frames_out,
+                                    sd_audio_t**                       audio_out);
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 

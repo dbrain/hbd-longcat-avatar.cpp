@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <set>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -3620,6 +3621,13 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->fps                                   = 16;
     sd_vid_gen_params->moe_boundary                          = 0.875f;
     sd_vid_gen_params->vace_strength                         = 1.f;
+    sd_vid_gen_params->vace_cont_latent                       = nullptr;
+    sd_vid_gen_params->vace_cont_latent_width                 = 0;
+    sd_vid_gen_params->vace_cont_latent_height                = 0;
+    sd_vid_gen_params->vace_cont_latent_frames                = 0;
+    sd_vid_gen_params->vace_cont_latent_channels              = 0;
+    sd_vid_gen_params->vace_cont_frames                       = 0;
+    sd_vid_gen_params->vace_cont_latent_drop_tail             = 0;
     sd_vid_gen_params->audio_path                            = nullptr;
     sd_vid_gen_params->audio_frame_offset                    = 0;
     sd_vid_gen_params->bsa_enabled                           = 0;
@@ -5960,6 +5968,12 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         }
 
         sd::Tensor<float> mask = sd::full<float>({request->width, request->height, request->frames, 1, 1}, 1.0f);
+        if (control_frame_count > 0) {
+            // Held control frames are inactive VACE context, not a reactive
+            // target.  This is what lets a continuation preserve its pixel tail
+            // while the remaining frames stay free to synthesize motion.
+            sd::ops::fill_slice(&mask, 2, 0, control_frame_count, 0.0f);
+        }
 
         control_video              = control_video - 0.5f;
         sd::Tensor<float> inactive = control_video * (1.0f - mask) + 0.5f;
@@ -5969,6 +5983,46 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         if (inactive.empty()) {
             LOG_ERROR("failed to encode VACE inactive context");
             return std::nullopt;
+        }
+
+        if (sd_vid_gen_params->vace_cont_latent != nullptr) {
+            const int64_t expected_w = inactive.shape()[0];
+            const int64_t expected_h = inactive.shape()[1];
+            const int64_t expected_c = inactive.shape()[3];
+            if (sd_vid_gen_params->vace_cont_latent_width != expected_w ||
+                sd_vid_gen_params->vace_cont_latent_height != expected_h ||
+                sd_vid_gen_params->vace_cont_latent_channels != expected_c ||
+                sd_vid_gen_params->vace_cont_latent_frames <= 0) {
+                LOG_ERROR("VACE continuation latent shape mismatch: got %dx%dx%dx%d, expected %lldx%lldxT x%lld",
+                          sd_vid_gen_params->vace_cont_latent_width,
+                          sd_vid_gen_params->vace_cont_latent_height,
+                          sd_vid_gen_params->vace_cont_latent_frames,
+                          sd_vid_gen_params->vace_cont_latent_channels,
+                          (long long)expected_w,
+                          (long long)expected_h,
+                          (long long)expected_c);
+                return std::nullopt;
+            }
+            const int pixel_frames = std::max(1, sd_vid_gen_params->vace_cont_frames);
+            const int64_t take = std::min<int64_t>(
+                inactive.shape()[2],
+                (std::min<int>(pixel_frames, request->frames) - 1) / 4 + 1);
+            const int64_t drop_tail = std::min<int64_t>(
+                std::max(0, sd_vid_gen_params->vace_cont_latent_drop_tail),
+                std::max<int64_t>(0, sd_vid_gen_params->vace_cont_latent_frames - take));
+            const int64_t src_end = sd_vid_gen_params->vace_cont_latent_frames - drop_tail;
+            const int64_t src_beg = src_end - take;
+            sd::Tensor<float> prior({expected_w,
+                                     expected_h,
+                                     sd_vid_gen_params->vace_cont_latent_frames,
+                                     expected_c,
+                                     1});
+            std::memcpy(prior.data(),
+                        sd_vid_gen_params->vace_cont_latent,
+                        static_cast<size_t>(prior.numel()) * sizeof(float));
+            auto tail = sd::ops::slice(prior, 2, src_beg, src_end);
+            sd::ops::slice_assign(&inactive, 2, 0, take, tail);
+            LOG_INFO("VACE continuation: injected %lld prior latent frame(s)", (long long)take);
         }
 
         reactive = sd_ctx->sd->encode_first_stage(reactive);  // [b, c, t, h/vae_scale_factor, w/vae_scale_factor]
@@ -6349,11 +6403,16 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
     return ok;
 }
 
-SD_API bool generate_video(sd_ctx_t* sd_ctx,
-                           const sd_vid_gen_params_t* sd_vid_gen_params,
-                           sd_image_t** frames_out,
-                           int* num_frames_out,
-                           sd_audio_t** audio_out) {
+SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
+                              const sd_vid_gen_params_t* sd_vid_gen_params,
+                              sd_image_t** frames_out,
+                              int* num_frames_out,
+                              sd_audio_t** audio_out,
+                              float** final_latent_out,
+                              int* latent_width_out,
+                              int* latent_height_out,
+                              int* latent_frames_out,
+                              int* latent_channels_out) {
     if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
         return false;
     }
@@ -6365,6 +6424,21 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     }
     if (num_frames_out != nullptr) {
         *num_frames_out = 0;
+    }
+    if (final_latent_out != nullptr) {
+        *final_latent_out = nullptr;
+    }
+    if (latent_width_out != nullptr) {
+        *latent_width_out = 0;
+    }
+    if (latent_height_out != nullptr) {
+        *latent_height_out = 0;
+    }
+    if (latent_frames_out != nullptr) {
+        *latent_frames_out = 0;
+    }
+    if (latent_channels_out != nullptr) {
+        *latent_channels_out = 0;
     }
 
     if (sd_ctx->sd->animatediff_loaded && sd_version_supports_animatediff(sd_ctx->sd->version)) {
@@ -6810,6 +6884,35 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         final_latent = sd::ops::slice(final_latent, 2, latents.ref_image_num, final_latent.shape()[2]);
     }
 
+    if (final_latent_out != nullptr) {
+        if (final_latent.dim() < 4 || final_latent.dim() > 5) {
+            LOG_ERROR("cannot export video latent with %d dimensions", final_latent.dim());
+            free_sd_audio(generated_audio);
+            return false;
+        }
+        const size_t bytes = static_cast<size_t>(final_latent.numel()) * sizeof(float);
+        float* exported = static_cast<float*>(malloc(bytes));
+        if (exported == nullptr) {
+            LOG_ERROR("failed to allocate %zu-byte video latent export", bytes);
+            free_sd_audio(generated_audio);
+            return false;
+        }
+        std::memcpy(exported, final_latent.data(), bytes);
+        *final_latent_out = exported;
+        if (latent_width_out != nullptr) {
+            *latent_width_out = static_cast<int>(final_latent.shape()[0]);
+        }
+        if (latent_height_out != nullptr) {
+            *latent_height_out = static_cast<int>(final_latent.shape()[1]);
+        }
+        if (latent_frames_out != nullptr) {
+            *latent_frames_out = static_cast<int>(final_latent.shape()[2]);
+        }
+        if (latent_channels_out != nullptr) {
+            *latent_channels_out = static_cast<int>(final_latent.shape()[3]);
+        }
+    }
+
     if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
         LOG_ERROR("cancelling generation before video decode");
         free_sd_audio(generated_audio);
@@ -6833,6 +6936,253 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     } else {
         free_sd_audio(generated_audio);
     }
+    return true;
+}
+
+SD_API bool generate_video(sd_ctx_t* sd_ctx,
+                           const sd_vid_gen_params_t* sd_vid_gen_params,
+                           sd_image_t** frames_out,
+                           int* num_frames_out,
+                           sd_audio_t** audio_out) {
+    return generate_video_ex(sd_ctx,
+                             sd_vid_gen_params,
+                             frames_out,
+                             num_frames_out,
+                             audio_out,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             nullptr);
+}
+
+static sd_image_t copy_video_frame(const sd_image_t& source) {
+    sd_image_t copy = source;
+    const size_t bytes = static_cast<size_t>(source.width) * source.height * source.channel;
+    copy.data = static_cast<uint8_t*>(malloc(bytes));
+    if (copy.data != nullptr && source.data != nullptr) {
+        std::memcpy(copy.data, source.data, bytes);
+    }
+    return copy;
+}
+
+class ScopedWanVaceEnvironment {
+public:
+    ScopedWanVaceEnvironment() {
+        for (const char* name : {"VACE_SKIP_BLOCKS", "VACE_STRENGTH_TAIL", "VACE_STRENGTH_ANCHOR_FRAMES"}) {
+            const char* value = getenv(name);
+            values.emplace_back(name, value != nullptr, value != nullptr ? value : "");
+        }
+    }
+
+    ~ScopedWanVaceEnvironment() {
+        for (const auto& [name, was_set, value] : values) {
+            if (was_set) {
+                setenv(name.c_str(), value.c_str(), 1);
+            } else {
+                unsetenv(name.c_str());
+            }
+        }
+    }
+
+private:
+    std::vector<std::tuple<std::string, bool, std::string>> values;
+};
+
+SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
+                                    const sd_vid_gen_params_t*        base_params,
+                                    const sd_wan_vace_chain_params_t* chain_params,
+                                    sd_image_t**                      frames_out,
+                                    int*                              num_frames_out,
+                                    sd_audio_t**                      audio_out) {
+    if (frames_out != nullptr) {
+        *frames_out = nullptr;
+    }
+    if (num_frames_out != nullptr) {
+        *num_frames_out = 0;
+    }
+    if (audio_out != nullptr) {
+        *audio_out = nullptr;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || base_params == nullptr || chain_params == nullptr ||
+        frames_out == nullptr || num_frames_out == nullptr || chain_params->n_segments < 1) {
+        LOG_ERROR("generate_wan_vace_chain: invalid arguments");
+        return false;
+    }
+    const auto& description = sd_ctx->sd->diffusion_model->get_desc();
+    if (description != "Wan2.1-VACE-1.3B" && description != "Wan2.x-VACE-14B") {
+        LOG_ERROR("generate_wan_vace_chain requires a Wan VACE diffusion model (got %s)", description.c_str());
+        return false;
+    }
+
+    const int overlap = chain_params->overlap_frames > 0 ? chain_params->overlap_frames : 5;
+    const int discard = chain_params->discard_tail_frames > 0 ? chain_params->discard_tail_frames : 4;
+    const int drop_latent_tail = std::max(0, chain_params->drop_latent_tail_frames > 0
+                                                  ? chain_params->drop_latent_tail_frames
+                                                  : 1);
+    const bool is_t2v = base_params->init_image.data == nullptr;
+    ScopedWanVaceEnvironment restore_environment;
+    std::vector<sd_image_t> stitched;
+    std::vector<sd_image_t> control_tail;
+    std::vector<float> prior_latent;
+    int latent_width = 0;
+    int latent_height = 0;
+    int latent_frames = 0;
+    int latent_channels = 0;
+
+    auto clear_tail = [&]() {
+        for (auto& frame : control_tail) {
+            free(frame.data);
+        }
+        control_tail.clear();
+    };
+    auto fail = [&]() {
+        clear_tail();
+        for (auto& frame : stitched) {
+            free(frame.data);
+        }
+        stitched.clear();
+        return false;
+    };
+
+    LOG_INFO("generate_wan_vace_chain: %d windows, overlap=%d, discard=%d, mode=%s",
+             chain_params->n_segments, overlap, discard, is_t2v ? "t2v" : "i2v");
+    for (int segment = 0; segment < chain_params->n_segments; ++segment) {
+        const bool continuation = segment > 0;
+        const bool need_latent = segment + 1 < chain_params->n_segments;
+        sd_vid_gen_params_t params = *base_params;
+        params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
+        if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
+            params.prompt = chain_params->segment_prompts[segment];
+        }
+
+        setenv("VACE_SKIP_BLOCKS", "0", 1);
+        if (continuation) {
+            if (prior_latent.empty() || control_tail.empty()) {
+                LOG_ERROR("generate_wan_vace_chain: continuation %d has no prior context", segment);
+                return fail();
+            }
+            params.control_frames = control_tail.data();
+            params.control_frames_size = static_cast<int>(control_tail.size());
+            params.vace_cont_latent = prior_latent.data();
+            params.vace_cont_latent_width = latent_width;
+            params.vace_cont_latent_height = latent_height;
+            params.vace_cont_latent_frames = latent_frames;
+            params.vace_cont_latent_channels = latent_channels;
+            params.vace_cont_frames = overlap;
+            params.vace_cont_latent_drop_tail = segment == 1 ? 0 : drop_latent_tail;
+            params.vace_strength = base_params->vace_strength;
+            // The carried latent is the continuity anchor.  Do not re-inject a
+            // still image into later windows unless a caller deliberately uses
+            // a fresh chain request for that experiment.
+            params.init_image.data = nullptr;
+            const int anchor = (std::min(overlap, std::max(1, params.video_frames)) - 1) / 4 + 1;
+            const char* tail = getenv("WAN_VACE_STRENGTH_TAIL");
+            setenv("VACE_STRENGTH_TAIL", tail != nullptr && tail[0] != '\0' ? tail : "0.2", 1);
+            const char* configured_anchor = getenv("WAN_VACE_STRENGTH_ANCHOR_FRAMES");
+            setenv("VACE_STRENGTH_ANCHOR_FRAMES",
+                   configured_anchor != nullptr && configured_anchor[0] != '\0'
+                       ? configured_anchor
+                       : std::to_string(anchor).c_str(),
+                   1);
+        } else if (is_t2v) {
+            params.control_frames = nullptr;
+            params.control_frames_size = 0;
+            params.vace_cont_latent = nullptr;
+            params.vace_cont_latent_frames = 0;
+            params.vace_strength = 0.0f;
+            unsetenv("VACE_STRENGTH_TAIL");
+            unsetenv("VACE_STRENGTH_ANCHOR_FRAMES");
+        } else {
+            const char* tail = getenv("WAN_VACE_I2V_STRENGTH_TAIL");
+            const char* anchor = getenv("WAN_VACE_I2V_STRENGTH_ANCHOR_FRAMES");
+            setenv("VACE_STRENGTH_TAIL", tail != nullptr && tail[0] != '\0' ? tail : "0.5", 1);
+            setenv("VACE_STRENGTH_ANCHOR_FRAMES", anchor != nullptr && anchor[0] != '\0' ? anchor : "3", 1);
+        }
+
+        sd_image_t* segment_frames = nullptr;
+        int segment_count = 0;
+        sd_audio_t* segment_audio = nullptr;
+        float* exported_latent = nullptr;
+        int out_width = 0;
+        int out_height = 0;
+        int out_frames = 0;
+        int out_channels = 0;
+        const bool generated = generate_video_ex(sd_ctx,
+                                                 &params,
+                                                 &segment_frames,
+                                                 &segment_count,
+                                                 &segment_audio,
+                                                 need_latent ? &exported_latent : nullptr,
+                                                 need_latent ? &out_width : nullptr,
+                                                 need_latent ? &out_height : nullptr,
+                                                 need_latent ? &out_frames : nullptr,
+                                                 need_latent ? &out_channels : nullptr);
+        free_sd_audio(segment_audio);
+        if (!generated || segment_frames == nullptr || segment_count <= 0 ||
+            (need_latent && exported_latent == nullptr)) {
+            LOG_ERROR("generate_wan_vace_chain: window %d failed", segment + 1);
+            free(segment_frames);
+            free(exported_latent);
+            return fail();
+        }
+
+        if (need_latent) {
+            const size_t count = static_cast<size_t>(out_width) * out_height * out_frames * out_channels;
+            prior_latent.assign(exported_latent, exported_latent + count);
+            latent_width = out_width;
+            latent_height = out_height;
+            latent_frames = out_frames;
+            latent_channels = out_channels;
+        }
+        free(exported_latent);
+
+        const int first_keep = continuation ? std::min(overlap, segment_count) : 0;
+        const int last_keep = continuation ? std::max(first_keep, segment_count - discard) : segment_count;
+        if (need_latent) {
+            clear_tail();
+            const int tail_start = std::max(first_keep, last_keep - overlap);
+            for (int frame = tail_start; frame < last_keep; ++frame) {
+                sd_image_t copy = copy_video_frame(segment_frames[frame]);
+                if (copy.data == nullptr) {
+                    for (int i = 0; i < segment_count; ++i) {
+                        free(segment_frames[i].data);
+                    }
+                    free(segment_frames);
+                    LOG_ERROR("generate_wan_vace_chain: could not copy continuation pixel tail");
+                    return fail();
+                }
+                control_tail.push_back(copy);
+            }
+        }
+        for (int frame = 0; frame < segment_count; ++frame) {
+            if (frame >= first_keep && frame < last_keep) {
+                stitched.push_back(segment_frames[frame]);
+            } else {
+                free(segment_frames[frame].data);
+            }
+        }
+        free(segment_frames);
+    }
+
+    clear_tail();
+    if (stitched.empty()) {
+        LOG_ERROR("generate_wan_vace_chain: no frames produced");
+        return false;
+    }
+    sd_image_t* output = static_cast<sd_image_t*>(malloc(stitched.size() * sizeof(sd_image_t)));
+    if (output == nullptr) {
+        for (auto& frame : stitched) {
+            free(frame.data);
+        }
+        LOG_ERROR("generate_wan_vace_chain: output allocation failed");
+        return false;
+    }
+    std::memcpy(output, stitched.data(), stitched.size() * sizeof(sd_image_t));
+    *frames_out = output;
+    *num_frames_out = static_cast<int>(stitched.size());
+    LOG_INFO("generate_wan_vace_chain: stitched %d windows -> %d frames",
+             chain_params->n_segments, *num_frames_out);
     return true;
 }
 

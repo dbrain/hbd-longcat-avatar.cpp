@@ -1,9 +1,11 @@
 #ifndef __SD_MODEL_DIFFUSION_WAN_HPP__
 #define __SD_MODEL_DIFFUSION_WAN_HPP__
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <utility>
+#include <cstdlib>
 
 #include "model/common/block.hpp"
 #include "model/common/rope.hpp"
@@ -845,10 +847,12 @@ namespace WAN {
 
             // vace_patch_embedding
             ggml_tensor* c = nullptr;
+            int64_t vace_t_len = 0;
             if (config.vace_layers > 0) {
                 auto vace_patch_embedding = std::dynamic_pointer_cast<Conv3d>(blocks["vace_patch_embedding"]);
 
                 c = vace_patch_embedding->forward(ctx, vace_context);                                    // [N*dim, t_len, h_len, w_len]
+                vace_t_len = c->ne[2];
                 c = ggml_reshape_3d(ctx->ggml_ctx, c, c->ne[0] * c->ne[1] * c->ne[2], c->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
             }
@@ -861,6 +865,37 @@ namespace WAN {
             }
 
             auto x_orig = x;
+
+            // VACE continuation uses an anchored leading context and a gray
+            // reactive tail.  A scalar control strength over-constrains that
+            // tail; optionally attenuate it per latent frame while leaving the
+            // leading anchor untouched.  With the variables unset this remains
+            // the exact upstream scalar path.
+            ggml_tensor* vace_ramp = nullptr;
+            if (c != nullptr && vace_t_len > 1) {
+                const char* tail_env = getenv("VACE_STRENGTH_TAIL");
+                if (tail_env != nullptr && tail_env[0] != '\0') {
+                    const float tail = static_cast<float>(atof(tail_env));
+                    int64_t anchor = 2;
+                    if (const char* anchor_env = getenv("VACE_STRENGTH_ANCHOR_FRAMES");
+                        anchor_env != nullptr && anchor_env[0] != '\0') {
+                        anchor = std::max<int64_t>(0, atoll(anchor_env));
+                    }
+                    const int64_t denom = vace_t_len - 1 - anchor;
+                    if (tail != vace_strength && anchor < vace_t_len && denom > 0) {
+                        auto scale = ggml_arange(ctx->ggml_ctx,
+                                                 -static_cast<float>(anchor),
+                                                 static_cast<float>(vace_t_len - anchor),
+                                                 1.0f);
+                        scale = ggml_scale(ctx->ggml_ctx, scale, 1.0f / static_cast<float>(denom));
+                        scale = ggml_clamp(ctx->ggml_ctx, scale, 0.0f, 1.0f);
+                        scale = ggml_scale(ctx->ggml_ctx, scale, tail - vace_strength);
+                        auto base = ggml_ext_full(ctx->ggml_ctx, vace_strength, vace_t_len, 1, 1, 1);
+                        scale = ggml_add(ctx->ggml_ctx, scale, base);
+                        vace_ramp = ggml_reshape_4d(ctx->ggml_ctx, scale, 1, 1, vace_t_len, 1);
+                    }
+                }
+            }
 
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<WanAttentionBlock>(blocks["blocks." + std::to_string(i)]);
@@ -876,7 +911,19 @@ namespace WAN {
                     auto result = vace_block->forward(ctx, c, x_orig, e0, pe, context, context_img_len);
                     auto c_skip = result.first;
                     c           = result.second;
-                    c_skip      = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
+                    if (vace_ramp != nullptr) {
+                        if (!ggml_is_contiguous(c_skip)) {
+                            c_skip = ggml_cont(ctx->ggml_ctx, c_skip);
+                        }
+                        const int64_t dim = c_skip->ne[0];
+                        const int64_t hw = c_skip->ne[1] / vace_t_len;
+                        const int64_t batch = c_skip->ne[2];
+                        auto c4 = ggml_reshape_4d(ctx->ggml_ctx, c_skip, dim, hw, vace_t_len, batch);
+                        c4 = ggml_mul(ctx->ggml_ctx, c4, vace_ramp);
+                        c_skip = ggml_reshape_3d(ctx->ggml_ctx, c4, dim, vace_t_len * hw, batch);
+                    } else {
+                        c_skip = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
+                    }
                     x           = ggml_add(ctx->ggml_ctx, x, c_skip);
                 }
                 sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i), "x");

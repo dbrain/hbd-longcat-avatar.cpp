@@ -248,7 +248,25 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
-        const bool generated = generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio);
+        bool generated = false;
+        if (job.wan_vace_prompts.empty()) {
+            generated = generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio);
+        } else {
+            std::vector<const char*> prompts;
+            prompts.reserve(job.wan_vace_prompts.size());
+            for (const auto& prompt : job.wan_vace_prompts) {
+                prompts.push_back(prompt.c_str());
+            }
+            sd_wan_vace_chain_params_t chain = {};
+            chain.n_segments = static_cast<int>(prompts.size());
+            chain.segment_prompts = prompts.data();
+            generated = generate_wan_vace_chain(runtime.sd_ctx,
+                                                 &params,
+                                                 &chain,
+                                                 &raw_results,
+                                                 &num_results,
+                                                 &generated_audio);
+        }
         if (!generated) {
             raw_results = nullptr;
         } else if (runtime.gpu_sharing != nullptr) {
@@ -344,7 +362,16 @@ void async_job_worker(ServerRuntime& runtime) {
             }
 
             job->completed_at = unix_timestamp_now();
-            if (ok) {
+            if (job->cancel_requested) {
+                job->status = AsyncJobStatus::Cancelled;
+                job->error_code = "cancelled";
+                job->error_message = "job cancelled by client";
+                job->result_images_b64.clear();
+                job->result_media_b64.clear();
+                job->result_media_mime_type.clear();
+                job->result_frame_count = 0;
+                job->result_fps = 0;
+            } else if (ok) {
                 job->status                 = AsyncJobStatus::Completed;
                 job->result_images_b64      = std::move(output_images);
                 job->result_media_b64       = std::move(output_media_b64);

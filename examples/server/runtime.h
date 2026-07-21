@@ -90,6 +90,7 @@ struct VidGenJobRequest {
 };
 
 std::string base64_encode(const std::vector<uint8_t>& bytes);
+bool base64_decode(const std::string& text, std::vector<uint8_t>& bytes);
 std::string normalize_output_format(std::string output_format);
 std::vector<std::string> supported_img_output_formats(bool allow_webp = true);
 std::vector<std::string> supported_vid_output_formats();

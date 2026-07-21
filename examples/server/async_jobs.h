@@ -37,11 +37,15 @@ struct AsyncGenerationJob {
     int64_t completed_at  = 0;
     ImgGenJobRequest img_gen;
     VidGenJobRequest vid_gen;
+    // Non-empty only for /wan/v1/generate.  The generic async job lifecycle and
+    // result schema are deliberately shared with regular video generation.
+    std::vector<std::string> wan_vace_prompts;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;
     int result_frame_count = 0;
     int result_fps         = 0;
+    bool cancel_requested  = false;
     std::string error_code;
     std::string error_message;
 };
