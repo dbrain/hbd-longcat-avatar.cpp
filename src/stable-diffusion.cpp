@@ -13947,12 +13947,17 @@ struct ChainAudioAcc {
 // last frame — that frame is the smoothest continuation. Returns the trim (drop) count. (A
 // per-segment exposure match — seg N+1 renders ~0.85 luma darker — further flattens the residual
 // tone step; validated offline, not yet ported here. See HANDOFF.)
+// `centre` is the EXPECTED trim (8*K — the pixel-frame block the carried latents occupy), not the
+// guide overlap. Centring the search on overlap_px = 1+(K-1)*8 instead put the band 7 frames low and
+// shrank its ceiling with K: at K=2 it became [3,23] while the true trim still sat near 8*K=16-24,
+// so the search rail-clipped high (or latched onto a spurious low minimum) — the divergence that
+// desynced the audio when K went 3 -> 2.
 static int ltxav_auto_trim_drop(const sd_image_t& prev_last, const sd_image_t* frames,
-                                int n_frames, int overlap_px) {
-    if (frames == nullptr || n_frames <= 0 || prev_last.data == nullptr) return overlap_px;
-    int lo = std::max(1, overlap_px - 6);
-    int hi = std::min(n_frames - 2, overlap_px + 14);
-    if (hi <= lo) return std::min(overlap_px, std::max(0, n_frames - 1));
+                                int n_frames, int centre) {
+    if (frames == nullptr || n_frames <= 0 || prev_last.data == nullptr) return centre;
+    int lo = std::max(1, centre - 8);
+    int hi = std::min(n_frames - 2, centre + 10);
+    if (hi <= lo) return std::min(centre, std::max(0, n_frames - 1));
     const int GW = 32, GH = 18;
     auto grid = [](const sd_image_t& im, std::vector<float>& out, int gw, int gh) {
         out.assign((size_t)gw * gh, 0.f);
@@ -13969,7 +13974,7 @@ static int ltxav_auto_trim_drop(const sd_image_t& prev_last, const sd_image_t* f
     };
     std::vector<float> ref, cur;
     grid(prev_last, ref, GW, GH);
-    int   best_t = overlap_px;
+    int   best_t = centre;
     float best   = 1e30f;
     for (int t = lo; t <= hi; ++t) {
         if (frames[t].data == nullptr) continue;
@@ -14206,12 +14211,17 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // LTX causal-VAE temporal: K latent frames decode to 1+(K-1)*8 pixel frames. That is
     // the head overlap we drop on seg>0 (the prior tail's re-render).
     int overlap_px = 1 + (K - 1) * 8;
-    // Extra frames the model takes to "settle" past the frozen guide before the smoothest seam.
-    // The content-adaptive auto-trim lands at ~overlap_px + this (measured 23-25 for K=3, guide 17);
-    // it seeds the FIRST continuation's drive-audio cold-start (see drop_pred below). koblem pads
-    // each continuation's render by the same guide+settle (its `overlap`≈24). Override via
-    // LTXAV_CHAIN_COLD_DROP if a model/K shifts it.
-    const int LTXAV_CONT_SETTLE_FRAMES = 7;
+    // The seam trim: the whole 8*K pixel-frame block the K carried latents occupy. The causal VAE
+    // decodes those K latents to overlap_px = 1+(K-1)*8 REAL frames; the model then re-renders the
+    // remaining 8*K - overlap_px = 7 frames settling into the uniform 8-frame latent group before it
+    // is producing genuinely new content. So the frames to discard are 8*K, not overlap_px — and
+    // that is K-derived, not a constant. (This is why the validated K=3 value was 24 and why the
+    // content-adaptive trim measured 23-25 there: it was rediscovering 8*K every segment. At K=2 the
+    // old `overlap_px + 7` arithmetic still gives 16 = 8*K, but the auto-trim's search band
+    // [overlap_px-6, overlap_px+14] = [3,23] no longer brackets it cleanly and rail-clips high.)
+    const int seam_drop_8k = 8 * K;
+    // Caller-pinned trim; 0 = derive (pin to 8*K when the engine owns the audio), <0 = force adaptive.
+    const int seam_drop_req = chain_params->cont_seam_drop_frames;
     if (overlap_px >= base_params->video_frames) {
         LOG_ERROR("generate_video_chain: cont_latent_frames (%d -> %d overlap pixel frames) must leave "
                   "new frames in video_frames (%d)",
@@ -14341,7 +14351,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // `chain_audio_full` drives lip-sync (16k mono — all the audio VAE takes); `chain_audio_track`
     // is the deliverable, kept verbatim. Same path for both = the common "voice drives AND
     // delivers" case, loaded twice at different fidelities on purpose.
-    const long long audio_offset_frames =
+    long long audio_offset_frames =
         (chain_params->chain_audio_full != nullptr || chain_params->chain_audio_track != nullptr)
             ? (long long)chain_params->chain_audio_offset_frames
             : 0;
@@ -14378,6 +14388,166 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return false;
         }
     }
+    // ── SEAM TRIM: PINNED vs CONTENT-ADAPTIVE ────────────────────────────────────────────────
+    // A/V is exact IFF the trim actually applied equals the trim the drive-audio window was cut
+    // against — and that window is cut BEFORE the render, so the trim must be known a priori.
+    // Therefore: pin the trim whenever the engine owns the audio (there is something to desync),
+    // and only run the content-adaptive search when it cannot cost anything. Caller pin wins;
+    // 0 derives 8*K; negative forces adaptive.
+    const bool has_shot_audio    = chain_params->segment_audio_full != nullptr ||
+                                chain_params->segment_audio_track != nullptr;
+    const bool engine_owns_audio = drive_full.loaded || track_full.loaded || has_shot_audio;
+    int        seam_drop_pin     = -1;  // -1 = content-adaptive
+    if (seam_drop_req > 0) {
+        seam_drop_pin = seam_drop_req;
+    } else if (seam_drop_req == 0 && engine_owns_audio) {
+        seam_drop_pin = seam_drop_8k;
+    }
+    if (seam_drop_pin >= 0) {
+        LOG_INFO("generate_video_chain: seam trim PINNED to %d frames (%s; K=%d -> 8*K=%d, guide overlap_px=%d) "
+                 "-> picture and track are frame-exact at every seam",
+                 seam_drop_pin, seam_drop_req > 0 ? "caller-supplied" : "derived", K, seam_drop_8k, overlap_px);
+    } else {
+        LOG_INFO("generate_video_chain: seam trim CONTENT-ADAPTIVE (search centred on 8*K=%d, guide overlap_px=%d)%s",
+                 seam_drop_8k, overlap_px,
+                 engine_owns_audio ? " -- A/V will wander by the per-segment prediction error" : "");
+    }
+
+    // ── PER-SHOT AUDIO: fold the per-segment clips into ONE timeline ─────────────────────────
+    // Everything downstream (the per-segment drive window, the deliverable cut, the resume/retake
+    // re-anchoring) is written against a single whole-timeline clip and is already exact. So rather
+    // than teach all of it about a second, per-shot addressing mode, per-shot clips are composited
+    // onto that same timeline here, once — after which this is indistinguishable from the caller
+    // having handed over one long track. Each shot's clip is laid at its own shot boundary, so a
+    // shot's audio starts with the shot no matter what any other shot's length turns out to be.
+    if (has_shot_audio) {
+        // Shot grid: visible[i] = render[i] - drop[i]. Knowable up front only because the trim is
+        // pinned/declared — which per-shot audio forces (has_shot_audio => engine_owns_audio).
+        if (chain_params->segment_seam_drop_frames == nullptr && n_chain > 1) {
+            LOG_WARN("generate_video_chain: per-shot audio without segment_seam_drop_frames — assuming "
+                     "every shot after the first is a continuation trimmed by %d. A fresh shot (scene "
+                     "cut / v2v) is NOT trimmed, so its audio and everything after it will sit %d "
+                     "frames late. Send the per-shot trims.",
+                     std::max(0, seam_drop_pin), std::max(0, seam_drop_pin));
+        }
+        std::vector<long long> shot_off((size_t)n_chain + 1, 0);
+        for (int i = 0; i < n_chain; ++i) {
+            int render_i = (chain_params->segment_video_frames != nullptr &&
+                            chain_params->segment_video_frames[i] > 0)
+                               ? chain_params->segment_video_frames[i]
+                               : base_params->video_frames;
+            int drop_i = 0;
+            if (chain_params->segment_seam_drop_frames != nullptr &&
+                chain_params->segment_seam_drop_frames[i] >= 0) {
+                drop_i = chain_params->segment_seam_drop_frames[i];
+            } else if (i > 0) {
+                drop_i = std::max(0, seam_drop_pin);
+            }
+            shot_off[(size_t)i + 1] = shot_off[(size_t)i] + std::max(0, render_i - drop_i);
+        }
+        const long long tl_frames = shot_off[(size_t)n_chain];
+
+        bool shot_audio_ok = true;
+        // `io` may already hold the whole-clip bed; per-shot clips replace their own spans on top.
+        auto composite = [&](ChainFullAudio& io, const char* const* paths, bool as_drive) {
+            if (paths == nullptr) {
+                return;
+            }
+            std::vector<ChainFullAudio> clips((size_t)n_chain);
+            uint32_t                    sr = io.loaded ? io.sample_rate : 0;
+            uint32_t                    ch = io.loaded ? io.channels : 0;
+            for (int i = 0; i < n_chain; ++i) {
+                const char* p = paths[i];
+                if (p == nullptr || p[0] == '\0') {
+                    continue;  // this shot simply contributes nothing
+                }
+                ChainFullAudio c;
+                bool           ok;
+                if (as_drive) {
+                    ok            = LONGCAT_AUDIO::load_wav_16k_mono(p, c.samples) && !c.samples.empty();
+                    c.sample_rate = 16000;
+                    c.channels    = 1;
+                } else {
+                    ok = LONGCAT_AUDIO::load_wav_full(p, c.samples, c.sample_rate, c.channels) &&
+                         !c.samples.empty();
+                }
+                if (!ok) {
+                    // A path that was supplied but cannot be read is a hard error, same contract as
+                    // the whole-clip params: silently dropping one shot's audio looks like a model
+                    // fault and wastes the whole chain.
+                    LOG_ERROR("generate_video_chain seg %d: per-shot %s audio '%s' unreadable",
+                              i, as_drive ? "drive" : "track", p);
+                    shot_audio_ok = false;
+                    return;
+                }
+                c.loaded = true;
+                if (sr == 0) {
+                    sr = c.sample_rate;
+                    ch = c.channels;
+                }
+                clips[(size_t)i] = std::move(c);
+            }
+            if (sr == 0 || ch == 0) {
+                return;  // no bed and no per-shot clips for this role
+            }
+            // Bed first (silence when there is none, or when it cannot be laid down as-is).
+            std::vector<float> tl;
+            if (io.loaded && io.sample_rate == sr && io.channels == ch) {
+                tl = io.window(0, tl_frames, (float)base_params->fps, audio_offset_frames);
+            } else {
+                if (io.loaded) {
+                    LOG_ERROR("generate_video_chain: whole-clip %s audio is %u Hz x%u but the per-shot "
+                              "clips are %u Hz x%u — no resampling is done; dropping the bed",
+                              as_drive ? "drive" : "track", io.sample_rate, io.channels, sr, ch);
+                }
+                tl.assign((size_t)std::max(0LL, llround((double)tl_frames * sr / base_params->fps)) * ch, 0.0f);
+            }
+            const long long tl_samples = ch == 0 ? 0 : (long long)(tl.size() / ch);
+            for (int i = 0; i < n_chain; ++i) {
+                ChainFullAudio& c = clips[(size_t)i];
+                if (!c.loaded) {
+                    continue;
+                }
+                if (c.sample_rate != sr || c.channels != ch) {
+                    LOG_ERROR("generate_video_chain seg %d: per-shot %s audio is %u Hz x%u, timeline is "
+                              "%u Hz x%u — no resampling is done; skipping this shot's audio",
+                              i, as_drive ? "drive" : "track", c.sample_rate, c.channels, sr, ch);
+                    shot_audio_ok = false;
+                    continue;
+                }
+                const long long a0   = llround((double)shot_off[(size_t)i] * sr / base_params->fps);
+                const long long a1   = llround((double)shot_off[(size_t)i + 1] * sr / base_params->fps);
+                const long long have = (long long)c.frames();
+                // Own the whole span: copy the clip, then SILENCE the rest of the shot. Leaving the
+                // bed showing through a short clip's tail would mix two sources inside one shot.
+                for (long long f = 0; f + a0 < a1 && f + a0 < tl_samples; ++f) {
+                    for (uint32_t k = 0; k < ch; ++k) {
+                        tl[(size_t)(a0 + f) * ch + k] =
+                            (f < have) ? c.samples[(size_t)f * ch + k] : 0.0f;
+                    }
+                }
+                LOG_INFO("generate_video_chain seg %d: per-shot %s audio -> timeline frames [%lld,%lld) "
+                         "(%lld audio frames supplied)",
+                         i, as_drive ? "drive" : "track", shot_off[(size_t)i], shot_off[(size_t)i + 1], have);
+            }
+            io.samples     = std::move(tl);
+            io.sample_rate = sr;
+            io.channels    = ch;
+            io.loaded      = true;
+        };
+        composite(drive_full, chain_params->segment_audio_full, true);
+        composite(track_full, chain_params->segment_audio_track, false);
+        if (!shot_audio_ok) {
+            return false;
+        }
+        // The composited buffers ARE the timeline: their t=0 is timeline frame 0, so any caller
+        // offset has already been consumed by the bed above and must not be applied twice.
+        audio_offset_frames = 0;
+        LOG_INFO("generate_video_chain: per-shot audio composited onto a %lld-frame timeline "
+                 "(drive=%d track=%d)",
+                 tl_frames, (int)drive_full.loaded, (int)track_full.loaded);
+    }
+
     // Where the drive slices are written. Prefer save_dir (banked next to the latents, so a
     // resume/retake can see exactly what drove each segment); else the audio dir; else skip.
     std::string drive_slice_dir;
@@ -14696,22 +14866,34 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // control_frames; a NULL entry clears any inherited base path so this seg isn't a latent-in
         // guide). A NULL array leaves the base_params->v2v_guide_latent_path inheritance intact
         // (single-segment / global source).
+        bool segmented_v2v_latent = false;
         if (chain_params->segment_v2v_guide_latent_paths != nullptr) {
             const char* gp = chain_params->segment_v2v_guide_latent_paths[seg];
             if (gp != nullptr && gp[0] != '\0') {
                 vp.v2v_guide_latent_path = gp;
                 vp.v2v_mode              = 2;
+                segmented_v2v_latent     = true;
                 LOG_INFO("generate_video_chain seg %d: V2V guide-edit LATENT-IN %s", seg + 1, gp);
             } else {
                 vp.v2v_guide_latent_path = nullptr;
             }
         }
 
+        // A shot whose content comes from a SOURCE CLIP rather than from the prior shot's motion.
+        // Both forms must behave identically here: pixels handed over as control_frames
+        // (`segmented_relip`) and the same shot handed over as a banked LATENT
+        // (`segmented_v2v_latent` — a clip we rendered, referenced by job id, no re-encode).
+        // Only the first used to count, so a latent-in guide-edit fell through to the ordinary
+        // continuation branch: it was conditioned on the previous shot's tail AND its guide, and was
+        // trimmed like a continuation while every caller treats a v2v shot as fresh and pads it by 0.
+        // That mismatch shortened the shot and slid the whole remaining timeline against the audio.
+        const bool v2v_shot = segmented_relip || segmented_v2v_latent;
+
         // Director keyframes: a shot with per-segment keyframes (image+frame pins) renders FRESH
         // via the LTXAV keyframe branch — frame 0 = scene start, last = end frame, a middle index
         // = a mid-shot reveal. Takes precedence over a plain scene-cut image and over continuation
         // (it's a fresh i2v-style shot, not a continuation of the prior motion).
-        const bool has_keyframes = !segmented_relip &&
+        const bool has_keyframes = !v2v_shot &&
                                    chain_params->segment_keyframes != nullptr &&
                                    chain_params->segment_keyframe_counts != nullptr &&
                                    chain_params->segment_keyframe_counts[seg] > 0 &&
@@ -14733,26 +14915,55 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 }
             }
         }
-        const bool kf_cont  = has_keyframes && seg > 0 && !segmented_relip && !kf_frame0;
+        const bool kf_cont  = has_keyframes && seg > 0 && !v2v_shot && !kf_frame0;
         const bool kf_fresh = has_keyframes && !kf_cont;
 
         // Director multi-scene: a seg>0 with its own init image starts a FRESH i2v scene here
         // (a scene cut) rather than continuing the prior motion. Seg-0 already uses the opener
         // via base_params->init_image, so per-segment images only matter for seg>0.
-        const bool scene_cut = seg > 0 && !segmented_relip && !has_keyframes &&
+        const bool scene_cut = seg > 0 && !v2v_shot && !has_keyframes &&
                                chain_params->segment_init_images != nullptr &&
                                chain_params->segment_init_images[seg] != nullptr &&
                                chain_params->segment_init_images[seg]->data != nullptr;
 
         // TEXT-ONLY scene cut: a seg>0 shot explicitly flagged as a new scene with NO image and no
         // keyframes — render it fresh from the prompt alone (mutually exclusive with scene_cut/kf).
-        const bool text_scene_cut = seg > 0 && !segmented_relip && !has_keyframes && !scene_cut &&
+        const bool text_scene_cut = seg > 0 && !v2v_shot && !has_keyframes && !scene_cut &&
                                     chain_params->segment_scene_cut != nullptr &&
                                     chain_params->segment_scene_cut[seg] != 0;
 
         // A fresh shot does not continue the prior tail; its stitch drop is 0 and it re-anchors the
         // continuity references. A merged (kf_cont) shot DOES continue, so it is NOT a fresh anchor.
         const bool fresh_anchor = scene_cut || kf_fresh || text_scene_cut;
+
+        // ── THIS SEGMENT'S SEAM TRIM ─────────────────────────────────────────────────────────
+        // Resolved ONCE here so the drive-audio window (cut below, before the render) and the stitch
+        // (after it) cannot use different numbers — that equality is the whole A/V exactness
+        // property. -1 = no fixed trim, fall through to the content-adaptive search.
+        //
+        // A caller-declared per-shot drop wins outright: it is `render - visible`, so honouring it is
+        // what guarantees the produced length is the requested one. It also removes any dependence on
+        // the engine and the caller agreeing about which shots are fresh — they have diverged before,
+        // and the cost of divergence is a permanently shifted timeline.
+        const bool engine_says_fresh = (seg == 0 || v2v_shot || fresh_anchor);
+        const int  seg_declared_drop = (chain_params->segment_seam_drop_frames != nullptr)
+                                           ? chain_params->segment_seam_drop_frames[seg]
+                                           : -1;
+        if (seg_declared_drop >= 0 && ((seg_declared_drop == 0) != engine_says_fresh)) {
+            // The timeline stays exact (we honour the caller), but the shot was CONDITIONED the other
+            // way, which is a real bug worth surfacing: a continuation trimmed as fresh keeps its
+            // re-rendered overlap (a visible stutter at the join); a fresh shot trimmed as a
+            // continuation loses the opening frames of a brand-new scene.
+            LOG_WARN("generate_video_chain seg %d: caller declares this shot %s (seam drop %d) but the "
+                     "engine renders it as %s (scene_cut=%d kf_fresh=%d text_cut=%d relip=%d) — honouring "
+                     "the caller's trim so the timeline and audio stay exact, but the CONDITIONING and "
+                     "the trim disagree; expect a seam artefact on this shot",
+                     seg, seg_declared_drop == 0 ? "FRESH" : "a CONTINUATION", seg_declared_drop,
+                     engine_says_fresh ? "FRESH" : "a CONTINUATION", (int)scene_cut, (int)kf_fresh,
+                     (int)text_scene_cut, (int)v2v_shot);
+        }
+        const int seg_seam_drop = (seg_declared_drop >= 0) ? seg_declared_drop
+                                                           : (engine_says_fresh ? 0 : seam_drop_pin);
 
         if (kf_fresh) {
             // Fresh keyframe shot: pin the caller's images at their frame indices; the keyframe
@@ -14793,7 +15004,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             vp.audio_frame_offset        = seg * (base_params->video_frames - overlap_px);
             LOG_INFO("generate_video_chain seg %d: MERGED continuation + %d keyframe pin(s)",
                      seg + 1, vp.keyframes_size);
-        } else if (seg == 0 || segmented_relip) {
+        } else if (seg == 0 || v2v_shot) {
             vp.cont_latent        = nullptr;
             vp.cont_latent_frames = 0;
             vp.cont_refine_latent = nullptr;
@@ -14910,15 +15121,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             //  • ordinary continuation: the previous continuation's MEASURED drop; a settle-inclusive
             //    cold-start only before any continuation has been measured.
             //
-            // Cold-start (first continuation, no measured drop yet): the content-adaptive trim lands
-            // a few frames ABOVE the guide overlap (overlap_px) — the model needs a short "settle"
-            // after the frozen guide before the smoothest cut. koblem pads each continuation's RENDER
-            // by exactly this guide+settle (its `overlap`≈24 for K=3), and the trim measures 23-25
-            // across content. Seeding the cold-start at overlap_px ALONE (guide only, 17) left the
-            // FIRST continuation's drive window ~6-7 frames early — its mouth ran AHEAD of the vocals
-            // (visible seg-1 lip lead) — while seg-2+ were already exact via last_cont_drop. Add the
-            // settle so seg-1 lands within ~1 frame. Overridable with LTXAV_CHAIN_COLD_DROP (value-gated).
-            int cold_drop = overlap_px + LTXAV_CONT_SETTLE_FRAMES;
+            // Cold-start (first continuation, no measured drop yet): 8*K — the pixel-frame block the
+            // carried latents occupy (see seam_drop_8k). When the trim is PINNED (the engine-owned-
+            // audio default) this is not an estimate at all: prediction and trim are the same number,
+            // so the window is exact by construction and last_cont_drop never has to correct anything.
+            // Overridable with LTXAV_CHAIN_COLD_DROP (value-gated).
+            int cold_drop = (seam_drop_pin >= 0) ? seam_drop_pin : seam_drop_8k;
             if (const char* e = std::getenv("LTXAV_CHAIN_COLD_DROP")) {
                 if (e[0] != '\0') {
                     char* end = nullptr;
@@ -14929,16 +15137,21 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 }
             }
             int drop_pred;
-            if (seg == 0 || segmented_relip || fresh_anchor) {
-                drop_pred = 0;
-            } else if (retake_active && seg == retake_seg &&
-                       getenv("LTXAV_RETAKE_NO_PIN_LENGTH") == nullptr &&
-                       chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+            if (retake_active && seg == retake_seg &&
+                getenv("LTXAV_RETAKE_NO_PIN_LENGTH") == nullptr &&
+                chain_params->save_dir != nullptr && chain_params->save_dir[0] != '\0') {
+                // The banked kept-length pin below wins over any seam pin (it reproduces the ORIGINAL
+                // timeline, which may have been rendered under a different trim), so predict from it.
                 int banked = read_seg_len(std::string(chain_params->save_dir) + "/seg_" +
                                           std::to_string(seg) + ".len");
                 drop_pred = (banked >= 0 && banked <= (int)vp.video_frames)
                                 ? ((int)vp.video_frames - banked)
-                                : (last_cont_drop >= 0 ? last_cont_drop : cold_drop);
+                                : ((seg_seam_drop >= 0) ? seg_seam_drop
+                                                        : (last_cont_drop >= 0 ? last_cont_drop : cold_drop));
+            } else if (seg_seam_drop >= 0) {
+                // FIXED for this shot (declared, pinned, or fresh=0): the stitch below applies exactly
+                // this, so the window is not a prediction at all — picture and track are frame-exact.
+                drop_pred = seg_seam_drop;
             } else {
                 drop_pred = (last_cont_drop >= 0) ? last_cont_drop : cold_drop;
             }
@@ -14946,7 +15159,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 // Value-gate: "${VAR:-}" yields an EMPTY STRING and getenv returns non-null, so a
                 // bare presence check silently enables drop=0 via atoi(""). Only a real integer pins.
                 // Parity with the actual-drop pin below: when the trim is pinned, so is the estimate.
-                if (e[0] != '\0' && seg > 0 && !(segmented_relip || fresh_anchor)) {
+                if (e[0] != '\0' && seg > 0 && !(v2v_shot || fresh_anchor)) {
                     char* end = nullptr;
                     long  v   = strtol(e, &end, 10);
                     if (end != nullptr && *end == '\0' && v >= 0) {
@@ -15167,30 +15380,47 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             }
         }
 
-        // Stitch: seg0 keeps all frames. For seg>0 the LEGACY head-placement path re-renders
-        // the overlap at the head and must drop it (overlap_px); the keyframe-append path
-        // (default) places the guide in the PAST and generates only NEW frames, so it drops
-        // nothing — that re-render+trim is exactly what caused the seam "skip". Override the
-        // drop with LTXAV_CHAIN_OVERLAP_DROP for tuning.
+        // Stitch. The trim was already resolved for this shot as `seg_seam_drop` (declared by the
+        // caller / chain pin / 0 for a fresh shot; -1 = decide here), BEFORE the drive-audio window
+        // was cut against it — do not re-decide it on any path that audio can see. The remaining
+        // choices are the LEGACY head-placement fixed overlap and, when nothing can desync, the
+        // content-adaptive search. LTXAV_CHAIN_OVERLAP_DROP still overrides (it gates the prediction
+        // identically, so the two stay equal).
         bool legacy_head = false;
         if (const char* e = std::getenv("LTXAV_CONT_LEGACY_HEAD")) {
             legacy_head = atoi(e) != 0;
         }
         int drop;
-        if (seg == 0 || segmented_relip || fresh_anchor) {
-            // A fresh shot (scene cut or keyframe shot) generates a wholly new scene — nothing to
-            // trim against the prior segment (and drop=0 keeps its audio aligned, like seg-0).
-            drop = 0;
-        } else if (legacy_head) {
+        if (legacy_head && !(seg == 0 || v2v_shot || fresh_anchor)) {
             drop = overlap_px;  // legacy head-placement re-renders + trims the fixed overlap
+        } else if (seg_seam_drop >= 0) {
+            // FIXED for this shot — declared by the caller, pinned chain-wide, or 0 because it is a
+            // fresh shot. The drive window for THIS segment was cut against exactly this number, so
+            // applying it verbatim is what makes picture and track exact. Moving the cut here to
+            // chase the smoothest frame is precisely what desynced them; the seam is instead polished
+            // by the frame-count-preserving tools (exposure match below, optional
+            // LTXAV_SEAM_CROSSFADE), which cannot shift the timeline.
+            //
+            // Clamp so a trim larger than the render cannot silently consume the whole segment
+            // (kept_n=0 -> a shot that vanishes from the timeline and takes its audio with it).
+            // Leaving one frame keeps the chain advancing; A/V exactness is already broken at that
+            // point, so say so loudly.
+            drop = seg_seam_drop;
+            if (drop >= seg_count) {
+                LOG_WARN("generate_video_chain seg %d: seam drop %d >= rendered frames %d — this shot "
+                         "was padded by less than it is trimmed by; clamping to %d (its A/V will be "
+                         "offset by the difference)",
+                         seg, seg_seam_drop, seg_count, std::max(0, seg_count - 1));
+                drop = std::max(0, seg_count - 1);
+            }
         } else {
-            // keyframe-append (default): auto-align the trim to the smoothest continuation of
-            // the prior segment's last kept frame, instead of a fixed overlap_px (the phase
-            // mismatch at a fixed cut is the seam "skip").
+            // keyframe-append, no audio at risk: auto-align the trim to the smoothest continuation of
+            // the prior segment's last kept frame. Centred on 8*K (the block the carried latents
+            // occupy) — centring on overlap_px let the band rail-clip as K shrank.
             drop = ltxav_auto_trim_drop(stitched.empty() ? sd_image_t{} : stitched.back(),
-                                        seg_video, seg_count, overlap_px);
-            LOG_INFO("generate_video_chain: seam auto-trim -> drop %d (fixed overlap_px would be %d)",
-                     drop, overlap_px);
+                                        seg_video, seg_count, seam_drop_8k);
+            LOG_INFO("generate_video_chain: seam auto-trim -> drop %d (8*K centre would be %d)",
+                     drop, seam_drop_8k);
         }
         if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
             // Only pin the trim for genuine continuations. A fresh shot (scene cut / keyframe-fresh /
@@ -15200,7 +15430,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             // getenv returns non-null "" — a bare presence check would `atoi("")==0` and silently
             // force drop=0 (NO seam trim at all — worse than the fixed pin). Only a real integer pins;
             // empty leaves the content-adaptive auto-trim above intact. Mirrors the drop_pred gate.
-            if (e[0] != '\0' && seg > 0 && !(segmented_relip || fresh_anchor)) {
+            if (e[0] != '\0' && seg > 0 && !(v2v_shot || fresh_anchor)) {
                 char* end = nullptr;
                 long  v   = strtol(e, &end, 10);
                 if (end != nullptr && *end == '\0' && v >= 0) {
@@ -15229,7 +15459,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // estimate (drop_pred). Fresh shots / relip anchors carry no meaningful trim, so they
         // do not update the running estimate — the next real continuation keeps predicting from
         // the last genuine continuation.
-        if (seg > 0 && !fresh_anchor && !segmented_relip) {
+        if (seg > 0 && !fresh_anchor && !v2v_shot) {
             last_cont_drop = drop;
         }
         // P1-C: tone-match this segment's kept frames to the prior segment's tail before stitching,
@@ -15323,9 +15553,17 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 }
                 return false;
             }
-            // Fresh shot (scene cut / fresh keyframe) => trim 0; continuation => auto-trim vs the
-            // NEW preceding stitched frame. Mirrors the live-loop drop logic.
-            bool kf_here = chain_params->segment_keyframes != nullptr &&
+            // Fresh shot (v2v source / scene cut / fresh keyframe) => trim 0; continuation =>
+            // auto-trim vs the NEW preceding stitched frame. Mirrors the live-loop drop logic —
+            // including v2v in BOTH its forms (control_frames pixels and banked latent-in).
+            bool v2v_here = (chain_params->segment_control_frames != nullptr &&
+                             chain_params->segment_control_frame_counts != nullptr &&
+                             chain_params->segment_control_frames[seg] != nullptr &&
+                             chain_params->segment_control_frame_counts[seg] > 0) ||
+                            (chain_params->segment_v2v_guide_latent_paths != nullptr &&
+                             chain_params->segment_v2v_guide_latent_paths[seg] != nullptr &&
+                             chain_params->segment_v2v_guide_latent_paths[seg][0] != '\0');
+            bool kf_here = !v2v_here && chain_params->segment_keyframes != nullptr &&
                            chain_params->segment_keyframe_counts != nullptr &&
                            chain_params->segment_keyframe_counts[seg] > 0 &&
                            chain_params->segment_keyframes[seg] != nullptr;
@@ -15341,21 +15579,29 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 }
             }
             bool kf_fresh_here  = kf_here && (seg == 0 || kf_frame0_here);
-            bool scene_cut_here = seg > 0 && !kf_here &&
+            bool scene_cut_here = seg > 0 && !v2v_here && !kf_here &&
                                   chain_params->segment_init_images != nullptr &&
                                   chain_params->segment_init_images[seg] != nullptr &&
                                   chain_params->segment_init_images[seg]->data != nullptr;
-            bool text_scene_cut_here = seg > 0 && !kf_here && !scene_cut_here &&
+            bool text_scene_cut_here = seg > 0 && !v2v_here && !kf_here && !scene_cut_here &&
                                        chain_params->segment_scene_cut != nullptr &&
                                        chain_params->segment_scene_cut[seg] != 0;
-            bool fresh_here = scene_cut_here || kf_fresh_here || text_scene_cut_here;
+            bool fresh_here = seg == 0 || v2v_here || scene_cut_here || kf_fresh_here || text_scene_cut_here;
+            // Same precedence as the live loop: caller-declared per-shot trim first, then the chain
+            // pin, then fresh=0. (The banked .len length-pin below still outranks all of it — a
+            // spliced tail must reproduce the length it was originally stitched at.)
+            const int declared_here = (chain_params->segment_seam_drop_frames != nullptr)
+                                          ? chain_params->segment_seam_drop_frames[seg]
+                                          : -1;
+            const int fixed_here    = (declared_here >= 0) ? declared_here
+                                                           : (fresh_here ? 0 : seam_drop_pin);
             int  drop;
-            if (fresh_here) {
-                drop = 0;
-            } else if (legacy_head_s) {
+            if (legacy_head_s && !fresh_here) {
                 drop = overlap_px;
+            } else if (fixed_here >= 0) {
+                drop = std::min(fixed_here, cnt);
             } else {
-                drop = ltxav_auto_trim_drop(stitched.empty() ? sd_image_t{} : stitched.back(), fr, cnt, overlap_px);
+                drop = ltxav_auto_trim_drop(stitched.empty() ? sd_image_t{} : stitched.back(), fr, cnt, seam_drop_8k);
             }
             if (const char* e = std::getenv("LTXAV_CHAIN_OVERLAP_DROP")) {
                 // Value-gate (see the live-loop pin): empty string = UNPIN, not drop=0. Falls through

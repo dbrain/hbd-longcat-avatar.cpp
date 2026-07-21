@@ -737,6 +737,68 @@ typedef struct {
     const char* chain_audio_full;
     const char* chain_audio_track;
     int         chain_audio_offset_frames;
+    // SEAM DROP PIN (frames of a continuation segment's head that are discarded at the stitch).
+    //
+    // Why a pin exists at all: the drive-audio window for a segment must be cut BEFORE the render
+    // (it conditions it), but the content-adaptive trim (ltxav_auto_trim_drop) can only be measured
+    // AFTER it. With a deliverable track muxed 1:1 against the timeline, that segment's picture is
+    // offset from its audio by exactly (actual_drop - predicted_drop) frames — so A/V is exact IF
+    // AND ONLY IF the trim is a number known a priori. Hence: when the engine owns the audio, the
+    // trim is PINNED and the seam is polished by audio-neutral means (frame-count-preserving:
+    // exposure match, LTXAV_SEAM_CROSSFADE) instead of by moving the cut.
+    //
+    //   > 0  pin every genuine continuation's trim (and its drive-audio prediction) to this value.
+    //        The caller MUST pad each continuation's render length by the same number, so
+    //        produced == requested visible length exactly.
+    //   0    default: pin to 8*K when the engine owns the audio (chain_audio_full/track), else
+    //        run the content-adaptive trim. 8*K is the pixel-frame block the K carried latents
+    //        occupy: the causal VAE decodes them to 1+(K-1)*8 real frames and the model re-renders
+    //        the remaining 7 settling into the uniform 8-frame latent group.
+    //   < 0  force the content-adaptive trim even with engine-owned audio (diagnostics; A/V then
+    //        wanders by the prediction error within each segment).
+    // LTXAV_CHAIN_OVERLAP_DROP (integer, value-gated) still overrides everything.
+    int         cont_seam_drop_frames;
+    // PER-SEGMENT seam drop (n_segments entries; a negative entry = "engine decides", i.e. fall
+    // back to cont_seam_drop_frames / the derived pin). Supersedes cont_seam_drop_frames per shot.
+    //
+    // This exists because the scalar pin is only exact if BOTH sides agree about which shots are
+    // continuations, and that agreement is not free: the caller decides how many head frames to pad
+    // a shot's render by, the engine independently re-derives "is this a fresh shot?" from images /
+    // keyframes / scene-cut flags / v2v sources, and the two rule sets have drifted apart before
+    // (e.g. a guide-edit shot handed over as a banked LATENT carries no control_frames, so the
+    // caller reads it as fresh and pads 0 while the engine reads it as an ordinary continuation).
+    // Any such disagreement silently eats `drop` frames the caller never padded and slides the
+    // whole remaining timeline against the muxed track — the exact failure the pin is meant to end.
+    //
+    // With this array the caller states the number outright: drop[i] = render_frames[i] -
+    // visible_frames[i]. Produced length then equals the requested length for every shot no matter
+    // how either side classifies it, and each segment's drive-audio window is cut against the trim
+    // that is actually applied. The engine still logs a WARN when its own classification disagrees,
+    // because a disagreement is a real bug about how the shot was CONDITIONED (a shot rendered as a
+    // continuation but trimmed as fresh keeps its re-rendered overlap = a visible stutter) — the
+    // array keeps it from becoming an audio desync, it does not make it correct.
+    const int*  segment_seam_drop_frames;
+    // PER-SHOT AUDIO (n_segments entries each; NULL/empty entry = that shot contributes nothing).
+    // Each clip starts at ITS OWN t=0 and owns exactly the span its shot contributes to the
+    // timeline — the "one track for the whole clip" model (chain_audio_full/track) is the special
+    // case of a single clip covering everything, and the two COMPOSE: the whole-clip track is laid
+    // down first as a bed and each per-shot clip then REPLACES its own span (music bed + per-shot
+    // VO). A clip shorter than its shot is padded with silence; longer, it is cut at the shot
+    // boundary — a shot's audio can never bleed into the next shot's.
+    //
+    //   segment_audio_full  — per-shot lip-sync driver (any rate/channels; downmixed to 16k mono)
+    //   segment_audio_track — per-shot deliverable audio, muxed verbatim
+    //
+    // The shot grid is computed BEFORE rendering as visible[i] = render[i] - drop[i], which is only
+    // knowable because the trim is pinned/declared — so supplying per-shot audio implies a pinned
+    // trim (it is forced on, exactly as a whole-clip track forces it). Send
+    // segment_seam_drop_frames alongside: without it the engine cannot tell which mid-chain shots
+    // are fresh and must assume every shot after the first is a continuation.
+    //
+    // No resampling is done: every per-shot TRACK clip must share the rate/channel layout of the
+    // bed (or, with no bed, of the first one loaded). Mismatched clips are skipped with an error.
+    const char** segment_audio_full;
+    const char** segment_audio_track;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

@@ -6,10 +6,19 @@
 // /sdcpp/v1/jobs/{id} endpoints (registered by register_sdcpp_api_endpoints), and the GPU
 // gate uses the /v1/admin/{drain,unload,load} endpoints (register_sdcpp_admin_endpoints).
 //
-// Request (JSON, or multipart with a `request` part + `audio_<i>` wav parts):
+// Request (JSON, or multipart with a `request` part + wav parts: `audio_<i>` pre-sliced per-segment
+// drive (legacy), `audio_full`/`audio_track` whole-timeline drive+deliverable, or
+// `audio_full_<i>`/`audio_track_<i>` PER-SHOT drive+deliverable — each per-shot clip starts at its
+// own shot and is composited over the whole-timeline pair, so a music bed and per-shot VO combine):
 //   { "segments": [ {"prompt": "..."}, ... ]   // OR "prompts": ["...", ...]
 //     "n_segments": N,                          // optional; defaults to segments.length
 //     "cont_latent_frames": 3,                  // K overlap latent frames
+//     "cont_seam_drop_frames": 24,              // optional: pin the seam trim (default: 8*K when
+//                                               //   the engine owns the audio). Pad each
+//                                               //   continuation's render by the SAME number.
+//     "segment_seam_drop_frames": [0, 16, ...], // optional, per shot: frames[i] - visible[i].
+//                                               //   Preferred — produced == requested even if the
+//                                               //   caller and engine classify a shot differently.
 //     "width","height","fps","steps","cfg_scale","sampling_method","scheduler","seed",
 //     "negative_prompt": "",
 //     "init_image": "<base64|data-uri>",        // optional, seg0 i2v (from_json_str loads it)
@@ -218,6 +227,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<std::pair<int, std::string>> audio_parts;  // (segment index, wav bytes)
             std::string audio_full_part;   // whole-timeline drive clip (engine slices it)
             std::string audio_track_part;  // whole-timeline deliverable track (engine muxes it)
+            // Per-shot clips (index, bytes), sparse: audio_full_<i> / audio_track_<i>.
+            std::vector<std::pair<int, std::string>> shot_audio_full_parts;
+            std::vector<std::pair<int, std::string>> shot_audio_track_parts;
             if (req.is_multipart_form_data()) {
                 std::string req_json;
                 if (req.form.has_field("request")) {
@@ -247,6 +259,27 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
                 if (req.form.has_file("audio_track")) {
                     audio_track_part = req.form.get_file("audio_track").content;
+                }
+                // PER-SHOT audio: `audio_full_<i>` / `audio_track_<i>`. Each clip starts at its own
+                // shot and is composited onto the whole-clip bed above (which may be absent). Sparse
+                // by design — a shot with no part contributes nothing — so probe every index rather
+                // than stopping at the first gap, unlike the contiguous pre-sliced audio_<i> loop.
+                int n_seg_hint = body.value("n_segments", 0);
+                if (body.contains("segments") && body["segments"].is_array()) {
+                    n_seg_hint = std::max(n_seg_hint, (int)body["segments"].size());
+                }
+                if (body.contains("prompts") && body["prompts"].is_array()) {
+                    n_seg_hint = std::max(n_seg_hint, (int)body["prompts"].size());
+                }
+                for (int i = 0; i < n_seg_hint; ++i) {
+                    std::string fk = "audio_full_" + std::to_string(i);
+                    std::string tk = "audio_track_" + std::to_string(i);
+                    if (req.form.has_file(fk)) {
+                        shot_audio_full_parts.emplace_back(i, req.form.get_file(fk).content);
+                    }
+                    if (req.form.has_file(tk)) {
+                        shot_audio_track_parts.emplace_back(i, req.form.get_file(tk).content);
+                    }
                 }
             } else {
                 if (req.body.empty()) {
@@ -464,6 +497,46 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             if (!audio_track_part.empty()) {
                 ltx_write_blob((job_dir / "audio" / "track.wav").string(), audio_track_part);
             }
+            // PER-SHOT audio, staged next to the whole-clip bed and re-discovered by path on every
+            // resume/retake exactly like it. Written on the first submit only; the arrays below are
+            // rebuilt from what is on disk, so a retake needs no re-upload.
+            if (!shot_audio_full_parts.empty() || !shot_audio_track_parts.empty()) {
+                fs::create_directories(job_dir / "audio", ec);
+                for (const auto& [idx, bytes] : shot_audio_full_parts) {
+                    ltx_write_blob(
+                        (job_dir / "audio" / ("shot_" + std::to_string(idx) + "_full.wav")).string(), bytes);
+                }
+                for (const auto& [idx, bytes] : shot_audio_track_parts) {
+                    ltx_write_blob(
+                        (job_dir / "audio" / ("shot_" + std::to_string(idx) + "_track.wav")).string(), bytes);
+                }
+            }
+            {
+                // n_segments is authoritative here (the chain object is already built).
+                int n_seg = chain.value("n_segments", 0);
+                if (n_seg <= 0 && chain.contains("prompts") && chain["prompts"].is_array()) {
+                    n_seg = (int)chain["prompts"].size();
+                }
+                json full_paths  = json::array();
+                json track_paths = json::array();
+                bool any_full = false, any_track = false;
+                for (int i = 0; i < n_seg; ++i) {
+                    auto fp = job_dir / "audio" / ("shot_" + std::to_string(i) + "_full.wav");
+                    auto tp = job_dir / "audio" / ("shot_" + std::to_string(i) + "_track.wav");
+                    bool hf = fs::exists(fp, ec);
+                    bool ht = fs::exists(tp, ec);
+                    full_paths.push_back(hf ? fp.string() : std::string());
+                    track_paths.push_back(ht ? tp.string() : std::string());
+                    any_full  = any_full || hf;
+                    any_track = any_track || ht;
+                }
+                if (any_full) {
+                    chain["segment_audio_full"] = full_paths;
+                }
+                if (any_track) {
+                    chain["segment_audio_track"] = track_paths;
+                }
+            }
             if (fs::exists(job_dir / "audio" / "full.wav", ec)) {
                 chain["chain_audio_full"] = (job_dir / "audio" / "full.wav").string();
             }
@@ -473,6 +546,17 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             // Timeline frame at which both clips' t=0 sits (default 0 = clip starts with the render).
             if (body.contains("chain_audio_offset_frames")) {
                 chain["chain_audio_offset_frames"] = body.value("chain_audio_offset_frames", 0);
+            }
+            // Seam trim pin. Send the SAME number the caller padded each continuation's render by:
+            // picture and track are then frame-exact at every seam and the produced segment length
+            // equals the requested visible length. Omit to let the engine derive 8*K.
+            if (body.contains("cont_seam_drop_frames")) {
+                chain["cont_seam_drop_frames"] = body.value("cont_seam_drop_frames", 0);
+            }
+            // Per-shot trim (render - visible). Preferred over the scalar: it holds even when the
+            // caller and the engine disagree about which shots are fresh.
+            if (body.contains("segment_seam_drop_frames")) {
+                chain["segment_seam_drop_frames"] = body["segment_seam_drop_frames"];
             }
             chain["ltx_job_dir"] = job_dir.string();
             chain["resume_from"] = resume_from;

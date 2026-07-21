@@ -687,6 +687,54 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     std::string audio_full    = body.value("chain_audio_full", std::string());
     std::string audio_track   = body.value("chain_audio_track", std::string());
     int         audio_offset_frames = body.value("chain_audio_offset_frames", 0);
+    // Seam trim pin (frames dropped from each continuation's head). The caller MUST pad each
+    // continuation's render by the same number for produced == requested visible length.
+    // 0 = derive 8*K and pin it whenever the engine owns the audio; <0 = force content-adaptive.
+    int         cont_seam_drop = body.value("cont_seam_drop_frames", 0);
+    // Per-segment override: drop[i] = render_frames[i] - visible_frames[i]. Stating it per shot is
+    // what makes produced == requested regardless of whether caller and engine classify a shot as
+    // fresh the same way (they have diverged). A negative/short entry = let the engine decide.
+    // Per-shot audio: each shot's own clip, staged by the route. `full` drives that shot's lip-sync,
+    // `track` is its deliverable audio; both compose onto the whole-clip bed above.
+    std::vector<std::string> seg_audio_full((size_t)n_segments);
+    std::vector<std::string> seg_audio_track((size_t)n_segments);
+    std::vector<const char*> seg_audio_full_ptrs;
+    std::vector<const char*> seg_audio_track_ptrs;
+    auto load_seg_audio = [&](const char* key, std::vector<std::string>& out) {
+        bool any = false;
+        if (body.contains(key) && body[key].is_array()) {
+            const auto& arr = body[key];
+            for (size_t i = 0; i < arr.size() && i < out.size(); ++i) {
+                if (arr[i].is_string()) {
+                    out[i] = arr[i].get<std::string>();
+                    any    = any || !out[i].empty();
+                }
+            }
+        }
+        return any;
+    };
+    if (load_seg_audio("segment_audio_full", seg_audio_full)) {
+        seg_audio_full_ptrs.reserve((size_t)n_segments);
+        for (const auto& s : seg_audio_full) {
+            seg_audio_full_ptrs.push_back(s.empty() ? nullptr : s.c_str());
+        }
+    }
+    if (load_seg_audio("segment_audio_track", seg_audio_track)) {
+        seg_audio_track_ptrs.reserve((size_t)n_segments);
+        for (const auto& s : seg_audio_track) {
+            seg_audio_track_ptrs.push_back(s.empty() ? nullptr : s.c_str());
+        }
+    }
+    std::vector<int> seam_drops;
+    if (body.contains("segment_seam_drop_frames") && body["segment_seam_drop_frames"].is_array()) {
+        seam_drops.assign((size_t)n_segments, -1);
+        const auto& arr = body["segment_seam_drop_frames"];
+        for (size_t i = 0; i < arr.size() && i < seam_drops.size(); ++i) {
+            if (arr[i].is_number_integer()) {
+                seam_drops[i] = arr[i].get<int>();
+            }
+        }
+    }
     std::string output_format = body.value("output_format", std::string("webm"));
     int         output_compression = body.value("output_compression", 90);
 
@@ -946,6 +994,10 @@ bool run_vid_chain_job(ServerRuntime& runtime,
     chain.chain_audio_full   = audio_full.empty() ? nullptr : audio_full.c_str();
     chain.chain_audio_track  = audio_track.empty() ? nullptr : audio_track.c_str();
     chain.chain_audio_offset_frames = audio_offset_frames;
+    chain.cont_seam_drop_frames     = cont_seam_drop;
+    chain.segment_seam_drop_frames  = seam_drops.empty() ? nullptr : seam_drops.data();
+    chain.segment_audio_full        = seg_audio_full_ptrs.empty() ? nullptr : seg_audio_full_ptrs.data();
+    chain.segment_audio_track       = seg_audio_track_ptrs.empty() ? nullptr : seg_audio_track_ptrs.data();
     chain.save_dir           = job_dir.empty() ? nullptr : job_dir.c_str();
     chain.resume_from        = std::max(0, resume_from);
     chain.segment_control_frames = relip_control_starts.empty() ? nullptr : relip_control_starts.data();
