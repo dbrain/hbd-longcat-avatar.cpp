@@ -1685,6 +1685,11 @@ struct WeightAdapter {
 struct GGMLRunnerContext {
     ggml_backend_t backend                                           = nullptr;
     ggml_context* ggml_ctx                                           = nullptr;
+    // Optional graph/cache hooks used by the LongCat Avatar runner. They carry
+    // real caller-owned cache buffers; graph-cut snapshots backend-backed external
+    // inputs before segment execution, so these do not revive the old global
+    // persistent-tensor registry.
+    ggml_cgraph* gf                                                   = nullptr;
     bool flash_attn_enabled                                          = false;
     bool conv2d_direct_enabled                                       = false;
     bool circular_x_enabled                                          = false;
@@ -1694,6 +1699,14 @@ struct GGMLRunnerContext {
     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
     std::function<void(ggml_tensor*, const void*)> set_backend_tensor_data;
+    int sampler_step                                                  = -1;
+    bool cond_kv_cache                                                = false;
+    std::vector<ggml_tensor*>* condkv_k                              = nullptr;
+    std::vector<ggml_tensor*>* condkv_v                              = nullptr;
+    std::vector<ggml_tensor*>* xattn_text_k                          = nullptr;
+    std::vector<ggml_tensor*>* xattn_text_v                          = nullptr;
+    std::vector<ggml_tensor*>* cache_writes                          = nullptr;
+    ggml_tensor* bsa_mask                                             = nullptr;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {
@@ -3376,6 +3389,16 @@ public:
     void set_force_prec_f32(bool force_prec_f32_) {
         force_prec_f32 = force_prec_f32_;
     }
+
+    // Expose immutable linear metadata for specialized runners which split a
+    // packed projection into exact output-row views without materializing the
+    // packed activation (LongCat Avatar's Q/K/V projection).
+    ggml_tensor* get_weight() const { return params.at("weight"); }
+    ggml_tensor* get_bias() const {
+        const auto it = params.find("bias");
+        return it == params.end() ? nullptr : it->second;
+    }
+    bool get_force_prec_f32() const { return force_prec_f32; }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
         ggml_tensor* w = params["weight"];

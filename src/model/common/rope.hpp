@@ -782,6 +782,46 @@ namespace Rope {
         return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
     }
 
+    // Wan-derived continuation models may prepend reference latent frames whose
+    // temporal RoPE position is an explicit anchor rather than the next sequence
+    // position. Keep this alongside gen_wan_pe so the model runner does not need a
+    // forked RoPE implementation.
+    __STATIC_INLINE__ std::vector<float> gen_wan_pe_ref(int t,
+                                                        int h,
+                                                        int w,
+                                                        int pt,
+                                                        int ph,
+                                                        int pw,
+                                                        int bs,
+                                                        int theta,
+                                                        const std::vector<int>& axes_dim,
+                                                        int num_ref_latents,
+                                                        int ref_img_index) {
+        int t_len = (t + pt / 2) / pt;
+        int h_len = (h + ph / 2) / ph;
+        int w_len = (w + pw / 2) / pw;
+        std::vector<std::vector<float>> ids(t_len * h_len * w_len, std::vector<float>(3, 0.0f));
+        for (int ti = 0; ti < t_len; ++ti) {
+            const float temporal = ti < num_ref_latents ? static_cast<float>(ref_img_index)
+                                                         : static_cast<float>(ti - num_ref_latents);
+            for (int yi = 0; yi < h_len; ++yi) {
+                for (int xi = 0; xi < w_len; ++xi) {
+                    auto& id = ids[(ti * h_len + yi) * w_len + xi];
+                    id[0] = temporal;
+                    id[1] = static_cast<float>(yi);
+                    id[2] = static_cast<float>(xi);
+                }
+            }
+        }
+        if (bs > 1) {
+            std::vector<std::vector<float>> repeated;
+            repeated.reserve(ids.size() * bs);
+            for (int i = 0; i < bs; ++i) repeated.insert(repeated.end(), ids.begin(), ids.end());
+            ids = std::move(repeated);
+        }
+        return embed_nd(ids, bs, static_cast<float>(theta), axes_dim);
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> gen_lingbot_video_ids(int t,
                                                                             int h,
                                                                             int w,

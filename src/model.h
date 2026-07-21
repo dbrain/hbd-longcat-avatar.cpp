@@ -51,6 +51,7 @@ enum SDVersion {
     VERSION_LENS,
     VERSION_MINIT2I,
     VERSION_LONGCAT,
+    VERSION_LONGCAT_AVATAR,
     VERSION_PID,
     VERSION_IDEOGRAM4,
     VERSION_SEFI_IMAGE,
@@ -176,6 +177,10 @@ static inline bool sd_version_is_longcat(SDVersion version) {
         return true;
     }
     return false;
+}
+
+static inline bool sd_version_is_longcat_avatar(SDVersion version) {
+    return version == VERSION_LONGCAT_AVATAR;
 }
 
 static inline bool sd_version_is_ernie_image(SDVersion version) {

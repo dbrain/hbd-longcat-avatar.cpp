@@ -83,6 +83,11 @@ struct LTXAVDiffusionExtra {
     const sd::Tensor<float>* video_positions = nullptr;
 };
 
+struct LongCatAvatarDiffusionExtra {
+    // Sampler step controls the cross-step cond/text K/V caches.
+    int step = -1;
+};
+
 struct MiniT2IDiffusionExtra {
     const sd::Tensor<float>* mask = nullptr;
 };
@@ -102,6 +107,7 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           WanDiffusionExtra,
                                           HiDreamO1DiffusionExtra,
                                           LTXAVDiffusionExtra,
+                                          LongCatAvatarDiffusionExtra,
                                           MiniT2IDiffusionExtra,
                                           HunyuanVideoDiffusionExtra>;
 
