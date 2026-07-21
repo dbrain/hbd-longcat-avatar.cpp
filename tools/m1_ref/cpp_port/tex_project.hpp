@@ -850,6 +850,75 @@ static inline Fit fit_similarity(const BBox& sil, const BBox& sub, bool aniso = 
     return f;
 }
 
+// The bbox fit above is deliberately conservative, but a bbox says nothing about a subject with separated
+// hair, an arm away from the torso, or other large concavities.  `fit_mask_overlap` is an opt-in A/B
+// refinement for exactly that case.  It searches a *bounded* uniform scale/translation neighbourhood of
+// the bbox fit and maximises the IoU of the rendered mesh silhouette against the source subject mask.
+//
+// It does NOT look at colour, UVs, or texture samples: the only thing it may improve is registration of
+// two already-matted silhouettes.  The source-mask area is in the IoU denominator, so shrinking the mesh
+// into a convenient interior patch cannot win.  The result is intentionally still a similarity transform:
+// no per-axis warp can hide a real geometry mismatch.
+struct FitMaskScore {
+    float iou = 0.f;
+    int inter = 0, mesh = 0, subject = 0;
+    bool valid = false;
+};
+
+static inline FitMaskScore score_fit_mask_overlap(const ZBuf& z, const std::vector<uint8_t>& subj,
+                                                  const Fit& f, int grid = 2) {
+    FitMaskScore out;
+    if (!f.fitted || subj.size() != (size_t)z.w * z.h || grid < 1) return out;
+    const int gw = (z.w + grid - 1) / grid, gh = (z.h + grid - 1) / grid;
+    std::vector<uint8_t> sm((size_t)gw * gh, 0), mm((size_t)gw * gh, 0);
+    for (int y = 0; y < z.h; y++) for (int x = 0; x < z.w; x++) {
+        if (subj[(size_t)y * z.w + x]) sm[(size_t)(y / grid) * gw + x / grid] = 1;
+    }
+    for (int y = 0; y < z.h; y += grid) for (int x = 0; x < z.w; x += grid) {
+        if (!std::isfinite(z.at(x, y))) continue;
+        float ox, oy; f.apply((float)x, (float)y, ox, oy);
+        const int xx = (int)std::floor(ox / grid), yy = (int)std::floor(oy / grid);
+        if (xx >= 0 && xx < gw && yy >= 0 && yy < gh) mm[(size_t)yy * gw + xx] = 1;
+    }
+    for (size_t i = 0; i < mm.size(); i++) {
+        out.mesh += mm[i]; out.subject += sm[i]; out.inter += mm[i] && sm[i];
+    }
+    const int uni = out.mesh + out.subject - out.inter;
+    out.iou = uni ? (float)out.inter / uni : 0.f;
+    out.valid = uni > 0;
+    return out;
+}
+
+// Coarse-to-fine search around `seed`.  The permitted 16% scale and 6% image translation excursions are
+// wide enough to correct a genuine silhouette/bbox disagreement, but narrow enough not to "discover" a
+// different subject in a bad matte.  Callers retain the seed unless this buys a material IoU improvement.
+static inline Fit fit_mask_overlap(const ZBuf& z, const std::vector<uint8_t>& subj, const Fit& seed,
+                                   FitMaskScore* seed_score = nullptr, FitMaskScore* best_score = nullptr) {
+    Fit best = seed;
+    FitMaskScore base = score_fit_mask_overlap(z, subj, seed), winner = base;
+    if (seed_score) *seed_score = base;
+    if (!seed.fitted || !base.valid) { if (best_score) *best_score = winner; return best; }
+    auto consider = [&](float scale_mul, float dx, float dy) {
+        Fit c = seed;
+        c.sx = c.sy = seed.sx * scale_mul;
+        c.tx = seed.tx + dx; c.ty = seed.ty + dy;
+        FitMaskScore s = score_fit_mask_overlap(z, subj, c);
+        if (s.valid && s.iou > winner.iou) { best = c; winner = s; }
+    };
+    // 9 * 7 * 7 = 441 inexpensive 1/2-resolution silhouette comparisons.
+    for (int si = -4; si <= 4; si++) for (int yi = -3; yi <= 3; yi++) for (int xi = -3; xi <= 3; xi++)
+        consider(1.f + 0.04f * si, 0.02f * z.w * xi, 0.02f * z.h * yi);
+    const Fit coarse = best;
+    // Refine tightly around the best coarse result.  Rebase onto `seed` so all candidates remain explicit.
+    const float coarse_scale = coarse.sx / seed.sx;
+    const float coarse_dx = coarse.tx - seed.tx, coarse_dy = coarse.ty - seed.ty;
+    for (int si = -2; si <= 2; si++) for (int yi = -2; yi <= 2; yi++) for (int xi = -2; xi <= 2; xi++)
+        consider(coarse_scale + 0.01f * si, coarse_dx + 0.005f * z.w * xi,
+                 coarse_dy + 0.005f * z.h * yi);
+    if (best_score) *best_score = winner;
+    return best;
+}
+
 // ---------------------------------------------------------------------------------------------
 // UV RASTER — per atlas texel 3D position + interpolated normal + coverage, from the BAKED (chart-split)
 // topology. Structure copied from tex_atlas.hpp:917-953. bt.uvs are NORMALIZED (tex_atlas.hpp:897 divides
@@ -1232,6 +1301,7 @@ struct View {
 //   TEXPROJ_BACK_ALIGN     1       0 = identity (no silhouette fit) for A/B; applies to ALL non-front views
 //   TEXPROJ_FRONT_ALIGN    1       BUG 1 FIX. 0 = restore the old unfitted front ("[FRONT: exact framing]")
 //   TEXPROJ_ALIGN_ANISO    0       1 = per-axis scale instead of uniform min(). A/B lever — see fit_similarity
+//   TEXPROJ_ALIGN_MASK_OPT 0       1 = bounded silhouette-vs-matte IoU refinement after bbox fit (A/B only)
 //   --- BUG 3: the seam ---
 //   TEXPROJ_SEAM_BLEND     0       1 = the 3D fill CROSS-FADES the views across the seam instead of running
 //                                  one inverse-distance mean over a mixed neighbour set. Default OFF.
@@ -1275,6 +1345,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
     const bool do_align = envi("TEXPROJ_BACK_ALIGN", 1) != 0;
     const bool front_align = envi("TEXPROJ_FRONT_ALIGN", 1) != 0;   // BUG 1: the front DOES need the fit
     const bool align_aniso = envi("TEXPROJ_ALIGN_ANISO", 0) != 0;
+    const bool align_mask_opt = envi("TEXPROJ_ALIGN_MASK_OPT", 0) != 0;
     // `auto` = use the file's OWN alpha when it has one, else fall back to `black`. See BUG 3: on the
     // soldier's flux2 back view this is the single largest measured seam contributor, because `black` at
     // 0.05 eats the bearskin and the boots exactly where they touch the silhouette. Default stays `black`
@@ -1478,7 +1549,24 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
                                      "silhouette %.0fx%.0f, subject %.0fx%.0f) — using identity\n",
                              i, v.cam.yaw_deg, v.sil.valid() ? v.sil.w() : 0.f, v.sil.valid() ? v.sil.h() : 0.f,
                              v.sub.valid() ? v.sub.w() : 0.f, v.sub.valid() ? v.sub.h() : 0.f);
-            } else if (cfg.verbose) {
+            } else {
+                if (align_mask_opt && !align_aniso) {
+                    FitMaskScore before, after;
+                    const Fit refined = fit_mask_overlap(v.z, v.subj, v.fit, &before, &after);
+                    // A tiny score bump is raster-grid noise; require a full point of silhouette IoU before
+                    // replacing the proven bbox recipe.  The downstream bg-reject alarm remains mandatory.
+                    if (after.valid && after.iou >= before.iou + 0.01f) {
+                        v.fit = refined;
+                        std::printf("[texproj] view %d align-mask-opt: IoU %.4f -> %.4f; scale=%.4f translate=(%+.2f, %+.2f)\n",
+                                    i, before.iou, after.iou, v.fit.sx, v.fit.tx, v.fit.ty);
+                    } else {
+                        std::printf("[texproj] view %d align-mask-opt: IoU %.4f -> %.4f; kept bbox fit (improvement < 0.01)\n",
+                                    i, before.iou, after.iou);
+                    }
+                } else if (align_mask_opt && align_aniso) {
+                    std::fprintf(stderr, "[texproj] WARN: TEXPROJ_ALIGN_MASK_OPT requires uniform fit; skipped because TEXPROJ_ALIGN_ANISO=1\n");
+                }
+                if (cfg.verbose) {
                 std::printf("[texproj] view %d align: silhouette [%d,%d..%d,%d] %.0fx%.0f  subject [%d,%d..%d,%d] %.0fx%.0f\n",
                             i, v.sil.x0, v.sil.y0, v.sil.x1, v.sil.y1, v.sil.w(), v.sil.h(),
                             v.sub.x0, v.sub.y0, v.sub.x1, v.sub.y1, v.sub.w(), v.sub.h());
@@ -1486,6 +1574,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
                             i, v.fit.sx, v.fit.sy, v.sub.w() / v.sil.w(), v.sub.h() / v.sil.h(),
                             align_aniso ? "aniso" : "min", v.fit.tx, v.fit.ty,
                             is_front ? "   <- FRONT (BUG 1: expected ~1.009 on the soldier)" : "");
+                }
             }
         } else if (cfg.verbose) {
             std::printf("[texproj] view %d align: DISABLED (%s=0) — identity (mask still built for bg-reject)\n",

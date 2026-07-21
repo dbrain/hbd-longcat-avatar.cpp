@@ -87,6 +87,15 @@ int main(int argc, char** argv) {
                     std::printf("            shift @ %-14s (%.0f,%.0f) -> (%.1f,%.1f)  = (%+.2f, %+.2f) px\n",
                                 names[k], px, py, ox, oy, ox - px, oy - py);
                 }
+                if (!aniso) {
+                    texproj::FitMaskScore base, opt;
+                    texproj::Fit refined = texproj::fit_mask_overlap(z, subj, f, &base, &opt);
+                    std::printf("        MASK-IOU: bbox %.4f (%d/%d mesh, %d subject), best %.4f; "
+                                "scale=%.4f translate=(%+.2f, %+.2f)%s\n",
+                                base.iou, base.inter, base.mesh, base.subject, opt.iou,
+                                refined.sx, refined.tx, refined.ty,
+                                opt.iou >= base.iou + 0.01f ? "  [eligible A/B improvement]" : "  [keep bbox]");
+                }
             }
             std::vector<uint8_t> er = subj;
             for (int r = 1; r <= 3; r++) {
