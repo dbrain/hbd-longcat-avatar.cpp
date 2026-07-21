@@ -31,8 +31,12 @@ public:
 
     // SIGKILL is intentional: the child owns CUDA's primary context and all backend
     // pools, so process exit is the only complete/portable VRAM release mechanism.
-    void unload();
+    // Returns only after the child has exited. A false result means the parent
+    // could not prove the CUDA-owning worker is gone, so callers must not admit
+    // a competing GPU workload.
+    bool unload();
     bool loaded() const;
+    int worker_pid() const;
     void drain();
     void reopen();
     bool draining() const;
@@ -42,7 +46,7 @@ public:
 
 private:
     bool ensure_worker_locked(const std::string& model, const std::string& gpu, std::string& error);
-    void unload_locked();
+    bool unload_locked();
     bool wait_until_ready_locked(std::string& error);
     int reserve_loopback_port() const;
     std::vector<std::string> child_args(const std::string& model, int port) const;

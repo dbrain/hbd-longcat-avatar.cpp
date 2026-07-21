@@ -12,6 +12,7 @@
 #include <json.hpp>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -71,12 +72,17 @@ WorkerSupervisor::WorkerSupervisor(std::string argv0,
       default_gpu_(std::move(default_gpu)) {}
 
 WorkerSupervisor::~WorkerSupervisor() {
-    unload();
+    (void)unload();
 }
 
 bool WorkerSupervisor::loaded() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return pid_ > 0;
+}
+
+int WorkerSupervisor::worker_pid() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pid_ > 0 ? pid_ : 0;
 }
 
 bool WorkerSupervisor::draining() const {
@@ -122,24 +128,41 @@ std::map<std::string, std::string> WorkerSupervisor::build_variants(const std::s
     return variants;
 }
 
-void WorkerSupervisor::unload_locked() {
-    if (pid_ > 0) {
-        ::kill(pid_, SIGKILL);
-        int status = 0;
-        while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {}
+bool WorkerSupervisor::unload_locked() {
+    if (pid_ <= 0) {
+        return true;
+    }
+    const int pid = pid_;
+    if (::kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        return false;
+    }
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = ::waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    // ESRCH means it was already gone; ECHILD means no process owned by this
+    // parent remains to retain the CUDA primary context. Any other wait error is
+    // treated as a failed residency transition rather than claiming VRAM is free.
+    if (waited != pid && !(waited < 0 && (errno == ECHILD || errno == ESRCH))) {
+        return false;
     }
     pid_ = -1;
     port_ = 0;
     active_model_.clear();
     active_gpu_.clear();
+    return true;
 }
 
-void WorkerSupervisor::unload() {
+bool WorkerSupervisor::unload() {
     std::lock_guard<std::mutex> lock(mutex_);
-    unload_locked();
+    if (!unload_locked()) {
+        return false;
+    }
     // Koblem's normal gate sequence is drain -> unload; reopening makes a later
     // request able to lazily create a fresh worker without requiring an extra /load.
     draining_.store(false);
+    return true;
 }
 
 int WorkerSupervisor::reserve_loopback_port() const {
@@ -231,7 +254,10 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
         error = "model or GPU switch requires the active worker to be idle";
         return false;
     }
-    unload_locked();
+    if (!unload_locked()) {
+        error = "could not terminate the prior GPU worker";
+        return false;
+    }
 
     port_ = reserve_loopback_port();
     if (port_ == 0) {
@@ -246,6 +272,12 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
         return false;
     }
     if (pid == 0) {
+        // Do not let a supervisor crash/restart orphan a CUDA-owning child.
+        // Explicit /unload still waits for this PID, but parent-death signalling
+        // covers every other exit path as well.
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() == 1) {
+            ::_exit(127);
+        }
         ::setenv("SD_SERVER_WORKER_CHILD", "1", 1);
         // The child receives the selected DiT as --diffusion-model, so retain
         // the complete logical variant map separately for safe in-chain LTX
@@ -269,7 +301,7 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
     active_model_ = model;
     active_gpu_ = gpu;
     if (!wait_until_ready_locked(error)) {
-        unload_locked();
+        (void)unload_locked();
         return false;
     }
     return true;
@@ -400,11 +432,14 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
         const int in_flight = supervisor.in_flight();
         response.set_content(json({{"status", "ok"}, {"busy", in_flight > 0}, {"in_flight", in_flight},
                                    {"draining", supervisor.draining()}, {"loaded", supervisor.loaded()},
-                                   {"loaded_model", supervisor.active_model()}}).dump(),
+                                   {"loaded_model", supervisor.active_model()},
+                                   {"worker_pid", supervisor.worker_pid() > 0 ? json(supervisor.worker_pid()) : json(nullptr)}}).dump(),
                              "application/json");
     });
     server.Get("/v1/gpu/status", [&supervisor](const httplib::Request&, httplib::Response& response) {
-        response.set_content(json({{"loaded", supervisor.loaded()}, {"gpu", supervisor.loaded() ? json(supervisor.active_gpu()) : json(nullptr)}}).dump(),
+        response.set_content(json({{"loaded", supervisor.loaded()},
+                                   {"gpu", supervisor.loaded() ? json(supervisor.active_gpu()) : json(nullptr)},
+                                   {"worker_pid", supervisor.worker_pid() > 0 ? json(supervisor.worker_pid()) : json(nullptr)}}).dump(),
                              "application/json");
     });
     server.Post("/v1/admin/drain", [&supervisor](const httplib::Request&, httplib::Response& response) {
@@ -430,9 +465,17 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
             return;
         }
         const bool was_loaded = supervisor.loaded();
-        supervisor.unload();
+        if (!supervisor.unload()) {
+            response.status = 503;
+            response.set_content(json({{"status", "unload failed"}, {"loaded", supervisor.loaded()},
+                                       {"worker_pid", supervisor.worker_pid()},
+                                       {"cuda_context_released", false}}).dump(),
+                                 "application/json");
+            return;
+        }
         response.set_content(json({{"status", was_loaded ? "unloaded" : "idle"}, {"unloaded", was_loaded},
-                                   {"cuda_context_released", true}, {"forced", force && in_flight > 0}}).dump(),
+                                   {"cuda_context_released", true}, {"worker_pid", nullptr},
+                                   {"forced", force && in_flight > 0}}).dump(),
                              "application/json");
     });
     server.Post("/v1/admin/load", [&supervisor](const httplib::Request&, httplib::Response& response) {
