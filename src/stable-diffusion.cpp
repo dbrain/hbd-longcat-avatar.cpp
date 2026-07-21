@@ -6928,8 +6928,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             auto full_audio = LONGCAT_AUDIO::build_full_audio_emb(whisper, video_length, audio_config);
             sd::Tensor<float> first;
             sd::Tensor<float> latter;
+            // The VAE may align a requested pixel-frame count before building
+            // latents.  Audio projection must follow that actual latent
+            // timeline, not the pre-alignment request, otherwise short Avatar
+            // clips build incompatible audio tensors (for example 16 vs 4).
+            const int audio_video_frames = sd_ctx->sd->latent_frames_to_video_frames(T);
             const int latent_audio_frames = LONGCAT_AUDIO::build_proj_inputs(full_audio,
-                                                                               request.frames,
+                                                                               audio_video_frames,
                                                                                audio_config,
                                                                                first,
                                                                                latter,
