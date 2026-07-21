@@ -21,7 +21,7 @@ LABEL="${4:-$(basename "$OUT")}"
 
 [[ -f "$REFINED" ]] || { echo "missing refined mesh: $REFINED" >&2; exit 2; }
 [[ -f "$IMAGE" ]] || { echo "missing source image: $IMAGE" >&2; exit 2; }
-for bin in native_texture_run.sh native_texture_rebake.sh verify_native_texture_asset.sh texture_rebake_native mesh_sample_main rig_texture_chain.sh rig_score mesh_topo; do
+for bin in native_texture_run.sh native_texture_rebake.sh verify_native_texture_asset.sh verify_native_texture_delivery.sh texture_rebake_native mesh_sample_main rig_texture_chain.sh rig_score mesh_topo; do
   [[ -x "$CP/shootout/$bin" || -x "$CP/$bin" ]] || { echo "missing executable: $bin" >&2; exit 2; }
 done
 
@@ -243,6 +243,7 @@ done
 # publishing a Hymotion asset.
 if [[ -z "$SELECTED_RIG" ]]; then
   write_texture_delivery_manifest rejected
+  "$CP/shootout/verify_native_texture_delivery.sh" "$OUT"
   cat >"$OUT/run-status.txt" <<EOF
 texture_lods=succeeded
 rig_state=rejected
@@ -270,6 +271,7 @@ published_hymotion_rig=hymotion_rigged.glb
 EOF
 
 write_texture_delivery_manifest succeeded "$SELECTED_RIG"
+"$CP/shootout/verify_native_texture_delivery.sh" "$OUT"
 
 cat >"$OUT/stages.json" <<JSON
 {"subject":"$LABEL · native refined-mesh image-to-rig runbook","input":"input.png","stages":[
