@@ -22,6 +22,10 @@ struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
     std::string serve_html_path;
+    // Optional alternate DiT used by the worker-isolated `model: "edit"`
+    // contract. A variant change recycles the CUDA child instead of retaining
+    // old allocations in a long-lived context.
+    std::string diffusion_model_edit_path;
     bool normal_exit = false;
     bool verbose     = false;
     bool color       = false;

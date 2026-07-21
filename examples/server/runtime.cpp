@@ -229,6 +229,7 @@ ArgOptions SDSvrParams::get_options() {
     options.string_options = {
         {"-l", "--listen-ip", "server listen ip (default: 127.0.0.1)", 0, &listen_ip},
         {"", "--serve-html-path", "path to HTML file to serve at root (optional)", 0, &serve_html_path},
+        {"", "--diffusion-model-edit", "alternate DiT GGUF for model=edit worker requests", 0, &diffusion_model_edit_path},
     };
 
     options.int_options = {

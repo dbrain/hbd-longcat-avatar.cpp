@@ -77,6 +77,7 @@ add_executable(${TARGET}
     routes_longcat.cpp
     routes_wan.cpp
     routes_gpu_sharing.cpp
+    worker_supervisor.cpp
 )
 if(APPLE)
     sd_set_macos_rpaths(${TARGET})
@@ -101,6 +102,14 @@ endif()
 if(SD_WEBM)
     target_compile_definitions(${TARGET} PRIVATE SD_USE_WEBM)
     target_link_libraries(${TARGET} PRIVATE webm)
+    if(SD_VPX_FOUND)
+        target_compile_definitions(${TARGET} PRIVATE SD_USE_VPX)
+        target_link_libraries(${TARGET} PRIVATE vpx)
+    endif()
+    if(SD_OPUS_FOUND)
+        target_compile_definitions(${TARGET} PRIVATE SD_USE_OPUS)
+        target_link_libraries(${TARGET} PRIVATE opus)
+    endif()
 endif()
 
 # due to httplib; it contains a pragma for MSVC, but other things need explicit flags

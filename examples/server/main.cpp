@@ -12,6 +12,7 @@
 #include "common/resource_owners.hpp"
 #include "routes.h"
 #include "runtime.h"
+#include "worker_supervisor.h"
 
 #ifdef HAVE_INDEX_HTML
 #include "frontend/dist/gen_index_html.h"
@@ -84,6 +85,34 @@ int main(int argc, const char** argv) {
     LOG_DEBUG("%s", svr_params.to_string().c_str());
     LOG_DEBUG("%s", ctx_params.to_string().c_str());
     LOG_DEBUG("%s", default_gen_params.to_string().c_str());
+
+    // The supervisor is deliberately created before new_sd_ctx(). It remains
+    // CUDA-free and proxies normal server traffic into a lazy child; /unload
+    // SIGKILLs that child, releasing the complete CUDA primary context instead
+    // of merely returning the DiT's buffers to a process-local allocator.
+    if (worker_isolation_requested() && !worker_isolation_child()) {
+        std::vector<std::string> original_args;
+        original_args.reserve(static_cast<size_t>(argc > 0 ? argc - 1 : 0));
+        for (int i = 1; i < argc; ++i) {
+            original_args.emplace_back(argv[i]);
+        }
+        const char* default_gpu = std::getenv("WORKER_DEFAULT_GPU");
+        WorkerSupervisor supervisor(argv[0],
+                                    std::move(original_args),
+                                    ctx_params.diffusion_model_path,
+                                    svr_params.diffusion_model_edit_path,
+                                    default_gpu == nullptr ? "" : default_gpu);
+        httplib::Server server;
+        server.set_payload_max_length(512ull * 1024 * 1024);
+        server.set_read_timeout(60 * 60, 0);
+        server.set_write_timeout(60 * 60, 0);
+        server.set_idle_interval(60, 0);
+        register_worker_supervisor_endpoints(server, supervisor);
+        LOG_INFO("worker isolation enabled: CUDA-free supervisor listening on http://%s:%d\n",
+                 svr_params.listen_ip.c_str(), svr_params.listen_port);
+        server.listen(svr_params.listen_ip, svr_params.listen_port);
+        return 0;
+    }
 
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(false);
     SDCtxPtr sd_ctx(new_sd_ctx(&sd_ctx_params));
