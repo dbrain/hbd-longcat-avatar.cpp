@@ -249,9 +249,25 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
         bool generated = false;
-        if (job.wan_vace_prompts.empty()) {
-            generated = generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio);
-        } else {
+        if (!job.ltx_prompts.empty()) {
+            std::vector<const char*> prompts;
+            prompts.reserve(job.ltx_prompts.size());
+            for (const auto& prompt : job.ltx_prompts) {
+                prompts.push_back(prompt.c_str());
+            }
+            sd_vid_chain_params_t chain = {};
+            chain.n_segments = static_cast<int>(prompts.size());
+            chain.segment_prompts = prompts.data();
+            chain.cont_latent_frames = job.ltx_cont_latent_frames;
+            chain.start_segment = job.ltx_resume_from;
+            chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();
+            generated = generate_video_chain(runtime.sd_ctx,
+                                              &params,
+                                              &chain,
+                                              &raw_results,
+                                              &num_results,
+                                              &generated_audio);
+        } else if (!job.wan_vace_prompts.empty()) {
             std::vector<const char*> prompts;
             prompts.reserve(job.wan_vace_prompts.size());
             for (const auto& prompt : job.wan_vace_prompts) {

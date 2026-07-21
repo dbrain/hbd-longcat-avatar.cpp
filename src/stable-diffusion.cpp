@@ -3630,6 +3630,11 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->vace_cont_latent_channels              = 0;
     sd_vid_gen_params->vace_cont_frames                       = 0;
     sd_vid_gen_params->vace_cont_latent_drop_tail             = 0;
+    sd_vid_gen_params->cont_latent                            = nullptr;
+    sd_vid_gen_params->cont_latent_width                      = 0;
+    sd_vid_gen_params->cont_latent_height                     = 0;
+    sd_vid_gen_params->cont_latent_frames                     = 0;
+    sd_vid_gen_params->cont_latent_channels                   = 0;
     sd_vid_gen_params->audio_path                            = nullptr;
     sd_vid_gen_params->audio_frame_offset                    = 0;
     sd_vid_gen_params->bsa_enabled                           = 0;
@@ -5652,7 +5657,55 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             return std::nullopt;
         }
 
-        if (!start_image.empty() || !end_image.empty()) {
+        if (sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+            // LTX chain continuation: retain the sampled video-space tail directly
+            // as fixed leading context for the next window. This stays entirely in
+            // latent space; decoding is only needed when rebuilding a durable prefix.
+            latents.init_latent = sd_ctx->sd->generate_init_latent(request->width,
+                                                                    request->height,
+                                                                    request->frames,
+                                                                    true);
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+            const int64_t width = latents.init_latent.shape()[0];
+            const int64_t height = latents.init_latent.shape()[1];
+            const int64_t frames = latents.init_latent.shape()[2];
+            const int64_t channels = latents.init_latent.shape()[3];
+            const int64_t carried_frames = sd_vid_gen_params->cont_latent_frames;
+            if (sd_vid_gen_params->cont_latent_width != width ||
+                sd_vid_gen_params->cont_latent_height != height ||
+                sd_vid_gen_params->cont_latent_channels != channels ||
+                carried_frames <= 0 || carried_frames > frames) {
+                LOG_ERROR("LTX continuation latent shape mismatch: got %dx%dx%dx%d, expected %lldx%lldx1..%lldx%lld",
+                          sd_vid_gen_params->cont_latent_width,
+                          sd_vid_gen_params->cont_latent_height,
+                          sd_vid_gen_params->cont_latent_frames,
+                          sd_vid_gen_params->cont_latent_channels,
+                          (long long)width,
+                          (long long)height,
+                          (long long)frames,
+                          (long long)channels);
+                return std::nullopt;
+            }
+            sd::Tensor<float> continuation({width, height, carried_frames, channels, 1});
+            std::memcpy(continuation.data(),
+                        sd_vid_gen_params->cont_latent,
+                        static_cast<size_t>(continuation.numel()) * sizeof(float));
+            float mask_value = 0.f;
+            if (const char* configured = std::getenv("LTXAV_CONT_OVERLAP_MASK")) {
+                mask_value = std::clamp(static_cast<float>(atof(configured)), 0.f, 1.f);
+            }
+            if (!apply_ltxav_condition_by_latent_index(&latents.init_latent,
+                                                       &latents.denoise_mask,
+                                                       continuation,
+                                                       0,
+                                                       "continuation",
+                                                       mask_value)) {
+                return std::nullopt;
+            }
+            LOG_INFO("LTX continuation: pinned %lld carried latent frame(s), mask=%.2f",
+                     (long long)carried_frames,
+                     mask_value);
+        } else if (!start_image.empty() || !end_image.empty()) {
             if (!start_image.empty() && !end_image.empty()) {
                 LOG_INFO("FLF2V");
             } else if (!start_image.empty()) {
@@ -6968,19 +7021,19 @@ static sd_image_t copy_video_frame(const sd_image_t& source) {
     return copy;
 }
 
-static sd_image_t* decode_wan_vace_banked_latent(sd_ctx_t* sd_ctx, const std::string& path, int* count_out) {
+static sd_image_t* decode_banked_video_latent(sd_ctx_t* sd_ctx, const std::string& path, int* count_out) {
     if (count_out != nullptr) {
         *count_out = 0;
     }
     try {
         auto latent = sd::load_tensor_from_file_as_tensor<float>(path);
         if (latent.empty()) {
-            LOG_ERROR("Wan VACE resume bank %s is empty", path.c_str());
+            LOG_ERROR("video continuation bank %s is empty", path.c_str());
             return nullptr;
         }
         auto decoded = sd_ctx->sd->decode_first_stage(latent, true);
         if (decoded.empty()) {
-            LOG_ERROR("Wan VACE could not VAE-decode resume bank %s", path.c_str());
+            LOG_ERROR("could not VAE-decode video continuation bank %s", path.c_str());
             return nullptr;
         }
         const int count = static_cast<int>(decoded.shape()[2]);
@@ -7003,12 +7056,12 @@ static sd_image_t* decode_wan_vace_banked_latent(sd_ctx_t* sd_ctx, const std::st
         }
         return frames;
     } catch (const std::exception& error) {
-        LOG_ERROR("Wan VACE could not load resume bank %s: %s", path.c_str(), error.what());
+        LOG_ERROR("could not load video continuation bank %s: %s", path.c_str(), error.what());
         return nullptr;
     }
 }
 
-static bool save_wan_vace_banked_latent(const std::string& path, const sd::Tensor<float>& latent) {
+static bool save_banked_video_latent(const std::string& path, const sd::Tensor<float>& latent) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output.is_open()) {
         return false;
@@ -7028,6 +7081,259 @@ static bool save_wan_vace_banked_latent(const std::string& path, const sd::Tenso
     output.write(reinterpret_cast<const char*>(latent.data()),
                  static_cast<std::streamsize>(latent.numel() * sizeof(float)));
     return output.good();
+}
+
+SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
+                                 const sd_vid_gen_params_t*   base_params,
+                                 const sd_vid_chain_params_t* chain_params,
+                                 sd_image_t**                 frames_out,
+                                 int*                         num_frames_out,
+                                 sd_audio_t**                 audio_out) {
+    if (frames_out != nullptr) {
+        *frames_out = nullptr;
+    }
+    if (num_frames_out != nullptr) {
+        *num_frames_out = 0;
+    }
+    if (audio_out != nullptr) {
+        *audio_out = nullptr;
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || base_params == nullptr || chain_params == nullptr ||
+        frames_out == nullptr || num_frames_out == nullptr || chain_params->n_segments < 1) {
+        LOG_ERROR("generate_video_chain: invalid arguments");
+        return false;
+    }
+    if (!sd_version_is_ltxav(sd_ctx->sd->version)) {
+        LOG_ERROR("generate_video_chain requires an LTX video model");
+        return false;
+    }
+
+    int carried_frames = std::max(1, chain_params->cont_latent_frames);
+    const int overlap_frames = 1 + (carried_frames - 1) * 8;
+    if (overlap_frames >= base_params->video_frames) {
+        LOG_ERROR("generate_video_chain: continuation overlap %d leaves no new frames in a %d-frame segment",
+                  overlap_frames,
+                  base_params->video_frames);
+        return false;
+    }
+    if (chain_params->start_segment < 0 || chain_params->start_segment >= chain_params->n_segments) {
+        LOG_ERROR("generate_video_chain: invalid resume segment %d/%d",
+                  chain_params->start_segment,
+                  chain_params->n_segments);
+        return false;
+    }
+    if (chain_params->start_segment > 0 && (chain_params->bank_dir == nullptr || chain_params->bank_dir[0] == '\0')) {
+        LOG_ERROR("generate_video_chain: resume requires a durable bank directory");
+        return false;
+    }
+
+    std::vector<sd_image_t> stitched;
+    std::vector<float> previous_tail;
+    int tail_width = 0;
+    int tail_height = 0;
+    int tail_channels = 0;
+    sd_audio_t* chain_audio = nullptr;
+
+    auto release_stitched = [&]() {
+        for (auto& frame : stitched) {
+            free(frame.data);
+        }
+        stitched.clear();
+    };
+    auto fail = [&]() {
+        release_stitched();
+        free_sd_audio(chain_audio);
+        return false;
+    };
+    auto adopt_frames = [&](sd_image_t* segment_frames, int count, int segment) {
+        const int drop = segment == 0 ? 0 : std::min(overlap_frames, count);
+        for (int frame = 0; frame < count; ++frame) {
+            if (frame < drop) {
+                free(segment_frames[frame].data);
+            } else {
+                stitched.push_back(segment_frames[frame]);
+            }
+        }
+        free(segment_frames);
+    };
+    auto extract_tail = [&](const float* raw,
+                            int width,
+                            int height,
+                            int frames,
+                            int channels) -> bool {
+        const int video_channels = sd_ctx->sd->get_latent_channel();
+        if (raw == nullptr || width <= 0 || height <= 0 || frames < carried_frames ||
+            channels < video_channels) {
+            LOG_ERROR("generate_video_chain: invalid exported LTX latent %dx%dx%dx%d for K=%d",
+                      width,
+                      height,
+                      frames,
+                      channels,
+                      carried_frames);
+            return false;
+        }
+        const size_t plane = static_cast<size_t>(width) * height;
+        previous_tail.assign(plane * static_cast<size_t>(carried_frames) * video_channels, 0.f);
+        for (int channel = 0; channel < video_channels; ++channel) {
+            for (int frame = 0; frame < carried_frames; ++frame) {
+                const size_t from = (static_cast<size_t>(channel) * frames + (frames - carried_frames + frame)) * plane;
+                const size_t to = (static_cast<size_t>(channel) * carried_frames + frame) * plane;
+                std::memcpy(previous_tail.data() + to, raw + from, plane * sizeof(float));
+            }
+        }
+        tail_width = width;
+        tail_height = height;
+        tail_channels = video_channels;
+        return true;
+    };
+    auto save_video_latent = [&](const std::string& path,
+                                  const float* raw,
+                                  int width,
+                                  int height,
+                                  int frames,
+                                  int channels) -> bool {
+        const int video_channels = sd_ctx->sd->get_latent_channel();
+        if (raw == nullptr || width <= 0 || height <= 0 || frames <= 0 || channels < video_channels) {
+            return false;
+        }
+        sd::Tensor<float> video({width, height, frames, video_channels, 1});
+        const size_t plane = static_cast<size_t>(width) * height;
+        for (int channel = 0; channel < video_channels; ++channel) {
+            const size_t count = plane * static_cast<size_t>(frames);
+            std::memcpy(video.data() + static_cast<size_t>(channel) * count,
+                        raw + static_cast<size_t>(channel) * count,
+                        count * sizeof(float));
+        }
+        return save_banked_video_latent(path, video);
+    };
+
+    // Rebuild a durable prefix exactly as the original chain stitched it, and
+    // recover the final bank's latent tail for the next sampled window.
+    for (int segment = 0; segment < chain_params->start_segment; ++segment) {
+        const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
+        int count = 0;
+        sd_image_t* banked_frames = decode_banked_video_latent(sd_ctx, path, &count);
+        if (banked_frames == nullptr || count <= 0) {
+            free(banked_frames);
+            return fail();
+        }
+        try {
+            auto banked = sd::load_tensor_from_file_as_tensor<float>(path);
+            if (banked.empty() || banked.dim() < 4 ||
+                !extract_tail(banked.data(),
+                              static_cast<int>(banked.shape()[0]),
+                              static_cast<int>(banked.shape()[1]),
+                              static_cast<int>(banked.shape()[2]),
+                              static_cast<int>(banked.shape()[3]))) {
+                for (int frame = 0; frame < count; ++frame) free(banked_frames[frame].data);
+                free(banked_frames);
+                return fail();
+            }
+        } catch (const std::exception& error) {
+            LOG_ERROR("generate_video_chain: could not restore LTX bank %s: %s", path.c_str(), error.what());
+            for (int frame = 0; frame < count; ++frame) free(banked_frames[frame].data);
+            free(banked_frames);
+            return fail();
+        }
+        adopt_frames(banked_frames, count, segment);
+    }
+
+    for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
+        sd_vid_gen_params_t params = *base_params;
+        params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
+        if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
+            params.prompt = chain_params->segment_prompts[segment];
+        }
+        if (segment > 0) {
+            if (previous_tail.empty()) {
+                LOG_ERROR("generate_video_chain: continuation segment %d has no prior latent tail", segment);
+                return fail();
+            }
+            params.init_image.data = nullptr;
+            params.cont_latent = previous_tail.data();
+            params.cont_latent_width = tail_width;
+            params.cont_latent_height = tail_height;
+            params.cont_latent_frames = carried_frames;
+            params.cont_latent_channels = tail_channels;
+        } else {
+            params.cont_latent = nullptr;
+            params.cont_latent_frames = 0;
+        }
+
+        sd_image_t* segment_frames = nullptr;
+        int segment_count = 0;
+        sd_audio_t* segment_audio = nullptr;
+        float* latent = nullptr;
+        int width = 0;
+        int height = 0;
+        int frames = 0;
+        int channels = 0;
+        if (!generate_video_ex(sd_ctx,
+                               &params,
+                               &segment_frames,
+                               &segment_count,
+                               &segment_audio,
+                               &latent,
+                               &width,
+                               &height,
+                               &frames,
+                               &channels) ||
+            segment_frames == nullptr || segment_count <= 0 || latent == nullptr) {
+            free_sd_audio(segment_audio);
+            free(segment_frames);
+            free(latent);
+            LOG_ERROR("generate_video_chain: LTX window %d failed", segment + 1);
+            return fail();
+        }
+        if (chain_params->bank_dir != nullptr && chain_params->bank_dir[0] != '\0' &&
+            !save_video_latent(std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin",
+                               latent,
+                               width,
+                               height,
+                               frames,
+                               channels)) {
+            LOG_ERROR("generate_video_chain: could not save LTX bank for window %d", segment + 1);
+            free_sd_audio(segment_audio);
+            for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
+            free(segment_frames);
+            free(latent);
+            return fail();
+        }
+        if (segment + 1 < chain_params->n_segments && !extract_tail(latent, width, height, frames, channels)) {
+            free_sd_audio(segment_audio);
+            for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
+            free(segment_frames);
+            free(latent);
+            return fail();
+        }
+        free(latent);
+        if (chain_audio == nullptr && segment == 0) {
+            chain_audio = segment_audio;
+        } else {
+            free_sd_audio(segment_audio);
+        }
+        adopt_frames(segment_frames, segment_count, segment);
+    }
+
+    if (stitched.empty()) {
+        return fail();
+    }
+    auto* output = static_cast<sd_image_t*>(malloc(stitched.size() * sizeof(sd_image_t)));
+    if (output == nullptr) {
+        return fail();
+    }
+    std::memcpy(output, stitched.data(), stitched.size() * sizeof(sd_image_t));
+    *frames_out = output;
+    *num_frames_out = static_cast<int>(stitched.size());
+    if (audio_out != nullptr) {
+        *audio_out = chain_audio;
+    } else {
+        free_sd_audio(chain_audio);
+    }
+    LOG_INFO("generate_video_chain: stitched %d LTX windows -> %d frames",
+             chain_params->n_segments,
+             *num_frames_out);
+    return true;
 }
 
 class ScopedWanVaceEnvironment {
@@ -7138,7 +7444,7 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
             for (int segment = 0; segment < chain_params->start_segment; ++segment) {
                 const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
                 int count = 0;
-                sd_image_t* frames = decode_wan_vace_banked_latent(sd_ctx, path, &count);
+                sd_image_t* frames = decode_banked_video_latent(sd_ctx, path, &count);
                 if (frames == nullptr || count <= 0) {
                     free(frames);
                     return fail();
@@ -7281,9 +7587,9 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
             if (chain_params->bank_dir != nullptr && chain_params->bank_dir[0] != '\0') {
                 sd::Tensor<float> bank({latent_width, latent_height, latent_frames, latent_channels, 1});
                 std::memcpy(bank.data(), prior_latent.data(), count * sizeof(float));
-                if (!save_wan_vace_banked_latent(std::string(chain_params->bank_dir) + "/seg_" +
-                                                      std::to_string(segment) + ".bin",
-                                                  bank)) {
+                if (!save_banked_video_latent(std::string(chain_params->bank_dir) + "/seg_" +
+                                                  std::to_string(segment) + ".bin",
+                                              bank)) {
                     LOG_ERROR("generate_wan_vace_chain: could not save segment %d bank", segment);
                     free(exported_latent);
                     for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);

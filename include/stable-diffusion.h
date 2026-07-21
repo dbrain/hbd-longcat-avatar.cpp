@@ -416,6 +416,15 @@ typedef struct {
     int vace_cont_latent_channels;
     int vace_cont_frames;
     int vace_cont_latent_drop_tail;
+    // LTX multi-segment continuation input. The caller supplies the prior
+    // segment's video-only diffusion-latent tail in ggml-ne order
+    // [width, height, frames, channels, 1]. The LTX path pins that tail at the
+    // head of the next segment, avoiding a lossy VAE decode/re-encode seam.
+    const float* cont_latent;
+    int cont_latent_width;
+    int cont_latent_height;
+    int cont_latent_frames;
+    int cont_latent_channels;
     // LongCat-Video-Avatar 1.5 driving audio.  This is a WAV file consumed by
     // the Whisper audio encoder; the same source track is returned as optional
     // generated audio, trimmed to the rendered clip.
@@ -437,6 +446,18 @@ typedef struct {
     bool circular_x;
     bool circular_y;
 } sd_vid_gen_params_t;
+
+// LTX multi-window render and durable continuation. Completed windows can be
+// saved as `seg_<n>.bin` under `bank_dir`; a non-zero `start_segment` restores
+// that prefix and renders only the remaining windows. Output ownership matches
+// generate_video.
+typedef struct {
+    int n_segments;
+    const char* const* segment_prompts;
+    int cont_latent_frames;
+    int start_segment;
+    const char* bank_dir;
+} sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;
 struct ggml_tensor;
@@ -536,6 +557,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* latent_height_out,
                               int* latent_frames_out,
                               int* latent_channels_out);
+
+SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
+                                 const sd_vid_gen_params_t*   base_params,
+                                 const sd_vid_chain_params_t* chain_params,
+                                 sd_image_t**                 frames_out,
+                                 int*                         num_frames_out,
+                                 sd_audio_t**                 audio_out);
 
 // Wan2.2-VACE multi-window continuation.  Each window carries both its kept
 // decoded pixel tail and the prior sampled latent directly in memory.  The
