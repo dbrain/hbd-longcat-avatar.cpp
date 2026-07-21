@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -521,6 +522,54 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
     }
     R.ok = true;
     return R;
+}
+
+// SkinTokens sometimes emits a semantically complete torso with only two
+// spine segments: Hips -> Spine1 -> Spine2. A direct Mixamo hand-off needs
+// the intervening `Spine` node too. Insert one *only* when the naming pass has
+// unambiguously identified that exact 21/22 topology. The new joint sits
+// halfway from Hips to the existing Spine1 and becomes its parent; its skin
+// column is zero because it is a transform-only intermediary. Child
+// inverse-bind matrices retain the rest pose, so animation of this node still
+// propagates through the hierarchy.
+inline bool synthesize_missing_mixamo_spine(std::vector<float>& joints,
+                                             std::vector<int>& parents,
+                                             std::vector<float>& skin_weights,
+                                             int64_t skin_rows,
+                                             std::string* detail = nullptr) {
+    const int old_j = (int)(joints.size() / 3);
+    if (old_j <= 0 || (int)parents.size() != old_j || skin_rows < 0 ||
+        skin_weights.size() != (size_t)skin_rows * (size_t)old_j) return false;
+    BoneNaming before = name_bones(joints, parents);
+    if (!before.ok || before.named_core != 21) return false;
+    int hips = -1, spine = -1, spine1 = -1, spine2 = -1;
+    for (int i = 0; i < old_j; i++) {
+        if (before.smpl[i] == 0) hips = i;
+        else if (before.smpl[i] == 3) spine = i;
+        else if (before.smpl[i] == 6) spine1 = i;
+        else if (before.smpl[i] == 9) spine2 = i;
+    }
+    // Do not invent anatomy for a general partial skeleton. This narrowly
+    // handles the observed short-torso form, with an already validated Hips /
+    // Spine1 / Spine2 chain and no existing Spine assignment.
+    if (spine >= 0 || hips < 0 || spine1 < 0 || spine2 < 0 || parents[spine1] != hips)
+        return false;
+
+    const int inserted = old_j;
+    for (int d = 0; d < 3; d++)
+        joints.push_back(0.5f * (joints[(size_t)hips * 3 + d] + joints[(size_t)spine1 * 3 + d]));
+    parents.push_back(hips);
+    parents[spine1] = inserted;
+    std::vector<float> expanded((size_t)skin_rows * (size_t)(old_j + 1), 0.f);
+    for (int64_t r = 0; r < skin_rows; r++) {
+        std::memcpy(&expanded[(size_t)r * (old_j + 1)],
+                    &skin_weights[(size_t)r * old_j], (size_t)old_j * sizeof(float));
+    }
+    skin_weights.swap(expanded);
+    BoneNaming after = name_bones(joints, parents);
+    if (!after.ok || after.named_core != 22) return false;
+    if (detail) *detail = "inserted transform-only Mixamo Spine between Hips and Spine1";
+    return true;
 }
 
 // -----------------------------------------------------------------------------------------
