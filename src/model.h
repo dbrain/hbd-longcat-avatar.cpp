@@ -291,6 +291,7 @@ static inline bool sd_version_is_dit(SDVersion version) {
         sd_version_is_lens(version) ||
         sd_version_is_minit2i(version) ||
         sd_version_is_longcat(version) ||
+        sd_version_is_longcat_avatar(version) ||
         sd_version_is_pid(version) ||
         sd_version_is_ideogram4(version) ||
         sd_version_is_sefi_image(version) ||
