@@ -368,7 +368,10 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
         // PID 1 is a normal supervisor PID inside a Docker PID namespace, so
         // compare against the pre-fork parent exactly rather than treating 1
         // as universally orphaned.
-        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != supervisor_pid) {
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+            ::_exit(125);
+        }
+        if (::getppid() != supervisor_pid) {
             ::_exit(126);
         }
         ::setenv("SD_SERVER_WORKER_CHILD", "1", 1);
