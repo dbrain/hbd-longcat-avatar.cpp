@@ -315,7 +315,6 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     SDImageVec results;
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
-    bool wan_resumed = false;
 
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
@@ -332,22 +331,8 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             sd_wan_vace_chain_params_t chain = {};
             chain.n_segments = static_cast<int>(prompts.size());
             chain.segment_prompts = prompts.data();
-            if (job.wan_vace_bank != nullptr && job.wan_vace_bank->completed_segments > 0) {
-                wan_resumed = true;
-                chain.start_segment = job.wan_vace_bank->completed_segments;
-                chain.resume_control_frames = job.wan_vace_bank->control_tail.data();
-                chain.resume_control_frames_size = static_cast<int>(job.wan_vace_bank->control_tail.size());
-                chain.resume_latent = job.wan_vace_bank->latent.data();
-                chain.resume_latent_width = job.wan_vace_bank->latent_width;
-                chain.resume_latent_height = job.wan_vace_bank->latent_height;
-                chain.resume_latent_frames = job.wan_vace_bank->latent_frames;
-                chain.resume_latent_channels = job.wan_vace_bank->latent_channels;
-            }
-            if (job.wan_vace_bank == nullptr) {
-                job.wan_vace_bank = std::make_shared<WanVaceResumeBank>();
-            }
-            chain.on_segment = bank_wan_segment;
-            chain.on_segment_user = job.wan_vace_bank.get();
+            chain.start_segment = job.wan_vace_resume_from;
+            chain.bank_dir = job.wan_vace_bank_dir.empty() ? nullptr : job.wan_vace_bank_dir.c_str();
             generated = generate_wan_vace_chain(runtime.sd_ctx,
                                                  &params,
                                                  &chain,
@@ -361,42 +346,6 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             runtime.gpu_sharing->diffusion_loaded.store(true);
         }
         results.adopt(raw_results, num_results);
-    }
-
-    // A resumed core chain returns only its newly rendered suffix.  Prepend
-    // deep copies of the retained prefix for container encoding; the bank stays
-    // valid for a later resume even after this job's output is released.
-    if (wan_resumed && job.wan_vace_bank != nullptr &&
-        job.wan_vace_bank->completed_segments > 0 && !job.wan_vace_bank->prefix_frames.empty()) {
-        const int suffix_count = results.count();
-        const int prefix_count = static_cast<int>(job.wan_vace_bank->prefix_frames.size());
-        sd_image_t* combined = static_cast<sd_image_t*>(malloc(static_cast<size_t>(prefix_count + suffix_count) * sizeof(sd_image_t)));
-        if (combined == nullptr) {
-            free_sd_audio(generated_audio);
-            error_message = "failed to allocate resumed video frame list";
-            return false;
-        }
-        int copied = 0;
-        for (; copied < prefix_count; ++copied) {
-            combined[copied] = copy_wan_frame(job.wan_vace_bank->prefix_frames[copied]);
-            if (combined[copied].data == nullptr) {
-                break;
-            }
-        }
-        if (copied != prefix_count) {
-            for (int i = 0; i < copied; ++i) {
-                free(combined[i].data);
-            }
-            free(combined);
-            free_sd_audio(generated_audio);
-            error_message = "failed to copy resumed video prefix";
-            return false;
-        }
-        for (int frame = 0; frame < suffix_count; ++frame) {
-            combined[prefix_count + frame] = results[frame];
-            results[frame].data = nullptr;
-        }
-        results.adopt(combined, prefix_count + suffix_count);
     }
 
     num_results = results.count();

@@ -1,11 +1,21 @@
 #include "routes.h"
 
+#include <filesystem>
 #include <string>
 #include <vector>
 
 #include "async_jobs.h"
 
 namespace {
+
+namespace fs = std::filesystem;
+
+fs::path wan_bank_root() {
+    if (const char* configured = getenv("WAN_JOB_DIR"); configured != nullptr && configured[0] != '\0') {
+        return configured;
+    }
+    return "/var/lib/wan-vace/jobs";
+}
 
 bool parse_wan_video_request(const json& body,
                              ServerRuntime& runtime,
@@ -138,29 +148,36 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
                 }
+                fs::path bank_dir;
                 if (!resume_job_id.empty()) {
+                    bank_dir = wan_bank_root() / resume_job_id;
                     const auto prior = manager.jobs.find(resume_job_id);
-                    if (prior == manager.jobs.end() || prior->second->wan_vace_bank == nullptr) {
-                        res.status = 404;
-                        res.set_content(R"({"error":"resume_job_id has no retained Wan continuation state"})", "application/json");
-                        return;
-                    }
-                    const auto& bank = prior->second->wan_vace_bank;
-                    if (prior->second->status == AsyncJobStatus::Queued ||
-                        prior->second->status == AsyncJobStatus::Generating ||
-                        bank->completed_segments <= 0 ||
-                        bank->completed_segments >= static_cast<int>(job->wan_vace_prompts.size())) {
+                    if (prior != manager.jobs.end() &&
+                        (prior->second->status == AsyncJobStatus::Queued || prior->second->status == AsyncJobStatus::Generating)) {
                         res.status = 409;
-                        res.set_content(R"({"error":"resume_job_id is not a resumable partial Wan chain"})", "application/json");
+                        res.set_content(R"({"error":"resume_job_id is still rendering"})", "application/json");
                         return;
                     }
-                    job->wan_vace_bank = bank;
-                    resume_from = bank->completed_segments;
+                    for (; fs::exists(bank_dir / ("seg_" + std::to_string(resume_from) + ".bin")); ++resume_from) {}
+                    if (resume_from <= 0 || resume_from >= static_cast<int>(job->wan_vace_prompts.size())) {
+                        res.status = 404;
+                        res.set_content(R"({"error":"resume_job_id has no resumable Wan latent bank"})", "application/json");
+                        return;
+                    }
+                } else {
+                    job->id = make_async_job_id(manager);
+                    bank_dir = wan_bank_root() / job->id;
                 }
-                if (job->wan_vace_bank == nullptr) {
-                    job->wan_vace_bank = std::make_shared<WanVaceResumeBank>();
+                std::error_code error;
+                fs::create_directories(bank_dir, error);
+                if (error) {
+                    res.status = 500;
+                    res.set_content(json({{"error", "could not create Wan bank directory"}, {"message", error.message()}}).dump(), "application/json");
+                    return;
                 }
-                job->id = make_async_job_id(manager);
+                if (job->id.empty()) job->id = make_async_job_id(manager);
+                job->wan_vace_bank_dir = bank_dir.string();
+                job->wan_vace_resume_from = resume_from;
                 manager.jobs[job->id] = job;
                 manager.queue.push_back(job->id);
             }

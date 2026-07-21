@@ -560,6 +560,10 @@ typedef struct {
     int resume_latent_height;
     int resume_latent_frames;
     int resume_latent_channels;
+    // Optional durable bank.  Each completed window is saved as seg_<n>.bin
+    // under this directory.  When start_segment is non-zero and no in-memory
+    // state is supplied, the chain VAE-decodes this bank to rebuild its prefix.
+    const char* bank_dir;
     // Called after each newly completed window.  `frames` are the kept frames
     // for that window; `latent` is non-NULL whenever another window remains.
     void (*on_segment)(int segment_index,

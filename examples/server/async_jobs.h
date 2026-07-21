@@ -56,6 +56,8 @@ struct AsyncGenerationJob {
     // result schema are deliberately shared with regular video generation.
     std::vector<std::string> wan_vace_prompts;
     std::shared_ptr<WanVaceResumeBank> wan_vace_bank;
+    std::string wan_vace_bank_dir;
+    int wan_vace_resume_from = 0;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;

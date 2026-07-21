@@ -15,6 +15,7 @@
 #include "core/rng.hpp"
 #include "core/rng_mt19937.hpp"
 #include "core/rng_philox.hpp"
+#include "core/tensor_ggml.hpp"
 #include "core/util.h"
 #include "model_loader.h"
 #include "model_manager.h"
@@ -6966,6 +6967,68 @@ static sd_image_t copy_video_frame(const sd_image_t& source) {
     return copy;
 }
 
+static sd_image_t* decode_wan_vace_banked_latent(sd_ctx_t* sd_ctx, const std::string& path, int* count_out) {
+    if (count_out != nullptr) {
+        *count_out = 0;
+    }
+    try {
+        auto latent = sd::load_tensor_from_file_as_tensor<float>(path);
+        if (latent.empty()) {
+            LOG_ERROR("Wan VACE resume bank %s is empty", path.c_str());
+            return nullptr;
+        }
+        auto decoded = sd_ctx->sd->decode_first_stage(latent, true);
+        if (decoded.empty()) {
+            LOG_ERROR("Wan VACE could not VAE-decode resume bank %s", path.c_str());
+            return nullptr;
+        }
+        const int count = static_cast<int>(decoded.shape()[2]);
+        auto* frames = static_cast<sd_image_t*>(calloc(static_cast<size_t>(count), sizeof(sd_image_t)));
+        if (frames == nullptr) {
+            return nullptr;
+        }
+        for (int frame = 0; frame < count; ++frame) {
+            frames[frame] = tensor_to_sd_image(decoded, frame);
+            if (frames[frame].data == nullptr) {
+                for (int i = 0; i < frame; ++i) {
+                    free(frames[i].data);
+                }
+                free(frames);
+                return nullptr;
+            }
+        }
+        if (count_out != nullptr) {
+            *count_out = count;
+        }
+        return frames;
+    } catch (const std::exception& error) {
+        LOG_ERROR("Wan VACE could not load resume bank %s: %s", path.c_str(), error.what());
+        return nullptr;
+    }
+}
+
+static bool save_wan_vace_banked_latent(const std::string& path, const sd::Tensor<float>& latent) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        return false;
+    }
+    const int32_t dimensions = static_cast<int32_t>(latent.dim());
+    const std::string name = "wan_vace_video_latent";
+    const int32_t name_length = static_cast<int32_t>(name.size());
+    const int32_t type = GGML_TYPE_F32;
+    output.write(reinterpret_cast<const char*>(&dimensions), sizeof(dimensions));
+    output.write(reinterpret_cast<const char*>(&name_length), sizeof(name_length));
+    output.write(reinterpret_cast<const char*>(&type), sizeof(type));
+    for (int32_t dimension = 0; dimension < dimensions; ++dimension) {
+        const int32_t length = static_cast<int32_t>(latent.shape()[dimension]);
+        output.write(reinterpret_cast<const char*>(&length), sizeof(length));
+    }
+    output.write(name.data(), name.size());
+    output.write(reinterpret_cast<const char*>(latent.data()),
+                 static_cast<std::streamsize>(latent.numel() * sizeof(float)));
+    return output.good();
+}
+
 class ScopedWanVaceEnvironment {
 public:
     ScopedWanVaceEnvironment() {
@@ -7051,35 +7114,75 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
         return false;
     }
     if (chain_params->start_segment > 0) {
-        if (chain_params->resume_control_frames == nullptr || chain_params->resume_control_frames_size <= 0 ||
-            chain_params->resume_latent == nullptr || chain_params->resume_latent_width <= 0 ||
-            chain_params->resume_latent_height <= 0 || chain_params->resume_latent_frames <= 0 ||
-            chain_params->resume_latent_channels <= 0) {
+        if (chain_params->resume_control_frames != nullptr && chain_params->resume_control_frames_size > 0 &&
+            chain_params->resume_latent != nullptr && chain_params->resume_latent_width > 0 &&
+            chain_params->resume_latent_height > 0 && chain_params->resume_latent_frames > 0 &&
+            chain_params->resume_latent_channels > 0) {
+            for (int frame = 0; frame < chain_params->resume_control_frames_size; ++frame) {
+                sd_image_t copy = copy_video_frame(chain_params->resume_control_frames[frame]);
+                if (copy.data == nullptr) {
+                    clear_tail();
+                    LOG_ERROR("generate_wan_vace_chain: could not copy resume control tail");
+                    return false;
+                }
+                control_tail.push_back(copy);
+            }
+            latent_width = chain_params->resume_latent_width;
+            latent_height = chain_params->resume_latent_height;
+            latent_frames = chain_params->resume_latent_frames;
+            latent_channels = chain_params->resume_latent_channels;
+            const size_t count = static_cast<size_t>(latent_width) * latent_height * latent_frames * latent_channels;
+            prior_latent.assign(chain_params->resume_latent, chain_params->resume_latent + count);
+        } else if (chain_params->bank_dir != nullptr && chain_params->bank_dir[0] != '\0') {
+            for (int segment = 0; segment < chain_params->start_segment; ++segment) {
+                const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
+                int count = 0;
+                sd_image_t* frames = decode_wan_vace_banked_latent(sd_ctx, path, &count);
+                if (frames == nullptr || count <= 0) {
+                    free(frames);
+                    return fail();
+                }
+                const bool continuation = segment > 0;
+                const int first_keep = continuation ? std::min(overlap, count) : 0;
+                const int last_keep = continuation ? std::max(first_keep, count - discard) : count;
+                if (segment + 1 == chain_params->start_segment) {
+                    auto latent = sd::load_tensor_from_file_as_tensor<float>(path);
+                    latent_width = static_cast<int>(latent.shape()[0]);
+                    latent_height = static_cast<int>(latent.shape()[1]);
+                    latent_frames = static_cast<int>(latent.shape()[2]);
+                    latent_channels = static_cast<int>(latent.shape()[3]);
+                    prior_latent.assign(latent.data(), latent.data() + latent.numel());
+                    const int tail_start = std::max(first_keep, last_keep - overlap);
+                    for (int frame = tail_start; frame < last_keep; ++frame) {
+                        sd_image_t copy = copy_video_frame(frames[frame]);
+                        if (copy.data == nullptr) {
+                            for (int i = 0; i < count; ++i) free(frames[i].data);
+                            free(frames);
+                            return fail();
+                        }
+                        control_tail.push_back(copy);
+                    }
+                }
+                for (int frame = 0; frame < count; ++frame) {
+                    if (frame >= first_keep && frame < last_keep) {
+                        stitched.push_back(frames[frame]);
+                    } else {
+                        free(frames[frame].data);
+                    }
+                }
+                free(frames);
+            }
+        } else {
             LOG_ERROR("generate_wan_vace_chain: resume state is incomplete");
             return false;
         }
-        for (int frame = 0; frame < chain_params->resume_control_frames_size; ++frame) {
-            sd_image_t copy = copy_video_frame(chain_params->resume_control_frames[frame]);
-            if (copy.data == nullptr) {
-                clear_tail();
-                LOG_ERROR("generate_wan_vace_chain: could not copy resume control tail");
-                return false;
-            }
-            control_tail.push_back(copy);
-        }
-        latent_width = chain_params->resume_latent_width;
-        latent_height = chain_params->resume_latent_height;
-        latent_frames = chain_params->resume_latent_frames;
-        latent_channels = chain_params->resume_latent_channels;
-        const size_t count = static_cast<size_t>(latent_width) * latent_height * latent_frames * latent_channels;
-        prior_latent.assign(chain_params->resume_latent, chain_params->resume_latent + count);
     }
 
     LOG_INFO("generate_wan_vace_chain: %d windows, overlap=%d, discard=%d, mode=%s",
              chain_params->n_segments, overlap, discard, is_t2v ? "t2v" : "i2v");
     for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
         const bool continuation = segment > 0;
-        const bool need_latent = segment + 1 < chain_params->n_segments;
+        const bool need_latent = true;
         sd_vid_gen_params_t params = *base_params;
         params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
         if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
@@ -7143,33 +7246,46 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
                                                  &segment_frames,
                                                  &segment_count,
                                                  &segment_audio,
-                                                 need_latent ? &exported_latent : nullptr,
-                                                 need_latent ? &out_width : nullptr,
-                                                 need_latent ? &out_height : nullptr,
-                                                 need_latent ? &out_frames : nullptr,
-                                                 need_latent ? &out_channels : nullptr);
+                                                 &exported_latent,
+                                                 &out_width,
+                                                 &out_height,
+                                                 &out_frames,
+                                                 &out_channels);
         free_sd_audio(segment_audio);
         if (!generated || segment_frames == nullptr || segment_count <= 0 ||
-            (need_latent && exported_latent == nullptr)) {
+            exported_latent == nullptr) {
             LOG_ERROR("generate_wan_vace_chain: window %d failed", segment + 1);
             free(segment_frames);
             free(exported_latent);
             return fail();
         }
 
-        if (need_latent) {
+        {
             const size_t count = static_cast<size_t>(out_width) * out_height * out_frames * out_channels;
             prior_latent.assign(exported_latent, exported_latent + count);
             latent_width = out_width;
             latent_height = out_height;
             latent_frames = out_frames;
             latent_channels = out_channels;
+            if (chain_params->bank_dir != nullptr && chain_params->bank_dir[0] != '\0') {
+                sd::Tensor<float> bank({latent_width, latent_height, latent_frames, latent_channels, 1});
+                std::memcpy(bank.data(), prior_latent.data(), count * sizeof(float));
+                if (!save_wan_vace_banked_latent(std::string(chain_params->bank_dir) + "/seg_" +
+                                                      std::to_string(segment) + ".bin",
+                                                  bank)) {
+                    LOG_ERROR("generate_wan_vace_chain: could not save segment %d bank", segment);
+                    free(exported_latent);
+                    for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
+                    free(segment_frames);
+                    return fail();
+                }
+            }
         }
         free(exported_latent);
 
         const int first_keep = continuation ? std::min(overlap, segment_count) : 0;
         const int last_keep = continuation ? std::max(first_keep, segment_count - discard) : segment_count;
-        if (need_latent) {
+        if (segment + 1 < chain_params->n_segments) {
             clear_tail();
             const int tail_start = std::max(first_keep, last_keep - overlap);
             for (int frame = tail_start; frame < last_keep; ++frame) {
