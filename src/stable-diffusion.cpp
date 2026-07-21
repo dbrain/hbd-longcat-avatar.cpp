@@ -3977,6 +3977,44 @@ static scheduler_t resolve_scheduler(sd_ctx_t* sd_ctx,
     return scheduler;
 }
 
+// Wan2.2 lightx2v DMD distill uses a fixed high/low expert sigma grid rather
+// than the generic discrete scheduler.  The server selects it explicitly for
+// the distilled GGUFs with WAN_DISTILL_SIGMAS=1; full-step Wan must retain the
+// normal scheduler.
+static std::vector<float> build_wan_distill_sigmas(int n_high, int n_low, int num_train_timesteps, float shift) {
+    const int boundary_t = num_train_timesteps / 2;
+    n_high = std::max(1, n_high);
+    n_low  = std::max(1, n_low);
+    std::vector<int> ts;
+    for (int i = 0; i < n_high; ++i) {
+        ts.push_back(num_train_timesteps - static_cast<int>(std::lround(
+            static_cast<double>(i) * static_cast<double>(boundary_t) / static_cast<double>(n_high))));
+    }
+    ts.push_back(boundary_t);
+    int last = boundary_t;
+    for (int i = 1; i < n_low; ++i) {
+        last = last > 1 ? last / 2 : 1;
+        ts.push_back(last);
+    }
+    std::vector<float> sigmas;
+    sigmas.reserve(ts.size() + 1);
+    for (int t : ts) {
+        const double r = static_cast<double>(t) / static_cast<double>(num_train_timesteps);
+        sigmas.push_back(static_cast<float>(static_cast<double>(shift) * r /
+                                            (1.0 + (static_cast<double>(shift) - 1.0) * r)));
+    }
+    sigmas.push_back(0.0f);
+    return sigmas;
+}
+
+static float wan_distill_shift(int /* spatial_seq_len */) {
+    if (const char* value = getenv("WAN_DISTILL_SHIFT"); value != nullptr && value[0] != '\0') {
+        const float shift = static_cast<float>(atof(value));
+        if (shift > 0.0f) return shift;
+    }
+    return 7.0f;
+}
+
 static float resolve_eta(sd_ctx_t* sd_ctx,
                          float eta,
                          enum sample_method_t sample_method) {
@@ -4313,6 +4351,18 @@ struct SamplePlan {
                                                       scheduler,
                                                       sd_ctx->sd->version,
                                                       sample_params->extra_sample_args);
+        }
+
+        if (sd_version_is_wan(sd_ctx->sd->version) &&
+            getenv("WAN_DISTILL_SIGMAS") != nullptr &&
+            sample_params->custom_sigmas_count <= 0) {
+            const int n_high = high_noise_sample_steps > 0 ? high_noise_sample_steps : 2;
+            const int n_low  = sample_steps > 0 ? sample_steps : 2;
+            const int seq_len = sd_ctx->sd->get_image_seq_len(request->height, request->width);
+            const float shift = wan_distill_shift(seq_len);
+            sigmas = build_wan_distill_sigmas(n_high, n_low, 1000, shift);
+            LOG_INFO("Wan2.2 DMD distilled schedule: %d high + %d low steps, shift=%.2f (seq_len=%d)",
+                     n_high, n_low, shift, seq_len);
         }
 
         eta = resolve_eta(sd_ctx, eta, sample_method);

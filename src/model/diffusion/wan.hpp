@@ -903,6 +903,19 @@ namespace WAN {
 
             auto x_orig = x;
 
+            // The PAI VACE adapter's block 0 residual is mis-scaled at full
+            // strength with few-step distill.  The VACE chain wrapper sets
+            // VACE_SKIP_BLOCKS=0; keep the control stream threaded to later
+            // blocks but omit the selected residual additions.
+            std::vector<int> vace_skip;
+            if (const char* value = getenv("VACE_SKIP_BLOCKS")) {
+                for (const char* p = value; *p;) {
+                    vace_skip.push_back(std::atoi(p));
+                    while (*p && *p != ',') ++p;
+                    while (*p == ',') ++p;
+                }
+            }
+
             // VACE continuation uses an anchored leading context and a gray
             // reactive tail.  A scalar control strength over-constrains that
             // tail; optionally attenuate it per latent frame while leaving the
@@ -948,20 +961,22 @@ namespace WAN {
                     auto result = vace_block->forward(ctx, c, x_orig, e0, pe, context, context_img_len);
                     auto c_skip = result.first;
                     c           = result.second;
-                    if (vace_ramp != nullptr) {
-                        if (!ggml_is_contiguous(c_skip)) {
-                            c_skip = ggml_cont(ctx->ggml_ctx, c_skip);
+                    if (std::find(vace_skip.begin(), vace_skip.end(), n) == vace_skip.end()) {
+                        if (vace_ramp != nullptr) {
+                            if (!ggml_is_contiguous(c_skip)) {
+                                c_skip = ggml_cont(ctx->ggml_ctx, c_skip);
+                            }
+                            const int64_t dim = c_skip->ne[0];
+                            const int64_t hw = c_skip->ne[1] / vace_t_len;
+                            const int64_t batch = c_skip->ne[2];
+                            auto c4 = ggml_reshape_4d(ctx->ggml_ctx, c_skip, dim, hw, vace_t_len, batch);
+                            c4 = ggml_mul(ctx->ggml_ctx, c4, vace_ramp);
+                            c_skip = ggml_reshape_3d(ctx->ggml_ctx, c4, dim, vace_t_len * hw, batch);
+                        } else {
+                            c_skip = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
                         }
-                        const int64_t dim = c_skip->ne[0];
-                        const int64_t hw = c_skip->ne[1] / vace_t_len;
-                        const int64_t batch = c_skip->ne[2];
-                        auto c4 = ggml_reshape_4d(ctx->ggml_ctx, c_skip, dim, hw, vace_t_len, batch);
-                        c4 = ggml_mul(ctx->ggml_ctx, c4, vace_ramp);
-                        c_skip = ggml_reshape_3d(ctx->ggml_ctx, c4, dim, vace_t_len * hw, batch);
-                    } else {
-                        c_skip = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
+                        x = ggml_add(ctx->ggml_ctx, x, c_skip);
                     }
-                    x           = ggml_add(ctx->ggml_ctx, x, c_skip);
                 }
                 sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i), "x");
                 if (c != nullptr) {
