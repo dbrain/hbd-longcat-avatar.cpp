@@ -150,7 +150,23 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
             std::string drive_audio_bytes;
             std::string track_audio_bytes;
+            std::vector<std::pair<int, std::string>> legacy_audio_parts;
             if (req.is_multipart_form_data()) {
+                // Backward-compatible per-window lip-sync WAVs.  Koblem's
+                // older relip/window path sends contiguous audio_<n> parts;
+                // retain them in the durable LTX bank so retries/resumes keep
+                // exactly the same conditioning inputs.
+                for (int index = 0;; ++index) {
+                    const std::string key = "audio_" + std::to_string(index);
+                    if (!req.form.has_file(key)) break;
+                    const std::string& bytes = req.form.get_file(key).content;
+                    if (bytes.empty()) {
+                        res.status = 400;
+                        res.set_content(json({{"error", key + " must be a non-empty WAV upload"}}).dump(), "application/json");
+                        return;
+                    }
+                    legacy_audio_parts.emplace_back(index, bytes);
+                }
                 if (req.form.has_file("audio_full")) {
                     drive_audio_bytes = req.form.get_file("audio_full").content;
                     if (drive_audio_bytes.empty()) {
@@ -346,7 +362,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 fs::path bank_dir;
                 std::string bank_id;
                 if (!resume_job_id.empty()) {
-                    if (!drive_audio_bytes.empty() || !track_audio_bytes.empty()) {
+                    if (!drive_audio_bytes.empty() || !track_audio_bytes.empty() || !legacy_audio_parts.empty()) {
                         res.status = 400;
                         res.set_content(R"({"error":"resumed LTX jobs reuse their banked audio; do not upload new audio"})", "application/json");
                         return;
@@ -399,6 +415,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return true;
                 };
                 if (!resume_job_id.empty()) {
+                    std::error_code audio_dir_error;
+                    const fs::path legacy_dir = bank_dir / "audio";
+                    if (fs::is_directory(legacy_dir, audio_dir_error)) {
+                        job->ltx_chain_audio_dir = legacy_dir.string();
+                    }
                     const fs::path drive_path = bank_dir / "audio_full.wav";
                     const fs::path track_path = bank_dir / "audio_track.wav";
                     std::error_code audio_error;
@@ -424,6 +445,26 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     res.status = 500;
                     res.set_content(R"({"error":"could not stage LTX audio upload"})", "application/json");
                     return;
+                } else if (!legacy_audio_parts.empty()) {
+                    const fs::path legacy_dir = bank_dir / "audio";
+                    std::error_code audio_dir_error;
+                    fs::create_directories(legacy_dir, audio_dir_error);
+                    if (audio_dir_error) {
+                        res.status = 500;
+                        res.set_content(R"({"error":"could not create LTX legacy audio directory"})", "application/json");
+                        return;
+                    }
+                    for (const auto& [index, bytes] : legacy_audio_parts) {
+                        std::ofstream output(legacy_dir / ("aud_" + std::to_string(index) + ".wav"),
+                                             std::ios::binary | std::ios::trunc);
+                        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                        if (!output.good()) {
+                            res.status = 500;
+                            res.set_content(R"({"error":"could not stage LTX legacy audio upload"})", "application/json");
+                            return;
+                        }
+                    }
+                    job->ltx_chain_audio_dir = legacy_dir.string();
                 } else if (!drive_audio_bytes.empty() || !track_audio_bytes.empty()) {
                     std::ofstream offset_file(bank_dir / "audio_offset_frames", std::ios::trunc);
                     offset_file << audio_offset_frames << '\n';

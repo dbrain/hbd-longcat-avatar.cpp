@@ -7698,6 +7698,16 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 return fail();
             }
             params.drive_audio_path = drive_audio_path.c_str();
+        } else if (chain_params->chain_audio_dir != nullptr && chain_params->chain_audio_dir[0] != '\0') {
+            // Koblem's older windowed relip path sends one already-sliced WAV
+            // per chain segment.  Keep it durable in the job bank and use it
+            // when no whole-timeline drive signal was supplied.
+            drive_audio_path = std::string(chain_params->chain_audio_dir) + "/aud_" +
+                               std::to_string(segment) + ".wav";
+            std::ifstream input(drive_audio_path, std::ios::binary);
+            if (input.good()) {
+                params.drive_audio_path = drive_audio_path.c_str();
+            }
         }
 
         sd_image_t* segment_frames = nullptr;

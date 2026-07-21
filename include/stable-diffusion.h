@@ -497,6 +497,10 @@ typedef struct {
     const char* chain_audio_full;
     const char* chain_audio_track;
     int chain_audio_offset_frames;
+    // Legacy pre-sliced per-window 16 kHz driving WAVs, named aud_<n>.wav.
+    // Kept for the Koblem relip/window API; whole-timeline chain_audio_full
+    // takes precedence when both forms are supplied.
+    const char* chain_audio_dir;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;
