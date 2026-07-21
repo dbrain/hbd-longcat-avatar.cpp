@@ -36,6 +36,7 @@
 #include "model/diffusion/lens.hpp"
 #include "model/diffusion/lingbot_video.hpp"
 #include "model/diffusion/ltxv.hpp"
+#include "longcat_avatar.hpp"
 #include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/mmdit.hpp"
 #include "model/diffusion/model.hpp"
@@ -111,6 +112,7 @@ const char* model_version_to_str[] = {
     "Lens",
     "MiniT2I",
     "Longcat-Image",
+    "Longcat-Video-Avatar",
     "PiD",
     "Ideogram 4",
     "SeFi-Image",
@@ -1160,6 +1162,19 @@ public:
                                                                      version,
                                                                      model_manager,
                                                                      sd_ctx_params->model_args);
+            } else if (sd_version_is_longcat_avatar(version)) {
+                cond_stage_model = std::make_shared<T5CLIPEmbedder>(backend_for(SDBackendModule::TE),
+                                                                    tensor_storage_map,
+                                                                    true,
+                                                                    0,
+                                                                    true,
+                                                                    model_manager,
+                                                                    sd_ctx_params->model_args);
+                diffusion_model = std::make_shared<LongCatAvatarModel>(backend_for(SDBackendModule::DIFFUSION),
+                                                                        tensor_storage_map,
+                                                                        "model.diffusion_model",
+                                                                        version,
+                                                                        model_manager);
             } else if (version == VERSION_HIDREAM_O1) {
                 cond_stage_model = std::make_shared<HiDreamO1::HiDreamO1Conditioner>(backend_for(SDBackendModule::TE),
                                                                                      tensor_storage_map,

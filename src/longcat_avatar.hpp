@@ -1961,6 +1961,10 @@ struct LongCatAvatarModel : public DiffusionModelRunner {
         return avatar.get_desc();
     }
 
+    void runner_done() override {
+        avatar.runner_done();
+    }
+
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
         avatar.get_param_tensors(tensors, prefix);
     }
@@ -1969,16 +1973,24 @@ struct LongCatAvatarModel : public DiffusionModelRunner {
         return 768;
     }
 
-    void set_flash_attention_enabled(bool enabled) {
+    void set_flash_attention_enabled(bool enabled) override {
         avatar.set_flash_attention_enabled(enabled);
     }
 
-    void set_avatar_max_graph_vram_bytes(size_t max_vram_bytes) {
+    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
         avatar.set_max_graph_vram_bytes(max_vram_bytes);
     }
 
-    void set_avatar_circular_axes(bool circular_x, bool circular_y) {
+    void set_stream_layers_enabled(bool enabled) override {
+        avatar.set_stream_layers_enabled(enabled);
+    }
+
+    void set_circular_axes(bool circular_x, bool circular_y) override {
         avatar.set_circular_axes(circular_x, circular_y);
+    }
+
+    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        avatar.set_weight_adapter(adapter);
     }
 
     sd::Tensor<float> compute(int n_threads,

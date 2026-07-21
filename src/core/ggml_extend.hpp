@@ -2960,7 +2960,7 @@ protected:
     }
 
 public:
-    void runner_done() {
+    virtual void runner_done() {
         free_compute_buffer();
         std::vector<ggml_tensor*> tensors_to_release = std::move(this->runner_param_tensors);
         this->runner_param_tensors.clear();
@@ -3162,28 +3162,28 @@ public:
                                 nullptr);
     }
 
-    void set_flash_attention_enabled(bool enabled) {
+    virtual void set_flash_attention_enabled(bool enabled) {
         flash_attn_enabled = enabled;
     }
 
-    void set_conv2d_direct_enabled(bool enabled) {
+    virtual void set_conv2d_direct_enabled(bool enabled) {
         conv2d_direct_enabled = enabled;
     }
 
-    void set_circular_axes(bool circular_x, bool circular_y) {
+    virtual void set_circular_axes(bool circular_x, bool circular_y) {
         circular_x_enabled = circular_x;
         circular_y_enabled = circular_y;
     }
 
-    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
+    virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
         weight_adapter = adapter;
     }
 
-    void set_max_graph_vram_bytes(size_t max_vram_bytes) {
+    virtual void set_max_graph_vram_bytes(size_t max_vram_bytes) {
         max_graph_vram_bytes = max_vram_bytes;
     }
 
-    void set_stream_layers_enabled(bool enabled) {
+    virtual void set_stream_layers_enabled(bool enabled) {
         if (enabled && is_multi_device()) {
             LOG_WARN("%s: --stream-layers is not supported with multiple runtime backends; ignoring",
                      get_desc().c_str());

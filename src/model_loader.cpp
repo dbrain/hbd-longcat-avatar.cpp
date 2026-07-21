@@ -466,6 +466,9 @@ SDVersion ModelLoader::get_sd_version() {
     bool has_attn_1024               = false;
 
     for (auto& [name, tensor_storage] : tensor_storage_map) {
+        if (tensor_storage.name.find("model.diffusion_model.blocks.0.audio_cross_attn.q_linear.weight") != std::string::npos) {
+            return VERSION_LONGCAT_AVATAR;
+        }
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos ||
             tensor_storage.name.find("model.diffusion_model.single_transformer_blocks.") != std::string::npos) {
             is_flux = true;
