@@ -454,6 +454,9 @@ typedef struct {
 typedef struct {
     int n_segments;
     const char* const* segment_prompts;
+    // Optional per-window render lengths. A zero entry uses video_frames from the
+    // base parameters; a continuation window must still leave room for its overlap.
+    const int* segment_video_frames;
     int cont_latent_frames;
     int start_segment;
     const char* bank_dir;

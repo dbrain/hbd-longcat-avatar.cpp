@@ -258,6 +258,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             sd_vid_chain_params_t chain = {};
             chain.n_segments = static_cast<int>(prompts.size());
             chain.segment_prompts = prompts.data();
+            chain.segment_video_frames = job.ltx_segment_frames.empty() ? nullptr : job.ltx_segment_frames.data();
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;
             chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();

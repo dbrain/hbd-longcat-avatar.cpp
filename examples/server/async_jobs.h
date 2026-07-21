@@ -46,6 +46,7 @@ struct AsyncGenerationJob {
     // Non-empty only for /ltx/v1/generate. The same async job and media result
     // lifecycle is used for LTX and Wan chains.
     std::vector<std::string> ltx_prompts;
+    std::vector<int> ltx_segment_frames;
     std::string ltx_bank_dir;
     std::string ltx_bank_id;
     int ltx_resume_from = 0;

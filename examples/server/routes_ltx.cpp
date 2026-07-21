@@ -129,18 +129,28 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
             std::vector<std::string> prompts;
+            std::vector<int> segment_frames;
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
                         prompts.push_back(segment.get<std::string>());
+                        segment_frames.push_back(0);
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
+                        const int frames = segment.value("frames", 0);
+                        if (frames < 0 || (frames > 0 && (frames - 1) % 8 != 0)) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"each LTX segment frames value must be 8k+1"})", "application/json");
+                            return;
+                        }
+                        segment_frames.push_back(frames);
                     }
                 }
             } else if (body.contains("prompts") && body["prompts"].is_array()) {
                 for (const auto& prompt : body["prompts"]) {
                     if (prompt.is_string()) {
                         prompts.push_back(prompt.get<std::string>());
+                        segment_frames.push_back(0);
                     }
                 }
             }
@@ -177,6 +187,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->created_at = unix_timestamp_now();
             job->vid_gen = std::move(request);
             job->ltx_prompts = std::move(prompts);
+            job->ltx_segment_frames = std::move(segment_frames);
             job->ltx_cont_latent_frames = continuation_frames;
             const std::string resume_job_id = body.value("resume_job_id", std::string());
             int resume_from = 0;

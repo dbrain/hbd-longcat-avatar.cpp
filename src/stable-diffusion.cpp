@@ -7155,7 +7155,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
 
     int carried_frames = std::max(1, chain_params->cont_latent_frames);
     const int overlap_frames = 1 + (carried_frames - 1) * (ltx_chain ? 8 : 4);
-    if (overlap_frames >= base_params->video_frames) {
+    if (overlap_frames >= base_params->video_frames &&
+        (chain_params->segment_video_frames == nullptr || chain_params->segment_video_frames[0] <= 0)) {
         LOG_ERROR("generate_video_chain: continuation overlap %d leaves no new frames in a %d-frame segment",
                   overlap_frames,
                   base_params->video_frames);
@@ -7313,6 +7314,16 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
 
     for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
         sd_vid_gen_params_t params = *base_params;
+        if (chain_params->segment_video_frames != nullptr && chain_params->segment_video_frames[segment] > 0) {
+            params.video_frames = chain_params->segment_video_frames[segment];
+        }
+        if (segment > 0 && overlap_frames >= params.video_frames) {
+            LOG_ERROR("generate_video_chain: continuation overlap %d leaves no new frames in segment %d (%d frames)",
+                      overlap_frames,
+                      segment + 1,
+                      params.video_frames);
+            return fail();
+        }
         params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
         if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
             params.prompt = chain_params->segment_prompts[segment];
