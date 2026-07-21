@@ -12,7 +12,8 @@
 #   IMAGE_TO_RIG_TEX_BACK=/absolute/back_rgba.png
 #   IMAGE_TO_RIG_TEX_VIEWS='90=/absolute/right.png -90=/absolute/left.png'
 # A projection is always a hybrid: real-image detail on genuinely observed texels, the
-# stable volume texture everywhere else. A single front photo is not a 360-degree texture.
+# legacy pipeline's stable volume texture everywhere else. It is an A/B, not the native
+# production atlas; a single front photo is not a 360-degree texture.
 # All GPU work is deliberately bound to the physical RTX 3060 (PCI bus order).
 set -euo pipefail
 

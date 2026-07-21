@@ -306,9 +306,10 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
 EOF
 fi
 
-# Projection is deliberately an A/B, never a replacement for native_high_textured.glb: the native
-# generated material remains responsible for every unobserved texel.  The cache's PBR is used only
-# to build an independently inspectable observed-view hybrid when the caller has real extra views.
+# Projection is deliberately an A/B, never a replacement for native_high_textured.glb. The current
+# implementation's fallback for unobserved texels is the separately keyed *legacy* PBR cache, not
+# the native generated atlas; it is therefore an independently inspectable observed-view candidate
+# only when the caller has real extra views.
 #
 # IMAGE_TO_RIG_TEX_VIEWS is retained for shell convenience, but it cannot represent paths containing
 # whitespace and is awkward for a real 4--8 camera turnaround.  The TSV manifest is the production
@@ -423,7 +424,7 @@ if [[ "$PROJECT" != 0 ]]; then
   {
     printf 'mode=observed-view hybrid A/B; native_high_textured.glb remains production default\n'
     printf 'camera_count=%s\n' "$TOTAL_PROJ_CAMERAS"
-    printf 'blend=real observed pixels in linear light; z-buffer + eroded-subject-mask reject; native generated base retained for unobserved texels\n'
+    printf 'blend=real observed pixels in linear light; z-buffer + eroded-subject-mask reject; legacy PBR volume base retained for unobserved texels; native high remains production\n'
     printf 'manifest=%s\n' "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-none}"
     printf 'projection_log=projection.log sha256=%s\n' "$(sha256sum "$PROJ_LOG" | awk '{print $1}')"
     printf 'promotion_requested=%s\n' "$PROJECT_PROMOTE"
