@@ -100,6 +100,10 @@ struct BakedTexture {
     std::vector<float> uvs;             // [Vout*2]  normalized [0,1], glTF convention
     std::vector<uint32_t> faces;        // [Fout*3]
     int chart_count = 0, atlas_count = 0;
+    // Effective unwrap policy, retained in the QC sidecar so an automatic
+    // topology decision is observable and reproducible after a long run.
+    std::string atlas_route = "unknown";
+    float atlas_cone_degrees = 0.f;     // zero means the direct xatlas route
     // Sampling provenance describes the original rasterised surface, not the
     // later filled atlas background. A visually complete PNG must not conceal
     // that the decoded PBR volume missed part of the actual mesh.
@@ -127,12 +131,14 @@ static inline bool write_quality_report(const std::string& path, const BakedText
     const double coverage=atlas_texels ? (double)bt.surface_texels/(double)atlas_texels : 0.0;
     const double missing=bt.surface_texels ? (double)bt.source_missing_texels/(double)bt.surface_texels : 0.0;
     const double unresolved=bt.surface_texels ? (double)bt.unresolved_surface_texels/(double)bt.surface_texels : 0.0;
-    f << "schema_version=2\n"
+    f << "schema_version=3\n"
       << "atlas_width=" << bt.tw << '\n'
       << "atlas_height=" << bt.th << '\n'
       << "atlas_texels=" << atlas_texels << '\n'
       << "chart_count=" << bt.chart_count << '\n'
       << "atlas_count=" << bt.atlas_count << '\n'
+      << "atlas_route=" << bt.atlas_route << '\n'
+      << "atlas_cone_degrees=" << bt.atlas_cone_degrees << '\n'
       << "surface_texels=" << bt.surface_texels << '\n'
       << "surface_coverage_fraction=" << coverage << '\n'
       << "source_sampled_texels=" << bt.source_sampled_texels << '\n'
@@ -969,9 +975,18 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             xatlas::PackCharts(atlas, po);
         }
     };
+    std::string atlas_route="direct";
+    float atlas_cone_degrees=0.f;
     if (effective_precluster && conformal_islands) {
         double tp=_now();
-        float cdeg=getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_precluster ? 45.f : cone_deg);
+        // 60 degrees is the validated automatic conformal-island policy. It
+        // reduced Gilly/Miku chart fragmentation 10--11% while improving the
+        // final-atlas native source-recovery MAE, RMSE and PSNR.  It is only
+        // used after the topology gate has rejected direct xatlas; clean
+        // direct meshes retain their established reference path.
+        float cdeg=getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_precluster ? 60.f : cone_deg);
+        atlas_route="conformal-islands";
+        atlas_cone_degrees=cdeg;
         std::vector<float> split_v; std::vector<uint32_t> split_f, face_materials;
         std::vector<int> split2orig; int ncl=0;
         precluster_split_mesh(in_verts,in_faces,std::cos(cdeg*3.14159265f/180.f),
@@ -1006,6 +1021,8 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     } else if (effective_precluster && !(std::getenv("ATL_PLANAR") || auto_planar)) {
         double tp=_now();
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (std::getenv("ATL_PYREF_XATLAS") ? 90.f : cone_deg);
+        atlas_route="clustered";
+        atlas_cone_degrees=cdeg;
         std::vector<ClusterMesh> clusters;
         const char* cluster_mode = "cumesh-cpu";
         bool use_cluster_sources = false;
@@ -1092,6 +1109,8 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         // xatlas packing pathological on dense hair/clothing meshes such as Miku.  A caller can
         // still request a tighter or wider explicit A/B cone with ATL_CONE.
         float cdeg = getenv("ATL_CONE") ? atof(getenv("ATL_CONE")) : (auto_planar ? 40.f : cone_deg);
+        atlas_route="planar-diagnostic";
+        atlas_cone_degrees=cdeg;
         if (verbose && auto_planar) printf("[atlas] auto planar islands: cone %.0f° (diagnostic fallback; omit ATL_AUTO_PLANAR for conformal islands)\n", cdeg);
         precluster_charts(in_verts, in_faces, std::cos(cdeg*3.14159265f/180.f), uv, uv2orig, uvfaces, facemat, ncl);
         if (verbose){ printf("[atlas] precluster: %d charts (cone %.0f°, %.2fs), %zu uv-verts\n",
@@ -1143,6 +1162,7 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
                         atlas->meshCount, total_v, total_i/3);
 
     BakedTexture bt; bt.tw=W; bt.th=Ht; bt.chart_count=(int)atlas->chartCount; bt.atlas_count=(int)atlas->atlasCount;
+    bt.atlas_route=atlas_route; bt.atlas_cone_degrees=atlas_cone_degrees;
     const int Vout=(int)total_v, Fout=(int)total_i/3;
     bt.verts.resize((size_t)Vout*3); bt.normals.resize((size_t)Vout*3); bt.uvs.resize((size_t)Vout*2);
     bt.faces.resize((size_t)Fout*3);
