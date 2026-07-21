@@ -2,6 +2,7 @@
 #define __SD_CORE_TENSOR_GGML_HPP__
 
 #include <array>
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -120,6 +121,39 @@ namespace sd {
             throw std::runtime_error("incomplete tensor file data: " + file_path);
         }
         return tensor;
+    }
+
+    template <typename T>
+    inline void save_tensor_to_file(const std::string& file_path,
+                                    const Tensor<T>& tensor,
+                                    const std::string& name) {
+        if (tensor.empty() || tensor.dim() > INT32_MAX) {
+            throw std::invalid_argument("cannot save an empty or over-dimensional tensor");
+        }
+        std::ofstream file(file_path, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("failed to open tensor file for writing: " + file_path);
+        }
+
+        const int32_t n_dims = static_cast<int32_t>(tensor.dim());
+        const int32_t length = static_cast<int32_t>(name.size());
+        const int32_t ttype  = static_cast<int32_t>(GGMLTypeTraits<T>::type);
+        file.write(reinterpret_cast<const char*>(&n_dims), sizeof(n_dims));
+        file.write(reinterpret_cast<const char*>(&length), sizeof(length));
+        file.write(reinterpret_cast<const char*>(&ttype), sizeof(ttype));
+        for (const int64_t extent : tensor.shape()) {
+            if (extent > INT32_MAX) {
+                throw std::invalid_argument("tensor dimension exceeds diagnostic file format");
+            }
+            const int32_t dim = static_cast<int32_t>(extent);
+            file.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+        }
+        file.write(name.data(), length);
+        file.write(reinterpret_cast<const char*>(tensor.data()),
+                   static_cast<std::streamsize>(tensor.numel() * sizeof(T)));
+        if (!file.good()) {
+            throw std::runtime_error("failed to write tensor file: " + file_path);
+        }
     }
 
 }  // namespace sd
