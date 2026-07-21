@@ -247,7 +247,13 @@ static inline bool sd_version_uses_flux2_vae(SDVersion version) {
 }
 
 static inline bool sd_version_uses_wan_vae(SDVersion version) {
-    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_qwen_image(version) || sd_version_is_krea2(version) || sd_version_is_anima(version)) {
+    // LongCat Avatar uses the Wan video VAE (the DiT itself is a separate
+    // LongCat Avatar architecture).  Without this classification the generic
+    // model manager constructs AutoEncoderKL and rejects every Wan-VAE tensor
+    // name during startup.
+    if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) ||
+        sd_version_is_longcat_avatar(version) || sd_version_is_qwen_image(version) ||
+        sd_version_is_krea2(version) || sd_version_is_anima(version)) {
         return true;
     }
     return false;
