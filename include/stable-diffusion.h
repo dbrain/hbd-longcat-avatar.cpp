@@ -457,6 +457,10 @@ typedef struct {
     // Optional per-window render lengths. A zero entry uses video_frames from the
     // base parameters; a continuation window must still leave room for its overlap.
     const int* segment_video_frames;
+    // Optional fresh-scene controls. A scene-cut window starts from its prompt without
+    // a continuation tail; an image entry pins its opening frame and also starts fresh.
+    const int* segment_scene_cuts;
+    const sd_image_t* const* segment_init_images;
     int cont_latent_frames;
     int start_segment;
     const char* bank_dir;

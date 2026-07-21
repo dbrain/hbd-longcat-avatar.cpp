@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "common/log.h"
+#include "common/common.h"
 #include "common/media_io.h"
 #include "common/resource_owners.hpp"
 
@@ -245,6 +246,28 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
 
+    std::vector<SDImageOwner> ltx_scene_image_owners;
+    std::vector<const sd_image_t*> ltx_scene_images;
+    if (!job.ltx_prompts.empty()) {
+        ltx_scene_image_owners.resize(job.ltx_prompts.size());
+        ltx_scene_images.resize(job.ltx_prompts.size(), nullptr);
+        for (size_t segment = 1; segment < job.ltx_segment_init_images.size(); ++segment) {
+            const std::string& encoded = job.ltx_segment_init_images[segment];
+            if (encoded.empty()) {
+                continue;
+            }
+            if (!decode_base64_image(encoded,
+                                     3,
+                                     params.width,
+                                     params.height,
+                                     ltx_scene_image_owners[segment])) {
+                error_message = "failed to decode LTX scene image for segment " + std::to_string(segment + 1);
+                return false;
+            }
+            ltx_scene_images[segment] = &ltx_scene_image_owners[segment].get();
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
@@ -259,6 +282,8 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.n_segments = static_cast<int>(prompts.size());
             chain.segment_prompts = prompts.data();
             chain.segment_video_frames = job.ltx_segment_frames.empty() ? nullptr : job.ltx_segment_frames.data();
+            chain.segment_scene_cuts = job.ltx_segment_scene_cuts.empty() ? nullptr : job.ltx_segment_scene_cuts.data();
+            chain.segment_init_images = ltx_scene_images.empty() ? nullptr : ltx_scene_images.data();
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;
             chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();

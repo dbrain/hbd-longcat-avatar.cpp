@@ -7219,8 +7219,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const size_t end = static_cast<size_t>(start + count) * audio->channels;
         chain_audio_samples.insert(chain_audio_samples.end(), audio->data + begin, audio->data + end);
     };
-    auto adopt_frames = [&](sd_image_t* segment_frames, int count, int segment) {
-        const int drop = segment == 0 ? 0 : std::min(overlap_frames, count);
+    auto adopt_frames = [&](sd_image_t* segment_frames, int count, int drop) {
+        drop = std::clamp(drop, 0, count);
         for (int frame = 0; frame < count; ++frame) {
             if (frame < drop) {
                 free(segment_frames[frame].data);
@@ -7309,7 +7309,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             free(banked_frames);
             return fail();
         }
-        adopt_frames(banked_frames, count, segment);
+        const bool fresh_scene = chain_params->segment_scene_cuts != nullptr &&
+                                 chain_params->segment_scene_cuts[segment] != 0;
+        const bool has_scene_image = chain_params->segment_init_images != nullptr &&
+                                     chain_params->segment_init_images[segment] != nullptr &&
+                                     chain_params->segment_init_images[segment]->data != nullptr;
+        adopt_frames(banked_frames, count, segment == 0 || fresh_scene || has_scene_image ? 0 : overlap_frames);
     }
 
     for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
@@ -7317,18 +7322,27 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (chain_params->segment_video_frames != nullptr && chain_params->segment_video_frames[segment] > 0) {
             params.video_frames = chain_params->segment_video_frames[segment];
         }
-        if (segment > 0 && overlap_frames >= params.video_frames) {
+        params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
+        if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
+            params.prompt = chain_params->segment_prompts[segment];
+        }
+        const bool fresh_scene = segment > 0 &&
+                                 ((chain_params->segment_scene_cuts != nullptr && chain_params->segment_scene_cuts[segment] != 0) ||
+                                  (chain_params->segment_init_images != nullptr &&
+                                   chain_params->segment_init_images[segment] != nullptr &&
+                                   chain_params->segment_init_images[segment]->data != nullptr));
+        if (segment > 0 && !fresh_scene && overlap_frames >= params.video_frames) {
             LOG_ERROR("generate_video_chain: continuation overlap %d leaves no new frames in segment %d (%d frames)",
                       overlap_frames,
                       segment + 1,
                       params.video_frames);
             return fail();
         }
-        params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
-        if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
-            params.prompt = chain_params->segment_prompts[segment];
+        if (fresh_scene && chain_params->segment_init_images != nullptr &&
+            chain_params->segment_init_images[segment] != nullptr) {
+            params.init_image = *chain_params->segment_init_images[segment];
         }
-        if (segment > 0) {
+        if (segment > 0 && !fresh_scene) {
             if (previous_tail.empty()) {
                 LOG_ERROR("generate_video_chain: continuation segment %d has no prior latent tail", segment);
                 return fail();
@@ -7394,10 +7408,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return fail();
         }
         free(latent);
-        const int audio_drop = segment == 0 ? 0 : std::min(overlap_frames, segment_count);
+        const int audio_drop = segment == 0 || fresh_scene ? 0 : std::min(overlap_frames, segment_count);
         append_audio(segment_audio, audio_drop, segment_count - audio_drop);
         free_sd_audio(segment_audio);
-        adopt_frames(segment_frames, segment_count, segment);
+        adopt_frames(segment_frames, segment_count, audio_drop);
     }
 
     if (stitched.empty()) {

@@ -130,11 +130,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
             std::vector<std::string> prompts;
             std::vector<int> segment_frames;
+            std::vector<int> segment_scene_cuts;
+            std::vector<std::string> segment_init_images;
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
                         prompts.push_back(segment.get<std::string>());
                         segment_frames.push_back(0);
+                        segment_scene_cuts.push_back(0);
+                        segment_init_images.emplace_back();
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
                         const int frames = segment.value("frames", 0);
@@ -144,6 +148,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             return;
                         }
                         segment_frames.push_back(frames);
+                        segment_scene_cuts.push_back(segment.value("scene_cut", false) ? 1 : 0);
+                        segment_init_images.push_back(segment.value("init_image", std::string()));
                     }
                 }
             } else if (body.contains("prompts") && body["prompts"].is_array()) {
@@ -151,6 +157,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     if (prompt.is_string()) {
                         prompts.push_back(prompt.get<std::string>());
                         segment_frames.push_back(0);
+                        segment_scene_cuts.push_back(0);
+                        segment_init_images.emplace_back();
                     }
                 }
             }
@@ -188,6 +196,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->vid_gen = std::move(request);
             job->ltx_prompts = std::move(prompts);
             job->ltx_segment_frames = std::move(segment_frames);
+            job->ltx_segment_scene_cuts = std::move(segment_scene_cuts);
+            job->ltx_segment_init_images = std::move(segment_init_images);
             job->ltx_cont_latent_frames = continuation_frames;
             const std::string resume_job_id = body.value("resume_job_id", std::string());
             int resume_from = 0;
