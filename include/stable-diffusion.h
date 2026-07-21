@@ -439,6 +439,11 @@ typedef struct {
     // the Whisper audio encoder; the same source track is returned as optional
     // generated audio, trimmed to the rendered clip.
     const char* audio_path;
+    // LTX-AV driving audio. This 16 kHz mono WAV is encoded by an encoder-capable
+    // LTX audio VAE and held fixed while video is denoised, so the generated
+    // motion follows the supplied speech. This is distinct from audio_path,
+    // which remains the LongCat Avatar Whisper input.
+    const char* drive_audio_path;
     // Start position in the driving-audio timeline, measured at the Avatar
     // model's fixed 25 fps.  Zero is the normal single-clip case.
     int audio_frame_offset;

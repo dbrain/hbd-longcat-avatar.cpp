@@ -2381,7 +2381,8 @@ public:
                              int audio_length,
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
-                             const sd::Tensor<float>& video_positions = {}) {
+                             const sd::Tensor<float>& video_positions = {},
+                             bool ltxav_audio_fixed                   = false) {
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
             ~RunnerDoneOnExit() {
@@ -2495,7 +2496,10 @@ public:
             sd::Tensor<float> audio_timesteps_tensor;
             if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
                 timesteps_vec          = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask);
-                audio_timesteps_tensor = sd::Tensor<float>({static_cast<int64_t>(base_timesteps_vec.size())}, base_timesteps_vec);
+                const std::vector<float> audio_timesteps = ltxav_audio_fixed
+                                                               ? std::vector<float>{0.f}
+                                                               : base_timesteps_vec;
+                audio_timesteps_tensor = sd::Tensor<float>({static_cast<int64_t>(audio_timesteps.size())}, audio_timesteps);
             } else {
                 timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask, step);
             }
@@ -4238,6 +4242,7 @@ struct ImageGenerationLatents {
     int64_t video_conditioning_frame_count = 0;
     int64_t video_target_frame_count       = 0;
     int audio_length                       = 0;
+    bool audio_fixed                        = false;
     bool v2v_sdedit                        = false;
 };
 
@@ -4355,7 +4360,8 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<flo
 
 static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
                                                                  const sd::Tensor<float>& video_latent,
-                                                                 const sd::Tensor<float>& audio_latent) {
+                                                                 const sd::Tensor<float>& audio_latent,
+                                                                 float audio_mask_value = 1.f) {
     if (video_mask.empty() || audio_latent.empty()) {
         return video_mask;
     }
@@ -4398,7 +4404,7 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tenso
 
     std::vector<int64_t> audio_mask_shape = video_latent.shape();
     audio_mask_shape[3]                   = extra_ch;
-    auto audio_mask                       = sd::Tensor<float>::ones(audio_mask_shape);
+    auto audio_mask                       = sd::full<float>(audio_mask_shape, audio_mask_value);
     return sd::ops::concat(video_mask_full, audio_mask, 3);
 }
 
@@ -4519,6 +4525,56 @@ static sd::Tensor<float> make_ltxav_empty_audio_latent(int audio_length) {
     constexpr int kLtxavAudioFrequencyBins = 16;
     constexpr int kLtxavAudioChannels      = 8;
     return sd::zeros<float>({kLtxavAudioFrequencyBins, audio_length, kLtxavAudioChannels, 1});
+}
+
+// Load a 16 kHz drive WAV, encode it with the optional LTX audio-VAE encoder,
+// then lay it out in the joint AV latent's [frequency, time, channel, batch]
+// format. The caller holds this latent fixed during video denoising.
+static sd::Tensor<float> encode_ltxav_drive_audio(sd_ctx_t* sd_ctx,
+                                                  const char* wav_path,
+                                                  int audio_length) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || wav_path == nullptr || wav_path[0] == '\0' || audio_length <= 0) {
+        return {};
+    }
+    auto& audio_vae = sd_ctx->sd->audio_vae_model;
+    if (audio_vae == nullptr || !audio_vae->config.has_encoder) {
+        LOG_ERROR("LTX drive audio requires an audio VAE GGUF with encoder weights and mel bases");
+        return {};
+    }
+
+    std::vector<float> wav;
+    if (!LONGCAT_AUDIO::load_wav_16k_mono(wav_path, wav) || wav.empty()) {
+        LOG_ERROR("failed to load LTX drive audio WAV: %s", wav_path);
+        return {};
+    }
+    sd::Tensor<float> waveform({static_cast<int64_t>(wav.size()), 1}, wav);
+    const auto encoded = audio_vae->encode(sd_ctx->sd->n_threads, waveform);
+    constexpr int kFrequencyBins = 16;
+    constexpr int kChannels      = 8;
+    if (encoded.empty() || encoded.dim() < 2 || encoded.shape()[0] != kFrequencyBins * kChannels) {
+        LOG_ERROR("LTX audio VAE produced an invalid drive latent for %s", wav_path);
+        return {};
+    }
+
+    auto output               = make_ltxav_empty_audio_latent(audio_length);
+    const int64_t source_time = encoded.shape()[1];
+    const int64_t copy_time   = std::min(source_time, static_cast<int64_t>(audio_length));
+    const float* source       = encoded.data();
+    float* destination        = output.data();
+    for (int64_t channel = 0; channel < kChannels; ++channel) {
+        for (int64_t time = 0; time < copy_time; ++time) {
+            for (int64_t frequency = 0; frequency < kFrequencyBins; ++frequency) {
+                destination[channel * static_cast<int64_t>(kFrequencyBins) * audio_length + time * kFrequencyBins + frequency] =
+                    source[time * encoded.shape()[0] + channel * kFrequencyBins + frequency];
+            }
+        }
+    }
+    LOG_INFO("LTX drive audio encoded: %s (%zu samples, %lld source tokens -> %d target tokens)",
+             wav_path,
+             wav.size(),
+             source_time,
+             audio_length);
+    return output;
 }
 
 static sd::Tensor<float> resize_ltxav_audio_latent(const sd::Tensor<float>& audio_latent,
@@ -5652,7 +5708,17 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
         latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
-        latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+        const char* drive_audio_path = sd_vid_gen_params->drive_audio_path;
+        if (drive_audio_path != nullptr && drive_audio_path[0] != '\0') {
+            latents.audio_latent = encode_ltxav_drive_audio(sd_ctx, drive_audio_path, latents.audio_length);
+            if (latents.audio_latent.empty()) {
+                LOG_ERROR("LTX drive audio was requested but could not be encoded");
+                return std::nullopt;
+            }
+            latents.audio_fixed = true;
+        } else {
+            latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+        }
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
@@ -6248,7 +6314,8 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         if (!latents.denoise_mask.empty()) {
             latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
                                                                            latents.init_latent,
-                                                                           latents.audio_latent);
+                                                                           latents.audio_latent,
+                                                                           latents.audio_fixed ? 0.f : 1.f);
         }
         latents.init_latent = pack_ltxav_audio_and_video_latents(latents.init_latent, latents.audio_latent);
     }
@@ -6820,7 +6887,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                            latents.audio_length,
                                                            static_cast<float>(request.fps),
                                                            request.cache_params,
-                                                           latents.video_positions);
+                                                           latents.video_positions,
+                                                           latents.audio_fixed);
         int64_t sampling_end          = ggml_time_ms();
         if (x_t_sampled.empty()) {
             LOG_ERROR("sampling(high noise) failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
@@ -6862,7 +6930,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                         latents.audio_length,
                                                         static_cast<float>(request.fps),
                                                         request.cache_params,
-                                                        latents.video_positions);
+                                                        latents.video_positions,
+                                                        latents.audio_fixed);
 
     int64_t sampling_end = ggml_time_ms();
     if (final_latent.empty()) {
@@ -7000,7 +7069,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                             latents.audio_length,
                                             static_cast<float>(hires_request.fps),
                                             hires_request.cache_params,
-                                            hires_video_positions);
+                                            hires_video_positions,
+                                            latents.audio_fixed);
         sampling_end   = ggml_time_ms();
         if (final_latent.empty()) {
             LOG_ERROR("sampling(latent upscale) failed after %.2fs",
