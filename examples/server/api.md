@@ -1265,6 +1265,10 @@ an alias for `video_frames`, and an optional `bsa` object (`enable`, `radius`,
 `self_frame`, `bookend`, `cube_h`, `cube_w`). The route is synchronous and rejects
 concurrent renders with `429`; `GET /health` reports its busy/draining/load state.
 
+Set `segments` or `duration_sec` to use latent-tail continuation. `cont_cond_frames`
+selects the carried latent tail (default `13`); the route preserves the original WAV
+as the delivered audio track across the stitched output.
+
 ### Completion Result
 
 Example completed job:

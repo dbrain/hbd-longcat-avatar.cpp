@@ -1,6 +1,9 @@
 #include "routes.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -8,6 +11,7 @@
 
 #include "async_jobs.h"
 #include "common/media_io.h"
+#include "longcat_audio.hpp"
 
 namespace {
 
@@ -59,6 +63,30 @@ bool decode_avatar_blob(const std::string& value, std::vector<uint8_t>& bytes) {
         encoded = encoded.substr(comma + 1);
     }
     return base64_decode(encoded, bytes) && !bytes.empty();
+}
+
+sd_audio_t* load_avatar_output_audio(const std::string& path, int frame_count, int fps) {
+    std::vector<float> samples;
+    if (!LONGCAT_AUDIO::load_wav_16k_mono(path, samples) || samples.empty()) {
+        return nullptr;
+    }
+    const int safe_fps = std::max(1, fps);
+    const size_t count = std::min(samples.size(),
+                                  static_cast<size_t>(std::max(0, frame_count)) * 16000 / safe_fps);
+    auto* audio = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
+    if (audio == nullptr) {
+        return nullptr;
+    }
+    audio->sample_rate = 16000;
+    audio->channels = 1;
+    audio->sample_count = count;
+    audio->data = static_cast<float*>(malloc(count * sizeof(float)));
+    if (audio->data == nullptr) {
+        free(audio);
+        return nullptr;
+    }
+    std::memcpy(audio->data, samples.data(), count * sizeof(float));
+    return audio;
 }
 
 bool parse_avatar_video_request(const json& body,
@@ -171,6 +199,21 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
             }
             sd_vid_gen_params_t params = request.to_sd_vid_gen_params_t();
             apply_avatar_bsa(body, params);
+            int segment_count = body.value("segments", 1);
+            const int continuation_frames = body.value("cont_cond_frames", 13);
+            if (body.contains("duration_sec") && body["duration_sec"].is_number()) {
+                const int overlap = 1 + (std::max(1, continuation_frames) - 1) * 4;
+                const int new_frames = std::max(1, params.video_frames - overlap);
+                const int target_frames = std::max(1, static_cast<int>(std::round(body["duration_sec"].get<double>() * 25.0)));
+                segment_count = target_frames <= params.video_frames
+                                    ? 1
+                                    : 1 + (target_frames - params.video_frames + new_frames - 1) / new_frames;
+            }
+            if (segment_count < 1 || continuation_frames < 1) {
+                res.status = 400;
+                res.set_content(R"({"error":"segments and cont_cond_frames must be positive"})", "application/json");
+                return;
+            }
 
             SDImageVec frames;
             sd_audio_t* generated_audio = nullptr;
@@ -178,7 +221,21 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
             {
                 std::lock_guard<std::mutex> lock(*runtime->sd_ctx_mutex);
                 sd_image_t* raw_frames = nullptr;
-                if (!generate_video(runtime->sd_ctx, &params, &raw_frames, &frame_count, &generated_audio)) {
+                bool generated = false;
+                if (segment_count == 1) {
+                    generated = generate_video(runtime->sd_ctx, &params, &raw_frames, &frame_count, &generated_audio);
+                } else {
+                    sd_vid_chain_params_t chain = {};
+                    chain.n_segments = segment_count;
+                    chain.cont_latent_frames = continuation_frames;
+                    generated = generate_video_chain(runtime->sd_ctx,
+                                                       &params,
+                                                       &chain,
+                                                       &raw_frames,
+                                                       &frame_count,
+                                                       &generated_audio);
+                }
+                if (!generated) {
                     free_sd_audio(generated_audio);
                     res.status = 500;
                     res.set_content(R"({"error":"avatar generation failed"})", "application/json");
@@ -188,6 +245,10 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
                 if (runtime->gpu_sharing != nullptr) {
                     runtime->gpu_sharing->diffusion_loaded.store(true);
                 }
+            }
+            if (segment_count > 1) {
+                free_sd_audio(generated_audio);
+                generated_audio = load_avatar_output_audio(audio_file.string(), frames.count(), request.gen_params.fps);
             }
             if (frames.count() <= 0) {
                 free_sd_audio(generated_audio);
@@ -207,7 +268,7 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
                 res.set_content(R"({"error":"could not encode avatar video"})", "application/json");
                 return;
             }
-            res.set_header("X-Avatar-Segments", "1");
+            res.set_header("X-Avatar-Segments", std::to_string(segment_count));
             res.set_header("X-Avatar-Offload", "false");
             res.set_header("X-Avatar-Render_Sec", "0");
             res.set_content(std::string(reinterpret_cast<const char*>(video.data()), video.size()), "video/webm");
