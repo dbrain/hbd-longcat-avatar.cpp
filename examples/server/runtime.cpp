@@ -230,6 +230,7 @@ ArgOptions SDSvrParams::get_options() {
         {"-l", "--listen-ip", "server listen ip (default: 127.0.0.1)", 0, &listen_ip},
         {"", "--serve-html-path", "path to HTML file to serve at root (optional)", 0, &serve_html_path},
         {"", "--diffusion-model-edit", "alternate DiT GGUF for model=edit worker requests", 0, &diffusion_model_edit_path},
+        {"", "--diffusion-model-variants", "named DiT variants: name=path;name=path", 0, &diffusion_model_variants_spec},
     };
 
     options.int_options = {
@@ -284,6 +285,8 @@ std::string SDSvrParams::to_string() const {
         << "  listen_ip: " << listen_ip << ",\n"
         << "  listen_port: \"" << listen_port << "\",\n"
         << "  serve_html_path: \"" << serve_html_path << "\",\n"
+        << "  diffusion_model_edit_path: \"" << diffusion_model_edit_path << "\",\n"
+        << "  diffusion_model_variants_spec: \"" << diffusion_model_variants_spec << "\",\n"
         << "}";
     return oss.str();
 }

@@ -101,6 +101,7 @@ int main(int argc, const char** argv) {
                                     std::move(original_args),
                                     ctx_params.diffusion_model_path,
                                     svr_params.diffusion_model_edit_path,
+                                    svr_params.diffusion_model_variants_spec,
                                     default_gpu == nullptr ? "" : default_gpu);
         httplib::Server server;
         server.set_payload_max_length(512ull * 1024 * 1024);

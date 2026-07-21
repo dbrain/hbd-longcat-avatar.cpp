@@ -26,6 +26,11 @@ struct SDSvrParams {
     // contract. A variant change recycles the CUDA child instead of retaining
     // old allocations in a long-lived context.
     std::string diffusion_model_edit_path;
+    // Extra named DiT variants for worker-isolated deployments. Format:
+    // "name=path;name=path". Each request's top-level `model` selects one;
+    // the supervisor destroys the old CUDA-owning process before spawning the
+    // requested variant, so switches cannot retain the old model in VRAM.
+    std::string diffusion_model_variants_spec;
     bool normal_exit = false;
     bool verbose     = false;
     bool color       = false;

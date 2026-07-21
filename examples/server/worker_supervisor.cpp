@@ -1,8 +1,11 @@
 #include "worker_supervisor.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -24,7 +27,8 @@ bool truthy(const char* value) {
 
 bool takes_value(const std::string& arg) {
     return arg == "--listen-ip" || arg == "-l" || arg == "--listen-port" || arg == "-p" ||
-           arg == "--diffusion-model";
+           arg == "--diffusion-model" || arg == "--diffusion-model-edit" ||
+           arg == "--diffusion-model-variants";
 }
 
 bool is_admin_path(const std::string& path) {
@@ -59,11 +63,13 @@ WorkerSupervisor::WorkerSupervisor(std::string argv0,
                                    std::vector<std::string> original_args,
                                    std::string base_model,
                                    std::string edit_model,
+                                   std::string variants_spec,
                                    std::string default_gpu)
     : argv0_(std::move(argv0)),
       original_args_(std::move(original_args)),
       base_model_(std::move(base_model)),
       edit_model_(std::move(edit_model)),
+      variants_(build_variants(base_model_, edit_model_, variants_spec)),
       default_gpu_(std::move(default_gpu)) {}
 
 WorkerSupervisor::~WorkerSupervisor() {
@@ -95,6 +101,27 @@ std::string WorkerSupervisor::active_model() const {
 std::string WorkerSupervisor::active_gpu() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return active_gpu_;
+}
+
+std::map<std::string, std::string> WorkerSupervisor::build_variants(const std::string& base_model,
+                                                                      const std::string& edit_model,
+                                                                      const std::string& variants_spec) {
+    std::map<std::string, std::string> variants;
+    if (!base_model.empty()) variants["base"] = base_model;
+    if (!edit_model.empty()) variants["edit"] = edit_model;
+    std::stringstream entries(variants_spec);
+    std::string entry;
+    while (std::getline(entries, entry, ';')) {
+        const size_t delimiter = entry.find('=');
+        if (delimiter == std::string::npos || delimiter == 0 || delimiter + 1 >= entry.size()) continue;
+        const std::string name = entry.substr(0, delimiter);
+        const std::string path = entry.substr(delimiter + 1);
+        const bool valid_name = std::all_of(name.begin(), name.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_' || c == '-';
+        });
+        if (valid_name && !path.empty()) variants[name] = path;
+    }
+    return variants;
 }
 
 void WorkerSupervisor::unload_locked() {
@@ -140,7 +167,8 @@ int WorkerSupervisor::reserve_loopback_port() const {
 
 std::vector<std::string> WorkerSupervisor::child_args(const std::string& model, int port) const {
     std::vector<std::string> out;
-    const std::string& model_path = model == "edit" ? edit_model_ : base_model_;
+    const auto variant = variants_.find(model);
+    const std::string& model_path = variant->second;
     bool replaced_model = false;
     for (size_t i = 0; i < original_args_.size(); ++i) {
         const std::string& arg = original_args_[i];
@@ -191,12 +219,8 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
                                              std::string& error) {
     const std::string model = requested_model.empty() ?
         (active_model_.empty() ? std::string("base") : active_model_) : requested_model;
-    if (model != "base" && model != "edit") {
+    if (variants_.find(model) == variants_.end()) {
         error = "unknown model variant '" + model + "'";
-        return false;
-    }
-    if (model == "edit" && edit_model_.empty()) {
-        error = "edit model is not configured";
         return false;
     }
     const std::string gpu = requested_gpu.empty() ? default_gpu_ : requested_gpu;
@@ -236,6 +260,29 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
     return true;
 }
 
+bool WorkerSupervisor::child_busy() const {
+    int port = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pid_ <= 0 || port_ <= 0) return false;
+        port = port_;
+    }
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(1, 0);
+    client.set_read_timeout(1, 0);
+    const auto response = client.Get("/health");
+    if (!response || response->status < 200 || response->status >= 300) return false;
+    try {
+        return json::parse(response->body).value("busy", false);
+    } catch (...) {
+        return false;
+    }
+}
+
+int WorkerSupervisor::in_flight() const {
+    return active_generation_requests_.load() + (child_busy() ? 1 : 0);
+}
+
 std::string WorkerSupervisor::request_model(const httplib::Request& request) {
     if (request.method != "POST") return {};
     std::string body = request.body;
@@ -269,6 +316,14 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
         response.status = 503;
         response.set_content(R"({"error":"service draining — not accepting new generation requests"})", "application/json");
         return true;
+    }
+    struct ActiveGenerationGuard {
+        std::atomic<int>* counter = nullptr;
+        ~ActiveGenerationGuard() { if (counter != nullptr) counter->fetch_sub(1); }
+    } active_guard;
+    if (is_generation_request(request)) {
+        active_generation_requests_.fetch_add(1);
+        active_guard.counter = &active_generation_requests_;
     }
     int worker_port = 0;
     {
@@ -317,8 +372,10 @@ bool worker_isolation_child() {
 
 void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervisor& supervisor) {
     server.Get("/health", [&supervisor](const httplib::Request&, httplib::Response& response) {
-        response.set_content(json({{"status", "ok"}, {"busy", false}, {"draining", supervisor.draining()},
-                                   {"loaded", supervisor.loaded()}, {"loaded_model", supervisor.active_model()}}).dump(),
+        const int in_flight = supervisor.in_flight();
+        response.set_content(json({{"status", "ok"}, {"busy", in_flight > 0}, {"in_flight", in_flight},
+                                   {"draining", supervisor.draining()}, {"loaded", supervisor.loaded()},
+                                   {"loaded_model", supervisor.active_model()}}).dump(),
                              "application/json");
     });
     server.Get("/v1/gpu/status", [&supervisor](const httplib::Request&, httplib::Response& response) {
@@ -327,13 +384,31 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
     });
     server.Post("/v1/admin/drain", [&supervisor](const httplib::Request&, httplib::Response& response) {
         supervisor.drain();
-        response.set_content(R"({"status":"draining","busy":false,"in_flight":0})", "application/json");
+        const int in_flight = supervisor.in_flight();
+        response.set_content(json({{"status", "draining"}, {"busy", in_flight > 0}, {"in_flight", in_flight}}).dump(),
+                             "application/json");
     });
-    server.Post("/v1/admin/unload", [&supervisor](const httplib::Request&, httplib::Response& response) {
+    server.Post("/v1/admin/unload", [&supervisor](const httplib::Request& request, httplib::Response& response) {
+        bool force = false;
+        if (!request.body.empty()) {
+            try {
+                force = json::parse(request.body).value("force", false);
+            } catch (...) {
+                // Preserve the established lenient admin contract for malformed bodies.
+            }
+        }
+        const int in_flight = supervisor.in_flight();
+        if (in_flight > 0 && !force) {
+            response.set_content(json({{"status", "busy (pass force=true to cancel + unload)"},
+                                       {"busy", true}, {"in_flight", in_flight}}).dump(),
+                                 "application/json");
+            return;
+        }
         const bool was_loaded = supervisor.loaded();
         supervisor.unload();
         response.set_content(json({{"status", was_loaded ? "unloaded" : "idle"}, {"unloaded", was_loaded},
-                                   {"cuda_context_released", true}}).dump(), "application/json");
+                                   {"cuda_context_released", true}, {"forced", force && in_flight > 0}}).dump(),
+                             "application/json");
     });
     server.Post("/v1/admin/load", [&supervisor](const httplib::Request&, httplib::Response& response) {
         supervisor.reopen();
