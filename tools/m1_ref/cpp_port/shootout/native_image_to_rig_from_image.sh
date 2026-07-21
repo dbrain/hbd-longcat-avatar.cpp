@@ -19,6 +19,8 @@
 #   IMAGE_TO_RIG_TEX_VIEWS_FILE=/abs/turnaround.tsv       robust 1--8 view manifest (yaw<TAB>absolute path)
 #                                                          yaw 0/180 replace the front/back source; all other
 #                                                          yaws are passed as --tex-view. Blank/# lines are ignored.
+#   IMAGE_TO_RIG_PROJECT_PROMOTE=1                         require a consistent 4--8-view projection pass;
+#                                                          otherwise projection remains a labelled A/B only
 #   IMAGE_TO_RIG_INPUT_MODE=auto|matte                   auto: preserve a cutout/matte or RMBG a raw photo
 #   MATTING_URL=http://localhost:18898                   native RMBG-2.0 service (raw-photo input only)
 #   IMAGE_TO_RIG_PREPARE_ONLY=1                          emit/audit input.png, without geometry inference
@@ -35,7 +37,9 @@ export IMAGE_TO_RIG_OUT_ROOT="$OUT_ROOT"
 for bin in image_to_rig mesh_topo make_matte; do
   [[ -x "$CP/$bin" ]] || { echo "missing executable: $bin (build it first)" >&2; exit 2; }
 done
-[[ -x "$CP/shootout/native_image_to_rig.sh" ]] || { echo "missing native image-to-rig driver" >&2; exit 2; }
+for bin in native_image_to_rig.sh verify_observed_projection.sh; do
+  [[ -x "$CP/shootout/$bin" ]] || { echo "missing native image-to-rig component: $bin" >&2; exit 2; }
+done
 # Detached production runs write their C++ progress to a file.  Force line buffering so stage logs say
 # what the 3060 is actually doing instead of appearing frozen until libc's file buffer fills.
 IMAGE_TO_RIG_CMD=(stdbuf -oL -eL "$CP/image_to_rig")
@@ -313,6 +317,9 @@ fi
 # evidence unambiguous.
 PROJ_ARGS=()
 PROJECT="${IMAGE_TO_RIG_PROJECT:-0}"
+PROJECT_PROMOTE="${IMAGE_TO_RIG_PROJECT_PROMOTE:-0}"
+[[ "$PROJECT_PROMOTE" == 0 || "$PROJECT_PROMOTE" == 1 ]] || { echo "IMAGE_TO_RIG_PROJECT_PROMOTE must be 0 or 1" >&2; exit 2; }
+[[ "$PROJECT_PROMOTE" != 1 ]] || PROJECT=1
 declare -A PROJ_PATH_BY_YAW=()
 declare -A PROJ_ORIGIN_BY_YAW=()
 declare -A PROJ_LABEL_BY_YAW=()
@@ -404,18 +411,22 @@ if [[ "$PROJECT" != 0 ]]; then
   write_pipeline_status running 'native textured delivery exists; generating optional observed-view A/B only'
   LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   echo "== $LABEL: observed-view projection A/B (native texture remains default) =="
+  PROJ_LOG="$OUT/projection.log"
+  : >"$PROJ_LOG"
   (
     exec 9>"$LOCK"
     flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
     "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
       --from-refined "$CACHE" --stage-dir "$OUT" --decimate 300000 --texsize 2048 --no-rig \
       --tex-project-overlay "${PROJ_ARGS[@]}" --out "$OUT/high_hybrid_projected.glb"
-  )
+  ) 2>&1 | tee "$PROJ_LOG"
   {
     printf 'mode=observed-view hybrid A/B; native_high_textured.glb remains production default\n'
     printf 'camera_count=%s\n' "$TOTAL_PROJ_CAMERAS"
     printf 'blend=real observed pixels in linear light; z-buffer + eroded-subject-mask reject; native generated base retained for unobserved texels\n'
     printf 'manifest=%s\n' "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-none}"
+    printf 'projection_log=projection.log sha256=%s\n' "$(sha256sum "$PROJ_LOG" | awk '{print $1}')"
+    printf 'promotion_requested=%s\n' "$PROJECT_PROMOTE"
     for yaw in $(printf '%s\n' "${!PROJ_PATH_BY_YAW[@]}" | LC_ALL=C sort -n); do
       path="${PROJ_PATH_BY_YAW[$yaw]}"
       printf 'view yaw=%s label=%s path=%s sha256=%s origin=%s\n' \
@@ -423,6 +434,12 @@ if [[ "$PROJECT" != 0 ]]; then
         "${PROJ_ORIGIN_BY_YAW[$yaw]}"
     done
   } >"$OUT/projection_source.txt"
+  if [[ "$PROJECT_PROMOTE" == 1 ]]; then
+    "$CP/shootout/verify_observed_projection.sh" "$OUT"
+    printf 'promotion_result=passed\n' >>"$OUT/projection_source.txt"
+  else
+    printf 'promotion_result=not-requested; labelled A/B only\n' >>"$OUT/projection_source.txt"
+  fi
 fi
 
 cat >"$OUT/runbook_source.txt" <<EOF
