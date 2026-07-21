@@ -1157,8 +1157,21 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                                                 int d0              = 1,
                                                 int d1              = 1,
                                                 int d2              = 1,
-                                                bool force_prec_f32 = false) {
-    if (force_prec_f32) {
+                                                bool force_prec_f32 = false,
+                                                bool cudnn_hi_prec  = false) {
+    const char* cudnn_conv = std::getenv("GGML_CUDNN_CONV3D");
+    if (cudnn_conv == nullptr) {
+        cudnn_conv = std::getenv("GGML_CUDNN_CONV");
+    }
+    const bool use_cudnn = cudnn_conv != nullptr && std::atoi(cudnn_conv) != 0 &&
+                           !force_prec_f32 && s0 == 1 && s1 == 1 && s2 == 1 &&
+                           d0 == 1 && d1 == 1 && d2 == 1;
+    if (use_cudnn) {
+        const int64_t OC = w->ne[3] / IC;
+        const int64_t N  = x->ne[3] / IC;
+        x = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2,
+                                (int) IC, (int) N, (int) OC, cudnn_hi_prec ? 1 : 0);
+    } else if (force_prec_f32) {
         ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
 
         int64_t OC = w->ne[3] / IC;
@@ -1186,7 +1199,7 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
         } else {
             int64_t OC = w->ne[3] / IC;
             int64_t N  = x->ne[3] / IC;
-            x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
+            x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC, 0);
         }
     }
 
