@@ -19,8 +19,8 @@
 #   IMAGE_TO_RIG_TEX_VIEWS_FILE=/abs/turnaround.tsv       robust 1--8 view manifest (yaw<TAB>absolute path)
 #                                                          yaw 0/180 replace the front/back source; all other
 #                                                          yaws are passed as --tex-view. Blank/# lines are ignored.
-#   IMAGE_TO_RIG_PROJECT_PROMOTE=1                         require a consistent 4--8-view projection pass;
-#                                                          otherwise projection remains a labelled A/B only
+#   IMAGE_TO_RIG_PROJECT_PROMOTE=1                         validate a consistent 4--8-view projection candidate;
+#                                                          it remains an A/B until native-base overlay exists
 #   IMAGE_TO_RIG_INPUT_MODE=auto|matte                   auto: preserve a cutout/matte or RMBG a raw photo
 #   MATTING_URL=http://localhost:18898                   native RMBG-2.0 service (raw-photo input only)
 #   IMAGE_TO_RIG_PREPARE_ONLY=1                          emit/audit input.png, without geometry inference
@@ -436,7 +436,7 @@ if [[ "$PROJECT" != 0 ]]; then
   } >"$OUT/projection_source.txt"
   if [[ "$PROJECT_PROMOTE" == 1 ]]; then
     "$CP/shootout/verify_observed_projection.sh" "$OUT"
-    printf 'promotion_result=passed\n' >>"$OUT/projection_source.txt"
+    printf 'promotion_result=validated-candidate; current legacy-PBR overlay does not replace native high production texture\n' >>"$OUT/projection_source.txt"
   else
     printf 'promotion_result=not-requested; labelled A/B only\n' >>"$OUT/projection_source.txt"
   fi

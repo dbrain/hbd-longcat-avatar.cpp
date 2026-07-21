@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Read-only promotion gate for a 4--8-view observed-image hybrid projection.
+# Read-only evidence gate for a 4--8-view observed-image hybrid projection.
 #
 # Usage:
 #   verify_observed_projection.sh <delivery-dir>
 #
 # A one-front-image overlay remains a useful labelled A/B. It must not become
-# the production texture merely because it wrote a plausible GLB. This gate is
-# intentionally for a real, consistent 4--8-view turnaround: it checks the
+# the native production texture merely because it wrote a plausible GLB. This
+# gate establishes a real, consistent 4--8-view candidate: it checks the
 # recorded source hashes, unique yaw coverage, per-view paint evidence,
 # silhouette alignment, and the fact that overlay holes retained the native
 # base rather than falling through to atlas-space colour invention.
@@ -22,7 +22,7 @@ GLB="$OUT/high_hybrid_projected.glb"
 
 value() { awk -F= -v key="$1" '$1==key {print substr($0,length(key)+2); exit}' "$SRC"; }
 CAMERAS="$(value camera_count)"
-[[ "$CAMERAS" =~ ^[4-8]$ ]] || { echo "REJECT: production observed projection needs 4--8 cameras (got '${CAMERAS:-missing}')" >&2; exit 1; }
+[[ "$CAMERAS" =~ ^[4-8]$ ]] || { echo "REJECT: validated observed projection needs 4--8 cameras (got '${CAMERAS:-missing}')" >&2; exit 1; }
 [[ "$(value mode)" == 'observed-view hybrid A/B; native_high_textured.glb remains production default' ]] || {
   echo "REJECT: projection provenance has unexpected mode: $SRC" >&2; exit 1;
 }
@@ -74,5 +74,5 @@ if [[ -n "$seam" ]]; then
   }
 fi
 
-printf 'VERIFIED observed projection promotion: cameras=%s views_painted=%s min_view_pct=%s telea=0 seam=%s\n' \
+printf 'VERIFIED observed projection candidate: cameras=%s views_painted=%s min_view_pct=%s telea=0 seam=%s\n' \
   "$CAMERAS" "$painted" "$MIN_VIEW_PCT" "${seam:-none}"
