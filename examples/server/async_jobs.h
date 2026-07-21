@@ -25,6 +25,21 @@ enum class AsyncJobStatus {
     Cancelled,
 };
 
+// Process-local Wan continuation bank.  Completed windows are retained as raw
+// frames plus their sampled latent so a cancelled/failed request can resume at
+// the exact next VACE seam without re-rendering its prefix.
+struct WanVaceResumeBank {
+    ~WanVaceResumeBank();
+    std::vector<sd_image_t> prefix_frames;
+    std::vector<sd_image_t> control_tail;
+    std::vector<float> latent;
+    int completed_segments = 0;
+    int latent_width = 0;
+    int latent_height = 0;
+    int latent_frames = 0;
+    int latent_channels = 0;
+};
+
 const char* async_job_kind_name(AsyncJobKind kind);
 const char* async_job_status_name(AsyncJobStatus status);
 
@@ -40,6 +55,7 @@ struct AsyncGenerationJob {
     // Non-empty only for /wan/v1/generate.  The generic async job lifecycle and
     // result schema are deliberately shared with regular video generation.
     std::vector<std::string> wan_vace_prompts;
+    std::shared_ptr<WanVaceResumeBank> wan_vace_bank;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;

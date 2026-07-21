@@ -7045,9 +7045,39 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
         return false;
     };
 
+    if (chain_params->start_segment < 0 || chain_params->start_segment >= chain_params->n_segments) {
+        LOG_ERROR("generate_wan_vace_chain: invalid resume segment %d/%d",
+                  chain_params->start_segment, chain_params->n_segments);
+        return false;
+    }
+    if (chain_params->start_segment > 0) {
+        if (chain_params->resume_control_frames == nullptr || chain_params->resume_control_frames_size <= 0 ||
+            chain_params->resume_latent == nullptr || chain_params->resume_latent_width <= 0 ||
+            chain_params->resume_latent_height <= 0 || chain_params->resume_latent_frames <= 0 ||
+            chain_params->resume_latent_channels <= 0) {
+            LOG_ERROR("generate_wan_vace_chain: resume state is incomplete");
+            return false;
+        }
+        for (int frame = 0; frame < chain_params->resume_control_frames_size; ++frame) {
+            sd_image_t copy = copy_video_frame(chain_params->resume_control_frames[frame]);
+            if (copy.data == nullptr) {
+                clear_tail();
+                LOG_ERROR("generate_wan_vace_chain: could not copy resume control tail");
+                return false;
+            }
+            control_tail.push_back(copy);
+        }
+        latent_width = chain_params->resume_latent_width;
+        latent_height = chain_params->resume_latent_height;
+        latent_frames = chain_params->resume_latent_frames;
+        latent_channels = chain_params->resume_latent_channels;
+        const size_t count = static_cast<size_t>(latent_width) * latent_height * latent_frames * latent_channels;
+        prior_latent.assign(chain_params->resume_latent, chain_params->resume_latent + count);
+    }
+
     LOG_INFO("generate_wan_vace_chain: %d windows, overlap=%d, discard=%d, mode=%s",
              chain_params->n_segments, overlap, discard, is_t2v ? "t2v" : "i2v");
-    for (int segment = 0; segment < chain_params->n_segments; ++segment) {
+    for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
         const bool continuation = segment > 0;
         const bool need_latent = segment + 1 < chain_params->n_segments;
         sd_vid_gen_params_t params = *base_params;
@@ -7163,6 +7193,17 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
             }
         }
         free(segment_frames);
+        if (chain_params->on_segment != nullptr && last_keep > first_keep) {
+            chain_params->on_segment(segment,
+                                     stitched.data() + stitched.size() - (last_keep - first_keep),
+                                     last_keep - first_keep,
+                                     need_latent ? prior_latent.data() : nullptr,
+                                     need_latent ? latent_width : 0,
+                                     need_latent ? latent_height : 0,
+                                     need_latent ? latent_frames : 0,
+                                     need_latent ? latent_channels : 0,
+                                     chain_params->on_segment_user);
+        }
     }
 
     clear_tail();

@@ -548,6 +548,30 @@ typedef struct {
     int overlap_frames;
     int discard_tail_frames;
     int drop_latent_tail_frames;
+    // Optional state for continuing a previously completed prefix.  The caller
+    // owns all buffers for the duration of this call.  `start_segment` must be
+    // the number of already-completed windows; the supplied pixel tail and
+    // sampled latent seed that next window.
+    int start_segment;
+    const sd_image_t* resume_control_frames;
+    int resume_control_frames_size;
+    const float* resume_latent;
+    int resume_latent_width;
+    int resume_latent_height;
+    int resume_latent_frames;
+    int resume_latent_channels;
+    // Called after each newly completed window.  `frames` are the kept frames
+    // for that window; `latent` is non-NULL whenever another window remains.
+    void (*on_segment)(int segment_index,
+                       const sd_image_t* frames,
+                       int frame_count,
+                       const float* latent,
+                       int latent_width,
+                       int latent_height,
+                       int latent_frames,
+                       int latent_channels,
+                       void* user);
+    void* on_segment_user;
 } sd_wan_vace_chain_params_t;
 
 SD_API bool generate_wan_vace_chain(sd_ctx_t*                          sd_ctx,

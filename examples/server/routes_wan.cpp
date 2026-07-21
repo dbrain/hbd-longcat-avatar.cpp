@@ -128,6 +128,8 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->created_at = unix_timestamp_now();
             job->vid_gen = std::move(request);
             job->wan_vace_prompts = std::move(prompts);
+            const std::string resume_job_id = body.value("resume_job_id", std::string());
+            int resume_from = 0;
             {
                 std::lock_guard<std::mutex> lock(manager.mutex);
                 purge_expired_jobs(manager);
@@ -135,6 +137,28 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     res.status = 429;
                     res.set_content(R"({"error":"job queue is full"})", "application/json");
                     return;
+                }
+                if (!resume_job_id.empty()) {
+                    const auto prior = manager.jobs.find(resume_job_id);
+                    if (prior == manager.jobs.end() || prior->second->wan_vace_bank == nullptr) {
+                        res.status = 404;
+                        res.set_content(R"({"error":"resume_job_id has no retained Wan continuation state"})", "application/json");
+                        return;
+                    }
+                    const auto& bank = prior->second->wan_vace_bank;
+                    if (prior->second->status == AsyncJobStatus::Queued ||
+                        prior->second->status == AsyncJobStatus::Generating ||
+                        bank->completed_segments <= 0 ||
+                        bank->completed_segments >= static_cast<int>(job->wan_vace_prompts.size())) {
+                        res.status = 409;
+                        res.set_content(R"({"error":"resume_job_id is not a resumable partial Wan chain"})", "application/json");
+                        return;
+                    }
+                    job->wan_vace_bank = bank;
+                    resume_from = bank->completed_segments;
+                }
+                if (job->wan_vace_bank == nullptr) {
+                    job->wan_vace_bank = std::make_shared<WanVaceResumeBank>();
                 }
                 job->id = make_async_job_id(manager);
                 manager.jobs[job->id] = job;
@@ -148,7 +172,8 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                                   {"created", job->created_at},
                                   {"poll_url", "/sdcpp/v1/jobs/" + job->id},
                                   {"media_url", "/sdcpp/v1/jobs/" + job->id + "/media"},
-                                  {"segments", static_cast<int>(job->wan_vace_prompts.size())}})
+                                  {"segments", static_cast<int>(job->wan_vace_prompts.size())},
+                                  {"resume_from", resume_from}})
                                 .dump(),
                             "application/json");
         } catch (const json::parse_error& error) {
