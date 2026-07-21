@@ -258,10 +258,7 @@ int WorkerSupervisor::reserve_loopback_port() const {
 }
 
 std::vector<std::string> WorkerSupervisor::child_args(const std::string& model, int port) const {
-    // execv() requires argv[0] even though original_args_ intentionally holds
-    // only argv[1..]. Without this, --diffusion-model becomes argv[0] and the
-    // worker parses its path as the first option, exiting before it can bind.
-    std::vector<std::string> out = {argv0_};
+    std::vector<std::string> out;
     const auto variant = variants_.find(model);
     const std::string& model_path = variant->second;
     bool replaced_model = false;
