@@ -89,6 +89,11 @@ write_status() {
   if [[ -s "$QC_FILE" ]]; then
     qc_lines="$(sed -n '/^sampling_verdict=/p;/^source_missing_fraction_before_repair=/p;/^unresolved_surface_texels_after_chart_repair=/p' "$QC_FILE")"
   fi
+  # Atlas and sampling controls are intentionally environment-overridable for
+  # native A/Bs. Record the effective overrides: without this, a retained GLB
+  # cannot distinguish the promoted parity recipe from a cone/median test.
+  local texture_controls
+  texture_controls="$(env | LC_ALL=C sort | awk -F= '$1 ~ /^(ATL|TEX)_/ && $1 != "TEX_STAGE_LOG" {print}' | paste -sd ';' -)"
   {
     printf 'launcher_state=%s\n' "$state"
     printf 'started_at=%s\n' "$STARTED_AT"
@@ -101,6 +106,7 @@ write_status() {
       "$MESH_SHA256" "$IMAGE_SHA256" "$BIN_SHA256" "$SOURCE_REVISION"
     printf 'texture_model=TRELLIS-2 Texturing cross-attention (trellis2_tex_%s); native C++ only\n' "$TEXTURE_RESOLUTION"
     printf 'unwrap_mode=%s\n' "$UNWRAP_MODE"
+    printf 'texture_controls=%s\n' "${texture_controls:-default}"
     [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
     [[ -z "$qc_lines" ]] || printf '%s\n' "$qc_lines"
     if [[ "$UNWRAP_MODE" == reference ]]; then

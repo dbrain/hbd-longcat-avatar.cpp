@@ -50,6 +50,10 @@ write_status() {
   if [[ -s "$QC_FILE" ]]; then
     qc_lines="$(sed -n '/^sampling_verdict=/p;/^source_missing_fraction_before_repair=/p;/^unresolved_surface_texels_after_chart_repair=/p' "$QC_FILE")"
   fi
+  # Keep CPU A/Bs reproducible. The chosen atlas policy often lives in ATL_ /
+  # TEX_ environment controls rather than the positional command line.
+  local texture_controls
+  texture_controls="$(env | LC_ALL=C sort | awk -F= '$1 ~ /^(ATL|TEX)_/ && $1 != "TEX_STAGE_LOG" {print}' | paste -sd ';' -)"
   {
     printf 'launcher_state=%s\n' "$state"
     printf 'started_at=%s\nupdated_at=%s\nelapsed_seconds=%s\nexit_code=%s\n' \
@@ -58,6 +62,7 @@ write_status() {
     printf 'mesh=%s\npbr_dump=%s\nout=%s\nstage_log=%s\n' "$MESH" "$DUMP" "$OUT" "$STAGE_FILE"
     printf 'mesh_sha256=%s\npbr_feats_sha256=%s\npbr_coords_sha256=%s\nbinary_sha256=%s\nsource_revision=%s\n' \
       "$MESH_SHA256" "$DUMP_FEATS_SHA256" "$DUMP_COORDS_SHA256" "$BINARY_SHA256" "$SOURCE_REVISION"
+    printf 'texture_controls=%s\n' "${texture_controls:-default}"
     [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
     [[ -z "$qc_lines" ]] || printf '%s\n' "$qc_lines"
     [[ "$state" != succeeded ]] || printf 'artifact_state=succeeded\n'
