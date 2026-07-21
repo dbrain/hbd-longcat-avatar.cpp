@@ -3643,6 +3643,17 @@ void free_sd_ctx(sd_ctx_t* sd_ctx) {
     free(sd_ctx);
 }
 
+SD_API void sd_ctx_free_diffusion_model(sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->diffusion_model == nullptr) {
+        return;
+    }
+
+    // ModelManager owns parameter residency. runner_done() releases the DiT's
+    // staged compute and parameter residency through that owner; a later compute
+    // prepares the same registered tensors again on demand.
+    sd_ctx->sd->diffusion_model->runner_done();
+}
+
 SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {
     if (sd_ctx && sd_ctx->sd) {
         if (mode < SD_CANCEL_ALL || mode > SD_CANCEL_RESET) {

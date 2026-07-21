@@ -176,6 +176,10 @@ bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode)
     return true;
 }
 
+bool runtime_is_draining(const ServerRuntime& runtime) {
+    return runtime.gpu_sharing != nullptr && runtime.gpu_sharing->draining.load();
+}
+
 std::string unsupported_generation_mode_error(SDMode mode) {
     if (mode == VID_GEN) {
         return "loaded model does not support vid_gen";

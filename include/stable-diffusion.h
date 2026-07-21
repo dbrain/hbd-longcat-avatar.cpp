@@ -459,6 +459,10 @@ SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
 
 SD_API sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params);
 SD_API void free_sd_ctx(sd_ctx_t* sd_ctx);
+// Release the DiT's staged compute and parameter residency while retaining the
+// context, model metadata, VAE, and text encoders. The next generation call reloads
+// the registered DiT parameters through ModelManager. Call only when idle.
+SD_API void sd_ctx_free_diffusion_model(sd_ctx_t* sd_ctx);
 SD_API void free_sd_audio(sd_audio_t* audio);
 
 SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);

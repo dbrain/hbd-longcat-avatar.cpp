@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -45,6 +46,13 @@ struct UpscalerEntry {
     int scale = 4;
 };
 
+// Server-side ownership state for cooperative GPU sharing. The model context
+// remains owned by main; this only gates new work and records DiT residency.
+struct GPUSharingState {
+    std::atomic<bool> draining{false};
+    std::atomic<bool> diffusion_loaded{true};
+};
+
 struct ServerRuntime {
     sd_ctx_t* sd_ctx;
     std::mutex* sd_ctx_mutex;
@@ -56,7 +64,10 @@ struct ServerRuntime {
     std::vector<UpscalerEntry>* upscaler_cache;
     std::mutex* upscaler_mutex;
     AsyncJobManager* async_job_manager;
+    GPUSharingState* gpu_sharing;
 };
+
+bool runtime_is_draining(const ServerRuntime& runtime);
 
 struct ImgGenJobRequest {
     SDGenerationParams gen_params;

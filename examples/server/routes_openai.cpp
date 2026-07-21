@@ -241,6 +241,9 @@ static bool execute_sync_img_gen_request(ServerRuntime& runtime,
         error_message = "generate_image returned no results";
         return false;
     }
+    if (runtime.gpu_sharing != nullptr) {
+        runtime.gpu_sharing->diffusion_loaded.store(true);
+    }
     return true;
 }
 

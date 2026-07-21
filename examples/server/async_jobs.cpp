@@ -176,9 +176,12 @@ bool execute_img_gen_job(ServerRuntime& runtime,
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
         int num_results         = 0;
-        if (!generate_image(runtime.sd_ctx, &params, &raw_results, &num_results)) {
+        const bool generated = generate_image(runtime.sd_ctx, &params, &raw_results, &num_results);
+        if (!generated) {
             raw_results = nullptr;
             num_results = 0;
+        } else if (runtime.gpu_sharing != nullptr) {
+            runtime.gpu_sharing->diffusion_loaded.store(true);
         }
         results.adopt(raw_results, num_results);
     }
@@ -245,8 +248,11 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
-        if (!generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio)) {
+        const bool generated = generate_video(runtime.sd_ctx, &params, &raw_results, &num_results, &generated_audio);
+        if (!generated) {
             raw_results = nullptr;
+        } else if (runtime.gpu_sharing != nullptr) {
+            runtime.gpu_sharing->diffusion_loaded.store(true);
         }
         results.adopt(raw_results, num_results);
     }

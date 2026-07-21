@@ -100,6 +100,7 @@ int main(int argc, const char** argv) {
     std::vector<UpscalerEntry> upscaler_cache;
     std::mutex upscaler_mutex;
     AsyncJobManager async_job_manager;
+    GPUSharingState gpu_sharing;
     ServerRuntime runtime = {
         sd_ctx.get(),
         &sd_ctx_mutex,
@@ -111,13 +112,14 @@ int main(int argc, const char** argv) {
         &upscaler_cache,
         &upscaler_mutex,
         &async_job_manager,
+        &gpu_sharing,
     };
 
     std::thread async_worker(async_job_worker, std::ref(runtime));
 
     httplib::Server svr;
 
-    svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+    svr.set_pre_routing_handler([&runtime](const httplib::Request& req, httplib::Response& res) {
         std::string origin = req.get_header_value("Origin");
         if (origin.empty()) {
             origin = "*";
@@ -129,6 +131,17 @@ int main(int argc, const char** argv) {
 
         if (req.method == "OPTIONS") {
             res.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        const bool is_generation_request =
+            req.method == "POST" &&
+            (req.path == "/sdcpp/v1/img_gen" || req.path == "/sdcpp/v1/vid_gen" ||
+             req.path == "/sdapi/v1/txt2img" || req.path == "/sdapi/v1/img2img" ||
+             req.path == "/v1/images/generations" || req.path == "/v1/images/edits");
+        if (is_generation_request && runtime_is_draining(runtime)) {
+            res.status = 503;
+            res.set_content(R"({"error":"service draining — not accepting new generation requests"})",
+                            "application/json");
             return httplib::Server::HandlerResponse::Handled;
         }
         return httplib::Server::HandlerResponse::Unhandled;
@@ -144,6 +157,7 @@ int main(int argc, const char** argv) {
     register_openai_api_endpoints(svr, runtime);
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
+    register_gpu_sharing_endpoints(svr, runtime);
 
     LOG_INFO("listening on: http://%s:%d\n", svr_params.listen_ip.c_str(), svr_params.listen_port);
     svr.listen(svr_params.listen_ip, svr_params.listen_port);

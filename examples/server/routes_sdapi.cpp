@@ -351,6 +351,9 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(R"({"error":"generate_image returned no results"})", "application/json");
                 return;
             }
+            if (runtime->gpu_sharing != nullptr) {
+                runtime->gpu_sharing->diffusion_loaded.store(true);
+            }
 
             json out;
             out["images"]     = json::array();

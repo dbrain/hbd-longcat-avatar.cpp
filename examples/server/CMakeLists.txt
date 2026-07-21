@@ -73,6 +73,7 @@ add_executable(${TARGET}
     routes_openai.cpp
     routes_sdapi.cpp
     routes_sdcpp.cpp
+    routes_gpu_sharing.cpp
 )
 if(APPLE)
     sd_set_macos_rpaths(${TARGET})
