@@ -26,6 +26,17 @@ namespace WAN {
         return enabled;
     }
 
+    // The Wan 2.2 decoder's last convolution produces the twelve channels
+    // consumed by unpatchify(2).  Keeping that result in F32 prevents a
+    // channel-dependent 2px screen-door pattern in decoded RGB output.
+    inline bool wan_vae_head_f32_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("WAN_VAE_HEAD_F32");
+            return value == nullptr || std::atoi(value) != 0;
+        }();
+        return enabled;
+    }
+
     class CausalConv3d : public GGMLBlock {
     protected:
         int64_t in_channels;
@@ -35,6 +46,7 @@ namespace WAN {
         std::tuple<int, int, int> padding;
         std::tuple<int, int, int> dilation;
         bool bias;
+        bool force_prec_f32;
 
         void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
             params["weight"] = ggml_new_tensor_4d(ctx,
@@ -55,14 +67,16 @@ namespace WAN {
                      std::tuple<int, int, int> stride   = {1, 1, 1},
                      std::tuple<int, int, int> padding  = {0, 0, 0},
                      std::tuple<int, int, int> dilation = {1, 1, 1},
-                     bool bias                          = true)
+                     bool bias                          = true,
+                     bool force_prec_f32                = false)
             : in_channels(in_channels),
               out_channels(out_channels),
               kernel_size(std::move(kernel_size)),
               stride(std::move(stride)),
               padding(std::move(padding)),
               dilation(std::move(dilation)),
-              bias(bias) {}
+              bias(bias),
+              force_prec_f32(force_prec_f32) {}
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* cache_x = nullptr) {
             // x: [N*IC, ID, IH, IW]
@@ -89,7 +103,8 @@ namespace WAN {
             return ggml_ext_conv_3d(ctx->ggml_ctx, ctx->backend, x, w, b, in_channels,
                                     std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                     0, 0, 0,
-                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation));
+                                    std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
+                                    force_prec_f32 && wan_vae_head_f32_enabled());
         }
     };
 
@@ -923,7 +938,7 @@ namespace WAN {
                 blocks["head.2"] = std::shared_ptr<GGMLBlock>(new Conv2dBut3d(out_dim, final_dim, {3, 3}, {1, 1}, {1, 1}));
 
             } else {
-                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, final_dim, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}));
+                blocks["head.2"] = std::shared_ptr<GGMLBlock>(new CausalConv3d(out_dim, final_dim, {3, 3, 3}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, true, wan2_2));
             }
         }
 
