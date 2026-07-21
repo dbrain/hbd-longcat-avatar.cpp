@@ -21,6 +21,35 @@ namespace fs = std::filesystem;
 
 namespace {
 
+struct LTXModelLease {
+    ServerRuntime* runtime = nullptr;
+    const std::vector<std::string>* models = nullptr;
+    std::map<std::string, std::string> variants;
+    std::string active;
+    std::string error;
+};
+
+bool lease_ltx_segment_model(int segment, void* user) {
+    auto* lease = static_cast<LTXModelLease*>(user);
+    if (lease == nullptr || lease->runtime == nullptr || lease->models == nullptr ||
+        segment < 0 || static_cast<size_t>(segment) >= lease->models->size()) {
+        return false;
+    }
+    const std::string& wanted = (*lease->models)[segment];
+    if (wanted.empty() || wanted == lease->active) return true;
+    const auto variant = lease->variants.find(wanted);
+    if (variant == lease->variants.end()) {
+        lease->error = "unknown LTX segment model variant '" + wanted + "'";
+        return false;
+    }
+    if (!sd_ctx_swap_diffusion_model(lease->runtime->sd_ctx, variant->second.c_str())) {
+        lease->error = "could not load LTX segment model variant '" + wanted + "'";
+        return false;
+    }
+    lease->active = wanted;
+    return true;
+}
+
 // A single bounded CPU encoder for progressive LTX segments.  The core owns
 // and frees its decoded frames, so the callback copies one segment at a time;
 // back-pressure prevents previews accumulating while a long chain samples.
@@ -464,6 +493,13 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.chain_audio_track = job.ltx_chain_audio_track.empty() ? nullptr : job.ltx_chain_audio_track.c_str();
             chain.chain_audio_offset_frames = job.ltx_chain_audio_offset_frames;
             chain.chain_audio_dir = job.ltx_chain_audio_dir.empty() ? nullptr : job.ltx_chain_audio_dir.c_str();
+            LTXModelLease model_lease;
+            model_lease.runtime = &runtime;
+            model_lease.models = &job.ltx_segment_models;
+            model_lease.variants = runtime_diffusion_model_variants(runtime);
+            model_lease.active = job.ltx_default_model;
+            chain.before_segment = job.ltx_segment_models.empty() ? nullptr : lease_ltx_segment_model;
+            chain.before_segment_user = job.ltx_segment_models.empty() ? nullptr : &model_lease;
             chain.on_segment = write_segment_previews ? write_segment_preview : nullptr;
             chain.on_segment_user = write_segment_previews ? &segment_writer : nullptr;
             generated = generate_video_chain(runtime.sd_ctx,
@@ -472,6 +508,20 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                                               &raw_results,
                                               &num_results,
                                               &generated_audio);
+            // A child can serve another job after this one. Restore its
+            // supervisor-selected model so a segment override cannot leak into
+            // a subsequent request whose top-level model was unchanged.
+            if (!job.ltx_segment_models.empty() && model_lease.active != job.ltx_default_model) {
+                const auto default_variant = model_lease.variants.find(job.ltx_default_model);
+                if (default_variant == model_lease.variants.end() ||
+                    !sd_ctx_swap_diffusion_model(runtime.sd_ctx, default_variant->second.c_str())) {
+                    generated = false;
+                    error_message = "could not restore LTX default model variant '" + job.ltx_default_model + "'";
+                }
+            }
+            if (!generated && error_message.empty() && !model_lease.error.empty()) {
+                error_message = model_lease.error;
+            }
         } else if (!job.wan_vace_prompts.empty()) {
             std::vector<const char*> prompts;
             prompts.reserve(job.wan_vace_prompts.size());

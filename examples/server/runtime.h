@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,7 @@ struct ServerRuntime {
 };
 
 bool runtime_is_draining(const ServerRuntime& runtime);
+std::map<std::string, std::string> runtime_diffusion_model_variants(const ServerRuntime& runtime);
 
 struct ImgGenJobRequest {
     SDGenerationParams gen_params;

@@ -501,6 +501,12 @@ typedef struct {
     // Kept for the Koblem relip/window API; whole-timeline chain_audio_full
     // takes precedence when both forms are supplied.
     const char* chain_audio_dir;
+    // Optional safe-boundary hook invoked immediately before each window is
+    // sampled. Returning false aborts the chain. It is intended for callers
+    // that need to lease an architecture-compatible DiT variant per segment;
+    // no frame or latent storage is live at this point.
+    bool (*before_segment)(int segment_index, void* user);
+    void* before_segment_user;
     // Optional notification after a complete segment has been sampled and
     // decoded. The frame storage remains owned by the chain and is valid only
     // for the callback; consumers that need it asynchronously must copy it.
@@ -527,6 +533,11 @@ SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
 SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
+// Replace the registered diffusion-model weights while preserving the
+// architecture-compatible runner and the other model components. The caller
+// must serialize this with generation; the outgoing DiT residency is released
+// before the replacement is registered.
+SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path);
 
 // ControlNet hot-swap APIs are not safe to call while generation is in flight.
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);

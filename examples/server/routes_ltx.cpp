@@ -185,6 +185,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
             }
             std::vector<std::string> prompts;
+            std::vector<std::string> segment_models;
             std::vector<int> segment_frames;
             std::vector<int> segment_scene_cuts;
             std::vector<std::string> segment_init_images;
@@ -196,6 +197,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
                         prompts.push_back(segment.get<std::string>());
+                        segment_models.emplace_back();
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
@@ -205,6 +207,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_guide_latent_paths.emplace_back();
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
+                        if (segment.contains("model") && !segment["model"].is_string()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"each LTX segment model must be a string"})", "application/json");
+                            return;
+                        }
+                        segment_models.push_back(segment.value("model", std::string()));
                         const int frames = segment.value("frames", 0);
                         if (frames < 0 || (frames > 0 && (frames - 1) % 8 != 0)) {
                             res.status = 400;
@@ -276,6 +284,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 for (const auto& prompt : body["prompts"]) {
                     if (prompt.is_string()) {
                         prompts.push_back(prompt.get<std::string>());
+                        segment_models.emplace_back();
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
@@ -305,6 +314,23 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", error_message}}).dump(), "application/json");
                 return;
             }
+            const std::string default_model = body.value("model", std::string("base"));
+            const auto variants = runtime_diffusion_model_variants(*runtime);
+            if (variants.find(default_model) == variants.end()) {
+                res.status = 400;
+                res.set_content(json({{"error", "unknown LTX model variant '" + default_model + "'"}}).dump(), "application/json");
+                return;
+            }
+            for (size_t index = 0; index < segment_models.size(); ++index) {
+                if (segment_models[index].empty()) segment_models[index] = default_model;
+                if (variants.find(segment_models[index]) == variants.end()) {
+                    res.status = 400;
+                    res.set_content(json({{"error", "unknown LTX segment model variant '" + segment_models[index] +
+                                                       "' for segment " + std::to_string(index + 1)}}).dump(),
+                                    "application/json");
+                    return;
+                }
+            }
             for (size_t segment = 0; segment < segment_v2v_modes.size(); ++segment) {
                 if (segment_v2v_modes[segment] != 1 &&
                     !(segment_v2v_modes[segment] == 2 && segment_v2v_guide_latent_paths[segment].empty())) continue;
@@ -329,6 +355,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->created_at = unix_timestamp_now();
             job->vid_gen = std::move(request);
             job->ltx_prompts = std::move(prompts);
+            job->ltx_segment_models = std::move(segment_models);
+            job->ltx_default_model = default_model;
             job->ltx_segment_frames = std::move(segment_frames);
             job->ltx_segment_scene_cuts = std::move(segment_scene_cuts);
             job->ltx_segment_init_images = std::move(segment_init_images);

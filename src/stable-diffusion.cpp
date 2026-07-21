@@ -531,6 +531,41 @@ public:
         return true;
     }
 
+    // Upstream's ModelManager owns all DiT parameter residency.  Re-register
+    // the same runner graph against a replacement GGUF at a serial boundary,
+    // which drops the outgoing CPU/VRAM blocks before the new loader source is
+    // made available. This deliberately supports only architecture-compatible
+    // variants (the existing tensor metadata validation enforces that).
+    bool swap_diffusion_model(const std::string& path) {
+        if (path.empty() || diffusion_model == nullptr || model_manager == nullptr) {
+            LOG_ERROR("swap_diffusion_model: missing path, diffusion runner, or model manager");
+            return false;
+        }
+
+        diffusion_model->runner_done();
+        if (!model_manager->unregister_param_tensors("Diffusion model")) {
+            LOG_ERROR("swap_diffusion_model: could not release outgoing diffusion tensors");
+            return false;
+        }
+
+        ModelLoader& loader = model_manager->loader();
+        if (!loader.init_from_file(path, "model.diffusion_model.")) {
+            LOG_ERROR("swap_diffusion_model: could not load '%s'", path.c_str());
+            return false;
+        }
+        if (!register_runner_params("Diffusion model", diffusion_model, SDBackendModule::DIFFUSION)) {
+            LOG_ERROR("swap_diffusion_model: could not register '%s'", path.c_str());
+            return false;
+        }
+        if (!model_manager->validate_registered_tensors()) {
+            LOG_ERROR("swap_diffusion_model: '%s' is not architecture-compatible", path.c_str());
+            model_manager->unregister_param_tensors("Diffusion model");
+            return false;
+        }
+        LOG_INFO("swap_diffusion_model: selected '%s'; weights will load lazily", path.c_str());
+        return true;
+    }
+
     bool load_control_net_from_file(const std::string& path) {
         if (path.empty()) {
             LOG_ERROR("sd_ctx_load_control_net: empty path");
@@ -3716,6 +3751,11 @@ SD_API void sd_ctx_free_diffusion_model(sd_ctx_t* sd_ctx) {
     // staged compute and parameter residency through that owner; a later compute
     // prepares the same registered tensors again on demand.
     sd_ctx->sd->diffusion_model->runner_done();
+}
+
+SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path) {
+    return sd_ctx != nullptr && sd_ctx->sd != nullptr && diffusion_model_path != nullptr &&
+           sd_ctx->sd->swap_diffusion_model(diffusion_model_path);
 }
 
 SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {
@@ -7615,6 +7655,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     }
 
     for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
+        if (chain_params->before_segment != nullptr &&
+            !chain_params->before_segment(segment, chain_params->before_segment_user)) {
+            LOG_ERROR("generate_video_chain: segment %d model lease failed", segment + 1);
+            return fail();
+        }
         sd_vid_gen_params_t params = *base_params;
         if (chain_params->segment_video_frames != nullptr && chain_params->segment_video_frames[segment] > 0) {
             params.video_frames = chain_params->segment_video_frames[segment];

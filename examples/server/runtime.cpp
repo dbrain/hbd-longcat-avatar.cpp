@@ -213,6 +213,41 @@ bool runtime_is_draining(const ServerRuntime& runtime) {
     return runtime.gpu_sharing != nullptr && runtime.gpu_sharing->draining.load();
 }
 
+std::map<std::string, std::string> runtime_diffusion_model_variants(const ServerRuntime& runtime) {
+    std::map<std::string, std::string> variants;
+    // A supervised child has --diffusion-model replaced with the selected
+    // variant. Its environment preserves the original logical map so `base`
+    // still means base rather than merely "the model selected at spawn".
+    if (const char* worker_map = std::getenv("SD_SERVER_WORKER_VARIANT_MAP");
+        worker_map != nullptr && worker_map[0] != '\0') {
+        std::stringstream entries(worker_map);
+        std::string entry;
+        while (std::getline(entries, entry, ';')) {
+            const size_t equals = entry.find('=');
+            if (equals == std::string::npos || equals == 0 || equals + 1 >= entry.size()) continue;
+            variants[entry.substr(0, equals)] = entry.substr(equals + 1);
+        }
+        return variants;
+    }
+    if (runtime.ctx_params != nullptr && !runtime.ctx_params->diffusion_model_path.empty()) {
+        variants.emplace("base", runtime.ctx_params->diffusion_model_path);
+    }
+    if (runtime.svr_params != nullptr && !runtime.svr_params->diffusion_model_edit_path.empty()) {
+        variants["edit"] = runtime.svr_params->diffusion_model_edit_path;
+    }
+    if (runtime.svr_params == nullptr) return variants;
+    std::stringstream entries(runtime.svr_params->diffusion_model_variants_spec);
+    std::string entry;
+    while (std::getline(entries, entry, ';')) {
+        const size_t equals = entry.find('=');
+        if (equals == std::string::npos || equals == 0 || equals + 1 >= entry.size()) continue;
+        const std::string name = entry.substr(0, equals);
+        const std::string path = entry.substr(equals + 1);
+        if (!name.empty() && !path.empty()) variants[name] = path;
+    }
+    return variants;
+}
+
 std::string unsupported_generation_mode_error(SDMode mode) {
     if (mode == VID_GEN) {
         return "loaded model does not support vid_gen";

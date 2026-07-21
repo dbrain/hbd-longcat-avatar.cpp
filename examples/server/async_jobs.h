@@ -46,6 +46,10 @@ struct AsyncGenerationJob {
     // Non-empty only for /ltx/v1/generate. The same async job and media result
     // lifecycle is used for LTX and Wan chains.
     std::vector<std::string> ltx_prompts;
+    // Variant identifiers, aligned to ltx_prompts. The worker leases these
+    // only at core-provided segment boundaries.
+    std::vector<std::string> ltx_segment_models;
+    std::string ltx_default_model = "base";
     std::vector<int> ltx_segment_frames;
     std::vector<int> ltx_segment_scene_cuts;
     std::vector<std::string> ltx_segment_init_images;

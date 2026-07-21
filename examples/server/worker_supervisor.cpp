@@ -247,6 +247,15 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
     }
     if (pid == 0) {
         ::setenv("SD_SERVER_WORKER_CHILD", "1", 1);
+        // The child receives the selected DiT as --diffusion-model, so retain
+        // the complete logical variant map separately for safe in-chain LTX
+        // leases (including a later return from edit to base).
+        std::string variant_map;
+        for (const auto& [name, path] : variants_) {
+            if (!variant_map.empty()) variant_map += ';';
+            variant_map += name + "=" + path;
+        }
+        ::setenv("SD_SERVER_WORKER_VARIANT_MAP", variant_map.c_str(), 1);
         if (!gpu.empty()) ::setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
         std::vector<char*> argv;
         argv.reserve(args.size() + 2);
