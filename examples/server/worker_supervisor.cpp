@@ -29,12 +29,6 @@ bool truthy(const char* value) {
            std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0;
 }
 
-bool takes_value(const std::string& arg) {
-    return arg == "--listen-ip" || arg == "-l" || arg == "--listen-port" || arg == "-p" ||
-           arg == "--diffusion-model" || arg == "--diffusion-model-edit" ||
-           arg == "--diffusion-model-variants";
-}
-
 bool is_admin_path(const std::string& path) {
     return path == "/health" || path == "/v1/gpu/status" || path == "/v1/admin/drain" ||
            path == "/v1/admin/unload" || path == "/v1/admin/load";
@@ -270,13 +264,24 @@ std::vector<std::string> WorkerSupervisor::child_args(const std::string& model, 
     bool replaced_model = false;
     for (size_t i = 0; i < original_args_.size(); ++i) {
         const std::string& arg = original_args_[i];
-        if (takes_value(arg)) {
+        // The parent owns the public listen address and the child owns its
+        // private loopback address.  Likewise, the parent selects one model
+        // variant per worker and exports the complete logical map separately
+        // for LTX's in-chain variant leases.  Those are the only options that
+        // must be consumed here.  Every other argument (notably --vae,
+        // --t5xxl, --llm, --audio-vae and tiling/offload settings) belongs to
+        // the real server and must reach the child unchanged.
+        if (arg == "--listen-ip" || arg == "-l" || arg == "--listen-port" || arg == "-p" ||
+            arg == "--diffusion-model-edit" || arg == "--diffusion-model-variants") {
             if (i + 1 >= original_args_.size()) break;
-            if (arg == "--diffusion-model") {
-                out.push_back(arg);
-                out.push_back(model_path);
-                replaced_model = true;
-            }
+            ++i;
+            continue;
+        }
+        if (arg == "--diffusion-model") {
+            if (i + 1 >= original_args_.size()) break;
+            out.push_back(arg);
+            out.push_back(model_path);
+            replaced_model = true;
             ++i;
             continue;
         }
