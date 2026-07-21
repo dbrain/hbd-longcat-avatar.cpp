@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <set>
 #include <tuple>
 #include <type_traits>
@@ -249,6 +250,24 @@ public:
     size_t control_net_params_mem_size = 0;
 
     std::shared_ptr<ModelManager> model_manager;
+
+    // LongCat Avatar chains reuse the same image, audio and prompt for each
+    // continuation window.  Text conditioning is independent of the window,
+    // but umT5 is costly to run, so retain its host-owned result only for the
+    // lifetime of one chain.  Do not share this with LTX: its per-window
+    // reference-image conditioning is part of SDCondition.
+    struct AvatarChainTextCond {
+        SDCondition cond;
+        SDCondition uncond;
+        bool has_uncond = false;
+    };
+    bool avatar_chain_text_cache_active = false;
+    std::map<std::string, AvatarChainTextCond> avatar_chain_text_cache;
+
+    static std::string avatar_chain_text_key(const std::string& prompt,
+                                             const std::string& negative_prompt) {
+        return prompt + std::string(1, '\x1f') + negative_prompt;
+    }
 
     std::shared_ptr<Denoiser> denoiser = std::make_shared<CompVisDenoiser>();
     std::vector<float> file_alphas_cumprod;
@@ -6437,14 +6456,42 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     }
 
     int64_t prepare_start_ms = ggml_time_ms();
-    embeds.cond              = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
+    const bool use_avatar_chain_cache =
+        sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+        sd_ctx->sd->avatar_chain_text_cache_active;
+    const std::string cache_key = use_avatar_chain_cache
+                                      ? StableDiffusionGGML::avatar_chain_text_key(request.prompt,
+                                                                                     request.negative_prompt)
+                                      : std::string();
+    const auto cache_it = use_avatar_chain_cache
+                              ? sd_ctx->sd->avatar_chain_text_cache.find(cache_key)
+                              : sd_ctx->sd->avatar_chain_text_cache.end();
+    if (cache_it != sd_ctx->sd->avatar_chain_text_cache.end() &&
+        (!request.use_uncond || cache_it->second.has_uncond)) {
+        LOG_INFO("LongCat Avatar: reusing chained text conditioning (prompt unchanged)");
+        embeds.cond = cache_it->second.cond;
+        if (request.use_uncond && cache_it->second.has_uncond) {
+            embeds.uncond = cache_it->second.uncond;
+        }
+    } else {
+        embeds.cond = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
+                                                                            condition_params);
+        if (request.use_uncond) {
+            condition_params.text = request.negative_prompt;
+            embeds.uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                    condition_params);
-    embeds.cond.c_concat     = latents.concat_latent;
-    embeds.cond.c_vector     = latents.clip_vision_output;
+        }
+        if (use_avatar_chain_cache) {
+            StableDiffusionGGML::AvatarChainTextCond cached;
+            cached.cond = embeds.cond;
+            cached.uncond = embeds.uncond;
+            cached.has_uncond = request.use_uncond;
+            sd_ctx->sd->avatar_chain_text_cache.emplace(cache_key, std::move(cached));
+        }
+    }
+    embeds.cond.c_concat = latents.concat_latent;
+    embeds.cond.c_vector = latents.clip_vision_output;
     if (request.use_uncond) {
-        condition_params.text  = request.negative_prompt;
-        embeds.uncond          = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
-                                                                                     condition_params);
         embeds.uncond.c_concat = latents.concat_latent;
         embeds.uncond.c_vector = latents.clip_vision_output;
     }
@@ -7514,6 +7561,20 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                        (chain_params->chain_audio_track != nullptr && chain_params->chain_audio_track[0] != '\0'))) {
         LOG_ERROR("generate_video_chain: full-timeline audio inputs are supported only for LTX chains");
         return false;
+    }
+
+    // Scope the Avatar cache strictly to this request.  A later request with a
+    // different image or audio must never inherit a condition from this chain.
+    struct AvatarChainTextCacheGuard {
+        StableDiffusionGGML* sd;
+        ~AvatarChainTextCacheGuard() {
+            sd->avatar_chain_text_cache.clear();
+            sd->avatar_chain_text_cache_active = false;
+        }
+    } avatar_chain_text_cache_guard{sd_ctx->sd};
+    if (avatar_chain) {
+        sd_ctx->sd->avatar_chain_text_cache.clear();
+        sd_ctx->sd->avatar_chain_text_cache_active = true;
     }
 
     int carried_frames = std::max(1, chain_params->cont_latent_frames);
