@@ -252,6 +252,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     std::vector<std::vector<sd_image_t>> ltx_v2v_images;
     std::vector<sd_image_t*> ltx_v2v_image_windows;
     std::vector<int> ltx_v2v_frame_counts;
+    std::vector<const char*> ltx_v2v_guide_latent_paths;
     if (!job.ltx_prompts.empty()) {
         ltx_scene_image_owners.resize(job.ltx_prompts.size());
         ltx_scene_images.resize(job.ltx_prompts.size(), nullptr);
@@ -274,6 +275,12 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         ltx_v2v_images.resize(job.ltx_prompts.size());
         ltx_v2v_image_windows.resize(job.ltx_prompts.size(), nullptr);
         ltx_v2v_frame_counts.resize(job.ltx_prompts.size(), 0);
+        ltx_v2v_guide_latent_paths.resize(job.ltx_prompts.size(), nullptr);
+        for (size_t segment = 0; segment < job.ltx_segment_v2v_guide_latent_paths.size(); ++segment) {
+            if (!job.ltx_segment_v2v_guide_latent_paths[segment].empty()) {
+                ltx_v2v_guide_latent_paths[segment] = job.ltx_segment_v2v_guide_latent_paths[segment].c_str();
+            }
+        }
         for (size_t segment = 0; segment < job.ltx_segment_control_frames.size(); ++segment) {
             const auto& encoded_frames = job.ltx_segment_control_frames[segment];
             if (encoded_frames.empty()) continue;
@@ -314,6 +321,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.segment_control_frame_counts = ltx_v2v_frame_counts.empty() ? nullptr : ltx_v2v_frame_counts.data();
             chain.segment_v2v_modes = job.ltx_segment_v2v_modes.empty() ? nullptr : job.ltx_segment_v2v_modes.data();
             chain.segment_v2v_strengths = job.ltx_segment_v2v_strengths.empty() ? nullptr : job.ltx_segment_v2v_strengths.data();
+            chain.segment_v2v_guide_latent_paths = ltx_v2v_guide_latent_paths.empty() ? nullptr : ltx_v2v_guide_latent_paths.data();
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;
             chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();

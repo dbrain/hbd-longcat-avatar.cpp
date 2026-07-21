@@ -60,6 +60,26 @@ bool write_ltx_bank_reference(const std::string& job_id, const std::string& bank
     return reference.good();
 }
 
+bool resolve_ltx_guide_latent_path(const std::string& requested_path, std::string& resolved_path) {
+    std::error_code error;
+    const fs::path root = fs::weakly_canonical(ltx_bank_root(), error);
+    if (error) return false;
+    const fs::path candidate = fs::weakly_canonical(requested_path, error);
+    if (error || !fs::is_regular_file(candidate, error)) return false;
+    const fs::path relative = candidate.lexically_relative(root);
+    if (relative.empty() || relative.is_absolute() || relative.begin() == relative.end() ||
+        relative.begin()->string() == "..") return false;
+    const std::string filename = candidate.filename().string();
+    if (filename.size() <= 8 || filename.rfind("seg_", 0) != 0 ||
+        filename.compare(filename.size() - 4, 4, ".bin") != 0 ||
+        !std::all_of(filename.begin() + 4, filename.end() - 4,
+                     [](unsigned char ch) { return std::isdigit(ch); })) {
+        return false;
+    }
+    resolved_path = candidate.string();
+    return true;
+}
+
 bool extract_ltx_request(const httplib::Request& req, json& body) {
     if (!req.is_multipart_form_data()) {
         if (req.body.empty()) {
@@ -135,6 +155,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<std::vector<std::string>> segment_control_frames;
             std::vector<int> segment_v2v_modes;
             std::vector<float> segment_v2v_strengths;
+            std::vector<std::string> segment_v2v_guide_latent_paths;
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
@@ -145,6 +166,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_control_frames.emplace_back();
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
+                        segment_v2v_guide_latent_paths.emplace_back();
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
                         const int frames = segment.value("frames", 0);
@@ -156,16 +178,25 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(frames);
                         segment_scene_cuts.push_back(segment.value("scene_cut", false) ? 1 : 0);
                         segment_init_images.push_back(segment.value("init_image", std::string()));
-                        if (segment.contains("v2v_source_latent_path")) {
+                        const int v2v_mode = segment.value("v2v_mode", 0);
+                        if (v2v_mode != 0 && v2v_mode != 1 && v2v_mode != 2) {
                             res.status = 400;
-                            res.set_content(R"({"error":"LTX latent-in guide editing is not supported by this engine build"})", "application/json");
+                            res.set_content("{\"error\":\"LTX v2v_mode must be 0, 1 (SDEdit), or 2 (guide edit)\"}", "application/json");
                             return;
                         }
-                        const int v2v_mode = segment.value("v2v_mode", 0);
-                        if (v2v_mode != 0 && v2v_mode != 1) {
-                            res.status = 400;
-                            res.set_content(R"({"error":"only LTX v2v_mode 1 (SDEdit) is supported"})", "application/json");
-                            return;
+                        std::string guide_latent_path;
+                        if (segment.contains("v2v_source_latent_path")) {
+                            if (!segment["v2v_source_latent_path"].is_string() ||
+                                !resolve_ltx_guide_latent_path(segment["v2v_source_latent_path"].get<std::string>(), guide_latent_path)) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"v2v_source_latent_path must be an existing LTX job-bank seg_<n>.bin file"})", "application/json");
+                                return;
+                            }
+                            if (v2v_mode != 2) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"v2v_source_latent_path requires v2v_mode 2"})", "application/json");
+                                return;
+                            }
                         }
                         std::vector<std::string> controls;
                         if (segment.contains("control_frames")) {
@@ -178,14 +209,19 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             }
                             for (const auto& frame : segment["control_frames"]) controls.push_back(frame.get<std::string>());
                         }
-                        if (v2v_mode == 1 && controls.empty()) {
+                        if ((v2v_mode == 1 || v2v_mode == 2) && controls.empty() && guide_latent_path.empty()) {
                             res.status = 400;
-                            res.set_content(R"({"error":"LTX SDEdit requires control_frames"})", "application/json");
+                            res.set_content(R"({"error":"LTX V2V requires control_frames or a guide latent path"})", "application/json");
                             return;
                         }
-                        if (v2v_mode == 0 && !controls.empty()) {
+                        if (v2v_mode == 0 && (!controls.empty() || !guide_latent_path.empty())) {
                             res.status = 400;
-                            res.set_content(R"({"error":"control_frames require v2v_mode 1"})", "application/json");
+                            res.set_content(R"({"error":"V2V sources require v2v_mode 1 or 2"})", "application/json");
+                            return;
+                        }
+                        if (!controls.empty() && !guide_latent_path.empty()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"guide edit accepts either control_frames or v2v_source_latent_path, not both"})", "application/json");
                             return;
                         }
                         const float v2v_strength = segment.value("v2v_guide_strength", -1.f);
@@ -197,6 +233,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_control_frames.push_back(std::move(controls));
                         segment_v2v_modes.push_back(v2v_mode);
                         segment_v2v_strengths.push_back(v2v_strength);
+                        segment_v2v_guide_latent_paths.push_back(std::move(guide_latent_path));
                     }
                 }
             } else if (body.contains("prompts") && body["prompts"].is_array()) {
@@ -209,6 +246,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_control_frames.emplace_back();
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
+                        segment_v2v_guide_latent_paths.emplace_back();
                     }
                 }
             }
@@ -232,7 +270,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
             for (size_t segment = 0; segment < segment_v2v_modes.size(); ++segment) {
-                if (segment_v2v_modes[segment] != 1) continue;
+                if (segment_v2v_modes[segment] != 1 &&
+                    !(segment_v2v_modes[segment] == 2 && segment_v2v_guide_latent_paths[segment].empty())) continue;
                 const int frames = segment_frames[segment] > 0 ? segment_frames[segment] : request.gen_params.video_frames;
                 if (static_cast<int>(segment_control_frames[segment].size()) != frames) {
                     res.status = 400;
@@ -260,6 +299,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_control_frames = std::move(segment_control_frames);
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
+            job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
             job->ltx_cont_latent_frames = continuation_frames;
             const std::string resume_job_id = body.value("resume_job_id", std::string());
             int resume_from = 0;

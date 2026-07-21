@@ -402,8 +402,15 @@ typedef struct {
     float moe_boundary;
     float strength;
     // LTX video-to-video mode. Zero preserves the upstream unsupported-control
-    // behavior; one selects SDEdit seeding from control_frames.
+    // behavior; one selects pixel-source SDEdit and two selects guide-edit,
+    // which also accepts a saved video-latent source.
     int v2v_mode;
+    // Guide-edit uses this instead of `strength` when positive. A value of one
+    // is a full restyle; lower values preserve more of the source scene.
+    float v2v_guide_strength;
+    // Trusted absolute path to a saved video-only LTX latent. Consumed only by
+    // v2v_mode 2; callers of the HTTP API must use the job-bank root.
+    const char* v2v_guide_latent_path;
     int64_t seed;
     int video_frames;
     int fps;
@@ -464,14 +471,16 @@ typedef struct {
     // a continuation tail; an image entry pins its opening frame and also starts fresh.
     const int* segment_scene_cuts;
     const sd_image_t* const* segment_init_images;
-    // Optional per-window SDEdit sources. Mode 1 replaces the window's starting
-    // video latent with these frames; it is a fresh scene rather than a continuation.
+    // Optional per-window V2V sources. Modes 1 and 2 replace the window's
+    // starting video latent; they are fresh scenes rather than continuations.
     sd_image_t* const* segment_control_frames;
     const int* segment_control_frame_counts;
     const int* segment_v2v_modes;
     // Negative entries retain base_params->strength; non-negative entries are
     // the SDEdit denoising strength for their corresponding V2V window.
     const float* segment_v2v_strengths;
+    // Optional trusted saved-video-latent source for a mode-2 V2V window.
+    const char* const* segment_v2v_guide_latent_paths;
     int cont_latent_frames;
     int start_segment;
     const char* bank_dir;
