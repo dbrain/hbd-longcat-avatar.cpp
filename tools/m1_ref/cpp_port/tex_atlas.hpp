@@ -107,6 +107,14 @@ struct BakedTexture {
     size_t source_sampled_texels = 0;
     size_t source_missing_texels = 0;
     size_t unresolved_surface_texels = 0;
+    // Native-only material-fidelity audit. Each directly sampled surface
+    // texel is compared with the final encoded/resized atlas sampled back at
+    // the same UV. This measures atlas loss (packing, filtering, resize and
+    // optional cleanup) without a Python renderer or oracle.
+    size_t source_recovery_texels = 0;
+    double source_recovery_mae_linear = 0.0;
+    double source_recovery_rmse_linear = 0.0;
+    double source_recovery_psnr_db = 0.0;
 };
 
 // Native-only bake evidence, written after the GLB and PNG have succeeded by
@@ -119,7 +127,7 @@ static inline bool write_quality_report(const std::string& path, const BakedText
     const double coverage=atlas_texels ? (double)bt.surface_texels/(double)atlas_texels : 0.0;
     const double missing=bt.surface_texels ? (double)bt.source_missing_texels/(double)bt.surface_texels : 0.0;
     const double unresolved=bt.surface_texels ? (double)bt.unresolved_surface_texels/(double)bt.surface_texels : 0.0;
-    f << "schema_version=1\n"
+    f << "schema_version=2\n"
       << "atlas_width=" << bt.tw << '\n'
       << "atlas_height=" << bt.th << '\n'
       << "atlas_texels=" << atlas_texels << '\n'
@@ -132,6 +140,10 @@ static inline bool write_quality_report(const std::string& path, const BakedText
       << "source_missing_fraction_before_repair=" << missing << '\n'
       << "unresolved_surface_texels_after_chart_repair=" << bt.unresolved_surface_texels << '\n'
       << "unresolved_surface_fraction_after_chart_repair=" << unresolved << '\n'
+      << "source_recovery_texels=" << bt.source_recovery_texels << '\n'
+      << "source_recovery_mae_linear=" << bt.source_recovery_mae_linear << '\n'
+      << "source_recovery_rmse_linear=" << bt.source_recovery_rmse_linear << '\n'
+      << "source_recovery_psnr_db=" << bt.source_recovery_psnr_db << '\n'
       << "sampling_verdict=" << (bt.unresolved_surface_texels==0 ? "complete-after-chart-repair" : "residual-unresolved") << '\n';
     return (bool)f;
 }
@@ -1328,10 +1340,16 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     // (covered AND all-channels-zero) as NOT-valid so the inpaint fills them from valid chart
     // neighbours (correct local colour, unlike grabbing a far/wrong voxel via a bigger fallback).
     std::vector<uint8_t> mask2(mask.size());
+    std::vector<uint8_t> source_valid(mask.size(), 0);
+    std::vector<float> source_rgb((size_t)W*Ht*3, 0.f);
     size_t holes=0;
     for (size_t p=0;p<(size_t)W*Ht;p++){
         bool any=false; const float* a=&atl[p*C]; for(int c=0;c<C;c++) if(a[c]!=0.f){any=true;break;}
         mask2[p] = (mask[p] && any) ? 1 : 0;
+        if (mask2[p]) {
+            source_valid[p]=1;
+            source_rgb[p*3+0]=a[0]; source_rgb[p*3+1]=a[1]; source_rgb[p*3+2]=a[2];
+        }
         if (mask[p] && !any) holes++;
     }
     if (verbose && holes) printf("[atlas] interior holes (covered but unsampled): %zu (%.2f%% of covered) -> inpainting\n",
@@ -1425,6 +1443,48 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         if (verbose && sigma > 0.f) printf("[atlas] baseColor gaussian blur sigma=%.2f\n", sigma);
         blur_u8_gaussian_rgb(bt.base_color, bt.tw, bt.th, 4, sigma);
     }
+    // Measure final-atlas recovery at every texel that was directly sampled
+    // from the native PBR volume. The reference is deliberately captured
+    // before inpaint/median/encode: a candidate that smooths away material
+    // detail may look subjectively cleaner, but its loss must be visible in
+    // the recorded number before it can become an automatic default.
+    auto dec_bc = [&](float c)->float {
+        c=std::max(0.f,std::min(1.f,c));
+        if (bc_srgb) return c<=0.04045f ? c/12.92f : std::pow((c+0.055f)/1.055f,2.4f);
+        if (bc_gamma>0.f) return std::pow(c,1.f/bc_gamma);
+        return c;
+    };
+    auto sample_final = [&](float x, float y, int ch)->float {
+        x=std::max(0.f,std::min(x,(float)bt.tw-1.f));
+        y=std::max(0.f,std::min(y,(float)bt.th-1.f));
+        const int x0=(int)std::floor(x), y0=(int)std::floor(y);
+        const int x1=std::min(x0+1,bt.tw-1), y1=std::min(y0+1,bt.th-1);
+        const float tx=x-x0, ty=y-y0;
+        auto q=[&](int xx,int yy){ return dec_bc(bt.base_color[((size_t)yy*bt.tw+xx)*4+ch]/255.f); };
+        const float a=q(x0,y0), b=q(x1,y0), c=q(x0,y1), d=q(x1,y1);
+        return (a*(1.f-tx)+b*tx)*(1.f-ty)+(c*(1.f-tx)+d*tx)*ty;
+    };
+    double abs_err=0.0, sq_err=0.0; size_t nrec=0;
+    for (int y=0;y<Ht;y++) for (int x=0;x<W;x++) {
+        const size_t p=(size_t)y*W+x;
+        if (!source_valid[p]) continue;
+        const float fx=((float)x+.5f)*(float)bt.tw/(float)W-.5f;
+        const float fy=((float)y+.5f)*(float)bt.th/(float)Ht-.5f;
+        for (int ch=0;ch<3;ch++) {
+            const double e=(double)sample_final(fx,fy,ch)-(double)source_rgb[p*3+ch];
+            abs_err+=std::fabs(e); sq_err+=e*e; ++nrec;
+        }
+    }
+    bt.source_recovery_texels=nrec/3;
+    if (nrec) {
+        bt.source_recovery_mae_linear=abs_err/(double)nrec;
+        bt.source_recovery_rmse_linear=std::sqrt(sq_err/(double)nrec);
+        bt.source_recovery_psnr_db=bt.source_recovery_rmse_linear>1e-12
+            ? std::min(99.0,20.0*std::log10(1.0/bt.source_recovery_rmse_linear)) : 99.0;
+    }
+    if (verbose) printf("[atlas] final-atlas source recovery: %zu texels, MAE %.6f RMSE %.6f PSNR %.2f dB\n",
+                        bt.source_recovery_texels,bt.source_recovery_mae_linear,
+                        bt.source_recovery_rmse_linear,bt.source_recovery_psnr_db);
     xatlas::Destroy(atlas);
     _stage("atlas_encode_complete");
     if (verbose) printf("[atlas] inpaint+encode+resize (%.2fs)\n", _now()-t_inp);
