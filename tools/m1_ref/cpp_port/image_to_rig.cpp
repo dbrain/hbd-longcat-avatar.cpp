@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -415,6 +416,26 @@ int main(int argc, char** argv) {
         if (ang > 0.05f && ang < 3.0f) { cam = ang; dist = 0.5f / std::tan(cam * 0.5f);
             printf("  [0/4] MoGe camera: fov=%.4frad (%.2fdeg) dist=%.6f  (%.1fs)\n", cam, cam*180.0f/(float)M_PI, dist, pix::now_s()-t_m); }
         else printf("  [0/4] MoGe returned implausible fov=%.4f — keeping cam=%.4f\n", ang, cam);
+    }
+
+    // A later observed-view overlay must use the same camera convention that
+    // created/refined this mesh. Persist the resolved values with the stage
+    // cache instead of requiring a fragile launcher-log scrape. This record is
+    // CPU-only provenance: it neither changes geometry nor invokes another
+    // model, and it is useful even when the default/caller camera was used.
+    if (!stage_dir.empty()) {
+        mkdir(stage_dir.c_str(), 0755);
+        std::ofstream cf(stage_dir + "/camera_provenance.txt", std::ios::trunc);
+        if (!cf) { std::fprintf(stderr, "WARN: could not write camera provenance in %s\n", stage_dir.c_str()); }
+        else {
+            cf << "schema_version=1\n"
+               << "camera_source=" << (use_moge ? "moge" : "caller-or-default") << '\n'
+               << "cam_angle_x_rad=" << cam << '\n'
+               << "camera_distance=" << dist << '\n'
+               << "mesh_scale=" << ms << '\n'
+               << "image=" << image << '\n';
+            std::printf("  [stage] wrote %s/camera_provenance.txt\n", stage_dir.c_str());
+        }
     }
 
     // ---------- [1/4] geometry + texture (in-process, GPU) ----------

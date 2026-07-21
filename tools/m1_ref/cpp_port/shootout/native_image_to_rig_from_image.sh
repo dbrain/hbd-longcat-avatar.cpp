@@ -452,6 +452,7 @@ input_mode=$INPUT_MODE
 geometry_cache=$CACHE
 geometry_recipe=$GEOMETRY_RECIPE
 geometry_delivery_manifest=$OUT/geometry_delivery.txt
+camera_provenance=$CACHE/camera_provenance.txt
 legacy_pbr_cache=$LEGACY_PBR_CACHE
 texture_recipe=native high Trellis material + CPU medium/low rebakes from native_high_texture_dump + structural rig gate
 texture_delivery_manifest=$OUT/texture_delivery.txt
