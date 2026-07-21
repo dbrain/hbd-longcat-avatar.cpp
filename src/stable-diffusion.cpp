@@ -542,6 +542,19 @@ public:
             return false;
         }
 
+        ModelLoader compatibility_probe;
+        if (!compatibility_probe.init_from_file(path, "model.diffusion_model.")) {
+            LOG_ERROR("swap_diffusion_model: could not inspect '%s'", path.c_str());
+            return false;
+        }
+        for (const std::string& name : compatibility_probe.get_tensor_names()) {
+            if (ends_with(name, ".wglobal")) {
+                LOG_ERROR("swap_diffusion_model: '%s' is an unsupported unfolded NVFP4 GGUF (%s)",
+                          path.c_str(), name.c_str());
+                return false;
+            }
+        }
+
         diffusion_model->runner_done();
         if (!model_manager->unregister_param_tensors("Diffusion model")) {
             LOG_ERROR("swap_diffusion_model: could not release outgoing diffusion tensors");
@@ -769,6 +782,22 @@ public:
             LOG_INFO("loading unconditional diffusion model from '%s'", sd_ctx_params->uncond_diffusion_model_path);
             if (!model_loader.init_from_file(sd_ctx_params->uncond_diffusion_model_path, "model.diffusion_model.uncond.")) {
                 LOG_WARN("loading unconditional diffusion model from '%s' failed", sd_ctx_params->uncond_diffusion_model_path);
+            }
+        }
+
+        // ModelOpt's unfolded NVFP4 export stores a second per-tensor scale as
+        // `<weight>.wglobal`. The previous fork applied those scales in a custom
+        // CUDA/cuBLASLt path; upstream ggml's native NVFP4 MMQ format has no
+        // equivalent sidecar contract. Loading one and silently ignoring the
+        // scales produces materially wrong (often white) output, so make the
+        // unsupported asset format explicit until it is folded into a
+        // self-contained GGUF or support is ported end-to-end.
+        for (const std::string& name : model_loader.get_tensor_names()) {
+            if (ends_with(name, ".wglobal")) {
+                LOG_ERROR("unfolded NVFP4 GGUF tensor '%s' requires per-tensor .wglobal support, "
+                          "which upstream ggml does not provide; use a folded NVFP4 GGUF or the compatible backend",
+                          name.c_str());
+                return false;
             }
         }
 
