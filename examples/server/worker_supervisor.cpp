@@ -260,7 +260,7 @@ int WorkerSupervisor::reserve_loopback_port() const {
 std::vector<std::string> WorkerSupervisor::child_args(const std::string& model, int port) const {
     std::vector<std::string> out;
     const auto variant = variants_.find(model);
-    const std::string& model_path = variant->second;
+    const std::string* model_path = variant == variants_.end() ? nullptr : &variant->second;
     bool replaced_model = false;
     for (size_t i = 0; i < original_args_.size(); ++i) {
         const std::string& arg = original_args_[i];
@@ -280,16 +280,20 @@ std::vector<std::string> WorkerSupervisor::child_args(const std::string& model, 
         if (arg == "--diffusion-model") {
             if (i + 1 >= original_args_.size()) break;
             out.push_back(arg);
-            out.push_back(model_path);
+            // Legacy single-model services (LongCat Avatar, and any server
+            // launched with -m) do not publish a logical variant map.  Keep
+            // their original model argument intact; only variant-aware
+            // services substitute the selected --diffusion-model path.
+            out.push_back(model_path != nullptr ? *model_path : original_args_[i + 1]);
             replaced_model = true;
             ++i;
             continue;
         }
         out.push_back(arg);
     }
-    if (!replaced_model && !model_path.empty()) {
+    if (!replaced_model && model_path != nullptr && !model_path->empty()) {
         out.push_back("--diffusion-model");
-        out.push_back(model_path);
+        out.push_back(*model_path);
     }
     out.push_back("--listen-ip");
     out.push_back("127.0.0.1");
@@ -329,7 +333,12 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
     reap_exited_locked();
     const std::string model = requested_model.empty() ?
         (active_model_.empty() ? std::string("base") : active_model_) : requested_model;
-    if (variants_.find(model) == variants_.end()) {
+    // A server started with the legacy single-model `-m` option has no
+    // diffusion variant map.  It is still a valid isolated worker: preserve
+    // its original argv and use the stable logical name "base" for health.
+    // Variant-aware services keep the strict validation needed for safe
+    // Flux/LTX model switches.
+    if (!variants_.empty() && variants_.find(model) == variants_.end()) {
         error = "unknown model variant '" + model + "'";
         return false;
     }
