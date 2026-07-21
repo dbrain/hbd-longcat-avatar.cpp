@@ -918,6 +918,12 @@ namespace LTXV {
             }
 
             auto regs = ggml_reshape_3d(ctx->ggml_ctx, params["learnable_registers"], hidden_size, num_learnable_registers, 1);
+            // NVFP4 GGUFs may keep the learned registers in BF16 while the
+            // activations are promoted to F32. ggml_concat requires matching
+            // element types, so align the registers before expanding them.
+            if (regs->type != hidden_states->type) {
+                regs = ggml_cast(ctx->ggml_ctx, regs, hidden_states->type);
+            }
             auto temp = ggml_new_tensor_3d(ctx->ggml_ctx, regs->type, regs->ne[0], regs->ne[1], hidden_states->ne[2]);
             regs      = ggml_repeat(ctx->ggml_ctx, regs, temp);
 
