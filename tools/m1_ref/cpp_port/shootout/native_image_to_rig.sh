@@ -67,7 +67,9 @@ assert_closed_mesh() {
 # A filled PNG alone is insufficient proof of a usable material: retain and gate
 # the native bake's original-surface sampling report.  Chart-local repair may
 # fix sparse misses, but no covered texel may remain unresolved before the
-# cosmetic whole-atlas background dilation.
+# cosmetic whole-atlas background dilation. The final-atlas recovery evidence
+# is then enforced by verify_native_texture_asset.sh, so a no-hole-but-washed-
+# out atlas cannot be promoted.
 assert_texture_qc() {
   local file="$1" qc unresolved
   qc="${file}.texture-qc.txt"
@@ -83,7 +85,7 @@ assert_texture_qc() {
 # skeleton: try_rig transfers that accepted skin onto high, so Hymotion does not silently inherit a
 # lower-resolution atlas.
 write_texture_delivery_manifest() {
-  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha qc qc_sha qc_verdict qc_missing topo
+  local rig_state="$1" level="${2:-none}" name file atlas status stage route stage_sha qc qc_sha qc_verdict qc_missing qc_schema qc_recovery_texels qc_mae qc_rmse qc_psnr topo
   # `reference` is a material recipe, not a promise that all meshes can use a
   # single global xatlas solve.  Record the measured route from the stage log:
   # direct for clean topology; conformal local islands where sharp/high-curvature
@@ -101,13 +103,14 @@ write_texture_delivery_manifest() {
     fi
   }
   {
-    printf 'schema_version=2\n'
+    printf 'schema_version=3\n'
     printf 'production_texture=native_high_textured.glb\n'
     printf 'native_unwrap=%s\n' "$NATIVE_UNWRAP"
     printf 'high_model_lattice=%s\nhigh_atlas_px=%s\n' "$NATIVE_HIGH_RESOLUTION" "$NATIVE_HIGH_ATLAS"
     printf 'lod_material_contract=medium/low are CPU rebakes of native_high_texture_dump; no second texture inference; adaptive xatlas uses direct parity charts for clean topology or conformal local islands for high curvature\n'
     printf 'topology_gate=position-welded open=0 for every texture LOD\n'
-    printf 'texture_qc_gate=zero unresolved rasterised surface texels after chart-local repair; source-missing count is retained for eye-test audit\n'
+    printf 'texture_qc_gate=zero unresolved rasterised surface texels after chart-local repair; schema-3 final-atlas recovery MAE<=%s and PSNR>=%s dB; source-missing count is retained for eye-test audit\n' \
+      "${NATIVE_TEXTURE_MAX_RECOVERY_MAE_LINEAR:-0.020}" "${NATIVE_TEXTURE_MIN_RECOVERY_PSNR_DB:-30}"
     printf 'rig_state=%s\nselected_rig=%s\n' "$rig_state" "$level"
     for name in high medium low; do
       file="$OUT/native_${name}_textured.glb"
@@ -119,16 +122,23 @@ write_texture_delivery_manifest() {
       [[ ! -f "$stage" ]] || stage_sha="$(sha256sum "$stage" | awk '{print $1}')"
       qc="${file}.texture-qc.txt"
       qc_sha="missing"; qc_verdict="missing"; qc_missing="missing"
+      qc_schema="missing"; qc_recovery_texels="missing"; qc_mae="missing"; qc_rmse="missing"; qc_psnr="missing"
       if [[ -f "$qc" ]]; then
         qc_sha="$(sha256sum "$qc" | awk '{print $1}')"
         qc_verdict="$(awk -F= '$1=="sampling_verdict" {print $2; exit}' "$qc")"
         qc_missing="$(awk -F= '$1=="source_missing_fraction_before_repair" {print $2; exit}' "$qc")"
+        qc_schema="$(awk -F= '$1=="schema_version" {print $2; exit}' "$qc")"
+        qc_recovery_texels="$(awk -F= '$1=="source_recovery_texels" {print $2; exit}' "$qc")"
+        qc_mae="$(awk -F= '$1=="source_recovery_mae_linear" {print $2; exit}' "$qc")"
+        qc_rmse="$(awk -F= '$1=="source_recovery_rmse_linear" {print $2; exit}' "$qc")"
+        qc_psnr="$(awk -F= '$1=="source_recovery_psnr_db" {print $2; exit}' "$qc")"
       fi
       topo="$("$CP/mesh_topo" "$file")"
-      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s atlas_route=%s stage_log=%s stage_log_sha256=%s texture_qc=%s texture_qc_sha256=%s sampling_verdict=%s source_missing_fraction_before_repair=%s topology="%s"\n' \
+      printf 'lod=%s file=%s sha256=%s atlas=%s atlas_sha256=%s atlas_route=%s stage_log=%s stage_log_sha256=%s texture_qc=%s texture_qc_sha256=%s qc_schema=%s sampling_verdict=%s source_missing_fraction_before_repair=%s source_recovery_texels=%s source_recovery_mae_linear=%s source_recovery_rmse_linear=%s source_recovery_psnr_db=%s topology="%s"\n' \
         "$name" "$(basename "$file")" "$(sha256sum "$file" | awk '{print $1}')" \
         "$(basename "$atlas")" "$(sha256sum "$atlas" | awk '{print $1}')" "$route" \
-        "$(basename "$stage")" "$stage_sha" "$(basename "$qc")" "$qc_sha" "$qc_verdict" "$qc_missing" "$topo"
+        "$(basename "$stage")" "$stage_sha" "$(basename "$qc")" "$qc_sha" "$qc_schema" "$qc_verdict" "$qc_missing" \
+        "$qc_recovery_texels" "$qc_mae" "$qc_rmse" "$qc_psnr" "$topo"
       [[ ! -f "$status" ]] || printf 'lod=%s native_texture_status=%s\n' "$name" "$(basename "$status")"
     done
     [[ "$rig_state" != succeeded ]] || printf 'hymotion_rigged=hymotion_rigged.glb sha256=%s\n' "$(sha256sum "$OUT/hymotion_rigged.glb" | awk '{print $1}')"

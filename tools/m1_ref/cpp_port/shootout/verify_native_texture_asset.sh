@@ -8,12 +8,21 @@
 # artifact or a copied delivery can be checked later. It validates the exact
 # companions a production native bake must retain: atlas, phase log, live/final
 # status, texture sampling QC, and the position-welded topology invariant.
+#
+# Schema-3 QC also measures how much the final encoded atlas changed the
+# decoded native PBR material. A bake can have no holes but still be washed out
+# or compressed, so this is a hard production gate. Defaults are deliberately
+# below the observed clean 512/2048 range (35.82--41.15 dB, MAE
+# 0.00188--0.00492): they catch material loss without making a subject-specific
+# promise. Labelled A/Bs may override the two environment variables.
 set -euo pipefail
 
 CP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GLB="${1:?usage: verify_native_texture_asset.sh <textured.glb> [--execution gpu|cpu]}"
 shift
 EXPECTED_EXECUTION=""
+MIN_RECOVERY_PSNR_DB="${NATIVE_TEXTURE_MIN_RECOVERY_PSNR_DB:-30}"
+MAX_RECOVERY_MAE_LINEAR="${NATIVE_TEXTURE_MAX_RECOVERY_MAE_LINEAR:-0.020}"
 if (( $# > 0 )); then
   [[ "$1" == "--execution" && $# == 2 ]] || { echo "usage: verify_native_texture_asset.sh <textured.glb> [--execution gpu|cpu]" >&2; exit 2; }
   EXPECTED_EXECUTION="$2"
@@ -46,6 +55,26 @@ UNRESOLVED="$(qc_value unresolved_surface_texels_after_chart_repair)"
 (( UNRESOLVED == 0 )) || { echo "REJECT: $UNRESOLVED unresolved surface texels: $QC" >&2; exit 1; }
 [[ "$(qc_value sampling_verdict)" == complete-after-chart-repair ]] || { echo "texture QC did not complete chart repair: $QC" >&2; exit 1; }
 
+SCHEMA="$(qc_value schema_version)"
+RECOVERY_TEXELS="$(qc_value source_recovery_texels)"
+RECOVERY_MAE="$(qc_value source_recovery_mae_linear)"
+RECOVERY_PSNR="$(qc_value source_recovery_psnr_db)"
+[[ "$SCHEMA" =~ ^[0-9]+$ ]] && (( SCHEMA >= 3 )) || {
+  echo "REJECT: texture QC lacks schema-3 final-atlas recovery evidence: $QC" >&2; exit 1;
+}
+[[ "$RECOVERY_TEXELS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "REJECT: texture QC lacks sampled final-atlas recovery texels: $QC" >&2; exit 1;
+}
+[[ "$RECOVERY_MAE" =~ ^[0-9]+([.][0-9]+)?$ && "$RECOVERY_PSNR" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+  echo "REJECT: texture QC has invalid final-atlas recovery metrics: $QC" >&2; exit 1;
+}
+awk -v psnr="$RECOVERY_PSNR" -v min="$MIN_RECOVERY_PSNR_DB" 'BEGIN { exit !(psnr >= min) }' || {
+  echo "REJECT: final-atlas recovery PSNR ${RECOVERY_PSNR} dB < ${MIN_RECOVERY_PSNR_DB} dB: $QC" >&2; exit 1;
+}
+awk -v mae="$RECOVERY_MAE" -v max="$MAX_RECOVERY_MAE_LINEAR" 'BEGIN { exit !(mae <= max) }' || {
+  echo "REJECT: final-atlas recovery MAE ${RECOVERY_MAE} > ${MAX_RECOVERY_MAE_LINEAR}: $QC" >&2; exit 1;
+}
+
 case "$EXPECTED_EXECUTION" in
   gpu)
     grep -q '^gpu=PCI GPU 0 / .*RTX 3060' "$STATUS" || { echo "GPU texture asset was not pinned to PCI GPU 0 / RTX 3060: $STATUS" >&2; exit 1; }
@@ -59,3 +88,5 @@ printf 'VERIFIED native texture asset\n'
 printf 'glb=%s\natlas=%s\ntopology=%s\n' "$GLB" "$ATLAS" "$TOPO"
 printf 'sampling_verdict=%s\nsource_missing_fraction_before_repair=%s\n' \
   "$(qc_value sampling_verdict)" "$(qc_value source_missing_fraction_before_repair)"
+printf 'final_atlas_recovery=texels=%s mae_linear=%s psnr_db=%s (gate: mae<=%s psnr>=%s)\n' \
+  "$RECOVERY_TEXELS" "$RECOVERY_MAE" "$RECOVERY_PSNR" "$MAX_RECOVERY_MAE_LINEAR" "$MIN_RECOVERY_PSNR_DB"
