@@ -8,6 +8,45 @@
 
 namespace native_cumesh {
 
+void clean_feature_preserving(const std::vector<float>& vertices,
+                              const std::vector<int64_t>& faces,
+                              std::vector<float>& out_vertices,
+                              std::vector<int64_t>& out_faces,
+                              CleanReport* report,
+                              float max_hole_perimeter) {
+    if (vertices.empty() || faces.empty() || vertices.size() % 3 || faces.size() % 3) {
+        throw std::runtime_error("native_cumesh::clean_feature_preserving received malformed mesh arrays");
+    }
+    if (!(max_hole_perimeter > 0.f)) {
+        throw std::runtime_error("native_cumesh::clean_feature_preserving max_hole_perimeter must be positive");
+    }
+    if (report) {
+        report->input_vertices = (int)(vertices.size() / 3);
+        report->input_faces = (int)(faces.size() / 3);
+    }
+
+    cumesh::CuMesh mesh;
+    mesh.init_host(vertices.data(), vertices.size() / 3, faces.data(), faces.size() / 3);
+
+    // Match the safe parts of o_voxel's pre-remesh cleanup without moving any surface vertex.  Repair
+    // splits non-manifold fans into ordinary manifold sheets; it is deliberately preferred to deleting
+    // faces, which would erase facial/hair detail.  fill_holes only closes loops below the Python
+    // postprocessor's 3e-2 perimeter threshold.
+    mesh.remove_degenerate_faces(1e-24f, 1e-12f);
+    mesh.remove_duplicate_faces();
+    mesh.fill_holes(max_hole_perimeter);
+    mesh.repair_non_manifold_edges();
+    mesh.remove_duplicate_faces();
+    mesh.fill_holes(max_hole_perimeter);
+    mesh.unify_face_orientations();
+    mesh.read_host(out_vertices, out_faces);
+
+    if (report) {
+        report->output_vertices = (int)(out_vertices.size() / 3);
+        report->output_faces = (int)(out_faces.size() / 3);
+    }
+}
+
 std::vector<ClusterMesh> compute_clusters(const std::vector<float>& vertices,
                                           const std::vector<int64_t>& faces,
                                           float threshold_cone_half_angle_rad,

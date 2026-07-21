@@ -11,6 +11,24 @@ struct ClusterMesh {
     std::vector<int> vmap;
 };
 
+// Feature-preserving cleanup for a decoded Pixal/O-Voxel dual-grid surface.  Unlike the production
+// occupancy marching-cubes fallback, this never resamples the surface: it removes degenerates and
+// duplicate faces, splits non-manifold fans, fills only small boundary loops, and makes winding
+// consistent.  It is a native CUDA implementation used for the clay-only postprocess A/B.
+struct CleanReport {
+    int input_vertices = 0;
+    int input_faces = 0;
+    int output_vertices = 0;
+    int output_faces = 0;
+};
+
+void clean_feature_preserving(const std::vector<float>& vertices,
+                              const std::vector<int64_t>& faces,
+                              std::vector<float>& out_vertices,
+                              std::vector<int64_t>& out_faces,
+                              CleanReport* report = nullptr,
+                              float max_hole_perimeter = 3e-2f);
+
 std::vector<ClusterMesh> compute_clusters(const std::vector<float>& vertices,
                                           const std::vector<int64_t>& faces,
                                           float threshold_cone_half_angle_rad,
