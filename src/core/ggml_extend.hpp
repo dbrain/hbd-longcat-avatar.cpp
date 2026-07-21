@@ -1678,7 +1678,8 @@ struct WeightAdapter {
                                            ggml_tensor* w,
                                            ggml_tensor* b,
                                            const std::string& prefix,
-                                           ForwardParams forward_params)                                                              = 0;
+                                           ForwardParams forward_params,
+                                           ggml_tensor* base_output_scale = nullptr)                                                = 0;
     virtual size_t get_extra_graph_size()                                                                                             = 0;
 };
 
@@ -3345,12 +3346,17 @@ protected:
     bool force_prec_f32;
     bool allow_weight_scale;
     bool has_weight_scale = false;
+    // ModelOpt's unfolded NVFP4 export stores this scalar next to each
+    // quantized weight.  It scales the base matmul only, before bias and any
+    // runtime LoRA delta are added.
+    bool has_weight_global = false;
     float scale;
     std::string prefix;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
         this->prefix         = prefix;
         has_weight_scale     = false;
+        has_weight_global    = false;
         enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
         if (in_features % ggml_blck_size(wtype) != 0 || force_f32) {
             wtype = GGML_TYPE_F32;
@@ -3363,6 +3369,10 @@ protected:
         if (allow_weight_scale && tensor_storage_map.find(prefix + "weight_scale") != tensor_storage_map.end()) {
             params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
             has_weight_scale       = true;
+        }
+        if (tensor_storage_map.find(prefix + "weight.wglobal") != tensor_storage_map.end()) {
+            params["weight.wglobal"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            has_weight_global        = true;
         }
     }
 
@@ -3406,22 +3416,32 @@ public:
         if (bias) {
             b = params["bias"];
         }
-        ggml_tensor* linear_bias = has_weight_scale ? nullptr : b;
+        ggml_tensor* linear_bias = (has_weight_scale || has_weight_global) ? nullptr : b;
         ggml_tensor* out         = nullptr;
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;
             forward_params.linear.scale          = scale;
-            out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx, ctx->backend, x, w, linear_bias, prefix, forward_params);
+            out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx,
+                                                                                           ctx->backend,
+                                                                                           x,
+                                                                                           w,
+                                                                                           linear_bias,
+                                                                                           prefix,
+                                                                                           forward_params,
+                                                                                           has_weight_global ? params["weight.wglobal"] : nullptr);
         } else {
             out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
         }
+        if (has_weight_global && !ctx->weight_adapter) {
+            out = ggml_mul(ctx->ggml_ctx, out, params["weight.wglobal"]);
+        }
         if (has_weight_scale) {
             out = ggml_mul(ctx->ggml_ctx, out, params["weight_scale"]);
-            if (b != nullptr) {
-                out = ggml_add_inplace(ctx->ggml_ctx, out, b);
-            }
+        }
+        if ((has_weight_scale || has_weight_global) && b != nullptr) {
+            out = ggml_add_inplace(ctx->ggml_ctx, out, b);
         }
         return out;
     }

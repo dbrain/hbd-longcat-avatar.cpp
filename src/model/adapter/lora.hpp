@@ -928,7 +928,8 @@ public:
                                    ggml_tensor* w,
                                    ggml_tensor* b,
                                    const std::string& prefix,
-                                   WeightAdapter::ForwardParams forward_params) override {
+                                   WeightAdapter::ForwardParams forward_params,
+                                   ggml_tensor* base_output_scale = nullptr) override {
         w = patch_weight(ctx, backend, w, prefix + "weight", false);
         if (b) {
             b = patch_weight(ctx, backend, b, prefix + "bias", false);
@@ -951,6 +952,11 @@ public:
                                    forward_params.conv2d.circular_x,
                                    forward_params.conv2d.circular_y,
                                    forward_params.conv2d.scale);
+        }
+        // ModelOpt's `.wglobal` belongs to the quantized base weight, not to
+        // any runtime LoRA delta. Apply it before the delta loop below.
+        if (base_output_scale != nullptr) {
+            out = ggml_mul(ctx, out, base_output_scale);
         }
         for (auto& lora_model : lora_models) {
             ggml_tensor* out_diff = lora_model->get_out_diff(ctx, backend, x, forward_params, prefix + "weight");

@@ -547,11 +547,10 @@ public:
             LOG_ERROR("swap_diffusion_model: could not inspect '%s'", path.c_str());
             return false;
         }
+        std::vector<std::string> required_weight_globals;
         for (const std::string& name : compatibility_probe.get_tensor_names()) {
             if (ends_with(name, ".wglobal")) {
-                LOG_ERROR("swap_diffusion_model: '%s' is an unsupported unfolded NVFP4 GGUF (%s)",
-                          path.c_str(), name.c_str());
-                return false;
+                required_weight_globals.push_back(name);
             }
         }
 
@@ -569,6 +568,15 @@ public:
         if (!register_runner_params("Diffusion model", diffusion_model, SDBackendModule::DIFFUSION)) {
             LOG_ERROR("swap_diffusion_model: could not register '%s'", path.c_str());
             return false;
+        }
+        const std::set<std::string> registered_names = model_manager->tensor_names();
+        for (const std::string& name : required_weight_globals) {
+            if (registered_names.find(name) == registered_names.end()) {
+                LOG_ERROR("swap_diffusion_model: '%s' has unsupported ModelOpt NVFP4 sidecar '%s'",
+                          path.c_str(), name.c_str());
+                model_manager->unregister_param_tensors("Diffusion model");
+                return false;
+            }
         }
         if (!model_manager->validate_registered_tensors()) {
             LOG_ERROR("swap_diffusion_model: '%s' is not architecture-compatible", path.c_str());
@@ -782,22 +790,6 @@ public:
             LOG_INFO("loading unconditional diffusion model from '%s'", sd_ctx_params->uncond_diffusion_model_path);
             if (!model_loader.init_from_file(sd_ctx_params->uncond_diffusion_model_path, "model.diffusion_model.uncond.")) {
                 LOG_WARN("loading unconditional diffusion model from '%s' failed", sd_ctx_params->uncond_diffusion_model_path);
-            }
-        }
-
-        // ModelOpt's unfolded NVFP4 export stores a second per-tensor scale as
-        // `<weight>.wglobal`. The previous fork applied those scales in a custom
-        // CUDA/cuBLASLt path; upstream ggml's native NVFP4 MMQ format has no
-        // equivalent sidecar contract. Loading one and silently ignoring the
-        // scales produces materially wrong (often white) output, so make the
-        // unsupported asset format explicit until it is folded into a
-        // self-contained GGUF or support is ported end-to-end.
-        for (const std::string& name : model_loader.get_tensor_names()) {
-            if (ends_with(name, ".wglobal")) {
-                LOG_ERROR("unfolded NVFP4 GGUF tensor '%s' requires per-tensor .wglobal support, "
-                          "which upstream ggml does not provide; use a folded NVFP4 GGUF or the compatible backend",
-                          name.c_str());
-                return false;
             }
         }
 
@@ -1648,6 +1640,21 @@ public:
         }
 
         model_manager->set_common_ignore_tensors(ignore_tensors);
+        size_t weight_global_count = 0;
+        const std::set<std::string> registered_names = model_manager->tensor_names();
+        for (const std::string& name : model_loader.get_tensor_names()) {
+            if (!ends_with(name, ".wglobal")) {
+                continue;
+            }
+            ++weight_global_count;
+            if (registered_names.find(name) == registered_names.end()) {
+                LOG_ERROR("unfolded NVFP4 GGUF sidecar '%s' is not attached to a supported Linear weight", name.c_str());
+                return false;
+            }
+        }
+        if (weight_global_count > 0) {
+            LOG_INFO("using %zu ModelOpt unfolded NVFP4 .wglobal sidecars through generic Linear scaling", weight_global_count);
+        }
         if (!model_manager->validate_registered_tensors()) {
             LOG_ERROR("model metadata validation failed");
             return false;
