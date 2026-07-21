@@ -6531,11 +6531,6 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
         sd::save_tensor_to_file<float>(path, video_latent, "wan_video_latent");
         LOG_INFO("WAN_SAVE_LATENT: wrote %s", path);
     }
-    if (const char* path = std::getenv("LTX_LOAD_LATENT"); path != nullptr && path[0] != '\0') {
-        video_latent = sd::load_tensor_from_file_as_tensor<float>(path);
-        LOG_INFO("LTX_LOAD_LATENT: decoding %s", path);
-    }
-    // auto z = sd::load_tensor_from_file_as_tensor<float>("ltx_vae_z.bin");
     // LTX_LOAD_LATENT (diagnostic): replace the just-sampled diffusion latent with one
     // saved earlier via WAN_SAVE_LATENT, so the SAME latent can be decoded through
     // different VAE weights/precisions for an airtight VAE-only A/B (the nvfp4/fp8 DiT is
