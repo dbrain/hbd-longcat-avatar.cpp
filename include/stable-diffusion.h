@@ -401,6 +401,9 @@ typedef struct {
     sd_sample_params_t high_noise_sample_params;
     float moe_boundary;
     float strength;
+    // LTX video-to-video mode. Zero preserves the upstream unsupported-control
+    // behavior; one selects SDEdit seeding from control_frames.
+    int v2v_mode;
     int64_t seed;
     int video_frames;
     int fps;
@@ -461,6 +464,14 @@ typedef struct {
     // a continuation tail; an image entry pins its opening frame and also starts fresh.
     const int* segment_scene_cuts;
     const sd_image_t* const* segment_init_images;
+    // Optional per-window SDEdit sources. Mode 1 replaces the window's starting
+    // video latent with these frames; it is a fresh scene rather than a continuation.
+    sd_image_t* const* segment_control_frames;
+    const int* segment_control_frame_counts;
+    const int* segment_v2v_modes;
+    // Negative entries retain base_params->strength; non-negative entries are
+    // the SDEdit denoising strength for their corresponding V2V window.
+    const float* segment_v2v_strengths;
     int cont_latent_frames;
     int start_segment;
     const char* bank_dir;

@@ -248,6 +248,10 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
 
     std::vector<SDImageOwner> ltx_scene_image_owners;
     std::vector<const sd_image_t*> ltx_scene_images;
+    std::vector<std::vector<SDImageOwner>> ltx_v2v_image_owners;
+    std::vector<std::vector<sd_image_t>> ltx_v2v_images;
+    std::vector<sd_image_t*> ltx_v2v_image_windows;
+    std::vector<int> ltx_v2v_frame_counts;
     if (!job.ltx_prompts.empty()) {
         ltx_scene_image_owners.resize(job.ltx_prompts.size());
         ltx_scene_images.resize(job.ltx_prompts.size(), nullptr);
@@ -265,6 +269,28 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                 return false;
             }
             ltx_scene_images[segment] = &ltx_scene_image_owners[segment].get();
+        }
+        ltx_v2v_image_owners.resize(job.ltx_prompts.size());
+        ltx_v2v_images.resize(job.ltx_prompts.size());
+        ltx_v2v_image_windows.resize(job.ltx_prompts.size(), nullptr);
+        ltx_v2v_frame_counts.resize(job.ltx_prompts.size(), 0);
+        for (size_t segment = 0; segment < job.ltx_segment_control_frames.size(); ++segment) {
+            const auto& encoded_frames = job.ltx_segment_control_frames[segment];
+            if (encoded_frames.empty()) continue;
+            auto& owners = ltx_v2v_image_owners[segment];
+            auto& images = ltx_v2v_images[segment];
+            owners.resize(encoded_frames.size());
+            images.reserve(encoded_frames.size());
+            for (size_t frame = 0; frame < encoded_frames.size(); ++frame) {
+                if (!decode_base64_image(encoded_frames[frame], 3, params.width, params.height, owners[frame])) {
+                    error_message = "failed to decode LTX V2V frame " + std::to_string(frame + 1) +
+                                    " for segment " + std::to_string(segment + 1);
+                    return false;
+                }
+                images.push_back(owners[frame].get());
+            }
+            ltx_v2v_image_windows[segment] = images.data();
+            ltx_v2v_frame_counts[segment] = static_cast<int>(images.size());
         }
     }
 
@@ -284,6 +310,10 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.segment_video_frames = job.ltx_segment_frames.empty() ? nullptr : job.ltx_segment_frames.data();
             chain.segment_scene_cuts = job.ltx_segment_scene_cuts.empty() ? nullptr : job.ltx_segment_scene_cuts.data();
             chain.segment_init_images = ltx_scene_images.empty() ? nullptr : ltx_scene_images.data();
+            chain.segment_control_frames = ltx_v2v_image_windows.empty() ? nullptr : ltx_v2v_image_windows.data();
+            chain.segment_control_frame_counts = ltx_v2v_frame_counts.empty() ? nullptr : ltx_v2v_frame_counts.data();
+            chain.segment_v2v_modes = job.ltx_segment_v2v_modes.empty() ? nullptr : job.ltx_segment_v2v_modes.data();
+            chain.segment_v2v_strengths = job.ltx_segment_v2v_strengths.empty() ? nullptr : job.ltx_segment_v2v_strengths.data();
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;
             chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();

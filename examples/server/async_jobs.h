@@ -49,6 +49,9 @@ struct AsyncGenerationJob {
     std::vector<int> ltx_segment_frames;
     std::vector<int> ltx_segment_scene_cuts;
     std::vector<std::string> ltx_segment_init_images;
+    std::vector<std::vector<std::string>> ltx_segment_control_frames;
+    std::vector<int> ltx_segment_v2v_modes;
+    std::vector<float> ltx_segment_v2v_strengths;
     std::string ltx_bank_dir;
     std::string ltx_bank_id;
     int ltx_resume_from = 0;

@@ -1252,6 +1252,13 @@ for a prompt-only fresh shot, or `init_image` for a fresh image-pinned shot. Fre
 are stitched without trimming the preceding continuation overlap. It returns the same
 asynchronous job and media URLs as `/sdcpp/v1/vid_gen`.
 
+An object may also request `v2v_mode: 1` with `control_frames`, a base64 image array
+containing exactly one frame for every requested output frame. This is SDEdit V2V: the
+source is VAE-encoded, treated as a fresh shot, and denoised according to optional
+`v2v_guide_strength` (`0..1`; otherwise normal `strength`). LTX guide-edit mode `2`
+and `v2v_source_latent_path` are rejected explicitly; they are not silently treated as
+text-to-video.
+
 The server keeps sampled video-only LTX latents in `$LTX_JOB_DIR/<resume_job_id>`
 (default `/var/lib/ltx-video/jobs`) and uses them to continue a later request without
 re-rendering its completed prefix. Set `resume_job_id` to the prior response's stable

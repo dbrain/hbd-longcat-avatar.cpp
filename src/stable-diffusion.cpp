@@ -3618,6 +3618,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->width                                 = 512;
     sd_vid_gen_params->height                                = 512;
     sd_vid_gen_params->strength                              = 0.75f;
+    sd_vid_gen_params->v2v_mode                              = 0;
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
@@ -4235,6 +4236,7 @@ struct ImageGenerationLatents {
     int64_t video_conditioning_frame_count = 0;
     int64_t video_target_frame_count       = 0;
     int audio_length                       = 0;
+    bool v2v_sdedit                        = false;
 };
 
 static float ltxv_latent_corner_to_pixel_frame(int64_t corner_index,
@@ -5652,7 +5654,7 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
-        if (sd_vid_gen_params->control_frames_size > 0) {
+        if (sd_vid_gen_params->control_frames_size > 0 && sd_vid_gen_params->v2v_mode != 1) {
             LOG_ERROR("LTXAV control_frames are not implemented");
             return std::nullopt;
         }
@@ -6169,6 +6171,46 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
     }
 
+    // LTX SDEdit V2V deliberately reaches this common t2v fallback first so
+    // the normal video positions, empty audio latent, and target grid exist.
+    // It then replaces only the video latent with the source clip and trims
+    // the sampling schedule below according to strength.
+    if (sd_version_is_ltxav(sd_ctx->sd->version) && sd_vid_gen_params->v2v_mode == 1 &&
+        sd_vid_gen_params->control_frames_size > 0) {
+        if (sd_vid_gen_params->control_frames == nullptr ||
+            sd_vid_gen_params->control_frames_size != request->frames) {
+            LOG_ERROR("LTXAV SDEdit requires exactly one control frame per output frame");
+            return std::nullopt;
+        }
+        sd::Tensor<float> source_video({request->width, request->height, request->frames, 3, 1});
+        for (int frame = 0; frame < request->frames; ++frame) {
+            if (sd_vid_gen_params->control_frames[frame].data == nullptr) {
+                LOG_ERROR("LTXAV SDEdit control frame %d is empty", frame);
+                return std::nullopt;
+            }
+            const auto source_image = sd_image_to_tensor(sd_vid_gen_params->control_frames[frame],
+                                                          request->width,
+                                                          request->height);
+            sd::ops::slice_assign(&source_video, 2, frame, frame + 1, source_image.unsqueeze(2));
+        }
+        auto source_latent = sd_ctx->sd->encode_first_stage(source_video);
+        if (source_latent.empty() || source_latent.dim() < 4 ||
+            source_latent.shape()[0] != latents.init_latent.shape()[0] ||
+            source_latent.shape()[1] != latents.init_latent.shape()[1] ||
+            source_latent.shape()[2] != latents.init_latent.shape()[2] ||
+            source_latent.shape()[3] != latents.init_latent.shape()[3]) {
+            LOG_ERROR("LTXAV SDEdit source latent does not match the target latent grid");
+            return std::nullopt;
+        }
+        std::memcpy(latents.init_latent.data(), source_latent.data(),
+                    static_cast<size_t>(source_latent.numel()) * sizeof(float));
+        latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+        latents.v2v_sdedit   = true;
+        LOG_INFO("LTXAV SDEdit: seeded %d video frames at strength %.2f",
+                 request->frames,
+                 sd_vid_gen_params->strength);
+    }
+
     if (sd_version_is_ltxav(sd_ctx->sd->version) && !latents.audio_latent.empty()) {
         if (!latents.denoise_mask.empty()) {
             latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
@@ -6582,6 +6624,24 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
     ImageGenerationLatents latents = std::move(*latent_inputs_opt);
+
+    if (latents.v2v_sdedit) {
+        const float strength = std::clamp(sd_vid_gen_params->strength, 0.f, 1.f);
+        if (strength < 1.f && plan.sample_steps > 0 &&
+            static_cast<int>(plan.sigmas.size()) == plan.sample_steps + 1) {
+            int t_enc = static_cast<int>(plan.sample_steps * strength);
+            t_enc = std::clamp(t_enc, 0, plan.sample_steps - 1);
+            const int start = plan.sample_steps - t_enc - 1;
+            if (start > 0 && start < static_cast<int>(plan.sigmas.size())) {
+                plan.sigmas = std::vector<float>(plan.sigmas.begin() + start, plan.sigmas.end());
+                plan.sample_steps = static_cast<int>(plan.sigmas.size()) - 1;
+                LOG_INFO("LTXAV SDEdit: strength=%.2f -> %d sampling steps (t_enc=%d)",
+                         strength,
+                         plan.sample_steps,
+                         t_enc);
+            }
+        }
+    }
 
     ImageGenerationEmbeds embeds = prepare_video_generation_embeds(sd_ctx,
                                                                    sd_vid_gen_params,
@@ -7314,7 +7374,13 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const bool has_scene_image = chain_params->segment_init_images != nullptr &&
                                      chain_params->segment_init_images[segment] != nullptr &&
                                      chain_params->segment_init_images[segment]->data != nullptr;
-        adopt_frames(banked_frames, count, segment == 0 || fresh_scene || has_scene_image ? 0 : overlap_frames);
+        const bool has_v2v_source = chain_params->segment_control_frames != nullptr &&
+                                    chain_params->segment_control_frame_counts != nullptr &&
+                                    chain_params->segment_control_frames[segment] != nullptr &&
+                                    chain_params->segment_control_frame_counts[segment] > 0 &&
+                                    chain_params->segment_v2v_modes != nullptr &&
+                                    chain_params->segment_v2v_modes[segment] == 1;
+        adopt_frames(banked_frames, count, segment == 0 || fresh_scene || has_scene_image || has_v2v_source ? 0 : overlap_frames);
     }
 
     for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
@@ -7326,11 +7392,18 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
             params.prompt = chain_params->segment_prompts[segment];
         }
+        const bool has_v2v_source = chain_params->segment_control_frames != nullptr &&
+                                    chain_params->segment_control_frame_counts != nullptr &&
+                                    chain_params->segment_control_frames[segment] != nullptr &&
+                                    chain_params->segment_control_frame_counts[segment] > 0 &&
+                                    chain_params->segment_v2v_modes != nullptr &&
+                                    chain_params->segment_v2v_modes[segment] == 1;
         const bool fresh_scene = segment > 0 &&
                                  ((chain_params->segment_scene_cuts != nullptr && chain_params->segment_scene_cuts[segment] != 0) ||
                                   (chain_params->segment_init_images != nullptr &&
                                    chain_params->segment_init_images[segment] != nullptr &&
-                                   chain_params->segment_init_images[segment]->data != nullptr));
+                                   chain_params->segment_init_images[segment]->data != nullptr) ||
+                                  has_v2v_source);
         if (segment > 0 && !fresh_scene && overlap_frames >= params.video_frames) {
             LOG_ERROR("generate_video_chain: continuation overlap %d leaves no new frames in segment %d (%d frames)",
                       overlap_frames,
@@ -7338,9 +7411,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                       params.video_frames);
             return fail();
         }
-        if (fresh_scene && chain_params->segment_init_images != nullptr &&
-            chain_params->segment_init_images[segment] != nullptr) {
-            params.init_image = *chain_params->segment_init_images[segment];
+        if (fresh_scene) {
+            params.init_image.data = nullptr;
+            if (chain_params->segment_init_images != nullptr &&
+                chain_params->segment_init_images[segment] != nullptr) {
+                params.init_image = *chain_params->segment_init_images[segment];
+            }
+        }
+        if (has_v2v_source) {
+            params.init_image.data = nullptr;
+            params.control_frames = chain_params->segment_control_frames[segment];
+            params.control_frames_size = chain_params->segment_control_frame_counts[segment];
+            params.v2v_mode = 1;
+            if (chain_params->segment_v2v_strengths != nullptr &&
+                chain_params->segment_v2v_strengths[segment] >= 0.f) {
+                params.strength = chain_params->segment_v2v_strengths[segment];
+            }
         }
         if (segment > 0 && !fresh_scene) {
             if (previous_tail.empty()) {

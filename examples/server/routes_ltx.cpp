@@ -132,6 +132,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<int> segment_frames;
             std::vector<int> segment_scene_cuts;
             std::vector<std::string> segment_init_images;
+            std::vector<std::vector<std::string>> segment_control_frames;
+            std::vector<int> segment_v2v_modes;
+            std::vector<float> segment_v2v_strengths;
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
@@ -139,6 +142,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
+                        segment_control_frames.emplace_back();
+                        segment_v2v_modes.push_back(0);
+                        segment_v2v_strengths.push_back(-1.f);
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
                         const int frames = segment.value("frames", 0);
@@ -150,6 +156,47 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(frames);
                         segment_scene_cuts.push_back(segment.value("scene_cut", false) ? 1 : 0);
                         segment_init_images.push_back(segment.value("init_image", std::string()));
+                        if (segment.contains("v2v_source_latent_path")) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"LTX latent-in guide editing is not supported by this engine build"})", "application/json");
+                            return;
+                        }
+                        const int v2v_mode = segment.value("v2v_mode", 0);
+                        if (v2v_mode != 0 && v2v_mode != 1) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"only LTX v2v_mode 1 (SDEdit) is supported"})", "application/json");
+                            return;
+                        }
+                        std::vector<std::string> controls;
+                        if (segment.contains("control_frames")) {
+                            if (!segment["control_frames"].is_array() ||
+                                !std::all_of(segment["control_frames"].begin(), segment["control_frames"].end(),
+                                             [](const json& frame) { return frame.is_string() && !frame.get<std::string>().empty(); })) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"LTX control_frames must be a non-empty base64 image array"})", "application/json");
+                                return;
+                            }
+                            for (const auto& frame : segment["control_frames"]) controls.push_back(frame.get<std::string>());
+                        }
+                        if (v2v_mode == 1 && controls.empty()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"LTX SDEdit requires control_frames"})", "application/json");
+                            return;
+                        }
+                        if (v2v_mode == 0 && !controls.empty()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"control_frames require v2v_mode 1"})", "application/json");
+                            return;
+                        }
+                        const float v2v_strength = segment.value("v2v_guide_strength", -1.f);
+                        if (v2v_strength < -1.f || v2v_strength > 1.f) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"v2v_guide_strength must be between 0 and 1"})", "application/json");
+                            return;
+                        }
+                        segment_control_frames.push_back(std::move(controls));
+                        segment_v2v_modes.push_back(v2v_mode);
+                        segment_v2v_strengths.push_back(v2v_strength);
                     }
                 }
             } else if (body.contains("prompts") && body["prompts"].is_array()) {
@@ -159,6 +206,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
+                        segment_control_frames.emplace_back();
+                        segment_v2v_modes.push_back(0);
+                        segment_v2v_strengths.push_back(-1.f);
                     }
                 }
             }
@@ -181,6 +231,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", error_message}}).dump(), "application/json");
                 return;
             }
+            for (size_t segment = 0; segment < segment_v2v_modes.size(); ++segment) {
+                if (segment_v2v_modes[segment] != 1) continue;
+                const int frames = segment_frames[segment] > 0 ? segment_frames[segment] : request.gen_params.video_frames;
+                if (static_cast<int>(segment_control_frames[segment].size()) != frames) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"LTX SDEdit requires one control frame per segment output frame"})", "application/json");
+                    return;
+                }
+            }
             const int continuation_frames = body.value("cont_latent_frames", 3);
             if (continuation_frames < 1) {
                 res.status = 400;
@@ -198,6 +257,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_frames = std::move(segment_frames);
             job->ltx_segment_scene_cuts = std::move(segment_scene_cuts);
             job->ltx_segment_init_images = std::move(segment_init_images);
+            job->ltx_segment_control_frames = std::move(segment_control_frames);
+            job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
+            job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_cont_latent_frames = continuation_frames;
             const std::string resume_job_id = body.value("resume_job_id", std::string());
             int resume_from = 0;
