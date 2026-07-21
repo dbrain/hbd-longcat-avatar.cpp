@@ -2,8 +2,7 @@
 #include "../../../thirdparty/meshoptimizer/meshoptimizer.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../../thirdparty/stb_image.h"
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "../../../thirdparty/stb_image_write.h"
+#include "glb_textured.hpp"  // owns stb_image_write implementation + unquantized textured writer
 
 #include <algorithm>
 #include <cfloat>
@@ -195,8 +194,31 @@ int main(int argc, char** argv) {
         size_t off = (size_t)bv.value("byteOffset", 0), len = (size_t)bv["byteLength"];
         return std::vector<uint8_t>(bin.begin() + off, bin.begin() + off + len);
     };
-    img0 = maybe_resize_png(image_bytes(0), tex_max, 4);
+    if (const char* replacement = std::getenv("GLB_REPACK_BASE_COLOR_PNG")) {
+        std::vector<uint8_t> replacement_png = read_file(replacement);
+        int rw=0,rh=0,rc=0;
+        uint8_t* rp=stbi_load_from_memory(replacement_png.data(),(int)replacement_png.size(),&rw,&rh,&rc,4);
+        if (!rp || rw<1 || rh<1) { std::fprintf(stderr,"replacement baseColor PNG decode failed: %s\n",replacement); return 1; }
+        stbi_image_free(rp);
+        img0 = maybe_resize_png(replacement_png, tex_max, 4);
+        std::printf("[repack] using replacement native baseColor atlas: %s\n", replacement);
+    } else img0 = maybe_resize_png(image_bytes(0), tex_max, 4);
     img1 = maybe_resize_png(image_bytes(1), tex_max, 3);
+
+    // A native-atlas projection must remain inspectable by the ordinary GLB
+    // reader/rig tools. Preserve f32 positions/normals/UVs in this mode rather
+    // than routing a texture-only A/B through the packed quantisation path.
+    if (std::getenv("GLB_REPACK_UNQUANTIZED")) {
+        int w0=0,h0=0,c0=0,w1=0,h1=0,c1=0;
+        uint8_t* p0=stbi_load_from_memory(img0.data(),(int)img0.size(),&w0,&h0,&c0,4);
+        uint8_t* p1=stbi_load_from_memory(img1.data(),(int)img1.size(),&w1,&h1,&c1,3);
+        if (!p0 || !p1 || w0!=w1 || h0!=h1) { std::fprintf(stderr,"unquantized repack texture decode/dimension mismatch\n"); return 1; }
+        std::vector<uint8_t> base(p0,p0+(size_t)w0*h0*4), mr(p1,p1+(size_t)w1*h1*3);
+        stbi_image_free(p0); stbi_image_free(p1);
+        bool ok=glb::write_glb_textured(argv[2],posv,nrmv,uvv,idx,base,mr,w0,h0);
+        std::printf("[repack] %s -> %s | unquantized %u verts / %u tris | %dx%d atlas\n",argv[1],argv[2],V,F3/3,w0,h0);
+        return ok ? 0 : 1;
+    }
 
 #ifdef REPACK_INPROC_BUILD
     // REPACK_INPROC=hero|small: decode the PNG atlases to pixels and write a fully in-process compressed

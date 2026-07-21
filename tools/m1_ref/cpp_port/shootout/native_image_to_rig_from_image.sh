@@ -13,14 +13,14 @@
 #   NATIVE_HIGH_RESOLUTION=1024 NATIVE_HIGH_ATLAS=4096  hero-detail high A/B
 #   (the generic runner always retains native_high_texture_dump for CPU LOD rebakes)
 #   IMAGE_TO_RIG_REFRESH=1                              recompute even if this image's cache exists
-#   IMAGE_TO_RIG_PROJECT=1                               create observed-view projection A/B
+#   IMAGE_TO_RIG_PROJECT=1                               create native-base observed-view texture A/B (CPU-only)
 #   IMAGE_TO_RIG_TEX_BACK=/abs/back.png
 #   IMAGE_TO_RIG_TEX_VIEWS='90=/abs/right.png -90=/abs/left.png'
 #   IMAGE_TO_RIG_TEX_VIEWS_FILE=/abs/turnaround.tsv       robust 1--8 view manifest (yaw<TAB>absolute path)
 #                                                          yaw 0/180 replace the front/back source; all other
 #                                                          yaws are passed as --tex-view. Blank/# lines are ignored.
-#   IMAGE_TO_RIG_PROJECT_PROMOTE=1                         validate a consistent 4--8-view projection candidate;
-#                                                          it remains an A/B until native-base overlay exists
+#   IMAGE_TO_RIG_PROJECT_PROMOTE=1                         validate a consistent 4--8-view native-base candidate;
+#                                                          it remains an A/B pending visual promotion
 #   IMAGE_TO_RIG_INPUT_MODE=auto|matte                   auto: preserve a cutout/matte or RMBG a raw photo
 #   MATTING_URL=http://localhost:18898                   native RMBG-2.0 service (raw-photo input only)
 #   IMAGE_TO_RIG_PREPARE_ONLY=1                          emit/audit input.png, without geometry inference
@@ -37,7 +37,7 @@ export IMAGE_TO_RIG_OUT_ROOT="$OUT_ROOT"
 for bin in image_to_rig mesh_topo make_matte; do
   [[ -x "$CP/$bin" ]] || { echo "missing executable: $bin (build it first)" >&2; exit 2; }
 done
-for bin in native_image_to_rig.sh verify_observed_projection.sh; do
+for bin in native_image_to_rig.sh native_observed_atlas_project.sh verify_native_observed_projection.sh; do
   [[ -x "$CP/shootout/$bin" ]] || { echo "missing native image-to-rig component: $bin" >&2; exit 2; }
 done
 # Detached production runs write their C++ progress to a file.  Force line buffering so stage logs say
@@ -97,18 +97,14 @@ export REMESH_CLOSE_R="${REMESH_CLOSE_R:-3}"
 # different reconstruction and must never be reused just because the source
 # image happens to be identical.
 GEOMETRY_RECIPE_VERSION=4
-# The clean default creates geometry only.  It must not pay for, or depend on,
+# The clean default creates geometry only. It must not pay for, or depend on,
 # Pixal's legacy PBR decoder before texture_mesh_native makes the production
-# material.  A caller requesting an observed-view projection has explicitly
-# asked for that legacy PBR cache as an A/B support artefact; it remains
-# non-production and cache-keyed separately.
+# material. Native observed-image overlay works over the generated native atlas
+# after this stage, so requesting it never changes the geometry cache recipe.
 LEGACY_PBR_CACHE="${IMAGE_TO_RIG_LEGACY_PBR_CACHE:-0}"
 [[ "$LEGACY_PBR_CACHE" == 0 || "$LEGACY_PBR_CACHE" == 1 ]] || {
   echo "IMAGE_TO_RIG_LEGACY_PBR_CACHE must be 0 or 1" >&2; exit 2;
 }
-if [[ "${IMAGE_TO_RIG_PROJECT:-0}" != 0 || -n "${IMAGE_TO_RIG_TEX_FRONT:-}" || -n "${IMAGE_TO_RIG_TEX_BACK:-}" || -n "${IMAGE_TO_RIG_TEX_VIEWS:-}" || -n "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-}" ]]; then
-  LEGACY_PBR_CACHE=1
-fi
 if [[ "$LEGACY_PBR_CACHE" == 1 ]]; then
   GEOMETRY_RECIPE="moge-noquad-us16384-proj-pbr-cache-direct-fallback8-close-r${REMESH_CLOSE_R}-v${GEOMETRY_RECIPE_VERSION}"
   GEOMETRY_CACHE_MODE=legacy-pbr-cache
@@ -237,8 +233,10 @@ if (( GEOMETRY_OPEN == 0 )); then GEOMETRY_GATE_RESULT=passed; fi
 PIPELINE_STAGE=native-texture-lods-rig
 write_pipeline_status running 'geometry gate passed; native high texture, CPU LOD rebakes, then structural rig gate'
 NATIVE_RIG=1
+RIG_MODE=native
 if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE" "$OUT" "$LABEL"; then
   NATIVE_RIG=0
+  RIG_MODE=structural-gate-rejected
   # The clean native texture LODs may be valid even when the learned skeleton is not. Do not throw
   # them away or publish an anonymous/malformed rig: use the older validated rig path only as a
   # named, explicit animation fallback. This is how Gilly remains usable while its one-leg native
@@ -246,11 +244,13 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
   for f in "$OUT/native_high_textured.glb" "$OUT/native_medium_textured.glb" "$OUT/native_low_textured.glb"; do
     [[ -f "$f" ]] || { echo "native pipeline failed before producing clean LODs; no rig fallback" >&2; exit 1; }
   done
-  [[ "$LEGACY_PBR_CACHE" == 1 ]] || {
-    echo "native rig rejected; clean geometry-only cache intentionally has no legacy PBR fallback. Re-run with IMAGE_TO_RIG_LEGACY_PBR_CACHE=1 only to evaluate that explicit fallback." >&2
-    exit 1
-  }
-  LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
+  if [[ "$LEGACY_PBR_CACHE" != 1 ]]; then
+    # Texture delivery is still valuable evidence, and can still receive a
+    # native observed-image A/B. Do not fabricate a rig or discard those
+    # assets merely because the strict skeleton falsifier rejected this model.
+    echo "native rig rejected; retaining clean texture delivery and optional native projection A/B (no legacy rig fallback requested)" >&2
+  else
+    LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
   mixamo_core_ok() {
     local file="$1" n
     local core=(Hips LeftUpLeg RightUpLeg Spine LeftLeg RightLeg Spine1 LeftFoot RightFoot Spine2
@@ -286,7 +286,9 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
       break
     fi
   done
-  [[ -n "${LEGACY_RIG_LEVEL:-}" ]] || { echo "no native or legacy rig candidate passed the structural gate" >&2; exit 1; }
+  if [[ -z "${LEGACY_RIG_LEVEL:-}" ]]; then
+    echo "no native or explicit legacy rig candidate passed the structural gate; retaining texture delivery" >&2
+  else
   # native_image_to_rig.sh truthfully records that its own learned skeleton was rejected. Preserve that
   # fact and also record the final generic-run outcome, rather than letting the top-level delivery
   # manifest imply that no Hymotion hand-off exists after this explicitly named fallback succeeds.
@@ -304,19 +306,21 @@ if ! "$CP/shootout/native_image_to_rig.sh" "$CACHE/refined.glb" "$PIPELINE_IMAGE
  {"file":"native_low_textured.glb","label":"LOW · native textured","note":"50k target faces · native Trellis generated texture"}
 ]}
 EOF
+    RIG_MODE=explicit-legacy-fallback
+  fi
+  fi
 fi
 
-# Projection is deliberately an A/B, never a replacement for native_high_textured.glb. The current
-# implementation's fallback for unobserved texels is the separately keyed *legacy* PBR cache, not
-# the native generated atlas; it is therefore an independently inspectable observed-view candidate
-# only when the caller has real extra views.
+# Projection is deliberately an A/B, never a replacement for native_high_textured.glb. It starts from
+# that exact native atlas and changes only texels genuinely observed by the supplied cameras; every
+# unobserved texel remains generated native material. The camera provenance is from the geometry cache.
 #
 # IMAGE_TO_RIG_TEX_VIEWS is retained for shell convenience, but it cannot represent paths containing
 # whitespace and is awkward for a real 4--8 camera turnaround.  The TSV manifest is the production
 # contract: one canonical camera yaw and one absolute source path per line.  Normalising yaws before
 # invoking image_to_rig prevents an accidental `180`/`-180` duplicate camera and makes the recorded
 # evidence unambiguous.
-PROJ_ARGS=()
+NATIVE_PROJ_ARGS=()
 PROJECT="${IMAGE_TO_RIG_PROJECT:-0}"
 PROJECT_PROMOTE="${IMAGE_TO_RIG_PROJECT_PROMOTE:-0}"
 [[ "$PROJECT_PROMOTE" == 0 || "$PROJECT_PROMOTE" == 1 ]] || { echo "IMAGE_TO_RIG_PROJECT_PROMOTE must be 0 or 1" >&2; exit 2; }
@@ -402,44 +406,29 @@ TOTAL_PROJ_CAMERAS="${#PROJ_PATH_BY_YAW[@]}"
 for yaw in $(printf '%s\n' "${!PROJ_PATH_BY_YAW[@]}" | LC_ALL=C sort -n); do
   path="${PROJ_PATH_BY_YAW[$yaw]}"
   case "$yaw" in
-    0) PROJ_ARGS+=(--tex-front "$path");;
-    180) PROJ_ARGS+=(--tex-back "$path");;
-    *) PROJ_ARGS+=(--tex-view "$yaw" "$path");;
+    0) NATIVE_PROJ_ARGS+=(--front "$path");;
+    180) NATIVE_PROJ_ARGS+=(--back "$path");;
+    *) NATIVE_PROJ_ARGS+=(--view "$yaw" "$path");;
   esac
 done
 if [[ "$PROJECT" != 0 ]]; then
-  PIPELINE_STAGE=observed-view-projection-ab
-  write_pipeline_status running 'native textured delivery exists; generating optional observed-view A/B only'
-  LOCK="$OUT_ROOT/.3060-image-to-rig.lock"
-  echo "== $LABEL: observed-view projection A/B (native texture remains default) =="
-  PROJ_LOG="$OUT/projection.log"
-  : >"$PROJ_LOG"
-  (
-    exec 9>"$LOCK"
-    flock -n 9 || { echo "another image-to-rig job owns the 3060 lock" >&2; exit 75; }
-    "${IMAGE_TO_RIG_CMD[@]}" --model /home/dbrain/models/3d/geo --image "$PIPELINE_IMAGE" --moge \
-      --from-refined "$CACHE" --stage-dir "$OUT" --decimate 300000 --texsize 2048 --no-rig \
-      --tex-project-overlay "${PROJ_ARGS[@]}" --out "$OUT/high_hybrid_projected.glb"
-  ) 2>&1 | tee "$PROJ_LOG"
-  {
-    printf 'mode=observed-view hybrid A/B; native_high_textured.glb remains production default\n'
-    printf 'camera_count=%s\n' "$TOTAL_PROJ_CAMERAS"
-    printf 'blend=real observed pixels in linear light; z-buffer + eroded-subject-mask reject; legacy PBR volume base retained for unobserved texels; native high remains production\n'
-    printf 'manifest=%s\n' "${IMAGE_TO_RIG_TEX_VIEWS_FILE:-none}"
-    printf 'projection_log=projection.log sha256=%s\n' "$(sha256sum "$PROJ_LOG" | awk '{print $1}')"
-    printf 'promotion_requested=%s\n' "$PROJECT_PROMOTE"
-    for yaw in $(printf '%s\n' "${!PROJ_PATH_BY_YAW[@]}" | LC_ALL=C sort -n); do
-      path="${PROJ_PATH_BY_YAW[$yaw]}"
-      printf 'view yaw=%s label=%s path=%s sha256=%s origin=%s\n' \
-        "$yaw" "${PROJ_LABEL_BY_YAW[$yaw]}" "$path" "$(sha256sum "$path" | awk '{print $1}')" \
-        "${PROJ_ORIGIN_BY_YAW[$yaw]}"
-    done
-  } >"$OUT/projection_source.txt"
+  PIPELINE_STAGE=native-observed-view-projection-ab
+  write_pipeline_status running 'native textured delivery exists; CPU-only native-base observed-image A/B'
+  CAMERA_PROVENANCE="$CACHE/camera_provenance.txt"
+  [[ -s "$CAMERA_PROVENANCE" ]] || {
+    echo "native observed projection needs camera provenance from this geometry cache; rerun geometry with IMAGE_TO_RIG_REFRESH=1" >&2; exit 1;
+  }
+  echo "== $LABEL: native-base observed-view projection A/B (native texture remains default) =="
+  "$CP/shootout/native_observed_atlas_project.sh" "$OUT/native_high_textured.glb" "$CAMERA_PROVENANCE" "$OUT" \
+    "${NATIVE_PROJ_ARGS[@]}"
+  NATIVE_PROJ_GLB="$OUT/native_high_textured_observed_projected_ab.glb"
   if [[ "$PROJECT_PROMOTE" == 1 ]]; then
-    "$CP/shootout/verify_observed_projection.sh" "$OUT"
-    printf 'promotion_result=validated-candidate; current legacy-PBR overlay does not replace native high production texture\n' >>"$OUT/projection_source.txt"
+    (( TOTAL_PROJ_CAMERAS >= 4 )) || { echo "promotion validation needs 4--8 observed cameras" >&2; exit 1; }
+    "$CP/shootout/verify_native_observed_projection.sh" "$NATIVE_PROJ_GLB"
+    printf 'promotion_result=validated-candidate; native high remains production pending visual promotion\n' \
+      >>"${NATIVE_PROJ_GLB%.glb}.projection-source.txt"
   else
-    printf 'promotion_result=not-requested; labelled A/B only\n' >>"$OUT/projection_source.txt"
+    "$CP/shootout/verify_native_observed_projection.sh" "$NATIVE_PROJ_GLB"
   fi
 fi
 
@@ -456,9 +445,15 @@ camera_provenance=$CACHE/camera_provenance.txt
 legacy_pbr_cache=$LEGACY_PBR_CACHE
 texture_recipe=native high Trellis material + CPU medium/low rebakes from native_high_texture_dump + structural rig gate
 texture_delivery_manifest=$OUT/texture_delivery.txt
-rig_mode=$([[ "$NATIVE_RIG" == 1 ]] && echo native || echo explicit-legacy-fallback)
+rig_mode=$RIG_MODE
 gpu=PCI GPU 0 / RTX 3060 only
 EOF
+if [[ "$RIG_MODE" == structural-gate-rejected ]]; then
+  PIPELINE_STAGE=rig-rejected
+  write_pipeline_status failed 'geometry and native texture LODs completed; no structurally valid Hymotion rig was published'
+  echo "== TEXTURE DELIVERY COMPLETE; RIG REJECTED: $OUT ==" >&2
+  exit 1
+fi
 PIPELINE_STAGE=complete
 PIPELINE_COMPLETED=1
 write_pipeline_status succeeded 'geometry, native texture LODs, and published rig/projection stages completed'

@@ -356,7 +356,7 @@ struct Stats {
     int n_hole = 0;                    // covered texels no view could paint
     int n_fill3d = 0;                  // of those, filled by the 3D k-nearest fill
     int n_telea = 0;                   // of those, fell through to the atlas-space Telea/dilate
-    int n_base = 0;                    // of those, retained from the pre-projection volume bake
+    int n_base = 0;                    // of those, retained from the pre-projection base atlas
     // BUG 3 — THE SEAM. n_seam = 3D-fill texels whose k-NN spans >=2 views: that set IS the front/back
     // crossover, and it is the ONLY place the two views meet (the projection's confidence overlap band is
     // empty by construction — see Cam::facing). seam_absdiff = mean |viewA-viewB| there, in sRGB units;
@@ -1666,8 +1666,8 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
     }
 
     // A front photo cannot see behind hair, under an arm, or around the back. Do not turn those visibility
-    // holes into nearest-neighbour/Telea noise: retain the coherent volume albedo. Supplied back/side
-    // views still replace it normally above. `n_hole` stays the honest source-coverage metric.
+    // holes into nearest-neighbour/Telea noise: retain the coherent pre-projection base atlas. Supplied
+    // back/side views still replace it normally above. `n_hole` stays the honest source-coverage metric.
     int n_base = 0;
     if (cfg.preserve_base_for_holes) {
         #pragma omp parallel for reduction(+:n_base) schedule(static)
@@ -1679,7 +1679,7 @@ inline bool project_onto(texatlas::BakedTexture& bt, const Cfg& cfg, Stats* out_
             n_base++;
         }
         if (cfg.verbose)
-            std::printf("[texproj] hybrid fallback: retained volume base for %d / %d unobserved texels (%.1f%%)\n",
+            std::printf("[texproj] hybrid fallback: retained pre-projection base for %d / %d unobserved texels (%.1f%%)\n",
                         n_base, n_hole, n_hole ? 100.0 * n_base / n_hole : 0.0);
     }
 
