@@ -57,6 +57,17 @@ Current endpoints include:
 - `POST /sdcpp/v1/jobs/{id}/cancel`
 - `POST /sdcpp/v1/vid_gen`
 
+### LTX Video Chain API
+
+Async multi-segment LTX-Video ("Director") API — a prompt-per-shot chain rendered into one
+continuous clip, with resume, in-place shot retake, and per-segment v2v sources. Jobs poll and
+stream via the `sdcpp` job endpoints above.
+
+Current endpoints include:
+
+- `POST /ltx/v1/generate`
+- `DELETE /ltx/v1/job`
+
 ## `sd_cpp_extra_args`
 
 `sd_cpp_extra_args` is an extension mechanism for the compatibility APIs.
@@ -1313,3 +1324,64 @@ Example cancelled job:
 - `400 Bad Request` for an empty body, unsupported model mode, invalid JSON, invalid generation parameters, or an unsupported output format
 - `429 Too Many Requests` when the job queue is full
 - `500 Internal Server Error` for unexpected server exceptions during submission
+
+## LTX Video Chain API
+
+### Purpose
+
+Renders a multi-segment LTX-Video "Director" chain — one prompt per shot, stitched into a single
+continuous clip — as an async job. Supports mid-chain resume, in-place single-shot retake, and
+per-segment video-to-video (v2v) sources. The exhaustive per-field contract lives in the header of
+`routes_ltx.cpp`; this section documents the request lifecycle and the fields relevant to
+retake/persistence. Submitted jobs are polled and streamed with the same `sdcpp` job endpoints
+(`GET /sdcpp/v1/jobs/{id}`, `.../media`, `.../segments/{n}`, `.../cancel`).
+
+### Artifact Stores
+
+Each job owns a durable artifact dir (`request.json`, per-segment `seg_<n>.bin` latents, optional
+per-segment webms, `final.webm`) so a chain can be resumed, re-fetched, or used as a retake source
+after the render completes. There are **two roots**, and a job id resolves against **both** (persist
+first, then FIFO):
+
+- **FIFO** (`LTX_JOB_DIR`, default `/var/lib/ltx-video/jobs`) — swept to the newest `LTX_JOB_KEEP`
+  (default `20`) job dirs. The default store for one-off / scratch renders.
+- **Persist** (`LTX_PERSIST_DIR`, default `/var/lib/ltx-video/persist`) — **never swept**. A fresh
+  job with `"persist": true` lands here; its banked latents remain a valid retake source until an
+  explicit `DELETE /ltx/v1/job`.
+
+### `POST /ltx/v1/generate`
+
+`multipart/form-data` with a JSON `request` part (the chain body) plus optional audio parts
+(`audio_0…`, `audio_full`, `audio_track`). Retake / persistence fields on the chain body:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `segments` | `array<object>` | Per-shot objects (`prompt`, optional `frames`, `model`, `init_image`, `keyframes`, v2v fields below). |
+| `persist` | `bool` | `true` → a **fresh** job's artifacts are written to the persist store (never swept). Default `false` → FIFO store. Ignored on a resume (the existing dir is reused). |
+| `resume_job_id` | `string` | Continue a prior job's banked chain — resolved against both stores. `404` if unknown. |
+| `retake_from` / `retake_segment` | `int` | Re-render ONLY this filtered shot index in place (pinned by both neighbours, then splice the banked tail). Only meaningful with `resume_job_id`. |
+| `segments[i].v2v_source_job_id` | `string` | v2v guide-edit source **by reference**: the job id whose banked `seg_<v2v_source_segment>.bin` is the source latent. The server resolves it against its own roots (single-component id guard) — no filesystem path crosses the wire. |
+| `segments[i].v2v_source_segment` | `int` | Segment index within `v2v_source_job_id` (default `0`). |
+| `segments[i].v2v_source_latent_path` | `string` | Server-internal absolute latent path. Still honoured, but prefer the by-reference fields above. |
+| `segments[i].control_frames` | `array<string>` | Pixel v2v source (base64 PNGs) — the fallback when no banked latent exists (foreign / uploaded clip). |
+
+Returns `202 Accepted` with `{ "id", "kind", "status", "poll_url", "media_url", "segments", "resume_from", "retake_segment", "job_dir" }`.
+
+Errors:
+
+- `202 Accepted` — job created
+- `400 Bad Request` — invalid JSON
+- `404 Not Found` — `resume_job_id` not found, or a `v2v_source_job_id` whose banked latent does not
+  resolve (`{"error":"v2v_source_not_found"}` — source aged out of the FIFO store or never existed)
+- `422 Unprocessable Entity` — request below the deterministic token floor (`nondeterministic_request`)
+- `429 Too Many Requests` — job queue full
+- `500 Internal Server Error` — unexpected exception
+
+### `DELETE /ltx/v1/job?id=<job_id>`
+
+Removes a job's artifact dir from whichever root holds it (persist or FIFO). Used to reclaim
+persist-store user data on demand (e.g. project delete / re-render), since the persist root is never
+auto-swept. The id is confined to the roots by a single-component guard. Idempotent.
+
+Returns `200 OK` with `{ "deleted": <bool>, "id": "<job_id>" }` (`deleted:false` when the id was
+absent). `400 Bad Request` for an invalid id.

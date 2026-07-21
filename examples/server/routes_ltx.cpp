@@ -26,8 +26,17 @@
 //     "v2v_guide_latent_path": "/…/seg_0.bin",    // guide-edit LATENT-IN source (PREFERRED when we
 //                                                 //   rendered the source): a banked diffusion latent
 //                                                 //   to guide from with NO pixel re-encode. Per-seg
-//                                                 //   via segments[i].v2v_source_latent_path. Absent
-//                                                 //   => fall back to control_frames (pixel encode).
+//                                                 //   PREFER by-reference: segments[i].v2v_source_job_id
+//                                                 //   (opaque job id) + v2v_source_segment (int) — the
+//                                                 //   engine resolves those to the banked seg_<n>.bin in
+//                                                 //   its own artifact roots (no path on the wire). A
+//                                                 //   raw segments[i].v2v_source_latent_path is still
+//                                                 //   honoured (engine-internal). Absent => fall back
+//                                                 //   to control_frames (pixel encode).
+//     "persist": false,                           // when true a FRESH job's artifacts land in the
+//                                                 //   persist root (LTX_PERSIST_DIR, never swept) so a
+//                                                 //   saved shot's latents survive as retake sources;
+//                                                 //   default false => FIFO root (swept, LTX_JOB_KEEP).
 //     "model": "edit",                            // selects the lipdub DiT variant
 //     "hires": { ... },                         // optional legacy single spatial upscaler
 //     "hires_chain": [ { "upscaler": "<spatial-upscaler-x2 name>",
@@ -69,6 +78,41 @@ static void ltx_write_blob(const std::string& path, const std::string& bytes) {
 static fs::path ltx_job_root() {
     const char* e = getenv("LTX_JOB_DIR");
     return fs::path((e != nullptr && e[0] != '\0') ? e : "/var/lib/ltx-video/jobs");
+}
+
+// Root for jobs the client marked persist:true (saved Director shots). NEVER swept — user data
+// lives here until an explicit DELETE. Overridable via LTX_PERSIST_DIR. A sibling of the FIFO
+// root so a job id resolves in exactly one of the two.
+static fs::path ltx_persist_root() {
+    const char* e = getenv("LTX_PERSIST_DIR");
+    return fs::path((e != nullptr && e[0] != '\0') ? e : "/var/lib/ltx-video/persist");
+}
+
+// A job id arriving from the wire (resume_job_id, v2v_source_job_id, DELETE ?id) must be a single
+// path component. The engine resolves ids against its own roots, so this is the confinement guard:
+// a crafted id can never traverse out of a root.
+static bool ltx_id_is_safe(const std::string& id) {
+    return !id.empty() && id.find('/') == std::string::npos && id.find('\\') == std::string::npos &&
+           id.find("..") == std::string::npos;
+}
+
+// Resolve an opaque job id to its artifact dir, checking the persist root first, then the FIFO
+// root. Returns an empty path for an unsafe id or when neither root holds it. This is how a
+// by-reference v2v source / resume finds its banked latents without a path ever crossing the wire.
+static fs::path ltx_resolve_job_dir(const std::string& id) {
+    if (!ltx_id_is_safe(id)) {
+        return {};
+    }
+    std::error_code ec;
+    fs::path        p = ltx_persist_root() / id;
+    if (fs::exists(p, ec)) {
+        return p;
+    }
+    p = ltx_job_root() / id;
+    if (fs::exists(p, ec)) {
+        return p;
+    }
+    return {};
 }
 
 // Count the contiguous run of banked segment latents (seg_0.bin, seg_1.bin, …) in a job
@@ -286,6 +330,45 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
+            // V2V source-by-reference: a retake names its banked source by opaque job id + segment
+            // (segments[i].v2v_source_job_id / v2v_source_segment) — never a filesystem path. Resolve
+            // each to the engine-internal absolute latent path (v2v_source_latent_path) the chain
+            // renderer already consumes; the id is confined to the engine's own artifact roots and the
+            // path never crosses the wire. A ref that doesn't resolve (source aged out of the FIFO
+            // store / never existed) fails the request before the job is registered.
+            if (chain.contains("segments") && chain["segments"].is_array()) {
+                for (auto& seg : chain["segments"]) {
+                    if (!seg.is_object()) {
+                        continue;
+                    }
+                    auto jit = seg.find("v2v_source_job_id");
+                    if (jit == seg.end() || !jit->is_string() || jit->get<std::string>().empty()) {
+                        continue;
+                    }
+                    const std::string src_id  = jit->get<std::string>();
+                    int               src_seg = 0;
+                    if (auto sit = seg.find("v2v_source_segment");
+                        sit != seg.end() && sit->is_number_integer()) {
+                        src_seg = sit->get<int>();
+                    }
+                    fs::path        src_dir = ltx_resolve_job_dir(src_id);
+                    fs::path        lat = src_dir.empty() ? fs::path()
+                                                          : src_dir / ("seg_" + std::to_string(src_seg) + ".bin");
+                    std::error_code lec;
+                    if (lat.empty() || !fs::exists(lat, lec)) {
+                        res.status = 404;
+                        res.set_content(json({{"error", "v2v_source_not_found"},
+                                              {"message", "banked latent for v2v_source_job_id '" + src_id +
+                                                              "' segment " + std::to_string(src_seg) +
+                                                              " not found"}})
+                                            .dump(),
+                                        "application/json");
+                        return;
+                    }
+                    seg["v2v_source_latent_path"] = lat.string();
+                }
+            }
+
             // Register the job (assign an id) before touching the filesystem, so a fresh job's
             // artifact dir can be keyed by its own id.
             AsyncJobManager&                    manager = *runtime->async_job_manager;
@@ -306,14 +389,18 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 manager.jobs[job->id] = job;  // registered but not queued until inputs are on disk
             }
 
-            // Resolve the artifact dir: an existing dir on resume, else this job's own.
-            fs::path        root = ltx_job_root();
+            // Resolve the artifact dir: an existing dir on resume, else this job's own. A fresh job
+            // marked persist:true is keyed into the persist root (never swept); everything else lands
+            // in the FIFO root (swept to LTX_JOB_KEEP). A resume finds its dir in whichever root holds
+            // it, so a persisted chain keeps accumulating there.
+            bool            persist = body.value("persist", false);
+            fs::path        root    = persist ? ltx_persist_root() : ltx_job_root();
             fs::path        job_dir;
             int             resume_from = 0;
             std::error_code ec;
             if (!resume_job_id.empty()) {
-                job_dir = root / resume_job_id;
-                if (!fs::exists(job_dir, ec)) {
+                job_dir = ltx_resolve_job_dir(resume_job_id);
+                if (job_dir.empty()) {
                     std::lock_guard<std::mutex> lock(manager.mutex);
                     manager.jobs.erase(job->id);
                     res.status = 404;
@@ -404,7 +491,10 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
                 ltx_write_blob((job_dir / "prompts.txt").string(), ptxt);
             }
-            ltx_sweep_old_jobs(root, job_dir);
+            // Only ever sweep the FIFO root — the persist store is user data and is never evicted.
+            // Passing job_dir as keep_dir is harmless when it lives in the persist root (it simply
+            // won't match anything the FIFO sweep iterates).
+            ltx_sweep_old_jobs(ltx_job_root(), job_dir);
 
             {
                 std::lock_guard<std::mutex> lock(manager.mutex);
@@ -435,6 +525,30 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         }
     });
 
+    // DELETE /ltx/v1/job?id=<job_id> — remove a job's artifact dir from whichever root holds it
+    // (persist or FIFO). koblem calls this on project-delete / tier-wipe so persisted user data is
+    // cleaned up on demand — the persist root is otherwise never swept. Confined to the roots by the
+    // single-component id guard. Idempotent: deleting a missing id succeeds with deleted:false.
+    svr.Delete("/ltx/v1/job", [](const httplib::Request& req, httplib::Response& res) {
+        const std::string id = req.has_param("id") ? req.get_param_value("id") : std::string();
+        if (!ltx_id_is_safe(id)) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid id"})", "application/json");
+            return;
+        }
+        std::error_code ec;
+        bool            removed = false;
+        for (const fs::path& r : {ltx_persist_root(), ltx_job_root()}) {
+            fs::path d = r / id;
+            if (fs::exists(d, ec)) {
+                fs::remove_all(d, ec);
+                removed = true;
+            }
+        }
+        res.status = 200;
+        res.set_content(json({{"deleted", removed}, {"id", id}}).dump(), "application/json");
+    });
+
     // GET /sdcpp/v1/jobs/{id}/media — stream the finished final.webm from the job's artifact
     // dir. Survives the in-RAM result TTL and a koblem disconnect: the file is read from disk
     // by job id, falling back to LTX_JOB_DIR/<id> when the job has already aged out of RAM.
@@ -450,7 +564,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
         }
         if (dir.empty()) {
-            dir = ltx_job_root() / job_id;  // job aged out of RAM; serve from disk
+            // job aged out of RAM; serve from disk — check both roots (a persisted job lives in
+            // the persist store), falling back to the FIFO path so a truly-absent id still 404s.
+            dir = ltx_resolve_job_dir(job_id);
+            if (dir.empty()) {
+                dir = ltx_job_root() / job_id;
+            }
         }
         fs::path        final_webm = dir / "final.webm";
         std::error_code ec;
@@ -485,7 +604,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
         }
         if (dir.empty()) {
-            dir = ltx_job_root() / job_id;  // job aged out of RAM; serve from disk
+            // job aged out of RAM; serve from disk — check both roots (a persisted job lives in
+            // the persist store), falling back to the FIFO path so a truly-absent id still 404s.
+            dir = ltx_resolve_job_dir(job_id);
+            if (dir.empty()) {
+                dir = ltx_job_root() / job_id;
+            }
         }
         // stage=4 (or absent) is the final seg_<n>.webm; stage 1/2 select the intermediate previews.
         const std::string stage_q = req.has_param("stage") ? req.get_param_value("stage") : "";
