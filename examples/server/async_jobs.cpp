@@ -325,6 +325,9 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;
             chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();
+            chain.chain_audio_full = job.ltx_chain_audio_full.empty() ? nullptr : job.ltx_chain_audio_full.c_str();
+            chain.chain_audio_track = job.ltx_chain_audio_track.empty() ? nullptr : job.ltx_chain_audio_track.c_str();
+            chain.chain_audio_offset_frames = job.ltx_chain_audio_offset_frames;
             generated = generate_video_chain(runtime.sd_ctx,
                                               &params,
                                               &chain,

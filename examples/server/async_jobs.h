@@ -55,6 +55,10 @@ struct AsyncGenerationJob {
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;
     std::string ltx_bank_dir;
     std::string ltx_bank_id;
+    // Durable full-timeline WAV inputs staged alongside the LTX latent bank.
+    std::string ltx_chain_audio_full;
+    std::string ltx_chain_audio_track;
+    int ltx_chain_audio_offset_frames = 0;
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;
     std::vector<std::string> result_images_b64;

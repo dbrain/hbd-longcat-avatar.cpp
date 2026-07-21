@@ -7292,6 +7292,96 @@ static bool save_banked_video_latent(const std::string& path, const sd::Tensor<f
     return output.good();
 }
 
+static bool write_ltx_drive_audio_wav(const std::string& path,
+                                      const std::vector<float>& samples) {
+    if (samples.empty()) {
+        return false;
+    }
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.is_open()) {
+        LOG_ERROR("generate_video_chain: could not create drive-audio slice %s", path.c_str());
+        return false;
+    }
+    const uint32_t sample_rate = 16000;
+    const uint16_t channels = 1;
+    const uint16_t bits = 16;
+    const uint32_t data_length = static_cast<uint32_t>(samples.size() * sizeof(int16_t));
+    const uint32_t riff_length = 36 + data_length;
+    const uint32_t byte_rate = sample_rate * channels * (bits / 8);
+    const uint16_t block_align = channels * (bits / 8);
+    const uint32_t fmt_length = 16;
+    const uint16_t format = 1;
+    output.write("RIFF", 4);
+    output.write(reinterpret_cast<const char*>(&riff_length), sizeof(riff_length));
+    output.write("WAVEfmt ", 8);
+    output.write(reinterpret_cast<const char*>(&fmt_length), sizeof(fmt_length));
+    output.write(reinterpret_cast<const char*>(&format), sizeof(format));
+    output.write(reinterpret_cast<const char*>(&channels), sizeof(channels));
+    output.write(reinterpret_cast<const char*>(&sample_rate), sizeof(sample_rate));
+    output.write(reinterpret_cast<const char*>(&byte_rate), sizeof(byte_rate));
+    output.write(reinterpret_cast<const char*>(&block_align), sizeof(block_align));
+    output.write(reinterpret_cast<const char*>(&bits), sizeof(bits));
+    output.write("data", 4);
+    output.write(reinterpret_cast<const char*>(&data_length), sizeof(data_length));
+    for (const float sample : samples) {
+        const int16_t pcm = static_cast<int16_t>(std::lround(std::clamp(sample, -1.f, 1.f) * 32767.f));
+        output.write(reinterpret_cast<const char*>(&pcm), sizeof(pcm));
+    }
+    return output.good();
+}
+
+struct LTXChainAudio {
+    std::vector<float> samples;
+    uint32_t sample_rate = 0;
+    uint32_t channels = 0;
+
+    bool loaded() const {
+        return sample_rate != 0 && channels != 0 && !samples.empty();
+    }
+
+    std::vector<float> window(int64_t start_frame,
+                              int64_t frame_count,
+                              int fps,
+                              int64_t offset_frames) const {
+        if (!loaded() || frame_count <= 0 || fps <= 0) {
+            return {};
+        }
+        const int64_t first = std::llround(static_cast<double>(start_frame - offset_frames) * sample_rate / fps);
+        const int64_t last = std::llround(static_cast<double>(start_frame + frame_count - offset_frames) * sample_rate / fps);
+        const int64_t wanted = std::max<int64_t>(0, last - first);
+        std::vector<float> result(static_cast<size_t>(wanted) * channels, 0.f);
+        const int64_t available = static_cast<int64_t>(samples.size() / channels);
+        for (int64_t frame = 0; frame < wanted; ++frame) {
+            const int64_t source_frame = first + frame;
+            if (source_frame < 0 || source_frame >= available) continue;
+            std::copy_n(samples.data() + static_cast<size_t>(source_frame) * channels,
+                        channels,
+                        result.data() + static_cast<size_t>(frame) * channels);
+        }
+        return result;
+    }
+};
+
+static sd_audio_t* make_ltx_chain_audio(const std::vector<float>& samples,
+                                        uint32_t sample_rate,
+                                        uint32_t channels) {
+    if (samples.empty() || sample_rate == 0 || channels == 0 || samples.size() % channels != 0) {
+        return nullptr;
+    }
+    auto* audio = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
+    if (audio == nullptr) return nullptr;
+    audio->sample_rate = sample_rate;
+    audio->channels = channels;
+    audio->sample_count = samples.size() / channels;
+    audio->data = static_cast<float*>(malloc(samples.size() * sizeof(float)));
+    if (audio->data == nullptr) {
+        free(audio);
+        return nullptr;
+    }
+    std::memcpy(audio->data, samples.data(), samples.size() * sizeof(float));
+    return audio;
+}
+
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,
                                  const sd_vid_chain_params_t* chain_params,
@@ -7318,6 +7408,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         LOG_ERROR("generate_video_chain requires an LTX or LongCat Avatar video model");
         return false;
     }
+    if (!ltx_chain && ((chain_params->chain_audio_full != nullptr && chain_params->chain_audio_full[0] != '\0') ||
+                       (chain_params->chain_audio_track != nullptr && chain_params->chain_audio_track[0] != '\0'))) {
+        LOG_ERROR("generate_video_chain: full-timeline audio inputs are supported only for LTX chains");
+        return false;
+    }
 
     int carried_frames = std::max(1, chain_params->cont_latent_frames);
     const int overlap_frames = 1 + (carried_frames - 1) * (ltx_chain ? 8 : 4);
@@ -7337,6 +7432,32 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     if (chain_params->start_segment > 0 && (chain_params->bank_dir == nullptr || chain_params->bank_dir[0] == '\0')) {
         LOG_ERROR("generate_video_chain: resume requires a durable bank directory");
         return false;
+    }
+
+    const int64_t audio_offset = (chain_params->chain_audio_full != nullptr || chain_params->chain_audio_track != nullptr)
+                                     ? chain_params->chain_audio_offset_frames
+                                     : 0;
+    LTXChainAudio drive_audio;
+    if (chain_params->chain_audio_full != nullptr && chain_params->chain_audio_full[0] != '\0') {
+        if (chain_params->bank_dir == nullptr || chain_params->bank_dir[0] == '\0' ||
+            !LONGCAT_AUDIO::load_wav_16k_mono(chain_params->chain_audio_full, drive_audio.samples) ||
+            drive_audio.samples.empty()) {
+            LOG_ERROR("generate_video_chain: drive audio requires a readable WAV and durable bank directory");
+            return false;
+        }
+        drive_audio.sample_rate = 16000;
+        drive_audio.channels = 1;
+    }
+    LTXChainAudio track_audio;
+    if (chain_params->chain_audio_track != nullptr && chain_params->chain_audio_track[0] != '\0') {
+        if (!LONGCAT_AUDIO::load_wav_full(chain_params->chain_audio_track,
+                                          track_audio.samples,
+                                          track_audio.sample_rate,
+                                          track_audio.channels) ||
+            !track_audio.loaded()) {
+            LOG_ERROR("generate_video_chain: track audio is not a readable WAV");
+            return false;
+        }
     }
 
     std::vector<sd_image_t> stitched;
@@ -7563,6 +7684,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             params.cont_latent_frames = 0;
         }
 
+        std::string drive_audio_path;
+        if (drive_audio.loaded()) {
+            const int drop = segment == 0 || fresh_scene ? 0 : std::min(overlap_frames, params.video_frames);
+            const int64_t timeline_start = static_cast<int64_t>(stitched.size()) - drop;
+            const auto slice = drive_audio.window(timeline_start,
+                                                  params.video_frames,
+                                                  std::max(1, params.fps),
+                                                  audio_offset);
+            drive_audio_path = std::string(chain_params->bank_dir) + "/aud_" + std::to_string(segment) + ".wav";
+            if (!write_ltx_drive_audio_wav(drive_audio_path, slice)) {
+                LOG_ERROR("generate_video_chain: could not stage drive audio for window %d", segment + 1);
+                return fail();
+            }
+            params.drive_audio_path = drive_audio_path.c_str();
+        }
+
         sd_image_t* segment_frames = nullptr;
         int segment_count = 0;
         sd_audio_t* segment_audio = nullptr;
@@ -7626,18 +7763,19 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     std::memcpy(output, stitched.data(), stitched.size() * sizeof(sd_image_t));
     *frames_out = output;
     *num_frames_out = static_cast<int>(stitched.size());
-    if (audio_out != nullptr && chain_audio_channels != 0 && !chain_audio_samples.empty()) {
-        auto* chain_audio = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
-        if (chain_audio != nullptr) {
-            chain_audio->sample_rate = chain_audio_rate;
-            chain_audio->channels = chain_audio_channels;
-            chain_audio->sample_count = chain_audio_samples.size() / chain_audio_channels;
-            chain_audio->data = static_cast<float*>(malloc(chain_audio_samples.size() * sizeof(float)));
-            if (chain_audio->data != nullptr) {
-                std::memcpy(chain_audio->data, chain_audio_samples.data(), chain_audio_samples.size() * sizeof(float));
-                *audio_out = chain_audio;
-            } else {
-                free(chain_audio);
+    if (audio_out != nullptr) {
+        if (track_audio.loaded()) {
+            const auto track = track_audio.window(0,
+                                                  static_cast<int64_t>(stitched.size()),
+                                                  std::max(1, base_params->fps),
+                                                  audio_offset);
+            *audio_out = make_ltx_chain_audio(track, track_audio.sample_rate, track_audio.channels);
+            if (*audio_out == nullptr) {
+                LOG_WARN("generate_video_chain: could not allocate requested deliverable audio track");
+            }
+        } else {
+            *audio_out = make_ltx_chain_audio(chain_audio_samples, chain_audio_rate, chain_audio_channels);
+            if (*audio_out == nullptr && !chain_audio_samples.empty()) {
                 LOG_WARN("generate_video_chain: could not allocate stitched audio");
             }
         }

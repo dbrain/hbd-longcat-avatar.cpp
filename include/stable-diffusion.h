@@ -489,6 +489,14 @@ typedef struct {
     int cont_latent_frames;
     int start_segment;
     const char* bank_dir;
+    // Optional full-timeline WAV inputs for LTX chains. The core slices
+    // chain_audio_full per generated window and holds each slice fixed as the
+    // drive signal; bank_dir is required so those durable slices survive the
+    // asynchronous job. chain_audio_track is muxed over the final stitched
+    // video at its actual post-overlap length.
+    const char* chain_audio_full;
+    const char* chain_audio_track;
+    int chain_audio_offset_frames;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

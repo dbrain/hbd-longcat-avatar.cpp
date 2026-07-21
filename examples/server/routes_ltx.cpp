@@ -148,6 +148,26 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(R"({"error":"missing or invalid request"})", "application/json");
                 return;
             }
+            std::string drive_audio_bytes;
+            std::string track_audio_bytes;
+            if (req.is_multipart_form_data()) {
+                if (req.form.has_file("audio_full")) {
+                    drive_audio_bytes = req.form.get_file("audio_full").content;
+                    if (drive_audio_bytes.empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"audio_full must be a non-empty WAV upload"})", "application/json");
+                        return;
+                    }
+                }
+                if (req.form.has_file("audio_track")) {
+                    track_audio_bytes = req.form.get_file("audio_track").content;
+                    if (track_audio_bytes.empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"audio_track must be a non-empty WAV upload"})", "application/json");
+                        return;
+                    }
+                }
+            }
             std::vector<std::string> prompts;
             std::vector<int> segment_frames;
             std::vector<int> segment_scene_cuts;
@@ -302,6 +322,18 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
             job->ltx_cont_latent_frames = continuation_frames;
             const std::string resume_job_id = body.value("resume_job_id", std::string());
+            if (body.contains("audio_offset_frames") && !body["audio_offset_frames"].is_number_integer()) {
+                res.status = 400;
+                res.set_content(R"({"error":"audio_offset_frames must be an integer"})", "application/json");
+                return;
+            }
+            const bool has_audio_offset_frames = body.contains("audio_offset_frames");
+            const int audio_offset_frames = body.value("audio_offset_frames", 0);
+            if (audio_offset_frames < 0) {
+                res.status = 400;
+                res.set_content(R"({"error":"audio_offset_frames must not be negative"})", "application/json");
+                return;
+            }
             int resume_from = 0;
             {
                 std::lock_guard<std::mutex> lock(manager.mutex);
@@ -314,6 +346,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 fs::path bank_dir;
                 std::string bank_id;
                 if (!resume_job_id.empty()) {
+                    if (!drive_audio_bytes.empty() || !track_audio_bytes.empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"resumed LTX jobs reuse their banked audio; do not upload new audio"})", "application/json");
+                        return;
+                    }
                     if (!resolve_ltx_bank_dir(resume_job_id, bank_dir, bank_id)) {
                         res.status = 400;
                         res.set_content(R"({"error":"invalid resume_job_id"})", "application/json");
@@ -350,9 +387,62 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     res.set_content(R"({"error":"could not persist LTX bank reference"})", "application/json");
                     return;
                 }
+                auto stage_audio = [&](const std::string& bytes,
+                                       const char* filename,
+                                       std::string& staged_path) -> bool {
+                    if (bytes.empty()) return true;
+                    const fs::path path = bank_dir / filename;
+                    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+                    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                    if (!output.good()) return false;
+                    staged_path = path.string();
+                    return true;
+                };
+                if (!resume_job_id.empty()) {
+                    const fs::path drive_path = bank_dir / "audio_full.wav";
+                    const fs::path track_path = bank_dir / "audio_track.wav";
+                    std::error_code audio_error;
+                    if (fs::is_regular_file(drive_path, audio_error)) job->ltx_chain_audio_full = drive_path.string();
+                    audio_error.clear();
+                    if (fs::is_regular_file(track_path, audio_error)) job->ltx_chain_audio_track = track_path.string();
+                    std::ifstream offset_file(bank_dir / "audio_offset_frames");
+                    int stored_offset = 0;
+                    if (offset_file >> stored_offset) {
+                        if (stored_offset < 0 || (has_audio_offset_frames && stored_offset != audio_offset_frames)) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"resume audio_offset_frames does not match the banked audio timeline"})", "application/json");
+                            return;
+                        }
+                        job->ltx_chain_audio_offset_frames = stored_offset;
+                    }
+                } else if (!stage_audio(drive_audio_bytes, "audio_full.wav", job->ltx_chain_audio_full) ||
+                           !stage_audio(track_audio_bytes, "audio_track.wav", job->ltx_chain_audio_track)) {
+                    std::error_code remove_error;
+                    fs::remove(bank_dir / "audio_full.wav", remove_error);
+                    remove_error.clear();
+                    fs::remove(bank_dir / "audio_track.wav", remove_error);
+                    res.status = 500;
+                    res.set_content(R"({"error":"could not stage LTX audio upload"})", "application/json");
+                    return;
+                } else if (!drive_audio_bytes.empty() || !track_audio_bytes.empty()) {
+                    std::ofstream offset_file(bank_dir / "audio_offset_frames", std::ios::trunc);
+                    offset_file << audio_offset_frames << '\n';
+                    if (!offset_file.good()) {
+                        std::error_code remove_error;
+                        fs::remove(bank_dir / "audio_full.wav", remove_error);
+                        remove_error.clear();
+                        fs::remove(bank_dir / "audio_track.wav", remove_error);
+                        res.status = 500;
+                        res.set_content(R"({"error":"could not persist LTX audio timeline metadata"})", "application/json");
+                        return;
+                    }
+                }
                 job->ltx_bank_dir = bank_dir.string();
                 job->ltx_bank_id = bank_id;
                 job->ltx_resume_from = resume_from;
+                if (job->ltx_chain_audio_offset_frames == 0) {
+                    job->ltx_chain_audio_offset_frames = audio_offset_frames;
+                }
                 manager.jobs[job->id] = job;
                 manager.queue.push_back(job->id);
             }
