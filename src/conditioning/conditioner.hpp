@@ -2,6 +2,7 @@
 #define __SD_CONDITIONING_CONDITIONER_HPP__
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 
@@ -1288,6 +1289,7 @@ struct T5CLIPEmbedder : public Conditioner {
     bool use_mask    = false;
     int mask_pad     = 0;
     bool is_umt5     = false;
+    bool trim_to_valid = false;
 
     T5CLIPEmbedder(ggml_backend_t backend,
                    const String2TensorStorage& tensor_storage_map      = {},
@@ -1507,6 +1509,24 @@ struct T5CLIPEmbedder : public Conditioner {
         }
 
         modify_mask_to_attend_padding(&t5_attn_mask, static_cast<int>(t5_attn_mask.numel()), mask_pad);
+
+        if (trim_to_valid && !hidden_states.empty()) {
+            int64_t valid = 0;
+            for (float mask_value : t5_attn_mask_vec) {
+                if (mask_value > -1.0e30f) {
+                    ++valid;
+                }
+            }
+            if (const char* env = std::getenv("LTX_T5_TRIM"); env != nullptr) {
+                const long requested = std::atol(env);
+                if (requested > 0) {
+                    valid = requested;
+                }
+            }
+            if (valid > 0 && valid < hidden_states.shape()[1]) {
+                hidden_states = sd::ops::slice(hidden_states, 1, 0, valid);
+            }
+        }
 
         SDCondition result;
         result.c_crossattn = std::move(hidden_states);

@@ -98,6 +98,9 @@ namespace LTXV {
         float av_ca_timestep_scale_multiplier               = 1000.f;
         int64_t num_audio_channels                          = 8;
         int64_t audio_frequency_bins                        = 16;
+        // Classic LTX-Video 0.9.x checkpoints are video-only.  Infer this
+        // from the absent audio patchifier before constructing any AV blocks.
+        bool has_audio = true;
 
         bool use_connector                   = false;
         int64_t connector_hidden_size        = 3840;
@@ -169,6 +172,7 @@ namespace LTXV {
             }
 
             auto audio_patchify_proj_iter = tensor_storage_map.find(prefix + ".audio_patchify_proj.weight");
+            config.has_audio              = audio_patchify_proj_iter != tensor_storage_map.end();
             if (audio_patchify_proj_iter != tensor_storage_map.end()) {
                 config.audio_in_channels         = audio_patchify_proj_iter->second.ne[0];
                 config.audio_hidden_size         = audio_patchify_proj_iter->second.ne[1];
@@ -207,9 +211,19 @@ namespace LTXV {
                 tensor_storage_map.find(prefix + ".transformer_blocks.0.audio_attn2.to_gate_logits.weight") != tensor_storage_map.end()) {
                 config.cross_attention_gated = true;
             }
-            if (tensor_storage_map.find(prefix + ".caption_projection.linear_1.weight") == tensor_storage_map.end() &&
-                tensor_storage_map.find(prefix + ".caption_projection.linear_2.weight") == tensor_storage_map.end()) {
+            auto caption_linear1_iter = tensor_storage_map.find(prefix + ".caption_projection.linear_1.weight");
+            auto caption_linear2_iter = tensor_storage_map.find(prefix + ".caption_projection.linear_2.weight");
+            if (caption_linear1_iter == tensor_storage_map.end() &&
+                caption_linear2_iter == tensor_storage_map.end()) {
                 config.use_caption_projection = false;
+            }
+            if (caption_linear1_iter != tensor_storage_map.end() &&
+                caption_linear2_iter != tensor_storage_map.end()) {
+                config.caption_channels                = caption_linear1_iter->second.ne[0];
+                config.caption_proj_before_connector   = false;
+                config.caption_projection_first_linear = false;
+                // LTX 0.9 uses interleaved rotary embeddings (LTX-2 does not).
+                config.video_rope_interleaved = true;
             }
             if (tensor_storage_map.find(prefix + ".audio_caption_projection.linear_1.weight") == tensor_storage_map.end() &&
                 tensor_storage_map.find(prefix + ".audio_caption_projection.linear_2.weight") == tensor_storage_map.end()) {
@@ -1103,27 +1117,32 @@ namespace LTXV {
         int64_t v_dim;
         int64_t a_dim;
         bool cross_attention_adaln;
+        bool has_audio = true;
 
         void init_params(ggml_context* ctx,
                          const String2TensorStorage& tensor_storage_map = {},
                          const std::string prefix                       = "") override {
             int64_t coeff                     = cross_attention_adaln ? 9 : 6;
             ggml_type vw                      = get_type(prefix + "scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
-            ggml_type aw                      = get_type(prefix + "audio_scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
             params["scale_shift_table"]       = ggml_new_tensor_2d(ctx, vw, v_dim, coeff);
-            params["audio_scale_shift_table"] = ggml_new_tensor_2d(ctx, aw, a_dim, coeff);
 
             if (cross_attention_adaln) {
-                ggml_type vpw                            = get_type(prefix + "prompt_scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
-                ggml_type apw                            = get_type(prefix + "audio_prompt_scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
-                params["prompt_scale_shift_table"]       = ggml_new_tensor_2d(ctx, vpw, v_dim, 2);
-                params["audio_prompt_scale_shift_table"] = ggml_new_tensor_2d(ctx, apw, a_dim, 2);
+                ggml_type vpw                      = get_type(prefix + "prompt_scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
+                params["prompt_scale_shift_table"] = ggml_new_tensor_2d(ctx, vpw, v_dim, 2);
             }
 
-            ggml_type avw                            = get_type(prefix + "scale_shift_table_a2v_ca_audio", tensor_storage_map, GGML_TYPE_F32);
-            ggml_type vaw                            = get_type(prefix + "scale_shift_table_a2v_ca_video", tensor_storage_map, GGML_TYPE_F32);
-            params["scale_shift_table_a2v_ca_audio"] = ggml_new_tensor_2d(ctx, avw, a_dim, 5);
-            params["scale_shift_table_a2v_ca_video"] = ggml_new_tensor_2d(ctx, vaw, v_dim, 5);
+            if (has_audio) {
+                ggml_type aw                      = get_type(prefix + "audio_scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
+                params["audio_scale_shift_table"] = ggml_new_tensor_2d(ctx, aw, a_dim, coeff);
+                if (cross_attention_adaln) {
+                    ggml_type apw                            = get_type(prefix + "audio_prompt_scale_shift_table", tensor_storage_map, GGML_TYPE_F32);
+                    params["audio_prompt_scale_shift_table"] = ggml_new_tensor_2d(ctx, apw, a_dim, 2);
+                }
+                ggml_type avw                            = get_type(prefix + "scale_shift_table_a2v_ca_audio", tensor_storage_map, GGML_TYPE_F32);
+                ggml_type vaw                            = get_type(prefix + "scale_shift_table_a2v_ca_video", tensor_storage_map, GGML_TYPE_F32);
+                params["scale_shift_table_a2v_ca_audio"] = ggml_new_tensor_2d(ctx, avw, a_dim, 5);
+                params["scale_shift_table_a2v_ca_video"] = ggml_new_tensor_2d(ctx, vaw, v_dim, 5);
+            }
         }
 
         BasicAVTransformerBlock(int64_t v_dim,
@@ -1136,18 +1155,22 @@ namespace LTXV {
                                 int64_t a_context_dim,
                                 bool apply_gated_attention,
                                 bool cross_attention_adaln,
-                                bool video_rope_interleaved)
+                                bool video_rope_interleaved,
+                                bool has_audio = true)
             : v_dim(v_dim),
               a_dim(a_dim),
-              cross_attention_adaln(cross_attention_adaln) {
+              cross_attention_adaln(cross_attention_adaln),
+              has_audio(has_audio) {
             blocks["attn1"]               = std::make_shared<CrossAttention>(v_dim, v_dim, v_heads, vd_head, apply_gated_attention, video_rope_interleaved);
-            blocks["audio_attn1"]         = std::make_shared<CrossAttention>(a_dim, a_dim, a_heads, ad_head, apply_gated_attention, false);
             blocks["attn2"]               = std::make_shared<CrossAttention>(v_dim, v_context_dim, v_heads, vd_head, apply_gated_attention, false);
-            blocks["audio_attn2"]         = std::make_shared<CrossAttention>(a_dim, a_context_dim, a_heads, ad_head, apply_gated_attention, false);
-            blocks["audio_to_video_attn"] = std::make_shared<CrossAttention>(v_dim, a_dim, a_heads, ad_head, apply_gated_attention, false);
-            blocks["video_to_audio_attn"] = std::make_shared<CrossAttention>(a_dim, v_dim, a_heads, ad_head, apply_gated_attention, false);
             blocks["ff"]                  = std::make_shared<FeedForward>(v_dim, v_dim, 4, FeedForward::Activation::GELU);
-            blocks["audio_ff"]            = std::make_shared<FeedForward>(a_dim, a_dim, 4, FeedForward::Activation::GELU);
+            if (has_audio) {
+                blocks["audio_attn1"]         = std::make_shared<CrossAttention>(a_dim, a_dim, a_heads, ad_head, apply_gated_attention, false);
+                blocks["audio_attn2"]         = std::make_shared<CrossAttention>(a_dim, a_context_dim, a_heads, ad_head, apply_gated_attention, false);
+                blocks["audio_to_video_attn"] = std::make_shared<CrossAttention>(v_dim, a_dim, a_heads, ad_head, apply_gated_attention, false);
+                blocks["video_to_audio_attn"] = std::make_shared<CrossAttention>(a_dim, v_dim, a_heads, ad_head, apply_gated_attention, false);
+                blocks["audio_ff"]            = std::make_shared<FeedForward>(a_dim, a_dim, 4, FeedForward::Activation::GELU);
+            }
         }
 
         std::vector<ggml_tensor*> get_ada_values(GGMLRunnerContext* ctx,
@@ -1228,7 +1251,7 @@ namespace LTXV {
             auto v_table = params["scale_shift_table"];
             auto a_table = params["audio_scale_shift_table"];
 
-            bool run_ax  = ax != nullptr && ggml_nelements(ax) > 0 && ax->ne[1] > 0;
+            bool run_ax  = has_audio && ax != nullptr && ggml_nelements(ax) > 0 && ax->ne[1] > 0;
             bool run_a2v = run_ax;
             bool run_v2a = run_ax;
 
@@ -1322,26 +1345,32 @@ namespace LTXV {
                                                                    get_type(prefix + "scale_shift_table", tensor_storage_map, GGML_TYPE_F32),
                                                                    config.hidden_size,
                                                                    2);
-            params["audio_scale_shift_table"] = ggml_new_tensor_2d(ctx,
-                                                                   get_type(prefix + "audio_scale_shift_table", tensor_storage_map, GGML_TYPE_F32),
-                                                                   config.audio_hidden_size,
-                                                                   2);
+            if (config.has_audio) {
+                params["audio_scale_shift_table"] = ggml_new_tensor_2d(ctx,
+                                                                       get_type(prefix + "audio_scale_shift_table", tensor_storage_map, GGML_TYPE_F32),
+                                                                       config.audio_hidden_size,
+                                                                       2);
+            }
         }
 
         LTXAVModelBlock(const LTXAVConfig& config)
             : config(config) {
             blocks["patchify_proj"]       = std::make_shared<Linear>(config.in_channels, config.hidden_size, true, true);
-            blocks["audio_patchify_proj"] = std::make_shared<Linear>(config.audio_in_channels, config.audio_hidden_size, true, true);
             blocks["adaln_single"]        = std::make_shared<AdaLayerNormSingle>(config.hidden_size, config.cross_attention_adaln ? 9 : 6);
-            blocks["audio_adaln_single"]  = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, config.cross_attention_adaln ? 9 : 6);
-            if (config.cross_attention_adaln) {
-                blocks["prompt_adaln_single"]       = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 2);
-                blocks["audio_prompt_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, 2);
+            if (config.has_audio) {
+                blocks["audio_patchify_proj"] = std::make_shared<Linear>(config.audio_in_channels, config.audio_hidden_size, true, true);
+                blocks["audio_adaln_single"]  = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, config.cross_attention_adaln ? 9 : 6);
+                if (config.cross_attention_adaln) {
+                    blocks["prompt_adaln_single"]       = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 2);
+                    blocks["audio_prompt_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, 2);
+                }
+                blocks["av_ca_video_scale_shift_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 4);
+                blocks["av_ca_a2v_gate_adaln_single"]          = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 1);
+                blocks["av_ca_audio_scale_shift_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, 4);
+                blocks["av_ca_v2a_gate_adaln_single"]          = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, 1);
+            } else if (config.cross_attention_adaln) {
+                blocks["prompt_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 2);
             }
-            blocks["av_ca_video_scale_shift_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 4);
-            blocks["av_ca_a2v_gate_adaln_single"]          = std::make_shared<AdaLayerNormSingle>(config.hidden_size, 1);
-            blocks["av_ca_audio_scale_shift_adaln_single"] = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, 4);
-            blocks["av_ca_v2a_gate_adaln_single"]          = std::make_shared<AdaLayerNormSingle>(config.audio_hidden_size, 1);
 
             if (config.use_caption_projection) {
                 if (config.caption_proj_before_connector) {
@@ -1352,7 +1381,7 @@ namespace LTXV {
                     blocks["caption_projection"] = std::make_shared<PixArtAlphaTextProjection>(config.caption_channels, config.hidden_size, config.hidden_size);
                 }
             }
-            if (config.use_audio_caption_projection) {
+            if (config.has_audio && config.use_audio_caption_projection) {
                 if (config.caption_proj_before_connector) {
                     if (config.caption_projection_first_linear) {
                         blocks["audio_caption_projection"] = std::make_shared<NormSingleLinearTextProjection>(config.caption_channels, config.audio_hidden_size);
@@ -1371,7 +1400,7 @@ namespace LTXV {
                                                                                                config.connector_rope_interleaved,
                                                                                                config.connector_apply_gated_attention);
             }
-            if (config.use_audio_connector) {
+            if (config.has_audio && config.use_audio_connector) {
                 blocks["audio_embeddings_connector"] = std::make_shared<Embeddings1DConnector>(config.audio_connector_hidden_size,
                                                                                                config.audio_connector_num_heads,
                                                                                                config.audio_connector_head_dim,
@@ -1392,13 +1421,16 @@ namespace LTXV {
                                                                                                               config.audio_cross_attention_dim,
                                                                                                               config.self_attention_gated || config.cross_attention_gated,
                                                                                                               config.cross_attention_adaln,
-                                                                                                              config.video_rope_interleaved);
+                                                                                                              config.video_rope_interleaved,
+                                                                                                              config.has_audio);
             }
 
             blocks["norm_out"]       = std::make_shared<LayerNorm>(config.hidden_size, 1e-6f, false);
             blocks["proj_out"]       = std::make_shared<Linear>(config.hidden_size, config.out_channels, true, true);
-            blocks["audio_norm_out"] = std::make_shared<LayerNorm>(config.audio_hidden_size, 1e-6f, false);
-            blocks["audio_proj_out"] = std::make_shared<Linear>(config.audio_hidden_size, config.audio_out_channels, true, true);
+            if (config.has_audio) {
+                blocks["audio_norm_out"] = std::make_shared<LayerNorm>(config.audio_hidden_size, 1e-6f, false);
+                blocks["audio_proj_out"] = std::make_shared<Linear>(config.audio_hidden_size, config.audio_out_channels, true, true);
+            }
         }
 
         ggml_tensor* patchify_video(GGMLRunnerContext* ctx, ggml_tensor* x, int64_t n) {
@@ -1452,9 +1484,11 @@ namespace LTXV {
             }
 
             bool is_fully_processed_context =
+                config.has_audio &&
                 context->ne[0] == config.cross_attention_dim + config.audio_cross_attention_dim &&
                 context->ne[1] >= 1024;
             bool is_unprocessed_dual_context =
+                config.has_audio &&
                 context->ne[0] == config.cross_attention_dim + config.audio_cross_attention_dim &&
                 context->ne[1] < 1024;
 
@@ -1577,7 +1611,7 @@ namespace LTXV {
             int64_t width      = vx->ne[0];
             int64_t height     = vx->ne[1];
             int64_t frames     = vx->ne[2];
-            int64_t audio_time = ax != nullptr ? ax->ne[1] : 0;
+            int64_t audio_time = (config.has_audio && ax != nullptr) ? ax->ne[1] : 0;
 
             vx = patchify_video(ctx, vx, n);
             vx = patchify_proj->forward(ctx, vx);
@@ -1601,36 +1635,42 @@ namespace LTXV {
             auto v_timestep_mod    = v_pair.first;
             auto v_embedded_time   = v_pair.second;
 
-            ggml_tensor* effective_audio_timestep = audio_timestep != nullptr ? audio_timestep : timestep;
-            auto a_timestep_scaled                = ggml_ext_scale(ctx->ggml_ctx, effective_audio_timestep, config.timestep_scale_multiplier);
-            auto a_pair                           = audio_adaln_single->forward(ctx, a_timestep_scaled);
-            auto a_timestep_mod                   = a_pair.first;
-            auto a_embedded_time                  = a_pair.second;
-
+            ggml_tensor* a_timestep_mod        = nullptr;
+            ggml_tensor* a_embedded_time       = nullptr;
             ggml_tensor* v_prompt_timestep_mod = nullptr;
             ggml_tensor* a_prompt_timestep_mod = nullptr;
-            if (config.cross_attention_adaln) {
-                auto prompt_adaln_single       = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["prompt_adaln_single"]);
-                auto audio_prompt_adaln_single = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["audio_prompt_adaln_single"]);
-                v_prompt_timestep_mod          = prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
-                a_prompt_timestep_mod          = audio_prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
+            ggml_tensor* av_ca_video_scale_shift_timestep = nullptr;
+            ggml_tensor* av_ca_a2v_gate_noise_timestep    = nullptr;
+            ggml_tensor* av_ca_audio_scale_shift_timestep = nullptr;
+            ggml_tensor* av_ca_v2a_gate_noise_timestep    = nullptr;
+            if (config.has_audio) {
+                ggml_tensor* effective_audio_timestep = audio_timestep != nullptr ? audio_timestep : timestep;
+                auto a_timestep_scaled                = ggml_ext_scale(ctx->ggml_ctx, effective_audio_timestep, config.timestep_scale_multiplier);
+                auto a_pair                           = audio_adaln_single->forward(ctx, a_timestep_scaled);
+                a_timestep_mod                        = a_pair.first;
+                a_embedded_time                       = a_pair.second;
+                if (config.cross_attention_adaln) {
+                    auto prompt_adaln_single       = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["prompt_adaln_single"]);
+                    auto audio_prompt_adaln_single = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["audio_prompt_adaln_single"]);
+                    v_prompt_timestep_mod          = prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
+                    a_prompt_timestep_mod          = audio_prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
+                }
+                auto av_ca_video_timestep = repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
+                auto av_ca_audio_timestep = effective_audio_timestep;
+                auto av_ca_factor         = config.av_ca_timestep_scale_multiplier / config.timestep_scale_multiplier;
+                av_ca_video_scale_shift_timestep =
+                    std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_video_scale_shift_adaln_single"])->forward(ctx, av_ca_video_timestep).first;
+                av_ca_a2v_gate_noise_timestep =
+                    std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_a2v_gate_adaln_single"])
+                        ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, av_ca_video_timestep, av_ca_factor))
+                        .first;
+                av_ca_audio_scale_shift_timestep =
+                    std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_audio_scale_shift_adaln_single"])->forward(ctx, av_ca_audio_timestep).first;
+                av_ca_v2a_gate_noise_timestep =
+                    std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_v2a_gate_adaln_single"])
+                        ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, av_ca_audio_timestep, av_ca_factor))
+                        .first;
             }
-
-            auto av_ca_video_timestep = repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
-            auto av_ca_audio_timestep = effective_audio_timestep;
-            auto av_ca_factor         = config.av_ca_timestep_scale_multiplier / config.timestep_scale_multiplier;
-            auto av_ca_video_scale_shift_timestep =
-                std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_video_scale_shift_adaln_single"])->forward(ctx, av_ca_video_timestep).first;
-            auto av_ca_a2v_gate_noise_timestep =
-                std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_a2v_gate_adaln_single"])
-                    ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, av_ca_video_timestep, av_ca_factor))
-                    .first;
-            auto av_ca_audio_scale_shift_timestep =
-                std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_audio_scale_shift_adaln_single"])->forward(ctx, av_ca_audio_timestep).first;
-            auto av_ca_v2a_gate_noise_timestep =
-                std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["av_ca_v2a_gate_adaln_single"])
-                    ->forward(ctx, ggml_ext_scale(ctx->ggml_ctx, av_ca_audio_timestep, av_ca_factor))
-                    .first;
 
             sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.prelude", "vx");
             sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.prelude", "ax");
@@ -1703,6 +1743,10 @@ namespace LTXV {
 
         std::string get_desc() override {
             return "ltxav";
+        }
+
+        bool has_audio_stream() const override {
+            return config.has_audio;
         }
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {

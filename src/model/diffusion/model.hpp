@@ -155,6 +155,11 @@ public:
 
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                    const std::string& prefix) = 0;
+
+    // Classic LTX-Video 0.9.x checkpoints are video-only. The LTX-2 default
+    // remains audio+video; the 0.9 runner overrides this to prevent the
+    // pipeline constructing a nonexistent audio stream.
+    virtual bool has_audio_stream() const { return true; }
 };
 
 #endif  // __SD_MODEL_DIFFUSION_MODEL_HPP__

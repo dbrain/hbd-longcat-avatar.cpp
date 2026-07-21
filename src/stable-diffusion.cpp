@@ -1121,11 +1121,27 @@ public:
                                                                      model_manager,
                                                                      sd_ctx_params->model_args);
             } else if (sd_version_is_ltxav(version)) {
-                cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
-                                                                   tensor_storage_map,
-                                                                   "text_encoders.llm",
-                                                                   "text_embedding_projection",
-                                                                   model_manager);
+                const bool ltxv_t5_caption =
+                    tensor_storage_map.find("model.diffusion_model.caption_projection.linear_1.weight") != tensor_storage_map.end() &&
+                    tensor_storage_map.find("text_embedding_projection.linear_1.weight") == tensor_storage_map.end() &&
+                    tensor_storage_map.find("text_encoders.llm.model.embed_tokens.weight") == tensor_storage_map.end();
+                if (ltxv_t5_caption) {
+                    LOG_INFO("LTX-Video 0.9.x checkpoint detected; using T5-XXL text encoder");
+                    auto ltx_t5 = std::make_shared<T5CLIPEmbedder>(backend_for(SDBackendModule::TE),
+                                                                    tensor_storage_map,
+                                                                    /*use_mask=*/false,
+                                                                    /*mask_pad=*/0,
+                                                                    /*is_umt5=*/false,
+                                                                    model_manager);
+                    ltx_t5->trim_to_valid = true;
+                    cond_stage_model      = ltx_t5;
+                } else {
+                    cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
+                                                                       tensor_storage_map,
+                                                                       "text_encoders.llm",
+                                                                       "text_embedding_projection",
+                                                                       model_manager);
+                }
                 diffusion_model  = std::make_shared<LTXV::LTXAVRunner>(backend_for(SDBackendModule::DIFFUSION),
                                                                       tensor_storage_map,
                                                                       "model.diffusion_model",
@@ -5783,17 +5799,22 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version)) {
-        latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
-        const char* drive_audio_path = sd_vid_gen_params->drive_audio_path;
-        if (drive_audio_path != nullptr && drive_audio_path[0] != '\0') {
-            latents.audio_latent = encode_ltxav_drive_audio(sd_ctx, drive_audio_path, latents.audio_length);
-            if (latents.audio_latent.empty()) {
-                LOG_ERROR("LTX drive audio was requested but could not be encoded");
-                return std::nullopt;
+        const bool has_audio = sd_ctx->sd->diffusion_model == nullptr || sd_ctx->sd->diffusion_model->has_audio_stream();
+        if (has_audio) {
+            latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
+            const char* drive_audio_path = sd_vid_gen_params->drive_audio_path;
+            if (drive_audio_path != nullptr && drive_audio_path[0] != '\0') {
+                latents.audio_latent = encode_ltxav_drive_audio(sd_ctx, drive_audio_path, latents.audio_length);
+                if (latents.audio_latent.empty()) {
+                    LOG_ERROR("LTX drive audio was requested but could not be encoded");
+                    return std::nullopt;
+                }
+                latents.audio_fixed = true;
+            } else {
+                latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
             }
-            latents.audio_fixed = true;
         } else {
-            latents.audio_latent = make_ltxav_empty_audio_latent(latents.audio_length);
+            latents.audio_length = 0;
         }
     }
 
