@@ -1256,6 +1256,15 @@ re-rendering its completed prefix. Set `resume_job_id` to the prior response's s
 The request's segment list must include the complete prefix plus new tail because the
 server reconstructs the stitched media from the durable banks.
 
+### LongCat Avatar compatibility endpoint
+
+`POST /generate` preserves the deployed LongCat Avatar wire contract: JSON fields
+`image` and `audio` contain base64 image and WAV bytes, and the successful response
+is a `video/webm` body. It accepts the normal sampling fields, `segment_frames` as
+an alias for `video_frames`, and an optional `bsa` object (`enable`, `radius`,
+`self_frame`, `bookend`, `cube_h`, `cube_w`). The route is synchronous and rejects
+concurrent renders with `429`; `GET /health` reports its busy/draining/load state.
+
 ### Completion Result
 
 Example completed job:

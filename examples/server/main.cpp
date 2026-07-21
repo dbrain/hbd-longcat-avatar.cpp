@@ -159,6 +159,7 @@ int main(int argc, const char** argv) {
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
     register_ltx_video_endpoints(svr, runtime);
+    register_longcat_avatar_endpoints(svr, runtime);
     register_wan_video_endpoints(svr, runtime);
     register_gpu_sharing_endpoints(svr, runtime);
 
