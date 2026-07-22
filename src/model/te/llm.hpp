@@ -1286,16 +1286,10 @@ namespace LLM {
                 intermediate_outputs.push_back(x);
             }
 
-            // Some image conditioners consume selected intermediate states rather
-            // than the final normalized state.  In that case, blocks after the
-            // deepest requested state cannot affect the returned tensor.  Besides
-            // avoiding needless compute, this keeps their weights out of the
-            // lazily-prepared CUDA set (Flux2-Klein requests 9, 18, and 27).
-            // Do not take this shortcut for the all-hidden-state path, or when a
-            // caller explicitly asks for the final normalized output (N + 1).
+            // Selected intermediate states do not depend on later layers.  Flux2
+            // consumes 9, 18, and 27, so avoid running the unused tail.
             int stop_layers = static_cast<int>(num_layers);
-            if (!return_all_hidden_states && !out_layers.empty() &&
-                out_layers.find(static_cast<int>(num_layers + 1)) == out_layers.end()) {
+            if (!return_all_hidden_states && !out_layers.empty()) {
                 const int max_out = *out_layers.rbegin();
                 if (max_out > 0 && max_out <= static_cast<int>(num_layers)) {
                     stop_layers = max_out;

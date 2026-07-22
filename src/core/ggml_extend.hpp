@@ -3461,7 +3461,9 @@ public:
 };
 
 __STATIC_INLINE__ bool support_get_rows(ggml_type wtype) {
-    std::set<ggml_type> allow_types = {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0};
+    // The CUDA get_rows kernel supports Q4_K.  Keeping the Qwen token embedding
+    // quantized avoids expanding the 151936x4096 table to F32 at load time.
+    std::set<ggml_type> allow_types = {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K};
     if (allow_types.find(wtype) != allow_types.end()) {
         return true;
     }
