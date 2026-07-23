@@ -1893,6 +1893,28 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("upscale_repeats", upscale_repeats);
     load_if_exists("seed", seed);
 
+    // Top-level sampling convenience keys (the koblem / API wire shape). The nested
+    // "sample_params" object below (parsed later, so it still wins) also sets these;
+    // these mirror the common knobs so a FLAT request body works too. Notably the
+    // relip/lipdub chain sends NO sample_params and carries only a top-level
+    // "sampling_method" -> without this the relip base pass silently fell back to the
+    // server default sampler. sample_method/scheduler are enums parsed by name.
+    load_if_exists("steps", sample_params.sample_steps);
+    load_if_exists("cfg_scale", sample_params.guidance.txt_cfg);
+    load_if_exists("guidance", sample_params.guidance.distilled_guidance);
+    if (j.contains("sampling_method") && j["sampling_method"].is_string()) {
+        enum sample_method_t m = str_to_sample_method(j["sampling_method"].get<std::string>().c_str());
+        if (m != SAMPLE_METHOD_COUNT) {
+            sample_params.sample_method = m;
+        }
+    }
+    if (j.contains("scheduler") && j["scheduler"].is_string()) {
+        enum scheduler_t s = str_to_scheduler(j["scheduler"].get<std::string>().c_str());
+        if (s != SCHEDULER_COUNT) {
+            sample_params.scheduler = s;
+        }
+    }
+
     load_if_exists("strength", strength);
     load_if_exists("control_strength", control_strength);
     load_if_exists("moe_boundary", moe_boundary);
