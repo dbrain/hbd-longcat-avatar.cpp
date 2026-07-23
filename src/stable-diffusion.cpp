@@ -7500,6 +7500,18 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
     }
 
+    // All VAE input-encoding (init/keyframe/ref/relip/v2v via encode_first_stage in
+    // prepare_video_generation_latents) is done. Release the video-VAE compute buffer
+    // now, BEFORE the gemma3 text encoder allocates its own ~819 MiB compute buffer in
+    // prepare_video_generation_embeds — otherwise on i2v the two stack and gemma3 OOMs
+    // (cudaMalloc "failed to allocate the compute buffer"). The VAE compute buffer
+    // re-allocates lazily at the output decode, so this is free. Mirrors the per-branch
+    // free prod does in the relip/v2v paths, hoisted to the one seam that covers every
+    // encode sub-path.
+    if (sd_ctx->sd->first_stage_model) {
+        sd_ctx->sd->first_stage_model->free_compute_buffer();
+    }
+
     ImageGenerationEmbeds embeds = prepare_video_generation_embeds(sd_ctx,
                                                                    sd_vid_gen_params,
                                                                    request,
@@ -8567,6 +8579,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     };
     auto fail = [&]() {
         release_stitched();
+        // Reclaim GPU memory on a failed/aborted job too, so a persistent worker
+        // does not carry this job's committed pool into the next request.
+        sd_ctx->sd->reclaim_ltx_chain_window_gpu_memory();
         return false;
     };
     auto append_audio = [&](const sd_audio_t* audio, int drop_frames, int kept_frames) {
@@ -9101,6 +9116,13 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     LOG_INFO("generate_video_chain: stitched %d LTX windows -> %d frames",
              chain_params->n_segments,
              *num_frames_out);
+    // Reclaim this job's GPU working set at job end. The between-window reclaim
+    // above skips the FINAL window, so without this the last window's committed
+    // VMM pool high-water + cuDNN conv3d reorder cache survive into the NEXT job
+    // on this persistent worker — starving the next job's text-encoder graph-cut
+    // cudaMalloc (a fresh alloc outside the pool) and OOMing it. Uses the same
+    // upstream-native trim the between-window path already uses.
+    sd_ctx->sd->reclaim_ltx_chain_window_gpu_memory();
     return true;
 }
 
