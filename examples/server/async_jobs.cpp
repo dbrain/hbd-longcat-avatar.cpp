@@ -3,6 +3,7 @@
 #include "async_jobs.h"
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -60,6 +61,7 @@ struct SegmentPreviewWriter {
     std::mutex mutex;
     std::condition_variable cv;
     int segment = -1;
+    int stage = 4;
     std::vector<sd_image_t> frames;
     bool pending = false;
     bool busy = false;
@@ -70,12 +72,14 @@ struct SegmentPreviewWriter {
         thread = std::thread([this] {
             for (;;) {
                 int queued_segment = -1;
+                int queued_stage = 4;
                 std::vector<sd_image_t> queued_frames;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     cv.wait(lock, [&] { return stop || pending; });
                     if (!pending && stop) break;
                     queued_segment = segment;
+                    queued_stage = stage;
                     queued_frames = std::move(frames);
                     pending = false;
                     busy = true;
@@ -83,8 +87,11 @@ struct SegmentPreviewWriter {
                 const auto bytes = create_video_from_sd_images_to_vector(
                     "webm", queued_frames.data(), static_cast<int>(queued_frames.size()), fps, quality, nullptr);
                 if (!bytes.empty()) {
-                    const fs::path final_path = fs::path(directory) /
-                                                ("seg_" + std::to_string(queued_segment) + ".webm");
+                    const std::string name = queued_stage == 4
+                                                 ? "seg_" + std::to_string(queued_segment) + ".webm"
+                                                 : "seg_" + std::to_string(queued_segment) + "_stage" +
+                                                       std::to_string(queued_stage) + ".webm";
+                    const fs::path final_path = fs::path(directory) / name;
                     const fs::path temp_path = final_path.string() + ".tmp";
                     std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
                     output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -104,7 +111,7 @@ struct SegmentPreviewWriter {
         });
     }
 
-    void enqueue(int index, const sd_image_t* source, int count) {
+    void enqueue(int index, int preview_stage, const sd_image_t* source, int count) {
         std::unique_lock<std::mutex> lock(mutex);
         cv.wait(lock, [&] { return stop || (!pending && !busy); });
         if (stop) return;
@@ -122,6 +129,7 @@ struct SegmentPreviewWriter {
             copies.push_back(copy);
         }
         segment = index;
+        stage = preview_stage;
         frames = std::move(copies);
         pending = true;
         lock.unlock();
@@ -140,7 +148,12 @@ struct SegmentPreviewWriter {
 };
 
 void write_segment_preview(int segment, const sd_image_t* frames, int count, void* user) {
-    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, frames, count);
+    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, 4, frames, count);
+}
+
+void write_ltx_stage_preview(int segment, int stage, int, int,
+                             const sd_image_t* frames, int count, void* user) {
+    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, stage, frames, count);
 }
 
 }  // namespace
@@ -299,7 +312,7 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
     // Koblem polls this optional list and fetches the URLs best-effort.  The
     // files are atomically published by SegmentPreviewWriter, so a listed
     // segment is always a complete, playable WebM rather than a partial write.
-    if (job.ltx_emit_segments && !job.ltx_bank_dir.empty() &&
+    if ((job.ltx_emit_segments || job.ltx_emit_stages) && !job.ltx_bank_dir.empty() &&
         (job.status == AsyncJobStatus::Generating || job.status == AsyncJobStatus::Completed)) {
         json partials = json::array();
         for (size_t segment = 0; segment < job.ltx_prompts.size(); ++segment) {
@@ -311,6 +324,22 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                     {"stage", 4},
                     {"url", "/sdcpp/v1/jobs/" + job.id + "/segments/" + std::to_string(segment)},
                 });
+            }
+            if (job.ltx_emit_stages) {
+                for (int stage = 1; stage <= 3; ++stage) {
+                    error.clear();
+                    const fs::path stage_path = fs::path(job.ltx_bank_dir) /
+                                                ("seg_" + std::to_string(segment) + "_stage" +
+                                                 std::to_string(stage) + ".webm");
+                    if (fs::is_regular_file(stage_path, error)) {
+                        partials.push_back({
+                            {"segment_index", static_cast<int>(segment)},
+                            {"stage", stage},
+                            {"url", "/sdcpp/v1/jobs/" + job.id + "/segments/" +
+                                        std::to_string(segment) + "?stage=" + std::to_string(stage)},
+                        });
+                    }
+                }
             }
         }
         if (!partials.empty()) result["partials"] = std::move(partials);
@@ -395,6 +424,22 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          int& output_fps,
                          std::string& error_message) {
     sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
+    std::vector<sd_hires_params_t> ltx_hires_chain;
+    if (!job.ltx_hires_stages.empty()) {
+        ltx_hires_chain.reserve(job.ltx_hires_stages.size());
+        for (size_t index = 0; index < job.ltx_hires_stages.size(); ++index) {
+            sd_hires_params_t stage = job.ltx_hires_stages[index].to_sd_vid_gen_params_t().hires;
+            stage.sample_method = index < job.ltx_hires_stage_methods.size()
+                                      ? job.ltx_hires_stage_methods[index]
+                                      : SAMPLE_METHOD_COUNT;
+            stage.cfg = index < job.ltx_hires_stage_cfgs.size()
+                            ? job.ltx_hires_stage_cfgs[index]
+                            : NAN;
+            ltx_hires_chain.push_back(stage);
+        }
+        params.hires_chain = ltx_hires_chain.data();
+        params.hires_chain_count = static_cast<int>(ltx_hires_chain.size());
+    }
 
     SDImageVec results;
     int num_results             = 0;
@@ -402,6 +447,11 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
 
     std::vector<SDImageOwner> ltx_scene_image_owners;
     std::vector<const sd_image_t*> ltx_scene_images;
+    std::vector<std::vector<SDImageOwner>> ltx_keyframe_image_owners;
+    std::vector<std::vector<sd_image_t>> ltx_keyframe_images;
+    std::vector<sd_image_t*> ltx_keyframe_image_windows;
+    std::vector<const int*> ltx_keyframe_indices;
+    std::vector<int> ltx_keyframe_counts;
     std::vector<std::vector<SDImageOwner>> ltx_v2v_image_owners;
     std::vector<std::vector<sd_image_t>> ltx_v2v_images;
     std::vector<sd_image_t*> ltx_v2v_image_windows;
@@ -410,6 +460,11 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     if (!job.ltx_prompts.empty()) {
         ltx_scene_image_owners.resize(job.ltx_prompts.size());
         ltx_scene_images.resize(job.ltx_prompts.size(), nullptr);
+        ltx_keyframe_image_owners.resize(job.ltx_prompts.size());
+        ltx_keyframe_images.resize(job.ltx_prompts.size());
+        ltx_keyframe_image_windows.resize(job.ltx_prompts.size(), nullptr);
+        ltx_keyframe_indices.resize(job.ltx_prompts.size(), nullptr);
+        ltx_keyframe_counts.resize(job.ltx_prompts.size(), 0);
         for (size_t segment = 1; segment < job.ltx_segment_init_images.size(); ++segment) {
             const std::string& encoded = job.ltx_segment_init_images[segment];
             if (encoded.empty()) {
@@ -424,6 +479,30 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                 return false;
             }
             ltx_scene_images[segment] = &ltx_scene_image_owners[segment].get();
+        }
+        for (size_t segment = 0; segment < job.ltx_segment_keyframes.size(); ++segment) {
+            const auto& encoded_keyframes = job.ltx_segment_keyframes[segment];
+            if (encoded_keyframes.empty()) continue;
+            if (segment >= job.ltx_segment_keyframe_indices.size() ||
+                encoded_keyframes.size() != job.ltx_segment_keyframe_indices[segment].size()) {
+                error_message = "invalid LTX keyframe job state for segment " + std::to_string(segment + 1);
+                return false;
+            }
+            auto& owners = ltx_keyframe_image_owners[segment];
+            auto& images = ltx_keyframe_images[segment];
+            owners.resize(encoded_keyframes.size());
+            images.reserve(encoded_keyframes.size());
+            for (size_t keyframe = 0; keyframe < encoded_keyframes.size(); ++keyframe) {
+                if (!decode_base64_image(encoded_keyframes[keyframe], 3, params.width, params.height, owners[keyframe])) {
+                    error_message = "failed to decode LTX keyframe " + std::to_string(keyframe + 1) +
+                                    " for segment " + std::to_string(segment + 1);
+                    return false;
+                }
+                images.push_back(owners[keyframe].get());
+            }
+            ltx_keyframe_image_windows[segment] = images.data();
+            ltx_keyframe_indices[segment] = job.ltx_segment_keyframe_indices[segment].data();
+            ltx_keyframe_counts[segment] = static_cast<int>(images.size());
         }
         ltx_v2v_image_owners.resize(job.ltx_prompts.size());
         ltx_v2v_images.resize(job.ltx_prompts.size());
@@ -456,7 +535,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     }
 
     SegmentPreviewWriter segment_writer;
-    const bool write_segment_previews = !job.ltx_prompts.empty() && job.ltx_emit_segments &&
+    const bool write_segment_previews = !job.ltx_prompts.empty() && (job.ltx_emit_segments || job.ltx_emit_stages) &&
                                         !job.ltx_bank_dir.empty();
     if (write_segment_previews) {
         segment_writer.directory = job.ltx_bank_dir;
@@ -481,6 +560,9 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.segment_video_frames = job.ltx_segment_frames.empty() ? nullptr : job.ltx_segment_frames.data();
             chain.segment_scene_cuts = job.ltx_segment_scene_cuts.empty() ? nullptr : job.ltx_segment_scene_cuts.data();
             chain.segment_init_images = ltx_scene_images.empty() ? nullptr : ltx_scene_images.data();
+            chain.segment_keyframes = ltx_keyframe_image_windows.empty() ? nullptr : ltx_keyframe_image_windows.data();
+            chain.segment_keyframe_indices = ltx_keyframe_indices.empty() ? nullptr : ltx_keyframe_indices.data();
+            chain.segment_keyframe_counts = ltx_keyframe_counts.empty() ? nullptr : ltx_keyframe_counts.data();
             chain.segment_control_frames = ltx_v2v_image_windows.empty() ? nullptr : ltx_v2v_image_windows.data();
             chain.segment_control_frame_counts = ltx_v2v_frame_counts.empty() ? nullptr : ltx_v2v_frame_counts.data();
             chain.segment_v2v_modes = job.ltx_segment_v2v_modes.empty() ? nullptr : job.ltx_segment_v2v_modes.data();
@@ -524,6 +606,9 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.before_segment_user = job.ltx_segment_models.empty() ? nullptr : &model_lease;
             chain.on_segment = write_segment_previews ? write_segment_preview : nullptr;
             chain.on_segment_user = write_segment_previews ? &segment_writer : nullptr;
+            params.emit_stages = job.ltx_emit_stages ? 1 : 0;
+            params.on_stage = job.ltx_emit_stages ? write_ltx_stage_preview : nullptr;
+            params.on_stage_user = job.ltx_emit_stages ? &segment_writer : nullptr;
             generated = generate_video_chain(runtime.sd_ctx,
                                               &params,
                                               &chain,

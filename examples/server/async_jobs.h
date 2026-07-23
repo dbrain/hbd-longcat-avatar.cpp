@@ -53,10 +53,19 @@ struct AsyncGenerationJob {
     std::vector<int> ltx_segment_frames;
     std::vector<int> ltx_segment_scene_cuts;
     std::vector<std::string> ltx_segment_init_images;
+    std::vector<std::vector<std::string>> ltx_segment_keyframes;
+    std::vector<std::vector<int>> ltx_segment_keyframe_indices;
     std::vector<std::vector<std::string>> ltx_segment_control_frames;
     std::vector<int> ltx_segment_v2v_modes;
     std::vector<float> ltx_segment_v2v_strengths;
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;
+    // Owned stage parameter views for the optional LTX hires chain.  The
+    // generation objects retain model-path and sigma backing storage until the
+    // worker has completed the request.
+    std::vector<SDGenerationParams> ltx_hires_stages;
+    std::vector<sample_method_t> ltx_hires_stage_methods;
+    std::vector<float> ltx_hires_stage_cfgs;
+    bool ltx_emit_stages = false;
     std::string ltx_bank_dir;
     std::string ltx_bank_id;
     // Durable full-timeline WAV inputs staged alongside the LTX latent bank.

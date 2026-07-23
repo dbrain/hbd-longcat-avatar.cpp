@@ -354,6 +354,10 @@ typedef struct {
     int upscale_tile_size;
     float* custom_sigmas;
     int custom_sigmas_count;
+    // Refine stages may use a sampler and CFG distinct from the base pass.
+    // SAMPLE_METHOD_COUNT and NAN retain the legacy inherited values.
+    enum sample_method_t sample_method;
+    float cfg;
 } sd_hires_params_t;
 
 typedef struct {
@@ -393,6 +397,12 @@ typedef struct {
     int clip_skip;
     sd_image_t init_image;
     sd_image_t end_image;
+    // LTXAV frame-pinned image guides. Each image is frozen at the matching
+    // pixel-frame index on the generated timeline. A zero count preserves the
+    // ordinary t2v/i2v/continuation paths.
+    sd_image_t* keyframes;
+    int* keyframe_frame_indices;
+    int keyframes_size;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;
@@ -466,6 +476,17 @@ typedef struct {
     sd_tiling_params_t vae_tiling_params;
     sd_cache_params_t cache;
     sd_hires_params_t hires;
+    // LTX supports an ordered sequence of latent-upscale + SDEdit refine
+    // stages. A null/empty chain preserves the legacy single `hires` pass.
+    const sd_hires_params_t* hires_chain;
+    int hires_chain_count;
+    // Optional previews emitted after each non-final upscale stage. Frame
+    // storage is borrowed for the duration of the callback only.
+    int emit_stages;
+    void (*on_stage)(int seg_index, int stage_scale, int width, int height,
+                     const sd_image_t* frames, int frame_count, void* user);
+    void* on_stage_user;
+    int stage_seg_index;
     bool circular_x;
     bool circular_y;
 } sd_vid_gen_params_t;
@@ -484,6 +505,11 @@ typedef struct {
     // a continuation tail; an image entry pins its opening frame and also starts fresh.
     const int* segment_scene_cuts;
     const sd_image_t* const* segment_init_images;
+    // Optional per-window LTXAV frame-pinned image guides. Each segment owns
+    // `segment_keyframe_counts[i]` images and matching pixel-frame indices.
+    sd_image_t* const* segment_keyframes;
+    const int* const* segment_keyframe_indices;
+    const int* segment_keyframe_counts;
     // Optional per-window V2V sources. Modes 1 and 2 replace the window's
     // starting video latent; they are fresh scenes rather than continuations.
     sd_image_t* const* segment_control_frames;

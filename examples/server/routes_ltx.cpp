@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -244,6 +245,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<int> segment_frames;
             std::vector<int> segment_scene_cuts;
             std::vector<std::string> segment_init_images;
+            std::vector<std::vector<std::string>> segment_keyframes;
+            std::vector<std::vector<int>> segment_keyframe_indices;
             std::vector<std::vector<std::string>> segment_control_frames;
             std::vector<int> segment_v2v_modes;
             std::vector<float> segment_v2v_strengths;
@@ -256,6 +259,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
+                        segment_keyframes.emplace_back();
+                        segment_keyframe_indices.emplace_back();
                         segment_control_frames.emplace_back();
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
@@ -277,6 +282,28 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(frames);
                         segment_scene_cuts.push_back(segment.value("scene_cut", false) ? 1 : 0);
                         segment_init_images.push_back(segment.value("init_image", std::string()));
+                        std::vector<std::string> keyframes;
+                        std::vector<int> keyframe_indices;
+                        if (segment.contains("keyframes")) {
+                            if (!segment["keyframes"].is_array() || segment["keyframes"].empty()) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"LTX keyframes must be a non-empty array of {image, frame}"})", "application/json");
+                                return;
+                            }
+                            for (const auto& keyframe : segment["keyframes"]) {
+                                if (!keyframe.is_object() || !keyframe.contains("image") ||
+                                    !keyframe["image"].is_string() || keyframe["image"].get<std::string>().empty() ||
+                                    !keyframe.contains("frame") || !keyframe["frame"].is_number_integer()) {
+                                    res.status = 400;
+                                    res.set_content(R"({"error":"each LTX keyframe needs a non-empty image and integer frame"})", "application/json");
+                                    return;
+                                }
+                                keyframes.push_back(keyframe["image"].get<std::string>());
+                                keyframe_indices.push_back(keyframe["frame"].get<int>());
+                            }
+                        }
+                        segment_keyframes.push_back(std::move(keyframes));
+                        segment_keyframe_indices.push_back(std::move(keyframe_indices));
                         const int v2v_mode = segment.value("v2v_mode", 0);
                         if (v2v_mode != 0 && v2v_mode != 1 && v2v_mode != 2) {
                             res.status = 400;
@@ -367,6 +394,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
+                        segment_keyframes.emplace_back();
+                        segment_keyframe_indices.emplace_back();
                         segment_control_frames.emplace_back();
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
@@ -419,6 +448,63 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", error_message}}).dump(), "application/json");
                 return;
             }
+            std::vector<SDGenerationParams> hires_stages;
+            std::vector<sample_method_t> hires_stage_methods;
+            std::vector<float> hires_stage_cfgs;
+            if (body.contains("hires_chain")) {
+                if (!body["hires_chain"].is_array() || body["hires_chain"].empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"hires_chain must be a non-empty array"})", "application/json");
+                    return;
+                }
+                for (const auto& stage : body["hires_chain"]) {
+                    if (!stage.is_object()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"each hires_chain stage must be an object"})", "application/json");
+                        return;
+                    }
+                    json stage_body = body;
+                    json stage_hires = stage;
+                    stage_hires["enabled"] = true;
+                    stage_body["hires"] = std::move(stage_hires);
+                    stage_body.erase("hires_chain");
+                    SDGenerationParams parsed = request.gen_params;
+                    if (!parsed.from_json_str(stage_body.dump(), [&](const std::string& path) {
+                            return get_lora_full_path(*runtime, path);
+                        }) ||
+                        !parsed.resolve_and_validate(VID_GEN, "", runtime->ctx_params->hires_upscalers_dir, true)) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"invalid hires_chain stage"})", "application/json");
+                        return;
+                    }
+                    sample_method_t method = SAMPLE_METHOD_COUNT;
+                    if (stage.contains("sample_method")) {
+                        if (!stage["sample_method"].is_string()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"hires_chain sample_method must be a string"})", "application/json");
+                            return;
+                        }
+                        method = str_to_sample_method(stage["sample_method"].get<std::string>().c_str());
+                        if (method == SAMPLE_METHOD_COUNT) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"invalid hires_chain sample_method"})", "application/json");
+                            return;
+                        }
+                    }
+                    float cfg = NAN;
+                    if (stage.contains("cfg")) {
+                        if (!stage["cfg"].is_number()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"hires_chain cfg must be numeric"})", "application/json");
+                            return;
+                        }
+                        cfg = stage["cfg"].get<float>();
+                    }
+                    hires_stages.push_back(std::move(parsed));
+                    hires_stage_methods.push_back(method);
+                    hires_stage_cfgs.push_back(cfg);
+                }
+            }
             const std::string default_model = body.value("model", std::string("base"));
             const auto variants = runtime_diffusion_model_variants(*runtime);
             if (variants.find(default_model) == variants.end()) {
@@ -446,6 +532,18 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
             }
+            for (size_t segment = 0; segment < segment_keyframe_indices.size(); ++segment) {
+                const int frames = segment_frames[segment] > 0 ? segment_frames[segment] : request.gen_params.video_frames;
+                for (const int frame : segment_keyframe_indices[segment]) {
+                    if (frame < 0 || frame >= frames) {
+                        res.status = 400;
+                        res.set_content(json({{"error", "LTX keyframe frame must be within segment " +
+                                                         std::to_string(segment + 1) + " output frames"}}).dump(),
+                                        "application/json");
+                        return;
+                    }
+                }
+            }
             const int continuation_frames = body.value("cont_latent_frames", 3);
             if (continuation_frames < 1) {
                 res.status = 400;
@@ -459,12 +557,18 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->status = AsyncJobStatus::Queued;
             job->created_at = unix_timestamp_now();
             job->vid_gen = std::move(request);
+            job->ltx_hires_stages = std::move(hires_stages);
+            job->ltx_hires_stage_methods = std::move(hires_stage_methods);
+            job->ltx_hires_stage_cfgs = std::move(hires_stage_cfgs);
+            job->ltx_emit_stages = body.value("emit_stages", false);
             job->ltx_prompts = std::move(prompts);
             job->ltx_segment_models = std::move(segment_models);
             job->ltx_default_model = default_model;
             job->ltx_segment_frames = std::move(segment_frames);
             job->ltx_segment_scene_cuts = std::move(segment_scene_cuts);
             job->ltx_segment_init_images = std::move(segment_init_images);
+            job->ltx_segment_keyframes = std::move(segment_keyframes);
+            job->ltx_segment_keyframe_indices = std::move(segment_keyframe_indices);
             job->ltx_segment_control_frames = std::move(segment_control_frames);
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
@@ -742,7 +846,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             res.set_content(R"({"error":"unknown LTX job"})", "application/json");
             return;
         }
-        const fs::path artifact = bank_dir / ("seg_" + segment + ".webm");
+        fs::path artifact = bank_dir / ("seg_" + segment + ".webm");
+        const std::string stage = req.get_param_value("stage");
+        if (!stage.empty() && stage != "4" &&
+            stage.find_first_not_of("0123456789") == std::string::npos) {
+            artifact = bank_dir / ("seg_" + segment + "_stage" + stage + ".webm");
+        }
         std::error_code error;
         if (!fs::is_regular_file(artifact, error)) {
             res.status = 404;

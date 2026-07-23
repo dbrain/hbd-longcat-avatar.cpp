@@ -1930,6 +1930,12 @@ bool SDGenerationParams::from_json_str(
         if (hires_json.contains("custom_sigmas") && hires_json["custom_sigmas"].is_array()) {
             hires_custom_sigmas = hires_json["custom_sigmas"].get<std::vector<float>>();
         }
+        if (hires_json.contains("sample_method") && hires_json["sample_method"].is_string()) {
+            hires_sample_method = hires_json["sample_method"];
+        }
+        if (hires_json.contains("cfg") && hires_json["cfg"].is_number()) {
+            hires_cfg = hires_json["cfg"];
+        }
         if (hires_json.contains("upscale_tile_size") && hires_json["upscale_tile_size"].is_number_integer()) {
             hires_upscale_tile_size = hires_json["upscale_tile_size"];
         }
@@ -2530,6 +2536,8 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    params.hires.sample_method       = hires_sample_method.empty() ? SAMPLE_METHOD_COUNT : str_to_sample_method(hires_sample_method.c_str());
+    params.hires.cfg                 = hires_cfg;
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
     return params;
@@ -2599,6 +2607,8 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.hires.upscale_tile_size   = hires_upscale_tile_size;
     params.hires.custom_sigmas       = hires_custom_sigmas.empty() ? nullptr : hires_custom_sigmas.data();
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
+    params.hires.sample_method       = hires_sample_method.empty() ? SAMPLE_METHOD_COUNT : str_to_sample_method(hires_sample_method.c_str());
+    params.hires.cfg                 = hires_cfg;
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
     return params;
