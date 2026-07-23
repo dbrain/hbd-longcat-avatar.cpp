@@ -585,7 +585,13 @@ namespace WAN {
                 auto before_proj = std::dynamic_pointer_cast<Linear>(blocks["before_proj"]);
 
                 c = before_proj->forward(ctx, c);
-                c = ggml_add(ctx->ggml_ctx, c, x);
+                // The VACE control stream may be F16 while its one-time main
+                // residual input is F16 too.  Keep this add in F32: ggml's
+                // F32 broadcast path requires an F32 rhs, and this transient
+                // is much smaller-lived than retaining the whole VACE stream
+                // in F32.
+                ggml_tensor* x_add = x->type == GGML_TYPE_F16 ? ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F32) : x;
+                c                 = ggml_add(ctx->ggml_ctx, c, x_add);
             }
 
             auto after_proj = std::dynamic_pointer_cast<Linear>(blocks["after_proj"]);
@@ -851,8 +857,13 @@ namespace WAN {
             // x_orig (src1) → the <float,float,float> binbcast branch on an F16 src1 =
             // the binbcast.cu:261 stride assert. The prod i2v/t2v path has vace_layers==0,
             // so this just scopes F16 to the supported (and target) path.
-            static const bool wan_dit_f16 = (std::getenv("WAN_DIT_F16") != nullptr);
-            const bool use_dit_f16        = wan_dit_f16 && config.vace_layers == 0;
+            static const bool wan_dit_f16      = std::getenv("WAN_DIT_F16") != nullptr;
+            static const bool wan_vace_dit_f16 = std::getenv("WAN_VACE_DIT_F16") != nullptr;
+            // Keep the upstream default unchanged for VACE.  This opt-in
+            // candidate extends the existing F16 residual policy to VACE only
+            // after its control stream is made type-safe below.
+            const bool use_dit_f16 = wan_dit_f16 &&
+                                     (config.vace_layers == 0 || wan_vace_dit_f16);
             if (use_dit_f16 && x->type == GGML_TYPE_F32) {
                 x = ggml_cast(ctx->ggml_ctx, x, GGML_TYPE_F16);
             }
@@ -892,8 +903,25 @@ namespace WAN {
                 vace_t_len = c->ne[2];
                 c = ggml_reshape_3d(ctx->ggml_ctx, c, c->ne[0] * c->ne[1] * c->ne[2], c->ne[3] / N, N);  // [N, dim, t_len*h_len*w_len]
                 c = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, c, 1, 0, 2, 3));  // [N, t_len*h_len*w_len, dim]
+                if (use_dit_f16 && c->type == GGML_TYPE_F32) {
+                    c = ggml_cast(ctx->ggml_ctx, c, GGML_TYPE_F16);
+                }
             }
-            sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            // These graph-cut topology switches do not change DiT arithmetic.
+            // They allow the VACE path to release the main-attention working
+            // set before control attention, and to recompute prelude x instead
+            // of retaining it across every VACE block.
+            const bool vace_split = [] {
+                const char* value = std::getenv("WAN_VACE_SPLIT");
+                return value != nullptr && value[0] == '1';
+            }();
+            const bool vace_xorig_recompute = [] {
+                const char* value = std::getenv("WAN_VACE_XORIG_RECOMPUTE");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (!vace_xorig_recompute) {
+                sd::ggml_graph_cut::mark_graph_cut(x, "wan.prelude", "x");
+            }
             // sd::ggml_graph_cut::mark_graph_cut(e, "wan.prelude", "e");
             // sd::ggml_graph_cut::mark_graph_cut(e0, "wan.prelude", "e0");
             // sd::ggml_graph_cut::mark_graph_cut(context, "wan.prelude", "context");
@@ -954,6 +982,13 @@ namespace WAN {
 
                 auto iter = config.vace_layers_mapping.find(i);
                 if (iter != config.vace_layers_mapping.end()) {
+                    // Finish the main block before allocating the matching
+                    // VACE block's attention workspace.  This is a pure
+                    // graph-cut boundary: arithmetic and dependency order do
+                    // not change.
+                    if (vace_split && c != nullptr) {
+                        sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i) + ".main", "x");
+                    }
                     int n = iter->second;
 
                     auto vace_block = std::dynamic_pointer_cast<VaceWanAttentionBlock>(blocks["vace_blocks." + std::to_string(n)]);
@@ -961,7 +996,15 @@ namespace WAN {
                     auto result = vace_block->forward(ctx, c, x_orig, e0, pe, context, context_img_len);
                     auto c_skip = result.first;
                     c           = result.second;
-                    if (std::find(vace_skip.begin(), vace_skip.end(), n) == vace_skip.end()) {
+                    // `c` is persistent between VACE injections.  Do not rename
+                    // that same producer at each intervening main block: graph
+                    // cuts are keyed by this name, and doing so pulls the VACE
+                    // control graph through four main blocks into one oversized
+                    // segment.  A fresh cut belongs exactly where VACE creates
+                    // its next control state.
+                    sd::ggml_graph_cut::mark_graph_cut(c, "wan.blocks." + std::to_string(i), "c");
+                    const bool skip_vace_inject = std::find(vace_skip.begin(), vace_skip.end(), n) != vace_skip.end();
+                    if (!skip_vace_inject) {
                         if (vace_ramp != nullptr) {
                             if (!ggml_is_contiguous(c_skip)) {
                                 c_skip = ggml_cont(ctx->ggml_ctx, c_skip);
@@ -976,12 +1019,17 @@ namespace WAN {
                             c_skip = ggml_ext_scale(ctx->ggml_ctx, c_skip, vace_strength);
                         }
                         x = ggml_add(ctx->ggml_ctx, x, c_skip);
+                    } else {
+                        // A skipped injection leaves `x` as the exact tensor
+                        // already named "*.main" above.  Materialize an exact
+                        // contiguous identity for the post-control boundary so
+                        // the final marker cannot rename that main boundary
+                        // back into the VACE group (the production chain skips
+                        // VACE block 0).
+                        x = ggml_cont(ctx->ggml_ctx, x);
                     }
                 }
                 sd::ggml_graph_cut::mark_graph_cut(x, "wan.blocks." + std::to_string(i), "x");
-                if (c != nullptr) {
-                    sd::ggml_graph_cut::mark_graph_cut(c, "wan.blocks." + std::to_string(i), "c");
-                }
             }
 
             // WAN_DIT_F16: bring the residual stream back to F32 before the head so the
