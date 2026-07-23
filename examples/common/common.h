@@ -240,6 +240,7 @@ struct SDGenerationParams {
     float a2v_guidance                    = 1.f;
     float a2v_ramp_end                    = 1.f;
     int relip_ref_tstride                 = 1;
+    bool lipdub_two_stage                  = false;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
 

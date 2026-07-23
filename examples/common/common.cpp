@@ -1902,6 +1902,7 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("a2v_guidance", a2v_guidance);
     load_if_exists("a2v_ramp_end", a2v_ramp_end);
     load_if_exists("relip_ref_tstride", relip_ref_tstride);
+    load_if_exists("two_stage", lipdub_two_stage);
 
     load_if_exists("auto_resize_ref_image", auto_resize_ref_image);
     load_if_exists("increase_ref_index", increase_ref_index);
@@ -2598,6 +2599,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.a2v_guidance              = a2v_guidance;
     params.a2v_ramp_end              = a2v_ramp_end;
     params.relip_ref_tstride         = relip_ref_tstride;
+    params.lipdub_two_stage           = lipdub_two_stage;
     params.seed                      = seed;
     params.video_frames              = video_frames;
     params.fps                       = fps;

@@ -424,6 +424,7 @@ typedef struct {
     // a second audio-decoupled DiT forward that increases articulation.
     float a2v_guidance;
     float a2v_ramp_end;
+    bool lipdub_two_stage;
     // Guide-edit uses this instead of `strength` when positive. A value of one
     // is a full restyle; lower values preserve more of the source scene.
     float v2v_guide_strength;

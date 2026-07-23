@@ -3815,6 +3815,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->relip_ref_tstride                     = 1;
     sd_vid_gen_params->a2v_guidance                           = 1.f;
     sd_vid_gen_params->a2v_ramp_end                           = 1.f;
+    sd_vid_gen_params->lipdub_two_stage                       = false;
     sd_vid_gen_params->v2v_guide_strength                    = 1.f;
     sd_vid_gen_params->v2v_guide_latent_path                 = nullptr;
     sd_vid_gen_params->keyframes                             = nullptr;
@@ -4532,6 +4533,7 @@ struct ImageGenerationLatents {
     int audio_length                       = 0;
     bool audio_fixed                        = false;
     bool v2v_sdedit                        = false;
+    bool relip_twostage                    = false;
 };
 
 static float ltxv_latent_corner_to_pixel_frame(int64_t corner_index,
@@ -7150,6 +7152,73 @@ static bool apply_ltxv_refine_image_conditioning(sd_ctx_t* sd_ctx,
         latent == nullptr || latent->empty() || denoise_mask == nullptr || video_positions == nullptr) {
         return true;
     }
+    if (latents.relip_twostage) {
+        if (sd_vid_gen_params->control_frames == nullptr || sd_vid_gen_params->control_frames_size <= 0) {
+            LOG_ERROR("LTX LipDub two-stage refine requires VAE encoding and source control_frames");
+            return false;
+        }
+        const int latent_channels = sd_ctx->sd->get_latent_channel();
+        sd::Tensor<float> target_video = *latent;
+        sd::Tensor<float> audio_latent;
+        if (latent->shape()[3] > latent_channels) {
+            target_video = sd::ops::slice(*latent, 3, 0, latent_channels);
+            audio_latent = unpack_ltxav_audio_latent(*latent, latents.audio_length, latent_channels);
+            if (audio_latent.empty()) {
+                LOG_ERROR("LTX LipDub two-stage refine could not unpack audio latent");
+                return false;
+            }
+        }
+        const int image_width = static_cast<int>(target_video.shape()[0]) * request.vae_scale_factor;
+        const int image_height = static_cast<int>(target_video.shape()[1]) * request.vae_scale_factor;
+        sd::Tensor<float> reference_video({image_width, image_height, request.frames, 3, 1});
+        for (int frame = 0; frame < request.frames; ++frame) {
+            const int source = std::min(frame, sd_vid_gen_params->control_frames_size - 1);
+            if (sd_vid_gen_params->control_frames[source].data == nullptr) {
+                LOG_ERROR("LTX LipDub two-stage control frame %d is empty", source);
+                return false;
+            }
+            const auto image = sd_image_to_tensor(sd_vid_gen_params->control_frames[source], image_width, image_height);
+            sd::ops::slice_assign(&reference_video, 2, frame, frame + 1, image.unsqueeze(2));
+        }
+        sd::Tensor<float> reference = sd_ctx->sd->encode_first_stage(reference_video);
+        if (reference.empty() || reference.shape()[3] != target_video.shape()[3]) {
+            LOG_ERROR("LTX LipDub two-stage full-resolution reference encode failed");
+            return false;
+        }
+        const int stride = std::max(1, sd_vid_gen_params->relip_ref_tstride);
+        if (stride > 1 && reference.shape()[2] > 1) {
+            const int64_t source_frames = reference.shape()[2];
+            auto shape = reference.shape();
+            shape[2] = (source_frames + stride - 1) / stride;
+            sd::Tensor<float> subsampled(shape);
+            for (int64_t output = 0, source = 0; source < source_frames; ++output, source += stride) {
+                sd::ops::slice_assign(&subsampled, 2, output, output + 1, sd::ops::slice(reference, 2, source, source + 1));
+            }
+            reference = std::move(subsampled);
+        }
+        ImageGenerationLatents relip_latents;
+        relip_latents.init_latent = target_video;
+        relip_latents.denoise_mask = make_ltxav_video_denoise_mask(target_video, 1.f);
+        relip_latents.video_target_frame_count = target_video.shape()[2];
+        if (!apply_ltxav_video_relip_reference(&relip_latents, reference, request.fps,
+                                                request.vae_scale_factor, stride)) {
+            return false;
+        }
+        *video_positions = std::move(relip_latents.video_positions);
+        if (audio_latent.empty()) {
+            *latent = std::move(relip_latents.init_latent);
+            *denoise_mask = std::move(relip_latents.denoise_mask);
+        } else {
+            *latent = pack_ltxav_audio_and_video_latents(relip_latents.init_latent, audio_latent);
+            *denoise_mask = pack_ltxav_audio_and_video_denoise_mask(relip_latents.denoise_mask,
+                                                                       relip_latents.init_latent,
+                                                                       audio_latent,
+                                                                       latents.audio_fixed ? 0.f : 1.f);
+        }
+        LOG_INFO("LTX LipDub two-stage: re-applied %lld full-resolution reference latent frame(s) for refine",
+                 (long long)reference.shape()[2]);
+        return true;
+    }
     if (sd_vid_gen_params->init_image.data == nullptr &&
         sd_vid_gen_params->end_image.data == nullptr) {
         return true;
@@ -7344,6 +7413,34 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             request.use_uncond = request.hires.cfg > 1.f;
         }
     }
+
+    // LipDub's production recipe is a half-resolution from-noise pass followed
+    // by the learned x2 latent upsampler and a full-resolution reference-aware
+    // refine.  This is deliberately restricted to mode-0 relip; SDEdit and
+    // guide-edit use the ordinary hires path.
+    const bool relip_twostage = sd_vid_gen_params->lipdub_two_stage &&
+                               sd_version_is_ltxav(sd_ctx->sd->version) &&
+                               sd_vid_gen_params->v2v_mode == 0 &&
+                               sd_vid_gen_params->control_frames != nullptr &&
+                               sd_vid_gen_params->control_frames_size > 0;
+    if (relip_twostage) {
+        if (!request.hires.enabled || request.hires.upscaler != SD_HIRES_UPSCALER_MODEL ||
+            strlen(SAFE_STR(request.hires.model_path)) == 0) {
+            LOG_ERROR("LTX LipDub two_stage requires the LTX spatial upsampler");
+            return false;
+        }
+        if (request.width % 64 != 0 || request.height % 64 != 0) {
+            LOG_ERROR("LTX LipDub two_stage requires width and height divisible by 64 (got %dx%d)",
+                      request.width, request.height);
+            return false;
+        }
+        request.width /= 2;
+        request.height /= 2;
+        request.hires.enabled = true;
+        request.hires.scale = 2.f;
+        LOG_INFO("LTX LipDub two-stage: half-res base %dx%d then x2 reference-aware refine",
+                 request.width, request.height);
+    }
     bool latent_upscale_enabled     = request.hires.enabled;
     GenerationRequest hires_request = request;
     if (latent_upscale_enabled) {
@@ -7373,6 +7470,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
     ImageGenerationLatents latents = std::move(*latent_inputs_opt);
+    latents.relip_twostage = relip_twostage;
 
     if (latents.v2v_sdedit) {
         const float requested_strength = sd_vid_gen_params->v2v_mode == 2 && sd_vid_gen_params->v2v_guide_strength > 0.f
@@ -7779,6 +7877,25 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
     if (latent_upscale_enabled) {
+        // The base relip pass includes frozen source-reference frames in its
+        // sampler grid.  The learned spatial upsampler must only see the
+        // generated target; the refine below re-encodes and re-attaches a
+        // fresh full-resolution reference block.
+        if (latents.relip_twostage && latents.video_conditioning_frame_count > 0) {
+            const int latent_channels = sd_ctx->sd->get_latent_channel();
+            sd::Tensor<float> target_video = final_latent;
+            sd::Tensor<float> audio_latent;
+            if (final_latent.shape()[3] > latent_channels) {
+                target_video = sd::ops::slice(final_latent, 3, 0, latent_channels);
+                audio_latent = unpack_ltxav_audio_latent(final_latent, latents.audio_length, latent_channels);
+            }
+            target_video = sd::ops::slice(target_video, 2, 0, latents.video_target_frame_count);
+            final_latent = audio_latent.empty()
+                               ? std::move(target_video)
+                               : pack_ltxav_audio_and_video_latents(target_video, audio_latent);
+            LOG_INFO("LTX LipDub two-stage: removed %lld base reference latent frame(s) before x2 upscale",
+                     (long long)latents.video_conditioning_frame_count);
+        }
         if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
             LOG_ERROR("cancelling generation before latent upscale");
             return false;
