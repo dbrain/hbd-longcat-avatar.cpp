@@ -2540,6 +2540,7 @@ public:
                              float frame_rate,
                              const sd_cache_params_t* cache_params,
                              const sd::Tensor<float>& video_positions = {},
+                             const sd::Tensor<float>& audio_positions = {},
                              bool ltxav_audio_fixed                   = false) {
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
@@ -2765,7 +2766,8 @@ public:
                         audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
                         audio_length,
                         frame_rate,
-                        video_positions.empty() ? nullptr : &video_positions};
+                        video_positions.empty() ? nullptr : &video_positions,
+                        audio_positions.empty() ? nullptr : &audio_positions};
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};
                 } else if (sd_version_is_minit2i(version)) {
@@ -4526,6 +4528,50 @@ static void set_ltxv_video_position(sd::Tensor<float>* positions,
     positions->index(1, 1, token, 0) = h_end;
     positions->index(0, 2, token, 0) = w_start;
     positions->index(1, 2, token, 0) = w_end;
+}
+
+// Positions for a temporal sub-window on the original video timeline.  The
+// target frames are sampled in tiles, but their RoPE locations must remain
+// absolute so a frozen overlap retains its original temporal coordinates.
+static sd::Tensor<float> build_ltxav_window_video_positions(int64_t width,
+                                                            int64_t height,
+                                                            int64_t latent_start,
+                                                            int64_t latent_frames,
+                                                            int fps,
+                                                            int spatial_scale,
+                                                            int temporal_scale = 8) {
+    GGML_ASSERT(width > 0 && height > 0 && latent_frames > 0 && fps > 0);
+    sd::Tensor<float> positions({2, 3, width * height * latent_frames, 1});
+    int64_t token = 0;
+    for (int64_t t = 0; t < latent_frames; ++t) {
+        const float t_start = ltxv_latent_corner_to_pixel_frame(latent_start + t, temporal_scale, true) /
+                              static_cast<float>(fps);
+        const float t_end = ltxv_latent_corner_to_pixel_frame(latent_start + t + 1, temporal_scale, true) /
+                            static_cast<float>(fps);
+        for (int64_t h = 0; h < height; ++h) {
+            const float h_start = static_cast<float>(h * spatial_scale);
+            const float h_end = static_cast<float>((h + 1) * spatial_scale);
+            for (int64_t w = 0; w < width; ++w) {
+                set_ltxv_video_position(&positions,
+                                        token++,
+                                        t_start,
+                                        t_end,
+                                        h_start,
+                                        h_end,
+                                        static_cast<float>(w * spatial_scale),
+                                        static_cast<float>((w + 1) * spatial_scale));
+            }
+        }
+    }
+    return positions;
+}
+
+static sd::Tensor<float> build_ltxav_window_audio_positions(int64_t audio_start, int64_t audio_frames) {
+    std::vector<float> positions(static_cast<size_t>(audio_frames));
+    for (int64_t t = 0; t < audio_frames; ++t) {
+        positions[static_cast<size_t>(t)] = LTXV::audio_latent_start_time_sec(audio_start + t);
+    }
+    return sd::Tensor<float>({audio_frames}, positions);
 }
 
 static sd::Tensor<float> build_ltxv_video_positions(int64_t width,
@@ -7350,6 +7396,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                            static_cast<float>(request.fps),
                                                            request.cache_params,
                                                            latents.video_positions,
+                                                           sd::Tensor<float>(),
                                                            latents.audio_fixed);
         int64_t sampling_end          = ggml_time_ms();
         if (x_t_sampled.empty()) {
@@ -7367,33 +7414,215 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
-    int64_t sampling_start         = ggml_time_ms();
-    sd::Tensor<float> final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
-                                                        true,
-                                                        x_t,
-                                                        std::move(noise),
-                                                        embeds.cond,
-                                                        request.use_uncond ? embeds.uncond : SDCondition(),
-                                                        embeds.img_uncond,
-                                                        sd::Tensor<float>(),
-                                                        0.f,
-                                                        sd_vid_gen_params->sample_params.guidance,
-                                                        plan.eta,
-                                                        sd_vid_gen_params->sample_params.shifted_timestep,
-                                                        plan.sample_method,
-                                                        sd_ctx->sd->is_flow_denoiser(),
-                                                        plan.extra_sample_args,
-                                                        plan.sigmas,
-                                                        std::vector<sd::Tensor<float>>{},
-                                                        ref_image_params,
-                                                        latents.denoise_mask,
-                                                        latents.vace_context,
-                                                        request.vace_strength,
-                                                        latents.audio_length,
-                                                        static_cast<float>(request.fps),
-                                                        request.cache_params,
-                                                        latents.video_positions,
-                                                        latents.audio_fixed);
+    int64_t sampling_start = ggml_time_ms();
+    auto sample_base_window = [&](const sd::Tensor<float>& window_latent,
+                                  sd::Tensor<float> window_noise,
+                                  const sd::Tensor<float>& window_mask,
+                                  int window_audio_length,
+                                  const sd::Tensor<float>& window_video_positions,
+                                  const sd::Tensor<float>& window_audio_positions = {}) {
+        return sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+                                  true,
+                                  window_latent,
+                                  std::move(window_noise),
+                                  embeds.cond,
+                                  request.use_uncond ? embeds.uncond : SDCondition(),
+                                  embeds.img_uncond,
+                                  sd::Tensor<float>(),
+                                  0.f,
+                                  sd_vid_gen_params->sample_params.guidance,
+                                  plan.eta,
+                                  sd_vid_gen_params->sample_params.shifted_timestep,
+                                  plan.sample_method,
+                                  sd_ctx->sd->is_flow_denoiser(),
+                                  plan.extra_sample_args,
+                                  plan.sigmas,
+                                  std::vector<sd::Tensor<float>>{},
+                                  ref_image_params,
+                                  window_mask,
+                                  latents.vace_context,
+                                  request.vace_strength,
+                                  window_audio_length,
+                                  static_cast<float>(request.fps),
+                                  request.cache_params,
+                                  window_video_positions,
+                                  window_audio_positions,
+                                  latents.audio_fixed);
+    };
+
+    sd::Tensor<float> final_latent;
+    const char* base_window_env = std::getenv("LTX_BASE_TEMPORAL_WINDOW");
+    // This is deliberately the small, safe subset of production temporal tiling:
+    // supplied fixed audio and unconditioned video only.  I2V/keyframe/continuation
+    // guides and V2V need appended-reference position handling and stay full-pass.
+    const bool base_window_unconditioned =
+        sd_vid_gen_params->init_image.data == nullptr && sd_vid_gen_params->end_image.data == nullptr &&
+        sd_vid_gen_params->keyframes_size == 0 && sd_vid_gen_params->cont_latent == nullptr &&
+        sd_vid_gen_params->end_cont_latent == nullptr;
+    const bool base_window_fixed_audio =
+        base_window_unconditioned && latents.audio_fixed && latents.video_positions.empty() && !latents.v2v_sdedit;
+    const bool base_window_plain_t2v =
+        base_window_unconditioned && !latents.audio_fixed && latents.audio_length == 0 && latents.video_positions.empty() &&
+        !latents.v2v_sdedit;
+    const bool base_temporal_windowing =
+        base_window_env != nullptr && base_window_env[0] != '\0' && std::string(base_window_env) != "0" &&
+        sd_version_is_ltxav(sd_ctx->sd->version) && (base_window_fixed_audio || base_window_plain_t2v) &&
+        latents.vace_context.empty() && (x_t.dim() == 4 || (x_t.dim() == 5 && x_t.shape()[4] == 1)) &&
+        x_t.shape()[2] > 1;
+    if (!base_temporal_windowing) {
+        final_latent = sample_base_window(x_t,
+                                          std::move(noise),
+                                          latents.denoise_mask,
+                                          latents.audio_length,
+                                          latents.video_positions,
+                                          sd::Tensor<float>());
+    } else {
+        int temporal_window = std::max(2, std::atoi(base_window_env));
+        int temporal_overlap = 4;
+        if (const char* overlap_env = std::getenv("LTX_BASE_TEMPORAL_OVERLAP"); overlap_env != nullptr) {
+            temporal_overlap = std::max(1, std::atoi(overlap_env));
+        }
+        const int64_t total_frames = x_t.shape()[2];
+        const int64_t latent_channels = sd_ctx->sd->get_latent_channel();
+        const bool has_fixed_audio = latents.audio_fixed && latents.audio_length > 0 &&
+                                     x_t.shape()[3] > latent_channels;
+        temporal_window = std::clamp(temporal_window, 2, static_cast<int>(std::max<int64_t>(2, total_frames)));
+        temporal_overlap = std::clamp(temporal_overlap, 1, temporal_window - 1);
+        if (total_frames <= temporal_window) {
+            final_latent = sample_base_window(x_t,
+                                              std::move(noise),
+                                              latents.denoise_mask,
+                                              latents.audio_length,
+                                              latents.video_positions,
+                                              sd::Tensor<float>());
+        } else {
+            auto full_video = sd::ops::slice(x_t, 3, 0, latent_channels);
+            auto full_noise = sd::ops::slice(noise, 3, 0, latent_channels);
+            sd::Tensor<float> full_audio;
+            if (has_fixed_audio) {
+                full_audio = unpack_ltxav_audio_latent(x_t, latents.audio_length, static_cast<int>(latent_channels));
+            }
+            if (has_fixed_audio && full_audio.empty()) {
+                LOG_ERROR("LTX base temporal-window could not unpack fixed driving audio latent");
+            } else {
+                sd::Tensor<float> full_video_mask;
+                if (!latents.denoise_mask.empty()) {
+                    full_video_mask = sd::ops::slice(latents.denoise_mask, 3, 0, latent_channels);
+                }
+                sd::Tensor<float> video_result(full_video.shape());
+                video_result.fill_(0.0f);
+                const int64_t plane = full_video.shape()[0] * full_video.shape()[1];
+                const int64_t stride = temporal_window - temporal_overlap;
+                const int64_t audio_rate = 25;
+                int64_t produced_end = 0;
+                int tile_index = 0;
+                for (int64_t start = 0;; start += stride, ++tile_index) {
+                    const int64_t tile_start = start + temporal_window >= total_frames
+                                                   ? std::max<int64_t>(0, total_frames - temporal_window)
+                                                   : start;
+                    const int64_t end = std::min<int64_t>(total_frames, tile_start + temporal_window);
+                    const int64_t length = end - tile_start;
+                    const int64_t frozen = tile_index == 0
+                                               ? 0
+                                               : std::min<int64_t>(length, std::max<int64_t>(0, produced_end - tile_start));
+                    auto video_tile = sd::ops::slice(full_video, 2, tile_start, end);
+                    auto noise_tile = sd::ops::slice(full_noise, 2, tile_start, end);
+                    if (frozen > 0) {
+                        float* tile_data = video_tile.data();
+                        const float* result_data = video_result.data();
+                        for (int64_t channel = 0; channel < latent_channels; ++channel) {
+                            for (int64_t local = 0; local < frozen; ++local) {
+                                std::memcpy(tile_data + plane * (local + length * channel),
+                                            result_data + plane * (tile_start + local + total_frames * channel),
+                                            static_cast<size_t>(plane) * sizeof(float));
+                            }
+                        }
+                    }
+                    int64_t audio_start = 0;
+                    int64_t audio_end = 0;
+                    sd::Tensor<float> audio_tile;
+                    if (has_fixed_audio) {
+                        const int64_t pixel_start = tile_start * 8;
+                        const int64_t pixel_end = std::min<int64_t>(request.frames, (end - 1) * 8 + 1);
+                        audio_start = std::clamp<int64_t>((pixel_start * audio_rate) / request.fps,
+                                                          0,
+                                                          full_audio.shape()[1]);
+                        audio_end = std::clamp<int64_t>((pixel_end * audio_rate + request.fps - 1) / request.fps,
+                                                        audio_start + 1,
+                                                        full_audio.shape()[1]);
+                        audio_tile = sd::ops::slice(full_audio, 1, audio_start, audio_end);
+                    }
+                    auto video_mask = full_video_mask.empty()
+                                          ? make_ltxav_video_denoise_mask(video_tile, 1.0f)
+                                          : sd::ops::slice(full_video_mask, 2, tile_start, end);
+                    if (frozen > 0) {
+                        float* mask_data = video_mask.data();
+                        const int64_t mask_channels = video_mask.shape()[3];
+                        for (int64_t channel = 0; channel < mask_channels; ++channel) {
+                            for (int64_t local = 0; local < frozen; ++local) {
+                                std::fill_n(mask_data + plane * (local + length * channel), plane, 0.0f);
+                            }
+                        }
+                    }
+                    auto latent_tile = has_fixed_audio
+                                           ? pack_ltxav_audio_and_video_latents(video_tile, audio_tile)
+                                           : video_tile;
+                    auto packed_noise = has_fixed_audio
+                                            ? pack_ltxav_audio_and_video_latents(noise_tile, audio_tile)
+                                            : noise_tile;
+                    auto mask_tile = has_fixed_audio
+                                         ? pack_ltxav_audio_and_video_denoise_mask(video_mask,
+                                                                                   video_tile,
+                                                                                   audio_tile,
+                                                                                   0.0f)
+                                         : video_mask;
+                    auto video_positions = build_ltxav_window_video_positions(video_tile.shape()[0],
+                                                                                video_tile.shape()[1],
+                                                                                tile_start,
+                                                                                length,
+                                                                                request.fps,
+                                                                                request.vae_scale_factor);
+                    auto audio_positions = has_fixed_audio
+                                               ? build_ltxav_window_audio_positions(audio_start, audio_tile.shape()[1])
+                                               : sd::Tensor<float>();
+                    LOG_INFO("LTX base temporal-window tile %d: latent [%lld,%lld), frozen-overlap=%lld, audio [%lld,%lld)",
+                             tile_index,
+                             (long long)tile_start,
+                             (long long)end,
+                             (long long)frozen,
+                             (long long)audio_start,
+                             (long long)audio_end);
+                    auto tile = sample_base_window(latent_tile,
+                                                   std::move(packed_noise),
+                                                   mask_tile,
+                                                   has_fixed_audio ? static_cast<int>(audio_tile.shape()[1]) : 0,
+                                                   video_positions,
+                                                   audio_positions);
+                    if (tile.empty()) {
+                        final_latent = {};
+                        break;
+                    }
+                    auto refined_video = sd::ops::slice(tile, 3, 0, latent_channels);
+                    const float* src = refined_video.data();
+                    float* dst = video_result.data();
+                    for (int64_t local = frozen; local < length; ++local) {
+                        for (int64_t channel = 0; channel < latent_channels; ++channel) {
+                            std::memcpy(dst + plane * (tile_start + local + total_frames * channel),
+                                        src + plane * (local + length * channel),
+                                        static_cast<size_t>(plane) * sizeof(float));
+                        }
+                    }
+                    produced_end = std::max(produced_end, end);
+                    if (end == total_frames) {
+                        final_latent = has_fixed_audio
+                                           ? pack_ltxav_audio_and_video_latents(video_result, full_audio)
+                                           : std::move(video_result);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     int64_t sampling_end = ggml_time_ms();
     if (final_latent.empty()) {
@@ -7537,6 +7766,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                             static_cast<float>(hires_request.fps),
                                             hires_request.cache_params,
                                             hires_video_positions,
+                                            sd::Tensor<float>(),
                                             latents.audio_fixed);
         sampling_end   = ggml_time_ms();
         if (final_latent.empty()) {
@@ -7635,6 +7865,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                latents.audio_length,
                                                static_cast<float>(stage_request.fps),
                                                stage_request.cache_params,
+                                               sd::Tensor<float>(),
                                                sd::Tensor<float>(),
                                                latents.audio_fixed);
             if (final_latent.empty()) {

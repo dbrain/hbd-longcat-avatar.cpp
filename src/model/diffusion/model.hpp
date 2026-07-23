@@ -81,6 +81,7 @@ struct LTXAVDiffusionExtra {
     int audio_length                         = 0;
     float frame_rate                         = 24.f;
     const sd::Tensor<float>* video_positions = nullptr;
+    const sd::Tensor<float>* audio_positions = nullptr;
 };
 
 struct LongCatAvatarDiffusionExtra {
