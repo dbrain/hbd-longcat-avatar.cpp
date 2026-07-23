@@ -358,6 +358,33 @@ bool execute_img_gen_job(ServerRuntime& runtime,
 
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
+
+        // FLUX.2-Klein dual-DiT: honour the request's top-level model variant by
+        // swapping the resident DiT before sampling. Empty variant (the default,
+        // and every non-flux2 img_gen caller) leaves the loaded DiT untouched, so
+        // single-model renders stay byte-identical. Swap when the wanted variant
+        // differs from the resident one, or after an /v1/admin/unload freed the
+        // DiT (diffusion_loaded == false) — mirrors prod ensure_variant_loaded
+        // (routes_sdcpp.cpp:392-406 -> async_jobs.cpp:1316) using this tree's
+        // runtime_diffusion_model_variants() map + sd_ctx_swap_diffusion_model.
+        if (!job.img_gen.model_variant.empty() && runtime.gpu_sharing != nullptr) {
+            const bool need_swap = !runtime.gpu_sharing->diffusion_loaded.load() ||
+                                   runtime.gpu_sharing->loaded_variant != job.img_gen.model_variant;
+            if (need_swap) {
+                const auto variants = runtime_diffusion_model_variants(runtime);
+                const auto variant  = variants.find(job.img_gen.model_variant);
+                if (variant == variants.end()) {
+                    error_message = "unknown model variant '" + job.img_gen.model_variant + "'";
+                    return false;
+                }
+                if (!sd_ctx_swap_diffusion_model(runtime.sd_ctx, variant->second.c_str())) {
+                    error_message = "could not load model variant '" + job.img_gen.model_variant + "'";
+                    return false;
+                }
+                runtime.gpu_sharing->loaded_variant = job.img_gen.model_variant;
+            }
+        }
+
         sd_image_t* raw_results = nullptr;
         int num_results         = 0;
         const bool generated = generate_image(runtime.sd_ctx, &params, &raw_results, &num_results);

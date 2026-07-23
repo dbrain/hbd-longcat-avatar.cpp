@@ -61,6 +61,11 @@ struct UpscalerEntry {
 struct GPUSharingState {
     std::atomic<bool> draining{false};
     std::atomic<bool> diffusion_loaded{true};
+    // Logical name of the DiT variant currently resident (FLUX.2-Klein dual-DiT:
+    // "base"/"edit"). Unlike the atomics above this is guarded by
+    // ServerRuntime::sd_ctx_mutex — only the serialized async worker reads/writes
+    // it around a swap. new_sd_ctx() loads --diffusion-model (base) at boot.
+    std::string loaded_variant = "base";
 };
 
 struct ServerRuntime {
@@ -84,6 +89,9 @@ struct ImgGenJobRequest {
     SDGenerationParams gen_params;
     std::string output_format = "png";
     int output_compression    = 100;
+    // Optional top-level "model":"base"|"edit" DiT selector (FLUX.2-Klein dual
+    // DiT). Empty = leave the resident DiT untouched (single-model byte-identical).
+    std::string model_variant;
 
     sd_img_gen_params_t to_sd_img_gen_params_t() {
         return gen_params.to_sd_img_gen_params_t();

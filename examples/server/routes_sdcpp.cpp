@@ -368,6 +368,31 @@ static bool parse_img_gen_request(const json& body,
     if (!assign_output_options(request, output_format, output_compression, true, error_message)) {
         return false;
     }
+
+    // FLUX.2-Klein dual-DiT: optional top-level "model":"base"|"edit" selects
+    // which DiT renders this request (koblem sends it on every img_gen call).
+    // Validate against the runtime variant map so an unknown name is rejected up
+    // front; "edit" on a server started without --diffusion-model-edit is absent
+    // from that map. When absent/empty, model_variant stays empty and the worker
+    // renders with whatever DiT is resident (single-model behaviour byte-
+    // identical). Mirrors prod routes_sdcpp.cpp:392-406.
+    if (body.contains("model") && body["model"].is_string()) {
+        const std::string variant = body["model"].get<std::string>();
+        if (!variant.empty()) {
+            if (variant == "edit" && runtime.svr_params != nullptr &&
+                runtime.svr_params->diffusion_model_edit_path.empty()) {
+                error_message = "edit model not available (server started without --diffusion-model-edit)";
+                return false;
+            }
+            const auto variants = runtime_diffusion_model_variants(runtime);
+            if (variants.find(variant) == variants.end()) {
+                error_message = "unknown model variant '" + variant + "'";
+                return false;
+            }
+            request.model_variant = variant;
+        }
+    }
+
     // Intentionally disable prompt-embedded LoRA tag parsing for server APIs.
     if (!request.gen_params.resolve_and_validate(IMG_GEN, "", runtime.ctx_params->hires_upscalers_dir, true)) {
         error_message = "invalid generation parameters";
