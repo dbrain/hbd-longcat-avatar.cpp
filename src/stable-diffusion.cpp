@@ -7438,6 +7438,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         request.height /= 2;
         request.hires.enabled = true;
         request.hires.scale = 2.f;
+        // Production's distilled LipDub stage-2 recipe is a fixed three-step
+        // low-noise refine unless the caller deliberately supplied sigmas.
+        if (request.hires.custom_sigmas == nullptr || request.hires.custom_sigmas_count <= 0) {
+            static float k_lipdub_stage2_sigmas[] = {0.909375f, 0.725f, 0.421875f, 0.f};
+            request.hires.custom_sigmas = k_lipdub_stage2_sigmas;
+            request.hires.custom_sigmas_count = 4;
+        }
         LOG_INFO("LTX LipDub two-stage: half-res base %dx%d then x2 reference-aware refine",
                  request.width, request.height);
     }

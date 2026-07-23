@@ -441,6 +441,20 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 body["video_frames"] = body["frames"];
             }
 
+            // Koblem's LipDub contract asks for the production two-stage
+            // recipe with `two_stage: true`; it does not need to redundantly
+            // expose the worker's configured latent-upscaler model. Enable
+            // that configured model before parameter resolution so the
+            // request reaches the engine with a valid model path.
+            if (body.value("two_stage", false)) {
+                json& hires = body["hires"];
+                if (!hires.is_object()) hires = json::object();
+                if (!hires.contains("enabled")) hires["enabled"] = true;
+                if (!hires.contains("upscaler")) {
+                    hires["upscaler"] = runtime->default_gen_params->hires_upscaler;
+                }
+            }
+
             VidGenJobRequest request;
             std::string error_message;
             if (!parse_ltx_video_request(body, *runtime, request, error_message)) {
