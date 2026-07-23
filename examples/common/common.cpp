@@ -1899,6 +1899,9 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("vace_strength", vace_strength);
     load_if_exists("audio_path", audio_path);
     load_if_exists("audio_frame_offset", audio_frame_offset);
+    load_if_exists("a2v_guidance", a2v_guidance);
+    load_if_exists("a2v_ramp_end", a2v_ramp_end);
+    load_if_exists("relip_ref_tstride", relip_ref_tstride);
 
     load_if_exists("auto_resize_ref_image", auto_resize_ref_image);
     load_if_exists("increase_ref_index", increase_ref_index);
@@ -2367,6 +2370,10 @@ bool SDGenerationParams::validate(SDMode mode) {
         LOG_ERROR("error: audio_frame_offset must be non-negative");
         return false;
     }
+    if (mode == VID_GEN && (a2v_guidance <= 0.f || a2v_ramp_end < 0.f || a2v_ramp_end > 1.f || relip_ref_tstride < 1)) {
+        LOG_ERROR("error: a2v_guidance must be positive, a2v_ramp_end within [0,1], and relip_ref_tstride positive");
+        return false;
+    }
 
     if (sample_params.shifted_timestep < 0 || sample_params.shifted_timestep > 1000) {
         LOG_ERROR("error: shifted_timestep must be in range [0, 1000]");
@@ -2588,6 +2595,9 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.high_noise_sample_params  = high_noise_sample_params;
     params.moe_boundary              = moe_boundary;
     params.strength                  = strength;
+    params.a2v_guidance              = a2v_guidance;
+    params.a2v_ramp_end              = a2v_ramp_end;
+    params.relip_ref_tstride         = relip_ref_tstride;
     params.seed                      = seed;
     params.video_frames              = video_frames;
     params.fps                       = fps;

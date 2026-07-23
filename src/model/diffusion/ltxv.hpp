@@ -1278,8 +1278,8 @@ namespace LTXV {
             auto a_table = params["audio_scale_shift_table"];
 
             bool run_ax  = has_audio && ax != nullptr && ggml_nelements(ax) > 0 && ax->ne[1] > 0;
-            bool run_a2v = run_ax;
-            bool run_v2a = run_ax;
+            bool run_a2v = run_ax && !ctx->ltx_skip_a2v_cross_attn;
+            bool run_v2a = run_ax && !ctx->ltx_skip_a2v_cross_attn;
 
             auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
@@ -1894,7 +1894,8 @@ namespace LTXV {
                                  int audio_length                                = 0,
                                  float frame_rate                                = 24.f,
                                  const sd::Tensor<float>& video_positions_tensor = {},
-                                 const sd::Tensor<float>& audio_positions_tensor = {}) {
+                                 const sd::Tensor<float>& audio_positions_tensor = {},
+                                 bool skip_a2v                                  = false) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -2104,6 +2105,7 @@ namespace LTXV {
 
             auto runner_ctx = get_context();
             runner_ctx.ltx_video_token_sel = v_token_sel_input;
+            runner_ctx.ltx_skip_a2v_cross_attn = skip_a2v;
             auto out_pair   = model.forward(&runner_ctx,
                                             vx,
                                             ax,
@@ -2130,7 +2132,8 @@ namespace LTXV {
                                   int audio_length                         = 0,
                                   float frame_rate                         = 24.f,
                                   const sd::Tensor<float>& video_positions = {},
-                                  const sd::Tensor<float>& audio_positions = {}) {
+                                  const sd::Tensor<float>& audio_positions = {},
+                                  bool skip_a2v = false) {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x,
                                    timesteps,
@@ -2140,7 +2143,8 @@ namespace LTXV {
                                    audio_length,
                                    frame_rate,
                                    video_positions,
-                                   audio_positions);
+                                   audio_positions,
+                                   skip_a2v);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
             return out;
@@ -2160,7 +2164,8 @@ namespace LTXV {
                            extra->audio_length,
                            extra->frame_rate,
                            tensor_or_empty(extra->video_positions),
-                           tensor_or_empty(extra->audio_positions));
+                           tensor_or_empty(extra->audio_positions),
+                           extra->skip_a2v);
         }
 
         void test(const std::string& x_path,

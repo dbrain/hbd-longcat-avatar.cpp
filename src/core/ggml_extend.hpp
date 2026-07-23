@@ -1799,6 +1799,9 @@ struct GGMLRunnerContext {
     // LTX video modulation token-collapse: optional I32 [video_tokens] mapping
     // compact AdaLN columns back to their per-token order.
     ggml_tensor* ltx_video_token_sel                                  = nullptr;
+    // LTXAV audio-to-video modality-guidance pass: retain each modality's
+    // own stack but sever the audio↔video cross-attention coupling.
+    bool ltx_skip_a2v_cross_attn                                       = false;
 
     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
         if (debug_tensors == nullptr || tensor == nullptr) {

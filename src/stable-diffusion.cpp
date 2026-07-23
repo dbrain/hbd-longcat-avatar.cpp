@@ -2541,7 +2541,9 @@ public:
                              const sd_cache_params_t* cache_params,
                              const sd::Tensor<float>& video_positions = {},
                              const sd::Tensor<float>& audio_positions = {},
-                             bool ltxav_audio_fixed                   = false) {
+                             bool ltxav_audio_fixed                   = false,
+                             float a2v_guidance_scale                 = 1.f,
+                             float a2v_ramp_end                       = 1.f) {
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
             ~RunnerDoneOnExit() {
@@ -2553,6 +2555,12 @@ public:
         RunnerDoneOnExit sample_diffusion_runner_done{work_diffusion_model.get()};
 
         RunnerDoneOnExit sample_control_runner_done{!control_image.empty() && control_net != nullptr ? control_net.get() : nullptr};
+
+        a2v_ramp_end = std::clamp(a2v_ramp_end, 0.f, 1.f);
+        if (a2v_guidance_scale != 1.f && sd_version_is_ltxav(version)) {
+            LOG_INFO("LTXAV A2V guidance scale=%.2f ramp_end=%.2f (+1 audio-decoupled forward/step)",
+                     a2v_guidance_scale, a2v_ramp_end);
+        }
 
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
         float cfg_scale     = guidance.txt_cfg;
@@ -2724,7 +2732,8 @@ public:
             auto run_condition = [&](const SDCondition& condition,
                                      const sd::Tensor<float>* c_concat_override                 = nullptr,
                                      const std::vector<int>* local_skip_layers                  = nullptr,
-                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr) -> sd::Tensor<float> {
+                                     const std::vector<sd::Tensor<float>>* ref_latents_override = nullptr,
+                                     bool skip_a2v_pass                                          = false) -> sd::Tensor<float> {
                 diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
                 diffusion_params.c_concat    = c_concat_override != nullptr ? c_concat_override : (condition.c_concat.empty() ? nullptr : &condition.c_concat);
                 diffusion_params.y           = condition.c_vector.empty() ? nullptr : &condition.c_vector;
@@ -2767,7 +2776,8 @@ public:
                         audio_length,
                         frame_rate,
                         video_positions.empty() ? nullptr : &video_positions,
-                        audio_positions.empty() ? nullptr : &audio_positions};
+                        audio_positions.empty() ? nullptr : &audio_positions,
+                        skip_a2v_pass};
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};
                 } else if (sd_version_is_minit2i(version)) {
@@ -2812,6 +2822,23 @@ public:
             cond_out = run_condition(*positive_condition, c_concat_override);
             if (cond_out.empty()) {
                 return {};
+            }
+
+            if (a2v_guidance_scale != 1.f && sd_version_is_ltxav(version) && ltxav_audio_fixed) {
+                float effective_scale = a2v_guidance_scale;
+                if (a2v_ramp_end < 1.f && !sigmas.empty() && sigmas[0] > 0.f) {
+                    const float fraction = std::clamp(1.f - sigma / sigmas[0], 0.f, 1.f);
+                    const float ramp = 1.f + (a2v_ramp_end - 1.f) * fraction;
+                    effective_scale = 1.f + (a2v_guidance_scale - 1.f) * ramp;
+                }
+                if (std::fabs(effective_scale - 1.f) > .02f) {
+                    sd::Tensor<float> audio_decoupled =
+                        run_condition(*positive_condition, c_concat_override, nullptr, nullptr, true);
+                    if (audio_decoupled.empty()) {
+                        return {};
+                    }
+                    cond_out = cond_out + (cond_out - audio_decoupled) * (effective_scale - 1.f);
+                }
             }
 
             if (!uncond.empty()) {
@@ -3786,6 +3813,8 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->strength                              = 0.75f;
     sd_vid_gen_params->v2v_mode                              = 0;
     sd_vid_gen_params->relip_ref_tstride                     = 1;
+    sd_vid_gen_params->a2v_guidance                           = 1.f;
+    sd_vid_gen_params->a2v_ramp_end                           = 1.f;
     sd_vid_gen_params->v2v_guide_strength                    = 1.f;
     sd_vid_gen_params->v2v_guide_latent_path                 = nullptr;
     sd_vid_gen_params->keyframes                             = nullptr;
@@ -7564,7 +7593,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                   request.cache_params,
                                   window_video_positions,
                                   window_audio_positions,
-                                  latents.audio_fixed);
+                                  latents.audio_fixed,
+                                  sd_vid_gen_params->a2v_guidance,
+                                  sd_vid_gen_params->a2v_ramp_end);
     };
 
     sd::Tensor<float> final_latent;
