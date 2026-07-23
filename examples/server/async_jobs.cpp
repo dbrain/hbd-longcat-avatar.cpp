@@ -424,6 +424,11 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          int& output_fps,
                          std::string& error_message) {
     sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
+    // The production LipDub client sends its source frames at the top level,
+    // with v2v_mode omitted (therefore mode 0).  Keep the selection in durable
+    // job state so queued requests cannot inherit a previous worker setting.
+    params.v2v_mode = job.ltx_v2v_mode;
+    params.relip_ref_tstride = std::max(1, job.ltx_relip_ref_tstride);
     std::vector<sd_hires_params_t> ltx_hires_chain;
     if (!job.ltx_hires_stages.empty()) {
         ltx_hires_chain.reserve(job.ltx_hires_stages.size());
@@ -531,6 +536,16 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             }
             ltx_v2v_image_windows[segment] = images.data();
             ltx_v2v_frame_counts[segment] = static_cast<int>(images.size());
+        }
+        // Koblem LipDub predates the per-segment Director schema: it posts a
+        // single top-level control_frames array plus audio_0.  The common
+        // request parser owns these decoded frame views in `params`; bridge
+        // that exact borrowed span into segment zero so generate_video_chain
+        // reaches the mode-0 reference path rather than dropping it.
+        if (job.ltx_v2v_mode == 0 && job.ltx_prompts.size() == 1 &&
+            params.control_frames != nullptr && params.control_frames_size > 0) {
+            ltx_v2v_image_windows[0] = params.control_frames;
+            ltx_v2v_frame_counts[0] = params.control_frames_size;
         }
     }
 

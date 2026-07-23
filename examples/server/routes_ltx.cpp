@@ -448,6 +448,28 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", error_message}}).dump(), "application/json");
                 return;
             }
+            // Koblem's LipDub endpoint keeps its source clip at the top level
+            // (`control_frames`) and omits v2v_mode: production defines that
+            // default as mode 0 (relip), distinct from SDEdit/guide-edit.
+            int top_level_v2v_mode = body.value("v2v_mode", 0);
+            if (top_level_v2v_mode != 0 && top_level_v2v_mode != 1 && top_level_v2v_mode != 2) {
+                res.status = 400;
+                res.set_content("{\"error\":\"LTX v2v_mode must be 0 (lipdub), 1 (SDEdit), or 2 (guide edit)\"}",
+                                "application/json");
+                return;
+            }
+            int relip_ref_tstride = body.value("relip_ref_tstride", 1);
+            if (relip_ref_tstride < 1) {
+                res.status = 400;
+                res.set_content(R"({"error":"relip_ref_tstride must be positive"})", "application/json");
+                return;
+            }
+            if (top_level_v2v_mode == 0 && !request.gen_params.control_frames.empty() &&
+                request.gen_params.control_frames.size() < static_cast<size_t>(request.gen_params.video_frames)) {
+                res.status = 400;
+                res.set_content(R"({"error":"LTX lipdub requires one control frame per output frame"})", "application/json");
+                return;
+            }
             std::vector<SDGenerationParams> hires_stages;
             std::vector<sample_method_t> hires_stage_methods;
             std::vector<float> hires_stage_cfgs;
@@ -545,9 +567,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
             }
             const int continuation_frames = body.value("cont_latent_frames", 3);
-            if (continuation_frames < 1) {
+            const bool single_lipdub = top_level_v2v_mode == 0 && !request.gen_params.control_frames.empty() &&
+                                       requested_segments == 1;
+            if (continuation_frames < 0 || (continuation_frames == 0 && !single_lipdub)) {
                 res.status = 400;
-                res.set_content(R"({"error":"cont_latent_frames must be positive"})", "application/json");
+                res.set_content(R"({"error":"cont_latent_frames must be positive except for a single lipdub window"})", "application/json");
                 return;
             }
 
@@ -557,6 +581,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->status = AsyncJobStatus::Queued;
             job->created_at = unix_timestamp_now();
             job->vid_gen = std::move(request);
+            job->ltx_v2v_mode = top_level_v2v_mode;
+            job->ltx_relip_ref_tstride = relip_ref_tstride;
             job->ltx_hires_stages = std::move(hires_stages);
             job->ltx_hires_stage_methods = std::move(hires_stage_methods);
             job->ltx_hires_stage_cfgs = std::move(hires_stage_cfgs);

@@ -50,6 +50,10 @@ struct AsyncGenerationJob {
     // only at core-provided segment boundaries.
     std::vector<std::string> ltx_segment_models;
     std::string ltx_default_model = "base";
+    // Top-level V2V selector is retained separately because SDGenerationParams
+    // deliberately has no LTX-specific transport fields.  Mode 0 is LipDub.
+    int ltx_v2v_mode = 0;
+    int ltx_relip_ref_tstride = 1;
     std::vector<int> ltx_segment_frames;
     std::vector<int> ltx_segment_scene_cuts;
     std::vector<std::string> ltx_segment_init_images;

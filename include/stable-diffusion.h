@@ -411,10 +411,15 @@ typedef struct {
     sd_sample_params_t high_noise_sample_params;
     float moe_boundary;
     float strength;
-    // LTX video-to-video mode. Zero preserves the upstream unsupported-control
-    // behavior; one selects pixel-source SDEdit and two selects guide-edit,
-    // which also accepts a saved video-latent source.
+    // LTX video-to-video mode. Zero is the production LipDub/relip path: the
+    // source clip is VAE encoded and appended as frozen, timeline-aligned
+    // reference tokens while a supplied drive-audio latent controls the mouth.
+    // One selects pixel-source SDEdit and two selects guide-edit, which also
+    // accepts a saved video-latent source.
     int v2v_mode;
+    // LipDub timeline-reference temporal stride. One preserves every latent
+    // frame; larger values retain every nth reference frame.
+    int relip_ref_tstride;
     // Guide-edit uses this instead of `strength` when positive. A value of one
     // is a full restyle; lower values preserve more of the source scene.
     float v2v_guide_strength;

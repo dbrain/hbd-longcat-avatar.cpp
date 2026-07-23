@@ -3785,6 +3785,7 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->height                                = 512;
     sd_vid_gen_params->strength                              = 0.75f;
     sd_vid_gen_params->v2v_mode                              = 0;
+    sd_vid_gen_params->relip_ref_tstride                     = 1;
     sd_vid_gen_params->v2v_guide_strength                    = 1.f;
     sd_vid_gen_params->v2v_guide_latent_path                 = nullptr;
     sd_vid_gen_params->keyframes                             = nullptr;
@@ -4628,6 +4629,41 @@ static sd::Tensor<float> build_ltxv_video_positions(int64_t width,
     return positions;
 }
 
+// LTX-2.3 LipDub/relip positions.  The generated target grid is followed by
+// reference frames at the *same* temporal locations, rather than keyframe
+// positions at the end of the clip.  This is the IC-LoRA conditioning layout
+// used by the production edit model.
+static sd::Tensor<float> build_ltxv_relip_video_positions(int64_t width,
+                                                           int64_t height,
+                                                           int64_t target_latent_frames,
+                                                           int64_t reference_latent_frames,
+                                                           int fps,
+                                                           int spatial_scale,
+                                                           int temporal_scale,
+                                                           int reference_temporal_stride = 1) {
+    GGML_ASSERT(width > 0 && height > 0 && target_latent_frames > 0 && reference_latent_frames > 0 && fps > 0);
+    reference_temporal_stride = std::max(1, reference_temporal_stride);
+    sd::Tensor<float> positions({2, 3, width * height * (target_latent_frames + reference_latent_frames), 1});
+    int64_t token = 0;
+    auto append = [&](int64_t frames, int temporal_stride) {
+        for (int64_t t = 0; t < frames; ++t) {
+            const int64_t source_t = t * temporal_stride;
+            const float t_start = ltxv_latent_corner_to_pixel_frame(source_t, temporal_scale, true) / static_cast<float>(fps);
+            const float t_end = ltxv_latent_corner_to_pixel_frame(source_t + 1, temporal_scale, true) / static_cast<float>(fps);
+            for (int64_t h = 0; h < height; ++h) {
+                for (int64_t w = 0; w < width; ++w) {
+                    set_ltxv_video_position(&positions, token++, t_start, t_end,
+                                             static_cast<float>(h * spatial_scale), static_cast<float>((h + 1) * spatial_scale),
+                                             static_cast<float>(w * spatial_scale), static_cast<float>((w + 1) * spatial_scale));
+                }
+            }
+        }
+    };
+    append(target_latent_frames, 1);
+    append(reference_latent_frames, reference_temporal_stride);
+    return positions;
+}
+
 // LTXAV multi-keyframe positions: the generated target grid is followed by
 // one frozen guide frame per image, placed at that image's pixel-frame index.
 static sd::Tensor<float> build_ltxv_multi_keyframe_video_positions(int64_t width,
@@ -4763,6 +4799,38 @@ static sd::Tensor<float> make_ltxav_video_denoise_mask(const sd::Tensor<float>& 
                             1,
                             1},
                            value);
+}
+
+// Production LipDub/relip: append the source clip as frozen, timeline-aligned
+// tokens.  The sampled grid remains the target video; the caller strips this
+// appended reference tail after sampling using video_conditioning_frame_count.
+static bool apply_ltxav_video_relip_reference(ImageGenerationLatents* latents,
+                                               const sd::Tensor<float>& reference,
+                                               int fps,
+                                               int spatial_scale,
+                                               int reference_temporal_stride = 1) {
+    if (latents == nullptr || latents->init_latent.empty() || latents->denoise_mask.empty() || reference.empty() ||
+        reference.shape()[0] != latents->init_latent.shape()[0] ||
+        reference.shape()[1] != latents->init_latent.shape()[1] ||
+        reference.shape()[3] != latents->init_latent.shape()[3]) {
+        LOG_ERROR("invalid LTXAV relip reference latent shape");
+        return false;
+    }
+    const int64_t reference_frames = reference.shape()[2];
+    latents->video_target_frame_count = latents->init_latent.shape()[2];
+    latents->video_conditioning_frame_count = reference_frames;
+    latents->init_latent = sd::ops::concat(latents->init_latent, reference, 2);
+    auto reference_mask = sd::full<float>({reference.shape()[0], reference.shape()[1], reference_frames, 1, 1}, 0.f);
+    latents->denoise_mask = sd::ops::concat(latents->denoise_mask, reference_mask, 2);
+    latents->video_positions = build_ltxv_relip_video_positions(latents->init_latent.shape()[0],
+                                                                  latents->init_latent.shape()[1],
+                                                                  latents->video_target_frame_count,
+                                                                  reference_frames,
+                                                                  fps,
+                                                                  spatial_scale,
+                                                                  8,
+                                                                  reference_temporal_stride);
+    return true;
 }
 
 static sd::Tensor<float> encode_ltxav_condition_image(sd_ctx_t* sd_ctx,
@@ -6075,8 +6143,8 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         const bool has_guide_latent = sd_vid_gen_params->v2v_guide_latent_path != nullptr &&
                                       sd_vid_gen_params->v2v_guide_latent_path[0] != '\0';
         if ((sd_vid_gen_params->control_frames_size > 0 || has_guide_latent) &&
-            sd_vid_gen_params->v2v_mode != 1 && sd_vid_gen_params->v2v_mode != 2) {
-            LOG_ERROR("LTXAV control_frames are not implemented");
+            sd_vid_gen_params->v2v_mode != 0 && sd_vid_gen_params->v2v_mode != 1 && sd_vid_gen_params->v2v_mode != 2) {
+            LOG_ERROR("invalid LTXAV v2v_mode");
             return std::nullopt;
         }
 
@@ -6683,6 +6751,55 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
 
     if (latents.init_latent.empty()) {
         latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+    }
+
+    // Production LipDub/relip (v2v_mode 0): source pixels become a frozen,
+    // timeline-aligned IC-LoRA reference block.  Unlike SDEdit this samples a
+    // new target from noise, and unlike guide-edit the reference is fully
+    // frozen while the fixed driving-audio latent supplies lip motion.
+    if (sd_version_is_ltxav(sd_ctx->sd->version) &&
+        sd_vid_gen_params->v2v_mode == 0 && sd_vid_gen_params->control_frames_size > 0) {
+        if (sd_vid_gen_params->control_frames == nullptr) {
+            LOG_ERROR("LTXAV relip control_frames pointer is null");
+            return std::nullopt;
+        }
+        const int64_t supplied = sd_vid_gen_params->control_frames_size;
+        sd::Tensor<float> reference_video({request->width, request->height, request->frames, 3, 1});
+        for (int frame = 0; frame < request->frames; ++frame) {
+            const int64_t source = std::min<int64_t>(frame, supplied - 1);
+            if (sd_vid_gen_params->control_frames[source].data == nullptr) {
+                LOG_ERROR("LTXAV relip control frame %lld is empty", (long long)source);
+                return std::nullopt;
+            }
+            const auto image = sd_image_to_tensor(sd_vid_gen_params->control_frames[source], request->width, request->height);
+            sd::ops::slice_assign(&reference_video, 2, frame, frame + 1, image.unsqueeze(2));
+        }
+        auto reference = sd_ctx->sd->encode_first_stage(reference_video);
+        if (reference.empty()) {
+            LOG_ERROR("failed to encode LTXAV relip reference video");
+            return std::nullopt;
+        }
+        latents.init_latent = sd_ctx->sd->generate_init_latent(request->width, request->height, request->frames, true);
+        latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+        const int reference_stride = std::max(1, sd_vid_gen_params->relip_ref_tstride);
+        if (reference_stride > 1 && reference.shape()[2] > 1) {
+            const int64_t original_frames = reference.shape()[2];
+            const int64_t kept_frames = (original_frames + reference_stride - 1) / reference_stride;
+            auto shape = reference.shape();
+            shape[2] = kept_frames;
+            sd::Tensor<float> subsampled(shape);
+            for (int64_t dst = 0, source = 0; source < original_frames; ++dst, source += reference_stride) {
+                sd::ops::slice_assign(&subsampled, 2, dst, dst + 1, sd::ops::slice(reference, 2, source, source + 1));
+            }
+            reference = std::move(subsampled);
+        }
+        if (!apply_ltxav_video_relip_reference(&latents, reference, request->fps,
+                                                request->vae_scale_factor, reference_stride)) {
+            return std::nullopt;
+        }
+        LOG_INFO("LTXAV LIPDUB RELIP: target %lld latent frames, reference %lld (temporal stride %d)%s",
+                 (long long)latents.video_target_frame_count, (long long)reference.shape()[2], reference_stride,
+                 latents.audio_fixed ? ", fixed drive audio" : "");
     }
 
     // LTX V2V deliberately reaches this common t2v fallback first so
@@ -8486,7 +8603,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const bool has_v2v_latent = chain_params->segment_v2v_guide_latent_paths != nullptr &&
                                     chain_params->segment_v2v_guide_latent_paths[segment] != nullptr &&
                                     chain_params->segment_v2v_guide_latent_paths[segment][0] != '\0';
-        const bool has_v2v_source = (v2v_mode == 1 && has_v2v_control) ||
+        const bool has_v2v_source = (v2v_mode == 0 && has_v2v_control) ||
+                                    (v2v_mode == 1 && has_v2v_control) ||
                                     (v2v_mode == 2 && (has_v2v_control || has_v2v_latent));
         const int declared_drop = chain_params->segment_seam_drop_frames != nullptr
                                       ? chain_params->segment_seam_drop_frames[segment]
@@ -8530,7 +8648,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const bool has_v2v_latent = chain_params->segment_v2v_guide_latent_paths != nullptr &&
                                     chain_params->segment_v2v_guide_latent_paths[segment] != nullptr &&
                                     chain_params->segment_v2v_guide_latent_paths[segment][0] != '\0';
-        const bool has_v2v_source = (v2v_mode == 1 && has_v2v_control) ||
+        const bool has_v2v_source = (v2v_mode == 0 && has_v2v_control) ||
+                                    (v2v_mode == 1 && has_v2v_control) ||
                                     (v2v_mode == 2 && (has_v2v_control || has_v2v_latent));
         bool keyframe_at_start = false;
         const bool has_keyframes = !has_v2v_source &&
