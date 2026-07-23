@@ -331,10 +331,8 @@ namespace LONGCAT_AVATAR {
                 // pre-computed once per render and shared across all 48 blocks + 7
                 // consume steps. Persist path (step 0) stays dense for stability.
                 out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q_rope, k_full, v_full,
-                                             num_heads, ctx->bsa_mask, true, fa, 1.0f);
-                if (fa) {
-                    out = ggml_ext_scale(ctx->ggml_ctx, out, 1.0f / kv_scale);
-                }
+                                             num_heads, ctx->bsa_mask, true, fa, kv_scale,
+                                             /*kv_prescaled_f16=*/fa);
             } else if (num_ref_latents > 0 && n_cond_tokens > 0 && n_cond_tokens < n_token && n_per_frame > 0) {
                 // ======= VIDEO-CONTINUATION 3-WAY SPLIT (generate_avc) =======
                 // Layout: [ref(num_ref_latents) | cond_tail | noise]. The leading
@@ -599,8 +597,8 @@ namespace LONGCAT_AVATAR {
                 ggml_tensor* k_cached = (*ctx->xattn_text_k)[block_idx];
                 ggml_tensor* v_cached = (*ctx->xattn_text_v)[block_idx];
                 auto out = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k_cached, v_cached,
-                                                  num_heads, nullptr, false, fa, 1.0f);
-                out = ggml_ext_scale(ctx->ggml_ctx, out, 1.0f / kv_scale);
+                                                  num_heads, nullptr, false, fa, kv_scale,
+                                                  /*kv_prescaled_f16=*/true);
                 out = proj->forward(ctx, out);
                 return out;
             }
@@ -1208,7 +1206,6 @@ namespace LONGCAT_AVATAR {
             if (audio != nullptr) {
                 sd::ggml_graph_cut::mark_graph_cut(audio, "longcat.prelude", "audio");
             }
-
             // FFN token-tiling: bound the SwiGLU's [11008, n_token] transient triple
             // at full length. Off (tiles=1, bit-identical single-shot) below a token
             // threshold so the 25f hot path is unchanged; LONGCAT_FFN_TILES overrides
@@ -1416,6 +1413,8 @@ namespace LONGCAT_AVATAR {
         }
 
         void free_condkv_cache() {
+            for (ggml_tensor* tensor : condkv_k_vec) unregister_persistent_tensor(tensor);
+            for (ggml_tensor* tensor : condkv_v_vec) unregister_persistent_tensor(tensor);
             if (condkv_buf) { ggml_backend_buffer_free(condkv_buf); condkv_buf = nullptr; }
             if (condkv_ctx) { ggml_free(condkv_ctx); condkv_ctx = nullptr; }
             condkv_k_vec.clear(); condkv_v_vec.clear(); condkv_ncond = -1;
@@ -1436,9 +1435,13 @@ namespace LONGCAT_AVATAR {
             }
             condkv_buf  = ggml_backend_alloc_ctx_tensors(condkv_ctx, runtime_backend);
             condkv_ncond = n_cond;
+            for (ggml_tensor* tensor : condkv_k_vec) register_persistent_tensor(tensor);
+            for (ggml_tensor* tensor : condkv_v_vec) register_persistent_tensor(tensor);
         }
 
         void free_xattn_text_cache() {
+            for (ggml_tensor* tensor : xattn_text_k_vec) unregister_persistent_tensor(tensor);
+            for (ggml_tensor* tensor : xattn_text_v_vec) unregister_persistent_tensor(tensor);
             if (xattn_text_buf) { ggml_backend_buffer_free(xattn_text_buf); xattn_text_buf = nullptr; }
             if (xattn_text_ctx) { ggml_free(xattn_text_ctx); xattn_text_ctx = nullptr; }
             xattn_text_k_vec.clear(); xattn_text_v_vec.clear(); xattn_text_nctx = -1;
@@ -1460,6 +1463,8 @@ namespace LONGCAT_AVATAR {
             }
             xattn_text_buf = ggml_backend_alloc_ctx_tensors(xattn_text_ctx, runtime_backend);
             xattn_text_nctx = n_ctx;
+            for (ggml_tensor* tensor : xattn_text_k_vec) register_persistent_tensor(tensor);
+            for (ggml_tensor* tensor : xattn_text_v_vec) register_persistent_tensor(tensor);
         }
         // RUNTIME mouth-exaggeration knob (default 1.0 = unchanged / bit-identical).
         // Set per request (API field, or the CLI via LONGCAT_AUDIO_MOUTH_SCALE).
@@ -1666,8 +1671,11 @@ namespace LONGCAT_AVATAR {
             // F16 prescaled by kv_scale=1/256 (same exact-exponent shift pattern as
             // lap-28.2 cond cache). Requires --diffusion-fa.
             //
-            // DEFAULT ON for prod. Opt out via env LONGCAT_NO_XATTN_TEXT_CACHE=1
-            // (or LONGCAT_XATTN_TEXT_CACHE=0). Auto-disables when BSA is enabled
+            // Keep this opt-in while the graph-cut executor is stabilised.  The
+            // cache saves only about 0.5 s, costs 384 MiB, and has a distinct
+            // persistent-write/read lifetime from the dense path.  Enable it for
+            // a targeted benchmark with LONGCAT_XATTN_TEXT_CACHE=1; an explicit
+            // 0 remains accepted for compatibility.  It auto-disables when BSA is enabled
             // AND we're on the resident path (params_backend == runtime_backend),
             // since DiT 8.5 + cond_kv 1.2 + BSA 195 MiB + xattn 384 MiB + compute
             // > 12 GiB at --max-vram 9 would OOM. The prod offload path keeps params
@@ -1711,7 +1719,7 @@ namespace LONGCAT_AVATAR {
             const bool is_continuation_segment = (num_ref_latents > 0 && n_cond_tokens > 0);
             const bool would_oom = would_oom_in_bsa || is_continuation_segment;
             const bool xattn_text_cache_active = !xattn_text_cache_explicit_off &&
-                                                 (xattn_text_cache_explicit_on || !would_oom) &&
+                                                 xattn_text_cache_explicit_on && !would_oom &&
                                                  runner_ctx.flash_attn_enabled &&
                                                  context != nullptr;
             if (xattn_text_cache_active) {

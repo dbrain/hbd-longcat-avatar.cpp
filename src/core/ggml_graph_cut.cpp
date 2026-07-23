@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -29,6 +30,16 @@ namespace sd::ggml_graph_cut {
             return tensor->name;
         }
         return sd_format("<tensor@%p>", (const void*)tensor);
+    }
+
+    // Views derived from one named cut retain the cut name with a descriptive
+    // suffix (for example " (reshaped)").  They are one logical cache value.
+    static std::string graph_cut_cache_identity(const std::string& name) {
+        if (name.rfind(GGML_RUNNER_CUT_PREFIX, 0) != 0) {
+            return name;
+        }
+        const size_t suffix = name.find(" (");
+        return suffix == std::string::npos ? name : name.substr(0, suffix);
     }
 
     static int graph_leaf_index(ggml_cgraph* gf, const ggml_tensor* tensor) {
@@ -294,12 +305,8 @@ namespace sd::ggml_graph_cut {
     static bool is_segment_output_needed_after(const Plan& plan,
                                                size_t end_segment_index,
                                                int output_node_index) {
-        if (end_segment_index + 1 >= plan.segments.size()) {
-            return false;
-        }
         for (size_t seg_idx = end_segment_index + 1; seg_idx < plan.segments.size(); ++seg_idx) {
-            const auto& segment = plan.segments[seg_idx];
-            for (const auto& input_ref : segment.input_refs) {
+            for (const auto& input_ref : plan.segments[seg_idx].input_refs) {
                 if (input_ref.type == Segment::INPUT_PREVIOUS_CUT &&
                     input_ref.node_index == output_node_index) {
                     return true;
@@ -311,7 +318,8 @@ namespace sd::ggml_graph_cut {
 
     static Segment make_segment_seed(const Plan& plan,
                                      size_t start_segment_index,
-                                     size_t end_segment_index) {
+                                     size_t end_segment_index,
+                                     bool preserve_orphan_outputs) {
         GGML_ASSERT(start_segment_index < plan.segments.size());
         GGML_ASSERT(end_segment_index < plan.segments.size());
         GGML_ASSERT(start_segment_index <= end_segment_index);
@@ -321,11 +329,18 @@ namespace sd::ggml_graph_cut {
         const auto& target_segment = plan.segments[end_segment_index];
         std::unordered_set<int> seen_output_node_indices;
         for (size_t seg_idx = start_segment_index; seg_idx <= end_segment_index; ++seg_idx) {
-            const bool is_boundary_segment = seg_idx == end_segment_index;
             for (int output_node_index : plan.segments[seg_idx].output_node_indices) {
-                if ((is_boundary_segment ||
-                     is_segment_output_needed_after(plan, end_segment_index, output_node_index)) &&
-                    seen_output_node_indices.insert(output_node_index).second) {
+                // Normal merged segments only need the boundary outputs that a
+                // later segment consumes.  LongCat additionally has persistent
+                // cache-write sinks: they are observed by a later *graph*, so
+                // no INPUT_PREVIOUS_CUT can express the dependency.  Preserve
+                // those orphan outputs for that runner only; retaining every
+                // output for every model turns a long LTX merge into a giant
+                // cache and defeats the weight-manager budget.
+                const bool needed_after = preserve_orphan_outputs ||
+                                          seg_idx == end_segment_index ||
+                                          is_segment_output_needed_after(plan, end_segment_index, output_node_index);
+                if (needed_after && seen_output_node_indices.insert(output_node_index).second) {
                     seed.output_node_indices.push_back(output_node_index);
                 }
             }
@@ -417,13 +432,24 @@ namespace sd::ggml_graph_cut {
                       return a.display_name < b.display_name;
                   });
         segment.input_refs = input_refs;
+        // A cut may expose several views of one backing activation.  Runtime
+        // caching aliases that backing, so budget accounting must do the same;
+        // otherwise a continuation can be planned as though the same tensor is
+        // resident once per view and split into dozens of needless segments.
+        std::unordered_set<std::string> counted_previous_cut_sources;
         for (const auto& input : input_refs) {
             ggml_tensor* current_input = input_tensor(gf, input);
-            size_t tensor_bytes        = current_input == nullptr
-                                             ? 0
-                                             : (input.type == Segment::INPUT_PREVIOUS_CUT
-                                                    ? cache_tensor_bytes(current_input)
-                                                    : ggml_nbytes(current_input));
+            size_t tensor_bytes        = 0;
+            if (current_input != nullptr) {
+                if (input.type == Segment::INPUT_PREVIOUS_CUT) {
+                    const std::string identity = graph_cut_cache_identity(input.display_name);
+                    if (counted_previous_cut_sources.insert(identity).second) {
+                        tensor_bytes = cache_tensor_bytes(current_input);
+                    }
+                } else {
+                    tensor_bytes = ggml_nbytes(current_input);
+                }
+            }
             switch (input.type) {
                 case Segment::INPUT_PREVIOUS_CUT:
                     segment.input_previous_cut_bytes += tensor_bytes;
@@ -437,9 +463,13 @@ namespace sd::ggml_graph_cut {
                     break;
             }
         }
+        std::unordered_set<std::string> counted_output_sources;
         for (int output_node_index : segment.output_node_indices) {
             ggml_tensor* output = ggml_graph_node(gf, output_node_index);
-            segment.output_bytes += cache_tensor_bytes(output);
+            const std::string identity = graph_cut_cache_identity(graph_cut_tensor_display_name(output));
+            if (counted_output_sources.insert(identity).second) {
+                segment.output_bytes += cache_tensor_bytes(output);
+            }
         }
         segment.compute_buffer_size = measure_segment_compute_buffer(backend, gf, segment, log_desc);
 
@@ -577,6 +607,24 @@ namespace sd::ggml_graph_cut {
         return tensors;
     }
 
+    std::vector<ggml_tensor*> runtime_param_tensors(ggml_cgraph* gf,
+                                                     const Segment& segment,
+                                                     const char* log_desc) {
+        std::vector<ggml_tensor*> tensors = param_tensors(gf, segment);
+        std::vector<ggml_tensor*> available;
+        available.reserve(tensors.size());
+        for (ggml_tensor* tensor : tensors) {
+            if (tensor_buffer(tensor) == nullptr) {
+                LOG_WARN("%s graph cut skipping param input without buffer: segment=%s tensor=%s",
+                         log_desc == nullptr ? "unknown" : log_desc,
+                         segment.group_name.c_str(), tensor->name);
+                continue;
+            }
+            available.push_back(tensor);
+        }
+        return available;
+    }
+
     std::unordered_set<std::string> collect_future_input_names(ggml_cgraph* gf,
                                                                const Plan& plan,
                                                                size_t current_segment_index) {
@@ -632,6 +680,49 @@ namespace sd::ggml_graph_cut {
         }
         for (int node_idx : segment.internal_node_indices) {
             ggml_graph_add_node(segment_graph, ggml_graph_node(gf, node_idx));
+        }
+
+        // ggml_new_graph_custom() starts with an empty visited-hash set.  Adding
+        // a graph-cut slice node-by-node therefore does not populate use_counts,
+        // which makes the CUDA multi-op fusion matchers reject every candidate
+        // (they correctly require one in-slice consumer).  Reconstruct the
+        // counts for this slice, and treat declared segment outputs as externally
+        // consumed so a boundary tensor is never fused away.
+        {
+            ggml_hash_set* hash_set = &segment_graph->visited_hash_set;
+            for (int node_index = 0; node_index < segment_graph->n_nodes; ++node_index) {
+                ggml_tensor* node = segment_graph->nodes[node_index];
+                size_t hash_pos = ggml_hash_insert(hash_set, node);
+                if (hash_pos == GGML_HASHSET_ALREADY_EXISTS) {
+                    hash_pos = ggml_hash_find(hash_set, node);
+                }
+                segment_graph->use_counts[hash_pos] = 0;
+            }
+
+            for (int node_index = 0; node_index < segment_graph->n_nodes; ++node_index) {
+                ggml_tensor* node = segment_graph->nodes[node_index];
+                for (int source_index = 0; source_index < GGML_MAX_SRC; ++source_index) {
+                    ggml_tensor* source = node->src[source_index];
+                    if (source == nullptr) {
+                        continue;
+                    }
+                    const size_t hash_pos = ggml_hash_find(hash_set, source);
+                    if (hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, hash_pos)) {
+                        segment_graph->use_counts[hash_pos]++;
+                    }
+                }
+            }
+
+            for (int output_node_index : segment.output_node_indices) {
+                ggml_tensor* output = ggml_graph_node(gf, output_node_index);
+                if (output == nullptr) {
+                    continue;
+                }
+                const size_t hash_pos = ggml_hash_find(hash_set, output);
+                if (hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, hash_pos)) {
+                    segment_graph->use_counts[hash_pos]++;
+                }
+            }
         }
         *graph_ctx_out = graph_ctx;
         return segment_graph;
@@ -783,6 +874,52 @@ namespace sd::ggml_graph_cut {
                           backend,
                           params_tensor_set,
                           log_desc);
+            if (std::getenv("GGML_GRAPH_CUT_PLAN_DIAG") != nullptr &&
+                !plan.segments.empty() && log_desc != nullptr) {
+                const Segment& built = plan.segments.back();
+                LOG_INFO("[GRAPH_CUT_PLAN] %s %s: internal=%zu outputs=%zu params=%.2f MiB external=%.2f MiB previous=%.2f MiB compute=%.2f MiB",
+                         log_desc,
+                         built.group_name.c_str(),
+                         built.internal_node_indices.size(),
+                         built.output_node_indices.size(),
+                         built.input_param_bytes / (1024.0 * 1024.0),
+                         built.input_external_bytes / (1024.0 * 1024.0),
+                         built.input_previous_cut_bytes / (1024.0 * 1024.0),
+                         built.compute_buffer_size / (1024.0 * 1024.0));
+                // Parameter names make an unexpectedly wide graph-cut segment
+                // diagnosable without changing its execution.  Keep this opt-in:
+                // a DiT can otherwise print thousands of leaves per request.
+                if (std::getenv("GGML_GRAPH_CUT_PLAN_DIAG_PARAMS") != nullptr &&
+                    (built.group_name == "ltxav.prelude" ||
+                     (built.group_name.find("transformer_blocks.") != std::string::npos &&
+                      built.group_name.rfind(".0") == built.group_name.size() - 2))) {
+                    for (const auto& input : built.input_refs) {
+                        if (input.type != Segment::INPUT_PARAM) {
+                            continue;
+                        }
+                        ggml_tensor* tensor = input_tensor(gf, input);
+                        LOG_INFO("[GRAPH_CUT_PARAM] %s %s %.2f MiB",
+                                 built.group_name.c_str(),
+                                 input.display_name.c_str(),
+                                 tensor == nullptr ? 0.0 : ggml_nbytes(tensor) / (1024.0 * 1024.0));
+                    }
+                }
+                // Cross-cut activations determine whether the budget merger can
+                // combine transformer blocks.  Report them separately on
+                // request: unlike parameter leaves, there are normally only a
+                // few and their names identify an unexpectedly wide boundary.
+                if (std::getenv("GGML_GRAPH_CUT_PLAN_DIAG_INPUTS") != nullptr &&
+                    built.group_name == "ltxav.transformer_blocks.0") {
+                    for (const auto& input : built.input_refs) {
+                        ggml_tensor* tensor = input_tensor(gf, input);
+                        LOG_INFO("[GRAPH_CUT_INPUT] %s type=%d %s %.2f MiB",
+                                 built.group_name.c_str(),
+                                 static_cast<int>(input.type),
+                                 input.display_name.c_str(),
+                                 tensor == nullptr ? 0.0 : cache_tensor_bytes(tensor) / (1024.0 * 1024.0));
+                    }
+                }
+            }
         }
 
         int final_output_index = graph_node_index_by_name(gf, "ggml_runner_final_result_tensor");
@@ -836,6 +973,8 @@ namespace sd::ggml_graph_cut {
 
         std::unordered_set<int> available_cut_output_node_indices;
         available_cut_output_node_indices.reserve(static_cast<size_t>(n_nodes));
+        const bool preserve_orphan_outputs = log_desc != nullptr &&
+                                             std::strcmp(log_desc, "Longcat-Video-Avatar") == 0;
 
         size_t start_segment_index = 0;
         while (start_segment_index < base_plan.segments.size()) {
@@ -843,7 +982,8 @@ namespace sd::ggml_graph_cut {
             auto single_available_cut_output_node_indices = available_cut_output_node_indices;
             auto single_seed                              = make_segment_seed(base_plan,
                                                                               start_segment_index,
-                                                                              start_segment_index);
+                                                                              start_segment_index,
+                                                                              preserve_orphan_outputs);
             build_segment(gf,
                           single_plan,
                           single_seed,
@@ -863,7 +1003,8 @@ namespace sd::ggml_graph_cut {
                 auto candidate_available_cut_output_node_indices = available_cut_output_node_indices;
                 auto candidate_seed                              = make_segment_seed(base_plan,
                                                                                      start_segment_index,
-                                                                                     next_end_segment_index);
+                                                                                     next_end_segment_index,
+                                                                                     preserve_orphan_outputs);
                 build_segment(gf,
                               candidate_plan,
                               candidate_seed,
@@ -879,13 +1020,13 @@ namespace sd::ggml_graph_cut {
                 if (candidate_bytes > max_graph_vram_bytes) {
                     break;
                 }
-
                 best_end_segment_index = next_end_segment_index;
             }
 
             auto best_seed = make_segment_seed(base_plan,
                                                start_segment_index,
-                                               best_end_segment_index);
+                                               best_end_segment_index,
+                                               preserve_orphan_outputs);
             build_segment(gf,
                           merged_plan,
                           best_seed,

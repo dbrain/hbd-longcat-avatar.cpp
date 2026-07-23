@@ -2,6 +2,8 @@
 #define __SD_MODEL_DIFFUSION_LTXV_HPP__
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -32,6 +34,22 @@ namespace LTXV {
             return ggml_permute(ctx, mod, 0, 2, 1, 3);
         }
         return mod;
+    }
+
+    // Expand a compact [dim, 1, unique_timestep_count] AdaLN chunk back to
+    // token order. This is a gather only: the compact modulation remains a
+    // graph-cut/cached prelude value until a transformer block consumes it.
+    __STATIC_INLINE__ ggml_tensor* gather_mod_tokens(ggml_context* ctx,
+                                                      ggml_tensor* c,
+                                                      ggml_tensor* sel) {
+        if (sel == nullptr) {
+            return c;
+        }
+        const int64_t dim = c->ne[0];
+        const int64_t unique_count = c->ne[2];
+        auto compact = ggml_reshape_2d(ctx, ggml_cont(ctx, c), dim, unique_count);
+        auto gathered = ggml_get_rows(ctx, compact, sel);
+        return ggml_reshape_3d(ctx, gathered, dim, 1, sel->ne[0]);
     }
 
     __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,
@@ -1179,7 +1197,8 @@ namespace LTXV {
                                                  int64_t dim,
                                                  int64_t coeff,
                                                  int64_t start = 0,
-                                                 int64_t count = -1) {
+                                                 int64_t count = -1,
+                                                 ggml_tensor* expand_sel = nullptr) {
             if (count < 0) {
                 count = coeff - start;
             }
@@ -1190,7 +1209,13 @@ namespace LTXV {
             s           = ggml_repeat(ctx->ggml_ctx, s, e);
             auto out    = ggml_add(ctx->ggml_ctx, s, t);
             auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
-            return std::vector<ggml_tensor*>(chunks.begin() + start, chunks.begin() + start + count);
+            std::vector<ggml_tensor*> selected(chunks.begin() + start, chunks.begin() + start + count);
+            if (expand_sel != nullptr) {
+                for (auto& chunk : selected) {
+                    chunk = gather_mod_tokens(ctx->ggml_ctx, chunk, expand_sel);
+                }
+            }
+            return selected;
         }
 
         ggml_tensor* apply_text_cross_attention(GGMLRunnerContext* ctx,
@@ -1202,9 +1227,10 @@ namespace LTXV {
                                                 ggml_tensor* timestep,
                                                 ggml_tensor* prompt_timestep,
                                                 int64_t dim,
-                                                ggml_tensor* attention_mask) {
+                                                ggml_tensor* attention_mask,
+                                                ggml_tensor* expand_sel = nullptr) {
             if (cross_attention_adaln) {
-                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3);
+                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, expand_sel);
                 auto q           = rms_norm(ctx->ggml_ctx, x);
                 q                = LTXV::modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
                 auto context_mod = context;
@@ -1255,7 +1281,7 @@ namespace LTXV {
             bool run_a2v = run_ax;
             bool run_v2a = run_ax;
 
-            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6);
+            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
             v_norm      = LTXV::modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
@@ -1269,7 +1295,8 @@ namespace LTXV {
                                                      v_timestep,
                                                      v_prompt_timestep,
                                                      v_dim,
-                                                     attention_mask);
+                                                     attention_mask,
+                                                     ctx->ltx_video_token_sel);
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
 
             if (run_ax) {
@@ -1325,7 +1352,7 @@ namespace LTXV {
                 ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
             }
 
-            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3);
+            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, ctx->ltx_video_token_sel);
             auto vx_scaled = rms_norm(ctx->ggml_ctx, vx);
             vx_scaled      = LTXV::modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
             auto v_ff_out  = ff->forward(ctx, vx_scaled);
@@ -1577,12 +1604,19 @@ namespace LTXV {
         std::vector<ggml_tensor*> get_output_scale_shift(GGMLRunnerContext* ctx,
                                                          ggml_tensor* table,
                                                          ggml_tensor* embedded_timestep,
-                                                         int64_t dim) {
+                                                         int64_t dim,
+                                                         ggml_tensor* expand_sel = nullptr) {
             auto temp = ggml_new_tensor_3d(ctx->ggml_ctx, embedded_timestep->type, dim, 2, embedded_timestep->ne[1]);
             auto t    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, embedded_timestep, dim, 1, embedded_timestep->ne[1]), temp);
             auto s    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, table, dim, 2, 1), temp);
             auto out  = ggml_add(ctx->ggml_ctx, s, t);
-            return ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            if (expand_sel != nullptr) {
+                for (auto& chunk : chunks) {
+                    chunk = gather_mod_tokens(ctx->ggml_ctx, chunk, expand_sel);
+                }
+            }
+            return chunks;
         }
 
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
@@ -1655,7 +1689,14 @@ namespace LTXV {
                     v_prompt_timestep_mod          = prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
                     a_prompt_timestep_mod          = audio_prompt_adaln_single->forward(ctx, a_timestep_scaled).first;
                 }
-                auto av_ca_video_timestep = repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
+                // With video modulation collapse, `timestep` is the compact
+                // unique-value table.  A scalar audio timestep is already the
+                // correct broadcast for the AV connector; expanding it to the
+                // compact width creates an incompatible modulation shape.
+                const bool mod_collapse = ctx->ltx_video_token_sel != nullptr;
+                auto av_ca_video_timestep = (mod_collapse && effective_audio_timestep->ne[0] == 1)
+                                                   ? effective_audio_timestep
+                                                   : repeat_scalar_timestep_like(ctx, effective_audio_timestep, timestep);
                 auto av_ca_audio_timestep = effective_audio_timestep;
                 auto av_ca_factor         = config.av_ca_timestep_scale_multiplier / config.timestep_scale_multiplier;
                 av_ca_video_scale_shift_timestep =
@@ -1674,6 +1715,33 @@ namespace LTXV {
 
             sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.prelude", "vx");
             sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.prelude", "ax");
+            // The transformer blocks all consume the preprocessed text/audio
+            // contexts and AdaLN values below.  Keeping only vx/ax at this
+            // boundary makes every block segment walk back through the whole
+            // connector/prelude graph, so the weight manager stages several
+            // GiB of shared parameters for every block.  Materialize those
+            // invariant values with the prelude and pass them as graph-cut
+            // inputs instead.  This preserves the graph numerics while making
+            // per-block parameter residency reflect the actual block.
+            {
+                sd::ggml_graph_cut::mark_graph_cut(v_context, "ltxav.prelude", "v_context");
+                if (a_context != v_context) {
+                    sd::ggml_graph_cut::mark_graph_cut(a_context, "ltxav.prelude", "a_context");
+                }
+                // These are invariant for every transformer block.  The graph-cut
+                // cache aliases views that share a backing activation, so keeping
+                // these at the prelude boundary does not multiply their storage.
+                sd::ggml_graph_cut::mark_graph_cut(v_timestep_mod, "ltxav.prelude", "v_timestep_mod");
+                sd::ggml_graph_cut::mark_graph_cut(v_embedded_time, "ltxav.prelude", "v_embedded_time");
+                sd::ggml_graph_cut::mark_graph_cut(a_timestep_mod, "ltxav.prelude", "a_timestep_mod");
+                sd::ggml_graph_cut::mark_graph_cut(a_embedded_time, "ltxav.prelude", "a_embedded_time");
+                sd::ggml_graph_cut::mark_graph_cut(v_prompt_timestep_mod, "ltxav.prelude", "v_prompt_timestep_mod");
+                sd::ggml_graph_cut::mark_graph_cut(a_prompt_timestep_mod, "ltxav.prelude", "a_prompt_timestep_mod");
+                sd::ggml_graph_cut::mark_graph_cut(av_ca_video_scale_shift_timestep, "ltxav.prelude", "av_ca_video_scale_shift");
+                sd::ggml_graph_cut::mark_graph_cut(av_ca_a2v_gate_noise_timestep, "ltxav.prelude", "av_ca_a2v_gate_noise");
+                sd::ggml_graph_cut::mark_graph_cut(av_ca_audio_scale_shift_timestep, "ltxav.prelude", "av_ca_audio_scale_shift");
+                sd::ggml_graph_cut::mark_graph_cut(av_ca_v2a_gate_noise_timestep, "ltxav.prelude", "av_ca_v2a_gate_noise");
+            }
 
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<BasicAVTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
@@ -1701,7 +1769,7 @@ namespace LTXV {
                 sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.transformer_blocks." + std::to_string(i), "ax");
             }
 
-            auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size);
+            auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, ctx->ltx_video_token_sel);
             vx                 = norm_out->forward(ctx, vx);
             vx                 = LTXV::modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
             vx                 = proj_out->forward(ctx, vx);
@@ -1730,6 +1798,10 @@ namespace LTXV {
         std::vector<float> audio_connector_pe_vec;
         sd::Tensor<float> vx_input_cache;
         sd::Tensor<float> ax_input_cache;
+        // These must outlive graph construction because the selector is an
+        // externally-backed graph input.
+        sd::Tensor<float> v_timestep_compact_cache;
+        std::vector<int32_t> v_token_sel_vec;
 
         LTXAVRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -1832,8 +1904,54 @@ namespace LTXV {
 
             ggml_tensor* vx         = make_input(vx_input_cache);
             ggml_tensor* ax         = make_optional_input(ax_input_cache);
-            ggml_tensor* timesteps  = make_input(timesteps_tensor);
+            ggml_tensor* timesteps  = nullptr;
+            ggml_tensor* v_token_sel_input = nullptr;
+            // Production-fork default: scalar T2V is unchanged; masked
+            // continuation uses compact modulation unless explicitly disabled.
+            bool collapse_enabled = true;
+            if (const char* value = std::getenv("LTX_MOD_COLLAPSE")) {
+                collapse_enabled = value[0] != '0';
+            }
+            const bool no_dedup = std::getenv("LTX_MOD_NO_DEDUP") != nullptr;
+            const int64_t n_timesteps = static_cast<int64_t>(timesteps_tensor.numel());
+            if (collapse_enabled && n_timesteps > 1) {
+                const float* timestep_data = timesteps_tensor.data();
+                std::vector<float> unique_timesteps;
+                v_token_sel_vec.resize(static_cast<size_t>(n_timesteps));
+                for (int64_t i = 0; i < n_timesteps; ++i) {
+                    const float timestep = timestep_data[i];
+                    int32_t unique_index = -1;
+                    if (!no_dedup) {
+                        for (size_t j = 0; j < unique_timesteps.size(); ++j) {
+                            if (unique_timesteps[j] == timestep) {
+                                unique_index = static_cast<int32_t>(j);
+                                break;
+                            }
+                        }
+                    }
+                    if (unique_index < 0) {
+                        unique_index = static_cast<int32_t>(unique_timesteps.size());
+                        unique_timesteps.push_back(timestep);
+                    }
+                    v_token_sel_vec[static_cast<size_t>(i)] = unique_index;
+                }
+                v_timestep_compact_cache = sd::Tensor<float>({static_cast<int64_t>(unique_timesteps.size())}, unique_timesteps);
+                timesteps = make_input(v_timestep_compact_cache);
+                v_token_sel_input = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, n_timesteps);
+                ggml_set_name(v_token_sel_input, "ltxav_video_token_sel");
+                set_backend_tensor_data(v_token_sel_input, v_token_sel_vec.data());
+                LOG_DEBUG("ltxav modulation collapse: %lld video tokens -> %zu unique timesteps", (long long)n_timesteps, unique_timesteps.size());
+            } else {
+                timesteps = make_input(timesteps_tensor);
+            }
             ggml_tensor* a_timestep = make_optional_input(audio_timesteps_tensor);
+            // The audio/prompt AdaLN path is indexed independently from video
+            // tokens.  It must retain the legacy per-frame timeline when the
+            // video path is compacted; otherwise its text-context broadcast
+            // sees the compact U=2 width and cannot repeat it safely.
+            if (a_timestep == nullptr && collapse_enabled && n_timesteps > 1) {
+                a_timestep = make_input(timesteps_tensor);
+            }
             ggml_tensor* context    = make_optional_input(context_tensor);
 
             ggml_cgraph* gf = new_graph_custom(LTXAV_GRAPH_SIZE);
@@ -1960,6 +2078,7 @@ namespace LTXV {
             }
 
             auto runner_ctx = get_context();
+            runner_ctx.ltx_video_token_sel = v_token_sel_input;
             auto out_pair   = model.forward(&runner_ctx,
                                             vx,
                                             ax,

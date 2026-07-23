@@ -1,6 +1,7 @@
 #include "model_manager.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iterator>
 #include <mutex>
@@ -51,6 +52,17 @@ static bool backend_supports_host_buffer(ggml_backend_t backend) {
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
     return props.caps.buffer_from_host_ptr;
+}
+
+static bool model_manager_profile_enabled() {
+    const char* value = std::getenv("SD_MODEL_MANAGER_PROFILE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static size_t model_manager_resident_headroom_bytes() {
+    const char* value = std::getenv("LONGCAT_SHARED_RESIDENT_HEADROOM_MB");
+    const double mb = value != nullptr && value[0] != '\0' ? std::atof(value) : 512.0;
+    return static_cast<size_t>(std::max(0.0, mb) * 1024.0 * 1024.0);
 }
 
 ModelManager::~ModelManager() {
@@ -286,6 +298,14 @@ bool ModelManager::load_all_params_eagerly() {
     return load_tensors_to_params_backend(all_states);
 }
 
+void ModelManager::reclaim_transient_compute_buffers() {
+    // A caller uses this only at a serialized request/window boundary, after
+    // every participating runner has completed.  Force-release avoids a stale
+    // bookkeeping reference pinning a temporary GPU staging block across the
+    // next video window; host/mmap parameter storage is intentionally kept.
+    release_compute_staging_blocks(true);
+}
+
 bool ModelManager::validate_registered_tensors() {
     bool ok = true;
     for (const auto& state : tensor_states_) {
@@ -400,6 +420,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             continue;
         }
 
+        const bool profile = model_manager_profile_enabled();
         int64_t t0 = ggml_time_ms();
 
         ggml_init_params init_params;
@@ -426,6 +447,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             return false;
         }
         ggml_backend_buffer_set_usage(compute_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        int64_t t_alloc = ggml_time_ms();
 
         for (auto& staged_tensor : staged_tensors) {
             TensorState* state          = staged_tensor.first;
@@ -436,7 +458,9 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             std::swap(managed_tensor->data, staging_tensor->data);
             std::swap(managed_tensor->extra, staging_tensor->extra);
         }
+        int64_t t_enqueue = ggml_time_ms();
         ggml_backend_synchronize(compute_backend);
+        int64_t t_sync = ggml_time_ms();
 
         auto block             = std::make_unique<ComputeStagingBlock>();
         block->compute_backend = compute_backend;
@@ -455,6 +479,22 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
                   states.size(),
                   ggml_backend_name(compute_backend),
                   (t1 - t0) * 1.0f / 1000);
+        if (profile) {
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            if (ggml_backend_dev_t device = ggml_backend_get_device(compute_backend); device != nullptr) {
+                ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+            }
+            LOG_INFO("[MM_PROFILE] stage %.2f MiB / %zu tensors: alloc=%lld ms enqueue=%lld ms sync=%lld ms total=%lld ms",
+                     ggml_backend_buffer_get_size(compute_buffer) / (1024.f * 1024.f),
+                     states.size(),
+                     (long long) (t_alloc - t0),
+                     (long long) (t_enqueue - t_alloc),
+                     (long long) (t_sync - t_enqueue),
+                     (long long) (t_sync - t0));
+            LOG_INFO("[MM_PROFILE] post-stage VRAM: free=%.2f MiB total=%.2f MiB",
+                     free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0));
+        }
     }
 
     return true;
@@ -898,14 +938,33 @@ void ModelManager::release_compute_staging_blocks(bool force,
                                               target_states->find(state) == target_states->end()) {
                                               return false;
                                           }
-                                          return state->active_prepare_count == 0;
+                                          return state->active_prepare_count == 0 &&
+                                                 state->retained_compute_count == 0;
                                       });
         }
 
         if (can_release) {
+            if (model_manager_profile_enabled() && block->buffer != nullptr) {
+                LOG_INFO("[MM_PROFILE] release compute %.2f MiB / %zu tensors",
+                         ggml_backend_buffer_get_size(block->buffer) / (1024.f * 1024.f),
+                         block->staged_tensors.size());
+            }
             free_compute_staging_block(*block);
             it = compute_staging_blocks_.erase(it);
         } else {
+            if (model_manager_profile_enabled() && block->buffer != nullptr) {
+                size_t active_tensors = 0;
+                for (const auto& staged_tensor : block->staged_tensors) {
+                    const TensorState* state = staged_tensor.first;
+                    if (state != nullptr && state->active_prepare_count > 0) {
+                        ++active_tensors;
+                    }
+                }
+                LOG_INFO("[MM_PROFILE] retain compute %.2f MiB / %zu tensors (%zu active)",
+                         ggml_backend_buffer_get_size(block->buffer) / (1024.f * 1024.f),
+                         block->staged_tensors.size(),
+                         active_tensors);
+            }
             ++it;
         }
     }
@@ -1100,6 +1159,70 @@ bool ModelManager::prepare_params(const std::vector<ggml_tensor*>& tensors) {
     return true;
 }
 
+bool ModelManager::retain_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
+    if (tensors.empty()) {
+        return true;
+    }
+
+    std::vector<TensorState*> required_states;
+    if (!resolve_required_tensor_states(tensors, required_states)) {
+        return false;
+    }
+
+    size_t new_bytes = 0;
+    ggml_backend_t compute_backend = nullptr;
+    for (TensorState* state : required_states) {
+        if (state == nullptr || should_ignore(*state) || is_optional_missing_tensor(state->name)) {
+            continue;
+        }
+        if (state->retained_compute_count > 0) {
+            continue;
+        }
+        if (state->compute_backend == nullptr || state->tensor == nullptr) {
+            LOG_ERROR("model manager cannot retain tensor '%s' without a compute backend", state->name.c_str());
+            return false;
+        }
+        if (compute_backend == nullptr) {
+            compute_backend = state->compute_backend;
+        } else if (compute_backend != state->compute_backend) {
+            LOG_ERROR("model manager cannot retain tensors across different compute backends");
+            return false;
+        }
+        new_bytes += ggml_nbytes(state->tensor);
+    }
+
+    if (compute_backend != nullptr) {
+        ggml_backend_dev_t device = ggml_backend_get_device(compute_backend);
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        if (device != nullptr) {
+            ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        }
+        const size_t headroom = model_manager_resident_headroom_bytes();
+        if (free_bytes != 0 && (new_bytes > free_bytes || free_bytes - new_bytes < headroom)) {
+            LOG_WARN("model manager declined %.2f MiB retained compute weights: %.2f MiB free, %.2f MiB headroom",
+                     new_bytes / (1024.0 * 1024.0), free_bytes / (1024.0 * 1024.0),
+                     headroom / (1024.0 * 1024.0));
+            return false;
+        }
+    }
+
+    if (!load_tensors_to_params_backend(required_states) ||
+        !stage_tensors_to_compute_backend(required_states)) {
+        release_compute_staging_blocks(false);
+        release_params_storage_blocks(false);
+        return false;
+    }
+    for (TensorState* state : required_states) {
+        if (state != nullptr && !should_ignore(*state) && !is_optional_missing_tensor(state->name)) {
+            state->retained_compute_count++;
+        }
+    }
+    LOG_INFO("model manager retained %zu compute tensors (%.2f MiB newly reserved)",
+             required_states.size(), new_bytes / (1024.0 * 1024.0));
+    return true;
+}
+
 void ModelManager::finish_compute_backend_usage(const std::vector<TensorState*>& states) {
     if (states.empty()) {
         return;
@@ -1126,6 +1249,22 @@ void ModelManager::release_compute_backend_params(const std::vector<ggml_tensor*
         return;
     }
     finish_compute_backend_usage(required_states);
+}
+
+void ModelManager::release_retained_compute_backend_params(const std::vector<ggml_tensor*>& tensors) {
+    if (tensors.empty()) {
+        return;
+    }
+    std::vector<TensorState*> required_states;
+    if (!resolve_required_tensor_states(tensors, required_states)) {
+        return;
+    }
+    for (TensorState* state : required_states) {
+        if (state != nullptr && state->retained_compute_count > 0) {
+            state->retained_compute_count--;
+        }
+    }
+    release_compute_staging_blocks(false);
 }
 
 void ModelManager::release_params_backend_params(const std::vector<ggml_tensor*>& tensors) {

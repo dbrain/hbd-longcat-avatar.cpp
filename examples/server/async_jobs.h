@@ -64,6 +64,13 @@ struct AsyncGenerationJob {
     std::string ltx_chain_audio_full;
     std::string ltx_chain_audio_track;
     int ltx_chain_audio_offset_frames = 0;
+    // Retake/seam/audio policy is durable job state rather than an endpoint-only
+    // concern: a queued job must retain precisely the contract that was staged.
+    int ltx_retake_segment = -1;
+    int ltx_cont_seam_drop_frames = 0;
+    std::vector<int> ltx_segment_seam_drop_frames;
+    std::vector<std::string> ltx_segment_audio_full;
+    std::vector<std::string> ltx_segment_audio_track;
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;
     bool ltx_emit_segments = false;

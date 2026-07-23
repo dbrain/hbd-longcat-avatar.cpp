@@ -41,6 +41,7 @@ private:
         bool metadata_validated            = false;
 
         int active_prepare_count = 0;
+        int retained_compute_count = 0;
 
         bool loaded_to_params_backend  = false;
         bool staged_to_compute_backend = false;
@@ -175,10 +176,18 @@ public:
     bool validate_registered_tensors();
     bool load_all_params_eagerly();
 
+    // A request/window boundary is stronger than a normal graph completion: no
+    // runner may still own a staged compute buffer, while CPU/mmap parameter
+    // storage must remain intact for the next window.  This deliberately does
+    // not touch params_storage_blocks_.
+    void reclaim_transient_compute_buffers();
+
     bool assign_compute_backend(const std::vector<ggml_tensor*>& tensors,
                                 ggml_backend_t compute_backend) override;
     bool prepare_params(const std::vector<ggml_tensor*>& tensors) override;
+    bool retain_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+    void release_retained_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void release_params_backend_params(const std::vector<ggml_tensor*>& tensors) override;
 };
 

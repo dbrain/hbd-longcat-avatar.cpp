@@ -326,6 +326,47 @@ public:
         return params_backend_for(module) != nullptr;
     }
 
+    // Keep CPU/mmap parameter residency warm across LTX continuation windows,
+    // but return every transient GPU allocation before the next window plans
+    // its graph-cut cache. This is an upstream weight-manager boundary, not a
+    // return to the fork's resident-weight implementation.
+    void reclaim_ltx_chain_window_gpu_memory() {
+        auto finish_runner = [](auto& runner) {
+            if (!runner) {
+                return;
+            }
+            runner->runner_done();
+            runner->free_cache_ctx_and_buffer();
+        };
+        finish_runner(diffusion_model);
+        finish_runner(high_noise_diffusion_model);
+        finish_runner(first_stage_model);
+        finish_runner(audio_vae_model);
+        if (model_manager) {
+            model_manager->reclaim_transient_compute_buffers();
+        }
+
+        std::set<ggml_backend_t> backends;
+        for (SDBackendModule module : {SDBackendModule::DIFFUSION, SDBackendModule::VAE, SDBackendModule::TE}) {
+            if (ggml_backend_t backend = backend_for(module); backend != nullptr && ggml_backend_is_cuda(backend)) {
+                backends.insert(backend);
+            }
+        }
+        for (ggml_backend_t backend : backends) {
+            ggml_backend_synchronize(backend);
+            ggml_backend_cuda_trim_memory(backend);
+        }
+
+        // LTX's cuDNN Conv3D path reorders each temporary staged VAE weight
+        // buffer. The cache is keyed by that temporary device address, so it
+        // cannot be kept safely into the next window and is outside VMM trim.
+        // Do not touch the CUDA runtime for a CPU-only LTX invocation.
+        if (!backends.empty()) {
+            ggml_backend_cuda_release_cudnn_conv3d_weights();
+        }
+        LOG_INFO("LTX chain boundary: reclaimed transient staged weights, CUDA VMM pages, and cuDNN Conv3D reorder buffers");
+    }
+
     template <typename T>
     bool register_runner_params(const std::string& desc,
                                 const std::shared_ptr<T>& model,
@@ -1786,6 +1827,7 @@ public:
                            version == VERSION_HIDREAM_O1 ||
                            sd_version_is_anima(version) ||
                            sd_version_is_ernie_image(version) ||
+                           sd_version_is_longcat_avatar(version) ||
                            sd_version_is_z_image(version) ||
                            sd_version_is_boogu_image(version) ||
                            sd_version_is_pid(version) ||
@@ -1793,6 +1835,11 @@ public:
                     pred_type = FLOW_PRED;
                     if (sd_version_is_wan(version)) {
                         default_flow_shift = 5.f;
+                    } else if (sd_version_is_longcat_avatar(version)) {
+                        // LongCat Avatar 1.5 is trained with FlowMatchEulerDiscrete
+                        // timestep shifting, not epsilon prediction. Keep this distinct
+                        // from the generic Wan 5.0 shift.
+                        default_flow_shift = 7.f;
                     } else if (sd_version_is_hunyuan_video(version)) {
                         default_flow_shift = 7.f;
                     } else if (sd_version_is_ernie_image(version)) {
@@ -2191,7 +2238,12 @@ public:
             return {sefi_denoiser->sem_timesteps[sched_idx],
                     sefi_denoiser->tex_timesteps[sched_idx]};
         }
-        if (diffusion_model->get_desc() == "Wan2.2-TI2V-5B") {
+        if (diffusion_model->get_desc() == "Wan2.2-TI2V-5B" ||
+            sd_version_is_longcat_avatar(version) ||
+            (version == VERSION_WAN2_2_I2V && !denoise_mask.empty())) {
+            // Avatar reference latents are clean conditioning anchors. Their
+            // per-frame timestep must be zero whenever the denoise mask pins
+            // them, matching the model's trained AI2V conditioning path.
             int64_t frame_count = init_latent.shape()[2];
             auto new_timesteps  = std::vector<float>(static_cast<size_t>(frame_count), timesteps[0]);
 
@@ -3748,6 +3800,11 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->cont_latent_height                     = 0;
     sd_vid_gen_params->cont_latent_frames                     = 0;
     sd_vid_gen_params->cont_latent_channels                   = 0;
+    sd_vid_gen_params->end_cont_latent                         = nullptr;
+    sd_vid_gen_params->end_cont_latent_width                   = 0;
+    sd_vid_gen_params->end_cont_latent_height                  = 0;
+    sd_vid_gen_params->end_cont_latent_frames                  = 0;
+    sd_vid_gen_params->end_cont_latent_channels                = 0;
     sd_vid_gen_params->audio_path                            = nullptr;
     sd_vid_gen_params->audio_frame_offset                    = 0;
     sd_vid_gen_params->bsa_enabled                           = 0;
@@ -3981,6 +4038,22 @@ static scheduler_t resolve_scheduler(sd_ctx_t* sd_ctx,
 // than the generic discrete scheduler.  The server selects it explicitly for
 // the distilled GGUFs with WAN_DISTILL_SIGMAS=1; full-step Wan must retain the
 // normal scheduler.
+// LongCat-Video-Avatar 1.5 DMD distilled sigma schedule.  The folded DMD
+// checkpoint is trained on this FlowMatch grid, not the generic discrete grid.
+static std::vector<float> build_longcat_dmd_sigmas(int distill_steps, int num_train_timesteps, float shift) {
+    std::vector<float> sigmas;
+    sigmas.reserve(distill_steps + 1);
+    for (int i = distill_steps; i >= 1; --i) {
+        long index = std::lround(static_cast<double>(i) * (num_train_timesteps / distill_steps));
+        index = num_train_timesteps - index;
+        const double raw = static_cast<double>(num_train_timesteps - 1 - index) / (num_train_timesteps - 1);
+        const double shifted = static_cast<double>(shift) * raw / (1.0 + (static_cast<double>(shift) - 1.0) * raw);
+        sigmas.push_back(static_cast<float>(shifted));
+    }
+    sigmas.push_back(0.0f);
+    return sigmas;
+}
+
 static std::vector<float> build_wan_distill_sigmas(int n_high, int n_low, int num_train_timesteps, float shift) {
     const int boundary_t = num_train_timesteps / 2;
     n_high = std::max(1, n_high);
@@ -4351,6 +4424,15 @@ struct SamplePlan {
                                                       scheduler,
                                                       sd_ctx->sd->version,
                                                       sample_params->extra_sample_args);
+        }
+
+        if (sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
+            sample_params->custom_sigmas_count <= 0) {
+            const int dmd_steps = (sample_steps > 0 && sample_steps < 8) ? sample_steps : 8;
+            sigmas = build_longcat_dmd_sigmas(dmd_steps, 1000, 7.0f);
+            total_steps = static_cast<int>(sigmas.size()) - 1;
+            sample_steps = total_steps;
+            LOG_INFO("LongCat-Avatar DMD distilled schedule: %d steps", total_steps);
         }
 
         if (sd_version_is_wan(sd_ctx->sd->version) &&
@@ -5896,7 +5978,8 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             return std::nullopt;
         }
 
-        if (sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) {
+        if ((sd_vid_gen_params->cont_latent != nullptr && sd_vid_gen_params->cont_latent_frames > 0) ||
+            (sd_vid_gen_params->end_cont_latent != nullptr && sd_vid_gen_params->end_cont_latent_frames > 0)) {
             // LTX chain continuation: retain the sampled video-space tail directly
             // as fixed leading context for the next window. This stays entirely in
             // latent space; decoding is only needed when rebuilding a durable prefix.
@@ -5910,10 +5993,11 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             const int64_t frames = latents.init_latent.shape()[2];
             const int64_t channels = latents.init_latent.shape()[3];
             const int64_t carried_frames = sd_vid_gen_params->cont_latent_frames;
-            if (sd_vid_gen_params->cont_latent_width != width ||
-                sd_vid_gen_params->cont_latent_height != height ||
-                sd_vid_gen_params->cont_latent_channels != channels ||
-                carried_frames <= 0 || carried_frames > frames) {
+            if (sd_vid_gen_params->cont_latent != nullptr &&
+                (sd_vid_gen_params->cont_latent_width != width ||
+                 sd_vid_gen_params->cont_latent_height != height ||
+                 sd_vid_gen_params->cont_latent_channels != channels ||
+                 carried_frames <= 0 || carried_frames > frames)) {
                 LOG_ERROR("LTX continuation latent shape mismatch: got %dx%dx%dx%d, expected %lldx%lldx1..%lldx%lld",
                           sd_vid_gen_params->cont_latent_width,
                           sd_vid_gen_params->cont_latent_height,
@@ -5925,25 +6009,60 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                           (long long)channels);
                 return std::nullopt;
             }
-            sd::Tensor<float> continuation({width, height, carried_frames, channels, 1});
-            std::memcpy(continuation.data(),
-                        sd_vid_gen_params->cont_latent,
-                        static_cast<size_t>(continuation.numel()) * sizeof(float));
             float mask_value = 0.f;
             if (const char* configured = std::getenv("LTXAV_CONT_OVERLAP_MASK")) {
                 mask_value = std::clamp(static_cast<float>(atof(configured)), 0.f, 1.f);
             }
-            if (!apply_ltxav_condition_by_latent_index(&latents.init_latent,
-                                                       &latents.denoise_mask,
-                                                       continuation,
-                                                       0,
-                                                       "continuation",
-                                                       mask_value)) {
-                return std::nullopt;
+            if (sd_vid_gen_params->cont_latent != nullptr) {
+                sd::Tensor<float> continuation({width, height, carried_frames, channels, 1});
+                std::memcpy(continuation.data(),
+                            sd_vid_gen_params->cont_latent,
+                            static_cast<size_t>(continuation.numel()) * sizeof(float));
+                if (!apply_ltxav_condition_by_latent_index(&latents.init_latent,
+                                                           &latents.denoise_mask,
+                                                           continuation,
+                                                           0,
+                                                           "continuation",
+                                                           mask_value)) {
+                    return std::nullopt;
+                }
+                LOG_INFO("LTX continuation: pinned %lld carried latent frame(s), mask=%.2f",
+                         (long long)carried_frames,
+                         mask_value);
             }
-            LOG_INFO("LTX continuation: pinned %lld carried latent frame(s), mask=%.2f",
-                     (long long)carried_frames,
-                     mask_value);
+            const int64_t end_frames = sd_vid_gen_params->end_cont_latent_frames;
+            if (sd_vid_gen_params->end_cont_latent != nullptr) {
+                if (sd_vid_gen_params->end_cont_latent_width != width ||
+                    sd_vid_gen_params->end_cont_latent_height != height ||
+                    sd_vid_gen_params->end_cont_latent_channels != channels ||
+                    end_frames <= 0 || end_frames > frames) {
+                    LOG_ERROR("LTX end continuation latent shape mismatch: got %dx%dx%dx%d, expected %lldx%lldx1..%lldx%lld",
+                              sd_vid_gen_params->end_cont_latent_width,
+                              sd_vid_gen_params->end_cont_latent_height,
+                              sd_vid_gen_params->end_cont_latent_frames,
+                              sd_vid_gen_params->end_cont_latent_channels,
+                              (long long)width,
+                              (long long)height,
+                              (long long)frames,
+                              (long long)channels);
+                    return std::nullopt;
+                }
+                sd::Tensor<float> end_continuation({width, height, end_frames, channels, 1});
+                std::memcpy(end_continuation.data(),
+                            sd_vid_gen_params->end_cont_latent,
+                            static_cast<size_t>(end_continuation.numel()) * sizeof(float));
+                if (!apply_ltxav_condition_by_latent_index(&latents.init_latent,
+                                                           &latents.denoise_mask,
+                                                           end_continuation,
+                                                           frames - end_frames,
+                                                           "end continuation",
+                                                           mask_value)) {
+                    return std::nullopt;
+                }
+                LOG_INFO("LTX retake: pinned %lld end latent frame(s), mask=%.2f",
+                         (long long)end_frames,
+                         mask_value);
+            }
         } else if (!start_image.empty() || !end_image.empty()) {
             if (!start_image.empty() && !end_image.empty()) {
                 LOG_INFO("FLF2V");
@@ -7159,7 +7278,6 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
-
     if (latent_upscale_enabled) {
         if (sd_ctx->sd->get_cancel_flag() == SD_CANCEL_ALL) {
             LOG_ERROR("cancelling generation before latent upscale");
@@ -7667,6 +7785,14 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         LOG_ERROR("generate_video_chain: resume requires a durable bank directory");
         return false;
     }
+    const bool retake_active = chain_params->enable_retake && chain_params->retake_segment >= 0;
+    if (retake_active && (chain_params->retake_segment >= chain_params->n_segments ||
+                          chain_params->bank_dir == nullptr || chain_params->bank_dir[0] == '\0')) {
+        LOG_ERROR("generate_video_chain: retake requires a valid segment and durable bank directory");
+        return false;
+    }
+    const int sample_start = retake_active ? chain_params->retake_segment : chain_params->start_segment;
+    const int sample_end = retake_active ? chain_params->retake_segment : chain_params->n_segments - 1;
 
     const int64_t audio_offset = (chain_params->chain_audio_full != nullptr || chain_params->chain_audio_track != nullptr)
                                      ? chain_params->chain_audio_offset_frames
@@ -7740,6 +7866,34 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const size_t end = static_cast<size_t>(start + count) * audio->channels;
         chain_audio_samples.insert(chain_audio_samples.end(), audio->data + begin, audio->data + end);
     };
+    auto append_shot_track = [&](const char* path, int kept_frames) -> bool {
+        if (path == nullptr || path[0] == '\0') {
+            return true;
+        }
+        std::vector<float> samples;
+        uint32_t sample_rate = 0;
+        uint32_t channels = 0;
+        if (!LONGCAT_AUDIO::load_wav_full(path, samples, sample_rate, channels) || sample_rate == 0 || channels == 0) {
+            LOG_ERROR("generate_video_chain: per-shot audio track is not a readable WAV: %s", path);
+            return false;
+        }
+        if (chain_audio_channels == 0) {
+            chain_audio_rate = sample_rate;
+            chain_audio_channels = channels;
+        }
+        if (sample_rate != chain_audio_rate || channels != chain_audio_channels) {
+            LOG_ERROR("generate_video_chain: per-shot audio track format %u Hz x%u does not match %u Hz x%u",
+                      sample_rate, channels, chain_audio_rate, chain_audio_channels);
+            return false;
+        }
+        const size_t wanted = static_cast<size_t>(std::llround(
+            static_cast<double>(std::max(0, kept_frames)) * sample_rate / std::max(1, base_params->fps)));
+        const size_t available = samples.size() / channels;
+        const size_t copy = std::min(wanted, available);
+        chain_audio_samples.insert(chain_audio_samples.end(), samples.begin(), samples.begin() + copy * channels);
+        chain_audio_samples.insert(chain_audio_samples.end(), (wanted - copy) * channels, 0.f);
+        return true;
+    };
     auto adopt_frames = [&](sd_image_t* segment_frames, int count, int drop) {
         drop = std::clamp(drop, 0, count);
         for (int frame = 0; frame < count; ++frame) {
@@ -7781,6 +7935,25 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         tail_channels = video_channels;
         return true;
     };
+    auto extract_head = [&](const float* raw,
+                            int width,
+                            int height,
+                            int frames,
+                            int channels,
+                            std::vector<float>& head) -> bool {
+        const int video_channels = sd_ctx->sd->get_latent_channel();
+        if (raw == nullptr || width <= 0 || height <= 0 || frames < carried_frames || channels < video_channels) {
+            return false;
+        }
+        const size_t plane = static_cast<size_t>(width) * height;
+        head.assign(plane * static_cast<size_t>(carried_frames) * video_channels, 0.f);
+        for (int channel = 0; channel < video_channels; ++channel) {
+            std::memcpy(head.data() + static_cast<size_t>(channel) * carried_frames * plane,
+                        raw + static_cast<size_t>(channel) * frames * plane,
+                        static_cast<size_t>(carried_frames) * plane * sizeof(float));
+        }
+        return true;
+    };
     auto save_video_latent = [&](const std::string& path,
                                   const float* raw,
                                   int width,
@@ -7804,7 +7977,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
 
     // Rebuild a durable prefix exactly as the original chain stitched it, and
     // recover the final bank's latent tail for the next sampled window.
-    for (int segment = 0; segment < chain_params->start_segment; ++segment) {
+    for (int segment = 0; segment < sample_start; ++segment) {
         const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
         int count = 0;
         sd_image_t* banked_frames = decode_banked_video_latent(sd_ctx, path, &count);
@@ -7845,10 +8018,27 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                     chain_params->segment_v2v_guide_latent_paths[segment][0] != '\0';
         const bool has_v2v_source = (v2v_mode == 1 && has_v2v_control) ||
                                     (v2v_mode == 2 && (has_v2v_control || has_v2v_latent));
-        adopt_frames(banked_frames, count, segment == 0 || fresh_scene || has_scene_image || has_v2v_source ? 0 : overlap_frames);
+        const int declared_drop = chain_params->segment_seam_drop_frames != nullptr
+                                      ? chain_params->segment_seam_drop_frames[segment]
+                                      : -1;
+        const int drop = segment == 0 || fresh_scene || has_scene_image || has_v2v_source
+                             ? 0
+                             : (declared_drop >= 0 ? declared_drop
+                                                   : (chain_params->cont_seam_drop_frames > 0
+                                                          ? chain_params->cont_seam_drop_frames
+                                                          : overlap_frames));
+        if (!track_audio.loaded() && chain_params->segment_audio_track != nullptr &&
+            chain_params->segment_audio_track[segment] != nullptr &&
+            chain_params->segment_audio_track[segment][0] != '\0' &&
+            !append_shot_track(chain_params->segment_audio_track[segment], count - std::min(drop, count))) {
+            for (int frame = 0; frame < count; ++frame) free(banked_frames[frame].data);
+            free(banked_frames);
+            return fail();
+        }
+        adopt_frames(banked_frames, count, drop);
     }
 
-    for (int segment = chain_params->start_segment; segment < chain_params->n_segments; ++segment) {
+    for (int segment = sample_start; segment <= sample_end; ++segment) {
         if (chain_params->before_segment != nullptr &&
             !chain_params->before_segment(segment, chain_params->before_segment_user)) {
             LOG_ERROR("generate_video_chain: segment %d model lease failed", segment + 1);
@@ -7923,9 +8113,65 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             params.cont_latent_frames = 0;
         }
 
+        // A retaken shot is additionally pinned to the head of its unchanged
+        // successor.  Read only the small latent head; the suffix itself is
+        // decoded and spliced after this window has completed.
+        std::vector<float> next_head;
+        if (retake_active && segment + 1 < chain_params->n_segments) {
+            const std::string next_path = std::string(chain_params->bank_dir) + "/seg_" +
+                                          std::to_string(segment + 1) + ".bin";
+            try {
+                auto next = sd::load_tensor_from_file_as_tensor<float>(next_path);
+                if (next.empty() || next.dim() < 4 ||
+                    !extract_head(next.data(), static_cast<int>(next.shape()[0]), static_cast<int>(next.shape()[1]),
+                                  static_cast<int>(next.shape()[2]), static_cast<int>(next.shape()[3]), next_head)) {
+                    LOG_ERROR("generate_video_chain: could not restore retake end guide from %s", next_path.c_str());
+                    return fail();
+                }
+                params.end_cont_latent = next_head.data();
+                params.end_cont_latent_width = static_cast<int>(next.shape()[0]);
+                params.end_cont_latent_height = static_cast<int>(next.shape()[1]);
+                params.end_cont_latent_frames = carried_frames;
+                params.end_cont_latent_channels = sd_ctx->sd->get_latent_channel();
+            } catch (const std::exception& error) {
+                LOG_ERROR("generate_video_chain: could not read retake end guide %s: %s", next_path.c_str(), error.what());
+                return fail();
+            }
+        }
+
         std::string drive_audio_path;
-        if (drive_audio.loaded()) {
-            const int drop = segment == 0 || fresh_scene ? 0 : std::min(overlap_frames, params.video_frames);
+        const int declared_drop = chain_params->segment_seam_drop_frames != nullptr
+                                      ? chain_params->segment_seam_drop_frames[segment]
+                                      : -1;
+        const int seam_drop = segment == 0 || fresh_scene
+                                  ? 0
+                                  : std::min(params.video_frames,
+                                             declared_drop >= 0 ? declared_drop
+                                                                : (chain_params->cont_seam_drop_frames > 0
+                                                                       ? chain_params->cont_seam_drop_frames
+                                                                       : overlap_frames));
+        if (chain_params->segment_audio_full != nullptr &&
+            chain_params->segment_audio_full[segment] != nullptr &&
+            chain_params->segment_audio_full[segment][0] != '\0') {
+            if (chain_params->bank_dir == nullptr || chain_params->bank_dir[0] == '\0') {
+                LOG_ERROR("generate_video_chain: per-shot drive audio requires a durable bank directory");
+                return fail();
+            }
+            std::vector<float> shot_drive;
+            if (!LONGCAT_AUDIO::load_wav_16k_mono(chain_params->segment_audio_full[segment], shot_drive) ||
+                shot_drive.empty()) {
+                LOG_ERROR("generate_video_chain: per-shot drive audio is not a readable WAV: %s",
+                          chain_params->segment_audio_full[segment]);
+                return fail();
+            }
+            drive_audio_path = std::string(chain_params->bank_dir) + "/aud_shot_" + std::to_string(segment) + ".wav";
+            if (!write_ltx_drive_audio_wav(drive_audio_path, shot_drive)) {
+                LOG_ERROR("generate_video_chain: could not stage per-shot drive audio for window %d", segment + 1);
+                return fail();
+            }
+            params.drive_audio_path = drive_audio_path.c_str();
+        } else if (drive_audio.loaded()) {
+            const int drop = seam_drop;
             const int64_t timeline_start = static_cast<int64_t>(stitched.size()) - drop;
             const auto slice = drive_audio.window(timeline_start,
                                                   params.video_frames,
@@ -8002,10 +8248,59 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                      chain_params->on_segment_user);
         }
         free(latent);
-        const int audio_drop = segment == 0 || fresh_scene ? 0 : std::min(overlap_frames, segment_count);
-        append_audio(segment_audio, audio_drop, segment_count - audio_drop);
+        const int audio_drop = std::min(seam_drop, segment_count);
+        if (chain_params->segment_audio_track != nullptr) {
+            if (!append_shot_track(chain_params->segment_audio_track[segment], segment_count - audio_drop)) {
+                free_sd_audio(segment_audio);
+                for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
+                free(segment_frames);
+                return fail();
+            }
+        } else {
+            append_audio(segment_audio, audio_drop, segment_count - audio_drop);
+        }
         free_sd_audio(segment_audio);
         adopt_frames(segment_frames, segment_count, audio_drop);
+        if (ltx_chain && segment + 1 < chain_params->n_segments) {
+            // previous_tail and the adopted frames are host-owned now; no GPU
+            // allocation from this window is needed by the continuation setup.
+            sd_ctx->sd->reclaim_ltx_chain_window_gpu_memory();
+        }
+    }
+
+    // Retake leaves downstream shots untouched: restore their durable latents,
+    // decode them, and apply the same declared seam policy used by the live
+    // chain.  This avoids re-sampling an entire timeline for a one-shot edit.
+    if (retake_active) {
+        for (int segment = sample_end + 1; segment < chain_params->n_segments; ++segment) {
+            const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
+            int segment_count = 0;
+            sd_image_t* segment_frames = decode_banked_video_latent(sd_ctx, path, &segment_count);
+            if (segment_frames == nullptr || segment_count <= 0) {
+                free(segment_frames);
+                LOG_ERROR("generate_video_chain: could not decode retake suffix bank %s", path.c_str());
+                return fail();
+            }
+            const int declared_drop = chain_params->segment_seam_drop_frames != nullptr
+                                          ? chain_params->segment_seam_drop_frames[segment]
+                                          : -1;
+            const int drop = std::min(segment_count,
+                                      declared_drop >= 0 ? declared_drop
+                                                         : (chain_params->cont_seam_drop_frames > 0
+                                                                ? chain_params->cont_seam_drop_frames
+                                                                : overlap_frames));
+            if (chain_params->segment_audio_track != nullptr &&
+                chain_params->segment_audio_track[segment] != nullptr &&
+                chain_params->segment_audio_track[segment][0] != '\0' &&
+                !append_shot_track(chain_params->segment_audio_track[segment], segment_count - drop)) {
+                for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
+                free(segment_frames);
+                return fail();
+            }
+            adopt_frames(segment_frames, segment_count, drop);
+        }
+        LOG_INFO("generate_video_chain: retook segment %d and spliced %d banked suffix segment(s)",
+                 sample_end, chain_params->n_segments - sample_end - 1);
     }
 
     if (stitched.empty()) {

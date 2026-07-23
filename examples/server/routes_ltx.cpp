@@ -204,6 +204,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::string drive_audio_bytes;
             std::string track_audio_bytes;
             std::vector<std::pair<int, std::string>> legacy_audio_parts;
+            std::vector<std::pair<int, std::string>> shot_audio_full_parts;
+            std::vector<std::pair<int, std::string>> shot_audio_track_parts;
             if (req.is_multipart_form_data()) {
                 // Backward-compatible per-window lip-sync WAVs.  Koblem's
                 // older relip/window path sends contiguous audio_<n> parts;
@@ -379,6 +381,32 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(R"({"error":"segments must contain exactly n_segments non-empty prompts"})", "application/json");
                 return;
             }
+            if (req.is_multipart_form_data()) {
+                // Sparse indexed per-shot audio deliberately does not stop at a
+                // missing index: Director may replace just shot 7 on a retake.
+                for (int index = 0; index < requested_segments; ++index) {
+                    const std::string full_key = "audio_full_" + std::to_string(index);
+                    const std::string track_key = "audio_track_" + std::to_string(index);
+                    if (req.form.has_file(full_key)) {
+                        const std::string& bytes = req.form.get_file(full_key).content;
+                        if (bytes.empty()) {
+                            res.status = 400;
+                            res.set_content(json({{"error", full_key + " must be a non-empty WAV upload"}}).dump(), "application/json");
+                            return;
+                        }
+                        shot_audio_full_parts.emplace_back(index, bytes);
+                    }
+                    if (req.form.has_file(track_key)) {
+                        const std::string& bytes = req.form.get_file(track_key).content;
+                        if (bytes.empty()) {
+                            res.status = 400;
+                            res.set_content(json({{"error", track_key + " must be a non-empty WAV upload"}}).dump(), "application/json");
+                            return;
+                        }
+                        shot_audio_track_parts.emplace_back(index, bytes);
+                    }
+                }
+            }
             body["prompt"] = prompts.front();
             if (body.contains("frames")) {
                 body["video_frames"] = body["frames"];
@@ -445,6 +473,41 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_emit_segments = body.value("emit_segments", false);
             const bool persist_bank = body.value("persist", false);
             const std::string resume_job_id = body.value("resume_job_id", std::string());
+            const int retake_segment = body.value("retake_segment", body.value("retake_from", -1));
+            if (retake_segment < -1 || retake_segment >= requested_segments) {
+                res.status = 400;
+                res.set_content(R"({"error":"retake_segment must name an existing segment"})", "application/json");
+                return;
+            }
+            if (retake_segment >= 0 && resume_job_id.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"retake_segment requires resume_job_id"})", "application/json");
+                return;
+            }
+            if (body.contains("cont_seam_drop_frames") && !body["cont_seam_drop_frames"].is_number_integer()) {
+                res.status = 400;
+                res.set_content(R"({"error":"cont_seam_drop_frames must be an integer"})", "application/json");
+                return;
+            }
+            const int cont_seam_drop_frames = body.value("cont_seam_drop_frames", 0);
+            std::vector<int> segment_seam_drop_frames;
+            if (body.contains("segment_seam_drop_frames")) {
+                if (!body["segment_seam_drop_frames"].is_array()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"segment_seam_drop_frames must be an array"})", "application/json");
+                    return;
+                }
+                segment_seam_drop_frames.assign(static_cast<size_t>(requested_segments), -1);
+                const auto& drops = body["segment_seam_drop_frames"];
+                for (size_t index = 0; index < drops.size() && index < segment_seam_drop_frames.size(); ++index) {
+                    if (!drops[index].is_number_integer()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"segment_seam_drop_frames entries must be integers"})", "application/json");
+                        return;
+                    }
+                    segment_seam_drop_frames[index] = drops[index].get<int>();
+                }
+            }
             if (body.contains("audio_offset_frames") && !body["audio_offset_frames"].is_number_integer()) {
                 res.status = 400;
                 res.set_content(R"({"error":"audio_offset_frames must be an integer"})", "application/json");
@@ -470,7 +533,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 fs::path bank_root;
                 std::string bank_id;
                 if (!resume_job_id.empty()) {
-                    if (!drive_audio_bytes.empty() || !track_audio_bytes.empty() || !legacy_audio_parts.empty()) {
+                    if (!drive_audio_bytes.empty() || !track_audio_bytes.empty() || !legacy_audio_parts.empty() ||
+                        !shot_audio_full_parts.empty() || !shot_audio_track_parts.empty()) {
                         res.status = 400;
                         res.set_content(R"({"error":"resumed LTX jobs reuse their banked audio; do not upload new audio"})", "application/json");
                         return;
@@ -488,10 +552,18 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         return;
                     }
                     for (; fs::exists(bank_dir / ("seg_" + std::to_string(resume_from) + ".bin")); ++resume_from) {}
-                    if (resume_from <= 0 || resume_from >= static_cast<int>(job->ltx_prompts.size())) {
+                    if (resume_from <= 0 || (resume_from >= static_cast<int>(job->ltx_prompts.size()) && retake_segment < 0)) {
                         res.status = 404;
                         res.set_content(R"({"error":"resume_job_id has no resumable LTX latent bank"})", "application/json");
                         return;
+                    }
+                    if (retake_segment >= 0) {
+                        if (retake_segment >= resume_from) {
+                            res.status = 404;
+                            res.set_content(R"({"error":"retake_segment is not present in the LTX latent bank"})", "application/json");
+                            return;
+                        }
+                        resume_from = retake_segment;
                     }
                 } else {
                     job->id = make_async_job_id(manager);
@@ -587,9 +659,46 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         return;
                     }
                 }
+                // Per-shot audio is stored independently of the legacy audio_<n>
+                // directory. On resume it is rediscovered so retakes never need a
+                // second upload and sparse shot indices stay sparse.
+                const fs::path shot_audio_dir = bank_dir / "audio";
+                if (!resume_job_id.empty() || !shot_audio_full_parts.empty() || !shot_audio_track_parts.empty()) {
+                    std::error_code shot_error;
+                    if (!shot_audio_full_parts.empty() || !shot_audio_track_parts.empty()) {
+                        fs::create_directories(shot_audio_dir, shot_error);
+                        if (shot_error) {
+                            res.status = 500;
+                            res.set_content(R"({"error":"could not create LTX per-shot audio directory"})", "application/json");
+                            return;
+                        }
+                        for (const auto& [index, bytes] : shot_audio_full_parts) {
+                            std::ofstream output(shot_audio_dir / ("shot_" + std::to_string(index) + "_full.wav"), std::ios::binary | std::ios::trunc);
+                            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                            if (!output.good()) { res.status = 500; res.set_content(R"({"error":"could not stage LTX per-shot audio upload"})", "application/json"); return; }
+                        }
+                        for (const auto& [index, bytes] : shot_audio_track_parts) {
+                            std::ofstream output(shot_audio_dir / ("shot_" + std::to_string(index) + "_track.wav"), std::ios::binary | std::ios::trunc);
+                            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                            if (!output.good()) { res.status = 500; res.set_content(R"({"error":"could not stage LTX per-shot audio upload"})", "application/json"); return; }
+                        }
+                    }
+                    job->ltx_segment_audio_full.assign(static_cast<size_t>(requested_segments), std::string());
+                    job->ltx_segment_audio_track.assign(static_cast<size_t>(requested_segments), std::string());
+                    for (int index = 0; index < requested_segments; ++index) {
+                        const fs::path full = shot_audio_dir / ("shot_" + std::to_string(index) + "_full.wav");
+                        const fs::path track = shot_audio_dir / ("shot_" + std::to_string(index) + "_track.wav");
+                        if (fs::is_regular_file(full, shot_error)) job->ltx_segment_audio_full[index] = full.string();
+                        shot_error.clear();
+                        if (fs::is_regular_file(track, shot_error)) job->ltx_segment_audio_track[index] = track.string();
+                    }
+                }
                 job->ltx_bank_dir = bank_dir.string();
                 job->ltx_bank_id = bank_id;
                 job->ltx_resume_from = resume_from;
+                job->ltx_retake_segment = retake_segment;
+                job->ltx_cont_seam_drop_frames = cont_seam_drop_frames;
+                job->ltx_segment_seam_drop_frames = std::move(segment_seam_drop_frames);
                 if (job->ltx_chain_audio_offset_frames == 0) {
                     job->ltx_chain_audio_offset_frames = audio_offset_frames;
                 }
@@ -606,6 +715,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                                   {"media_url", "/sdcpp/v1/jobs/" + job->id + "/media"},
                                   {"segments", static_cast<int>(job->ltx_prompts.size())},
                                   {"resume_from", resume_from},
+                                  {"retake_segment", retake_segment},
                                   {"resume_job_id", job->ltx_bank_id}})
                                 .dump(),
                             "application/json");

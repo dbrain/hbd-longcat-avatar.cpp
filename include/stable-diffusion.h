@@ -435,6 +435,14 @@ typedef struct {
     int cont_latent_height;
     int cont_latent_frames;
     int cont_latent_channels;
+    // Optional frozen video-latent guide at the end of an LTX window.  Chain
+    // retake uses the opening latent frames of the unchanged next shot here so
+    // the re-rendered shot is constrained at both seams.
+    const float* end_cont_latent;
+    int end_cont_latent_width;
+    int end_cont_latent_height;
+    int end_cont_latent_frames;
+    int end_cont_latent_channels;
     // LongCat-Video-Avatar 1.5 driving audio.  This is a WAV file consumed by
     // the Whisper audio encoder; the same source track is returned as optional
     // generated audio, trimmed to the rendered clip.
@@ -515,6 +523,25 @@ typedef struct {
                        int frame_count,
                        void* user);
     void* on_segment_user;
+    // Re-render one durable banked shot in place.  `enable_retake` is separate
+    // so legacy zero-initialized chain structs retain their ordinary behavior;
+    // set it whenever retake_segment is supplied (including segment zero).
+    bool enable_retake;
+    // The prefix is restored from
+    // bank_dir, the selected shot is sampled with both neighbour guides when
+    // available, and the unchanged suffix is decoded from its banks.  -1 is
+    // disabled when enable_retake is false.
+    int retake_segment;
+    // Continuation seam policy.  A positive scalar pins every ordinary
+    // continuation; zero retains the derived latent-overlap drop.  Per-shot
+    // entries supersede it; a negative entry selects the scalar/derived value.
+    int cont_seam_drop_frames;
+    const int* segment_seam_drop_frames;
+    // Optional per-shot audio files.  full drives that window's LTX audio
+    // conditioning; track is appended from its own t=0 for exactly the kept
+    // portion of that shot (padding short tracks with silence).
+    const char* const* segment_audio_full;
+    const char* const* segment_audio_track;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

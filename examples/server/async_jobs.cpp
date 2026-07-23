@@ -493,6 +493,28 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.chain_audio_track = job.ltx_chain_audio_track.empty() ? nullptr : job.ltx_chain_audio_track.c_str();
             chain.chain_audio_offset_frames = job.ltx_chain_audio_offset_frames;
             chain.chain_audio_dir = job.ltx_chain_audio_dir.empty() ? nullptr : job.ltx_chain_audio_dir.c_str();
+            std::vector<const char*> segment_audio_full;
+            std::vector<const char*> segment_audio_track;
+            if (!job.ltx_segment_audio_full.empty()) {
+                segment_audio_full.reserve(job.ltx_segment_audio_full.size());
+                for (const auto& path : job.ltx_segment_audio_full) {
+                    segment_audio_full.push_back(path.empty() ? nullptr : path.c_str());
+                }
+            }
+            if (!job.ltx_segment_audio_track.empty()) {
+                segment_audio_track.reserve(job.ltx_segment_audio_track.size());
+                for (const auto& path : job.ltx_segment_audio_track) {
+                    segment_audio_track.push_back(path.empty() ? nullptr : path.c_str());
+                }
+            }
+            chain.retake_segment = job.ltx_retake_segment;
+            chain.enable_retake = job.ltx_retake_segment >= 0;
+            chain.cont_seam_drop_frames = job.ltx_cont_seam_drop_frames;
+            chain.segment_seam_drop_frames = job.ltx_segment_seam_drop_frames.empty()
+                                                 ? nullptr
+                                                 : job.ltx_segment_seam_drop_frames.data();
+            chain.segment_audio_full = segment_audio_full.empty() ? nullptr : segment_audio_full.data();
+            chain.segment_audio_track = segment_audio_track.empty() ? nullptr : segment_audio_track.data();
             LTXModelLease model_lease;
             model_lease.runtime = &runtime;
             model_lease.models = &job.ltx_segment_models;

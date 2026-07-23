@@ -2,6 +2,7 @@
 #define __SD_MODEL_VAE_LTX_VAE_HPP__
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -1262,6 +1263,8 @@ namespace LTXVAE {
             auto decoder   = std::dynamic_pointer_cast<Decoder>(blocks["decoder"]);
             auto processor = std::dynamic_pointer_cast<PerChannelStatistics>(blocks["per_channel_statistics"]);
             auto latents   = processor->un_normalize(ctx, z);
+            const bool f16 = decode_f16_enabled();
+            if (f16) { latents = ggml_cast(ctx->ggml_ctx, latents, GGML_TYPE_F16); }
 
             feat_idx          = 0;
             int chunk_overlap = temporal_tile_overlap;  // modified by forward_tiled_frame temporal inflation
@@ -1270,7 +1273,11 @@ namespace LTXVAE {
             if (chunk_overlap > 0) {
                 out_chunk = ggml_ext_slice(ctx->ggml_ctx, out_chunk, 2, 0, out_chunk->ne[2] - chunk_overlap);
             }
-            return ltx_unpatchify(ctx->ggml_ctx, out_chunk, patch_size, 1);
+            auto out = ltx_unpatchify(ctx->ggml_ctx, out_chunk, patch_size, 1);
+            if (f16 && out->type != GGML_TYPE_F32) {
+                out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F32);
+            }
+            return out;
         }
 
         ggml_tensor* encode(GGMLRunnerContext* ctx,
@@ -1450,7 +1457,18 @@ struct LTXVideoVAE : public VAE {
 
     ggml_cgraph* build_temporal_tile_graph(const sd::Tensor<float>& z_chunk_tensor,
                                            int chunk_idx,
-                                           int chunk_overlap) {
+                                           int chunk_overlap,
+                                           bool cache_temporal_feats = true) {
+        if (const char* diag = std::getenv("LTX_VAE_GRAPH_DIAG"); diag != nullptr && diag[0] != '\0' && diag[0] != '0') {
+            LOG_INFO("LTX VAE graph diagnostic: latent=[%lld,%lld,%lld,%lld] chunk=%d overlap=%d cache_feats=%d",
+                     (long long)z_chunk_tensor.shape()[0],
+                     (long long)z_chunk_tensor.shape()[1],
+                     (long long)z_chunk_tensor.shape()[2],
+                     (long long)z_chunk_tensor.shape()[3],
+                     chunk_idx,
+                     chunk_overlap,
+                     cache_temporal_feats);
+        }
         // Larger node budget (see build_graph): a per-tile decode with conv3d W/H-tiling emits many
         // slice/im2col/concat nodes, so high WTILES/HTILES would overflow the old 20480 cap.
         ggml_cgraph* gf       = new_graph_custom(131072);
@@ -1460,9 +1478,11 @@ struct LTXVideoVAE : public VAE {
             timestep = make_input(decode_timestep_tensor);
         }
 
-        std::vector<ggml_tensor*> feat_map(128, nullptr);
-        for (size_t feat_idx = 0; feat_idx < feat_map.size(); ++feat_idx) {
-            feat_map[feat_idx] = get_cache_tensor_by_name(temporal_feat_cache_name(feat_idx));
+        std::vector<ggml_tensor*> feat_map(cache_temporal_feats ? 128 : 0, nullptr);
+        if (cache_temporal_feats) {
+            for (size_t feat_idx = 0; feat_idx < feat_map.size(); ++feat_idx) {
+                feat_map[feat_idx] = get_cache_tensor_by_name(temporal_feat_cache_name(feat_idx));
+            }
         }
 
         auto runner_ctx  = get_context();
@@ -1475,11 +1495,13 @@ struct LTXVideoVAE : public VAE {
                                                   chunk_overlap,
                                                   feat_count);
 
-        for (int feat_idx = 0; feat_idx < feat_count && feat_idx < static_cast<int>(feat_map.size()); ++feat_idx) {
-            ggml_tensor* feat_cache = feat_map[static_cast<size_t>(feat_idx)];
-            if (feat_cache != nullptr) {
-                cache(temporal_feat_cache_name(static_cast<size_t>(feat_idx)), feat_cache);
-                ggml_build_forward_expand(gf, feat_cache);
+        if (cache_temporal_feats) {
+            for (int feat_idx = 0; feat_idx < feat_count && feat_idx < static_cast<int>(feat_map.size()); ++feat_idx) {
+                ggml_tensor* feat_cache = feat_map[static_cast<size_t>(feat_idx)];
+                if (feat_cache != nullptr) {
+                    cache(temporal_feat_cache_name(static_cast<size_t>(feat_idx)), feat_cache);
+                    ggml_build_forward_expand(gf, feat_cache);
+                }
             }
         }
 
@@ -1489,9 +1511,28 @@ struct LTXVideoVAE : public VAE {
 
     sd::Tensor<float> decode_temporal_tiled_streaming(const int n_threads,
                                                       const sd::Tensor<float>& input,
-                                                      size_t expected_dim) {
+                                                      size_t expected_dim,
+                                                      int requested_frames = 0,
+                                                      int requested_overlap = -1,
+                                                      bool retain_compute_params = false) {
         const int64_t total_frames = input.shape()[2];
         TemporalTilePlan plan      = resolve_temporal_tile_plan(total_frames);
+        // Spatial+temporal decoding is configured independently of generic
+        // VAE tiling. Production uses 8 latent frames with a two-frame overlap
+        // even though it deliberately supplies no --temporal-tiling flag.
+        if (requested_frames > 0) {
+            plan.frames  = std::max(1, requested_frames);
+            plan.overlap = std::max(0, requested_overlap);
+            if (plan.overlap >= plan.frames) {
+                plan.overlap = plan.frames - 1;
+            }
+            if (total_frames > 1 && plan.overlap >= total_frames) {
+                plan.overlap = static_cast<int>(total_frames - 1);
+            }
+            plan.stride = std::max(1, plan.frames - plan.overlap);
+            const int64_t tiled_frames = std::max<int64_t>(1, total_frames - plan.overlap);
+            plan.num_tiles = static_cast<int>((tiled_frames + plan.stride - 1) / plan.stride);
+        }
 
         LOG_DEBUG("Using streaming temporal tiling: temporal_tile_frames=%d, temporal_tile_overlap=%d, total latent frames=%lld, resulting in %d tiles",
                   plan.frames,
@@ -1520,7 +1561,11 @@ struct LTXVideoVAE : public VAE {
                                                  static_cast<int>(start),
                                                  chunk_overlap);
             };
-            auto chunk = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true, true, true),
+            auto chunk = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
+                                                                                     n_threads,
+                                                                                     !retain_compute_params,
+                                                                                     true,
+                                                                                     !retain_compute_params),
                                                          expected_dim);
             if (chunk.empty()) {
                 free_cache_ctx_and_buffer();
@@ -1549,7 +1594,8 @@ struct LTXVideoVAE : public VAE {
     sd::Tensor<float> decode_temporal_blend(const int n_threads,
                                             const sd::Tensor<float>& input,
                                             size_t expected_dim,
-                                            int T, int O) {
+                                            int T, int O,
+                                            bool retain_compute_params = false) {
         const int64_t total = input.shape()[2];
         if (T < 1) { T = 1; }
         if (O < 1) { O = 1; }
@@ -1567,9 +1613,14 @@ struct LTXVideoVAE : public VAE {
             free_cache_ctx_and_buffer();
             cache_tensor_map.clear();
             auto get_graph = [&]() -> ggml_cgraph* {
-                return build_temporal_tile_graph(z_tile, static_cast<int>(start), 0);
+                return build_temporal_tile_graph(z_tile, static_cast<int>(start), 0, false);
             };
-            auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, true), expected_dim);
+            auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
+                                                                                   n_threads,
+                                                                                   !retain_compute_params,
+                                                                                   true,
+                                                                                   !retain_compute_params),
+                                                         expected_dim);
             if (out.empty()) {
                 free_cache_ctx_and_buffer();
                 cache_tensor_map.clear();
@@ -1640,6 +1691,238 @@ struct LTXVideoVAE : public VAE {
         return out;
     }
 
+    // LTX_VAE_SPATIAL_TILES=NxM (+ LTX_VAE_SPATIAL_OVERLAP=O latent px, default 6): Comfy-style
+    // FEATHERED SPATIAL tiling — the intended replacement for temporal tiling. Splits the latent
+    // into NX*NY OVERLAPPING spatial tiles and decodes each tile WHOLE-TEMPORAL (all frames in ONE
+    // graph, NO temporal chopping -> no cross-tile motion ghosting/seams), then stitches with a
+    // NORMALIZED smootherstep feather over the pixel overlap band: accumulate (weighted sum, weight)
+    // and divide out. Unlike sd_tensor_merge_2d's additive analytic-sum-to-1 blend (which breaks at
+    // the snapped last row/col -> residual seam), the explicit normalization is robust to irregular
+    // tile placement. The O-px overlap keeps each tile's conv-padding-corrupted border in the
+    // low-weight zone while the neighbour's real-context interior dominates -> no grid-cross seam.
+    // VRAM knob = tile COUNT: the per-graph activation floor scales with (tile_latent_pixels *
+    // all_frames), so more/smaller tiles -> lower peak. Pair with GGML_CUDNN_CONV3D=1; if a single
+    // tile still spikes, LTX_VAE_CONV3D_WTILES/_HTILES bounds the per-tile im2col (orthogonal).
+    sd::Tensor<float> decode_spatial_blend(const int n_threads,
+                                           const sd::Tensor<float>& input,
+                                           size_t expected_dim,
+                                           int NX, int NY, int O,
+                                           bool temporal_blend = false,
+                                           bool temporal_stream = false,
+                                           int temporal_tile_frames = 0,
+                                           int temporal_tile_overlap = 0) {
+        const int64_t total_start_ms = ggml_time_ms();
+        const int64_t Wl = input.shape()[0];
+        const int64_t Hl = input.shape()[1];
+        if (NX < 1) { NX = 1; }
+        if (NY < 1) { NY = 1; }
+        if (O < 0)  { O = 0; }
+        NX = static_cast<int>(std::min<int64_t>(NX, Wl));
+        NY = static_cast<int>(std::min<int64_t>(NY, Hl));
+        const int64_t coreW = (Wl + NX - 1) / NX;  // non-overlap core width per tile (latent)
+        const int64_t coreH = (Hl + NY - 1) / NY;
+
+        sd::Tensor<float> out;     // lazily allocated once the pixel scale / frames / channels are known
+        std::vector<double> wsum;  // per-pixel accumulated blend weight (Wp*Hp)
+        int64_t Wp = 0, Hp = 0, scale = 0, FC = 0;
+
+        auto smoother = [](double x) { x = x < 0 ? 0 : (x > 1 ? 1 : x); return x * x * x * (x * (6.0 * x - 15.0) + 10.0); };
+
+        // A spatial/temporal decode is one VAE operation, even though it executes multiple graphs.
+        // Keep its ModelManager staging alive across those graphs and release it at this decode
+        // boundary.  Otherwise every temporal tile copies the complete VAE back to CUDA, which is
+        // both slower and unnecessary: the tile compute buffers themselves are still freed promptly.
+        const bool retain_compute_params = true;
+        const bool tile_profile = getenv("LTX_VAE_TILE_PROFILE") != nullptr;
+        double tile_runner_s    = 0.0;
+        double tile_graph_s     = 0.0;
+        double tile_blend_s     = 0.0;
+
+        for (int ty = 0; ty < NY; ++ty) {
+            const int64_t cy0 = static_cast<int64_t>(ty) * coreH;
+            const int64_t cy1 = std::min<int64_t>(Hl, static_cast<int64_t>(ty + 1) * coreH);
+            const int64_t y0  = std::max<int64_t>(0, cy0 - O);
+            const int64_t y1  = std::min<int64_t>(Hl, cy1 + O);
+            for (int tx = 0; tx < NX; ++tx) {
+                const int64_t cx0 = static_cast<int64_t>(tx) * coreW;
+                const int64_t cx1 = std::min<int64_t>(Wl, static_cast<int64_t>(tx + 1) * coreW);
+                const int64_t x0  = std::max<int64_t>(0, cx0 - O);
+                const int64_t x1  = std::min<int64_t>(Wl, cx1 + O);
+
+                // Latent tile [x0,x1) x [y0,y1). The normal path decodes all frames in one
+                // graph; the explicit hybrid path further bounds its activation floor with
+                // temporal windows before this spatial feathering pass.
+                auto z_tile = sd::ops::slice(input, 0, x0, x1);
+                z_tile      = sd::ops::slice(z_tile, 1, y0, y1);
+
+                int64_t tile_runner_start = ggml_time_ms();
+                double tile_graph_local_s = 0.0;
+                sd::Tensor<float> tile;
+                if (temporal_blend) {
+                    LOG_DEBUG("LTX VAE spatiotemporal %s tile %d,%d: latent [%lld,%lld)x[%lld,%lld), temporal tile=%d overlap=%d",
+                              temporal_stream ? "stream" : "blend",
+                              tx, ty, (long long)x0, (long long)x1, (long long)y0, (long long)y1,
+                              temporal_tile_frames, temporal_tile_overlap);
+                    // A feather blend mixes two independently decoded mouth motions at every
+                    // temporal overlap. For long clips that reads as periodic lip-sync loss.
+                    // The streaming path carries the decoder's causal feature maps forward and
+                    // emits each overlap only once, preserving temporal state instead.
+                    tile = temporal_stream
+                               ? decode_temporal_tiled_streaming(n_threads,
+                                                                 z_tile,
+                                                                 expected_dim,
+                                                                 temporal_tile_frames,
+                                                                 temporal_tile_overlap,
+                                                                 retain_compute_params)
+                               : decode_temporal_blend(n_threads,
+                                                       z_tile,
+                                                       expected_dim,
+                                                       temporal_tile_frames,
+                                                       temporal_tile_overlap,
+                                                       retain_compute_params);
+                } else {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    // Decode this spatial tile through the SAME graph builder decode_temporal_blend
+                    // uses (build_temporal_tile_graph -> decode_tiled_chunk -> forward_tiled_frame), so
+                    // the conv3d routing matches the proven temporal path. build_graph()/vae.decode()'s
+                    // whole-decode conv path hits `im2col.cu GGML_ASSERT(src1->type == F32)` under
+                    // LTX_VAE_DECODE_F16=1 + GGML_CUDNN_CONV3D=1 (a stride/dilation-1 conv that the cuDNN
+                    // matcher rejects falls back to im2col with an F16 activation); the tiled-frame path
+                    // does not. z_tile holds ALL latent frames (we only slice dims 0/1) and is decoded as
+                    // ONE chunk (idx 0, overlap 0) -> NO temporal chop. chunk_idx==0 makes the causal
+                    // drop-first trim fire identically for every spatial tile, so all tiles share the
+                    // same output frame count (f*8-7 = full clip length).
+                    const bool export_temporal_cache = false;
+                    auto get_graph = [&]() -> ggml_cgraph* {
+                        int64_t graph_start = ggml_time_ms();
+                        ggml_cgraph* graph  = build_temporal_tile_graph(z_tile, 0, 0, false);
+                        tile_graph_local_s += (ggml_time_ms() - graph_start) * 1.0 / 1000.0;
+                        return graph;
+                    };
+                    tile = restore_trailing_singleton_dims(
+                        GGMLRunner::compute<float>(get_graph,
+                                                   n_threads,
+                                                   !retain_compute_params,
+                                                   true,
+                                                   !retain_compute_params),
+                        expected_dim);
+                }
+                const double tile_runner_local_s = (ggml_time_ms() - tile_runner_start) * 1.0 / 1000.0;
+                tile_runner_s += tile_runner_local_s;
+                tile_graph_s += tile_graph_local_s;
+                if (tile.empty()) {
+                    free_cache_ctx_and_buffer();
+                    cache_tensor_map.clear();
+                    runner_done();
+                    return {};
+                }
+
+                const int64_t tw = tile.shape()[0];
+                const int64_t th = tile.shape()[1];
+                if (out.empty()) {
+                    scale       = tw / (x1 - x0);  // spatial upsample factor (expect 32 for LTX)
+                    Wp          = Wl * scale;
+                    Hp          = Hl * scale;
+                    auto oshape = tile.shape();
+                    oshape[0]   = Wp;
+                    oshape[1]   = Hp;
+                    out         = sd::Tensor<float>(oshape);
+                    out.fill_(0.0f);
+                    FC = tile.numel() / (tw * th);  // frames*channels (all dims after H)
+                    wsum.assign(static_cast<size_t>(Wp * Hp), 0.0);
+                }
+
+                const int64_t X0        = x0 * scale;          // pixel offset of this tile in the full frame
+                const int64_t Y0        = y0 * scale;
+                const int64_t leftband  = (cx0 - x0) * scale;  // pixel width of the feather band (0 at image edge)
+                const int64_t rightband = (x1 - cx1) * scale;
+                const int64_t topband   = (cy0 - y0) * scale;
+                const int64_t botband   = (y1 - cy1) * scale;
+
+                // Precompute separable per-column / per-row feather weights.
+                std::vector<double> wcol(static_cast<size_t>(tw), 1.0), wrow(static_cast<size_t>(th), 1.0);
+                for (int64_t lx = 0; lx < tw; ++lx) {
+                    double wx = 1.0;
+                    if (leftband > 0)  { wx = std::min(wx, static_cast<double>(lx) / static_cast<double>(leftband)); }
+                    if (rightband > 0) { wx = std::min(wx, static_cast<double>(tw - 1 - lx) / static_cast<double>(rightband)); }
+                    wcol[static_cast<size_t>(lx)] = smoother(wx);
+                }
+                for (int64_t ly = 0; ly < th; ++ly) {
+                    double wy = 1.0;
+                    if (topband > 0) { wy = std::min(wy, static_cast<double>(ly) / static_cast<double>(topband)); }
+                    if (botband > 0) { wy = std::min(wy, static_cast<double>(th - 1 - ly) / static_cast<double>(botband)); }
+                    wrow[static_cast<size_t>(ly)] = smoother(wy);
+                }
+
+                const float* sp = tile.data();
+                float* dp       = out.data();
+                int64_t tile_blend_start = ggml_time_ms();
+                for (int64_t fc = 0; fc < FC; ++fc) {
+                    const float* spc = sp + tw * th * fc;
+                    float* dpc       = dp + Wp * Hp * fc;
+                    for (int64_t ly = 0; ly < th; ++ly) {
+                        const int64_t py     = Y0 + ly;
+                        const double wr      = wrow[static_cast<size_t>(ly)];
+                        const float* srow    = spc + tw * ly;
+                        float* drow          = dpc + Wp * py;
+                        double* wrowacc      = (fc == 0) ? (wsum.data() + Wp * py) : nullptr;
+                        for (int64_t lx = 0; lx < tw; ++lx) {
+                            const double w = wcol[static_cast<size_t>(lx)] * wr;
+                            if (w <= 0.0) { continue; }
+                            drow[X0 + lx] += static_cast<float>(w) * srow[lx];
+                            if (wrowacc) { wrowacc[X0 + lx] += w; }
+                        }
+                    }
+                }
+                tile_blend_s += (ggml_time_ms() - tile_blend_start) * 1.0 / 1000.0;
+                if (tile_profile) {
+                    LOG_INFO("LTX VAE spatial tile %d,%d: latent [%lld,%lld)x[%lld,%lld) -> %lldx%lld, "
+                             "runner=%.3fs graph_build=%.3fs blend=%.3fs",
+                             tx,
+                             ty,
+                             (long long)x0,
+                             (long long)x1,
+                             (long long)y0,
+                             (long long)y1,
+                             (long long)tw,
+                             (long long)th,
+                             tile_runner_local_s,
+                             tile_graph_local_s,
+                             (ggml_time_ms() - tile_blend_start) * 1.0 / 1000.0);
+                }
+            }
+        }
+        free_cache_ctx_and_buffer();
+        cache_tensor_map.clear();
+        runner_done();
+        if (out.empty()) { return {}; }
+
+        // Normalize each pixel by its accumulated blend weight (proper weighted average).
+        int64_t normalize_start_ms = ggml_time_ms();
+        int64_t normalized_pixels = 0;
+        float* dp = out.data();
+        for (int64_t p = 0; p < Wp * Hp; ++p) {
+            const double ws = wsum[static_cast<size_t>(p)];
+            if (ws <= 1e-9) { continue; }
+            if (std::fabs(ws - 1.0) <= 1e-6) { continue; }
+            const float inv = static_cast<float>(1.0 / ws);
+            for (int64_t fc = 0; fc < FC; ++fc) { dp[p + Wp * Hp * fc] *= inv; }
+            ++normalized_pixels;
+        }
+        double normalize_s = (ggml_time_ms() - normalize_start_ms) * 1.0 / 1000.0;
+        LOG_INFO("LTX VAE spatial-blend timings: tile_runner=%.3fs graph_build=%.3fs tile_blend=%.3fs normalize=%.3fs "
+                 "(normalized %lld/%lld pixels) total=%.3fs",
+                 tile_runner_s,
+                 tile_graph_s,
+                 tile_blend_s,
+                 normalize_s,
+                 (long long)normalized_pixels,
+                 (long long)(Wp * Hp),
+                 (ggml_time_ms() - total_start_ms) * 1.0 / 1000.0);
+        return out;
+    }
+
     ggml_cgraph* build_latent_statistics_graph(const sd::Tensor<float>& z_tensor, bool normalize) {
         ggml_cgraph* gf = new_graph_custom(1024);
         ggml_tensor* z  = make_input(z_tensor);
@@ -1674,6 +1957,26 @@ struct LTXVideoVAE : public VAE {
             if (cropped_t != input.shape()[2]) {
                 input = sd::ops::slice(input, 2, 0, cropped_t);
             }
+        }
+        // Production LTX uses feathered spatial tiles; generic VAE tiling is
+        // not equivalent for the causal 22B decoder and can allocate a full
+        // frame during decode.  Keep the tile state local and blend only the
+        // overlap bands.
+        if (decode_graph && input.dim() >= 4 && input.shape()[2] >= 1 &&
+            getenv("LTX_VAE_SPATIAL_TILES") != nullptr) {
+            const std::string spec = getenv("LTX_VAE_SPATIAL_TILES");
+            int nx = std::max(1, atoi(spec.c_str()));
+            int ny = nx;
+            const size_t sep = spec.find_first_of("xX");
+            if (sep != std::string::npos) ny = std::max(1, atoi(spec.c_str() + sep + 1));
+            const int overlap = wholeframe_env_int("LTX_VAE_SPATIAL_OVERLAP", 6);
+            const bool hybrid = input.shape()[2] > 1 && getenv("LTX_VAE_SPATIOTEMPORAL_BLEND") != nullptr;
+            const bool stream = hybrid && getenv("LTX_VAE_TEMPORAL_STREAM") != nullptr;
+            const int frames = hybrid ? wholeframe_env_int("LTX_VAE_TBLEND_FRAMES", DEFAULT_TEMPORAL_TILE_FRAMES) : 0;
+            const int temporal_overlap = hybrid ? wholeframe_env_int("LTX_VAE_TBLEND_OVERLAP", 2) : 0;
+            LOG_INFO("LTX VAE spatial%s decode: tiles=%dx%d overlap=%d", hybrid ? "+temporal" : "", nx, ny, overlap);
+            return decode_spatial_blend(n_threads, input, expected_dim, nx, ny, overlap,
+                                        hybrid, stream, frames, temporal_overlap);
         }
         // LTX_VAE_TEMPORAL_BLEND: length-independent, seam-free decode. Decode the latent in
         // INDEPENDENT temporal tiles (bounds the full-res feature-map floor to a T-frame tile) and
