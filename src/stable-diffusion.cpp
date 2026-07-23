@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <set>
@@ -19,6 +21,7 @@
 #include "core/rng_philox.hpp"
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
+#include "gguf.h"
 #include "model_loader.h"
 #include "model_manager.h"
 #include "stable-diffusion.h"
@@ -193,6 +196,46 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
     return std::max(0.0f, reuse_threshold);
 }
 
+// Read the per-tensor NVFP4 weight globals (ModelOpt weight_scale_2) out of an UNFOLDED
+// import.  They are stored as tiny sibling F32 tensors named "<weight>.wglobal".
+// Deliberately reads the file directly (gguf metadata with no_alloc=true, then a 4-byte
+// read per sidecar by file offset) rather than going through the shared ModelLoader:
+// this must be unambiguous about WHICH file it is describing, and the loader accumulates
+// every model file ever init'd -- including the DiT that a hot-swap replaced.  `out` is
+// keyed by the BARE gguf name "<weight>.wglobal"; a legacy folded gguf has none, so an
+// empty map is the normal, correct result for those.
+static void load_nvfp4_weight_globals(const std::string& path, std::map<std::string, float>& out) {
+    struct gguf_init_params gp = {/*no_alloc=*/true, /*ctx=*/nullptr};
+    gguf_context* gctx         = gguf_init_from_file(path.c_str(), gp);
+    if (gctx == nullptr) {
+        return;
+    }
+    const size_t data_off = gguf_get_data_offset(gctx);
+    FILE* f               = fopen(path.c_str(), "rb");
+    if (f != nullptr) {
+        const int64_t n = gguf_get_n_tensors(gctx);
+        for (int64_t i = 0; i < n; ++i) {
+            const char* name = gguf_get_tensor_name(gctx, i);
+            const size_t len = name ? strlen(name) : 0;
+            if (len < 8 || strcmp(name + len - 8, ".wglobal") != 0) {
+                continue;
+            }
+            // Only the exact shape this fold understands: one f32 scalar.  Anything else
+            // is left unregistered, so its Linear keeps the graph-level multiply.
+            if (gguf_get_tensor_type(gctx, i) != GGML_TYPE_F32 || gguf_get_tensor_size(gctx, i) != sizeof(float)) {
+                continue;
+            }
+            const size_t off = data_off + gguf_get_tensor_offset(gctx, i);
+            float g          = 1.0f;
+            if (fseek(f, (long)off, SEEK_SET) == 0 && fread(&g, sizeof(float), 1, f) == 1) {
+                out[name] = g;
+            }
+        }
+        fclose(f);
+    }
+    gguf_free(gctx);
+}
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 template <typename T, typename = void>
@@ -219,6 +262,12 @@ public:
     std::shared_ptr<RNG> sampler_rng = nullptr;
     int n_threads                    = -1;
     float default_flow_shift         = INFINITY;
+
+    // {model file, runtime tensor-name prefix} of every leg that boot scanned for NVFP4
+    // .wglobal sidecars. Kept so a DiT hot-swap, which rebuilds the whole (process-global)
+    // registry, can re-register the legs it is NOT replacing -- e.g. a MoE high-noise
+    // expert loaded under its own prefix.
+    std::vector<std::pair<std::string, std::string>> nvfp4_weight_global_legs;
 
     std::shared_ptr<Conditioner> cond_stage_model;
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
@@ -595,6 +644,129 @@ public:
         return true;
     }
 
+    // Rebuild the process-global NVFP4 weight-global registry from the given model files.
+    // Each leg is {file path, runtime tensor-name prefix} exactly as it was handed to
+    // ModelLoader::init_from_file, because the sidecars are stored under bare gguf names.
+    //
+    // Registering a scalar is what licenses Linear::forward to drop its full-size
+    // ggml_mul: the FP4 cuBLASLt GEMM then folds the scalar into the matmul alpha.  The
+    // failure mode is asymmetric -- a scalar that is registered but keyed wrong (or stale
+    // from a previous model) is silently wrong output, while one that is simply absent
+    // only costs the multiply we were trying to remove.  So this ALWAYS clears first, and
+    // on any inconsistency it clears again and leaves every Linear on the graph path.
+    void register_nvfp4_weight_globals(const std::vector<std::pair<std::string, std::string>>& legs,
+                                       const char* context) {
+        // Never additive: a hot-swapped variant must not inherit the outgoing model's
+        // scalars (a FOLDED gguf has already folded its global into the block scales and
+        // would be scaled a second time).
+        ggml_cuda_nvfp4_clear_weight_globals();
+
+        if (model_manager == nullptr) {
+            return;
+        }
+
+        // Ground truth for "how many Linears would otherwise emit the graph multiply":
+        // the currently registered param tensors, which is exactly the set the graph
+        // builder bound a "weight.wglobal" param for.
+        size_t expected_sidecars = 0;
+        for (const std::string& name : model_manager->tensor_names()) {
+            if (ends_with(name, ".wglobal")) {
+                ++expected_sidecars;
+            }
+        }
+        if (expected_sidecars == 0) {
+            return;  // folded gguf (or no NVFP4 model at all): nothing to fold, nothing to log
+        }
+
+        // ggml_set_name truncates to GGML_MAX_NAME, and the CUDA backend only ever sees
+        // that truncated name -- so key by tensor->name, and refuse to fold at all if two
+        // distinct weights of the SAME file collide onto one key with different scalars.
+        // Across legs, later wins: that mirrors ModelLoader, where a later init_from_file()
+        // overrides an earlier file's tensor of the same name (e.g. --diffusion-model
+        // replacing the DiT inside a full checkpoint).
+        std::map<std::string, float> by_ggml_name;
+        size_t n_found = 0, n_unmatched = 0, n_conflict = 0;
+        for (const auto& leg : legs) {
+            if (leg.first.empty()) {
+                continue;
+            }
+            std::map<std::string, float> wglobals;
+            load_nvfp4_weight_globals(leg.first, wglobals);
+            std::map<std::string, float> leg_by_ggml_name;
+            for (const auto& kv : wglobals) {
+                ++n_found;
+                // "<bare weight>.wglobal" -> the runtime name of the weight it belongs to
+                const std::string weight_name = leg.second + kv.first.substr(0, kv.first.size() - 8);
+                ggml_tensor* weight           = model_manager->find_tensor(weight_name);
+                if (weight == nullptr) {
+                    LOG_WARN("%s: NVFP4 weight global '%s' from '%s' matches no registered tensor '%s'; "
+                             "that Linear keeps its graph-level scale",
+                             context, kv.first.c_str(), leg.first.c_str(), weight_name.c_str());
+                    ++n_unmatched;
+                    continue;
+                }
+                if (!std::isfinite(kv.second) || kv.second <= 0.f) {
+                    LOG_ERROR("%s: NVFP4 weight global for '%s' is not a usable scale (%g)",
+                              context, weight_name.c_str(), kv.second);
+                    ++n_conflict;
+                    continue;
+                }
+                auto it = leg_by_ggml_name.find(weight->name);
+                if (it != leg_by_ggml_name.end() && it->second != kv.second) {
+                    LOG_ERROR("%s: NVFP4 weight globals of '%s' collide on ggml name '%s' (%g vs %g) -- "
+                              "GGML_MAX_NAME truncation makes the fold ambiguous",
+                              context, leg.first.c_str(), weight->name, it->second, kv.second);
+                    ++n_conflict;
+                    continue;
+                }
+                leg_by_ggml_name[weight->name] = kv.second;
+            }
+            for (const auto& kv : leg_by_ggml_name) {
+                by_ggml_name[kv.first] = kv.second;
+            }
+        }
+
+        if (n_conflict > 0) {
+            LOG_ERROR("%s: %zu NVFP4 weight-global conflicts -- NOT folding any of them into the "
+                      "GEMM alpha; every Linear keeps its explicit scale (slower, correct)",
+                      context, n_conflict);
+            ggml_cuda_nvfp4_clear_weight_globals();
+            return;
+        }
+        if (by_ggml_name.empty()) {
+            LOG_WARN("%s: model declares %zu NVFP4 .wglobal sidecars but none of them could be matched "
+                     "back to a registered weight (%zu read from file, %zu unmatched); keeping the "
+                     "graph-level scale for all of them",
+                     context, expected_sidecars, n_found, n_unmatched);
+            return;
+        }
+
+        for (const auto& kv : by_ggml_name) {
+            ggml_cuda_nvfp4_register_weight_global(kv.first.c_str(), kv.second);
+        }
+
+        if (by_ggml_name.size() != expected_sidecars || n_unmatched > 0) {
+            LOG_ERROR("%s: registered %zu of %zu NVFP4 weight globals (%zu read from the model files, "
+                      "%zu unmatched); the remainder stay on the graph-level scale path",
+                      context, by_ggml_name.size(), expected_sidecars, n_found, n_unmatched);
+        }
+
+        // Say plainly whether the fold is actually live: registration alone is not enough,
+        // the FP4 cuBLASLt path also has to be enabled and the device Blackwell-class.
+        const bool folded = ggml_cuda_nvfp4_weight_global_folded(backend_manager.runtime_backend(SDBackendModule::DIFFUSION),
+                                                                 by_ggml_name.begin()->first.c_str());
+        if (folded) {
+            LOG_INFO("%s: folding %zu NVFP4 weight globals into the cuBLASLt FP4 GEMM alpha "
+                     "(per-Linear scale multiply elided)",
+                     context, by_ggml_name.size());
+        } else {
+            LOG_WARN("%s: %zu NVFP4 weight globals registered but the cuBLASLt FP4 GEMM fold is not "
+                     "active for the diffusion backend (GGML_NVFP4_CUBLASLT off, non-CUDA, or "
+                     "pre-Blackwell); keeping the graph-level scale",
+                     context, by_ggml_name.size());
+        }
+    }
+
     // Upstream's ModelManager owns all DiT parameter residency.  Re-register
     // the same runner graph against a replacement GGUF at a serial boundary,
     // which drops the outgoing CPU/VRAM blocks before the new loader source is
@@ -647,6 +819,27 @@ public:
             model_manager->unregister_param_tensors("Diffusion model");
             return false;
         }
+        // Re-point the NVFP4 weight-global registry at the INCOMING gguf.  This is a full
+        // rebuild, not an update: the registry is process-global and every selectable DiT
+        // variant comes through here, so an unfolded -> folded swap must not leave the
+        // outgoing scalars registered (the folded weights would be scaled twice), and an
+        // unfolded -> unfolded swap must not keep the outgoing model's values.
+        //
+        // The registry is keyed by tensor name and the swap reuses the same runner graph,
+        // so the keys are identical across variants -- only the values change.
+        //
+        // Legs that the swap does NOT replace (a MoE high-noise expert, an uncond DiT) must
+        // be re-registered from their own files, or the rebuild would silently drop them
+        // back onto the slower graph-level scale path.  The boot legs that DO cover
+        // "model.diffusion_model." (including a single-file checkpoint, prefix "") are
+        // dropped: their copy of these weights is the one being replaced.
+        std::vector<std::pair<std::string, std::string>> legs = {{path, "model.diffusion_model."}};
+        for (const auto& leg : nvfp4_weight_global_legs) {
+            if (!leg.first.empty() && !leg.second.empty() && leg.second != "model.diffusion_model.") {
+                legs.push_back(leg);
+            }
+        }
+        register_nvfp4_weight_globals(legs, "swap_diffusion_model");
         LOG_INFO("swap_diffusion_model: selected '%s'; weights will load lazily", path.c_str());
         return true;
     }
@@ -1749,7 +1942,21 @@ public:
             }
         }
         if (weight_global_count > 0) {
-            LOG_INFO("using %zu ModelOpt unfolded NVFP4 .wglobal sidecars through generic Linear scaling", weight_global_count);
+            // Hand the scalars to the CUDA FP4 GEMM so it can fold them into the matmul
+            // alpha, instead of paying a full-size elementwise multiply per Linear.  Legs
+            // mirror the init_from_file() calls above, since the sidecars carry bare gguf
+            // names and it is the load prefix that makes them runtime tensor names.
+            nvfp4_weight_global_legs = {
+                {SAFE_STR(sd_ctx_params->model_path), ""},
+                {SAFE_STR(sd_ctx_params->diffusion_model_path), "model.diffusion_model."},
+                {SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path), "model.high_noise_diffusion_model."},
+                {SAFE_STR(sd_ctx_params->uncond_diffusion_model_path), "model.diffusion_model.uncond."},
+            };
+            register_nvfp4_weight_globals(nvfp4_weight_global_legs, "nvfp4 weight globals");
+        } else {
+            // No unfolded sidecars in this model: make sure a previously created context in
+            // this process cannot leave stale scalars behind in the global registry.
+            ggml_cuda_nvfp4_clear_weight_globals();
         }
         if (!model_manager->validate_registered_tensors()) {
             LOG_ERROR("model metadata validation failed");

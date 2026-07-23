@@ -98,6 +98,14 @@ std::set<std::string> ModelManager::tensor_names() const {
     return names;
 }
 
+ggml_tensor* ModelManager::find_tensor(const std::string& name) const {
+    auto it = tensor_states_by_name_.find(name);
+    if (it == tensor_states_by_name_.end() || it->second == nullptr) {
+        return nullptr;
+    }
+    return it->second->tensor;
+}
+
 size_t estimate_tensors_size(const std::map<std::string, ggml_tensor*>& tensors) {
     size_t size = 0;
     std::unordered_set<ggml_tensor*> seen;

@@ -126,6 +126,11 @@ public:
 
     std::set<std::string> tensor_names() const;
 
+    // Registered graph tensor for a full (untruncated) loader tensor name, or nullptr.
+    // Needed to recover the tensor's ggml ->name, which ggml_set_name truncates to
+    // GGML_MAX_NAME and which is therefore the only key the CUDA backend ever sees.
+    ggml_tensor* find_tensor(const std::string& name) const;
+
     bool register_param_tensors(const std::string& desc,
                                 std::map<std::string, ggml_tensor*> tensors,
                                 ResidencyMode residency_mode,

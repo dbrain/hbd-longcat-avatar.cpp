@@ -3924,6 +3924,46 @@ public:
     }
 };
 
+// Can this Linear's `w @ x` be relied on to apply the registered NVFP4 weight global
+// (ModelOpt weight_scale_2) inside the GEMM itself?  Only the CUDA cuBLASLt FP4 path folds
+// the scalar into the matmul alpha; every other route (MMQ, dequant-cuBLAS, CPU, a
+// pre-Blackwell device, an unregistered tensor) silently multiplies by 1.0.  So this must
+// return false whenever anything is unproven -- a false negative merely keeps the (correct)
+// explicit multiply in the graph, whereas a false positive is wrong pixels with no error.
+//
+// The tensor-shaped preconditions below mirror the bail list at the top of
+// ggml_cuda_nvfp4_cublaslt_mul_mat(); the backend/env/registry ones are proven by
+// ggml_cuda_nvfp4_weight_global_folded().  `x` is the pre-ggml_ext_linear activation:
+// that function feeds mul_mat a 2D reshape only when ne2*ne3 is 1 or > 1024, and anything
+// non-contiguous it might make contiguous is treated here as unproven.
+__STATIC_INLINE__ bool ggml_ext_nvfp4_weight_global_folded_in_gemm(ggml_backend_t backend,
+                                                                   ggml_tensor* w,
+                                                                   ggml_tensor* x) {
+    if (backend == nullptr || w == nullptr || x == nullptr) {
+        return false;
+    }
+    if (w->type != GGML_TYPE_NVFP4) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    const int64_t x_batch = x->ne[2] * x->ne[3];
+    if (x_batch != 1 && x_batch <= 1024) {
+        return false;  // mul_mat would see a batched src1 -> cuBLASLt FP4 path bails
+    }
+    if (!ggml_is_contiguous(w) || !ggml_is_contiguous(x)) {
+        return false;
+    }
+    if (x->ne[0] != w->ne[0] || w->ne[0] % 64 != 0) {
+        return false;
+    }
+    return ggml_cuda_nvfp4_weight_global_folded(backend, w->name);
+}
+
 class Linear : public UnaryBlock {
 protected:
     int64_t in_features;
@@ -4003,7 +4043,18 @@ public:
         if (bias) {
             b = params["bias"];
         }
-        ggml_tensor* linear_bias = (has_weight_scale || has_weight_global) ? nullptr : b;
+        // ModelOpt's `.wglobal` is a single scalar, but expressing it as a graph node
+        // costs a full-size elementwise multiply over every Linear output (plus the
+        // separate bias add it forces).  The CUDA FP4 cuBLASLt GEMM can instead fold the
+        // scalar straight into the matmul alpha for free.  Elide the graph multiply ONLY
+        // when that fold is proven to happen for this exact matmul -- if it is not, the
+        // GEMM multiplies by 1.0 and the output would be silently wrong.
+        const bool fold_weight_global =
+            has_weight_global && !ctx->weight_adapter &&
+            ggml_ext_nvfp4_weight_global_folded_in_gemm(ctx->backend, w, x);
+        const bool scale_weight_global_in_graph = has_weight_global && !fold_weight_global;
+
+        ggml_tensor* linear_bias = (has_weight_scale || scale_weight_global_in_graph) ? nullptr : b;
         ggml_tensor* out         = nullptr;
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
@@ -4021,13 +4072,13 @@ public:
         } else {
             out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
         }
-        if (has_weight_global && !ctx->weight_adapter) {
+        if (scale_weight_global_in_graph && !ctx->weight_adapter) {
             out = ggml_mul(ctx->ggml_ctx, out, params["weight.wglobal"]);
         }
         if (has_weight_scale) {
             out = ggml_mul(ctx->ggml_ctx, out, params["weight_scale"]);
         }
-        if ((has_weight_scale || has_weight_global) && b != nullptr) {
+        if ((has_weight_scale || scale_weight_global_in_graph) && b != nullptr) {
             out = ggml_add_inplace(ctx->ggml_ctx, out, b);
         }
         return out;
