@@ -8180,10 +8180,6 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
         int64_t audio_latent_decode_end = ggml_time_ms();
         LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_latent_decode_end - audio_latent_decode_start) * 1.0f / 1000);
-        // The audio waveform is now host-owned.  Release the audio-VAE runner's
-        // staged GPU weights before the substantially larger video-VAE decode.
-        // A later segment can stage the same mmap-backed weights again on demand.
-        sd_ctx->sd->audio_vae_model->runner_done();
     }
     if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !avatar_input_wav.empty()) {
         constexpr uint32_t sample_rate = 16000;
