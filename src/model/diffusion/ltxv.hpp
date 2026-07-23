@@ -52,6 +52,8 @@ namespace LTXV {
         return ggml_reshape_3d(ctx, gathered, dim, 1, sel->ne[0]);
     }
 
+    // Reference AdaLN modulation: out = x + x*scale + shift == 1 MUL + 2 ADD, all at
+    // full activation width. Kept as the unfused reference; the live path is modulate_v2().
     __STATIC_INLINE__ ggml_tensor* modulate(ggml_context* ctx,
                                             ggml_tensor* x,
                                             ggml_tensor* shift,
@@ -59,6 +61,48 @@ namespace LTXV {
         shift = align_token_modulation(ctx, x, shift);
         scale = align_token_modulation(ctx, x, scale);
         return Flux::modulate(ctx, x, shift, scale, true);
+    }
+
+    // Fold the +1 of (1+scale) into an AdaLN scale chunk.
+    //
+    // MUST be applied exactly once, and MUST be applied to the COMPACT [dim, 1, U]
+    // modulation chunk (i.e. before gather_mod_tokens() expands it to per-token order):
+    // on the compact table this costs dim*U elements, on the expanded one it would cost
+    // dim*L — exactly the full-width ADD that modulate_v2() is removing, i.e. a wash.
+    //
+    // ggml_scale is F32-only on the CUDA backend, while classic LTX-Video 0.9.x
+    // checkpoints can store the scale_shift tables as F16/BF16. Upcast the (tiny) chunk
+    // first; a no-op for the F32 tables of LTX-2, so that path is unaffected.
+    __STATIC_INLINE__ ggml_tensor* adaln_scale_plus_one(ggml_context* ctx, ggml_tensor* scale) {
+        if (scale == nullptr) {
+            return nullptr;
+        }
+        if (scale->type != GGML_TYPE_F32) {
+            scale = ggml_cast(ctx, scale, GGML_TYPE_F32);
+        }
+        return ggml_scale_bias(ctx, scale, 1.0f, 1.0f);  // scale -> scale + 1
+    }
+
+    // Reassociated AdaLN modulation: out = x*(1+scale) + shift.
+    //
+    // `scale_plus1` must ALREADY carry the +1 (applied by adaln_scale_plus_one() on the
+    // compact modulation chunk — see get_ada_values()/get_scale_shift_values()).
+    //
+    // vs modulate(): 1 MUL + 2 ADD -> 1 MUL + 1 ADD, dropping one full-width ADD per
+    // modulation site. It also leaves the preceding ggml_rms_norm() output with exactly
+    // ONE consumer (modulate() fed it to both the MUL and the first ADD), which is the
+    // use-count precondition of the ggml-cuda {RMS_NORM, MUL, ADD} fusion matcher.
+    //
+    // Numerics: x + x*s + shift and x*(1+s) + shift differ only in rounding. This is the
+    // same form the reference fused AdaLN kernel computes (rms_norm(x)*(mul + 1) + shift),
+    // so the reassociation is the accepted one.
+    __STATIC_INLINE__ ggml_tensor* modulate_v2(ggml_context* ctx,
+                                               ggml_tensor* x,
+                                               ggml_tensor* shift,
+                                               ggml_tensor* scale_plus1) {
+        shift       = align_token_modulation(ctx, x, shift);
+        scale_plus1 = align_token_modulation(ctx, x, scale_plus1);
+        return ggml_add(ctx, ggml_mul(ctx, x, scale_plus1), shift);
     }
 
     __STATIC_INLINE__ ggml_tensor* apply_gate(ggml_context* ctx,
@@ -794,7 +838,16 @@ namespace LTXV {
             s             = ggml_repeat(ctx->ggml_ctx, s, e);
             t             = ggml_repeat(ctx->ggml_ctx, t, e);
             auto out      = ggml_add(ctx->ggml_ctx, s, t);
-            return ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
+            auto chunks   = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
+            // Chunk layout is (shift, scale, gate) per group: msa = 0..2, mlp = 3..5 and,
+            // under cross_attention_adaln, cross-attn q = 6..8. Pre-bias the SCALE chunks
+            // for modulate_v2(); shift/gate chunks are left untouched.
+            chunks[1] = adaln_scale_plus_one(ctx->ggml_ctx, chunks[1]);
+            chunks[4] = adaln_scale_plus_one(ctx->ggml_ctx, chunks[4]);
+            if (cross_attention_adaln) {
+                chunks[7] = adaln_scale_plus_one(ctx->ggml_ctx, chunks[7]);
+            }
+            return chunks;
         }
 
         std::vector<ggml_tensor*> get_prompt_scale_shift_values(GGMLRunnerContext* ctx,
@@ -808,7 +861,10 @@ namespace LTXV {
             s        = ggml_repeat(ctx->ggml_ctx, s, e);
             t        = ggml_repeat(ctx->ggml_ctx, t, e);
             auto out = ggml_add(ctx->ggml_ctx, s, t);
-            return ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            // (shift, scale) — pre-bias the SCALE chunk for modulate_v2().
+            chunks[1]   = adaln_scale_plus_one(ctx->ggml_ctx, chunks[1]);
+            return chunks;
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -832,7 +888,7 @@ namespace LTXV {
             auto gate_mlp  = mods[5];
 
             auto x_norm = rms_norm(ctx->ggml_ctx, x);
-            x_norm      = LTXV::modulate(ctx->ggml_ctx, x_norm, shift_msa, scale_msa);
+            x_norm      = LTXV::modulate_v2(ctx->ggml_ctx, x_norm, shift_msa, scale_msa);
             auto msa    = attn1->forward(ctx, x_norm, nullptr, self_attention_mask, pe);
             x           = ggml_add(ctx->ggml_ctx, x, apply_gate(ctx->ggml_ctx, msa, gate_msa));
 
@@ -842,12 +898,12 @@ namespace LTXV {
                 auto gate_q  = mods[8];
 
                 auto q = rms_norm(ctx->ggml_ctx, x);
-                q      = LTXV::modulate(ctx->ggml_ctx, q, shift_q, scale_q);
+                q      = LTXV::modulate_v2(ctx->ggml_ctx, q, shift_q, scale_q);
 
                 auto context_mod = context;
                 if (prompt_timestep != nullptr) {
                     auto prompt_mods = get_prompt_scale_shift_values(ctx, prompt_timestep);
-                    context_mod      = LTXV::modulate(ctx->ggml_ctx, context_mod, prompt_mods[0], prompt_mods[1]);
+                    context_mod      = LTXV::modulate_v2(ctx->ggml_ctx, context_mod, prompt_mods[0], prompt_mods[1]);
                 }
 
                 auto mca = attn2->forward(ctx, q, context_mod, attention_mask, nullptr, nullptr);
@@ -858,7 +914,7 @@ namespace LTXV {
             }
 
             auto y       = rms_norm(ctx->ggml_ctx, x);
-            y            = LTXV::modulate(ctx->ggml_ctx, y, shift_mlp, scale_mlp);
+            y            = LTXV::modulate_v2(ctx->ggml_ctx, y, shift_mlp, scale_mlp);
             auto mlp_out = ff->forward(ctx, y);
             x            = ggml_add(ctx->ggml_ctx, x, apply_gate(ctx->ggml_ctx, mlp_out, gate_mlp));
             return x;
@@ -1191,6 +1247,11 @@ namespace LTXV {
             }
         }
 
+        // `scale_idx`: indices INTO THE RETURNED vector whose chunk is an AdaLN *scale*
+        // destined for modulate_v2(). Those chunks get the +1 of (1+scale) folded in here,
+        // while they are still the COMPACT [dim, 1, U] table — i.e. before the optional
+        // gather_mod_tokens() expansion to per-token order, which is what keeps the fold
+        // cheap. Pass {} (the default) to get the raw chunks for modulate()/apply_gate().
         std::vector<ggml_tensor*> get_ada_values(GGMLRunnerContext* ctx,
                                                  ggml_tensor* table,
                                                  ggml_tensor* timestep,
@@ -1198,7 +1259,8 @@ namespace LTXV {
                                                  int64_t coeff,
                                                  int64_t start = 0,
                                                  int64_t count = -1,
-                                                 ggml_tensor* expand_sel = nullptr) {
+                                                 ggml_tensor* expand_sel = nullptr,
+                                                 const std::vector<int>& scale_idx = {}) {
             if (count < 0) {
                 count = coeff - start;
             }
@@ -1210,6 +1272,10 @@ namespace LTXV {
             auto out    = ggml_add(ctx->ggml_ctx, s, t);
             auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, static_cast<int>(coeff), 1);
             std::vector<ggml_tensor*> selected(chunks.begin() + start, chunks.begin() + start + count);
+            for (int i : scale_idx) {
+                GGML_ASSERT(i >= 0 && i < (int) selected.size());
+                selected[i] = adaln_scale_plus_one(ctx->ggml_ctx, selected[i]);
+            }
             if (expand_sel != nullptr) {
                 for (auto& chunk : selected) {
                     chunk = gather_mod_tokens(ctx->ggml_ctx, chunk, expand_sel);
@@ -1230,13 +1296,15 @@ namespace LTXV {
                                                 ggml_tensor* attention_mask,
                                                 ggml_tensor* expand_sel = nullptr) {
             if (cross_attention_adaln) {
-                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, expand_sel);
+                // q_mods = (shift, scale, gate) -> scale at 1
+                auto q_mods      = get_ada_values(ctx, table, timestep, dim, 9, 6, 3, expand_sel, {1});
                 auto q           = rms_norm(ctx->ggml_ctx, x);
-                q                = LTXV::modulate(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
+                q                = LTXV::modulate_v2(ctx->ggml_ctx, q, q_mods[0], q_mods[1]);
                 auto context_mod = context;
                 if (prompt_timestep != nullptr && prompt_table != nullptr) {
-                    auto p_mods = get_ada_values(ctx, prompt_table, prompt_timestep, dim, 2);
-                    context_mod = LTXV::modulate(ctx->ggml_ctx, context_mod, p_mods[0], p_mods[1]);
+                    // p_mods = (shift, scale) -> scale at 1
+                    auto p_mods = get_ada_values(ctx, prompt_table, prompt_timestep, dim, 2, 0, -1, nullptr, {1});
+                    context_mod = LTXV::modulate_v2(ctx->ggml_ctx, context_mod, p_mods[0], p_mods[1]);
                 }
                 auto out = attn->forward(ctx, q, context_mod, attention_mask, nullptr, nullptr);
                 return apply_gate(ctx->ggml_ctx, out, q_mods[2]);
@@ -1281,9 +1349,12 @@ namespace LTXV {
             bool run_a2v = run_ax && !ctx->ltx_skip_a2v_cross_attn;
             bool run_v2a = run_ax && !ctx->ltx_skip_a2v_cross_attn;
 
-            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel);
+            // v_mods[0..2] = (shift, scale, gate) for the video self-attn -> scale at 1.
+            // Entries 3.. are re-fetched separately below (v_ff_mods / q_mods), so only
+            // index 1 is consumed here and only index 1 needs the +1 fold.
+            auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel, {1});
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
-            v_norm      = LTXV::modulate(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
+            v_norm      = LTXV::modulate_v2(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
             auto v_txt  = apply_text_cross_attention(ctx,
@@ -1300,9 +1371,10 @@ namespace LTXV {
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
 
             if (run_ax) {
-                auto a_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6);
+                // a_mods[0..2] = (shift, scale, gate) for the audio self-attn -> scale at 1.
+                auto a_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6, 0, -1, nullptr, {1});
                 auto a_norm = rms_norm(ctx->ggml_ctx, ax);
-                a_norm      = LTXV::modulate(ctx->ggml_ctx, a_norm, a_mods[0], a_mods[1]);
+                a_norm      = LTXV::modulate_v2(ctx->ggml_ctx, a_norm, a_mods[0], a_mods[1]);
                 auto a_sa   = audio_attn1->forward(ctx, a_norm, nullptr, nullptr, a_pe);
                 ax          = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_sa, a_mods[2]));
                 auto a_txt  = apply_text_cross_attention(ctx,
@@ -1323,10 +1395,11 @@ namespace LTXV {
                 if (run_a2v) {
                     auto a2v_audio_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 0, 4);
                     auto a2v_video_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_video"], 1, 0, 4);
-                    auto a2v_audio       = get_ada_values(ctx, a2v_audio_table, a_cross_scale_shift_timestep, a_dim, 4);
-                    auto a2v_video       = get_ada_values(ctx, a2v_video_table, v_cross_scale_shift_timestep, v_dim, 4);
-                    auto vx_scaled       = LTXV::modulate(ctx->ggml_ctx, vx_norm3, a2v_video[1], a2v_video[0]);
-                    auto ax_scaled       = LTXV::modulate(ctx->ggml_ctx, ax_norm3, a2v_audio[1], a2v_audio[0]);
+                    // a2v uses chunk layout (scale, shift, ...) -> scale at 0.
+                    auto a2v_audio       = get_ada_values(ctx, a2v_audio_table, a_cross_scale_shift_timestep, a_dim, 4, 0, -1, nullptr, {0});
+                    auto a2v_video       = get_ada_values(ctx, a2v_video_table, v_cross_scale_shift_timestep, v_dim, 4, 0, -1, nullptr, {0});
+                    auto vx_scaled       = LTXV::modulate_v2(ctx->ggml_ctx, vx_norm3, a2v_video[1], a2v_video[0]);
+                    auto ax_scaled       = LTXV::modulate_v2(ctx->ggml_ctx, ax_norm3, a2v_audio[1], a2v_audio[0]);
                     auto a2v_out         = audio_to_video_attn->forward(ctx, vx_scaled, ax_scaled, nullptr, v_cross_pe, a_cross_pe);
                     auto a2v_gate_table  = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_video"], 1, 4, 5);
                     auto a2v_gate        = get_ada_values(ctx, a2v_gate_table, v_cross_gate_timestep, v_dim, 1)[0];
@@ -1336,25 +1409,30 @@ namespace LTXV {
                 if (run_v2a) {
                     auto v2a_audio_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 0, 4);
                     auto v2a_video_table = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_video"], 1, 0, 4);
-                    auto v2a_audio       = get_ada_values(ctx, v2a_audio_table, a_cross_scale_shift_timestep, a_dim, 4);
-                    auto v2a_video       = get_ada_values(ctx, v2a_video_table, v_cross_scale_shift_timestep, v_dim, 4);
-                    auto ax_scaled       = LTXV::modulate(ctx->ggml_ctx, ax_norm3, v2a_audio[3], v2a_audio[2]);
-                    auto vx_scaled       = LTXV::modulate(ctx->ggml_ctx, vx_norm3, v2a_video[3], v2a_video[2]);
+                    // v2a consumes the SECOND pair of the same 4-wide table: (scale, shift)
+                    // at 2,3 -> scale at 2. (Separate get_ada_values() calls from the a2v
+                    // branch above, so these are distinct graph nodes — no double-fold.)
+                    auto v2a_audio       = get_ada_values(ctx, v2a_audio_table, a_cross_scale_shift_timestep, a_dim, 4, 0, -1, nullptr, {2});
+                    auto v2a_video       = get_ada_values(ctx, v2a_video_table, v_cross_scale_shift_timestep, v_dim, 4, 0, -1, nullptr, {2});
+                    auto ax_scaled       = LTXV::modulate_v2(ctx->ggml_ctx, ax_norm3, v2a_audio[3], v2a_audio[2]);
+                    auto vx_scaled       = LTXV::modulate_v2(ctx->ggml_ctx, vx_norm3, v2a_video[3], v2a_video[2]);
                     auto v2a_out         = video_to_audio_attn->forward(ctx, ax_scaled, vx_scaled, nullptr, a_cross_pe, v_cross_pe);
                     auto v2a_gate_table  = ggml_ext_slice(ctx->ggml_ctx, params["scale_shift_table_a2v_ca_audio"], 1, 4, 5);
                     auto v2a_gate        = get_ada_values(ctx, v2a_gate_table, a_cross_gate_timestep, a_dim, 1)[0];
                     ax                   = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, v2a_out, v2a_gate));
                 }
-                auto a_ff_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6, 3, 3);
+                // a_ff_mods = chunks 3..5 rebased to (shift, scale, gate) -> scale at 1.
+                auto a_ff_mods = get_ada_values(ctx, a_table, a_timestep, a_dim, cross_attention_adaln ? 9 : 6, 3, 3, nullptr, {1});
                 auto ax_scaled = rms_norm(ctx->ggml_ctx, ax);
-                ax_scaled      = LTXV::modulate(ctx->ggml_ctx, ax_scaled, a_ff_mods[0], a_ff_mods[1]);
+                ax_scaled      = LTXV::modulate_v2(ctx->ggml_ctx, ax_scaled, a_ff_mods[0], a_ff_mods[1]);
                 auto a_ff_out  = audio_ff->forward(ctx, ax_scaled);
                 ax             = ggml_add(ctx->ggml_ctx, ax, apply_gate(ctx->ggml_ctx, a_ff_out, a_ff_mods[2]));
             }
 
-            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, ctx->ltx_video_token_sel);
+            // v_ff_mods = chunks 3..5 rebased to (shift, scale, gate) -> scale at 1.
+            auto v_ff_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 3, 3, ctx->ltx_video_token_sel, {1});
             auto vx_scaled = rms_norm(ctx->ggml_ctx, vx);
-            vx_scaled      = LTXV::modulate(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
+            vx_scaled      = LTXV::modulate_v2(ctx->ggml_ctx, vx_scaled, v_ff_mods[0], v_ff_mods[1]);
             auto v_ff_out  = ff->forward(ctx, vx_scaled);
             vx             = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_ff_out, v_ff_mods[2]));
 
@@ -1611,6 +1689,9 @@ namespace LTXV {
             auto s    = ggml_repeat(ctx->ggml_ctx, ggml_reshape_3d(ctx->ggml_ctx, table, dim, 2, 1), temp);
             auto out  = ggml_add(ctx->ggml_ctx, s, t);
             auto chunks = ggml_ext_chunk(ctx->ggml_ctx, out, 2, 1);
+            // (shift, scale) — pre-bias the SCALE chunk for modulate_v2(), while it is
+            // still compact (before the optional per-token gather below).
+            chunks[1]   = adaln_scale_plus_one(ctx->ggml_ctx, chunks[1]);
             if (expand_sel != nullptr) {
                 for (auto& chunk : chunks) {
                     chunk = gather_mod_tokens(ctx->ggml_ctx, chunk, expand_sel);
@@ -1771,14 +1852,14 @@ namespace LTXV {
 
             auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, ctx->ltx_video_token_sel);
             vx                 = norm_out->forward(ctx, vx);
-            vx                 = LTXV::modulate(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
+            vx                 = LTXV::modulate_v2(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
             vx                 = proj_out->forward(ctx, vx);
             vx                 = unpatchify_video(ctx, vx, width, height, frames);
 
             if (ax != nullptr && audio_time > 0) {
                 auto a_shift_scale = get_output_scale_shift(ctx, params["audio_scale_shift_table"], a_embedded_time, config.audio_hidden_size);
                 ax                 = audio_norm_out->forward(ctx, ax);
-                ax                 = LTXV::modulate(ctx->ggml_ctx, ax, a_shift_scale[0], a_shift_scale[1]);
+                ax                 = LTXV::modulate_v2(ctx->ggml_ctx, ax, a_shift_scale[0], a_shift_scale[1]);
                 ax                 = audio_proj_out->forward(ctx, ax);
                 ax                 = unpatchify_audio(ctx, ax, audio_time);
             }
