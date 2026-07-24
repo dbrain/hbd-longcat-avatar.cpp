@@ -145,8 +145,9 @@ namespace WAN {
             // would fall back to the slow cont+repeat+mul+add chain (big intermediates,
             // the lap-08b smell). Upcast q/k to F32 here so the fused RoPE fires; this is
             // the F32-cast LTX applies for the same reason. The cuDNN flash kernel casts
-            // q→F16 internally and, with GGML_CUDNN_ATTN_F16_OUT, stores an F16 output
-            // that feeds the F16 o_proj. v is re-cast to F16 inside ggml_ext_attention_ext
+            // q→F16 internally. (GGML_CUDNN_ATTN_F16_OUT, which would also make the attention
+            // RESULT F16 for o_proj, is opt-in per call site in ggml_ext_attention_ext and is
+            // NOT taken by wan — only LTX opts in.) v is re-cast to F16 inside ggml_ext_attention_ext
             // (build_kqv), so leave it F16. Self-gated on the F16 type → no-op in the
             // default F32 path (byte-identical).
             if (q->type == GGML_TYPE_F16) {
@@ -232,6 +233,15 @@ namespace WAN {
             // attention over the rolling cache), so mask=nullptr is correct. The
             // wrapper pads L_k->256 internally. Gated by the runner's flash flag so
             // S2V_NO_FLASH=1 still selects the exact (FA-off) path for A/B.
+            //
+            // GGML_CUDNN_ATTN_F16_OUT MUST STAY OFF ON THIS PATH. The shape here (mask ==
+            // nullptr, d_head == 128, F16 K/V) is exactly cuDNN's selection window, so it
+            // would otherwise opt in silently — but this is the causal KV-cache self-attn:
+            // `attn` feeds o_proj whose weight is the ordinary (Q4_K/Q8_0/F16) causal weight,
+            // not an NVFP4 one, so an F16 activation there fails
+            // ggml_backend_cuda_device_supports_op() and ggml_backend_sched drops the Linear
+            // to the CPU backend. It is excluded by construction: ggml_ext_attention_ext's
+            // f16_out_ok parameter defaults to false and is NOT passed here.
             auto attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend,
                                                q_roped, k_all, vv, num_heads, nullptr,
                                                /*skip_reshape=*/true,
@@ -843,9 +853,10 @@ namespace WAN {
             // WAN_DIT_F16 (default OFF, prod byte-identical when unset): run the DiT
             // residual stream in F16 to halve the per-block glue/copy/cast HBM traffic
             // (the nsys wall of k_bin_bcast<op_add> 5754-call residual adds, the
-            // <op_mul> AdaLN modulates, the convert_unary<half,float> casts) and to feed
-            // the cuDNN F16 attention output (GGML_CUDNN_ATTN_F16_OUT) straight into the
-            // next Linear with no re-upcast. Mirrors LTX_DIT_F16 (ltxv.hpp:1738). The
+            // <op_mul> AdaLN modulates, the convert_unary<half,float> casts). (Feeding the
+            // attention output straight in as F16 as well — GGML_CUDNN_ATTN_F16_OUT — is a
+            // separate, per-call-site opt-in that wan does not take; see the note at the
+            // forward_kv_cache attention.) Mirrors LTX_DIT_F16 (ltxv.hpp:1738). The
             // NVFP4 Linears emit F16 here (cuBLASLt FP4 GEMM: F32 accumulate, F16 store —
             // supports_op gate ggml-cuda.cu:6046, mm_dst gate ggml_extend.hpp:1149);
             // e0/context/pe stay F32 and broadcast into the F16 stream via the

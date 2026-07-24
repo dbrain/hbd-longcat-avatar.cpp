@@ -63,6 +63,50 @@ namespace LTXV {
         return ctx != nullptr && ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
     }
 
+    // GGML_CUDNN_ATTN_F16_OUT -- let the DiT attention hand its output to `to_out.0` as F16
+    // instead of F32. Independent of LTX_DIT_F16 on purpose: it pays off in BOTH streams.
+    //   * F32 stream: to_out's activation-quant reads half-width and its dst is F16, which
+    //     then broadcasts into the F32 residual via the F32,F16->F32 binbcast combo.
+    //   * F16 stream (LTX_DIT_F16): it also removes the ONLY F32 island left inside a block --
+    //     today the attention returns F32, so to_out falls off the F16-dst gate in
+    //     ggml_ext_linear and the residual add pays a full-width F32 read at every one of the
+    //     ~6 attentions x 28 blocks per forward.
+    // Value-honouring (`=0` disables), same as LTX_DIT_F16.
+    __STATIC_INLINE__ bool ltx_attn_f16_out_env() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = getenv("GGML_CUDNN_ATTN_F16_OUT");
+            v             = (e != nullptr && atoi(e) != 0) ? 1 : 0;
+        }
+        return v == 1;
+    }
+
+    // Full gate. An F16 attention output is only ever handed to `to_out.0`, so the question is
+    // exactly "will that ONE mul_mat be served with an F16 src1". Answering it per-Linear
+    // instead of per-device is what makes this safe to enable on a non-NVFP4 checkpoint:
+    // ggml_backend_cuda_device_supports_op() REJECTS an F16 src1 against a non-F16, non-served
+    // weight, and a rejected DiT Linear is not slow, it is dropped to the CPU backend.
+    //   * device/backend must advertise the cuBLASLt FP4 route (Blackwell + GGML_NVFP4_CUBLASLT)
+    //     -- the same probe LTX_DIT_F16 uses. Non-Blackwell / no-cuDNN builds keep today's F32
+    //     path, which is also what prod's has_blackwell_mma() gate buys.
+    //   * the to_out weight must actually be NVFP4, so ggml_ext_linear's mm_dst gate is
+    //     guaranteed to fire and emit the F16 dst rather than asking for an F32 dst from an
+    //     F16 activation.
+    //   * no LoRA/weight-adapter: forward_with_lora() builds its own delta chain and an F16
+    //     activation through it is unproven.
+    __STATIC_INLINE__ bool ltx_attn_f16_out_enabled(GGMLRunnerContext* ctx, const ggml_tensor* to_out_weight) {
+        if (!ltx_attn_f16_out_env()) {
+            return false;
+        }
+        if (ctx == nullptr || ctx->weight_adapter != nullptr) {
+            return false;
+        }
+        if (to_out_weight == nullptr || to_out_weight->type != GGML_TYPE_NVFP4) {
+            return false;
+        }
+        return ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
+    }
+
     __STATIC_INLINE__ ggml_tensor* align_token_modulation(ggml_context* ctx,
                                                           ggml_tensor* x,
                                                           ggml_tensor* mod) {
@@ -823,9 +867,20 @@ namespace LTXV {
             // Normalizing Q to F32 here makes the F16 stream independent of that selection
             // instead of silently depending on it. K/V are unaffected: the attention wrapper
             // casts them to F16 regardless, so they keep the half-width win.
+            //
+            // GGML_CUDNN_ATTN_F16_OUT does NOT change this. That optimization retypes the
+            // attention RESULT (a CPY node after the flash node), never ggml_flash_attn_ext's
+            // Q or its destination, so it cannot make an F16 Q reachable by a native kernel.
+            // The cast therefore stays exactly as landed, and the "no native fattn kernel ever
+            // sees a non-F32 Q" property is preserved unconditionally, on every device, with
+            // the flag on or off.
             if (q->type != GGML_TYPE_F32) {
                 q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
             }
+
+            // GGML_CUDNN_ATTN_F16_OUT opt-in. Decided per Linear (see ltx_attn_f16_out_enabled)
+            // because the F16 attention output has exactly one consumer: to_out.0 below.
+            const bool f16_out_ok = ltx_attn_f16_out_enabled(ctx, to_out_0->get_weight());
 
             auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
                                               ctx->backend,
@@ -835,7 +890,10 @@ namespace LTXV {
                                               heads,
                                               mask,
                                               false,
-                                              ctx->flash_attn_enabled);
+                                              ctx->flash_attn_enabled,
+                                              /*kv_scale=*/1.0f,
+                                              /*kv_prescaled_f16=*/false,
+                                              /*f16_out_ok=*/f16_out_ok);
 
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);

@@ -1434,7 +1434,13 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                                       bool skip_reshape = false,
                                                       bool flash_attn   = false,
                                                       float kv_scale    = 1.0f,   // avoid overflow
-                                                      bool kv_prescaled_f16 = false) {  // caller supplied F16(K/V * kv_scale)
+                                                      bool kv_prescaled_f16 = false,   // caller supplied F16(K/V * kv_scale)
+                                                      // GGML_CUDNN_ATTN_F16_OUT opt-in: the CALLER promises that whatever
+                                                      // consumes this attention output can take an F16 activation (see the
+                                                      // gate below). Default false => every existing call site is
+                                                      // byte-identical, and a caller that must NOT get an F16 output (the
+                                                      // wan causal KV-cache self-attention) is excluded by construction.
+                                                      bool f16_out_ok = false) {
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -1509,8 +1515,65 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
             return nullptr;
         }
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        // Restore the x(1/kv_scale) FIRST, in F32. A caller that scaled K/V DOWN to stay in
+        // F16 range restores by a large factor here; doing that while `out` is already F16
+        // can overflow F16-max (65504) to +-inf and poison the whole DiT. Keeping the restore
+        // in F32 leaves even a diverged forward finite.
         if (kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+        }
+
+        // GGML_CUDNN_ATTN_F16_OUT -- hand the attention output to the NEXT Linear (to_out) as
+        // F16 instead of F32.
+        //
+        // The flash node's own destination stays F32: this is a separate CPY on the result
+        // (plus a CLAMP where kv_scale can amplify it out of range), NOT a retype of
+        // ggml_flash_attn_ext's dst. That matters for safety -- no
+        // ggml CUDA fattn kernel ever sees a non-F32 KQV (or a non-F32 Q; the callers that run
+        // an F16 residual stream normalize Q to F32 before they get here). All this buys is:
+        //   - one full-size F16 store instead of F32 for the attention output,
+        //   - the to_out GEMM quantizes an F16 activation instead of an F32 one, and
+        //   - with an NVFP4 weight the to_out dst is F16 too (ggml_ext_linear's mm_dst gate),
+        //     so the residual add downstream reads half-width.
+        // cuDNN SDPA is where this pays off (it is the Blackwell fast path and the whole point
+        // of the flag's name), but correctness does not depend on cuDNN actually being chosen:
+        // if a native kernel runs, it writes F32 and the CPY still converts.
+        //
+        // Gating:
+        //   * `f16_out_ok` -- caller opt-in (the consumer can take F16; see the parameter).
+        //   * env, value-honouring: GGML_CUDNN_ATTN_F16_OUT=0 must DISABLE, not enable.
+        //   * mask_in == nullptr && d_head in {64,128} -- the cuDNN SDPA selection shape
+        //     (fattn.cu ggml_cuda_get_best_fattn_kernel). Deliberately NOT gated on
+        //     q_in->type: under an F16 residual stream the rope'd self-attn q is cast back to
+        //     F32 (RoPE is F32-only), so q is F32 on exactly the path we want this on.
+        // Device gating lives at the call site (it needs to know the weight/backend can serve
+        // an F16 activation at all); this helper only owns the shape + env part.
+        static const bool cudnn_f16_out_env = [] {
+            const char* e = getenv("GGML_CUDNN_ATTN_F16_OUT");
+            return e != nullptr && atoi(e) != 0;
+        }();
+        const bool want_f16_out = f16_out_ok && cudnn_f16_out_env &&
+                                  mask_in == nullptr && (d_head == 64 || d_head == 128);
+        if (want_f16_out) {
+            // Overflow guard, but ONLY where an overflow is actually reachable.
+            //
+            // With kv_scale == 1.0 the F16 cast below CANNOT overflow: flash attention's
+            // output is a convex combination of V rows (softmax weights sum to 1), so
+            // |out| <= max|V|, and the V this kernel reads is F16 (either the caller's
+            // prescaled F16 V, or the ggml_cast above) -- so |out| <= 65504 by construction
+            // and a clamp would be a provable no-op costing a full-size F32 read+write on
+            // every attention, which is most of what this optimization is trying to save.
+            //
+            // kv_scale != 1.0 breaks that bound: the caller scaled K/V DOWN to stay in F16
+            // range and the x(1/kv_scale) restore above amplifies the result back up (LTX in
+            // the prod fork uses 1/256, i.e. a x256 amplification), so a large-but-finite F32
+            // value can exceed F16 max and cast to +-inf, which poisons the rest of the DiT.
+            // Bound it there: identity for a healthy output, finite for a diverged one.
+            // (ggml_clamp is a VIEW of `out`, so it is in-place -- no extra allocation.)
+            if (kv_scale != 1.0f) {
+                out = ggml_clamp(ctx, out, -65504.0f, 65504.0f);
+            }
+            out = ggml_cast(ctx, out, GGML_TYPE_F16);
         }
         return out;
     };
