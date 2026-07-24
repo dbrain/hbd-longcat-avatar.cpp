@@ -26,11 +26,14 @@ GPU3060="${GPU_3060_UUID:-GPU-3b9ac5cf-95c5-5c9e-de19-af33af4b27d6}"
 mkdir -p "$OUT"
 cd "$CPP_DIR"
 
-echo "[1/4] geometry decode (--no-clean keeps the O-Voxel mesh) + PBR dump  [3060]"
+echo "[1/4] geometry decode (--no-clean keeps the O-Voxel mesh) + PBR dump, no bake/rig  [3060]"
+# --stage-dir writes coarse.glb (the O-Voxel mesh snapshot); --dump-geo writes pbr_{feats,coords}.bin
+# (stage-dir only caches the PBR inside the refine block, which --no-refine skips, so we need both);
+# --material-cache-only stops after the material cache -> skips the wasted UV bake + rig (~2min).
 CUDA_VISIBLE_DEVICES="$GPU3060" nice -n 10 ionice -c2 -n7 \
   flock -w 2400 "$LOCK" ./image_to_rig \
     --model "$MODEL" --image "$IMG" \
-    --no-clean --no-refine --dump-geo "$OUT" \
+    --no-clean --no-refine --material-cache-only --stage-dir "$OUT" --dump-geo "$OUT" \
     --out "$OUT/_decode_probe.glb" 2>&1 | tee "$OUT/01_decode.log"
 test -f "$OUT/coarse.glb"     || { echo "FAIL: no O-Voxel coarse.glb staged"; exit 1; }
 test -f "$OUT/pbr_feats.bin"  || { echo "FAIL: --dump-geo did not cache pbr_feats.bin"; exit 1; }
