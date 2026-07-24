@@ -379,12 +379,16 @@ static bool parse_img_gen_request(const json& body,
     if (body.contains("model") && body["model"].is_string()) {
         const std::string variant = body["model"].get<std::string>();
         if (!variant.empty()) {
-            if (variant == "edit" && runtime.svr_params != nullptr &&
-                runtime.svr_params->diffusion_model_edit_path.empty()) {
+            // Consult the runtime variant map (which reflects the worker-isolation
+            // SD_SERVER_WORKER_VARIANT_MAP), NOT svr_params->diffusion_model_edit_path:
+            // under isolation the request-handling child has --diffusion-model-edit
+            // stripped from its argv (worker_supervisor.cpp), so that field is always
+            // empty even though the edit DiT is loaded and selectable via the map.
+            const auto variants = runtime_diffusion_model_variants(runtime);
+            if (variant == "edit" && variants.find("edit") == variants.end()) {
                 error_message = "edit model not available (server started without --diffusion-model-edit)";
                 return false;
             }
-            const auto variants = runtime_diffusion_model_variants(runtime);
             if (variants.find(variant) == variants.end()) {
                 error_message = "unknown model variant '" + variant + "'";
                 return false;
