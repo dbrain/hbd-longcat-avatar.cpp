@@ -305,6 +305,16 @@ if [ "$BASE" = "dump_to_glb" ]; then
   exit 0
 fi
 
+# mesh_taubin: feature-preserving Taubin (λ|μ) low-pass for the SMOOTH-COARSE-DELIVERY post-step
+# (narrow_band_dc_probe DC output -> de-terraced smooth coarse). glb_reader+glb_writer only, no ggml.
+if [ "$BASE" = "mesh_taubin" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build mesh_taubin (glb_reader + glb_writer Taubin low-pass, no ggml)"
+  "$CXX" -O2 -std=c++17 "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # ultrashape_mc_test: native marching-cubes surface extractor (ultrashape_mc.hpp) validated vs the
 # cubvh golden + GLB write. Pure CPU, no ggml/CUDA — npy.hpp + glb_writer.hpp only.
 if [ "$BASE" = "ultrashape_mc_test" ]; then

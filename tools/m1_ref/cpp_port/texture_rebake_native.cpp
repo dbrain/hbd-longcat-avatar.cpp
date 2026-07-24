@@ -263,7 +263,17 @@ int main(int argc,char**argv) {
                 // direct read robust to the refined surface sitting a few voxels off the sparse shell.
                 // RP_TRILINEAR_SNAP=1 restores the old coarse-shell snap for A/B.
                 unsetenv("RP_ATTR");
-                if(!std::getenv("RP_TRILINEAR_SNAP")) setenv("RP_DIRECT","1",1);
+                // NORMAL-MARCH (2026-07-24, the fringe-speckle fix): volume-direct at the refined
+                // texel reads the coarse grid-`gs` PBR shell in its FRINGE (the refined surface sits a
+                // few voxels off), so partial trilinear support flips texel-to-texel -> speckle grain +
+                // red splotches (v8). Marching along the texel normal onto the volume iso-surface reads
+                // at FULL support with no lateral slide -> clean AND crisp on the refined geometry.
+                // RP_TRILINEAR_SNAP=1 restores the old coarse-shell snap and RP_VOLUME_DIRECT=1 the v8
+                // direct read, both for A/B.
+                if(!std::getenv("RP_TRILINEAR_SNAP")) {
+                    if (std::getenv("RP_VOLUME_DIRECT")) setenv("RP_DIRECT","1",1);
+                    else setenv("RP_NORMAL_MARCH","1",1);
+                }
                 // RP_FRONTDOT=-1 disables front-face rejection on the guard snap so it takes the
                 // GLOBALLY closest triangle exactly like Python's BVH.
                 setenv("RP_FRONTDOT","-1",0);

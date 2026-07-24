@@ -1364,15 +1364,31 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         // sampling is 47.6% wrong, at fallback_r=8 it is 1.34% wrong (vs RP_ATTR's 4.87%). The snap is
         // kept as the guard for the ~1.9% of texels the volume has no data near at all.
         const bool volume_direct = std::getenv("RP_DIRECT")!=nullptr;
+        // RP_NORMAL_MARCH: THE FRINGE-SPECKLE FIX. volume-direct reads the volume at the texel's own
+        // position, but the refined delivery surface sits a few voxels off the coarse grid-`gs` shell
+        // the PBR was decoded on, so that read lands in the shell FRINGE (only a corner or two of the
+        // 8 trilinear neighbours present -> the renormalised value flips texel-to-texel -> the speckle
+        // grain + red splotches seen on v8). Instead, march the query along +/- the texel normal and
+        // take the point of maximum trilinear support (the volume iso-surface centre). Because the
+        // refined and coarse surfaces are the SAME shape offset along the normal, this lands on the
+        // geometrically corresponding on-shell point with NO lateral slide (thin tie/collar stay
+        // crisp) and reads at FULL support (no fringe speckle). The snap+volume guard is kept only for
+        // texels the shell has nothing near along the normal at all.
+        const bool normal_march = std::getenv("RP_NORMAL_MARCH")!=nullptr;
+        const float nm_range = std::getenv("RP_NM_RANGE") ? (float)atof(std::getenv("RP_NM_RANGE")) : 8.0f;
+        const float nm_step  = std::getenv("RP_NM_STEP")  ? (float)atof(std::getenv("RP_NM_STEP"))  : 0.5f;
+        const float nm_min_tw= std::getenv("RP_NM_MIN_TW")? (float)atof(std::getenv("RP_NM_MIN_TW")): 0.25f;
         texgs::VolIndex vol(pbr_coords.data(), (int)pbr_coords.size()/4, 4, 1);
         double tbh=_now();
         texrp::DenseHash dh(dense_verts->data(), dense_faces->data(), (int64_t)dense_faces->size()/3, ncell);
         if (verbose) printf("[atlas] reproject: dense %zu v / %zu f, hash %d^3 cells (%.2fs build), front_dot=%.2f, maxdist=%.2f vox, back_fallback=%s, mode=%s, fallback_r=%d\n",
                             dense_verts->size()/3, dense_faces->size()/3, ncell, _now()-tbh, fdot, maxdist_vox,
                             allow_back?"on":"off",
-                            volume_direct ? (use_attr?"volume-direct (guard: mesh-attr)":"volume-direct (guard: snap+volume)")
+                            normal_march ? "normal-march (guard: snap+volume)"
+                                          : volume_direct ? (use_attr?"volume-direct (guard: mesh-attr)":"volume-direct (guard: snap+volume)")
                                           : (use_attr?"mesh-attr":"snap+volume"),
                             sample_fallback_r);
+        if (verbose && normal_march) printf("[atlas] normal-march: range=%.1f step=%.2f min_tw=%.2f vox\n", nm_range, nm_step, nm_min_tw);
         size_t miss=0, guard=0;
         #pragma omp parallel for schedule(dynamic, 2048) reduction(+:miss) reduction(+:guard)
         for (int p=0;p<W*Ht;p++){
@@ -1381,21 +1397,32 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
             // VOLUME-DIRECT: read the volume at the texel's OWN position first. No shell round-trip →
             // no slide → the volume's own boundary sharpness survives. Only if the volume has nothing
             // within sample_fallback_r of this texel do we fall through to the snap (the black-texture guard).
-            if (volume_direct) {
+            float qn[3]={Nn[0],Nn[1],Nn[2]}; float L=std::sqrt(qn[0]*qn[0]+qn[1]*qn[1]+qn[2]*qn[2]);
+            if (L>1e-20f){ qn[0]/=L;qn[1]/=L;qn[2]/=L; }
+            // NORMAL-MARCH: snap onto the volume iso-surface along the texel normal, then trilinear
+            // sample at full support. No lateral slide, no fringe speckle. Guard only if the shell
+            // has nothing near along the normal.
+            if (normal_march) {
+                float q0=(P[0]+0.5f)*grid_res, q1=(P[1]+0.5f)*grid_res, q2=(P[2]+0.5f)*grid_res;
+                float tw=texgs::sample_shell_normal_march(vol, pbr_feats.data(), C, q0,q1,q2,
+                                                          qn[0],qn[1],qn[2], nm_range, nm_step, &atl[(size_t)p*C]);
+                if (tw >= nm_min_tw) continue;
+                guard++;
+            } else if (volume_direct) {
                 float q0=(P[0]+0.5f)*grid_res, q1=(P[1]+0.5f)*grid_res, q2=(P[2]+0.5f)*grid_res;
                 texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r);
                 bool any=false; for (int c=0;c<C;c++) if (atl[(size_t)p*C+c]!=0.f){ any=true; break; }
                 if (any) continue;
                 guard++;
             }
-            float qn[3]={Nn[0],Nn[1],Nn[2]}; float L=std::sqrt(qn[0]*qn[0]+qn[1]*qn[1]+qn[2]*qn[2]);
-            if (L>1e-20f){ qn[0]/=L;qn[1]/=L;qn[2]/=L; }
             float snap[3];
             if (!dh.sample(P, qn, use_attr?dense_attr->data():nullptr, C, use_attr?&atl[(size_t)p*C]:nullptr, snap, fdot, maxring, maxdist2, allow_back)) { miss++; continue; }
             if (!use_attr){ float q0=(snap[0]+0.5f)*grid_res, q1=(snap[1]+0.5f)*grid_res, q2=(snap[2]+0.5f)*grid_res;
                 texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &atl[(size_t)p*C], sample_fallback_r); }
         }
-        if (verbose && volume_direct) printf("[atlas] volume-direct: %zu texels (%.3f%% of covered) had no voxel within fallback_r=%d -> snap guard\n",
+        if (verbose && normal_march) printf("[atlas] normal-march: %zu texels (%.3f%% of covered) had no on-shell point along the normal -> snap guard\n",
+                                             guard, 100.0*guard/(double)std::max(1,covered));
+        if (verbose && volume_direct && !normal_march) printf("[atlas] volume-direct: %zu texels (%.3f%% of covered) had no voxel within fallback_r=%d -> snap guard\n",
                                              guard, 100.0*guard/(double)std::max(1,covered), sample_fallback_r);
         if (verbose && miss) printf("[atlas] reproject misses (no dense tri in range): %zu (%.3f%% of covered)\n",
                                     miss, 100.0*miss/(double)std::max(1,covered));

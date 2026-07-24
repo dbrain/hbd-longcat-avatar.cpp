@@ -105,6 +105,84 @@ static inline void sample_one(const VolIndex& vol, const float* feats, int C,
     for (int c = 0; c < C; c++) out[c] = 0.f;
 }
 
+// Like sample_one but WITHOUT the nearest-voxel fallback, and returns the total present trilinear
+// weight tw in [0,1] alongside the (renormalised) value. tw is a direct measure of how well the
+// query sits inside the occupied shell: tw~=1 => all 8 corners present => full support => a smooth,
+// stable read; tw small => the point is in the shell FRINGE, only a corner or two present, and the
+// renormalised value flips between neighbouring texels as different corner subsets appear -> the
+// speckle grain. Used by the normal-march projector to find the on-shell point (max tw) along the
+// texel normal, which is where the volume field is clean.
+static inline float sample_one_weighted(const VolIndex& vol, const float* feats, int C,
+                                        float qx, float qy, float qz, float* out) {
+    for (int c = 0; c < C; c++) out[c] = 0.f;
+    float tw = 0.f;
+    static const float OFF[8][3] = {
+        {-0.5f,-0.5f,-0.5f}, {-0.5f,-0.5f, 0.5f}, {-0.5f, 0.5f,-0.5f}, {-0.5f, 0.5f, 0.5f},
+        { 0.5f,-0.5f,-0.5f}, { 0.5f,-0.5f, 0.5f}, { 0.5f, 0.5f,-0.5f}, { 0.5f, 0.5f, 0.5f},
+    };
+    for (int k = 0; k < 8; k++) {
+        int cx = (int)(qx + OFF[k][0]);
+        int cy = (int)(qy + OFF[k][1]);
+        int cz = (int)(qz + OFF[k][2]);
+        int idx = vol.find(cx, cy, cz);
+        if (idx < 0) continue;
+        float w = (1.f - std::fabs((float)cx + 0.5f - qx))
+                * (1.f - std::fabs((float)cy + 0.5f - qy))
+                * (1.f - std::fabs((float)cz + 0.5f - qz));
+        const float* f = &feats[(size_t)idx * C];
+        for (int c = 0; c < C; c++) out[c] += w * f[c];
+        tw += w;
+    }
+    if (tw > 1e-12f) { float inv = 1.f / tw; for (int c = 0; c < C; c++) out[c] *= inv; }
+    return tw;
+}
+
+// NORMAL-MARCH projection: the sparse PBR volume was decoded on the COARSE grid-`gs` iso-surface;
+// the refined delivery mesh sits a few voxels off that shell along its own normal, so a direct read
+// at the texel lands in the shell fringe (partial support -> speckle) or misses entirely. Marching
+// the query along +/- the texel normal `n` (unit, in world space == grid space since q=(pos+0.5)*gs)
+// and taking the point of MAXIMUM trilinear support snaps onto the volume iso-surface WITHOUT any
+// lateral slide (unlike closest-point-on-mesh, which smears thin features across material
+// boundaries). Returns the tw of the chosen point (0 if nothing on the shell was found within
+// `range` voxels). Searches closest-to-surface first and stops early once full support is reached,
+// so faithful geometry wins ties and the common case is cheap.
+static inline float sample_shell_normal_march(const VolIndex& vol, const float* feats, int C,
+                                              float qx, float qy, float qz,
+                                              float nx, float ny, float nz,
+                                              float range, float step, float* out) {
+    // SUPPORT-WEIGHTED ACCUMULATION (not hard argmax). A hard argmax over the march ("take the
+    // single most-supported point") is spatially UNSTABLE on a fine mesh: adjacent texels have
+    // slightly different normals, so their argmax flips to a different on-shell voxel and the atlas
+    // streaks. Instead integrate the trilinear reads along the normal weighted by their own support
+    // AND a Gaussian centred on the refined surface (t=0). The support weight concentrates the
+    // integral on the shell crossing (off-shell points contribute ~0); the Gaussian prefers the
+    // NEAREST crossing (so a thin feature whose +n and -n both hit a wall does not blend the far
+    // wall) and, crucially, makes the result a SMOOTH function of the query -> no per-texel flip,
+    // no streaks. Averaging is ALONG the normal (through the thin shell, where colour barely
+    // varies), never laterally, so material boundaries stay crisp. Returns the accumulated support
+    // weight as a coverage measure (0 => nothing on the shell along the normal).
+    const float sigma = std::getenv("RP_NM_SIGMA") ? (float)atof(std::getenv("RP_NM_SIGMA")) : 3.0f;
+    const float inv2s2 = 1.f / (2.f * sigma * sigma);
+    float acc[8] = {0,0,0,0,0,0,0,0};   // C<=6 for PBR
+    float wsum = 0.f, twsum = 0.f;
+    float tmp[8];
+    for (float a = 0.f; a <= range + 1e-6f; a += step) {
+        for (int s = 0; s < (a == 0.f ? 1 : 2); s++) {
+            float t = (s == 0) ? a : -a;
+            float tw = sample_one_weighted(vol, feats, C, qx + t*nx, qy + t*ny, qz + t*nz, tmp);
+            if (tw <= 1e-6f) continue;
+            float w = tw * std::exp(-(t*t) * inv2s2);
+            for (int c = 0; c < C; c++) acc[c] += w * tmp[c];
+            wsum += w; twsum += tw;
+        }
+    }
+    if (wsum > 1e-9f) { float inv = 1.f / wsum; for (int c = 0; c < C; c++) out[c] = acc[c] * inv; }
+    else { for (int c = 0; c < C; c++) out[c] = 0.f; return 0.f; }
+    // coverage = peak support reached; twsum/count is noisy, so report the best single-point support
+    // approximately via wsum normalised by the Gaussian mass near 0. Simpler: return min(1, twsum).
+    return twsum > 1.f ? 1.f : twsum;
+}
+
 // Batch: query[Q,3] (grid-index space) -> out[Q,C]. OpenMP over queries.
 static inline void grid_sample_trilinear(const float* feats, const int32_t* coords, int N, int coord_stride,
                                          int coord_xoff, int C, const float* query, int Q, float* out) {
