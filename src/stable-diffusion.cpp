@@ -7848,6 +7848,61 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                  request.frames);
     }
 
+    // LTXAV_VAE_LAZY: on an LTXAV (a2v/i2v) render the video VAE (~1385 MB) + audio VAE
+    // (~353 MB) are UNUSED between here and the final output decode, yet their encode-staged
+    // GPU weights squat ~1.7 GB through the VRAM-peak DiT sample loop (and the latent
+    // refine/upscale). All VAE input-encoding (init/keyframe/ref/relip/v2v via
+    // encode_first_stage, plus the a2v audio encode) finished before prepare_video_generation_*
+    // above; the video-VAE compute BUFFER was already dropped at the encode seam (:7831). What
+    // remains resident is the ModelManager COMPUTE STAGING for those encodes: LTX VAE _compute
+    // and the audio VAE encode both call GGMLRunner::compute(..., free_compute_params=false,
+    // auto_free=false), so the staged weights stay in runner_param_tensors until the next
+    // runner_done() (normally not until decode/tiling or the chain boundary). Release them now.
+    //
+    // Fork parity: the fork calls release_all_gpu_param_residency() on both VAEs here. The
+    // rebuild has no resident_runtime_params_buffer — DiT/VAE residency is ModelManager-owned.
+    // runner_done() is the equivalent freer: it funnels the encode-staged params through
+    // release_compute_backend_params() -> finish_compute_backend_usage() ->
+    // release_compute_staging_blocks(), freeing the GPU staging buffer while
+    // free_compute_staging_block() swaps each tensor back to its params-backend home (host RAM
+    // under --offload-to-cpu, or mmap/disk under Disk residency). Decode automatically re-homes
+    // the VAE: prepare_execute_graph_weights() -> prepare_params() re-stages from that home. This
+    // is the SAME operation reclaim_ltx_chain_window_gpu_memory() already runs on these runners
+    // at every chain boundary (finish_runner -> runner_done), so the encode->free->decode-reload
+    // cycle is already proven for multi-segment reuse. Under a no-offload recipe (params_backend
+    // == compute_backend) nothing was ever staged, so runner_done() is a harmless VRAM no-op.
+    //
+    // Gate: unset/0 is byte-identical to today (no eviction). Prod sets LTXAV_VAE_LAZY=1
+    // (docker-compose), which enables it. Trims the VAE backend's CUDA pool + drops the cuDNN
+    // Conv3D reorder cache (keyed by the now-stale staged weight pointers) so the freed VRAM
+    // becomes real DiT headroom, mirroring the chain-boundary reclaim.
+    static const bool ltxav_vae_lazy = [] {
+        const char* s = getenv("LTXAV_VAE_LAZY");
+        return s != nullptr && s[0] == '1';
+    }();
+    if (ltxav_vae_lazy &&
+        sd_version_is_ltxav(sd_ctx->sd->version) &&
+        sd_ctx->sd->first_stage_model) {
+        int64_t phase_t0 = ggml_time_ms();
+        sd_ctx->sd->first_stage_model->runner_done();
+        if (sd_ctx->sd->audio_vae_model) {
+            sd_ctx->sd->audio_vae_model->runner_done();
+        }
+        if (ggml_backend_t vae_backend = sd_ctx->sd->backend_for(SDBackendModule::VAE);
+            vae_backend != nullptr && ggml_backend_is_cuda(vae_backend)) {
+            ggml_backend_synchronize(vae_backend);
+            ggml_backend_cuda_trim_memory(vae_backend);
+            // The staged VAE weights just moved (compute copies freed, home restored); their
+            // device pointers are stale, so the cuDNN Conv3D weight-reorder cache holds orphaned
+            // buffers. Free them now (they re-reorder at decode anyway) or they leak per segment.
+            ggml_backend_cuda_release_cudnn_conv3d_weights();
+        }
+        LOG_INFO("LTXAV_VAE_LAZY: released encode-staged video+audio VAE GPU params + trimmed VAE pool "
+                 "+ freed cuDNN Conv3D reorder weights before the DiT sample loop; re-staged at decode "
+                 "(%.3fs)",
+                 (ggml_time_ms() - phase_t0) * 1.0f / 1000);
+    }
+
     int64_t latent_start = ggml_time_ms();
     int W                = request.width / request.vae_scale_factor;
     int H                = request.height / request.vae_scale_factor;
