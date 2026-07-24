@@ -27,6 +27,42 @@ namespace LTXV {
         return ggml_rms_norm(ctx, x, eps);
     }
 
+    // LTX_DIT_F16 — run the DiT residual stream (vx/ax) in F16 instead of F32.
+    //
+    // The DiT is bandwidth-bound on elementwise glue, not on the GEMMs: the AdaLN
+    // modulate/gate multiplies, the residual adds, the per-Linear bias adds and the
+    // attention layout copies all move the full [hidden x tokens] activation. Halving
+    // its element width halves all of that traffic, and it halves the compute-buffer
+    // footprint too.
+    //
+    // ONLY safe when the FP4 GEMM can consume F16 activations directly. If it cannot, every
+    // DiT Linear fails ggml_backend_supports_op and ggml_backend_sched drops it to the CPU
+    // backend -- so this is a correctness gate, not just a perf one. Hence the device/env
+    // probe below rather than a bare env check.
+    //
+    // Value-honouring: `LTX_DIT_F16=0` must DISABLE it. A presence-only test (getenv() !=
+    // nullptr) would silently keep F16 on for anyone bisecting with an explicit 0.
+    __STATIC_INLINE__ bool ltx_dit_f16_env() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = getenv("LTX_DIT_F16");
+            v = (e != nullptr && atoi(e) != 0) ? 1 : 0;
+        }
+        return v == 1;
+    }
+
+    // Full gate: the env opt-in AND a device/backend that will actually serve an NVFP4
+    // mul_mat with an F16 activation + F16 destination (cuBLASLt FP4, Blackwell-only,
+    // GGML_NVFP4_CUBLASLT=1). On an sm86 box (e.g. the 3060 the same image is deployed to)
+    // this is false and the well-tested F32 stream runs unchanged — which also keeps the
+    // cross-attentions off the F16-Q path that only the Blackwell cuDNN SDPA accepts.
+    __STATIC_INLINE__ bool ltx_dit_f16_enabled(GGMLRunnerContext* ctx) {
+        if (!ltx_dit_f16_env()) {
+            return false;
+        }
+        return ctx != nullptr && ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
+    }
+
     __STATIC_INLINE__ ggml_tensor* align_token_modulation(ggml_context* ctx,
                                                           ggml_tensor* x,
                                                           ggml_tensor* mod) {
@@ -611,6 +647,17 @@ namespace LTXV {
                                                      int64_t dim_head,
                                                      bool rope_interleaved) {
         GGML_ASSERT(x->ne[0] == heads * dim_head);
+        // Rope::apply_rope builds its rotation out of ggml_mul/ggml_add against the F32 `pe`
+        // table and hands the result straight to attention. Under LTX_DIT_F16 the F16-dst
+        // Linears deliver an F16 q/k here, which would (a) carry F16 through the whole
+        // rotation and (b) leave attention with an F16 Q that only the Blackwell cuDNN SDPA
+        // accepts -- every native ggml flash kernel asserts Q->type == F32
+        // (fattn-common.cuh:990). Normalize back to F32 so the RoPE chain and the attention
+        // that follows are bit-identical to the F32 stream. (v skips RoPE and stays F16; the
+        // attention wrapper casts K/V to F16 anyway.) No-op when x is already F32.
+        if (x->type != GGML_TYPE_F32) {
+            x = ggml_cast(ctx, x, GGML_TYPE_F32);
+        }
         auto x4 = ggml_reshape_4d(ctx, x, dim_head, heads, x->ne[1], x->ne[2]);
         if (pe != nullptr && pe->ne[3] == x->ne[1] * heads) {
             auto x_flat   = ggml_reshape_4d(ctx, x4, dim_head, 1, x->ne[1] * heads, x->ne[2]);
@@ -765,6 +812,21 @@ namespace LTXV {
                 k = apply_hidden_rope(ctx->ggml_ctx, k, k_pe, heads, dim_head, rope_interleaved);
             }
 
+            // Every CROSS-attention passes pe == nullptr, so it skips the RoPE cast above and
+            // under LTX_DIT_F16 would hand attention an F16 Q. ggml's native CUDA flash
+            // kernels assert Q->type == GGML_TYPE_F32 (fattn-common.cuh:990) -- only the
+            // Blackwell cuDNN SDPA consumes an F16 Q, and ggml_cuda_get_best_fattn_kernel()
+            // never inspects Q->type, so it will happily select a native kernel (whenever
+            // GGML_CUDNN_ATTN is off, cuDNN is unavailable, or the shape falls outside
+            // cuDNN's mask-free / D in {64,128} window) and then abort mid-render.
+            //
+            // Normalizing Q to F32 here makes the F16 stream independent of that selection
+            // instead of silently depending on it. K/V are unaffected: the attention wrapper
+            // casts them to F16 regardless, so they keep the half-width win.
+            if (q->type != GGML_TYPE_F32) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+            }
+
             auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
                                               ctx->backend,
                                               q,
@@ -778,6 +840,16 @@ namespace LTXV {
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
                 auto gate_logits    = to_gate_logits->forward(ctx, x);
+                // ggml_scale is F32-ONLY on CUDA (scale.cu:28-29 asserts, it does not fall
+                // back), and under LTX_DIT_F16 this Linear inherits x's F16 and returns an
+                // F16 dst -- which would abort in the first attention of the first block.
+                // Bring the gate back to F32 before sigmoid so the whole gate computation is
+                // numerically identical to the F32 stream. It is [n_head, tokens], i.e. ~1/128
+                // of an activation, so the cast is free. Every LTX-2 attention carries
+                // to_gate_logits, so this path is NOT optional.
+                if (gate_logits->type != GGML_TYPE_F32) {
+                    gate_logits = ggml_cast(ctx->ggml_ctx, gate_logits, GGML_TYPE_F32);
+                }
                 auto gates          = ggml_sigmoid(ctx->ggml_ctx, gate_logits);
                 gates               = ggml_ext_scale(ctx->ggml_ctx, gates, 2.0f, true);
                 gates               = ggml_reshape_4d(ctx->ggml_ctx, gates, 1, heads, gate_logits->ne[1], gate_logits->ne[2]);
@@ -1737,6 +1809,20 @@ namespace LTXV {
                 ax = nullptr;
             }
 
+            // LTX_DIT_F16: enter the F16 residual stream. Everything upstream of this point
+            // (patchify + patchify_proj) and everything downstream of the matching un-cast
+            // before norm_out stays F32, so only the transformer-block body — where all the
+            // full-width elementwise glue lives — changes width. The text/audio CONTEXTS are
+            // deliberately NOT cast: they feed the cross-attention to_k/to_v, which then keep
+            // an F32 dst and so keep the wglobal->alpha fold's F32 shape as well.
+            const bool dit_f16 = ltx_dit_f16_enabled(ctx);
+            if (dit_f16) {
+                vx = ggml_cast(ctx->ggml_ctx, vx, GGML_TYPE_F16);
+                if (ax != nullptr) {
+                    ax = ggml_cast(ctx->ggml_ctx, ax, GGML_TYPE_F16);
+                }
+            }
+
             bool run_ax    = ax != nullptr && ggml_nelements(ax) > 0 && audio_time > 0;
             auto contexts  = preprocess_contexts(ctx, context, video_connector_pe, audio_connector_pe, run_ax);
             auto v_context = contexts.first;
@@ -1850,6 +1936,12 @@ namespace LTXV {
                 sd::ggml_graph_cut::mark_graph_cut(ax, "ltxav.transformer_blocks." + std::to_string(i), "ax");
             }
 
+            // Leave the F16 residual stream before the head: norm_out is a LayerNorm
+            // (ggml_norm) and proj_out is an F32 Linear, and the sampler/VAE downstream all
+            // expect F32. One cast per forward, vs. the per-op traffic it just saved.
+            if (dit_f16 && vx->type != GGML_TYPE_F32) {
+                vx = ggml_cast(ctx->ggml_ctx, vx, GGML_TYPE_F32);
+            }
             auto v_shift_scale = get_output_scale_shift(ctx, params["scale_shift_table"], v_embedded_time, config.hidden_size, ctx->ltx_video_token_sel);
             vx                 = norm_out->forward(ctx, vx);
             vx                 = LTXV::modulate_v2(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
@@ -1857,6 +1949,9 @@ namespace LTXV {
             vx                 = unpatchify_video(ctx, vx, width, height, frames);
 
             if (ax != nullptr && audio_time > 0) {
+                if (dit_f16 && ax->type != GGML_TYPE_F32) {
+                    ax = ggml_cast(ctx->ggml_ctx, ax, GGML_TYPE_F32);
+                }
                 auto a_shift_scale = get_output_scale_shift(ctx, params["audio_scale_shift_table"], a_embedded_time, config.audio_hidden_size);
                 ax                 = audio_norm_out->forward(ctx, ax);
                 ax                 = LTXV::modulate_v2(ctx->ggml_ctx, ax, a_shift_scale[0], a_shift_scale[1]);

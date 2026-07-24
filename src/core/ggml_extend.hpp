@@ -1015,18 +1015,45 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
+    // F16 residual stream (LTX_DIT_F16): when the activation is already F16 and the weight is
+    // NVFP4, emit an F16-dst matmul instead of ggml_mul_mat's hardcoded F32. The cuBLASLt FP4
+    // GEMM accumulates in F32 and stores F16 (nvfp4-cublaslt.cu:418), so the dominant
+    // [hidden x tokens] output and every downstream elementwise op stay half-width. Without
+    // this the residual add immediately re-reads a full-width F32 operand and the F16 stream
+    // buys nothing (measured a NET LOSS in that shape historically).
+    //
+    // The caller is responsible for only feeding an F16 activation on a backend that
+    // advertises it (ggml_cuda_nvfp4_f16_dst_available); this function just honours the type
+    // it is given.
+    //
+    // Self-gated on (NVFP4 weight + F16 activation): every other model keeps the F32 dst
+    // byte-identically. K % 64 and the 2D shape mirror the FP4 GEMM's own preconditions so we
+    // never REQUEST an F16 dst that ggml_backend_supports_op() would then refuse; the backend
+    // re-checks all of it anyway (ggml_cuda_nvfp4_fp4_gemm_serves).
+    ggml_type mm_dst = GGML_TYPE_F32;
+    {
+        // the matmul's src1 is 2D either because x already is, or because the >1024 branch
+        // below reshapes it; anything else keeps a batched src1, which the FP4 path bails on.
+        const int64_t x_batch    = x->ne[2] * x->ne[3];
+        const bool    src1_is_2d = (x_batch == 1) || (x_batch > 1024);
+        if (!force_prec_f32 && x->type == GGML_TYPE_F16 && w->type == GGML_TYPE_NVFP4 &&
+            src1_is_2d && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[0] % 64 == 0 &&
+            ggml_is_contiguous(w) && ggml_is_contiguous(x)) {
+            mm_dst = GGML_TYPE_F16;
+        }
+    }
     if (x->ne[2] * x->ne[3] > 1024) {
         // workaround: avoid ggml cuda error
         int64_t ne2 = x->ne[2];
         int64_t ne3 = x->ne[3];
         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
-        x           = ggml_mul_mat(ctx, w, x);
+        x           = ggml_mul_mat_ext(ctx, w, x, mm_dst);
         if (force_prec_f32) {
             ggml_mul_mat_set_prec(x, GGML_PREC_F32);
         }
         x = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
     } else {
-        x = ggml_mul_mat(ctx, w, x);
+        x = ggml_mul_mat_ext(ctx, w, x, mm_dst);
         if (force_prec_f32) {
             ggml_mul_mat_set_prec(x, GGML_PREC_F32);
         }
