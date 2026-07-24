@@ -21,6 +21,7 @@
 #include "ultrashape_cond.hpp"
 #include "us_image_proc.hpp"
 #include "us_voxelize.hpp"
+#include "mesh_exact_clean.hpp"
 #include "torch_randn.hpp"
 #include "sparse_vae.hpp"                 // svae::Mesh
 #include "m1_ggml.hpp"                    // M1Harness, new_graph
@@ -545,6 +546,19 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
         if (cfg.verbose && out.F != f0)
             printf("  [US] drop floaters (<%.1f%% of largest): verts %d->%d, faces %d->%d\n",
                    dfrac*100.f, v0, out.N, f0, out.F);
+    }
+    // MC may emit a few exactly coincident edge endpoints.  Weld only those
+    // bit-identical positions and drop their zero-area/duplicate triangles;
+    // never snap nearby hair/face geometry or smooth the generated surface.
+    {
+        const mesh_exact_clean::Report clean = mesh_exact_clean::clean(out.verts, out.faces);
+        out.N = (int)(out.verts.size() / 3);
+        out.F = (int)(out.faces.size() / 3);
+        if (cfg.verbose && (clean.welded_vertices || clean.dropped_degenerate_faces || clean.dropped_duplicate_faces))
+            printf("  [US] exact mesh cleanup: V %lld->%lld (welded %lld), F %lld->%lld (degenerate %lld, duplicate %lld)\n",
+                   (long long)clean.input_vertices, (long long)clean.output_vertices, (long long)clean.welded_vertices,
+                   (long long)clean.input_faces, (long long)clean.output_faces,
+                   (long long)clean.dropped_degenerate_faces, (long long)clean.dropped_duplicate_faces);
     }
     if (cfg.verbose) printf("  [US] refined mesh: verts=%d faces=%d (G=%d)\n", out.N, out.F, G);
     return out;

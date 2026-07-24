@@ -14,6 +14,7 @@
 //
 // Optional --flag overrides (so the same tool serves golden + live e2e output):
 //   --verts <f.npy>    --skin <f.npy>    --joints <f.npy>    --parents <i64.npy>    --k <int>
+//   --normalize-target  apply mesh_sample_main's normalized rig frame to the target before transfer
 //   (e.g. --joints <dir>/gen_joints.npy --parents <dir>/gen_parents.npy for live output)
 //
 // Pure CPU. Header-only deps: glb_reader.hpp, glb_rigged.hpp (+ glb_writer.hpp), rig_transfer.hpp.
@@ -111,7 +112,7 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
             "usage: %s <full_mesh.glb> <sampled_dir> <out_rigged.glb>\n"
-            "          [--verts f.npy] [--skin f.npy] [--joints f.npy] [--parents i64.npy] [--k N]\n",
+            "          [--verts f.npy] [--skin f.npy] [--joints f.npy] [--parents i64.npy] [--k N] [--normalize-target]\n",
             argv[0]);
         return 2;
     }
@@ -125,8 +126,9 @@ int main(int argc, char** argv) {
     std::string joints_npy  = dir + "/detok_joints.npy";
     std::string parents_npy = dir + "/detok_parents.npy";
     int k = 4;
+    bool normalize_target = false;
 
-    for (int a = 4; a + 1 <= argc - 1; a++) {
+    for (int a = 4; a < argc; a++) {
         std::string f = argv[a];
         auto next = [&]() -> std::string { return (a + 1 < argc) ? std::string(argv[++a]) : std::string(); };
         if      (f == "--verts")   verts_npy   = next();
@@ -134,6 +136,7 @@ int main(int argc, char** argv) {
         else if (f == "--joints")  joints_npy  = next();
         else if (f == "--parents") parents_npy = next();
         else if (f == "--k")       k = std::atoi(next().c_str());
+        else if (f == "--normalize-target") normalize_target = true;
         else std::fprintf(stderr, "warn: ignoring unknown arg '%s'\n", f.c_str());
     }
     if (k < 1) k = 1;
@@ -171,6 +174,30 @@ int main(int argc, char** argv) {
 
     std::printf("  Ns=%lld  Nd=%lld  J=%d  (full mesh F=%lld, normals=%s)\n",
                 (long long)Ns, (long long)Nd, J, (long long)F, have_nrm ? "yes" : "computed");
+
+    // mesh_sample_main always supplies points in its bbox-midpoint/global-max
+    // normalized frame.  A source GLB may retain authoring units or a scene
+    // transform, so an explicit transfer diagnostic needs this same transform
+    // before kNN. Keep it opt-in: callers with already-normalized targets do
+    // not silently alter their requested output frame.
+    if (normalize_target) {
+        double mn[3] = {1e30,1e30,1e30}, mx[3] = {-1e30,-1e30,-1e30}, c[3];
+        for (int64_t i = 0; i < Nd; ++i) for (int d = 0; d < 3; ++d) {
+            const double v = mesh.verts[(size_t)i * 3 + d];
+            mn[d] = std::min(mn[d], v); mx[d] = std::max(mx[d], v);
+        }
+        for (int d = 0; d < 3; ++d) c[d] = 0.5 * (mn[d] + mx[d]);
+        double radius = 0.0;
+        for (int64_t i = 0; i < Nd; ++i) for (int d = 0; d < 3; ++d)
+            radius = std::max(radius, std::fabs((double)mesh.verts[(size_t)i * 3 + d] - c[d]));
+        const double inv = radius > 0.0 ? 1.0 / radius : 1.0;
+        for (int64_t i = 0; i < Nd; ++i) for (int d = 0; d < 3; ++d) {
+            float& value = mesh.verts[(size_t)i * 3 + d];
+            value = (float)(((double)value - c[d]) * inv);
+        }
+        std::printf("  normalized target into sampled rig frame (center [%.3g,%.3g,%.3g] scale %.4g)\n",
+                    c[0], c[1], c[2], inv);
+    }
 
     // --- transfer ---
     std::vector<float> dst_w;

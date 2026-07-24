@@ -4,7 +4,10 @@
 // FINAL (e.g. UltraShape-refined) mesh instead of rebaking the geometry pass's low-frequency PBR
 // volume.  The chain is:
 //   mesh -> Trellis2 canonical frame -> flexible dual grid -> shape SLat encoder
-//        -> DINOv3 image conditioning -> cross texture SLat DiT -> PBR decoder -> UV bake.
+//        -> DINOv3 full-token cross conditioning -> Trellis2 texture SLat DiT
+//        -> PBR decoder -> UV bake.
+// The projection-conditioned Pixal texture checkpoint remains available only as an explicit
+// diagnostic mode; it is not the generic arbitrary-mesh texturing contract.
 // No Python is involved at run time.
 #include "pixal3d_chain.hpp"
 #include "voxelizer.hpp"
@@ -25,8 +28,18 @@
 
 static void usage() {
     std::printf("usage: texture_mesh_native --model <geo_gguf_dir> --mesh <in.glb> --image <matte.png> --out <out.glb>\n"
-                "                           [--resolution 512|1024] [--texsize N] [--seed N] [--decimate F] [--dump-dir DIR]\n"
+                "                           [--resolution 1024] [--texsize N] [--seed N] [--noise-npy reference_noise.npy] [--texture-model generic-cross|pixal-proj] [--encoder-decimate F] [--decimate F] [--dump-dir DIR]\n"
+                "                           [--camera camera_provenance.txt | --cam radians --dist units --scale value] [--voxelizer-only|--shape-encoder-only] [--shape-encoder-input-dir DIR]\n"
                 "                           [--unwrap production|reference] [--atlas-out base_color.png] [--status-file PATH]\n");
+}
+
+static float camera_value(const std::string& path, const char* key, float fallback) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("cannot read camera provenance: " + path);
+    const std::string prefix=std::string(key)+"=";
+    std::string line;
+    while (std::getline(f,line)) if (line.rfind(prefix,0)==0) return std::stof(line.substr(prefix.size()));
+    throw std::runtime_error("camera provenance lacks " + std::string(key) + ": " + path);
 }
 
 // The runner may be interrupted after this child has completed (for example a detached terminal
@@ -72,16 +85,21 @@ static std::vector<float> load_norm(const std::string& model, const char* which)
 // Match Trellis2TexturingPipeline.preprocess_mesh exactly.  The swap is undone only after baking,
 // so the output remains in the original GLB coordinate convention.
 static void preprocess_mesh(std::vector<float>& v) {
-    float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+    // trimesh exposes GLB positions as float64, and the official pipeline performs this
+    // normalization in NumPy float64 before torch casts the finished vertices to float32.
+    // Keeping this arithmetic in float used to move boundary-aligned triangles by one ULP,
+    // creating a handful of different o_voxel cells despite the same source GLB.
+    double mn[3] = {1e300,1e300,1e300}, mx[3] = {-1e300,-1e300,-1e300};
     for (size_t i=0;i<v.size();i+=3) for (int c=0;c<3;c++) {
-        mn[c] = std::min(mn[c], v[i+c]); mx[c] = std::max(mx[c], v[i+c]);
+        const double value = v[i+c];
+        mn[c] = std::min(mn[c], value); mx[c] = std::max(mx[c], value);
     }
-    float center[3], extent=0.f;
+    double center[3], extent=0.;
     for (int c=0;c<3;c++) { center[c]=0.5f*(mn[c]+mx[c]); extent=std::max(extent,mx[c]-mn[c]); }
-    const float scale = 0.99999f / std::max(extent, 1e-12f);
+    const double scale = 0.99999 / std::max(extent, 1e-12);
     for (size_t i=0;i<v.size();i+=3) {
-        float x=(v[i]-center[0])*scale, y=(v[i+1]-center[1])*scale, z=(v[i+2]-center[2])*scale;
-        v[i]=x; v[i+1]=-z; v[i+2]=y;
+        const double x=(v[i]-center[0])*scale, y=(v[i+1]-center[1])*scale, z=(v[i+2]-center[2])*scale;
+        v[i]=(float)x; v[i+1]=(float)-z; v[i+2]=(float)y;
     }
 }
 
@@ -154,7 +172,10 @@ static imgio::Image load_texture_image(const std::string& path, std::string* inp
         for (size_t i=0;i<alpha01.size();i++) alpha01[i]=ai.rgb[i*3];
         w=nw; h=nh;
     }
-    int x0=0,y0=0,x1=w-1,y1=h-1;
+    // Pillow crops use exclusive right/bottom coordinates.  Preserve the entire opaque input
+    // verbatim: using w-1/h-1 here silently discarded the final row and column, which then
+    // changed every DINO feature during the square resize.
+    int x0=0,y0=0,x1=w,y1=h;
     if (has_alpha) {
         x0=w; y0=h; x1=-1; y1=-1;
         for (int y=0;y<h;y++) for (int x=0;x<w;x++) if (alpha01[(size_t)y*w+x] > .8f) {
@@ -186,9 +207,10 @@ int main(int argc, char** argv) {
     setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
     // Direct xatlas charts with Pixal3D's chart settings are the quality default.  The old
     // precluster path remains available as `production` for a deliberately faster fallback.
-    std::string model, mesh_path, image_path, out, dump_dir, atlas_out, status_file, unwrap="reference";
-    bool condition_only=false;
-    int resolution=512, texsize=2048, seed=42, decimate=0;
+    std::string model, mesh_path, image_path, out, dump_dir, atlas_out, status_file, camera_file, noise_npy, shape_encoder_input_dir, unwrap="reference", texture_model="generic-cross";
+    bool condition_only=false, voxelizer_only=false, shape_encoder_only=false;
+    int resolution=1024, texsize=2048, seed=42, encoder_decimate=0, decimate=0;
+    float cam=.7332379387484828f, dist=1.3021559715270996f, mesh_scale=1.f;
     for (int i=1;i<argc;i++) {
         std::string a=argv[i];
         if (a=="--model" && i+1<argc) model=argv[++i];
@@ -198,16 +220,35 @@ int main(int argc, char** argv) {
         else if (a=="--resolution" && i+1<argc) resolution=std::atoi(argv[++i]);
         else if (a=="--texsize" && i+1<argc) texsize=std::atoi(argv[++i]);
         else if (a=="--seed" && i+1<argc) seed=std::atoi(argv[++i]);
+        else if (a=="--noise-npy" && i+1<argc) noise_npy=argv[++i];
+        else if (a=="--texture-model" && i+1<argc) texture_model=argv[++i];
+        else if (a=="--encoder-decimate" && i+1<argc) encoder_decimate=std::atoi(argv[++i]);
         else if (a=="--decimate" && i+1<argc) decimate=std::atoi(argv[++i]);
         else if (a=="--dump-dir" && i+1<argc) dump_dir=argv[++i];
         else if (a=="--unwrap" && i+1<argc) unwrap=argv[++i];
         else if (a=="--atlas-out" && i+1<argc) atlas_out=argv[++i];
         else if (a=="--status-file" && i+1<argc) status_file=argv[++i];
+        else if (a=="--camera" && i+1<argc) camera_file=argv[++i];
+        else if (a=="--shape-encoder-input-dir" && i+1<argc) shape_encoder_input_dir=argv[++i];
+        else if (a=="--cam" && i+1<argc) cam=std::stof(argv[++i]);
+        else if (a=="--dist" && i+1<argc) dist=std::stof(argv[++i]);
+        else if (a=="--scale" && i+1<argc) mesh_scale=std::stof(argv[++i]);
         else if (a=="--condition-only") condition_only=true;
+        else if (a=="--voxelizer-only") voxelizer_only=true;
+        else if (a=="--shape-encoder-only") shape_encoder_only=true;
         else { usage(); return 1; }
     }
     if (model.empty() || mesh_path.empty() || image_path.empty() || (out.empty() && !condition_only) ||
-        (resolution!=512 && resolution!=1024) || (unwrap!="production" && unwrap!="reference")) { usage(); return 1; }
+        resolution!=1024 || (unwrap!="production" && unwrap!="reference") ||
+        (texture_model!="generic-cross" && texture_model!="pixal-proj")) { usage(); return 1; }
+    if (!camera_file.empty()) {
+        cam=camera_value(camera_file,"cam_angle_x_rad",cam);
+        dist=camera_value(camera_file,"camera_distance",dist);
+        mesh_scale=camera_value(camera_file,"mesh_scale",mesh_scale);
+    }
+    if (!(cam>.05f && cam<3.f && dist>0.f && mesh_scale>0.f)) {
+        std::fprintf(stderr,"FAIL: invalid camera contract (cam=%g dist=%g scale=%g)\n",cam,dist,mesh_scale); return 1;
+    }
     if (!condition_only && atlas_out.empty()) atlas_out=out+".atlas.png";
     if (!condition_only && !std::getenv("TEX_STAGE_LOG")) {
         const std::string stage_log=out+".stage-log.txt";
@@ -218,10 +259,34 @@ int main(int argc, char** argv) {
     setenv("PIXAL3D_GGUF_DIR", model.c_str(), 1);
 
     try {
+        // `generic-cross` is the exact model contract of Trellis2TexturingPipeline: full DINO
+        // image-token cross-attention, the generic shape encoder, and the matching M6 decoder.
+        // Keep Pixal's projection model as an explicit diagnostic only; silently mixing these
+        // two checkpoints made prior native/Python texture comparisons meaningless.
+        if (!condition_only && texture_model=="generic-cross" &&
+            !std::filesystem::is_directory("weights_npy/trellis2_tex_1024"))
+            throw std::runtime_error("missing generic Trellis2 cross checkpoint: weights_npy/trellis2_tex_1024");
+        if (!condition_only && texture_model=="pixal-proj") {
+            const std::string tex_checkpoint=model+"/slat_flow_imgshape2tex_1024.gguf";
+            if (!std::filesystem::is_regular_file(tex_checkpoint))
+                throw std::runtime_error("missing required Pixal projection texture checkpoint: "+tex_checkpoint);
+        }
         native_stage("start");
         glb::Mesh mesh;
         if (!glb::read_glb(mesh_path.c_str(), mesh) || mesh.verts.empty() || mesh.faces.empty())
             throw std::runtime_error("could not read mesh GLB");
+        // Delivery meshes contain UV seam duplicates and can be much denser than the sparse
+        // encoder's trained surface-token regime.  Cap the encoder input before voxelisation;
+        // the existing --decimate remains the independent final atlas/LOD setting.
+        if (encoder_decimate > 0 && (int)mesh.faces.size()/3 > encoder_decimate) {
+            std::vector<float> dverts;
+            std::vector<int64_t> dfaces;
+            texatlas::decimate(mesh.verts, mesh.faces, (size_t)encoder_decimate, dverts, dfaces, true);
+            mesh.verts.swap(dverts);
+            mesh.faces.swap(dfaces);
+            std::printf("[native-texture] encoder mesh decimated to %zu v / %zu f\\n",
+                        mesh.verts.size()/3, mesh.faces.size()/3);
+        }
         std::printf("[native-texture] mesh %zu v / %zu f, resolution=%d, atlas=%d\\n",
                     mesh.verts.size()/3, mesh.faces.size()/3, resolution, texsize);
         preprocess_mesh(mesh.verts);
@@ -231,6 +296,8 @@ int main(int argc, char** argv) {
         imgio::Image source=load_texture_image(image_path,&texture_input_contract);
         if (!dump_dir.empty()) {
             std::filesystem::create_directories(dump_dir);
+            dump_npy(dump_dir+"/native_preprocessed_vertices.npy",mesh.verts,"<f4",{(int)mesh.verts.size()/3,3});
+            dump_npy(dump_dir+"/native_preprocessed_faces.npy",mesh.faces,"<i8",{(int)mesh.faces.size()/3,3});
             dump_npy(dump_dir+"/native_proc_image_chw.npy",imgio::to_chw(source),"<f4",{3,source.h,source.w});
             std::ofstream input_meta(dump_dir+"/native_input_contract.txt",std::ios::trunc);
             if (!input_meta) throw std::runtime_error("could not write input contract metadata");
@@ -242,43 +309,77 @@ int main(int argc, char** argv) {
         if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_dino_input_chw.npy",img_chw,"<f4",{3,resolution,resolution}); }
         std::vector<float> img_norm=pix::imagenet_norm(img_chw, resolution);
         std::vector<float> global, patchmap;
-        pix::run_dinov3(img_norm, resolution==512 ? dino::CFG512 : dino::CFG1024, true, global, patchmap);
+        pix::run_dinov3(img_norm, dino::CFG1024, true, global, patchmap);
         native_stage("dino_complete");
-        std::vector<float> cond=global;
-        cond.insert(cond.end(), patchmap.begin(), patchmap.end());
-        if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_cond.npy",cond,"<f4",{1,(int)cond.size()/1024,1024}); }
+        if (!dump_dir.empty()) { std::filesystem::create_directories(dump_dir); dump_npy(dump_dir+"/native_tex_global.npy",global,"<f4",{1,5,1024}); }
+        // Persist the exact generic flow input before the condition-only exit as well.  This keeps
+        // the small DINO parity gate useful without having to run the encoder or texture flow.
+        std::vector<float> dino_cross=global;
+        dino_cross.insert(dino_cross.end(),patchmap.begin(),patchmap.end());
+        if (!dump_dir.empty()) dump_npy(dump_dir+"/native_tex_cross_cond.npy",dino_cross,"<f4",
+                                        {1,5+(int)(patchmap.size()/dino::HID),dino::HID});
         if (condition_only) {
             append_artifact_status(status_file, "succeeded", 0);
             std::printf("[native-texture] condition-only complete\n"); return 0;
         }
-        std::printf("[native-texture] DINOv3: %zu conditioning tokens\\n", cond.size()/1024);
-
-        std::vector<int32_t> faces(mesh.faces.size());
-        for (size_t i=0;i<faces.size();i++) faces[i]=(int32_t)mesh.faces[i];
-        int gs[3]={resolution,resolution,resolution};
-        const float amin[3]={-.5f,-.5f,-.5f}, amax[3]={.5f,.5f,.5f};
-        vox::VoxelOut voxels=vox::mesh_to_flexible_dual_grid(mesh.verts.data(), (int)mesh.verts.size()/3,
-            faces.data(), (int)faces.size()/3, gs, amin, amax, 1.f, .2f, 1e-2f);
-        native_stage("voxel_complete");
-        if (!voxels.N) throw std::runtime_error("voxelizer returned no surface cells");
-        std::vector<int32_t> coords((size_t)voxels.N*4);
-        std::vector<float> feats6((size_t)voxels.N*6);
-        for (int i=0;i<voxels.N;i++) for (int c=0;c<3;c++) {
-            coords[(size_t)i*4+c+1]=voxels.coords[(size_t)i*3+c];
-            // FlexiDualGridVaeEncoder applies this centring itself before its sparse backbone.
-            // This C++ port feeds that backbone directly, so preserve the upstream centred contract
-            // here rather than passing the raw [0,1] o_voxel values a second time.
-            feats6[(size_t)i*6+c]=voxels.dual[(size_t)i*3+c]-.5f;
-            feats6[(size_t)i*6+c+3]=(float)voxels.intersected[(size_t)i*3+c]-.5f;
+        if (texture_model=="pixal-proj") {
+            std::printf("[native-texture] Pixal projection texture: FOV=%.4f rad dist=%.6f scale=%.6f%s\\n",
+                        cam,dist,mesh_scale,camera_file.empty()?" (default contract)":" (provenance)");
+        } else {
+            std::printf("[native-texture] generic Trellis2 cross texture: %d DINO tokens (no camera projection)\\n",
+                        5+(int)(patchmap.size()/dino::HID));
         }
-        if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_voxel_coords.npy",coords,"<i4",{voxels.N,4}); dump_npy(dump_dir+"/native_voxel_feats6.npy",feats6,"<f4",{voxels.N,6}); }
+
+        std::vector<int32_t> coords;
+        std::vector<float> feats6;
+        int voxel_N=0;
+        if (!shape_encoder_input_dir.empty()) {
+            NpyArray c=npy_load(shape_encoder_input_dir+"/python_voxel_coords.npy");
+            NpyArray f=npy_load(shape_encoder_input_dir+"/python_voxel_feats6.npy");
+            if (c.descr!="<i4" || f.descr!="<f4" || c.shape.size()!=2 || f.shape.size()!=2 ||
+                c.shape[1]!=4 || f.shape[1]!=6 || c.shape[0]!=f.shape[0])
+                throw std::runtime_error("--shape-encoder-input-dir requires official [N,4] int32 coords and [N,6] float32 feats");
+            coords.assign(c.i32(),c.i32()+c.numel()); feats6.assign(f.f32(),f.f32()+f.numel());
+            voxel_N=(int)c.shape[0];
+            std::printf("[native-texture] shape encoder uses supplied official voxel boundary: %s\\n",shape_encoder_input_dir.c_str());
+        } else {
+            std::vector<int32_t> faces(mesh.faces.size());
+            for (size_t i=0;i<faces.size();i++) faces[i]=(int32_t)mesh.faces[i];
+            int gs[3]={resolution,resolution,resolution};
+            const float amin[3]={-.5f,-.5f,-.5f}, amax[3]={.5f,.5f,.5f};
+            vox::VoxelOut voxels=vox::mesh_to_flexible_dual_grid(mesh.verts.data(), (int)mesh.verts.size()/3,
+                faces.data(), (int)faces.size()/3, gs, amin, amax, 1.f, .2f, 1e-2f);
+            if (!voxels.N) throw std::runtime_error("voxelizer returned no surface cells");
+            voxel_N=voxels.N; coords.resize((size_t)voxel_N*4); feats6.resize((size_t)voxel_N*6);
+            for (int i=0;i<voxel_N;i++) for (int c=0;c<3;c++) {
+                coords[(size_t)i*4+c+1]=voxels.coords[(size_t)i*3+c];
+                // FlexiDualGridVaeEncoder applies this centring itself before its sparse backbone.
+                // This C++ port feeds that backbone directly, so preserve the upstream centred contract
+                // here rather than passing the raw [0,1] o_voxel values a second time.
+                feats6[(size_t)i*6+c]=voxels.dual[(size_t)i*3+c]-.5f;
+                feats6[(size_t)i*6+c+3]=(float)voxels.intersected[(size_t)i*3+c]-.5f;
+            }
+        }
+        native_stage("voxel_complete");
+        if (!voxel_N) throw std::runtime_error("voxelizer returned no surface cells");
+        if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_voxel_coords.npy",coords,"<i4",{voxel_N,4}); dump_npy(dump_dir+"/native_voxel_feats6.npy",feats6,"<f4",{voxel_N,6}); }
+        if (voxelizer_only) {
+            append_artifact_status(status_file, "succeeded", 0);
+            std::printf("[native-texture] voxelizer-only complete\\n");
+            return 0;
+        }
         std::vector<int32_t> slat_coords;
         std::vector<float> slat=senc::shape_slat_encode(coords, feats6, "weights_npy/shape_enc", true, &slat_coords);
         native_stage("shape_slat_complete");
         const int M=(int)slat_coords.size()/4;
         if (!M) throw std::runtime_error("shape encoder returned no SLat tokens");
         if (!dump_dir.empty()) { dump_npy(dump_dir+"/native_shape_slat_coords.npy",slat_coords,"<i4",{M,4}); dump_npy(dump_dir+"/native_shape_slat_feats.npy",slat,"<f4",{M,32}); }
-        std::printf("[native-texture] flexible grid %d -> shape SLat %d tokens\\n", voxels.N, M);
+        std::printf("[native-texture] flexible grid %d -> shape SLat %d tokens\\n", voxel_N, M);
+        if (shape_encoder_only) {
+            append_artifact_status(status_file, "succeeded", 0);
+            std::printf("[native-texture] shape-encoder-only complete\\n");
+            return 0;
+        }
 
         std::vector<float> shape_mean=load_norm(model,"shape_slat_norm_mean"), shape_std=load_norm(model,"shape_slat_norm_std");
         std::vector<float> tex_mean=load_norm(model,"tex_slat_norm_mean"), tex_std=load_norm(model,"tex_slat_norm_std");
@@ -286,25 +387,61 @@ int main(int argc, char** argv) {
         std::vector<int32_t> cxyz((size_t)M*3);
         for (int i=0;i<M;i++) for (int c=0;c<3;c++) cxyz[(size_t)i*3+c]=slat_coords[(size_t)i*4+c+1];
         std::vector<float> tex;
-        {
-            trandn::Generator gen((uint64_t)seed);
-            std::vector<float> noise=gen.randn((int64_t)M*32), x64((size_t)M*64);
-            // The two lattice sizes use separately trained texture-flow weights.  Selecting 1024 here
-            // for a 512 comparison quietly invalidates parity even if every operation is native.
-            const char* flow_weights = resolution==512 ? "weights_npy/trellis2_tex_512" : "weights_npy/trellis2_tex_1024";
-            M1Harness H(flow_weights, 4096, true);
+        if (texture_model=="pixal-proj") {
+            std::vector<float> naf_hr=pix::run_naf(img_chw,patchmap,naf::CFG1024,true);
+            native_stage("naf_complete");
+            geo::ProjCam texture_cam(cam,dist,mesh_scale);
+            std::vector<float> proj_cond=geo::proj_cond_shape(slat_coords.data(),M,patchmap.data(),64,64,
+                naf_hr.data(),512,512,dino::HID,resolution/16,1024,texture_cam);
+            native_stage("projection_condition_complete");
+            if (!dump_dir.empty()) dump_npy(dump_dir+"/native_tex_proj_cond.npy",proj_cond,"<f4",{M,slatdit::PROJ_IN});
+            std::vector<float> noise;
+            if (!noise_npy.empty()) {
+                NpyArray a=npy_load(noise_npy);
+                if (a.descr!="<f4" || a.shape.size()!=2 || a.shape[0]!=M || a.shape[1]!=32)
+                    throw std::runtime_error("--noise-npy must be a float32 [shape_slat_tokens,32] tensor");
+                noise.assign(a.f32(),a.f32()+a.numel());
+                std::printf("[native-texture] using supplied diagnostic flow noise: %s\n",noise_npy.c_str());
+            } else {
+                trandn::Generator gen((uint64_t)seed);
+                noise=gen.randn((int64_t)M*32);
+            }
+            std::vector<float> x64((size_t)M*64);
+            M1Harness H(pix::TEXFLOW_PROJ_W, 2048, true);
             ggml_context* ctx=H.ctx;
-            int64_t xn[4]={64,M,1,1}, tn[4]={1,1,1,1}, cn[4]={1024,(int64_t)cond.size()/1024,1,1};
-            ggml_tensor* xin=H.input("x",2,xn), *tin=H.input("t",1,tn), *cin=H.input("cond",2,cn);
-            ggml_tensor* pred=texdit::build_tex_dit_cross_forward(ctx,H,M,(int)cn[1],xin,tin,cin,cxyz.data());
+            int64_t xn[4]={64,M,1,1}, tn[4]={1,1,1,1}, gn[4]={1024,5,1,1}, pn[4]={slatdit::PROJ_IN,M,1,1};
+            ggml_tensor* xin=H.input("x",2,xn), *tin=H.input("t",1,tn), *gin=H.input("global",2,gn), *pin=H.input("proj",2,pn);
+            ggml_tensor* pred=slatdit::build_slat_dit_forward(ctx,H,M,xin,tin,gin,pin,cxyz.data());
             ggml_set_output(pred); ggml_cgraph* graph=new_graph(ctx,65536); ggml_build_forward_expand(graph,pred);
-            H.alloc_and_upload(graph); H.upload_input_raw(cin,cond);
+            H.alloc_and_upload(graph); H.upload_input_raw(gin,global); H.upload_input_raw(pin,proj_cond);
             auto forward=[&](const std::vector<float>& x, float t, bool) {
                 for (int i=0;i<M;i++) for (int c=0;c<32;c++) { x64[(size_t)i*64+c]=x[(size_t)i*32+c]; x64[(size_t)i*64+c+32]=slat[(size_t)i*32+c]; }
                 H.upload_input_raw(xin,x64); H.upload_input_raw(tin,std::vector<float>{t}); H.compute(graph);
                 std::vector<float> r((size_t)M*32); ggml_backend_tensor_get(pred,r.data(),0,r.size()*sizeof(float)); return r;
             };
-            tex=geo::flow_sampler((int64_t)M*32,noise,1e-5f,1.f,0.f,3.f,.6,.9,12,forward,"native tex");
+            tex=geo::flow_sampler((int64_t)M*32,noise,1e-5f,1.f,0.f,3.f,.6,.9,12,forward,"native Pixal proj tex");
+        } else {
+            // Exact Trellis2TexturingPipeline contract: five DINO global tokens followed by every
+            // image patch token, fed through the generic cross-attention texture flow.  This is the
+            // reference model, unlike Pixal's image-to-3D projection-conditioned texture flow above.
+            const int Ntok=5+(int)(patchmap.size()/dino::HID);
+            const std::vector<float>& cond=dino_cross;
+            native_stage("cross_condition_complete");
+            trandn::Generator gen((uint64_t)seed);
+            std::vector<float> noise=gen.randn((int64_t)M*32), x64((size_t)M*64);
+            M1Harness H(pix::TEXFLOW_W,4096,true);
+            ggml_context* ctx=H.ctx;
+            int64_t xn[4]={64,M,1,1}, tn[4]={1,1,1,1}, cn[4]={dino::HID,Ntok,1,1};
+            ggml_tensor* xin=H.input("x",2,xn), *tin=H.input("t",1,tn), *cin=H.input("cond",2,cn);
+            ggml_tensor* pred=texdit::build_tex_dit_cross_forward(ctx,H,M,Ntok,xin,tin,cin,cxyz.data());
+            ggml_set_output(pred); ggml_cgraph* graph=new_graph(ctx,65536); ggml_build_forward_expand(graph,pred);
+            H.alloc_and_upload(graph); H.upload_input_raw(cin,cond);
+            auto forward=[&](const std::vector<float>& x,float t,bool) {
+                for (int i=0;i<M;i++) for (int c=0;c<32;c++) { x64[(size_t)i*64+c]=x[(size_t)i*32+c]; x64[(size_t)i*64+c+32]=slat[(size_t)i*32+c]; }
+                H.upload_input_raw(xin,x64); H.upload_input_raw(tin,std::vector<float>{t}); H.compute(graph);
+                std::vector<float> r((size_t)M*32); ggml_backend_tensor_get(pred,r.data(),0,r.size()*sizeof(float)); return r;
+            };
+            tex=geo::flow_sampler((int64_t)M*32,noise,1e-5f,1.f,0.f,3.f,.6,.9,12,forward,"native Trellis2 cross tex");
         } // Release the large texture-flow graph and its GPU weights before M6 PBR decode.
         native_stage("texture_flow_complete");
         for (size_t i=0;i<tex.size();i++) tex[i]=tex[i]*tex_std[i%32]+tex_mean[i%32];

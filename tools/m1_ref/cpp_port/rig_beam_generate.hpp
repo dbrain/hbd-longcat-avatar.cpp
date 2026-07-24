@@ -101,8 +101,9 @@ static inline void beam_warp_temperature(std::vector<float>& lg, float temperatu
 }
 
 // (d) TOP_K: keep the k largest FINITE logits, rest -inf. (If fewer than k allowed, keep all.)
-static inline void beam_warp_top_k(std::vector<float>& lg, int top_k) {
+static inline void beam_warp_top_k(std::vector<float>& lg, int top_k, int min_tokens_to_keep = 1) {
     if (top_k <= 0) return;
+    top_k = std::max(top_k, min_tokens_to_keep);
     std::vector<std::pair<float,int>> fin;
     fin.reserve(lg.size());
     for (size_t i = 0; i < lg.size(); ++i) if (std::isfinite(lg[i])) fin.push_back({ lg[i], (int)i });
@@ -118,7 +119,7 @@ static inline void beam_warp_top_k(std::vector<float>& lg, int top_k) {
 
 // (e) TOP_P (nucleus): softmax survivors, sort desc, keep the smallest prefix whose cumulative
 //     prob >= top_p (always keep at least the top-1); rest -inf.
-static inline void beam_warp_top_p(std::vector<float>& lg, float top_p) {
+static inline void beam_warp_top_p(std::vector<float>& lg, float top_p, int min_tokens_to_keep = 1) {
     if (top_p >= 1.0f) return;
     std::vector<std::pair<float,int>> fin;
     for (size_t i = 0; i < lg.size(); ++i) if (std::isfinite(lg[i])) fin.push_back({ lg[i], (int)i });
@@ -134,7 +135,7 @@ static inline void beam_warp_top_p(std::vector<float>& lg, float top_p) {
         double p = std::exp((double)fin[r].first - mx) / sum;
         keep[fin[r].second] = 1;
         cum += p;
-        if (cum >= (double)top_p) break;
+        if (cum >= (double)top_p && (int)r + 1 >= min_tokens_to_keep) break;
     }
     const float ninf = -std::numeric_limits<float>::infinity();
     for (size_t i = 0; i < lg.size(); ++i) if (!keep[i]) lg[i] = ninf;
@@ -182,14 +183,21 @@ static inline void beam_rope_tables(const Qwen3Cfg& cfg, int64_t p0, int64_t L,
     const int hd = cfg.head_dim, half = hd / 2;
     cosb.assign((size_t)hd * L, 0.f);
     sinb.assign((size_t)hd * L, 0.f);
-    std::vector<double> invf(half);
-    for (int j = 0; j < half; j++) invf[j] = std::pow((double)cfg.rope_theta, -(double)(2 * j) / hd);
+    // Upstream Qwen3 is loaded in BF16, so RotaryEmbedding's persistent
+    // inv_freq buffer is BF16 too.  Its forward promotes those rounded values
+    // to F32 for position multiplication and sin/cos; computing an unrounded
+    // host double here moves the RoPE phase enough to perturb attention.
+    std::vector<float> invf(half);
+    for (int j = 0; j < half; j++) {
+        const float inv = std::pow((float)cfg.rope_theta, -(float)(2 * j) / hd);
+        invf[j] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(inv));
+    }
     for (int64_t t = 0; t < L; t++) {
         int64_t p = p0 + t;
         for (int i = 0; i < hd; i++) {
-            double ang = (double)p * invf[i < half ? i : i - half];
-            cosb[t * hd + i] = (float)std::cos(ang);
-            sinb[t * hd + i] = (float)std::sin(ang);
+            const float ang = (float)p * invf[i < half ? i : i - half];
+            cosb[t * hd + i] = std::cos(ang);
+            sinb[t * hd + i] = std::sin(ang);
         }
     }
 }
@@ -280,7 +288,8 @@ inline std::vector<int> rig_beam_generate(M1Harness& H, const Qwen3Cfg& cfg,
                                           int top_k = 5,
                                           float top_p = 0.95f,
                                           uint64_t seed = 0,
-                                          bool verbose = true) {
+                                          bool verbose = true,
+                                          std::vector<RigHyp>* finished_out = nullptr) {
     const int hidden = cfg.hidden, hd = cfg.head_dim, V = cfg.vocab;
     const int P = n_cond + (int)start_tokens.size();          // prefix length (cond rows + start tokens)
     // SHARED-PREFIX KV: the P-row prefix (mesh_cond ++ start tokens) is IDENTICAL across all beams, so
@@ -716,6 +725,13 @@ inline std::vector<int> rig_beam_generate(M1Harness& H, const Qwen3Cfg& cfg,
 
         auto best = std::max_element(finished.begin(), finished.end(),
                         [](const RigHyp& a, const RigHyp& b){ return a.normscore < b.normscore; });
+        // See the batched decoder: retain only completed hypotheses for an
+        // independent anatomy gate at the production call site.
+        if (finished_out) {
+            *finished_out = finished;
+            std::sort(finished_out->begin(), finished_out->end(),
+                      [](const RigHyp& a, const RigHyp& b) { return a.normscore > b.normscore; });
+        }
         if (verbose) {
             int gl = (int)best->sequence.size() - (int)start_tokens.size();
             printf("[rig_beam] DONE: %zu hyps (eos-terminated in pool=%d), best %s normscore=%.4f, "

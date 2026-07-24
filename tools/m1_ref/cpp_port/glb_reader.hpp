@@ -5,8 +5,9 @@
 //
 // Scope: the single embedded GLB binary buffer (buffer 0 = the BIN chunk). Supports
 //   POSITION (VEC3 f32), indices (SCALAR u8/u16/u32), TEXCOORD_0 (VEC2 f32), NORMAL (VEC3 f32).
-//   Handles accessor byteOffset + bufferView byteStride (tight or interleaved). Concatenates all
-//   primitives across all meshes (offsetting indices). Returns false on malformed input (no crash).
+//   Handles accessor byteOffset + bufferView byteStride (tight or interleaved), and applies the
+//   active scene's node hierarchy (matrix or TRS) before concatenating primitives. Returns false on
+//   malformed input (no crash).
 //   External/base64 buffer URIs are out of scope -> false with a clear stderr message.
 #pragma once
 #include <cstdint>
@@ -16,6 +17,9 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <array>
+#include <cmath>
+#include <functional>
 
 namespace glb {
 
@@ -251,6 +255,68 @@ struct AccessorView {
     bool valid() const { return base != nullptr && ncomp > 0 && csize > 0 && count >= 0; }
 };
 
+// Column-major affine matrices, matching glTF's matrix convention.
+typedef std::array<float, 16> Mat4;
+inline Mat4 mat4_identity() {
+    return {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+}
+inline Mat4 mat4_mul(const Mat4& a, const Mat4& b) {
+    Mat4 o{};
+    for (int c = 0; c < 4; ++c)
+        for (int r = 0; r < 4; ++r)
+            for (int k = 0; k < 4; ++k)
+                o[c * 4 + r] += a[k * 4 + r] * b[c * 4 + k];
+    return o;
+}
+inline void mat4_point(const Mat4& m, const float* p, float* out) {
+    for (int r = 0; r < 3; ++r)
+        out[r] = m[0 * 4 + r] * p[0] + m[1 * 4 + r] * p[1] + m[2 * 4 + r] * p[2] + m[3 * 4 + r];
+}
+inline bool mat4_normal(const Mat4& m, const float* n, float* out) {
+    // inverse-transpose of the linear part; do not transform normals as points when a node has
+    // non-uniform scale. The determinant guard rejects a degenerate node transform cleanly.
+    const float a=m[0], b=m[4], c=m[8], d=m[1], e=m[5], f=m[9], g=m[2], h=m[6], i=m[10];
+    const float A=e*i-f*h, B=c*h-b*i, C=b*f-c*e, D=f*g-d*i, E=a*i-c*g, F=c*d-a*f,
+                G=d*h-e*g, H=b*g-a*h, I=a*e-b*d;
+    const float det=a*A+b*D+c*G;
+    if (std::fabs(det) < 1e-12f) return false;
+    // (inverse(M))^T * n is the cofactor matrix divided by det.
+    out[0]=(A*n[0]+D*n[1]+G*n[2])/det;
+    out[1]=(B*n[0]+E*n[1]+H*n[2])/det;
+    out[2]=(C*n[0]+F*n[1]+I*n[2])/det;
+    const float len=std::sqrt(out[0]*out[0]+out[1]*out[1]+out[2]*out[2]);
+    if (len < 1e-12f) return false;
+    out[0]/=len; out[1]/=len; out[2]/=len;
+    return true;
+}
+inline bool node_local_matrix(const JVal& node, Mat4& out) {
+    out = mat4_identity();
+    if (const JVal* mj = node.find("matrix")) {
+        if (!mj->is_arr() || mj->arr.size() != 16) return false;
+        for (int k = 0; k < 16; ++k) {
+            if (!mj->arr[(size_t)k].is_num()) return false;
+            out[(size_t)k] = (float)mj->arr[(size_t)k].num;
+        }
+        return true;
+    }
+    float t[3]={0,0,0}, q[4]={0,0,0,1}, s[3]={1,1,1};
+    auto read = [&](const char* key, float* dst, int n) {
+        const JVal* a=node.find(key);
+        if (!a) return true;
+        if (!a->is_arr() || (int)a->arr.size()!=n) return false;
+        for (int k=0;k<n;++k) { if (!a->arr[(size_t)k].is_num()) return false; dst[k]=(float)a->arr[(size_t)k].num; }
+        return true;
+    };
+    if (!read("translation",t,3) || !read("rotation",q,4) || !read("scale",s,3)) return false;
+    const float x=q[0], y=q[1], z=q[2], w=q[3];
+    // R * S, then translation. glTF quaternions are [x,y,z,w].
+    out = { (1-2*y*y-2*z*z)*s[0], (2*x*y+2*w*z)*s[0], (2*x*z-2*w*y)*s[0], 0,
+            (2*x*y-2*w*z)*s[1], (1-2*x*x-2*z*z)*s[1], (2*y*z+2*w*x)*s[1], 0,
+            (2*x*z+2*w*y)*s[2], (2*y*z-2*w*x)*s[2], (1-2*x*x-2*y*y)*s[2], 0,
+            t[0], t[1], t[2], 1 };
+    return true;
+}
+
 }  // namespace detail
 
 // ----------------------------------------------------------------------------
@@ -327,6 +393,55 @@ inline bool read_glb(const char* path, Mesh& out) {
     }
     if (!bin_ptr) { std::fprintf(stderr, "glb::read_glb: no BIN chunk\n"); return false; }
 
+    // A glTF mesh is geometry only: each visible instance gets its placement from a node. Older
+    // versions of this reader concatenated mesh arrays directly, which turns valid transformed GLBs
+    // (notably some FBX conversions) sideways or leaves their child meshes detached.
+    struct MeshInstance { int mesh = -1; Mat4 world{}; };
+    std::vector<MeshInstance> instances;
+    const JVal* nodes = root.find("nodes");
+    const JVal* scenes = root.find("scenes");
+    if (nodes && nodes->is_arr() && !nodes->arr.empty()) {
+        std::vector<int> roots;
+        if (scenes && scenes->is_arr() && !scenes->arr.empty()) {
+            int scene_idx = root.find("scene") ? (int)root.find("scene")->as_int(0) : 0;
+            if (scene_idx < 0 || scene_idx >= (int)scenes->arr.size()) {
+                std::fprintf(stderr, "glb::read_glb: active scene index invalid\n"); return false;
+            }
+            const JVal* rs = scenes->arr[(size_t)scene_idx].find("nodes");
+            if (rs && rs->is_arr()) for (const JVal& v : rs->arr) roots.push_back((int)v.as_int(-1));
+        }
+        if (roots.empty()) {
+            std::vector<bool> child(nodes->arr.size(), false);
+            for (const JVal& n : nodes->arr) if (const JVal* ch=n.find("children"); ch && ch->is_arr())
+                for (const JVal& c : ch->arr) { int ci=(int)c.as_int(-1); if (ci>=0 && ci<(int)child.size()) child[(size_t)ci]=true; }
+            for (int ni=0; ni<(int)child.size(); ++ni) if (!child[(size_t)ni]) roots.push_back(ni);
+        }
+        std::vector<bool> visiting(nodes->arr.size(), false);
+        std::function<bool(int,const Mat4&)> visit = [&](int ni, const Mat4& parent) {
+            if (ni < 0 || ni >= (int)nodes->arr.size() || visiting[(size_t)ni]) return false;
+            visiting[(size_t)ni] = true;
+            const JVal& n = nodes->arr[(size_t)ni]; Mat4 local;
+            if (!node_local_matrix(n, local)) return false;
+            Mat4 world = mat4_mul(parent, local);
+            if (const JVal* mi=n.find("mesh")) {
+                int m=(int)mi->as_int(-1);
+                if (m < 0 || m >= (int)meshes->arr.size()) return false;
+                instances.push_back({m, world});
+            }
+            if (const JVal* ch=n.find("children")) {
+                if (!ch->is_arr()) return false;
+                for (const JVal& c : ch->arr) if (!visit((int)c.as_int(-1), world)) return false;
+            }
+            visiting[(size_t)ni] = false;
+            return true;
+        };
+        for (int ni : roots) if (!visit(ni, mat4_identity())) {
+            std::fprintf(stderr, "glb::read_glb: malformed node hierarchy/transform\n"); return false;
+        }
+    }
+    if (instances.empty())
+        for (int mi=0; mi<(int)meshes->arr.size(); ++mi) instances.push_back({mi, mat4_identity()});
+
     // Resolve an accessor index -> a view into the BIN blob. Returns valid()==false on failure.
     auto resolve = [&](int64_t acc_idx) -> AccessorView {
         AccessorView av;
@@ -394,12 +509,21 @@ inline bool read_glb(const char* path, Mesh& out) {
         float v; std::memcpy(&v, p, 4); return v;
     };
 
-    // ---- iterate meshes -> primitives, concatenating ----
+    // ---- iterate transformed mesh instances -> primitives, concatenating ----
     bool any_prim = false;
-    for (const JVal& mesh : meshes->arr) {
+    for (const MeshInstance& instance : instances) {
+        const JVal& mesh = meshes->arr[(size_t)instance.mesh];
         const JVal* prims = mesh.find("primitives");
         if (!prims || !prims->is_arr()) continue;
         for (const JVal& prim : prims->arr) {
+            // This reader supplies triangle faces to surface sampling, normal
+            // generation, and skin transfer.  glTF meshes may also contain
+            // LINE/LINES/POINTS primitives (for example an FBX curve kept as
+            // a halo or guide).  Treating their index stream as triangles
+            // creates a non-multiple-of-three face buffer and an invalid
+            // rigged GLB downstream.  Default glTF mode is TRIANGLES (4).
+            const int mode = prim.find("mode") ? (int)prim.find("mode")->as_int(4) : 4;
+            if (mode != 4) continue;
             const JVal* attrs = prim.find("attributes");
             if (!attrs || !attrs->is_obj()) continue;
             const JVal* posj = attrs->find("POSITION");
@@ -414,8 +538,12 @@ inline bool read_glb(const char* path, Mesh& out) {
             int64_t V = pos.count;
 
             // POSITION
-            for (int64_t v = 0; v < V; v++)
-                for (int c = 0; c < 3; c++) out.verts.push_back(read_float(pos, v, c));
+            for (int64_t v = 0; v < V; v++) {
+                float p[3], transformed[3];
+                for (int c = 0; c < 3; c++) p[c] = read_float(pos, v, c);
+                mat4_point(instance.world, p, transformed);
+                out.verts.insert(out.verts.end(), transformed, transformed + 3);
+            }
 
             // NORMAL (optional). Pad with previous behavior: keep arrays index-aligned.
             const JVal* nrmj = attrs->find("NORMAL");
@@ -424,8 +552,14 @@ inline bool read_glb(const char* path, Mesh& out) {
                 AccessorView nv = resolve(nrmj->as_int(-1));
                 if (nv.valid() && nv.comp_ct == 5126 && nv.ncomp == 3 && nv.count == V) {
                     have_nrm = true;
-                    for (int64_t v = 0; v < V; v++)
-                        for (int c = 0; c < 3; c++) out.normals.push_back(read_float(nv, v, c));
+                    for (int64_t v = 0; v < V; v++) {
+                        float n[3], transformed[3];
+                        for (int c = 0; c < 3; c++) n[c] = read_float(nv, v, c);
+                        if (!mat4_normal(instance.world, n, transformed)) {
+                            std::fprintf(stderr, "glb::read_glb: degenerate node transform for NORMAL\n"); return false;
+                        }
+                        out.normals.insert(out.normals.end(), transformed, transformed + 3);
+                    }
                 }
             }
             if (!have_nrm && !out.normals.empty()) {
@@ -456,6 +590,10 @@ inline bool read_glb(const char* path, Mesh& out) {
                     std::fprintf(stderr, "glb::read_glb: indices accessor invalid\n");
                     return false;
                 }
+                if (iv.count % 3 != 0) {
+                    std::fprintf(stderr, "glb::read_glb: TRIANGLES index count is not divisible by 3\n");
+                    return false;
+                }
                 for (int64_t i = 0; i < iv.count; i++) {
                     int64_t idx = read_index(iv, i);
                     if (idx < 0) { std::fprintf(stderr, "glb::read_glb: bad index componentType\n"); return false; }
@@ -463,6 +601,10 @@ inline bool read_glb(const char* path, Mesh& out) {
                 }
             } else {
                 // non-indexed: implicit 0,1,2,... over the vertices of this primitive
+                if (V % 3 != 0) {
+                    std::fprintf(stderr, "glb::read_glb: non-indexed TRIANGLES vertex count is not divisible by 3\n");
+                    return false;
+                }
                 for (int64_t i = 0; i < V; i++) out.faces.push_back(base_v + i);
             }
             any_prim = true;

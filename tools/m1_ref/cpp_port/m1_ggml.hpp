@@ -90,13 +90,22 @@ struct M1Harness {
     M1Harness(const std::string& weight_dir, size_t mem_mb = 512, bool use_cuda = false) {
         wdir = weight_dir;
         // GGUF override: PIXAL3D_GGUF_DIR=<dir> + <dir>/<model>.gguf present -> use it.
+        // The quality runner can selectively retain the F32 .npy source for
+        // M3b geometry and Pixal's projection-conditioned M6 texture DiT.
+        // These 1.3B stages execute sequentially, fit the 3060 in F32, and
+        // are sensitive enough that the local F16 GGUF control is not parity
+        // grade. Every other stage continues to use the local bundle.
+        const std::string base = weight_dir.substr(weight_dir.find_last_of('/') + 1);
+        const bool force_f32_m3b = base == "slat_flow_1024" && std::getenv("PIXAL3D_QUALITY_F32_M3B");
+        const bool force_f32_proj_tex = base == "slat_flow_imgshape2tex_1024" && std::getenv("PIXAL3D_QUALITY_F32_PROJ_TEX");
         if (const char* gdir = std::getenv("PIXAL3D_GGUF_DIR")) {
-            std::string base = weight_dir.substr(weight_dir.find_last_of('/') + 1);
             std::string gpath = std::string(gdir) + "/" + base + ".gguf";
-            gguf_init_params gp{ /*no_alloc=*/false, /*ctx=*/&gctx_data };
-            gctx = gguf_init_from_file(gpath.c_str(), gp);
-            if (gctx) { use_gguf = true; }
-            else { gctx_data = nullptr; }  // not packed yet -> fall back to .npy
+            if (!force_f32_m3b && !force_f32_proj_tex) {
+                gguf_init_params gp{ /*no_alloc=*/false, /*ctx=*/&gctx_data };
+                gctx = gguf_init_from_file(gpath.c_str(), gp);
+                if (gctx) { use_gguf = true; }
+                else { gctx_data = nullptr; }  // not packed yet -> fall back to .npy
+            }
         }
 #ifdef M1_USE_CUDA
         if (use_cuda) backend = ggml_backend_cuda_init(0);
@@ -449,7 +458,8 @@ static inline ggml_tensor* gelu_tanh_(ggml_context* ctx, ggml_tensor* x) {
 // f16 tensor-core accumulation (same as the dense fast path). Used for self-attn only (cross-attn's
 // 5 kv tokens don't benefit). fa_mask->ne[0] = n_kv padded to a multiple of 256.
 static inline ggml_tensor* attention(ggml_context* ctx, ggml_tensor* q, ggml_tensor* k,
-                                     ggml_tensor* v, float scale, ggml_tensor* fa_mask = nullptr) {
+                                     ggml_tensor* v, float scale, ggml_tensor* fa_mask = nullptr,
+                                     bool m6_precision = false) {
     int64_t d = q->ne[0], nh = q->ne[1], tq = q->ne[2], tk = k->ne[2];
     // DIAG capture (PIXAL3D_FA_CAPTURE): name the FIRST block's rope'd/rms-normed q,k,v as outputs so
     // the harness can dump them -> replay through fa_repro (capture-the-failing-latents-and-replay).
@@ -458,10 +468,26 @@ static inline ggml_tensor* attention(ggml_context* ctx, ggml_tensor* q, ggml_ten
         ggml_set_output(k); ggml_set_name(k,"cap_k");
         ggml_set_output(v); ggml_set_name(v,"cap_v"); } }
     const bool fast = pix_fast_prec();   // PIXAL3D_FAST: f16 tensor-core QK/AV (softmax stays fp32)
+    const char * cudnn_env = std::getenv("GGML_CUDNN_ATTN");
+    const bool cudnn_native = cudnn_env && std::atoi(cudnn_env) != 0 && fa_mask == nullptr && tq == tk && tk >= 256;
+    // Exact Pixal M6 route: source-built FlashAttention v2 is invoked only
+    // for mask-free BF16 D=128 self-attention.  It is separate from ggml's
+    // generic/LTX flash dispatch and remains opt-in for parity validation.
+    const bool pixal_fa2_candidate = std::getenv("PIXAL3D_FA2") != nullptr && fa_mask == nullptr &&
+        (!std::getenv("PIXAL3D_FA2_M6_ONLY") || m6_precision) &&
+        tq == tk && d == 128 && nh == 12 && tk >= 256;
+    // Diagnostic only: graph construction visits one mask-free self-attention
+    // node per block.  Bound the native FA2 route to its first N nodes when
+    // comparing mixed-kernel numerical trajectories; unset means all nodes.
+    static int pixal_fa2_graph_calls = 0;
+    const char * pixal_fa2_limit_env = std::getenv("PIXAL3D_FA2_MAX_GRAPH_CALLS");
+    const int pixal_fa2_limit = pixal_fa2_limit_env ? std::atoi(pixal_fa2_limit_env) : -1;
+    const bool pixal_fa2 = pixal_fa2_candidate && (pixal_fa2_limit < 0 || pixal_fa2_graph_calls++ < pixal_fa2_limit);
     // Flash on PIXAL3D_FAST OR the scoped USR_GEO_FLASH (fp32-accum flash without the global prec drop).
-    if ((fast || geo_flash()) && fa_mask) {
+    if (((fast || geo_flash()) && fa_mask) || cudnn_native || pixal_fa2) {
         // ---- FLASH-ATTENTION path ----
-        int64_t nkvpad = fa_mask->ne[0], nqpad = fa_mask->ne[1];
+        int64_t nkvpad = fa_mask ? fa_mask->ne[0] : tk;
+        int64_t nqpad  = fa_mask ? fa_mask->ne[1] : tq;
         ggml_tensor* qf = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [d, tq, head]
         ggml_tensor* kf = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [d, tk, head]
         ggml_tensor* vf = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));  // [d, tk, head] (not transposed)
@@ -484,16 +510,17 @@ static inline ggml_tensor* attention(ggml_context* ctx, ggml_tensor* q, ggml_ten
         // the accumulator stays in range, then scale the output back up. 1/64 gives ~3x headroom over
         // the observed worst case. This — NOT the kernel/mask/q-pad — is why flash NaN'd only late.
         const float vsc = std::getenv("PIXAL3D_FA_VSCALE") ? atof(std::getenv("PIXAL3D_FA_VSCALE")) : (1.0f/64.0f);
-        vf = ggml_scale(ctx, vf, vsc);
-        kf = ggml_cast(ctx, kf, GGML_TYPE_F16);                              // flash K/V F16 (kernel asserts Q stays F32)
-        vf = ggml_cast(ctx, vf, GGML_TYPE_F16);
+        if (!cudnn_native && !pixal_fa2) vf = ggml_scale(ctx, vf, vsc);
+        if (pixal_fa2) qf = ggml_cast(ctx, qf, GGML_TYPE_BF16);
+        kf = ggml_cast(ctx, kf, (cudnn_native || pixal_fa2) ? GGML_TYPE_BF16 : GGML_TYPE_F16);
+        vf = ggml_cast(ctx, vf, (cudnn_native || pixal_fa2) ? GGML_TYPE_BF16 : GGML_TYPE_F16);
         ggml_tensor* r = ggml_flash_attn_ext(ctx, qf, kf, vf, fa_mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);                      // fp32 accumulation
         // r is [d, head, nqpad]; take the first tq query rows (the pad-query outputs are junk). n_q is
         // the slowest dim, so rows [0,tq) are a contiguous prefix.
         if (tq < nqpad) r = ggml_view_3d(ctx, r, d, nh, tq, r->nb[1], r->nb[2], 0);
         ggml_tensor* out = ggml_cont_2d(ctx, r, d * nh, tq);               // [d,head,tq] -> [C, tq]
-        out = ggml_scale(ctx, out, 1.0f / vsc);                            // undo the V pre-scale
+        if (!cudnn_native && !pixal_fa2) out = ggml_scale(ctx, out, 1.0f / vsc); // undo V pre-scale
         if (std::getenv("PIXAL3D_FA_CAPTURE")) { static int co=0; if(co<40){
             char nm[24]; snprintf(nm,sizeof(nm),"cap_out_%d",co); ggml_set_output(out); ggml_set_name(out,nm); co++; } }
         return out;
@@ -504,11 +531,22 @@ static inline ggml_tensor* attention(ggml_context* ctx, ggml_tensor* q, ggml_ten
     ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));  // [tk, d, head]
     if (fast) vp = ggml_cast(ctx, vp, GGML_TYPE_F16);
     ggml_tensor* qp = ggml_permute(ctx, q, 0, 2, 1, 3);  // [d, tq, head]
+    const char* scale_mode = std::getenv("PIXAL3D_ATTN_PRESCALE_Q");
+    if (std::getenv("PIXAL3D_ATTN_PRESCALE_Q_M6_ONLY") && !m6_precision) scale_mode = nullptr;
+    if (fa_mask == nullptr && std::getenv("PIXAL3D_ATTN_PRESCALE_SELF_ONLY")) scale_mode = nullptr;
+    const bool prescale_q = scale_mode != nullptr;
+    const bool prescale_k = scale_mode && (std::strcmp(scale_mode, "k") == 0 || std::strcmp(scale_mode, "split") == 0);
+    const bool split_scale = scale_mode && std::strcmp(scale_mode, "split") == 0;
+    const float q_scale = split_scale ? std::sqrt(scale) : scale;
+    const float k_scale = split_scale ? std::sqrt(scale) : (prescale_k ? scale : 1.0f);
+    if (prescale_k) kp = ggml_scale(ctx, ggml_cont(ctx, kp), k_scale);
     // one query block [d, b, head] -> attention out [d, b, head]
     auto block = [&](ggml_tensor* qb) -> ggml_tensor* {
+        if (prescale_q && !prescale_k) qb = ggml_scale(ctx, ggml_cont(ctx, qb), q_scale);
+        if (split_scale) qb = ggml_scale(ctx, ggml_cont(ctx, qb), q_scale);
         ggml_tensor* kq = ggml_mul_mat(ctx, kp, qb);     // [tk, b, head]
         if (!fast) ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-        kq = ggml_soft_max_ext(ctx, kq, nullptr, scale, 0.0f);
+        kq = ggml_soft_max_ext(ctx, kq, nullptr, prescale_q ? 1.0f : scale, 0.0f);
         ggml_tensor* kqv = ggml_mul_mat(ctx, vp, kq);    // [d, b, head]
         if (!fast) ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
         return kqv;

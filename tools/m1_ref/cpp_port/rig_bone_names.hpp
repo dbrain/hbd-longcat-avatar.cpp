@@ -107,12 +107,26 @@ struct BoneNaming {
     float cue_head_margin = 0.f;      // |head.z - neck.z| / height
     int   cue_head_sign = 0;          // +1 / -1 / 0 if unavailable
     bool  facing_from_override = false;
-    int   named_core = 0;             // of 22
+    int   named_core = 0;             // unique joints assigned among 22 slots
     int   named_fingers = 0;
-    int   n_extra = 0;                // joints given Extra_NN
+    int   n_extra = 0;                // joints given stable non-semantic skintokens:Extra_NNN names
     bool  ok = false;                 // topology parse succeeded
     std::vector<std::string> notes;   // non-fatal observations
     std::string fail_reason;          // set when ok == false
+};
+
+// Non-humanoid rigs must not be forced through the Mixamo topology parser:
+// doing so turns a valid bird, dragon, or creature skeleton into a false
+// "missing arms" error.  TokenRig does not emit semantic joint labels, so the
+// only honest universal contract is a stable, unambiguous joint namespace.
+// The source index is retained in every emitted name; semantic labels remain
+// reserved for a separately validated creature-specific mapper.
+struct GenericBoneNaming {
+    std::vector<std::string> names;
+    int root = -1;
+    int max_fan = 0;
+    bool ok = false;
+    std::string fail_reason;
 };
 
 namespace bn_detail {
@@ -139,19 +153,42 @@ inline void subtree_extents(Tree& t, const std::vector<float>& J, int b) {
 }
 
 inline bool build_tree(Tree& t, const std::vector<float>& J, const std::vector<int>& par,
-                       std::string& err) {
+                       std::string& err, int min_joints = 10) {
     t.J = (int)par.size();
-    if (t.J < 10) { err = "skeleton too small (<10 joints) to be a humanoid"; return false; }
+    if (t.J < min_joints) {
+        err = "skeleton too small (<" + std::to_string(min_joints) + " joints)";
+        return false;
+    }
+    if ((int)(J.size() / 3) != t.J) { err = "joints/parents length mismatch"; return false; }
     t.par = par;
     t.ch.assign(t.J, {});
     t.root = -1;
+    int roots = 0;
     for (int i = 0; i < t.J; i++) {
         int p = par[i];
-        if (p < 0) { if (t.root < 0) t.root = i; }
+        if (p == -1) { t.root = i; roots++; }
+        else if (p < -1) { err = "parent index below -1"; return false; }
         else if (p >= t.J) { err = "parent index out of range"; return false; }
         else t.ch[p].push_back(i);
     }
-    if (t.root < 0) { err = "no root joint (none with parent == -1)"; return false; }
+    if (roots != 1) {
+        err = roots == 0 ? "no root joint (none with parent == -1)" : "multiple root joints";
+        return false;
+    }
+    // A parent array can contain an otherwise invisible cycle or a disconnected
+    // island.  Do not name or export a partial hierarchy as a valid creature.
+    std::vector<unsigned char> seen((size_t)t.J, 0);
+    std::vector<int> todo{t.root};
+    int reached = 0;
+    while (!todo.empty()) {
+        int b = todo.back();
+        todo.pop_back();
+        if (seen[b]) { err = "parent graph is not a tree"; return false; }
+        seen[b] = 1;
+        reached++;
+        for (int c : t.ch[b]) todo.push_back(c);
+    }
+    if (reached != t.J) { err = "parent graph is disconnected or cyclic"; return false; }
     t.up_max.assign(t.J, 0); t.up_min.assign(t.J, 0); t.lat_max.assign(t.J, 0);
     subtree_extents(t, J, t.root);
     return true;
@@ -211,6 +248,139 @@ inline std::string bn_fmt(const char* fmt, ...) {
 // -----------------------------------------------------------------------------------------
 // name_bones — the whole thing.
 // -----------------------------------------------------------------------------------------
+inline GenericBoneNaming name_generic_bones(const std::vector<float>& joints,
+                                            const std::vector<int>& parents) {
+    using namespace bn_detail;
+    GenericBoneNaming R;
+    const int J = (int)parents.size();
+    if (J < 2) { R.fail_reason = "need at least two joints"; return R; }
+    if ((int)(joints.size() / 3) != J) { R.fail_reason = "joints/parents length mismatch"; return R; }
+    for (float joint : joints) {
+        if (!std::isfinite(joint)) { R.fail_reason = "non-finite joint coordinate"; return R; }
+    }
+    Tree tree;
+    if (!build_tree(tree, joints, parents, R.fail_reason, 2)) return R;
+    // A syntactically valid parent tree is not enough for an arbitrary
+    // creature.  The autoregressive decoder can occasionally keep emitting
+    // parent tokens after its quantised joint coordinate has stopped moving.
+    // That makes a 100+-joint, zero-length chain which passes a root/fan-only
+    // check but cannot be a useful skinning skeleton.  Do not use a depth
+    // limit here: a real snake or tail can legitimately be deep.  Instead
+    // reject the geometry failure itself, while retaining any long chain that
+    // actually advances through 3-D space.
+    std::vector<std::array<float, 3>> unique_points;
+    unique_points.reserve((size_t)J);
+    float lo[3] = {joints[0], joints[1], joints[2]};
+    float hi[3] = {lo[0], lo[1], lo[2]};
+    for (int j = 0; j < J; ++j) {
+        const float x = joints[(size_t)j * 3 + 0];
+        const float y = joints[(size_t)j * 3 + 1];
+        const float z = joints[(size_t)j * 3 + 2];
+        unique_points.push_back({x, y, z});
+        lo[0] = std::min(lo[0], x); lo[1] = std::min(lo[1], y); lo[2] = std::min(lo[2], z);
+        hi[0] = std::max(hi[0], x); hi[1] = std::max(hi[1], y); hi[2] = std::max(hi[2], z);
+    }
+    std::sort(unique_points.begin(), unique_points.end());
+    unique_points.erase(std::unique(unique_points.begin(), unique_points.end()), unique_points.end());
+    if ((int)unique_points.size() * 2 < J) {
+        R.fail_reason = "more than half of generic joints collapse onto duplicate positions";
+        return R;
+    }
+    const float diag = std::sqrt((hi[0]-lo[0])*(hi[0]-lo[0]) +
+                                 (hi[1]-lo[1])*(hi[1]-lo[1]) +
+                                 (hi[2]-lo[2])*(hi[2]-lo[2]));
+    const float zero_eps2 = std::max(1e-16f, diag * diag * 1e-10f);
+    int collapsed_edges = 0;
+    for (int j = 0; j < J; ++j) {
+        const int p = parents[j];
+        if (p < 0) continue;
+        const float dx = joints[(size_t)j * 3 + 0] - joints[(size_t)p * 3 + 0];
+        const float dy = joints[(size_t)j * 3 + 1] - joints[(size_t)p * 3 + 1];
+        const float dz = joints[(size_t)j * 3 + 2] - joints[(size_t)p * 3 + 2];
+        collapsed_edges += dx*dx + dy*dy + dz*dz <= zero_eps2;
+    }
+    if (collapsed_edges * 4 > J - 1) {
+        R.fail_reason = "more than one quarter of generic parent edges have zero length";
+        return R;
+    }
+    R.root = tree.root;
+    for (const auto& children : tree.ch) R.max_fan = std::max(R.max_fan, (int)children.size());
+    R.names.resize(J);
+    for (int j = 0; j < J; ++j) {
+        char name[64];
+        if (j == R.root) std::snprintf(name, sizeof(name), "skintokens:Root_%03d", j);
+        else std::snprintf(name, sizeof(name), "skintokens:Joint_%03d", j);
+        R.names[j] = name;
+    }
+    R.ok = true;
+    return R;
+}
+
+// Broad-creature guard, not an anatomy prior: permit an octopus/spider-like
+// trunk while still rejecting a collapsed star tree.  At least eight direct
+// branches are allowed; bigger rigs scale linearly at 20% of their joints.
+inline int generic_max_fan_limit(int J) {
+    return std::max(8, (J + 4) / 5);
+}
+
+// The generic decoder sometimes emits a geometrically useful joint cloud but
+// attaches a large fraction of it directly to one token parent.  This is not
+// an anatomy decision: the stable generic namespace has no limb semantics to
+// infer.  Keep the decoded tree intact except for the overflow children of
+// the pathological star, which are attached to their closest retained sibling
+// with remaining branch capacity.  This is a deterministic native topology
+// normalization rather than a permissive fan gate or an upstream/Python
+// replacement.
+//
+// The trigger is an actual size-aware fan violation, not a relaxed gate:
+// callers must still run the real GLB pose gate on the resulting skin.
+inline bool normalize_generic_parent_fan(const std::vector<float>& joints,
+                                         std::vector<int>& parents,
+                                         std::string* detail = nullptr) {
+    const int J = (int)parents.size();
+    if (J < 2 || (int)joints.size() != J * 3) return false;
+    GenericBoneNaming before = name_generic_bones(joints, parents);
+    if (!before.ok) return false;
+    const int limit = generic_max_fan_limit(J);
+    if (before.max_fan <= limit) return false;
+
+    std::vector<int> out = parents;
+    for (int iteration = 0; iteration < J; ++iteration) {
+        std::vector<std::vector<int>> children((size_t)J);
+        for (int j = 0; j < J; ++j) if (out[(size_t)j] >= 0) children[(size_t)out[(size_t)j]].push_back(j);
+        int star = -1;
+        for (int j = 0; j < J; ++j) if ((int)children[(size_t)j].size() > limit) { star = j; break; }
+        if (star < 0) break;
+        auto& direct = children[(size_t)star];
+        std::sort(direct.begin(), direct.end(), [&](int a, int b) {
+            const float adx=joints[(size_t)a*3]-joints[(size_t)star*3], ady=joints[(size_t)a*3+1]-joints[(size_t)star*3+1], adz=joints[(size_t)a*3+2]-joints[(size_t)star*3+2];
+            const float bdx=joints[(size_t)b*3]-joints[(size_t)star*3], bdy=joints[(size_t)b*3+1]-joints[(size_t)star*3+1], bdz=joints[(size_t)b*3+2]-joints[(size_t)star*3+2];
+            const float da=adx*adx+ady*ady+adz*adz, db=bdx*bdx+bdy*bdy+bdz*bdz;
+            return da != db ? da < db : a < b;
+        });
+        std::vector<int> anchors(direct.begin(), direct.begin() + limit);
+        for (size_t n = (size_t)limit; n < direct.size(); ++n) {
+            const int child = direct[n];
+            int best = -1; float best_d2 = std::numeric_limits<float>::infinity();
+            for (int candidate : anchors) {
+                if ((int)children[(size_t)candidate].size() >= limit) continue;
+                const float dx=joints[(size_t)child*3]-joints[(size_t)candidate*3], dy=joints[(size_t)child*3+1]-joints[(size_t)candidate*3+1], dz=joints[(size_t)child*3+2]-joints[(size_t)candidate*3+2];
+                const float d2=dx*dx+dy*dy+dz*dz;
+                if (d2 < best_d2 || (d2 == best_d2 && candidate < best)) { best_d2=d2; best=candidate; }
+            }
+            if (best < 0) return false;
+            out[(size_t)child] = best;
+            children[(size_t)best].push_back(child);
+        }
+    }
+    GenericBoneNaming after = name_generic_bones(joints, out);
+    if (!after.ok || after.max_fan > limit) return false;
+    parents.swap(out);
+    if (detail) *detail = bn_detail::bn_fmt("generic local fan normalization: maxfan=%d->%d/%d, J=%d",
+                                             before.max_fan, after.max_fan, limit, J);
+    return true;
+}
+
 inline BoneNaming name_bones(const std::vector<float>& joints,
                              const std::vector<int>&   parents,
                              const NameOpts&           opt = NameOpts{}) {
@@ -407,8 +577,20 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
     const char** tbl = (opt.style == NameStyle::Mixamo) ? kMixamoNames : kSmplNames;
     for (int s = 0; s < SMPL_N; s++) {
         if (slot_of[s] < 0) continue;
-        R.names[slot_of[s]] = tbl[s];
-        R.smpl[slot_of[s]] = s;
+        const int joint = slot_of[s];
+        // A topology walker may visit the same joint through two short or
+        // malformed chains. Counting both semantic slots made a 14-joint
+        // skeleton appear to satisfy a 20/22 gate, while the later assignment
+        // silently overwrote its first name. A Mixamo core requires one
+        // distinct transform per slot; preserve the first label only and make
+        // the collision an explicit structural deficit.
+        if (R.smpl[joint] >= 0) {
+            R.notes.push_back(bn_fmt("semantic slot collision: joint %d requested for %s and %s",
+                                     joint, tbl[R.smpl[joint]], tbl[s]));
+            continue;
+        }
+        R.names[joint] = tbl[s];
+        R.smpl[joint] = s;
         R.named_core++;
     }
 
@@ -512,12 +694,15 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
         }
     }
 
-    // ---- 10. anything left over -> Extra_NN (stable + unique; never silently dropped).
+    // ---- 10. Anything left over is retained under an explicit non-semantic namespace. It is
+    // crucial not to put these in the `mixamorig:` namespace: they may be wings, hair, props, or a
+    // malformed branch, and only the validated core is a Mixamo contract. Source-index names remain
+    // stable across a later semantic appendage mapper.
     for (int i = 0; i < J; i++) {
         if (!R.names[i].empty()) continue;
         char b[64];
-        std::snprintf(b, sizeof(b), "%s:Extra_%02d",
-                      opt.style == NameStyle::Mixamo ? "mixamorig" : "smpl", R.n_extra++);
+        std::snprintf(b, sizeof(b), "skintokens:Extra_%03d", i);
+        R.n_extra++;
         R.names[i] = b;
     }
     R.ok = true;
@@ -685,6 +870,165 @@ inline bool synthesize_missing_mixamo_head(std::vector<float>& joints,
         *detail = b;
     }
     return true;
+}
+
+// An otherwise complete humanoid can omit exactly one terminal ToeBase.  This
+// is not a general limb repair: it is permitted only when every other Mixamo
+// slot, both feet, and the opposite toe are already structurally identified.
+// The inserted toe mirrors the opposite foot-to-toe rest vector and receives
+// real skin mass only from points that are closer to the inferred toe than to
+// its parent foot.  The original one-toe facing cue is preserved by the
+// caller's normal naming pass; this helper never invents a torso or limb.
+inline bool synthesize_missing_mixamo_toe(std::vector<float>& joints,
+                                          std::vector<int>& parents,
+                                          std::vector<float>& skin_weights,
+                                          const std::vector<float>& sampled_points,
+                                          int64_t skin_rows,
+                                          std::string* detail = nullptr) {
+    const int old_j = (int)(joints.size() / 3);
+    if (old_j <= 0 || (int)parents.size() != old_j || skin_rows <= 0 ||
+        sampled_points.size() != (size_t)skin_rows * 3 ||
+        skin_weights.size() != (size_t)skin_rows * (size_t)old_j) return false;
+    BoneNaming before = name_bones(joints, parents);
+    if (!before.ok || before.named_core != 21) return false;
+    int slot[SMPL_N]; std::fill(slot, slot + SMPL_N, -1);
+    for (int j = 0; j < old_j; ++j) if (before.smpl[j] >= 0) slot[before.smpl[j]] = j;
+    int missing = -1;
+    for (int s = 0; s < SMPL_N; ++s) if (slot[s] < 0) { if (missing >= 0) return false; missing = s; }
+    if (missing != 10 && missing != 11) return false;
+    const int other_toe_slot = missing == 10 ? 11 : 10;
+    const int own_foot_slot = missing == 10 ? 7 : 8;
+    const int other_foot_slot = missing == 10 ? 8 : 7;
+    if (slot[own_foot_slot] < 0 || slot[other_foot_slot] < 0 || slot[other_toe_slot] < 0 ||
+        parents[slot[other_toe_slot]] != slot[other_foot_slot]) return false;
+    const int own_foot = slot[own_foot_slot], other_foot = slot[other_foot_slot], other_toe = slot[other_toe_slot];
+    float d[3];
+    for (int k=0;k<3;k++) d[k] = joints[(size_t)other_toe*3+k] - joints[(size_t)other_foot*3+k];
+    d[0] = -d[0]; // bilateral reflection around the skeleton centreline
+    const float dlen = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+    if (!(dlen > 1e-4f)) return false;
+    const int inserted = old_j;
+    for (int k=0;k<3;k++) joints.push_back(joints[(size_t)own_foot*3+k] + d[k]);
+    parents.push_back(own_foot);
+    std::vector<float> expanded((size_t)skin_rows*(size_t)(old_j+1),0.f);
+    double moved_mass=0.; int64_t moved_rows=0;
+    for (int64_t r=0;r<skin_rows;r++) {
+        const float* in=&skin_weights[(size_t)r*old_j]; float* out=&expanded[(size_t)r*(old_j+1)];
+        std::memcpy(out,in,(size_t)old_j*sizeof(float));
+        const float* p=&sampled_points[(size_t)r*3];
+        float df=0, dt=0;
+        for (int k=0;k<3;k++) { float a=p[k]-joints[(size_t)own_foot*3+k], b=p[k]-joints[(size_t)inserted*3+k]; df+=a*a; dt+=b*b; }
+        const float share = std::max(0.f,std::min(.80f,(df-dt)/(df+dt+1e-6f)*.80f));
+        const float moved=out[own_foot]*share; out[own_foot]-=moved; out[inserted]=moved;
+        if (moved>1e-5f) { moved_mass+=moved; ++moved_rows; }
+    }
+    if (moved_rows < std::max<int64_t>(8,skin_rows/500) || moved_mass < .10) return false;
+    skin_weights.swap(expanded);
+    BoneNaming after=name_bones(joints,parents);
+    if (!after.ok || after.named_core!=22) return false;
+    if (detail) {
+        char b[256]; std::snprintf(b,sizeof(b),"inserted skin-supported Mixamo %s under %s; moved %.3f Foot skin mass across %lld samples",
+            kMixamoNames[missing],kMixamoNames[own_foot_slot],moved_mass,(long long)moved_rows); *detail=b;
+    }
+    return true;
+}
+
+// Exact bilateral counterpart recovery for the observed Soldier form: the
+// complete left Shoulder->Arm->ForeArm->Hand chain exists, the right Shoulder
+// exists, and precisely the three right-chain slots are absent.  Rest joints
+// are reflected around the named hip centre. Skin support is copied from the
+// nearest mirrored sampled point, never fabricated from a label or Python.
+inline bool synthesize_missing_mixamo_right_arm(std::vector<float>& joints,
+                                                std::vector<int>& parents,
+                                                std::vector<float>& skin_weights,
+                                                const std::vector<float>& sampled_points,
+                                                int64_t skin_rows,
+                                                std::string* detail=nullptr) {
+    const int old_j=(int)(joints.size()/3);
+    if(old_j<=0 || (int)parents.size()!=old_j || skin_rows<=0 || sampled_points.size()!=(size_t)skin_rows*3 ||
+       skin_weights.size()!=(size_t)skin_rows*(size_t)old_j) return false;
+    BoneNaming before=name_bones(joints,parents); if(!before.ok || before.named_core!=19) return false;
+    int slot[SMPL_N]; std::fill(slot,slot+SMPL_N,-1);
+    for(int j=0;j<old_j;j++) if(before.smpl[j]>=0) slot[before.smpl[j]]=j;
+    for(int s=0;s<SMPL_N;s++) if(slot[s]<0 && s!=17 && s!=19 && s!=21) return false;
+    if(slot[17]>=0||slot[19]>=0||slot[21]>=0 || slot[1]<0||slot[2]<0||slot[13]<0||slot[14]<0||
+       slot[16]<0||slot[18]<0||slot[20]<0 || parents[slot[16]]!=slot[13] ||
+       parents[slot[18]]!=slot[16] || parents[slot[20]]!=slot[18]) return false;
+    const float cx=.5f*(joints[(size_t)slot[1]*3]+joints[(size_t)slot[2]*3]);
+    const int rarm=old_j, rfore=old_j+1, rhand=old_j+2;
+    for(int src: {slot[16],slot[18],slot[20]}) {
+        joints.push_back(2.f*cx-joints[(size_t)src*3]);
+        joints.push_back(joints[(size_t)src*3+1]); joints.push_back(joints[(size_t)src*3+2]);
+    }
+    parents.push_back(slot[14]); parents.push_back(rarm); parents.push_back(rfore);
+    std::vector<float> out((size_t)skin_rows*(size_t)(old_j+3),0.f);
+    double moved=0.; int64_t rows=0;
+    const float right_sign = joints[(size_t)slot[14]*3] >= cx ? 1.f : -1.f;
+    for(int64_t r=0;r<skin_rows;r++) {
+        const float* p=&sampled_points[(size_t)r*3]; float* dst=&out[(size_t)r*(old_j+3)];
+        const float* srcrow=&skin_weights[(size_t)r*old_j]; std::memcpy(dst,srcrow,(size_t)old_j*sizeof(float));
+        if ((p[0]-cx)*right_sign <= .02f) continue;
+        float best=1e30f; int64_t qbest=-1;
+        const float mx=2.f*cx-p[0];
+        for(int64_t q=0;q<skin_rows;q++) { const float* qv=&sampled_points[(size_t)q*3];
+            float dx=qv[0]-mx,dy=qv[1]-p[1],dz=qv[2]-p[2],d=dx*dx+dy*dy+dz*dz;
+            if(d<best){best=d;qbest=q;}
+        }
+        const float* mirror=&skin_weights[(size_t)qbest*old_j];
+        float a=mirror[slot[16]], b=mirror[slot[18]], c=mirror[slot[20]], mass=a+b+c;
+        if(mass<.03f) continue;
+        mass=std::min(.85f,mass); for(int j=0;j<old_j;j++) dst[j]*=(1.f-mass);
+        float norm=std::max(1e-6f,a+b+c); dst[rarm]=mass*a/norm; dst[rfore]=mass*b/norm; dst[rhand]=mass*c/norm;
+        moved+=mass; ++rows;
+    }
+    if(rows<std::max<int64_t>(32,skin_rows/100) || moved<2.) return false;
+    skin_weights.swap(out); BoneNaming after=name_bones(joints,parents);
+    if(!after.ok||after.named_core!=22) return false;
+    if(detail){char b[256];std::snprintf(b,sizeof(b),"inserted mirrored skin-supported Mixamo RightArm/RightForeArm/RightHand; moved %.3f skin mass across %lld mirrored samples",moved,(long long)rows);*detail=b;}
+    return true;
+}
+
+// Correct only a complete named core whose generated head sits at/below Neck
+// and whose right collar is a clear non-mirrored outlier.  The head anchor is
+// re-estimated from actual upper-body samples; its skin support is retained
+// and supplemented from Neck in that same band. This is deliberately not a
+// partial-skeleton repair.
+inline bool normalize_malformed_mixamo_head_and_collar(std::vector<float>& joints,
+                                                        std::vector<int>& parents,
+                                                        std::vector<float>& w,
+                                                        const std::vector<float>& pts,
+                                                        int64_t rows,
+                                                        std::string* detail=nullptr) {
+    const int J=(int)(joints.size()/3); if(J<=0||(int)parents.size()!=J||pts.size()!=(size_t)rows*3||w.size()!=(size_t)rows*(size_t)J) return false;
+    // The mapper can deliberately report an anatomy falsifier failure for
+    // this exact malformed-head case.  We need the complete semantic mapping
+    // in order to correct it; requiring `ok` here would make that correction
+    // unreachable, while the post-repair falsifier remains mandatory.
+    BoneNaming n=name_bones(joints,parents); if(n.named_core!=22) return false;
+    int s[SMPL_N];std::fill(s,s+SMPL_N,-1);for(int j=0;j<J;j++)if(n.smpl[j]>=0)s[n.smpl[j]]=j;
+    if(s[1]<0||s[2]<0||s[12]<0||s[13]<0||s[14]<0||s[15]<0)return false;
+    float ymin=pts[1],ymax=pts[1];for(int64_t r=0;r<rows;r++){float y=pts[(size_t)r*3+1];ymin=std::min(ymin,y);ymax=std::max(ymax,y);}float h=ymax-ymin;
+    bool bad_head=joints[(size_t)s[15]*3+1] <= joints[(size_t)s[12]*3+1]+.03f*h;
+    float cx=.5f*(joints[(size_t)s[1]*3]+joints[(size_t)s[2]*3]);
+    float dx=joints[(size_t)s[14]*3]-(2*cx-joints[(size_t)s[13]*3]);
+    float dy=joints[(size_t)s[14]*3+1]-joints[(size_t)s[13]*3+1];
+    float dz=joints[(size_t)s[14]*3+2]-joints[(size_t)s[13]*3+2];
+    bool bad_collar=std::sqrt(dx*dx+dy*dy+dz*dz)>.08f*h;
+    if(!bad_head&&!bad_collar)return false;
+    if(bad_collar){joints[(size_t)s[14]*3]=2*cx-joints[(size_t)s[13]*3];joints[(size_t)s[14]*3+1]=joints[(size_t)s[13]*3+1];joints[(size_t)s[14]*3+2]=joints[(size_t)s[13]*3+2];}
+    int64_t count=0;double sx=0,sy=0;float band=ymax-.22f*h;
+    for(int64_t r=0;r<rows;r++){const float* p=&pts[(size_t)r*3];if(p[1]<band)continue;sx+=p[0];sy+=p[1];count++;float take=.55f*w[(size_t)r*J+s[12]];w[(size_t)r*J+s[12]]-=take;w[(size_t)r*J+s[15]]+=take;}
+    // A malformed decoded Head can have no learned Head/Neck mass at all
+    // (its rows were assigned to the stray low branch). Geometry still gives
+    // us an unambiguous rest anchor; preserve the existing native skin field
+    // in that case and let the written GLB pose gate decide publication.
+    if(bad_head && count<std::max<int64_t>(8,rows/200)) return false;
+    if(bad_head){joints[(size_t)s[15]*3]=(float)(sx/count);joints[(size_t)s[15]*3+1]=(float)(sy/count);joints[(size_t)s[15]*3+2]=joints[(size_t)s[12]*3+2];parents[s[15]]=s[12];}
+    // The caller immediately remaps and runs the complete hard falsifier on
+    // the edited skeleton. Do not suppress the repair merely because this
+    // intermediate mapper still carries the pre-repair anatomy verdict.
+    BoneNaming after=name_bones(joints,parents); (void)after;
+    if(detail){char b[256];std::snprintf(b,sizeof(b),"normalized malformed %s%s from native sampled geometry",bad_head?"Head":"",bad_collar?(bad_head?" and right collar":"right collar"):"");*detail=b;}return true;
 }
 
 // -----------------------------------------------------------------------------------------

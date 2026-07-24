@@ -18,7 +18,8 @@
 static void usage() {
     std::printf("usage: native_atlas_project --mesh native.glb --front image.png --out-atlas atlas.png\\n"
                 "       [--camera camera_provenance.txt] [--cam radians --dist units --scale value]\\n"
-                "       [--back image.png] [--view yaw_deg image.png]... [--debug-dir dir] [--stats out.txt]\\n");
+                "       [--back image.png] [--view yaw_deg image.png]... [--debug-dir dir] [--stats out.txt]\\n"
+                "       [--raw-frame | --camera-frame]\\n");
 }
 static float read_camera_value(const std::string& path, const char* key, float fallback) {
     std::ifstream f(path); std::string line, prefix=std::string(key)+"=";
@@ -46,6 +47,11 @@ int main(int argc,char**argv) {
     std::string mesh,front,out_atlas,back,camera,debug,stats;
     texproj::Cfg cfg; cfg.preserve_base_for_holes=true; cfg.verbose=true;
     bool cam_set=false, dist_set=false, scale_set=false;
+    // Pixal stores vertices in a volume frame: +x is image-right, -z is
+    // image-up, and -y faces the input camera.  texproj::Cam uses conventional
+    // camera coordinates (+x right, +y up, +z toward camera).  Convert only a
+    // projection copy; the mesh written back into the output GLB stays untouched.
+    bool raw_pixal_frame=true;
     for(int i=1;i<argc;i++) { std::string a=argv[i];
         auto next=[&]()->const char* { if(++i>=argc) throw std::runtime_error("missing value for "+a); return argv[i]; };
         if(a=="--mesh") mesh=next(); else if(a=="--front") front=next(); else if(a=="--out-atlas") out_atlas=next();
@@ -53,6 +59,8 @@ int main(int argc,char**argv) {
         else if(a=="--cam") { cfg.cam=std::strtof(next(),nullptr); cam_set=true; }
         else if(a=="--dist") { cfg.dist=std::strtof(next(),nullptr); dist_set=true; }
         else if(a=="--scale") { cfg.ms=std::strtof(next(),nullptr); scale_set=true; }
+        else if(a=="--raw-frame") raw_pixal_frame=true;
+        else if(a=="--camera-frame") raw_pixal_frame=false;
         else if(a=="--view") { float yaw=std::strtof(next(),nullptr); std::string img=next(); cfg.views.push_back({yaw,img}); }
         else { usage(); return 2; }
     }
@@ -66,6 +74,16 @@ int main(int argc,char**argv) {
         glb::Mesh m; if(!glb::read_glb(mesh.c_str(),m)) throw std::runtime_error("cannot read native GLB mesh");
         if(m.uvs.size()!=m.verts.size()/3*2 || m.normals.size()!=m.verts.size())
             throw std::runtime_error("native GLB must have full POSITION/NORMAL/TEXCOORD_0");
+        if(raw_pixal_frame) {
+            for(size_t i=0;i<m.verts.size();i+=3) {
+                const float x=m.verts[i], y=m.verts[i+1], z=m.verts[i+2];
+                m.verts[i] = -x; m.verts[i+1] = -z; m.verts[i+2] = -y;
+            }
+            for(size_t i=0;i<m.normals.size();i+=3) {
+                const float x=m.normals[i], y=m.normals[i+1], z=m.normals[i+2];
+                m.normals[i] = -x; m.normals[i+1] = -z; m.normals[i+2] = -y;
+            }
+        }
         std::vector<uint8_t> png; std::string mime;
         if(!glb::read_glb_basecolor_png(mesh.c_str(),png,mime)) throw std::runtime_error("cannot extract native baseColor image");
         int w=0,h=0,c=0; uint8_t* px=stbi_load_from_memory(png.data(),(int)png.size(),&w,&h,&c,4);

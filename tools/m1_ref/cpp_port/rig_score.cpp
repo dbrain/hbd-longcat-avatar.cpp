@@ -13,9 +13,10 @@
 //   symmetry   fraction of joints with a bilateral mirror partner (max over the X / Z mirror planes)
 //   coverage   min over axes of joint-extent / mesh-extent (catches "clustered in one region")
 //   structure  blend of root/leaf/depth plausibility
-//   TOTAL      0.40*symmetry + 0.30*coverage + 0.30*structure   (0..1; higher = more biped-like)
+//   TOTAL      0.50*symmetry + 0.30*coverage + 0.20*structure, then a fan gate
 // Heuristic, not ground truth — owner judges by RENDER; this just makes A/B/best-of-N objective.
 #include "glb_reader.hpp"
+#include "rig_bone_names.hpp"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -85,6 +86,30 @@ int main(int argc,char**argv){
 
     vector<int> jointNode(J); vector<int> nodeJoint(N,-1);
     for(int k=0;k<J;k++){ jointNode[k]=(int)jl->arr[k].num; nodeJoint[jointNode[k]]=k; }
+    std::vector<std::string> joint_names((size_t)J);
+    for (int k=0;k<J;k++) if (const auto* n=nodes->arr[(size_t)jointNode[k]].find("name"); n && n->is_str()) joint_names[(size_t)k]=n->str;
+    int named_core=0;
+    for (int s=0;s<rig::SMPL_N;s++) {
+        bool found=false;
+        for (const std::string& name : joint_names) if (name == rig::kMixamoNames[s]) { found=true; break; }
+        if (found) named_core++;
+    }
+    int recovered_tips=0;
+    for (const std::string& name : joint_names)
+        if (name.rfind("skintokens:AppendageTip_", 0) == 0) recovered_tips++;
+    // The generic profile intentionally has no anatomical labels.  Its only
+    // portable naming contract is a complete stable Root_/Joint_ namespace,
+    // so recognize that contract here rather than scoring the same output
+    // with humanoid-only fan expectations.  Requiring every joint to use the
+    // namespace prevents a partially named humanoid skeleton from opting out
+    // of the Mixamo-core gate.
+    int generic_roots=0, generic_joints=0;
+    for (const std::string& name : joint_names) {
+        if (name.rfind("skintokens:Root_", 0) == 0) generic_roots++;
+        else if (name.rfind("skintokens:Joint_", 0) == 0) generic_joints++;
+    }
+    const bool generic_namespace = named_core == 0 && generic_roots == 1 &&
+                                   generic_joints == J - 1;
     vector<std::array<float,3>> P(J);
     for(int k=0;k<J;k++){ Mat4 m=W(jointNode[k]); P[k]={m[12],m[13],m[14]}; }
     // skeleton parents (walk node parents to the first ancestor that is also a joint)
@@ -163,17 +188,21 @@ int main(int argc,char**argv){
     float depth_s=depth_plaus(max_depth);
     float structure=0.5f*root_s + 0.5f*depth_s;
 
-    // fan penalty: 1.0 while max_children<=6 (a clean biped never exceeds this), decaying to 0 by >=12.
-    // A head-fan / runaway is an unambiguous defect, so it multiplies the whole score (not a weighted term).
-    float fan_s = max_children<=6 ? 1.f : std::max(0.f, 1.f - (float)(max_children-6)/6.f);
+    // A vanilla biped stays at <=6. A validated Mixamo core can intentionally carry a recovered
+    // mirrored appendage pair at its torso. Each two skin-supported tip nodes earn three additional
+    // slots (the pair plus the shared attachment); anonymous high-fan trees remain penalized.
+    int fan_limit = generic_namespace ? rig::generic_max_fan_limit(J) : 6;
+    if (!generic_namespace && named_core == rig::SMPL_N && recovered_tips >= 2)
+        fan_limit += 3 * (recovered_tips / 2);
+    float fan_s = max_children<=fan_limit ? 1.f : std::max(0.f, 1.f - (float)(max_children-fan_limit)/6.f);
 
     float TOTAL = (0.50f*symmetry + 0.30f*coverage + 0.20f*structure) * fan_s;
 
     printf("%-40s J=%-3d", path, J);
     if(expected>0) printf(" (exp~%d)",expected);
-    printf("  roots=%d leaves=%d depth=%d maxfan=%d  symmetry=%.3f coverage=%.3f structure=%.3f fan=%.2f  TOTAL=%.3f\n",
-           roots,leaves,max_depth,max_children, symmetry,coverage,structure,fan_s, TOTAL);
-    printf("    sub: root_s=%.2f depth_s=%.2f | sym_x=%.3f sym_y=%.3f sym_z=%.3f | jext=[%.2f %.2f %.2f] mext=[%.2f %.2f %.2f] mesh=%s\n",
-           root_s,depth_s, sx,sy,sz, jext[0],jext[1],jext[2], mext[0],mext[1],mext[2], have_mesh?"yes":"NO");
+    printf("  roots=%d leaves=%d depth=%d maxfan=%d/%d  symmetry=%.3f coverage=%.3f structure=%.3f fan=%.2f  TOTAL=%.3f\n",
+           roots,leaves,max_depth,max_children,fan_limit, symmetry,coverage,structure,fan_s, TOTAL);
+    printf("    sub: root_s=%.2f depth_s=%.2f named_core=%d/%d generic_namespace=%s recovered_appendage_tips=%d | sym_x=%.3f sym_y=%.3f sym_z=%.3f | jext=[%.2f %.2f %.2f] mext=[%.2f %.2f %.2f] mesh=%s\n",
+           root_s,depth_s,named_core,rig::SMPL_N,generic_namespace?"yes":"no",recovered_tips, sx,sy,sz, jext[0],jext[1],jext[2],mext[0],mext[1],mext[2], have_mesh?"yes":"NO");
     return 0;
 }

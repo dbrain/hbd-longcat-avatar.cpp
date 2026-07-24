@@ -80,6 +80,9 @@ int main(int argc, char** argv) {
 
     bool weights_ready = false;
     std::vector<float> got_logits((size_t)S * V, 0.f);   // collected incremental logits per position
+    const char * trace_dir = Qwen3Subtrace::env_dir();
+    const int trace_pos = std::getenv("RIG_QWEN3_DECODE_TRACE_POS")
+        ? std::atoi(std::getenv("RIG_QWEN3_DECODE_TRACE_POS")) : -1;
 
     // ---- helper: build + run a chunk graph; copies the chunk's logits into got_logits[write0..]. ----
     auto run_chunk = [&](int write0, int L, bool causal_mask) {
@@ -117,13 +120,17 @@ int main(int argc, char** argv) {
         }
 
         std::vector<ggml_tensor*> writes;
+        Qwen3Subtrace subtrace;
+        if (trace_dir && L == 1 && write0 == trace_pos) subtrace.dir = trace_dir;
         ggml_tensor* logits = build_qwen3_cached(H, cctx, cfg, cache, inp, cos3, sin3,
-                                                 write0, L, maskT, writes);  // [vocab, L]
+                                                 write0, L, maskT, writes, nullptr, 0, nullptr,
+                                                 subtrace.enabled() ? &subtrace : nullptr);  // [vocab, L]
         ggml_set_output(logits);
 
         ggml_cgraph* gf = new_graph(cctx, 32768);
         ggml_build_forward_expand(gf, logits);
         for (ggml_tensor* w : writes) ggml_build_forward_expand(gf, w);  // ensure cache writes run
+        subtrace.add_to_graph(gf);
 
         if (!weights_ready) {
             H.wbuf = ggml_backend_alloc_ctx_tensors(H.ctx_w, H.backend);
@@ -149,6 +156,7 @@ int main(int argc, char** argv) {
         if (causal_mask) ggml_backend_tensor_set(maskT, maskb.data(), 0, maskb.size() * sizeof(float));
 
         ggml_backend_graph_compute(H.backend, gf);
+        subtrace.write(H);
 
         // pull the chunk's L columns of logits -> got_logits[write0 .. write0+L)
         ggml_backend_tensor_get(logits, got_logits.data() + (size_t)write0 * V, 0,

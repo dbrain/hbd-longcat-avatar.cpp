@@ -80,15 +80,21 @@ inline Skeleton detokenize(const int64_t* all, int64_t n_all, const Spec& s) {
         if (id < s.num_discrete) {
             V3 current;
             if (is_branch) {
-                // a branch joint needs a full 6-token group (parent xyz ++ child xyz). On a malformed/
-                // truncated stream the tail may be short -> reading ids[i+3..i+5] would run off the end
-                // (garbage int64 -> ~1e12 joint coords). Stop parsing cleanly instead of emitting junk.
-                if (i + 6 > ids.size()) break;
+                // TokenizerPart.detokenize attempts to stack every coordinate group. A truncated
+                // group consequently raises upstream; accepting its valid prefix here would create
+                // a different skeleton and could let malformed AR output reach profile selection.
+                if (i + 6 > ids.size()) {
+                    r.err = "truncated branch coordinate group";
+                    return r;
+                }
                 V3 p_joint = undiscretize(&ids[i], s);
                 current = undiscretize(&ids[i + 3], s);
                 joints.push_back(current); p_joints.push_back(p_joint); i += 6;
             } else {
-                if (i + 3 > ids.size()) break;   // need a full xyz triplet; tail too short -> stop
+                if (i + 3 > ids.size()) {
+                    r.err = "truncated coordinate group";
+                    return r;
+                }
                 current = undiscretize(&ids[i], s);
                 joints.push_back(current);
                 if (p_joints.empty()) p_joints.push_back(current);   // root
@@ -100,6 +106,14 @@ inline Skeleton detokenize(const int64_t* all, int64_t n_all, const Spec& s) {
         else if (id == s.spring || s.parts_ids.count((int)id)) { i += 1; }
         else if (s.cls_ids.count((int)id) || id == s.cls_none) { i += 1; }
         else { r.err = "unexpected token " + std::to_string((long long)id); return r; }
+    }
+    if (is_branch) {
+        r.err = "branch token without coordinate group";
+        return r;
+    }
+    if (joints.empty()) {
+        r.err = "no joint coordinate groups";
+        return r;
     }
     const int J = (int)joints.size();
 

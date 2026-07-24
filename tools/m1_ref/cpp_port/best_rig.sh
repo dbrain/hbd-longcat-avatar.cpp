@@ -7,6 +7,11 @@
 # Usage: best_rig.sh <rig_in_dir> <qwen3_w_dir> <out_rig.glb> <out_dump_dir> [N=6] [extra e2e args...]
 # Env: PIXAL3D_GGUF_DIR must be set.
 set -euo pipefail
+
+echo "best_rig.sh is retired for production: banked conditioning and best-of-seed selection are not publishable." >&2
+echo "Use rig_texture_chain.sh with real R1/R4 and its structural and real-LBS gates." >&2
+exit 64
+
 CP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RIG_IN="${1:?rig_in_dir}"; QW="${2:?qwen3_w_dir}"; OUT_GLB="${3:?out_rig.glb}"; OUT_DUMP="${4:?out_dump_dir}"
 N="${5:-6}"; shift $(( $#<5 ? $# : 5 )) || true; EXTRA="${*:-}"

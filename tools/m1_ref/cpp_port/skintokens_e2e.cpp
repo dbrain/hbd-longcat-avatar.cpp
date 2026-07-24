@@ -24,6 +24,7 @@
 #include "rig_beam_generate_batched.hpp"
 #include "rig_sample.hpp"
 #include "rig_grammar.hpp"
+#include "rig_bone_names.hpp"
 #include "detok_r5.hpp"
 #include "rig_skin_decoder.hpp"
 #include "rig_fsq.hpp"
@@ -41,6 +42,10 @@
 #include <fstream>
 #include <chrono>
 #include <filesystem>
+
+#ifdef M1_USE_CUDA
+extern "C" void qwen_cublaslt_hook_enable();
+#endif
 
 // Peak-VRAM sampling via the CUDA runtime — only available in the CUDA build (CPU build does NOT
 // link cudart). Guarded by M1_USE_CUDA (set by build.sh's cuda branch). Falls back to a no-op note.
@@ -147,6 +152,9 @@ static void npy_write(const std::string& path, const void* data, size_t elem_byt
 }
 
 int main(int argc, char** argv) {
+#ifdef M1_USE_CUDA
+    qwen_cublaslt_hook_enable();
+#endif
     // R3/R4/R5 dump arrays are the explicit hand-off to combine_rig_tex_main.
     // A fresh host may not have the historical test directory, so create it
     // before writing rather than reporting a successful dump of a dropped file.
@@ -179,6 +187,15 @@ int main(int argc, char** argv) {
     ggml_type prec      = GGML_TYPE_BF16;  // AR compute precision. bf16 = model's NATIVE regime (matches
                                            // Python's torch_dtype=bfloat16). prec=fp32 upcasts (shorter rigs).
     bool do_sample      = true;   // `nosample` => deterministic beam (no warpers/RNG; HF do_sample=False)
+    // Opt-in profile gates. Humanoid selection requires the 22-bone Mixamo
+    // contract; generic selection validates only a well-formed skeleton tree
+    // and deliberately does not invent creature semantics from anonymous
+    // joints. Both are kept off for parity/oracle tooling.
+    bool structural_select = false;
+    bool generic_structural_select = false;
+    int generic_candidate_rank = -1;
+    rig::PrefixPrefillMode prefix_prefill = rig::PrefixPrefillMode::SharedB1;
+    bool diagnostic_prefix_parity = false;
     int pos = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -195,6 +212,12 @@ int main(int argc, char** argv) {
         else if (a == "sample") r3_mode = "sample";
         else if (a == "tfprobe") r3_mode = "tfprobe";
         else if (a == "nosample") do_sample = false;   // deterministic beam (HF do_sample=False)
+        else if (a == "structural-select") structural_select = true;
+        else if (a == "generic-structural-select") generic_structural_select = true;
+        else if (a.rfind("generic-candidate=", 0) == 0) generic_candidate_rank = std::atoi(a.c_str() + 18);
+        else if (a == "prefix_prefill=shared-b1") prefix_prefill = rig::PrefixPrefillMode::SharedB1;
+        else if (a == "prefix_prefill=hf-batched-diag") prefix_prefill = rig::PrefixPrefillMode::HfBatchedDiagnostic;
+        else if (a == "diagnostic_prefix_parity=1") diagnostic_prefix_parity = true;
         else if (a.rfind("beams=", 0) == 0) num_beams = std::atoi(a.c_str() + 6);
         else if (a.rfind("seed=",  0) == 0) seed   = std::strtoull(a.c_str() + 5, nullptr, 10);
         else if (a.rfind("temp=",  0) == 0) temp   = std::atof(a.c_str() + 5);
@@ -210,6 +233,27 @@ int main(int argc, char** argv) {
         else if (pos == 0) { e2e = a; pos++; }
         else if (pos == 1) { qwen3_w = a; pos++; }
         else if (pos == 2) { out_glb = a; pos++; }
+    }
+    if (structural_select && generic_structural_select) {
+        std::fprintf(stderr, "choose either structural-select (humanoid) or generic-structural-select\n");
+        return 2;
+    }
+    if (generic_candidate_rank >= 0 && !generic_structural_select) {
+        std::fprintf(stderr, "generic-candidate=N requires generic-structural-select\n");
+        return 2;
+    }
+    if (prefix_prefill == rig::PrefixPrefillMode::HfBatchedDiagnostic && !diagnostic_prefix_parity) {
+        std::fprintf(stderr, "prefix_prefill=hf-batched-diag requires diagnostic_prefix_parity=1; it is not a production mode\n");
+        return 2;
+    }
+    if (prefix_prefill == rig::PrefixPrefillMode::HfBatchedDiagnostic && r3_mode != "beam") {
+        std::fprintf(stderr, "prefix_prefill=hf-batched-diag requires beam decoding\n");
+        return 2;
+    }
+    if (prefix_prefill == rig::PrefixPrefillMode::HfBatchedDiagnostic &&
+        std::getenv("RIG_BEAM_SEQ") && std::getenv("RIG_BEAM_SEQ")[0] != '0') {
+        std::fprintf(stderr, "prefix_prefill=hf-batched-diag requires the batched beam decoder (unset RIG_BEAM_SEQ)\n");
+        return 2;
     }
     std::string r3_detail;
     if (r3_mode == "beam")        r3_detail = " (num_beams=" + std::to_string(num_beams) + ")";
@@ -284,17 +328,11 @@ int main(int argc, char** argv) {
         //   encode(): input_proj(cat[fourier(pc), normals]) for data(kv) + sampled queries,
         //   cross_attn -> 8x self_attn -> ln_post  => latents [width=512, Q=tokens_skin_cond=512].
         //   output_proj = Sequential(Linear(512->896), RMSNorm(896))  (tokenrig.py L111).
-        // FPS query sampling (rng.choice seed=0 + fps ratio 1/4) is NOT ported (host sub-task, see
-        // vecset_encode.cpp) -> consume banked sampled_pc/sampled_feats from the R1 weight dir.
+        // Query sampling is the model input, not a harmless preprocessing detail.  Reproduce the
+        // Python `default_rng(0).choice(N, 2048, replace=False)` + deterministic FPS locally;
+        // never borrow sample points from the reference/weight directory.
         VecsetCfg vcfg;   // dims hard-set from the proven checkpoint (vecset_encoder.hpp header).
         printf("[STAGE R1] R1=real: vecset encoder + output_proj. r1w=%s\n", r1w.c_str());
-
-        // sampled FPS queries: prefer r1w (the R0 dump), else e2e dir.
-        std::string spc_path = file_exists(r1w + "/sampled_pc.npy") ? (r1w + "/sampled_pc.npy")
-                                                                    : (e2e + "/sampled_pc.npy");
-        std::string sft_path = file_exists(r1w + "/sampled_feats.npy") ? (r1w + "/sampled_feats.npy")
-                                                                       : (e2e + "/sampled_feats.npy");
-        bool have_fps = file_exists(spc_path) && file_exists(sft_path);
 
         // output_proj weights — EXTRACTED-FROM-CKPT requirement. They are part of the TokenRig
         // top-level state_dict, NOT the mesh_encoder.encoder.* dump and NOT the skin gguf:
@@ -306,18 +344,33 @@ int main(int argc, char** argv) {
         std::string op_n = r1w + "/output_proj.1.weight.npy";
         bool have_op = file_exists(op_w) && file_exists(op_b) && file_exists(op_n);
 
-        if (!have_fps) {
-            printf("[STAGE R1] WARN: FPS sampled_pc/sampled_feats not found (looked in %s and %s).\n"
-                   "           FPS (rng.choice seed=0 + fps ratio 1/4) is unported; falling back to banked cond.\n",
-                   r1w.c_str(), e2e.c_str());
+        if (!have_op) {
+            printf("[STAGE R1] WARN: output_proj weights NOT on disk; cannot form real mesh_cond.\n");
             if (!load_banked_cond()) return 1;
         } else {
-            NpyArray spc_a = npy_load(spc_path), sft_a = npy_load(sft_path);
-            int64_t Q = spc_a.shape[spc_a.shape.size() - 2];
-            std::vector<float> spc(spc_a.f32(), spc_a.f32() + spc_a.numel());
-            std::vector<float> sft(sft_a.f32(), sft_a.f32() + sft_a.numel());
-            printf("[STAGE R1] inputs: N=%d data points, Q=%lld FPS queries (%s)\n",
-                   N, (long long)Q, spc_path.c_str());
+            const int K = std::min(N, 512 * 4);
+            std::vector<int> sampled_idx = rig::numpy_choice_seed0_without_replacement(N, K);
+            if ((int)sampled_idx.size() != K) { printf("[STAGE R1] FAIL: native NumPy choice failed\n"); return 1; }
+            std::vector<float> pre_pc((size_t)K * 3), pre_feats((size_t)K * 3);
+            for (int i = 0; i < K; ++i) for (int k = 0; k < 3; ++k) {
+                pre_pc[(size_t)i * 3 + k] = verts[(size_t)sampled_idx[i] * 3 + k];
+                pre_feats[(size_t)i * 3 + k] = norms[(size_t)sampled_idx[i] * 3 + k];
+            }
+            std::vector<int> fidx = rig::fps(pre_pc, 512, 0);
+            std::vector<float> spc, sft;
+            rig::gather(pre_pc, fidx, spc);
+            rig::gather(pre_feats, fidx, sft);
+            const int64_t Q = (int64_t)fidx.size();
+            if (const char* dump_queries = std::getenv("RIG_DUMP_R1_QUERIES")) {
+                if (*dump_queries) {
+                    const std::string base(dump_queries);
+                    npy_write(base + "_pc.npy", spc.data(), sizeof(float), "<f4", {Q, 3});
+                    npy_write(base + "_feats.npy", sft.data(), sizeof(float), "<f4", {Q, 3});
+                    printf("[STAGE R1] dumped native PCG64+FPS queries -> %s_{pc,feats}.npy\n", base.c_str());
+                }
+            }
+            printf("[STAGE R1] inputs: N=%d data points, Q=%lld native PCG64 choice+FPS queries\n",
+                   N, (long long)Q);
 
             // host Fourier embed (+ normals concat) for the kv data (all verts) + the queries.
             std::vector<float> data_embed = e2e_fourier_embed(verts.data(), norms.data(), N, vcfg);  // [in_dim,N]
@@ -340,13 +393,6 @@ int main(int argc, char** argv) {
                              Hr.weight("output_proj.0.bias"), cond_t);            // [896, Q]
                 cond_t = ggml_rms_norm(rctx, cond_t, 1e-5f);                       // RMSNorm eps (nn.RMSNorm default 1e-5)
                 cond_t = ggml_mul(rctx, cond_t, Hr.weight("output_proj.1.weight"));// * gamma
-            } else {
-                printf("[STAGE R1] WARN: output_proj weights NOT on disk. Need (extract from ckpt):\n"
-                       "             %s\n             %s\n             %s\n"
-                       "           ckpt key prefix 'output_proj.' in grpo_1400.ckpt['state_dict']:\n"
-                       "             output_proj.0.weight [896,512]  output_proj.0.bias [896]  output_proj.1.weight [896]\n"
-                       "           Encoder latents computed, but mesh_cond requires output_proj -> falling back to banked cond.\n",
-                       op_w.c_str(), op_b.c_str(), op_n.c_str());
             }
             ggml_set_output(cond_t);
 
@@ -357,11 +403,10 @@ int main(int argc, char** argv) {
             Hr.upload_input_raw(samp_in, samp_embed);
             Hr.compute(gf);
             int out_h = (int)cond_t->ne[0];
-            printf("[STAGE R1] ran encoder graph -> %s [%d, %lld]\n",
-                   have_op ? "mesh_cond" : "latents (pre output_proj)", out_h, (long long)cond_t->ne[1]);
+            printf("[STAGE R1] ran encoder graph -> mesh_cond [%d, %lld]\n", out_h, (long long)cond_t->ne[1]);
             vram_sample();   // sample while Hr (vecset encoder weights) is still resident.
 
-            if (have_op && out_h == hidden) {
+            if (out_h == hidden) {
                 // read back row-major [Q, hidden] (ggml ne0=hidden contiguous == row-major last dim).
                 std::vector<float> computed((size_t)Q * hidden);
                 ggml_backend_tensor_get(cond_t, computed.data(), 0, computed.size() * sizeof(float));
@@ -370,14 +415,18 @@ int main(int argc, char** argv) {
                 mesh_cond = std::move(computed);
                 n_cond = (int)Q;
                 printf("[STAGE R1] using REAL mesh_cond: n_cond=%d hidden=%d\n", n_cond, hidden);
-            } else {
-                if (!load_banked_cond()) return 1;
-            }
+            } else { printf("[STAGE R1] FAIL: output_proj returned hidden=%d (expected %d)\n", out_h, hidden); return 1; }
         }
     }
 
     t_r1 = ms_since(t_r1_0, clk::now());
     // (R1 peak is sampled in-scope above for the --r1 real path; banked mode holds no resident harness.)
+    if (const char* dump_cond = std::getenv("RIG_DUMP_MESH_COND")) {
+        if (*dump_cond && n_cond > 0 && mesh_cond.size() == (size_t)n_cond * (size_t)hidden) {
+            npy_write(dump_cond, mesh_cond.data(), sizeof(float), "<f4", {n_cond, hidden});
+            printf("[STAGE R1] dumped mesh_cond [%d,%d] -> %s\n", n_cond, hidden, dump_cond);
+        }
+    }
 
     // ================= R3: AR generate ===============================================
     auto t_r3_0 = clk::now();
@@ -393,10 +442,17 @@ int main(int argc, char** argv) {
     std::vector<int> start_tokens = { gspec.token_id_bos, gspec.token_id_cls_none };  // [257, 263]
     printf("[STAGE R3] start_tokens = {%d, %d} (bos, cls_none); n_cond=%d\n",
            start_tokens[0], start_tokens[1], n_cond);
+    printf("[STAGE R3] prefix_prefill=%s effective_batch=%d cache=%s production_eligible=%s%s\n",
+           prefix_prefill == rig::PrefixPrefillMode::SharedB1 ? "shared-b1" : "hf-batched-diag",
+           prefix_prefill == rig::PrefixPrefillMode::SharedB1 ? 1 : num_beams,
+           prefix_prefill == rig::PrefixPrefillMode::SharedB1 ? "shared" : "expanded-then-column0",
+           prefix_prefill == rig::PrefixPrefillMode::SharedB1 ? "yes" : "no",
+           diagnostic_prefix_parity ? " diagnostic_prefix_parity=acknowledged" : "");
 
     // Fresh harness with qwen3 weights (npy mode: basename "qwen3_w" won't resolve to a gguf even
     // when PIXAL3D_GGUF_DIR is set for the skin VAE -> falls back to per-tensor npy).
     std::vector<int> tokens;
+    std::vector<rig::RigHyp> completed_beams;
     {
         M1Harness Hq(qwen3_w, 64, use_cuda);   // small metadata ctx; weights live in ctx_w
         // f16 weight storage (halves resident weight VRAM; matmul still F32-accumulate). Opt-in via
@@ -470,15 +526,24 @@ int main(int argc, char** argv) {
             // DEFAULT = BATCHED decode (all beams in one forward; bit-exact to sequential, ~Nx faster).
             // Force the original sequential path with env RIG_BEAM_SEQ=1 (A/B parity check).
             bool seq_beam = std::getenv("RIG_BEAM_SEQ") && std::getenv("RIG_BEAM_SEQ")[0] != '0';
-            auto beam_fn = seq_beam ? rig::rig_beam_generate : rig::rig_beam_generate_batched;
             printf("[STAGE R3] beam decode = %s\n", seq_beam ? "SEQUENTIAL" : "BATCHED");
-            tokens = beam_fn(Hq, qcfg, embed_table.data(),
-                             mesh_cond.data(), n_cond, start_tokens, gspec,
-                             /*num_beams=*/num_beams, /*max_new_tokens=*/(maxnew>0?maxnew:1534),
-                             /*length_penalty=*/1.0f, /*repetition_penalty=*/reppen,
-                             /*do_sample=*/do_sample, /*temperature=*/temp,
-                             /*top_k=*/topk, /*top_p=*/topp, /*seed=*/seed,
-                             /*verbose=*/true);
+            if (seq_beam) {
+                tokens = rig::rig_beam_generate(Hq, qcfg, embed_table.data(),
+                    mesh_cond.data(), n_cond, start_tokens, gspec,
+                    /*num_beams=*/num_beams, /*max_new_tokens=*/(maxnew>0?maxnew:1534),
+                    /*length_penalty=*/1.0f, /*repetition_penalty=*/reppen,
+                    /*do_sample=*/do_sample, /*temperature=*/temp,
+                    /*top_k=*/topk, /*top_p=*/topp, /*seed=*/seed,
+                    /*verbose=*/true, &completed_beams);
+            } else {
+                tokens = rig::rig_beam_generate_batched(Hq, qcfg, embed_table.data(),
+                    mesh_cond.data(), n_cond, start_tokens, gspec,
+                    /*num_beams=*/num_beams, /*max_new_tokens=*/(maxnew>0?maxnew:1534),
+                    /*length_penalty=*/1.0f, /*repetition_penalty=*/reppen,
+                    /*do_sample=*/do_sample, /*temperature=*/temp,
+                    /*top_k=*/topk, /*top_p=*/topp, /*seed=*/seed,
+                    /*verbose=*/true, &completed_beams, prefix_prefill);
+            }
         } else {
             tokens = rig::rig_generate(Hq, qcfg, embed_table.data(),
                                        mesh_cond.data(), n_cond, start_tokens, gspec,
@@ -515,9 +580,145 @@ int main(int argc, char** argv) {
     // ================= R5: detokenize -> joints + parents ============================
     auto t_r5_0 = clk::now();
     detok::Spec dspec = detok::load_spec(e2e + "/tok_spec.txt");
+    if (structural_select || generic_structural_select) {
+        if (r3_mode != "beam" || completed_beams.empty()) {
+            printf("[STAGE R3] FAIL: structural selection requires completed beam hypotheses.\n");
+            return 1;
+        }
+        int selected = -1;
+        for (size_t i = 0; i < completed_beams.size(); ++i) {
+            const rig::RigHyp& hyp = completed_beams[i];
+            if (!hyp.eos) continue;
+            std::vector<int64_t> candidate(hyp.sequence.begin(), hyp.sequence.end());
+            detok::Skeleton test = detok::detokenize(candidate.data(), (int64_t)candidate.size(), dspec);
+            if (!test.ok) {
+                printf("[STAGE R3] structural candidate %zu rejected: detokenize %s\n", i, test.err.c_str());
+                continue;
+            }
+            if (generic_structural_select) {
+                if (generic_candidate_rank >= 0 && (int)i != generic_candidate_rank) continue;
+                std::string normalized;
+                if (rig::normalize_generic_parent_fan(test.joints, test.parents, &normalized))
+                    printf("[STAGE R3] generic candidate %zu: %s\n", i, normalized.c_str());
+                rig::GenericBoneNaming generic = rig::name_generic_bones(test.joints, test.parents);
+                if (!generic.ok) {
+                    printf("[STAGE R3] generic candidate %zu rejected: %s\n", i, generic.fail_reason.c_str());
+                    continue;
+                }
+                const int fan_limit = rig::generic_max_fan_limit(test.J);
+                if (generic.max_fan > fan_limit) {
+                    printf("[STAGE R3] generic candidate %zu rejected: maxfan=%d exceeds size-aware limit=%d for J=%d\n",
+                           i, generic.max_fan, fan_limit, test.J);
+                    continue;
+                }
+                tokens = hyp.sequence;
+                selected = (int)i;
+                printf("[STAGE R3] generic structural-select accepted candidate %zu/%zu: J=%d score=%.5f root=%d maxfan=%d/%d\n",
+                       i + 1, completed_beams.size(), test.J, hyp.normscore, generic.root, generic.max_fan, fan_limit);
+                break;
+            }
+            rig::NameOpts opts;
+            if (const char* facing = std::getenv("RIG_BONE_FACING"))
+                opts.facing_override = facing[0] == '-' ? -1 : +1;
+            rig::BoneNaming named = rig::name_bones(test.joints, test.parents, opts);
+            if (!named.ok) {
+                printf("[STAGE R3] structural candidate %zu rejected: core=%d/22 (%s)\n", i,
+                       named.named_core, named.fail_reason.c_str());
+                if (named.named_core >= 18) {
+                    bool present[22] = {};
+                    for (const std::string& name : named.names)
+                        for (int s = 0; s < 22; ++s)
+                            if (name == rig::kMixamoNames[s]) present[s] = true;
+                    printf("[STAGE R3] structural candidate %zu missing slots:", i);
+                    for (int s = 0; s < 22; ++s) if (!present[s])
+                        printf(" %s", rig::kMixamoNames[s]);
+                    printf("\n");
+                }
+                continue;
+            }
+            // The only incomplete form allowed through this pre-skin gate is
+            // the already-audited short torso / terminal-head form.  R4 plus
+            // combine_rig_tex_main will apply its geometry-and-skin-supported
+            // repair and re-run the full falsifier. A separate exact 21/22
+            // terminal-toe form is also allowed: combine derives it from the
+            // mirrored existing toe plus actual Foot skin mass. Missing a
+            // limb, hand, or any other semantic node is never repairable.
+            bool present[22] = {};
+            int hips = -1, spine1 = -1, spine2 = -1, neck = -1;
+            for (int j = 0; j < (int)named.names.size(); ++j) {
+                for (int s = 0; s < 22; ++s) if (named.names[j] == rig::kMixamoNames[s]) {
+                    present[s] = true;
+                    if (s == 0) hips = j;
+                    else if (s == 6) spine1 = j;
+                    else if (s == 9) spine2 = j;
+                    else if (s == 12) neck = j;
+                }
+            }
+            bool missing_only_spine_head = named.named_core == 20 || named.named_core == 21;
+            for (int s = 0; s < 22; ++s)
+                if (!present[s] && s != 3 && s != 15) missing_only_spine_head = false;
+            bool needs_spine = !present[3], needs_head = !present[15];
+            bool repairable = missing_only_spine_head &&
+                              (!needs_spine || (hips >= 0 && spine1 >= 0 && spine2 >= 0 &&
+                                                 test.parents[spine1] == hips)) &&
+                              (!needs_head || neck >= 0);
+            bool missing_only_one_toe = named.named_core == 21 && (present[10] != present[11]);
+            for (int s = 0; s < 22; ++s)
+                if (!present[s] && s != 10 && s != 11) missing_only_one_toe = false;
+            const int own_foot_slot = present[10] ? 8 : 7;
+            const int other_foot_slot = present[10] ? 7 : 8;
+            const int other_toe_slot = present[10] ? 10 : 11;
+            int own_foot=-1, other_foot=-1, other_toe=-1;
+            for (int j=0;j<(int)named.smpl.size();++j) {
+                if (named.smpl[j]==own_foot_slot) own_foot=j;
+                if (named.smpl[j]==other_foot_slot) other_foot=j;
+                if (named.smpl[j]==other_toe_slot) other_toe=j;
+            }
+            bool toe_repairable = missing_only_one_toe && own_foot>=0 && other_foot>=0 && other_toe>=0 &&
+                                  test.parents[other_toe] == other_foot;
+            bool missing_only_right_arm = named.named_core == 19;
+            for(int s=0;s<22;s++) if(!present[s] && s!=17 && s!=19 && s!=21) missing_only_right_arm=false;
+            int ls=-1,rs=-1,la=-1,lf=-1,lh=-1;
+            for(int j=0;j<(int)named.smpl.size();j++){ if(named.smpl[j]==13)ls=j; if(named.smpl[j]==14)rs=j; if(named.smpl[j]==16)la=j; if(named.smpl[j]==18)lf=j; if(named.smpl[j]==20)lh=j; }
+            bool right_arm_repairable=missing_only_right_arm && ls>=0&&rs>=0&&la>=0&&lf>=0&&lh>=0&&test.parents[la]==ls&&test.parents[lf]==la&&test.parents[lh]==lf;
+            repairable = repairable || toe_repairable || right_arm_repairable;
+            if (named.named_core != 22 && !repairable) {
+                printf("[STAGE R3] structural candidate %zu rejected: core=%d/22 (not the narrow Spine/Head repair form)\n",
+                       i, named.named_core);
+                printf("[STAGE R3] structural candidate %zu missing slots:", i);
+                for (int s = 0; s < 22; ++s) if (!present[s])
+                    printf(" %s", rig::kMixamoNames[s]);
+                printf("\n");
+                continue;
+            }
+            if (named.named_core == 22) {
+                int fails = rig::falsify_bone_names(test.joints, test.parents, named, false);
+                if (fails != 0) {
+                    printf("[STAGE R3] structural candidate %zu rejected: bone falsifier=%d\n", i, fails);
+                    continue;
+                }
+            }
+            tokens = hyp.sequence;
+            selected = (int)i;
+            printf("[STAGE R3] structural-select accepted candidate %zu/%zu: J=%d score=%.5f%s\n",
+                   i + 1, completed_beams.size(), test.J, hyp.normscore,
+                   repairable ? (right_arm_repairable ? " (exact mirrored right-arm repair required post-skin)" : (toe_repairable ? " (exact one-ToeBase repair required post-skin)" : " (narrow Spine/Head repair required post-skin)")) : "");
+            break;
+        }
+        if (selected < 0) {
+            printf("[STAGE R3] FAIL: no completed real-conditioned beam passed the %s gate.\n",
+                   generic_structural_select ? "generic skeleton" : "22-bone anatomy");
+            return 1;
+        }
+    }
     std::vector<int64_t> tok64(tokens.begin(), tokens.end());
     detok::Skeleton sk = detok::detokenize(tok64.data(), (int64_t)tok64.size(), dspec);
     if (!sk.ok) { printf("[STAGE R5] FAIL: %s\n", sk.err.c_str()); return 1; }
+    if (generic_structural_select) {
+        std::string normalized;
+        if (rig::normalize_generic_parent_fan(sk.joints, sk.parents, &normalized))
+            printf("[STAGE R5] %s\n", normalized.c_str());
+    }
     const int J = sk.J;
     printf("[STAGE R5] J=%d joints, parents derived\n", J);
     {
@@ -582,10 +783,8 @@ int main(int argc, char** argv) {
     //           onto any other mesh — so it must NOT be used when rigging a new mesh).
     //   real:   COMPUTE cond_latents from THIS mesh's verts/normals via the validated cond-encoder:
     //             cond_kv_embed = skin_embed_with_feats(ALL N verts, normals)            [in_feat, N]
-    //             cond_q  = choice(N, 4*384) -> fps(->384, start 0) (mirrors _encode/_sample_features:
-    //                       cond=cat[verts,normals]; cond_tokens=tokens_skin_cond=384; seed=None =>
-    //                       nondeterministic in python, so a deterministic mt19937 draw is a valid
-    //                       replica), cond_q_embed = skin_embed_with_feats(those 384, their normals)
+    //             cond_q  = default_rng(0).choice(N, 4*384) -> fps(->384, start 0), then
+    //                       cond_q_embed = skin_embed_with_feats(those 384, their normals)
     //             cond_latents = build_cond_encoder(cond_q_embed, cond_kv_embed)          [512, 384]
     // Mode resolution: explicit cond=real|banked wins; "auto" => real when r1=real (we're rigging a
     // NEW mesh, so the banked giraffe cond_latents would be wrong), else banked.
@@ -611,17 +810,14 @@ int main(int argc, char** argv) {
         if (!std::getenv("PIXAL3D_GGUF_DIR"))
             setenv("PIXAL3D_GGUF_DIR", "/mnt/hdd/3d/avatar-shootout/_weights/skin_vae_gguf", 0);
 
-        // cond-query selection: choice(N, 4*384) distinct -> fps -> 384 (start 0). Mirrors
-        // _sample_features(cond, cond_tokens=384): rng.choice then fps(ratio=1/4, random_start=False).
+        // cond-query selection: exact fixed-seed NumPy choice(N, 4*384) -> FPS -> 384 (start 0).
+        // This is the same seeded condition sampling used by the parity probe; mt19937 here would
+        // silently produce a different learned skin field even after R1 had become exact.
         const int Qc = std::min(SKIN_COND_TOKENS, N);
         const int Kc = std::min(Qc * 4, N);
-        std::vector<int> pre_idx(N);
-        for (int i = 0; i < N; ++i) pre_idx[i] = i;
-        std::mt19937_64 crng(seed);                 // deterministic replica of the python nondeterministic draw
-        for (int i = 0; i < Kc; ++i) {              // partial Fisher-Yates: Kc distinct indices
-            std::uniform_int_distribution<int> D(i, N - 1);
-            std::swap(pre_idx[i], pre_idx[D(crng)]);
-        }
+        if (seed != 0) { printf("[STAGE R4] FAIL: exact native condition sampling requires seed=0\n"); return 1; }
+        std::vector<int> pre_idx = rig::numpy_choice_seed0_without_replacement(N, Kc);
+        if ((int)pre_idx.size() != Kc) { printf("[STAGE R4] FAIL: native NumPy choice failed\n"); return 1; }
         std::vector<float> pre_pts((size_t)Kc * 3), pre_nrm((size_t)Kc * 3);
         for (int i = 0; i < Kc; ++i)
             for (int k = 0; k < 3; ++k) {
@@ -660,7 +856,7 @@ int main(int argc, char** argv) {
         n_cond_skin = Q;
         cond_lat.resize((size_t)scfg.latent * Q);   // ggml [512, Q] read back row-major == [Q, 512]
         ggml_backend_tensor_get(cl, cond_lat.data(), 0, cond_lat.size() * sizeof(float));
-        printf("[STAGE R4] cond_latents (REAL, computed): [%d,%d]; cond-query=choice(%d,%d)->fps->%d (start 0)\n",
+        printf("[STAGE R4] cond_latents (REAL, computed): [%d,%d]; cond-query=NumPy-PCG64-choice(%d,%d)->fps->%d (start 0)\n",
                n_cond_skin, scfg.latent, N, Kc, Q);
 
         // sanity cosine vs banked giraffe cond_latents (high ~>0.99 ONLY for the giraffe; a NEW mesh

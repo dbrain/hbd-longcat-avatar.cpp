@@ -7,7 +7,9 @@
 # This is deliberately independent of native_image_to_rig.sh so an eye-test
 # artifact or a copied delivery can be checked later. It validates the exact
 # companions a production native bake must retain: atlas, phase log, live/final
-# status, texture sampling QC, and the position-welded topology invariant.
+# status, texture sampling QC, and the position-welded topology invariant. It
+# also proves the external audit atlas is the byte-identical PNG embedded by
+# the GLB, so a stale sidecar cannot make a different exported material pass.
 #
 # Schema-3 QC also measures how much the final encoded atlas changed the
 # decoded native PBR material. A bake can have no holes but still be washed out
@@ -38,6 +40,18 @@ QC="${GLB}.texture-qc.txt"
 for sidecar in "$ATLAS" "$STATUS" "$STAGE" "$QC"; do
   [[ -s "$sidecar" ]] || { echo "missing required native sidecar: $sidecar" >&2; exit 1; }
 done
+
+EXTRACTOR="$CP/glb_reader_test"
+[[ -x "$EXTRACTOR" ]] || { echo "missing GLB baseColor extractor: $EXTRACTOR" >&2; exit 1; }
+EMBEDDED_ATLAS="$(mktemp "${TMPDIR:-/tmp}/native-texture-atlas.XXXXXX.png")"
+cleanup_embedded_atlas() { rm -f "$EMBEDDED_ATLAS"; }
+trap cleanup_embedded_atlas EXIT
+"$EXTRACTOR" "$GLB" --extract-basecolor "$EMBEDDED_ATLAS" >/dev/null
+ATLAS_SHA256="$(sha256sum "$ATLAS" | awk '{print $1}')"
+EMBEDDED_ATLAS_SHA256="$(sha256sum "$EMBEDDED_ATLAS" | awk '{print $1}')"
+[[ "$ATLAS_SHA256" == "$EMBEDDED_ATLAS_SHA256" ]] || {
+  echo "REJECT: sidecar atlas does not match the PNG embedded by the GLB: $ATLAS" >&2; exit 1;
+}
 
 TOPO="$($CP/mesh_topo "$GLB")" || { echo "could not inspect topology: $GLB" >&2; exit 1; }
 [[ "$TOPO" =~ open=([0-9]+) ]] || { echo "topology report lacks open-edge count: $GLB" >&2; exit 1; }
@@ -85,7 +99,7 @@ case "$EXPECTED_EXECUTION" in
 esac
 
 printf 'VERIFIED native texture asset\n'
-printf 'glb=%s\natlas=%s\ntopology=%s\n' "$GLB" "$ATLAS" "$TOPO"
+printf 'glb=%s\natlas=%s\natlas_sha256=%s\ntopology=%s\n' "$GLB" "$ATLAS" "$ATLAS_SHA256" "$TOPO"
 printf 'sampling_verdict=%s\nsource_missing_fraction_before_repair=%s\n' \
   "$(qc_value sampling_verdict)" "$(qc_value source_missing_fraction_before_repair)"
 printf 'final_atlas_recovery=texels=%s mae_linear=%s psnr_db=%s (gate: mae<=%s psnr>=%s)\n' \

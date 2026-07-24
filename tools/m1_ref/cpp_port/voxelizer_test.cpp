@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -43,6 +44,29 @@ static Npy npy_load(const std::string& path) {
 
 static int64_t key3(int32_t x,int32_t y,int32_t z){ return vox::cell_key(x,y,z); }
 
+// Keep the set/feature comparison auditable: when a full fixture disagrees,
+// this optional dump lets an external NumPy comparator inspect the exact
+// native cells rather than trying to infer them from aggregate percentages.
+static void dump_npy(const std::string& path, const char* descr,
+                     size_t rows, size_t cols, const void* data, size_t bytes) {
+    std::string hdr = std::string("{'descr': '") + descr +
+        "', 'fortran_order': False, 'shape': (" + std::to_string(rows) +
+        ", " + std::to_string(cols) + "), }";
+    const size_t preamble = 10; // magic + v1.0 version + uint16 header length
+    const size_t padded = ((preamble + hdr.size() + 1 + 15) / 16) * 16;
+    hdr.append(padded - preamble - hdr.size() - 1, ' ');
+    hdr.push_back('\n');
+    if (hdr.size() > 65535) { std::fprintf(stderr, "npy header too large\n"); std::exit(1); }
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); std::exit(1); }
+    const char magic[] = {'\x93','N','U','M','P','Y',1,0};
+    const uint16_t hlen = (uint16_t)hdr.size();
+    f.write(magic, sizeof(magic)); f.write((const char*)&hlen, sizeof(hlen));
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    f.write((const char*)data, (std::streamsize)bytes);
+    if (!f) { std::fprintf(stderr, "short write %s\n", path.c_str()); std::exit(1); }
+}
+
 int main(int argc, char** argv) {
     std::string gdir = argc>1 ? argv[1] : "/mnt/hdd/pixal3d_tex/golden_voxel";
     int grid = argc>2 ? atoi(argv[2]) : 1024;
@@ -60,9 +84,27 @@ int main(int argc, char** argv) {
     float amn[3]={-0.5f,-0.5f,-0.5f}, amx[3]={0.5f,0.5f,0.5f};
     vox::VoxelOut o = vox::mesh_to_flexible_dual_grid(verts,V,faces.data(),F,gs,amn,amx,1.0f,0.2f,1e-2f);
     printf("C++ voxelizer N=%d\n",o.N);
+    if (const char* out = std::getenv("VOX_DUMP_DIR")) {
+        const std::string root(out);
+        dump_npy(root + "/native_voxel_coords.npy", "<i4", (size_t)o.N, 3,
+                 o.coords.data(), o.coords.size() * sizeof(int32_t));
+        dump_npy(root + "/native_voxel_dual_local.npy", "<f4", (size_t)o.N, 3,
+                 o.dual.data(), o.dual.size() * sizeof(float));
+        dump_npy(root + "/native_voxel_intersected.npy", "|i1", (size_t)o.N, 3,
+                 o.intersected.data(), o.intersected.size() * sizeof(int8_t));
+        std::printf("wrote native voxel dump: %s\n", root.c_str());
+    }
 
     // load golden
     Npy gc=npy_load(gdir+"/coords.npy"), gd=npy_load(gdir+"/dual_vertices.npy"), gi=npy_load(gdir+"/intersected.npy");
+    // Historical local captures stored [x,y,z]; the official encoder boundary
+    // stores [batch,x,y,z].  Treat both as the same spatial fixture rather
+    // than accidentally comparing batch/x/y against x/y/z.
+    if (gc.shape.size()!=2 || (gc.shape[1]!=3 && gc.shape[1]!=4)) {
+        std::fprintf(stderr, "golden coords must be [N,3] or [N,4], got rank=%zu width=%zu\n",
+                     gc.shape.size(), gc.shape.size()>1 ? gc.shape[1] : 0); return 1;
+    }
+    const int gc_stride=(int)gc.shape[1], gc_xyz=gc_stride-3;
     int M=(int)gc.shape[0];
     const int32_t* gco=(const int32_t*)gc.raw.data();
     const float*   gdu=(const float*)gd.raw.data();
@@ -72,7 +114,8 @@ int main(int argc, char** argv) {
     // optional per-cell dump: env DUMPN dumps first N matched cells (ours vs golden)
     // golden map
     std::unordered_map<int64_t,int> gmap; gmap.reserve((size_t)M*2);
-    for(int i=0;i<M;i++) gmap.emplace(key3(gco[i*3],gco[i*3+1],gco[i*3+2]),i);
+    auto gcoord = [&](int i, int a) -> int32_t { return gco[(size_t)i*gc_stride+gc_xyz+a]; };
+    for(int i=0;i<M;i++) gmap.emplace(key3(gcoord(i,0),gcoord(i,1),gcoord(i,2)),i);
     // ours map
     std::unordered_map<int64_t,int> omap; omap.reserve((size_t)o.N*2);
     for(int i=0;i<o.N;i++) omap.emplace(key3(o.coords[i*3],o.coords[i*3+1],o.coords[i*3+2]),i);
@@ -94,7 +137,7 @@ int main(int argc, char** argv) {
         int gj=it->second;
         for(int a=0;a<3;a++){
             // golden dual is the GLOBAL normalized coord (coord+offset)/grid; recover in-cell offset.
-            double goff = (double)gdu[(size_t)gj*3+a]*grid - (double)gco[gj*3+a];
+            double goff = (double)gdu[(size_t)gj*3+a]*grid - (double)gcoord(gj,a);
             double e=std::fabs((double)o.dual[(size_t)i*3+a]-goff);
             dmax=std::max(dmax,e); dsum+=e; dn++;
             itot++; if(o.intersected[(size_t)i*3+a]==gin[(size_t)gj*3+a]) iagree++;
@@ -116,7 +159,7 @@ int main(int argc, char** argv) {
         for(int dz=-1;dz<=1;dz++) for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
             long hit=0;
             for(int j=0;j<M;j++) if(gin[j*3+a]) {
-                auto it=omap.find(key3(gco[j*3]+dx,gco[j*3+1]+dy,gco[j*3+2]+dz));
+                auto it=omap.find(key3(gcoord(j,0)+dx,gcoord(j,1)+dy,gcoord(j,2)+dz));
                 if(it!=omap.end() && o.intersected[it->second*3+a]) hit++;
             }
             if(hit>best){best=hit;bx=dx;by=dy;bz=dz;}
@@ -129,7 +172,7 @@ int main(int argc, char** argv) {
             printf("cell(%d,%d,%d) ours dual[%.4f %.4f %.4f] golden[%.4f %.4f %.4f] | ours int[%d%d%d] gold[%d%d%d]\n",
                 o.coords[i*3],o.coords[i*3+1],o.coords[i*3+2],
                 o.dual[i*3],o.dual[i*3+1],o.dual[i*3+2],
-                gdu[gj*3]*grid-gco[gj*3], gdu[gj*3+1]*grid-gco[gj*3+1], gdu[gj*3+2]*grid-gco[gj*3+2],
+                gdu[gj*3]*grid-gcoord(gj,0), gdu[gj*3+1]*grid-gcoord(gj,1), gdu[gj*3+2]*grid-gcoord(gj,2),
                 o.intersected[i*3],o.intersected[i*3+1],o.intersected[i*3+2], gin[gj*3],gin[gj*3+1],gin[gj*3+2]);
             shown++; } }
 

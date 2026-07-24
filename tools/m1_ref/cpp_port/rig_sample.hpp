@@ -355,20 +355,31 @@ inline std::vector<float> rig_teacher_force_logits(M1Harness& H, const Qwen3Cfg&
     ggml_cgraph* gf = new_graph(cctx, 32768);
     ggml_build_forward_expand(gf, logits);
 
-    H.wbuf = ggml_backend_alloc_ctx_tensors(H.ctx_w, H.backend);
-    for (auto& gu : H.gguf_uploads) ggml_backend_tensor_set(gu.first, gu.second, 0, ggml_nbytes(gu.first));
-    for (auto& u : H.uploads) { NpyArray a = npy_load(u.second); ggml_backend_tensor_set(u.first, a.raw.data(), 0, (size_t)a.numel() * 4); }
-
-    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(H.backend));
-    if (!ggml_gallocr_alloc_graph(ga, gf)) { ggml_gallocr_free(ga); ggml_free(cctx); throw std::runtime_error("tf: alloc failed"); }
+    // Use the harness allocator for the teacher-forced graph as well.  The
+    // prior hand-rolled allocation only placed weights and gallocr temporaries;
+    // a graph input may remain bufferless when CUDA's allocator prunes it from
+    // the liveness plan, then ggml_backend_tensor_set() aborts below.  The
+    // harness owns the persistent weights and its graph allocator follows the
+    // same input-allocation contract as the regular decode path.
+    H.alloc_and_upload(gf);
+    auto require_buffer = [](const char* name, ggml_tensor* t) {
+        if (!t->buffer) throw std::runtime_error(std::string("tf: bufferless tensor: ") + name);
+    };
+    require_buffer("input", inp);
+    require_buffer("cos", cosT);
+    require_buffer("sin", sinT);
     ggml_backend_tensor_set(inp,  prefix.data(), 0, (size_t)L * hidden * sizeof(float));
     ggml_backend_tensor_set(cosT, cosb.data(),  0, cosb.size() * sizeof(float));
     ggml_backend_tensor_set(sinT, sinb.data(),  0, sinb.size() * sizeof(float));
-    ggml_backend_tensor_set(maskT, maskb.data(), 0, maskb.size() * sizeof(float));
+    // The operation-local Qwen FA2 prefill owns causality and prunes this
+    // generic dense mask from the graph.  Upload it only when a non-FA2 graph
+    // retained the tensor.
+    if (maskT->buffer)
+        ggml_backend_tensor_set(maskT, maskb.data(), 0, maskb.size() * sizeof(float));
     ggml_backend_graph_compute(H.backend, gf);
     std::vector<float> out((size_t)L * V);
     ggml_backend_tensor_get(logits, out.data(), 0, (size_t)L * V * sizeof(float));
-    ggml_gallocr_free(ga); ggml_free(cctx);
+    ggml_free(cctx);
     return out;   // out[col*V + v]
 }
 

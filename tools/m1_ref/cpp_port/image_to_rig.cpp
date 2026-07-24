@@ -82,8 +82,11 @@ static void usage() {
            "        [--us-octree N] [--us-latents N] [--us-steps N] [--us-guidance F] [--us-chunk N]\n"
            "        [--us-gguf <dir>] [--us-dit-w <dir>] [--us-vae-w <dir>] [--us-cnd-w <dir>] [--us-meta <npy>]\n"
            "        [--stage-dir <dir>]   (emit coarse/refined/decimated GLB intermediates + resume caches)\n"
+           "        [--image-model-ready] (diagnostic only: input already is Pixal's final square/black frame;\n"
+           "                          bypass native alpha/crop framing to isolate downstream geometry)\n"
            "        [--from-refined <dir>] (resume: skip geometry+refine, load refined.glb + PBR cache)\n"
            "        [--geometry-only]      (write the clean refined geometry cache; skip legacy PBR/atlas/rig)\n"
+           "        [--material-cache-only] (write clean refined geometry + native Pixal PBR cache; skip atlas/rig)\n"
            "        [--tex-dit proj|cross] [--tex-dit-w <dir>]\n"
            "                         (WHICH generative tex DiT paints the PBR volume. cross = DEFAULT =\n"
            "                          trellis2_tex_1024 (TRELLIS-2 texturing model, full 4101-token DINOv3\n"
@@ -159,6 +162,12 @@ static void bbox_canon_onto(std::vector<float>& v, const std::vector<float>& ref
 }
 
 int main(int argc, char** argv) {
+    // A production run can spend many minutes in M4/UltraShape.  When stdout is
+    // redirected to the per-candidate run log, libc otherwise fully buffers
+    // stage lines and leaves the operator unable to tell a live decode from a
+    // dead process.  Preserve every existing message, but make newline-delimited
+    // progress authoritative in the log.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     // Correctness-first: fp32 matmul accumulation, no TF32 (TF32's ~1e-2 noise flips occupancy-threshold
     // voxels). overwrite=0 so a caller CAN relax it (export NVIDIA_TF32_OVERRIDE=1) for the perf A/B --
     // pixal3d.cpp:67's sibling comment already says "perf phase relaxes". Default stays 0.
@@ -173,12 +182,12 @@ int main(int argc, char** argv) {
     setenv("USR_DIT_FLASH",    "1",    0);
     setenv("USR_DECODE_FLASH", "1",    0);
     setenv("USR_MOE_CHUNK",    "8192", 0);
-    //  - USR_GEO_FLASH=1: flash the GEOMETRY DiTs' self-attn (M3b slat + tex-proj + tex-cross), same deal
-    //    as USR_DIT_FLASH but for the pixal3d geo stages. M3b 280->192s, tex 160->111s (-138s, 31%), peak
-    //    4.3GB. Effectively lossless: coarse.glb A/B adds only ~0.016% chamfer OVER the geo DiTs' own
-    //    ~0.08% run-to-run nondeterminism floor (f16 Q/K/V, GGML_PREC_F32 accum; lin/FFN/MoE stay fp32).
-    //    `USR_GEO_FLASH=0` restores the fp32 dense-tiled path.
-    setenv("USR_GEO_FLASH",    "1",    0);
+    //  - USR_GEO_FLASH=1 enables F16-Q/K/V flash attention for the geometry DiTs (M3b slat + texture).
+    //    It is a throughput option only.  The frozen M3b contract on the RTX 3060 measures mean error
+    //    1.129e-2 versus Python FP32 with flash, compared with 1.991e-3 for dense F32; that divergence
+    //    is large enough to alter face/clothing geometry.  High-quality production therefore defaults
+    //    to dense F32.  Set =1 deliberately for a performance-only run and label it as such.
+    setenv("USR_GEO_FLASH",    "0",    0);
     std::string model, image, out;
     std::string r1w     = "/home/dbrain/models/3d/rig/r1w_real";
     std::string qwen3_w = "/home/dbrain/models/3d/rig/qwen3_w";
@@ -208,6 +217,7 @@ int main(int argc, char** argv) {
     std::string dump_geo, from_geo;
     bool no_rig = false;
     bool geometry_only = false;
+    bool material_cache_only = false;
     uint64_t rig_seed = 0;
     // Standard bone naming (ON by default -- an anonymous bone_N rig cannot take a Mixamo or
     // AMASS clip without a human hand-mapping it, which is the whole point of rigging).
@@ -286,6 +296,7 @@ int main(int argc, char** argv) {
     // for the eye-test page AND the .bin caches to resume. --from-refined <dir> skips geometry+refine
     // (loads refined.glb + the cached PBR volume). --from-geo (below) skips only the geometry diffusion.
     std::string stage_dir, from_refined;
+    bool image_model_ready = false;  // diagnostic only; production always owns the framing contract.
     pix::ChainInput in;
 
     auto nextf = [&](int& i){ return (float)std::atof(argv[++i]); };
@@ -340,6 +351,7 @@ int main(int argc, char** argv) {
         else if (a == "--us-cnd-w" && i+1 < argc) uscfg.cnd_w = argv[++i];
         else if (a == "--us-meta" && i+1 < argc) uscfg.meta = argv[++i];
         else if (a == "--stage-dir" && i+1 < argc) stage_dir = argv[++i];
+        else if (a == "--image-model-ready") image_model_ready = true;
         else if (a == "--from-refined" && i+1 < argc) from_refined = argv[++i];
         else if (a == "--tex-snap-volume") tex_snap_volume = true;
         else if (a == "--tex-volume-direct") tex_volume_direct = true;
@@ -386,13 +398,15 @@ int main(int argc, char** argv) {
         else if (a == "--from-geo" && i+1 < argc) from_geo = argv[++i];
         else if (a == "--no-rig") no_rig = true;
         else if (a == "--geometry-only") geometry_only = true;
+        else if (a == "--material-cache-only") material_cache_only = true;
         // geometry sampler knobs (forwarded to ChainInput; defaults already = inference.py)
         else if (a == "--guidance" && i+1 < argc) { float g=nextf(i); in.ss.guidance=g; in.shape.guidance=g; }
         else if (a == "--steps" && i+1 < argc) { int s=std::atoi(argv[++i]); in.ss.steps=in.shape.steps=in.tex.steps=s; }
         else { printf("unknown/incomplete arg: %s\n", a.c_str()); usage(); return 1; }
     }
     if (model.empty() || image.empty() || out.empty()) { usage(); return 1; }
-    if (geometry_only && stage_dir.empty()) { printf("--geometry-only requires --stage-dir\n"); return 1; }
+    if ((geometry_only || material_cache_only) && stage_dir.empty()) { printf("--geometry-only/--material-cache-only requires --stage-dir\n"); return 1; }
+    if (geometry_only && material_cache_only) { printf("--geometry-only and --material-cache-only are mutually exclusive\n"); return 1; }
     if (fast) { setenv("PIXAL3D_FAST", "1", 1); setenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F", "1", 1); }
 
     printf("==== image_to_rig (inline native image -> textured+rigged GLB) ====\n");
@@ -400,6 +414,8 @@ int main(int argc, char** argv) {
            model.c_str(), image.c_str(), out.c_str(), cam, dist, ms, use_cuda ? "cuda" : "cpu");
     if (geometry_only) {
         printf("  geometry-only=yes (legacy PBR material, UV bake, and rig are skipped)\n");
+    } else if (material_cache_only) {
+        printf("  material-cache-only=yes (native Pixal PBR volume retained; UV bake and rig are skipped)\n");
     } else {
         printf("  tex-dit=%s%s%s\n", in.tex_proj ? "proj (slat_flow_imgshape2tex_1024)" : "cross (trellis2_tex_1024)",
                in.tex_flow_w.empty() ? "" : " w=", in.tex_flow_w.c_str());
@@ -441,8 +457,8 @@ int main(int argc, char** argv) {
     // ---------- [1/4] geometry + texture (in-process, GPU) ----------
     setenv("PIXAL3D_GGUF_DIR", model.c_str(), 1);
     try {
-        in.img512_raw  = imgio::load_chw(image, 512);
-        in.img1024_raw = imgio::load_chw(image, 1024);
+        in.img512_raw  = image_model_ready ? imgio::load_chw(image, 512) : imgio::load_pixal_matte_chw(image, 512);
+        in.img1024_raw = image_model_ready ? imgio::load_chw(image, 1024) : imgio::load_pixal_matte_chw(image, 1024);
     } catch (const std::exception& e) { printf("image load failed: %s\n", e.what()); return 1; }
     in.cam = cam; in.dist = dist; in.ms = ms; in.use_cuda = use_cuda; in.verbose = true;
     // Keep the established M4 mesh-decode layout (including its auxiliary subdivision output) exactly
@@ -533,6 +549,11 @@ int main(int argc, char** argv) {
         mkdir(stage_dir.c_str(), 0755);
         if (glb::write_glb((stage_dir + "/coarse.glb").c_str(), mesh.verts, mesh.faces))
             printf("  [stage] wrote %s/coarse.glb (%d v / %d f)\n", stage_dir.c_str(), mesh.N, mesh.F);
+        // The PBR voxel coords are indices on the grid-`in.resolution` lattice, so the lattice scale
+        // has to be staged with the volume for any consumer (--from-refined resume, the CPU texture
+        // rebake) to sample it in the right coordinate space.  Tag it here rather than only on the
+        // refine path so a --no-refine stage cache is never left untagged.
+        sv_i32(stage_dir + "/resolution.bin", (int32_t)in.resolution);
     }
 
     // ---------- [1a/4] UltraShape refine (native, in-process): clean/watertight ~7.5x densify ----------
@@ -548,6 +569,23 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) { printf("FAIL: UltraShape refine: %s\n", e.what()); return 1; }
         // re-canonicalize the ±1 UltraShape mesh onto the coarse-mesh bbox so the PBR volume bakes onto it.
         bbox_canon_onto(refined.verts, coarse_ref);
+        // The refinement kernel already removes bit-identical vertices in its ±1
+        // frame.  Re-canonicalising to the Pixal frame is another float transform,
+        // though, and can make two formerly distinct endpoints collapse when the
+        // GLB's f32 positions are written.  Repeat the exact-only cleanup *after*
+        // that final coordinate transform so the staged delivery mesh itself, not
+        // merely the internal UltraShape mesh, is the topology contract.
+        {
+            const mesh_exact_clean::Report clean = mesh_exact_clean::clean(refined.verts, refined.faces);
+            refined.N = (int)(refined.verts.size() / 3);
+            refined.F = (int)(refined.faces.size() / 3);
+            if (clean.welded_vertices || clean.dropped_degenerate_faces || clean.dropped_duplicate_faces)
+                printf("  [1a/4] final-frame exact cleanup: V %lld->%lld (welded %lld), F %lld->%lld (degenerate %lld, duplicate %lld)\n",
+                       (long long)clean.input_vertices, (long long)clean.output_vertices,
+                       (long long)clean.welded_vertices, (long long)clean.input_faces,
+                       (long long)clean.output_faces, (long long)clean.dropped_degenerate_faces,
+                       (long long)clean.dropped_duplicate_faces);
+        }
         mesh = std::move(refined);
         printf("  [1a/4] UltraShape refine: -> %d v / %d f  (%.1fs)\n", mesh.N, mesh.F, pix::now_s() - t_ref);
         // stage-dir: emit refined.glb + cache the PBR volume + resolution for --from-refined resume.
@@ -562,14 +600,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (geometry_only) {
+    if (geometry_only || material_cache_only) {
         // The stage cache is the delivery boundary for the native texture runner.  No legacy UV bake,
         // PNG atlas, or skeleton is generated here, so those artefacts cannot be accidentally promoted.
         if (!did_refine_load && !refine) {
             glb::write_glb((stage_dir + "/refined.glb").c_str(), mesh.verts, mesh.faces);
         }
-        printf("==== DONE (--geometry-only) -> %s/refined.glb  (verts=%d faces=%d, %.1fs total) ====\n",
-               stage_dir.c_str(), mesh.N, mesh.F, pix::now_s() - t_geo);
+        printf("==== DONE (--%s) -> %s/refined.glb  (verts=%d faces=%d, %.1fs total) ====\n",
+               geometry_only ? "geometry-only" : "material-cache-only", stage_dir.c_str(), mesh.N, mesh.F, pix::now_s() - t_geo);
         return 0;
     }
 

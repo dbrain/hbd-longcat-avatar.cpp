@@ -17,6 +17,10 @@
 # All GPU work is deliberately bound to the physical RTX 3060 (PCI bus order).
 set -euo pipefail
 
+echo "image_to_rig_sane.sh is retired for production: it can publish a rig without the current real-R1/R4 and real-LBS gate evidence." >&2
+echo "Use native_image_to_rig.sh, which routes rig publication through rig_texture_chain.sh." >&2
+exit 64
+
 CP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_ROOT="${IMAGE_TO_RIG_OUT_ROOT:-/mnt/hdd/3d/avatar-shootout/_shootout_out/runbook_image_to_rig}"
 MODEL="${1:?model: miku, gilly, or soldier}"
@@ -43,19 +47,15 @@ case "$MODEL" in
 esac
 case "$LEVEL" in all|high|medium|low) ;; *) echo "unknown level '$LEVEL'" >&2; exit 2 ;; esac
 
-# CUDA normally enumerates by a fast-but-unstable order.  PCI order is stable here,
-# where index 0 is the 3060 and index 1 is the owner's busy 5060 Ti.
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=0
+# Select the reserved 3060 by UUID. Never let a device ordinal spill this
+# diagnostic path onto the owner's busy 5060 Ti.
+GPU_3060_UUID="${IMAGE_TO_RIG_GPU_3060_UUID:-$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | awk -F', ' '$2 ~ /RTX 3060/ {uuid=$1} END {print uuid}')}"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$GPU_3060_UUID" 2>/dev/null | head -1)"
+[[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: '$GPU_3060_UUID' is '$GPU_NAME', expected the reserved RTX 3060" >&2; exit 1; }
+export CUDA_VISIBLE_DEVICES="$GPU_3060_UUID"
 # The eye-tested seal eliminates the visibly ripply/sliced shell. Keep it explicit
 # in the runbook so a process environment cannot silently restore the legacy leak.
 export REMESH_CLOSE_R=3
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
-if [[ "$GPU_NAME" != *"RTX 3060"* ]]; then
-  echo "refusing to run: PCI GPU 0 is '$GPU_NAME', not the reserved RTX 3060" >&2
-  exit 1
-fi
-
 mkdir -p "$OUT_ROOT/$MODEL"
 OUT_DIR="$OUT_ROOT/$MODEL"
 ln -sfn "$IMAGE" "$OUT_DIR/input.png"

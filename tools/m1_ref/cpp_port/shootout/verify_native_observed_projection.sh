@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 # Read-only gate for a native-base observed-image texture candidate.
+# A one- to three-view candidate is a valid, explicitly unpromotable A/B: it
+# can improve observed detail while retaining native material in blind areas.
+# The 4--8-view / circular-coverage rule applies only when the caller asks to
+# validate a turntable promotion candidate.
 set -euo pipefail
 
 CP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GLB="${1:?usage: verify_native_observed_projection.sh <candidate.glb>}"
+shift
+REQUIRE_TURNAROUND=0
+if (( $# > 0 )); then
+  [[ "$1" == "--require-turnaround" && $# == 1 ]] || {
+    echo "usage: verify_native_observed_projection.sh <candidate.glb> [--require-turnaround]" >&2; exit 2;
+  }
+  REQUIRE_TURNAROUND=1
+fi
 BASE="${GLB%.glb}"
 SRC="${BASE}.projection-source.txt"
 QC="${BASE}.projection-qc.txt"
@@ -72,6 +84,27 @@ while IFS= read -r line; do
   [[ -s "$path" && "$(sha256sum "$path" | awk '{print $1}')" == "$expected" ]] || { echo "REJECT: view source changed: $path" >&2; exit 1; }
 done <"$SRC"
 (( VIEWS == CAMERAS )) || { echo "REJECT: expected $CAMERAS views, found $VIEWS" >&2; exit 1; }
+# A nominal four-camera set is not a turnaround if all yaws are clustered at
+# the front. The projection can only improve genuinely observed regions, so a
+# *promotion* requires every circular gap to be bounded. Ordinary 0/90/180/270
+# and 45-degree eight-view turntables pass; 0/10/20/30 does not. A one-front or
+# front/back A/B deliberately does not meet this bar, but remains useful and
+# valid as long as its blind texels retain the native generated base.
+MAX_YAW_GAP="$(sed -n 's/^view yaw=\([^ ]*\).*/\1/p' "$SRC" | LC_ALL=C sort -n | awk '
+  NR==1 { first=$1; prev=$1; next }
+  { gap=$1-prev; if (gap>max) max=gap; prev=$1 }
+  END { if (NR) { gap=first+360-prev; if (gap>max) max=gap; printf "%.6f", max } }
+')"
+[[ "$MAX_YAW_GAP" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "REJECT: could not determine observed-view yaw coverage" >&2; exit 1; }
+MAX_ALLOWED_YAW_GAP="${NATIVE_OBSERVED_MAX_YAW_GAP_DEGREES:-135}"
+[[ "$MAX_ALLOWED_YAW_GAP" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "NATIVE_OBSERVED_MAX_YAW_GAP_DEGREES must be numeric" >&2; exit 2; }
+if (( REQUIRE_TURNAROUND )); then
+  (( CAMERAS >= 4 )) || { echo "REJECT: promotion needs a real 4--8-view turnaround, not $CAMERAS view(s)" >&2; exit 1; }
+  awk -v got="$MAX_YAW_GAP" -v max="$MAX_ALLOWED_YAW_GAP" 'BEGIN { exit !(got <= max) }' || {
+    echo "REJECT: observed yaw coverage has a ${MAX_YAW_GAP}° gap (> ${MAX_ALLOWED_YAW_GAP}°): use a real 4--8-view turnaround" >&2
+    exit 1
+  }
+fi
 MIN_VIEW="${NATIVE_OBSERVED_MIN_VIEW_COVERAGE_PCT:-0.5}"
 PAINTED=0
 while IFS= read -r pct; do
@@ -98,4 +131,5 @@ if [[ -n "$RIGGED_GLB" ]]; then
     echo "REJECT: rigged candidate score invalid: $RIG_SCORE" >&2; exit 1;
   }
 fi
-printf 'VERIFIED native observed projection candidate: views=%s native-base=%s telea=0 seam=%s/255\n' "$CAMERAS" "$NATIVE_BASE" "$SEAM"
+printf 'VERIFIED native observed projection candidate: views=%s max_yaw_gap=%sdeg turnaround_required=%s native-base=%s telea=0 seam=%s/255\n' \
+  "$CAMERAS" "$MAX_YAW_GAP" "$REQUIRE_TURNAROUND" "$NATIVE_BASE" "$SEAM"

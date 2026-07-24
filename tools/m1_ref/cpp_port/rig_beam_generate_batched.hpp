@@ -12,6 +12,7 @@
 #include "qwen3_batched.hpp"
 #include "rig_beam_generate.hpp"   // reuse ALL warper/grammar/log-softmax helpers + rig_vram_used_mib
 #include "rig_grammar.hpp"
+#include "rig_philox_race.hpp"
 #ifdef M1_USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -25,8 +26,40 @@
 #include <random>
 #include <stdexcept>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 
 namespace rig {
+
+// Diagnostic .npy writer for the Qwen shared-prefix trace.  Kept here rather
+// than in the production runner so ordinary generation has no file-system
+// work or graph taps unless RIG_QWEN_LAYER_TRACE is explicitly set.
+static inline void rig_write_f32_npy(const std::string& path, const float* data,
+                                     const std::vector<int64_t>& shape) {
+    std::string dims = "(";
+    for (int64_t d : shape) dims += std::to_string(d) + ",";
+    dims += ")";
+    std::string hdr = "{'descr': '<f4', 'fortran_order': False, 'shape': " + dims + ", }";
+    const size_t pad = (64 - ((10 + hdr.size() + 1) % 64)) % 64;
+    hdr.append(pad, ' ');
+    hdr.push_back('\n');
+    const uint16_t hlen = (uint16_t)hdr.size();
+    size_t n = 1;
+    for (int64_t d : shape) n *= (size_t)d;
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("cannot write Qwen layer trace: " + path);
+    out.write("\x93NUMPY", 6);
+    const char ver[2] = {1, 0}; out.write(ver, 2);
+    out.write(reinterpret_cast<const char*>(&hlen), sizeof(hlen));
+    out.write(hdr.data(), (std::streamsize)hdr.size());
+    out.write(reinterpret_cast<const char*>(data), (std::streamsize)(n * sizeof(float)));
+    if (!out) throw std::runtime_error("failed writing Qwen layer trace: " + path);
+}
+
+// The shared B=1 prefill is the established production route.  HF expands
+// the prefix to B rows first, but that graph is retained solely as an explicit
+// diagnostic comparison until it has its own end-to-end acceptance evidence.
+enum class PrefixPrefillMode { SharedB1, HfBatchedDiagnostic };
 
 inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& cfg,
                                                   const float* embed_table, const float* mesh_cond, int n_cond,
@@ -36,12 +69,42 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
                                                   float length_penalty = 1.0f, float repetition_penalty = 2.0f,
                                                   bool do_sample = true, float temperature = 1.0f,
                                                   int top_k = 5, float top_p = 0.95f,
-                                                  uint64_t seed = 0, bool verbose = true) {
+                                                  uint64_t seed = 0, bool verbose = true,
+                                                  std::vector<RigHyp>* finished_out = nullptr,
+                                                  PrefixPrefillMode prefix_prefill = PrefixPrefillMode::SharedB1) {
     const int hidden = cfg.hidden, hd = cfg.head_dim, V = cfg.vocab;
     const int P = n_cond + (int)start_tokens.size();
     const int suffix_max = max_new_tokens + 4;
-    std::mt19937_64 rng(seed);
+    // PyTorch's CUDA multinomial(replacement=false) consumes one full
+    // exponential Philox race over the flattened [B,V] distribution each
+    // iteration.  This is intentionally not the mt19937 CDF sampler used by
+    // the historical sequential port.
+    uint64_t philox_offset = 0;
     auto embed_row = [&](int tok) -> const float* { return embed_table + (size_t)tok * hidden; };
+    auto philox_race_topk = [&](const std::vector<float>& scores, int want) {
+        std::vector<float> expo(scores.size());
+        if (!rig_torch_philox_exponentials(expo, seed, &philox_offset))
+            throw std::runtime_error("CUDA Philox exponential race failed");
+        float mx = -std::numeric_limits<float>::infinity();
+        for (float v : scores) if (std::isfinite(v)) mx = std::max(mx, v);
+        struct Race { float key; int index; };
+        std::vector<Race> race; race.reserve(scores.size());
+        for (size_t i = 0; i < scores.size(); ++i) {
+            // p/q top-k is PyTorch's native without-replacement algorithm.
+            // The softmax denominator cancels, so exp(score-max)/q suffices.
+            // ATen forms p/q.  A masked -inf score has p=0 and therefore a
+            // zero race key, rather than -inf.  Those zero-probability draws
+            // fill the B-wide inactive slots and preserve HF tie behaviour.
+            const float key = std::isfinite(scores[i]) ? expf(scores[i] - mx) / expo[i] : 0.0f;
+            race.push_back({key, (int)i});
+        }
+        want = std::min(want, (int)race.size());
+        std::partial_sort(race.begin(), race.begin() + want, race.end(),
+                          [](const Race& a, const Race& b) { return a.key > b.key; });
+        std::vector<int> out; out.reserve(want);
+        for (int i = 0; i < want; ++i) out.push_back(race[i].index);
+        return out;
+    };
 
     // ---- shared prefix cache + ONE batched suffix cache + a 1-column temp (single-buffer in-place
     //      reorder: the 2nd full double-buffer was pure write-safety overhead ~= one suffix cache; an
@@ -60,52 +123,298 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
     if (verbose) printf("[rig_beam_b] VRAM after pool alloc (1 batched suffix @ %dx%d + 1 temp col + shared prefix @ %d): %.0f MiB\n",
                         suffix_max, num_beams, P, vram_peak);
 
-    // ============================ PREFILL the shared prefix cache (sequential, L=P) ============
+    // ============================ PREFILL the prefix cache =========================================
+    // Transformers expands inputs_embeds to num_beams BEFORE its first BF16
+    // forward.  Do the same here: a B=1 prefill followed by cache repetition
+    // has different tensor-core/attention numerics and therefore can change
+    // the very first Philox race.  The B prefix rows are identical, so after
+    // the graph completes we retain only column zero in the shared 3-D cache
+    // used by the existing suffix decoder.
     std::vector<float> prefix_embeds; prefix_embeds.reserve((size_t)P * hidden);
     prefix_embeds.insert(prefix_embeds.end(), mesh_cond, mesh_cond + (size_t)n_cond * hidden);
     for (int t : start_tokens) { const float* r = embed_row(t); prefix_embeds.insert(prefix_embeds.end(), r, r + hidden); }
     std::vector<float> prefix_logits;
-    {
+    const char* layer_trace_env = std::getenv("RIG_QWEN_LAYER_TRACE");
+    const bool trace_prefix = layer_trace_env && layer_trace_env[0] != '\0' && layer_trace_env[0] != '0';
+    const bool trace_layer0_only = std::getenv("RIG_QWEN_LAYER_TRACE_LAYER0_ONLY") != nullptr;
+    const bool trace_shared_b1 = trace_prefix && prefix_prefill == PrefixPrefillMode::SharedB1;
+    const std::string layer_trace_dir = trace_prefix ? layer_trace_env : "";
+    Qwen3Subtrace subtrace;
+    if (const char* dir = Qwen3Subtrace::env_dir()) {
+        if (prefix_prefill == PrefixPrefillMode::SharedB1) subtrace.dir = dir;
+        else if (verbose) printf("[rig_beam_b] RIG_QWEN3_SUBTRACE_DIR is shared-b1-only; skipping hf-batched-diag\n");
+    }
+    if (prefix_prefill == PrefixPrefillMode::HfBatchedDiagnostic) {
         std::vector<float> cosb, sinb; beam_rope_tables(cfg, 0, P, cosb, sinb);
         std::vector<float> maskb((size_t)P * P, 0.f);
         for (int q = 0; q < P; q++) for (int k = 0; k < P; k++) maskb[(size_t)q * P + k] = (k <= q) ? 0.0f : -INFINITY;
         ggml_init_params ip{ (size_t)512 * 1024 * 1024, nullptr, true };
         ggml_context* cctx = ggml_init(ip);
-        int64_t ine[4] = { hidden, P, 1, 1 }; ggml_tensor* inp = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, ine);
+        // A short-lived [hd,nkv,P,B] cache receives every expanded prefix
+        // row.  It is released before suffix caches are used; only col 0 is
+        // copied into `pre` below.
+        Qwen3KvCacheBatched pre_batched; pre_batched.init(H, cfg, P, num_beams);
+        int64_t ine[4] = { hidden, P, num_beams, 1 }; ggml_tensor* inp = ggml_new_tensor(cctx, GGML_TYPE_F32, 3, ine);
         ggml_set_input(inp);
+        int64_t cne[4] = { hd, P, num_beams, 1 };
+        ggml_tensor* cosT = ggml_new_tensor(cctx, GGML_TYPE_F32, 3, cne); ggml_set_input(cosT);
+        ggml_tensor* sinT = ggml_new_tensor(cctx, GGML_TYPE_F32, 3, cne); ggml_set_input(sinT);
+        ggml_tensor* cos3 = ggml_reshape_4d(cctx, cosT, hd, 1, P, num_beams);
+        ggml_tensor* sin3 = ggml_reshape_4d(cctx, sinT, hd, 1, P, num_beams);
+        int64_t mne[4] = { P, P, 1, 1 }; ggml_tensor* maskT = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, mne); ggml_set_input(maskT);
+        std::vector<ggml_tensor*> writes;
+        std::vector<ggml_tensor*> layer_last_taps;
+        std::vector<ggml_tensor*> attn_last_taps;
+        std::vector<ggml_tensor*> post_attn_last_taps;
+        std::vector<ggml_tensor*> mlp_last_taps;
+        std::vector<ggml_tensor*> gate_last_taps;
+        std::vector<ggml_tensor*> up_last_taps;
+        std::vector<ggml_tensor*> swiglu_last_taps;
+        std::vector<ggml_tensor*> mlp_input_last_taps;
+        ggml_tensor* input_last_tap = nullptr;
+        if (trace_prefix) {
+            input_last_tap = ggml_view_3d(cctx, inp, hidden, 1, 1,
+                                          inp->nb[1], inp->nb[2], (size_t)(P - 1) * inp->nb[1]);
+        }
+        ggml_tensor* logits = build_qwen3_prefill_batched(H, cctx, cfg, pre_batched,
+                                                           inp, cos3, sin3, P, num_beams, maskT, writes,
+                                                           trace_prefix ? &layer_last_taps : nullptr,
+                                                           trace_prefix ? &attn_last_taps : nullptr,
+                                                           trace_prefix ? &post_attn_last_taps : nullptr,
+                                                           trace_prefix ? &mlp_last_taps : nullptr,
+                                                           trace_prefix ? &gate_last_taps : nullptr,
+                                                           trace_prefix ? &up_last_taps : nullptr,
+                                                           trace_prefix ? &swiglu_last_taps : nullptr,
+                                                           trace_prefix ? &mlp_input_last_taps : nullptr);
+        ggml_set_output(logits);
+        ggml_cgraph* gf = new_graph(cctx, 32768);
+        ggml_build_forward_expand(gf, logits);
+        for (ggml_tensor* w : writes) ggml_build_forward_expand(gf, w);
+        if (input_last_tap) ggml_build_forward_expand(gf, input_last_tap);
+        for (ggml_tensor* tap : layer_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : attn_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : post_attn_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : mlp_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : gate_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : up_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : swiglu_last_taps) ggml_build_forward_expand(gf, tap);
+        for (ggml_tensor* tap : mlp_input_last_taps) ggml_build_forward_expand(gf, tap);
+        if (!weights_ready) { upload_weights_maybe_f16(H); weights_ready = true; }
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(H.backend));
+        if (!ggml_gallocr_alloc_graph(ga, gf)) { ggml_gallocr_free(ga); ggml_free(cctx); throw std::runtime_error("batched prefill gallocr failed"); }
+        if (!inp->buffer || !cosT->buffer || !sinT->buffer)
+            throw std::runtime_error("batched prefill gallocr did not allocate an input tensor");
+        std::vector<float> expanded_prefix((size_t)num_beams * P * hidden);
+        std::vector<float> expanded_cos((size_t)num_beams * hd * P), expanded_sin((size_t)num_beams * hd * P);
+        for (int b = 0; b < num_beams; ++b) {
+            std::copy(prefix_embeds.begin(), prefix_embeds.end(), expanded_prefix.begin() + (size_t)b * P * hidden);
+            std::copy(cosb.begin(), cosb.end(), expanded_cos.begin() + (size_t)b * hd * P);
+            std::copy(sinb.begin(), sinb.end(), expanded_sin.begin() + (size_t)b * hd * P);
+        }
+        ggml_backend_tensor_set(inp, expanded_prefix.data(), 0, expanded_prefix.size() * sizeof(float));
+        ggml_backend_tensor_set(cosT, expanded_cos.data(), 0, expanded_cos.size() * sizeof(float));
+        ggml_backend_tensor_set(sinT, expanded_sin.data(), 0, expanded_sin.size() * sizeof(float));
+        // The operation-local causal-Qwen FA2 prefill does not consume the
+        // generic additive mask, so gallocr deliberately has no buffer for
+        // it.  It supports both BF16 and F32 cache storage at this point.
+        const bool qwen_fa2_prefill =
+            cfg.head_dim == 128 && cfg.n_heads == 16 && cfg.n_kv == 8;
+        if (!qwen_fa2_prefill) {
+            if (!maskT->buffer) throw std::runtime_error("batched prefill missing additive-mask buffer");
+            ggml_backend_tensor_set(maskT, maskb.data(), 0, maskb.size() * sizeof(float));
+        }
+        ggml_backend_graph_compute(H.backend, gf);
+        vram_bump();
+        prefix_logits.resize(V);
+        ggml_backend_tensor_get(logits, prefix_logits.data(), 0, (size_t)V * sizeof(float));
+        if (trace_prefix) {
+            const bool trace_one_layer = trace_layer0_only || std::getenv("RIG_QWEN_LAYER_TRACE_LAYER") != nullptr;
+            const int traced_layers = trace_one_layer ? 1 : cfg.n_layers;
+            if ((int) layer_last_taps.size() != traced_layers || (int) attn_last_taps.size() != traced_layers ||
+                (int) post_attn_last_taps.size() != traced_layers || (int) mlp_last_taps.size() != traced_layers ||
+                (int) gate_last_taps.size() != traced_layers || (int) up_last_taps.size() != traced_layers ||
+                (int) swiglu_last_taps.size() != traced_layers || (int) mlp_input_last_taps.size() != traced_layers)
+                throw std::runtime_error("batched Qwen layer trace did not capture every layer");
+            std::filesystem::create_directories(layer_trace_dir);
+            std::vector<float> input_last((size_t)hidden);
+            std::vector<float> layer_last((size_t)traced_layers * hidden);
+            const char * qkv_trace = std::getenv("RIG_QWEN_LAYER_TRACE_QKV");
+            const bool trace_input_norm = std::getenv("RIG_QWEN_LAYER_TRACE_INPUT_NORM") != nullptr;
+            const int attn_width = trace_input_norm ? cfg.hidden :
+                (qkv_trace && (qkv_trace[0] == 'k' || qkv_trace[0] == 'v')
+                    ? cfg.head_dim * cfg.n_kv : cfg.head_dim * cfg.n_heads);
+            std::vector<float> attn_last((size_t)traced_layers * attn_width);
+            std::vector<float> post_attn_last((size_t)traced_layers * hidden);
+            std::vector<float> mlp_last((size_t)traced_layers * hidden);
+            std::vector<float> gate_last((size_t)traced_layers * cfg.intermediate);
+            std::vector<float> up_last((size_t)traced_layers * cfg.intermediate);
+            std::vector<float> swiglu_last((size_t)traced_layers * cfg.intermediate);
+            std::vector<float> mlp_input_last((size_t)traced_layers * hidden);
+            ggml_backend_tensor_get(input_last_tap, input_last.data(), 0, input_last.size() * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(layer_last_taps[l], layer_last.data() + (size_t)l * hidden,
+                                        0, (size_t)hidden * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(attn_last_taps[l], attn_last.data() + (size_t)l * attn_width,
+                                        0, (size_t)attn_width * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(post_attn_last_taps[l], post_attn_last.data() + (size_t)l * hidden,
+                                        0, (size_t)hidden * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(mlp_last_taps[l], mlp_last.data() + (size_t)l * hidden,
+                                        0, (size_t)hidden * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(gate_last_taps[l], gate_last.data() + (size_t)l * cfg.intermediate,
+                                        0, (size_t)cfg.intermediate * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(up_last_taps[l], up_last.data() + (size_t)l * cfg.intermediate,
+                                        0, (size_t)cfg.intermediate * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(swiglu_last_taps[l], swiglu_last.data() + (size_t)l * cfg.intermediate,
+                                        0, (size_t)cfg.intermediate * sizeof(float));
+            for (int l = 0; l < traced_layers; ++l)
+                ggml_backend_tensor_get(mlp_input_last_taps[l], mlp_input_last.data() + (size_t)l * hidden,
+                                        0, (size_t)hidden * sizeof(float));
+            rig_write_f32_npy(layer_trace_dir + "/input_last_f32.npy", input_last.data(), {hidden});
+            rig_write_f32_npy(layer_trace_dir + "/layer_last_f32.npy", layer_last.data(),
+                              {traced_layers, hidden});
+            rig_write_f32_npy(layer_trace_dir + "/attn_last_f32.npy", attn_last.data(),
+                              {traced_layers, attn_width});
+            rig_write_f32_npy(layer_trace_dir + "/post_attn_last_f32.npy", post_attn_last.data(),
+                              {traced_layers, hidden});
+            rig_write_f32_npy(layer_trace_dir + "/mlp_last_f32.npy", mlp_last.data(),
+                              {traced_layers, hidden});
+            rig_write_f32_npy(layer_trace_dir + "/gate_last_f32.npy", gate_last.data(),
+                              {traced_layers, cfg.intermediate});
+            rig_write_f32_npy(layer_trace_dir + "/up_last_f32.npy", up_last.data(),
+                              {traced_layers, cfg.intermediate});
+            rig_write_f32_npy(layer_trace_dir + "/swiglu_last_f32.npy", swiglu_last.data(),
+                              {traced_layers, cfg.intermediate});
+            rig_write_f32_npy(layer_trace_dir + "/mlp_input_last_f32.npy", mlp_input_last.data(),
+                              {traced_layers, hidden});
+            if (verbose) printf("[rig_beam_b] wrote B%d Qwen layer trace -> %s\n", num_beams, layer_trace_dir.c_str());
+        }
+        if (std::getenv("RIG_BEAM_TRACE") && std::getenv("RIG_BEAM_TRACE")[0] != '0') {
+            // Read-only parity probe for the first HF-expanded prefill row.
+            // These coordinate tokens are the decisive Tira first-race set.
+            printf("[btrace] prefix_raw 125=%.7g 126=%.7g 127=%.7g 128=%.7g 129=%.7g\n",
+                   prefix_logits[125], prefix_logits[126], prefix_logits[127], prefix_logits[128], prefix_logits[129]);
+        }
+        // Cache tensors are contiguous per beam column.  Column zero is the
+        // common prefix needed by the suffix decoder; all B rows had exactly
+        // repeated inputs, matching HF's expanded prefill convention.
+        for (int l = 0; l < cfg.n_layers; ++l) {
+            ggml_tensor* bk = pre_batched.k_cache[l]; ggml_tensor* bv = pre_batched.v_cache[l];
+            ggml_tensor* pk = pre->k_cache[l];         ggml_tensor* pv = pre->v_cache[l];
+            const size_t bytes = (size_t)P * bk->nb[2];
+#ifdef M1_USE_CUDA
+            cudaMemcpy(pk->data, bk->data, bytes, cudaMemcpyDeviceToDevice);
+            cudaMemcpy(pv->data, bv->data, bytes, cudaMemcpyDeviceToDevice);
+#else
+            std::vector<char> host(bytes);
+            ggml_backend_tensor_get(bk, host.data(), 0, bytes); ggml_backend_tensor_set(pk, host.data(), 0, bytes);
+            ggml_backend_tensor_get(bv, host.data(), 0, bytes); ggml_backend_tensor_set(pv, host.data(), 0, bytes);
+#endif
+        }
+        ggml_gallocr_free(ga); ggml_free(cctx);
+        pre->pos = P;
+    } else {
+        // Production B=1 path.  Keep this graph/layout byte-for-byte aligned
+        // with the historical shared-prefix implementation: the batched
+        // suffix decoder broadcasts this single prefix cache across beams.
+        std::vector<float> cosb, sinb; beam_rope_tables(cfg, 0, P, cosb, sinb);
+        std::vector<float> maskb((size_t)P * P, 0.f);
+        for (int q = 0; q < P; ++q) for (int k = 0; k < P; ++k)
+            maskb[(size_t)q * P + k] = (k <= q) ? 0.0f : -INFINITY;
+        ggml_init_params ip{ (size_t)512 * 1024 * 1024, nullptr, true };
+        ggml_context* cctx = ggml_init(ip);
+        int64_t ine[4] = { hidden, P, 1, 1 };
+        ggml_tensor* inp = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, ine); ggml_set_input(inp);
         int64_t cne[4] = { hd, P, 1, 1 };
         ggml_tensor* cosT = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, cne); ggml_set_input(cosT);
         ggml_tensor* sinT = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, cne); ggml_set_input(sinT);
         ggml_tensor* cos3 = ggml_reshape_3d(cctx, cosT, hd, 1, P);
         ggml_tensor* sin3 = ggml_reshape_3d(cctx, sinT, hd, 1, P);
-        int64_t mne[4] = { P, P, 1, 1 }; ggml_tensor* maskT = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, mne); ggml_set_input(maskT);
+        int64_t mne[4] = { P, P, 1, 1 };
+        ggml_tensor* maskT = ggml_new_tensor(cctx, GGML_TYPE_F32, 2, mne); ggml_set_input(maskT);
         std::vector<ggml_tensor*> writes;
-        ggml_tensor* logits = build_qwen3_cached(H, cctx, cfg, *pre, inp, cos3, sin3, 0, P, maskT, writes, nullptr, 0);
+        std::vector<ggml_tensor*> layer_last_taps;
+        // Match the layer taps' [hidden] layout for an input-side comparison.
+        // This is created only for the explicit diagnostic trace.
+        ggml_tensor* input_last_tap = nullptr;
+        if (trace_shared_b1) {
+            input_last_tap = ggml_view_2d(cctx, inp, hidden, 1, inp->nb[1],
+                                           (size_t)(P - 1) * inp->nb[1]);
+        }
+        ggml_tensor* logits = build_qwen3_cached(H, cctx, cfg, *pre, inp, cos3, sin3,
+                                                  0, P, maskT, writes, nullptr, 0,
+                                                  trace_shared_b1 ? &layer_last_taps : nullptr,
+                                                  subtrace.enabled() ? &subtrace : nullptr);
         ggml_set_output(logits);
         ggml_cgraph* gf = new_graph(cctx, 32768);
         ggml_build_forward_expand(gf, logits);
         for (ggml_tensor* w : writes) ggml_build_forward_expand(gf, w);
+        subtrace.add_to_graph(gf);
+        if (input_last_tap) ggml_build_forward_expand(gf, input_last_tap);
+        for (ggml_tensor* tap : layer_last_taps) ggml_build_forward_expand(gf, tap);
         if (!weights_ready) { upload_weights_maybe_f16(H); weights_ready = true; }
         ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(H.backend));
-        if (!ggml_gallocr_alloc_graph(ga, gf)) { ggml_gallocr_free(ga); ggml_free(cctx); throw std::runtime_error("batched prefill gallocr failed"); }
+        if (!ggml_gallocr_alloc_graph(ga, gf)) {
+            ggml_gallocr_free(ga); ggml_free(cctx);
+            throw std::runtime_error("shared prefix prefill gallocr failed");
+        }
         ggml_backend_tensor_set(inp, prefix_embeds.data(), 0, (size_t)P * hidden * sizeof(float));
         ggml_backend_tensor_set(cosT, cosb.data(), 0, cosb.size() * sizeof(float));
         ggml_backend_tensor_set(sinT, sinb.data(), 0, sinb.size() * sizeof(float));
-        ggml_backend_tensor_set(maskT, maskb.data(), 0, maskb.size() * sizeof(float));
+        // The operation-local causal-Qwen FA2 prefill owns causality and does
+        // not reference the generic additive mask, irrespective of the
+        // retained KV-cache precision.
+        const bool qwen_fa2_prefill =
+            cfg.head_dim == 128 && cfg.n_heads == 16 && cfg.n_kv == 8;
+        if (!qwen_fa2_prefill)
+            ggml_backend_tensor_set(maskT, maskb.data(), 0, maskb.size() * sizeof(float));
         ggml_backend_graph_compute(H.backend, gf);
+        subtrace.write(H);
+        if (subtrace.enabled() && verbose) printf("[rig_beam_b] wrote Qwen3 subtrace -> %s\n", subtrace.dir.c_str());
         vram_bump();
         std::vector<float> all((size_t)P * V);
-        ggml_backend_tensor_get(logits, all.data(), 0, (size_t)P * V * sizeof(float));
+        ggml_backend_tensor_get(logits, all.data(), 0, all.size() * sizeof(float));
         prefix_logits.assign(all.begin() + (size_t)(P - 1) * V, all.begin() + (size_t)P * V);
+        if (trace_shared_b1) {
+            if ((int)layer_last_taps.size() != cfg.n_layers)
+                throw std::runtime_error("Qwen layer trace did not capture every layer");
+            std::filesystem::create_directories(layer_trace_dir);
+            std::vector<float> input_last((size_t)hidden);
+            std::vector<float> layer_last((size_t)cfg.n_layers * hidden);
+            ggml_backend_tensor_get(input_last_tap, input_last.data(), 0, input_last.size() * sizeof(float));
+            for (int l = 0; l < cfg.n_layers; ++l)
+                ggml_backend_tensor_get(layer_last_taps[l], layer_last.data() + (size_t)l * hidden,
+                                        0, (size_t)hidden * sizeof(float));
+            rig_write_f32_npy(layer_trace_dir + "/input_last_f32.npy", input_last.data(), {hidden});
+            rig_write_f32_npy(layer_trace_dir + "/layer_last_f32.npy", layer_last.data(),
+                              {cfg.n_layers, hidden});
+            if (verbose) printf("[rig_beam_b] wrote shared-b1 Qwen layer trace -> %s\n", layer_trace_dir.c_str());
+        }
+        if (std::getenv("RIG_BEAM_TRACE") && std::getenv("RIG_BEAM_TRACE")[0] != '0') {
+            printf("[btrace] prefix_raw 125=%.7g 126=%.7g 127=%.7g 128=%.7g 129=%.7g\n",
+                   prefix_logits[125], prefix_logits[126], prefix_logits[127], prefix_logits[128], prefix_logits[129]);
+        }
         ggml_gallocr_free(ga); ggml_free(cctx);
         pre->pos = P;
     }
+    if (verbose) printf("[rig_beam_b] prefix_prefill=%s effective_batch=%d cache=%s production_eligible=%s\n",
+                        prefix_prefill == PrefixPrefillMode::SharedB1 ? "shared-b1" : "hf-batched-diag",
+                        prefix_prefill == PrefixPrefillMode::SharedB1 ? 1 : num_beams,
+                        prefix_prefill == PrefixPrefillMode::SharedB1 ? "shared" : "expanded-then-column0",
+                        prefix_prefill == PrefixPrefillMode::SharedB1 ? "yes" : "no");
     if (verbose) printf("[rig_beam_b] prefill P=%d (n_cond=%d), suffix_max=%d, beams=%d seed=%llu\n",
                         P, n_cond, suffix_max, num_beams, (unsigned long long)seed);
 
     // ---- batched decode: B beams' next token at suffix offset `step`. embeds = [B*hidden] (col-major
     //      per beam). Writes into `suf` at col 0..B-1. Returns logits [B*V] (beam b at [b*V, b*V+V)). ----
     double t_build = 0, t_compute = 0; long n_decode = 0;   // per-step CPU build vs GPU compute split
+    const char* decode_trace_env = std::getenv("RIG_QWEN_DECODE_TRACE");
+    const int decode_trace_step = decode_trace_env ? std::atoi(decode_trace_env) : -1;
     auto run_batched = [&](Qwen3KvCacheBatched& suf, int step, int B,
                            const std::vector<float>& embeds) -> std::vector<float> {
         auto _t0 = std::chrono::steady_clock::now();
@@ -123,11 +432,14 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         ggml_tensor* cos3 = ggml_reshape_3d(cctx, cosT, hd, 1, B);
         ggml_tensor* sin3 = ggml_reshape_3d(cctx, sinT, hd, 1, B);
         std::vector<ggml_tensor*> writes;
-        ggml_tensor* logits = build_qwen3_batched(H, cctx, cfg, suf, *pre, P, inp, cos3, sin3, step, B, writes);
+        std::vector<ggml_tensor*> decode_taps;
+        ggml_tensor* logits = build_qwen3_batched(H, cctx, cfg, suf, *pre, P, inp, cos3, sin3, step, B, writes,
+                                                   step == decode_trace_step ? &decode_taps : nullptr);
         ggml_set_output(logits);
         ggml_cgraph* gf = new_graph(cctx, 32768);
         ggml_build_forward_expand(gf, logits);
         for (ggml_tensor* w : writes) ggml_build_forward_expand(gf, w);
+        for (ggml_tensor* tap : decode_taps) ggml_build_forward_expand(gf, tap);
         ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(H.backend));
         if (!ggml_gallocr_alloc_graph(ga, gf)) { ggml_gallocr_free(ga); ggml_free(cctx); throw std::runtime_error("batched decode gallocr failed"); }
         ggml_backend_tensor_set(inp, embeds.data(), 0, (size_t)B * hidden * sizeof(float));
@@ -139,6 +451,18 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         vram_bump();
         std::vector<float> out((size_t)B * V);
         ggml_backend_tensor_get(logits, out.data(), 0, (size_t)B * V * sizeof(float));
+        if (!decode_taps.empty()) {
+            if (decode_taps.size() != 6) throw std::runtime_error("cached decode trace missing layer-0 taps");
+            std::filesystem::create_directories("/tmp/qwen_decode_trace");
+            const char* names[] = {"q", "k", "v", "attn", "oproj", "layer"};
+            const int widths[] = {hd * cfg.n_heads, hd * cfg.n_kv, hd * cfg.n_kv, hd * cfg.n_heads, hidden, hidden};
+            for (int i = 0; i < 6; ++i) {
+                std::vector<float> host((size_t)widths[i] * B);
+                ggml_backend_tensor_get(decode_taps[i], host.data(), 0, host.size() * sizeof(float));
+                rig_write_f32_npy(std::string("/tmp/qwen_decode_trace/") + names[i] + "_step" + std::to_string(step) + ".npy",
+                                  host.data(), {B, widths[i]});
+            }
+        }
         ggml_gallocr_free(ga); ggml_free(cctx);
         suf.pos = step + 1;
         t_build   += std::chrono::duration<double,std::milli>(_t1 - _t0).count();
@@ -204,7 +528,7 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         }
     };
 
-    struct BBeam { int col; std::vector<int> sequence; std::vector<float> last_logits; double score; };
+    struct BBeam { int col; std::vector<int> sequence; std::vector<float> last_logits; float score; };
 
     // ============================ STEP 0: expand prefix -> beams ========================
     std::vector<RigHyp> finished;
@@ -212,17 +536,38 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         std::vector<int> allowed = allowed_next_tokens(start_tokens, spec);
         std::vector<float> s0 = prefix_logits;
         beam_log_softmax_inplace(s0);
-        beam_repetition_penalty(s0, start_tokens, repetition_penalty);
+        // HF generate() receives inputs_embeds and keeps an empty dummy
+        // input_ids prompt, so RepetitionPenalty sees generated tokens only;
+        // BOS/CLS live solely in TokenRig's grammar processor.
         apply_grammar_mask(s0, allowed);
-        if (do_sample) { beam_warp_temperature(s0, temperature); beam_warp_top_k(s0, top_k); beam_warp_top_p(s0, top_p); }
-        std::vector<std::pair<float,int>> cands;
+        if (do_sample) { beam_warp_temperature(s0, temperature); beam_warp_top_k(s0, top_k, 2); beam_warp_top_p(s0, top_p, 2); }
+        // HF starts with B prompt rows: score[0]=0 and score[1:]=-1e9.
+        // Even the effectively-zero rows must occupy flattened logical slots,
+        // because their exponential values advance CUDA Philox identically.
+        struct First { float score; int parent; int tok; int race_rank; };
+        std::vector<First> cands;
+        std::vector<int> race0;
         if (do_sample) {
-            std::vector<int> drawn = beam_sample_distinct(s0, num_beams, rng);
-            for (int t : drawn) if (std::isfinite(s0[t])) cands.push_back({ s0[t], t });
-            std::sort(cands.begin(), cands.end(), [](auto&a, auto&b){ return a.first > b.first; });
+            std::vector<float> flat((size_t)num_beams * V, -std::numeric_limits<float>::infinity());
+            for (int b = 0; b < num_beams; ++b) for (int t = 0; t < V; ++t)
+                if (std::isfinite(s0[t])) flat[(size_t)b * V + t] = s0[t] + (b ? -1.0e9f : 0.0f);
+            race0 = philox_race_topk(flat, 2 * num_beams);
+            for (int rank = 0; rank < (int)race0.size(); ++rank) {
+                const int at = race0[rank], parent = at / V, tok = at % V;
+                if (tok == spec.model_eos && rank < num_beams)
+                    finished.push_back({std::vector<int>(start_tokens.begin(), start_tokens.end()), flat[at], true}), finished.back().sequence.push_back(tok);
+                // torch.multinomial without replacement returns zero-probability
+                // entries after the five legal first-row choices.  Retain them
+                // as -inf running slots so the next flattened [B,V] layout and
+                // Philox consumption remain identical instead of collapsing B.
+                else cands.push_back({flat[at], parent, tok, rank});
+            }
+            // Running beams are score-topk among selected non-stopping draws;
+            // draw order remains significant only for the finished top-B mask.
+            std::sort(cands.begin(), cands.end(), [](const First& a, const First& b){ return a.score > b.score; });
         } else {
-            for (int t : allowed) if (std::isfinite(s0[t])) cands.push_back({ s0[t], t });
-            std::sort(cands.begin(), cands.end(), [](auto&a, auto&b){ return a.first > b.first; });
+            for (int t : allowed) if (std::isfinite(s0[t])) cands.push_back({s0[t], 0, t, 0});
+            std::sort(cands.begin(), cands.end(), [](const First& a, const First& b){ return a.score > b.score; });
         }
         int nb = std::min((int)cands.size(), num_beams);
         if (nb == 0) throw std::runtime_error("rig_beam_generate_batched: no allowed tokens at step 0");
@@ -230,15 +575,23 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         // batched-decode the nb first tokens (suffix offset 0, fresh suffix in `cur`).
         cur->reset();
         std::vector<float> embeds((size_t)nb * hidden);
-        for (int b = 0; b < nb; ++b) { const float* r = embed_row(cands[b].second); std::copy(r, r + hidden, embeds.begin() + (size_t)b * hidden); }
+        for (int b = 0; b < nb; ++b) { const float* r = embed_row(cands[b].tok); std::copy(r, r + hidden, embeds.begin() + (size_t)b * hidden); }
         std::vector<float> lg = run_batched(*cur, 0, nb, embeds);
         std::vector<BBeam> beams; beams.reserve(nb);
         for (int b = 0; b < nb; ++b) {
             BBeam beam; beam.col = b;
-            beam.sequence = start_tokens; beam.sequence.push_back(cands[b].second);
+            beam.sequence = start_tokens; beam.sequence.push_back(cands[b].tok);
             beam.last_logits.assign(lg.begin() + (size_t)b * V, lg.begin() + (size_t)(b + 1) * V);
-            beam.score = cands[b].first;
+            beam.score = cands[b].score;
             beams.push_back(std::move(beam));
+        }
+        const bool trace_sample = std::getenv("RIG_BEAM_TRACE") && std::getenv("RIG_BEAM_TRACE")[0] != '0';
+        if (trace_sample && do_sample) {
+            printf("[btrace] iter=0 race:");
+            for (int r = 0; r < (int)race0.size(); ++r) printf(" %d:%d", race0[r] / V, race0[r] % V);
+            printf("\n[btrace] iter=0 running:");
+            for (int b = 0; b < (int)beams.size(); ++b) printf(" %d:%.7g", beams[b].sequence.back(), beams[b].score);
+            printf("\n");
         }
         if (verbose) printf("[rig_beam_b] step 0: spawned %zu beams (top token %d)\n", beams.size(), beams.empty() ? -1 : beams[0].sequence.back());
         if (std::getenv("RIG_LOGIT_PROBE") && !beams.empty()) {  // step-0 beam-0 decode-logit parity probe
@@ -253,7 +606,9 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         const bool dump_dbg = std::getenv("RIG_BEAM_DUMP") && std::getenv("RIG_BEAM_DUMP")[0] != '0';
         const int beams_to_keep = 2 * num_beams;
         auto norm = [&](double score, int gen_len) { return score / std::pow((double)std::max(1, gen_len), (double)length_penalty); };
-        auto worst_finished_norm = [&]() -> double { if (finished.empty()) return -1e30; double w = std::numeric_limits<double>::infinity(); for (auto& h : finished) w = std::min(w, h.normscore); return w; };
+        // HF only permits its early-stop bound once all B finished slots have
+        // been populated.  A single early EOS must not suppress live beams.
+        auto worst_finished_norm = [&]() -> double { if ((int)finished.size() < num_beams) return -1.0e9; double w = std::numeric_limits<double>::infinity(); for (auto& h : finished) w = std::min(w, h.normscore); return w; };
         auto bank_finished = [&](std::vector<int> seq, double normscore, bool eos) {
             finished.push_back({ std::move(seq), normscore, eos });
             if ((int)finished.size() > num_beams) { auto worst = std::min_element(finished.begin(), finished.end(), [](const RigHyp&a, const RigHyp&b){ return a.normscore < b.normscore; }); finished.erase(worst); }
@@ -265,36 +620,33 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
             if (active == 0) break;
 
             // ---- 1+2: joint candidate pool (acc = warped_logp + beam_score) ----
-            struct JC { double acc; int parent; int tok; };
-            std::vector<JC> jc;
+            struct JC { float acc; int parent; int tok; };
+            // Keep the exact [B,V] row-major shape.  Do not compact masked
+            // logits: PyTorch materialises an exponential for every slot.
+            std::vector<JC> jc((size_t)active * V);
+            std::vector<float> flat_scores((size_t)active * V, -std::numeric_limits<float>::infinity());
             for (int i = 0; i < active; ++i) {
                 std::vector<float> s = beams[i].last_logits;
                 std::vector<int> allowed2 = allowed_next_tokens(beams[i].sequence, spec);
                 beam_log_softmax_inplace(s);
-                beam_repetition_penalty(s, beams[i].sequence, repetition_penalty);
+                std::vector<int> generated(beams[i].sequence.begin() + start_tokens.size(), beams[i].sequence.end());
+                beam_repetition_penalty(s, generated, repetition_penalty);
                 apply_grammar_mask(s, allowed2);
-                if (do_sample) { beam_warp_temperature(s, temperature); beam_warp_top_k(s, top_k); beam_warp_top_p(s, top_p); }
-                for (size_t t = 0; t < s.size(); ++t) if (std::isfinite(s[t])) jc.push_back({ beams[i].score + (double)s[t], i, (int)t });
+                if (do_sample) { beam_warp_temperature(s, temperature); beam_warp_top_k(s, top_k, 2); beam_warp_top_p(s, top_p, 2); }
+                for (int t = 0; t < V; ++t) {
+                    const float acc = std::isfinite(s[t]) ? beams[i].score + s[t]
+                                                         : -std::numeric_limits<float>::infinity();
+                    jc[(size_t)i * V + t] = {acc, i, t};
+                    flat_scores[(size_t)i * V + t] = (float)acc;
+                }
             }
-            if (jc.empty()) break;
+            if (active == 0) break;
 
             // ---- 3: pick beams_to_keep candidates from the joint pool ----
             int want = std::min((int)jc.size(), beams_to_keep);
             std::vector<int> picks; picks.reserve(want);
             if (do_sample) {
-                std::vector<char> used(jc.size(), 0);
-                double mx = -std::numeric_limits<double>::infinity();
-                for (auto& c : jc) mx = std::max(mx, c.acc);
-                std::uniform_real_distribution<double> uni(0.0, 1.0);
-                for (int n = 0; n < want; ++n) {
-                    double sum = 0.0; for (size_t k = 0; k < jc.size(); ++k) if (!used[k]) sum += std::exp(jc[k].acc - mx);
-                    if (sum <= 0.0) break;
-                    double u = uni(rng) * sum, accum = 0.0; int pick = -1;
-                    for (size_t k = 0; k < jc.size(); ++k) { if (used[k]) continue; accum += std::exp(jc[k].acc - mx); if (u < accum) { pick = (int)k; break; } }
-                    if (pick < 0) for (size_t k = jc.size(); k-- > 0; ) if (!used[k]) { pick = (int)k; break; }
-                    if (pick < 0) break;
-                    used[pick] = 1; picks.push_back(pick);
-                }
+                picks = philox_race_topk(flat_scores, want);
             } else {
                 std::vector<int> idx(jc.size()); for (size_t k = 0; k < jc.size(); ++k) idx[k] = (int)k;
                 std::partial_sort(idx.begin(), idx.begin() + want, idx.end(), [&](int a, int b){ return jc[a].acc > jc[b].acc; });
@@ -308,18 +660,18 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
             // HF's _update_finished_beams masks them out (`& top_num_beam_mask`). Banking ALL eos picks
             // (the old behavior) let a SHORT, low-ranked eos hyp slip in; being short its length-normalized
             // score could win -> the C++ rigs terminated sparser than Python (J37 vs 56 on det gilly).
-            std::vector<std::pair<double,int>> noneos; noneos.reserve(picks.size());
+            std::vector<std::pair<float,int>> noneos; noneos.reserve(picks.size());
             for (int pi = 0; pi < (int)picks.size(); ++pi) {
                 const JC& c = jc[picks[pi]];
                 if (c.tok == spec.model_eos) {
                     if (pi < num_beams) { std::vector<int> seq = beams[c.parent].sequence; seq.push_back(spec.model_eos); bank_finished(std::move(seq), norm(c.acc, gen_len), true);
-                        if (dump_dbg) printf("[bdump] BANK eos step=%d gen_len=%d pi=%d rawscore=%.4f normscore=%.5f best_act_norm=%.5f\n", step, gen_len, pi, c.acc, norm(c.acc,gen_len), beams.empty()?0.0:norm([&]{double m=-1e30;for(auto&b:beams)m=std::max(m,b.score);return m;}(),gen_len)); }
+                        if (dump_dbg) printf("[bdump] BANK eos step=%d gen_len=%d pi=%d rawscore=%.4f normscore=%.5f best_act_norm=%.5f\n", step, gen_len, pi, c.acc, norm(c.acc,gen_len), beams.empty()?0.0:norm([&]{float m=-1e30f;for(auto&b:beams)m=std::max(m,b.score);return m;}(),gen_len)); }
                     // else: eos ranked >= num_beams -> discarded (not finished, not a running beam), per HF.
                 } else noneos.push_back({ c.acc, picks[pi] });
             }
             std::sort(noneos.begin(), noneos.end(), [](const auto&a, const auto&b){ return a.first > b.first; });
             int nkeep = std::min((int)noneos.size(), num_beams);
-            struct Survivor { int parent_col; int tok; double score; std::vector<int> seq; };
+            struct Survivor { int parent_col; int tok; float score; std::vector<int> seq; };
             std::vector<Survivor> survivors; survivors.reserve(nkeep);
             for (int r = 0; r < nkeep; ++r) {
                 const JC& c = jc[noneos[r].second];
@@ -342,10 +694,23 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
                 nbm.score = survivors[k].score;
                 next_beams.push_back(std::move(nbm));
             }
+            if (dump_dbg && step < 8) {
+                printf("[bdump] step=%d survivors:", step);
+                for (int k = 0; k < (int) survivors.size(); ++k)
+                    printf(" %d/%d:%.7g", survivors[k].parent_col, survivors[k].tok, survivors[k].score);
+                printf("\n");
+            }
+            if (trace_sample && do_sample && step < 4) {
+                printf("[btrace] iter=%d race:", step);
+                for (int r = 0; r < (int)picks.size(); ++r) { const JC& c = jc[picks[r]]; printf(" %d:%d", c.parent, c.tok); }
+                printf("\n[btrace] iter=%d running:", step);
+                for (int k = 0; k < (int)next_beams.size(); ++k) printf(" %d/%d:%.7g", survivors[k].parent_col, survivors[k].tok, survivors[k].score);
+                printf("\n");
+            }
             beams = std::move(next_beams);     // cur holds this step's beams (single buffer, reordered in place)
 
             // ---- 5: early-stop heuristic ----
-            double best_active = -std::numeric_limits<double>::infinity();
+            float best_active = -std::numeric_limits<float>::infinity();
             for (auto& b : beams) best_active = std::max(best_active, b.score);
             double best_active_norm = beams.empty() ? -1e30 : norm(best_active, gen_len);
             improvement_possible = improvement_possible && (best_active_norm > worst_finished_norm());
@@ -368,6 +733,14 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
                 printf("[bdump]   %s gen_len=%4d normscore=%.5f rawscore=%.4f %s\n", h->eos?"EOS ":"TRUNC", gl, h->normscore, h->normscore*std::pow((double)std::max(1,gl),(double)length_penalty), (h==sorted.front())?"<== WINNER":""); }
         }
         auto best = std::max_element(finished.begin(), finished.end(), [](const RigHyp& a, const RigHyp& b){ return a.normscore < b.normscore; });
+        // The language-model winner is not automatically anatomically valid.
+        // Expose completed hypotheses only; callers must never promote a live,
+        // max-length partial beam as a skeleton alternative.
+        if (finished_out) {
+            *finished_out = finished;
+            std::sort(finished_out->begin(), finished_out->end(),
+                      [](const RigHyp& a, const RigHyp& b) { return a.normscore > b.normscore; });
+        }
         if (verbose) {
             int gl = (int)best->sequence.size() - (int)start_tokens.size();
             printf("[rig_beam_b] DONE: %zu hyps (eos in pool=%d), best %s normscore=%.4f, len=%zu (gen=%d), last=%d\n",

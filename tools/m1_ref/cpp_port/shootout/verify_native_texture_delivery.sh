@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the selected HIGH / MEDIUM / LOW native texture delivery as one unit.
+# Verify the selected HERO / HIGH / MEDIUM / LOW native texture delivery as one unit.
 #
 # Usage:
 #   verify_native_texture_delivery.sh <delivery-dir>
@@ -33,7 +33,7 @@ hash_matches() {
 
 SCHEMA="$(value schema_version)"
 [[ "$SCHEMA" =~ ^[0-9]+$ ]] && (( SCHEMA >= 3 )) || {
-  echo "REJECT: delivery manifest is not schema 3: $MANIFEST" >&2; exit 1;
+  echo "REJECT: delivery manifest is older than schema 3: $MANIFEST" >&2; exit 1;
 }
 PRODUCTION_HIGH="$(value production_texture)"
 [[ -n "$PRODUCTION_HIGH" && -s "$OUT/$PRODUCTION_HIGH" ]] || {
@@ -41,13 +41,17 @@ PRODUCTION_HIGH="$(value production_texture)"
 }
 
 SELECTED="$(value selected_production_lods)"
-if [[ -n "$SELECTED" ]]; then
+if (( SCHEMA >= 4 )); then
+  HERO_ID=hero; HIGH_ID=high; MEDIUM_ID=medium; LOW_ID=low
+elif [[ -n "$SELECTED" ]]; then
   HIGH_ID=high-production; MEDIUM_ID=medium-production; LOW_ID=low-production
 else
   HIGH_ID=high; MEDIUM_ID=medium; LOW_ID=low
 fi
 
-for id in "$HIGH_ID" "$MEDIUM_ID" "$LOW_ID"; do
+IDS=("$HIGH_ID" "$MEDIUM_ID" "$LOW_ID")
+if (( SCHEMA >= 4 )); then IDS=("$HERO_ID" "${IDS[@]}"); fi
+for id in "${IDS[@]}"; do
   line="$(awk -v key="lod=$id" '$1==key {print; exit}' "$MANIFEST")"
   [[ -n "$line" ]] || { echo "REJECT: manifest has no selected $id LOD record: $MANIFEST" >&2; exit 1; }
   file="$(field "$line" file)" || { echo "REJECT: $id record has no file: $MANIFEST" >&2; exit 1; }
@@ -60,10 +64,10 @@ for id in "$HIGH_ID" "$MEDIUM_ID" "$LOW_ID"; do
   [[ -s "$status" ]] || { echo "REJECT: selected $id has no status: $status" >&2; exit 1; }
   if grep -q '^execution=CPU-only native re-atlas; no GPU reserved$' "$status"; then execution=cpu; else execution=gpu; fi
   "$CP/shootout/verify_native_texture_asset.sh" "$OUT/$file" --execution "$execution"
-  [[ "$id" != "$HIGH_ID" || "$file" == "$PRODUCTION_HIGH" ]] || {
-    echo "REJECT: production_texture=$PRODUCTION_HIGH does not match selected high=$file" >&2; exit 1;
+  [[ "$id" != "${HERO_ID:-__no_hero__}" || "$file" == "$PRODUCTION_HIGH" ]] || {
+    echo "REJECT: production_texture=$PRODUCTION_HIGH does not match hero=$file" >&2; exit 1;
   }
 done
 
-printf 'VERIFIED native texture delivery: %s (high=%s, medium/low selected from %s)\n' \
+printf 'VERIFIED native texture delivery: %s (production=%s, delivery tiers selected from %s)\n' \
   "$OUT" "$PRODUCTION_HIGH" "$MANIFEST"

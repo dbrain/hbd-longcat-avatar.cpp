@@ -109,6 +109,16 @@ inline std::vector<int> next_possible_tokens(const std::vector<int>& emitted,
         EXPECT_JOINT_2,
         EXPECT_JOINT_3,
         EXPECT_BRANCH_OR_PART_OR_JOINT,
+        // A branch serializes an explicit parent coordinate triple followed
+        // by the child triple.  Treating it as an ordinary three-coordinate
+        // joint makes EOS legal halfway through that six-token payload; R5
+        // then correctly rejects the supposedly completed sequence.
+        EXPECT_BRANCH_PARENT_1,
+        EXPECT_BRANCH_PARENT_2,
+        EXPECT_BRANCH_PARENT_3,
+        EXPECT_BRANCH_CHILD_1,
+        EXPECT_BRANCH_CHILD_2,
+        EXPECT_BRANCH_CHILD_3,
         EXPECT_JOINT,
         EXPECT_CLS,   // present in the python emit-switch but never reached by the walk
     };
@@ -136,10 +146,16 @@ inline std::vector<int> next_possible_tokens(const std::vector<int>& emitted,
                 state = EXPECT_BRANCH_OR_PART_OR_JOINT;
                 break;
             case EXPECT_BRANCH_OR_PART_OR_JOINT:
-                if (id == g.token_id_branch) state = EXPECT_JOINT;
+                if (id == g.token_id_branch) state = EXPECT_BRANCH_PARENT_1;
                 else if (id < g.num_discrete) state = EXPECT_JOINT_2;
                 else                          state = EXPECT_JOINT; // a part
                 break;
+            case EXPECT_BRANCH_PARENT_1: state = EXPECT_BRANCH_PARENT_2; break;
+            case EXPECT_BRANCH_PARENT_2: state = EXPECT_BRANCH_PARENT_3; break;
+            case EXPECT_BRANCH_PARENT_3: state = EXPECT_BRANCH_CHILD_1; break;
+            case EXPECT_BRANCH_CHILD_1:  state = EXPECT_BRANCH_CHILD_2; break;
+            case EXPECT_BRANCH_CHILD_2:  state = EXPECT_BRANCH_CHILD_3; break;
+            case EXPECT_BRANCH_CHILD_3:  state = EXPECT_BRANCH_OR_PART_OR_JOINT; break;
             case EXPECT_JOINT:
                 state = EXPECT_JOINT_2;
                 break;
@@ -171,6 +187,12 @@ inline std::vector<int> next_possible_tokens(const std::vector<int>& emitted,
         case EXPECT_PART_OR_JOINT:       add_part(); add_joint(); add_eos(); break;
         case EXPECT_JOINT_2:             add_joint(); break;
         case EXPECT_JOINT_3:             add_joint(); break;
+        case EXPECT_BRANCH_PARENT_1:     add_joint(); break;
+        case EXPECT_BRANCH_PARENT_2:     add_joint(); break;
+        case EXPECT_BRANCH_PARENT_3:     add_joint(); break;
+        case EXPECT_BRANCH_CHILD_1:      add_joint(); break;
+        case EXPECT_BRANCH_CHILD_2:      add_joint(); break;
+        case EXPECT_BRANCH_CHILD_3:      add_joint(); break;
         case EXPECT_BRANCH_OR_PART_OR_JOINT: add_joint(); add_part(); add_branch(); add_eos(); break;
         case EXPECT_JOINT:               add_joint(); break;
     }
@@ -191,6 +213,12 @@ inline int bones_in_sequence(const std::vector<int>& emitted,
         EXPECT_JOINT_2,
         EXPECT_JOINT_3,
         EXPECT_BRANCH_OR_PART_OR_JOINT,
+        EXPECT_BRANCH_PARENT_1,
+        EXPECT_BRANCH_PARENT_2,
+        EXPECT_BRANCH_PARENT_3,
+        EXPECT_BRANCH_CHILD_1,
+        EXPECT_BRANCH_CHILD_2,
+        EXPECT_BRANCH_CHILD_3,
         EXPECT_JOINT,
     };
     int s = 0;
@@ -219,9 +247,23 @@ inline int bones_in_sequence(const std::vector<int>& emitted,
                 state = EXPECT_BRANCH_OR_PART_OR_JOINT;
                 break;
             case EXPECT_BRANCH_OR_PART_OR_JOINT:
-                if (id == g.token_id_branch) { state = EXPECT_JOINT; is_branch = true; }
+                if (id == g.token_id_branch) { state = EXPECT_BRANCH_PARENT_1; is_branch = true; }
                 else if (id < g.num_discrete) state = EXPECT_JOINT_2;
                 else                          state = EXPECT_JOINT;
+                break;
+            case EXPECT_BRANCH_PARENT_1: state = EXPECT_BRANCH_PARENT_2; break;
+            case EXPECT_BRANCH_PARENT_2: state = EXPECT_BRANCH_PARENT_3; break;
+            case EXPECT_BRANCH_PARENT_3: state = EXPECT_BRANCH_CHILD_1; break;
+            case EXPECT_BRANCH_CHILD_1:  state = EXPECT_BRANCH_CHILD_2; break;
+            case EXPECT_BRANCH_CHILD_2:  state = EXPECT_BRANCH_CHILD_3; break;
+            case EXPECT_BRANCH_CHILD_3:
+                // A six-coordinate branch payload serializes one additional
+                // child joint. It must contribute to J just like an ordinary
+                // coordinate triple, otherwise the skin-phase mask requests
+                // too few 4-token skin codes and accepts model EOS early.
+                s += 1;
+                is_branch = false;
+                state = EXPECT_BRANCH_OR_PART_OR_JOINT;
                 break;
             case EXPECT_JOINT:
                 state = EXPECT_JOINT_2;

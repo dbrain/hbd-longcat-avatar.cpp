@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstdint>
 #include <cfloat>
+#include <cmath>
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { std::fprintf(stderr, "FAIL: %s\n", msg); g_fail++; } } while (0)
@@ -76,6 +77,36 @@ int main(int argc, char** argv) {
 
     // writer bakes per-vertex normals -> reader should recover them
     CHECK(m.normals.size() == verts.size(), "normals recovered (NORMAL attribute)");
+
+    // Node TRS is part of glTF placement, not mesh geometry. Verify the helper used by the
+    // reader before exercising an externally transformed GLB in the optional smoke below.
+    {
+        glb::detail::JVal node; node.type = glb::detail::JVal::Obj;
+        auto vec = [](std::initializer_list<float> values) {
+            glb::detail::JVal a; a.type = glb::detail::JVal::Arr;
+            for (float v : values) { glb::detail::JVal n; n.type = glb::detail::JVal::Num; n.num = v; a.arr.push_back(n); }
+            return a;
+        };
+        node.obj["translation"] = vec({4.f, -2.f, 1.f});
+        node.obj["scale"] = vec({2.f, 3.f, 4.f});
+        glb::detail::Mat4 tr;
+        CHECK(glb::detail::node_local_matrix(node, tr), "node TRS parsed");
+        float p[3] = {1, 1, 1}, got[3]; glb::detail::mat4_point(tr, p, got);
+        CHECK(std::fabs(got[0] - 6.f) < 1e-6f && std::fabs(got[1] - 1.f) < 1e-6f && std::fabs(got[2] - 5.f) < 1e-6f,
+              "node TRS applied to POSITION");
+        float n[3] = {0, 1, 0}, ngot[3];
+        CHECK(glb::detail::mat4_normal(tr, n, ngot) && std::fabs(ngot[1] - 1.f) < 1e-6f,
+              "node inverse-transpose applied to NORMAL");
+        glb::detail::JVal rotated; rotated.type = glb::detail::JVal::Obj;
+        rotated.obj["rotation"] = vec({0.f, 0.f, 0.70710678f, 0.70710678f});
+        rotated.obj["scale"] = vec({2.f, 3.f, 4.f});
+        glb::detail::Mat4 rot;
+        CHECK(glb::detail::node_local_matrix(rotated, rot), "rotated node TRS parsed");
+        float xnormal[3] = {1, 0, 0}, rotated_normal[3];
+        CHECK(glb::detail::mat4_normal(rot, xnormal, rotated_normal) &&
+              std::fabs(rotated_normal[0]) < 1e-5f && std::fabs(rotated_normal[1] - 1.f) < 1e-5f,
+              "inverse-transpose preserves rotated normal direction");
+    }
 
     std::printf("self-test: V=%zu F=%zu normals=%zu uvs=%zu\n",
                 m.verts.size() / 3, m.faces.size() / 3, m.normals.size() / 3, m.uvs.size() / 2);

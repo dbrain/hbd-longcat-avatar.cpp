@@ -18,6 +18,8 @@ static double now(){ using namespace std::chrono; return duration_cast<duration<
 int main(int argc, char** argv) {
     int TS = (argc>1)? atoi(argv[1]) : 2048;
     int DECI = (argc>2)? atoi(argv[2]) : 0;   // decimate target faces (0=off)
+    // A controlled bake must not overwrite the historical root-level oracle.
+    const std::string outdir = getenv("OUT_DIR") ? getenv("OUT_DIR") : ".";
     NpyArray vN = npy_load(std::string(GOLD)+"/vertices.npy");        // [V,3] f32
     NpyArray fN = npy_load(std::string(GOLD)+"/faces.npy");           // [F,3] i64
     NpyArray pfN= npy_load(std::string(REFS)+"/tex_pbr.npy");         // [N,6] f32
@@ -61,10 +63,13 @@ int main(int argc, char** argv) {
 
     // debug PNGs
     glb::encode_png(bt.base_color.data(), bt.tw, bt.th, 4);  // (warm)
-    stbi_write_png("tex_base_color.png", bt.tw, bt.th, 4, bt.base_color.data(), bt.tw*4);
-    stbi_write_png("tex_metal_rough.png", bt.tw, bt.th, 3, bt.metal_rough.data(), bt.tw*3);
-    bool ok = glb::write_glb_textured("miku_uvatlas.glb", bt.verts, bt.normals, bt.uvs, bt.faces,
+    const std::string base_png = outdir + "/tex_base_color.png";
+    const std::string metal_png = outdir + "/tex_metal_rough.png";
+    const std::string glb_out = outdir + "/miku_uvatlas_native.glb";
+    stbi_write_png(base_png.c_str(), bt.tw, bt.th, 4, bt.base_color.data(), bt.tw*4);
+    stbi_write_png(metal_png.c_str(), bt.tw, bt.th, 3, bt.metal_rough.data(), bt.tw*3);
+    bool ok = glb::write_glb_textured(glb_out.c_str(), bt.verts, bt.normals, bt.uvs, bt.faces,
                                       bt.base_color, bt.metal_rough, bt.tw, bt.th);
-    printf("[bake] wrote miku_uvatlas.glb (%s) + tex_base_color.png + tex_metal_rough.png\n", ok?"ok":"FAIL");
+    printf("[bake] wrote %s (%s) + %s + %s\n", glb_out.c_str(), ok?"ok":"FAIL", base_png.c_str(), metal_png.c_str());
     return ok?0:1;
 }

@@ -145,8 +145,22 @@ inline RigResult run_rig_pipeline(const std::vector<float>& verts, const std::ve
         M1Harness Hq(opt.qwen3_w.c_str(), 64, opt.use_cuda);
         Hq.w_f16 = std::getenv("RIG_W_F16") && std::getenv("RIG_W_F16")[0] != '0';
         bool seq_beam = std::getenv("RIG_BEAM_SEQ") && std::getenv("RIG_BEAM_SEQ")[0] != '0';
-        auto beam_fn = seq_beam ? rig::rig_beam_generate : rig::rig_beam_generate_batched;
-        tokens = beam_fn(Hq, qcfg, embed_table.data(), mesh_cond.data(), n_cond, start_tokens, gspec,
+        // rig_beam_generate_batched gained a trailing PrefixPrefillMode parameter
+        // (a batched-only concept); rig_beam_generate did not.  Default arguments
+        // are not part of a function's type, so the two can no longer be unified
+        // into one function pointer via ?: (that was the build break).  Dispatch
+        // with if/else instead — both trailing optionals (finished_out,
+        // prefix_prefill) take their defaults, so the batched path keeps its
+        // production SharedB1 prefill and behaviour is unchanged.
+        if (seq_beam)
+            tokens = rig::rig_beam_generate(Hq, qcfg, embed_table.data(), mesh_cond.data(), n_cond, start_tokens, gspec,
+                         /*num_beams=*/opt.num_beams, /*max_new_tokens=*/opt.max_new,
+                         /*length_penalty=*/1.0f, /*repetition_penalty=*/opt.reppen,
+                         /*do_sample=*/opt.do_sample, /*temperature=*/opt.temp,
+                         /*top_k=*/opt.topk, /*top_p=*/opt.topp, /*seed=*/opt.seed,
+                         /*verbose=*/opt.verbose);
+        else
+            tokens = rig::rig_beam_generate_batched(Hq, qcfg, embed_table.data(), mesh_cond.data(), n_cond, start_tokens, gspec,
                          /*num_beams=*/opt.num_beams, /*max_new_tokens=*/opt.max_new,
                          /*length_penalty=*/1.0f, /*repetition_penalty=*/opt.reppen,
                          /*do_sample=*/opt.do_sample, /*temperature=*/opt.temp,

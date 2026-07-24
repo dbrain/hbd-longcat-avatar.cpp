@@ -14,6 +14,8 @@ NUM_LATENTS="${NUM_LATENTS:-8192}"; CHUNK="${CHUNK:-2048}"; STEPS="${STEPS:-50}"
 # Dual-GPU box: pin to the 3060 (sm_86) by UUID. This image's PyTorch only carries sm_50..sm_90 kernels,
 # so --gpus all exposes the 5060 Ti (sm_120) and PyTorch dies "no kernel image". Override w/ GPU_UUID.
 GPU_UUID="${GPU_UUID:-GPU-3b9ac5cf-95c5-5c9e-de19-af33af4b27d6}"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$GPU_UUID" 2>/dev/null | head -1)"
+[[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: '$GPU_UUID' is '$GPU_NAME', expected the reserved RTX 3060" >&2; exit 1; }
 echo "=== UltraShape refine: $MESH (img $IMG) -> $OUT  (low_vram, num_latents=$NUM_LATENTS chunk=$CHUNK octree=$OCTREE steps=$STEPS) ==="
 docker run --rm --gpus "device=$GPU_UUID" -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -v "$ROOT":/work ultrashape bash -c "cd /work/UltraShape-1.0 && \

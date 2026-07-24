@@ -32,6 +32,16 @@ int main(int argc, char** argv) {
     bool use_cuda = (argc > 1 && std::string(argv[1]) == "cuda");
     const float SM = 1e-5f, GS = 7.5f, GR = 0.7f, RT = 5.0f, IV0 = 0.6f, IV1 = 1.0f;
     const int STEPS = 12;
+    // Optional exact stage-boundary oracle.  This is diagnostic-only: native
+    // production never reads Python artifacts, but a pinned Python capture is
+    // the only valid way to measure whether a native precision experiment has
+    // actually repaired the first occupancy divergence.
+    const char* oracle_env = std::getenv("PIXAL3D_STAGE1_ORACLE_DIR");
+    const std::string oracle = oracle_env ? oracle_env : GOLD;
+    const bool has_oracle = oracle_env != nullptr;
+    const char* raw_inputs_env = std::getenv("PIXAL3D_STAGE1_NATIVE_INPUT_DIR");
+    printf("[sampler] reference=%s%s\n", oracle.c_str(), has_oracle ? " (stage oracle)" : " (legacy golden)");
+    if (raw_inputs_env) printf("[sampler] inputs=%s (captured native F32 boundary)\n", raw_inputs_env);
 
     // ===== DiT forward graph (ss_flow) =====
     M1Harness Hf(FLOW_W, 512, use_cuda);
@@ -49,10 +59,25 @@ int main(int argc, char** argv) {
     ggml_cgraph* gff = new_graph(cf, 32768);
     ggml_build_forward_expand(gff, vout);
     Hf.alloc_and_upload(gff);
-    NpyArray gN = npy_load(std::string(REFS) + "/dino_global.npy");   // golden cond global
-    NpyArray pN = npy_load(std::string(REFS) + "/proj.npy");          // golden cond proj
-    std::vector<float> cond_g(gN.f32(), gN.f32() + gN.numel());
-    std::vector<float> cond_p(pN.f32(), pN.f32() + pN.numel());
+    auto load_raw_f32 = [](const std::string& path, size_t n) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) throw std::runtime_error("cannot open " + path);
+        std::vector<float> out(n);
+        f.read(reinterpret_cast<char*>(out.data()), (std::streamsize)(n * sizeof(float)));
+        if ((size_t)f.gcount() != n * sizeof(float)) throw std::runtime_error("short read " + path);
+        return out;
+    };
+    std::vector<float> cond_g, cond_p;
+    if (raw_inputs_env) {
+        const std::string raw = raw_inputs_env;
+        cond_g = load_raw_f32(raw + "/native_stage1_global_f32.bin", (size_t)5 * 1024);
+        cond_p = load_raw_f32(raw + "/native_stage1_proj_f32.bin", (size_t)ssdit::SEQ * 1024);
+    } else {
+        NpyArray gN = npy_load(oracle + "/stage1_cond/global.npy");
+        NpyArray pN = npy_load(oracle + "/stage1_cond/proj.npy");
+        cond_g.assign(gN.f32(), gN.f32() + gN.numel());
+        cond_p.assign(pN.f32(), pN.f32() + pN.numel());
+    }
     std::vector<float> zero_g(cond_g.size(), 0.f), zero_p(cond_p.size(), 0.f);
 
     // forward(x,t_scaled,use_cond) -> v_host[NEL]
@@ -80,35 +105,43 @@ int main(int argc, char** argv) {
     };
 
     // ===== sampler loop =====
-    NpyArray noiseN = npy_load(std::string(REFS) + "/noise_seed42.npy");
-    std::vector<float> x(noiseN.f32(), noiseN.f32() + NEL);
-    std::vector<float> tseq(STEPS + 1);
+    std::vector<float> x;
+    if (raw_inputs_env) x = load_raw_f32(std::string(raw_inputs_env) + "/native_stage1_noise_f32.bin", NEL);
+    else {
+        NpyArray noiseN = npy_load(oracle + "/stage1_noise/noise.npy");
+        x.assign(noiseN.f32(), noiseN.f32() + NEL);
+    }
+    // Match geo::flow_sampler and Python's np.linspace/Möbius construction:
+    // t pairs are formed in double, then individual tensor operations receive
+    // their F32 scalar.  A float-built sequence is enough to move a handful
+    // of occupancy-threshold voxels and is not a valid production comparison.
+    std::vector<double> tseq(STEPS + 1);
     for (int i = 0; i <= STEPS; i++) {
-        float lt = 1.0f - (float)i / STEPS;          // linspace(1,0,13)
+        double lt = 1.0 - (double)i / STEPS;          // np.linspace(1,0,13)
         tseq[i] = RT * lt / (1 + (RT - 1) * lt);     // Mobius warp
     }
     for (int s = 0; s < STEPS; s++) {
-        float t = tseq[s], tp = tseq[s + 1];
+        double t = tseq[s], tp = tseq[s + 1];
         std::vector<float> v;
         printf("  step %2d/%d t=%.4f %s\n", s + 1, STEPS, t, (t >= IV0 && t <= IV1) ? "[cfg]" : "[cond]");
         if (t >= IV0 && t <= IV1) {
-            std::vector<float> vp = forward(x, 1000.f * t, true);
-            std::vector<float> vn = forward(x, 1000.f * t, false);
+            std::vector<float> vp = forward(x, (float)(1000.0 * t), true);
+            std::vector<float> vn = forward(x, (float)(1000.0 * t), false);
             stat("vp", vp); stat("vn", vn);
             std::vector<float> pred(NEL);
             for (int i = 0; i < NEL; i++) pred[i] = GS * vp[i] + (1 - GS) * vn[i];
             // std-rescale
-            std::vector<float> x0p = pred_to_x0(x, t, vp), x0c = pred_to_x0(x, t, pred);
+            std::vector<float> x0p = pred_to_x0(x, (float)t, vp), x0c = pred_to_x0(x, (float)t, pred);
             double sp = vstd(x0p), sc = vstd(x0c), r = sp / sc;
             printf("    std_pos=%.4g std_cfg=%.4g r=%.4g\n", sp, sc, r);
             std::vector<float> x0(NEL);
             for (int i = 0; i < NEL; i++) { float resc = x0c[i] * (float)r; x0[i] = GR * resc + (1 - GR) * x0c[i]; }
-            v = x0_to_pred(x, t, x0);
+            v = x0_to_pred(x, (float)t, x0);
         } else {
-            v = forward(x, 1000.f * t, true);
+            v = forward(x, (float)(1000.0 * t), true);
             stat("v", v);
         }
-        for (int i = 0; i < NEL; i++) x[i] -= (t - tp) * v[i];
+        for (int i = 0; i < NEL; i++) x[i] -= (float)(t - tp) * v[i];
         stat("x", x);
         fflush(stdout);
     }
@@ -117,20 +150,22 @@ int main(int argc, char** argv) {
     // ===== compare z_s =====
     printf("[sampler] backend=%s\n", use_cuda ? "cuda" : "cpu");
     {
-        NpyArray gold = npy_load(std::string(GOLD) + "/stage1_ssdec/z_s.npy");  // bf16 torso
+        NpyArray gold = npy_load(oracle + "/stage1_ssdec/z_s.npy");
         double ma = 0, sum = 0; const float* g = gold.f32();
         for (int i = 0; i < NEL; i++) { double d = std::fabs(z_s[i] - g[i]); ma = std::max(ma, d); sum += d; }
-        printf("  z_s vs golden(bf16): maxabs=%.3e median(mean)=%.3e (expect ~1.2 / ~3.6e-3)\n", ma, sum / NEL);
+        printf("  z_s vs %s: maxabs=%.3e meanabs=%.3e%s\n",
+               has_oracle ? "stage reference" : "golden(bf16)", ma, sum / NEL,
+               has_oracle ? "" : " (expect ~1.2 / ~3.6e-3)");
     }
     {
         std::string tp = std::string(REFS) + "/torch_z_s_fp32.npy";
         std::ifstream f(tp);
-        if (f.good()) {
+        if (!has_oracle && f.good()) {
             NpyArray tz = npy_load(tp);
             double ma = 0, sum = 0; const float* g = tz.f32();
             for (int i = 0; i < NEL; i++) { double d = std::fabs(z_s[i] - g[i]); ma = std::max(ma, d); sum += d; }
             printf("  z_s vs torch_fp32: maxabs=%.3e meanabs=%.3e (tight fp32 cross-check)\n", ma, sum / NEL);
-        } else {
+        } else if (!has_oracle) {
             printf("  (torch_z_s_fp32.npy not ready yet — skipping tight cross-check)\n");
         }
     }
@@ -150,12 +185,16 @@ int main(int argc, char** argv) {
     std::vector<float> L((size_t)64 * 64 * 64);
     ggml_backend_tensor_get(logits, L.data(), 0, L.size() * sizeof(float));
     auto mine = ssvae::logits_to_coords(L);
-    auto gold = ssvae::load_golden_coords(std::string(GOLD) + "/stage1_out/coords.npy");
+    auto gold = ssvae::load_golden_coords(oracle + "/stage1_out/coords.npy");
     int inter = 0; for (auto& c : mine) if (gold.count(c)) inter++;
     int uni = (int)mine.size() + (int)gold.size() - inter;
     double iou = (double)inter / uni;
     printf("  coords mine N=%zu  golden N=%zu  inter=%d  IoU=%.4f\n", mine.size(), gold.size(), inter, iou);
-    bool ok = (mine.size() >= 1100 && mine.size() <= 1135 && iou > 0.97);
-    printf("[sampler] %s (expect N~1120, IoU~0.986)\n", ok ? "PASS" : "FAIL");
+    const bool ok = has_oracle
+        ? (mine.size() == gold.size() && inter == (int)gold.size())
+        : (mine.size() >= 1100 && mine.size() <= 1135 && iou > 0.97);
+    printf("[sampler] %s %s\n", ok ? "PASS" : "FAIL",
+           has_oracle ? "(exact stage oracle requires coordinate-set equality)"
+                      : "(expect N~1120, IoU~0.986)");
     return ok ? 0 : 1;
 }

@@ -5,6 +5,8 @@
 //
 // Build: g++ -O3 -fopenmp -std=c++17 -march=native -ffast-math p3sam_retopo.cpp -o p3sam_retopo
 // Run:   ./p3sam_retopo <dense.glb> <out_decimated.glb> [weights_dir] [obj_decimate_path] [seg_out.glb]
+//        ./p3sam_retopo <dense.glb> <ignored.glb> [weights_dir] [obj_decimate_path]
+//                         <seg_out.glb> --segment-only
 #include "p3sam_segment.hpp"
 #include "per_part_decimate.hpp"
 #include "glb_reader.hpp"
@@ -15,18 +17,42 @@
 #include <vector>
 #include <unordered_map>
 #include <ctime>
+#include <fstream>
 
 static double now_s() { return (double)clock() / CLOCKS_PER_SEC; }
 
+static bool write_face_ids_npy(const std::string& path, const std::vector<int64_t>& ids) {
+    std::string header = "{'descr': '<i8', 'fortran_order': False, 'shape': (" + std::to_string(ids.size()) + ",), }";
+    header.append((64 - ((10 + header.size() + 1) % 64)) % 64, ' ');
+    header += '\n';
+    const uint16_t hlen = (uint16_t)header.size();
+    std::ofstream file(path, std::ios::binary);
+    if (!file) return false;
+    file.write("\x93NUMPY", 6);
+    const char version[2] = {1, 0}; file.write(version, 2);
+    file.write(reinterpret_cast<const char*>(&hlen), 2);
+    file.write(header.data(), (std::streamsize)header.size());
+    file.write(reinterpret_cast<const char*>(ids.data()), (std::streamsize)(ids.size() * sizeof(int64_t)));
+    return (bool)file;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
-        printf("usage: %s <dense.glb> <out_decimated.glb> [weights_dir] [obj_decimate] [seg_out.glb]\n", argv[0]);
+        printf("usage: %s <dense.glb> <out_decimated.glb> [weights_dir] [obj_decimate] [seg_out.glb] [--segment-only]\n", argv[0]);
         return 1;
     }
     std::string in = argv[1], out = argv[2];
     std::string wdir = argc > 3 ? argv[3] : "/mnt/hdd/3d/avatar-shootout/p3sam_goldens/weights_npy";
     std::string objdec = argc > 4 ? argv[4] : "./obj_decimate";
-    std::string segout = argc > 5 ? argv[5] : "";
+    std::string segout;
+    bool segment_only = false;
+    for (int i = 5; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--segment-only") segment_only = true;
+        else if (segout.empty()) segout = arg;
+        else { fprintf(stderr, "unexpected argument: %s\n", arg.c_str()); return 1; }
+    }
+    if (segment_only && segout.empty()) { fprintf(stderr, "--segment-only requires a segmentation GLB path\n"); return 1; }
 
     glb::Mesh m;
     if (!glb::read_glb(in.c_str(), m)) { printf("FAIL: read %s\n", in.c_str()); return 1; }
@@ -67,6 +93,13 @@ int main(int argc, char** argv) {
         }
         glb::write_glb(segout.c_str(), sv, sf, &vc);
         printf("[retopo] wrote segmentation -> %s\n", segout.c_str());
+        const std::string ids_out = segout + ".face_ids.npy";
+        if (!write_face_ids_npy(ids_out, face_ids)) { fprintf(stderr, "FAIL: write %s\n", ids_out.c_str()); return 1; }
+        printf("[retopo] wrote face ids -> %s\n", ids_out.c_str());
+    }
+    if (segment_only) {
+        printf("[retopo] segment-only complete; no decimated delivery mesh was written\n");
+        return 0;
     }
 
     glb::Mesh dec; std::vector<ppd::PartReport> rep;

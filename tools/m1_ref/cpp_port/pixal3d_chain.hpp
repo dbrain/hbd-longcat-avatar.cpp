@@ -18,6 +18,7 @@
 #include "tex_grid_sample.hpp"   // lap-17: per-vertex PBR grid_sample for the remeshed mesh
 #include "torch_randn.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -50,6 +51,33 @@ static const char* TEXDEC_W = "weights_npy/tex_dec";                        // M
 static inline double now_s() {
     using namespace std::chrono;
     return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Optional, deliberately raw stage capture for native-vs-reference diagnosis.  This is not a
+// production artifact: callers must opt in with PIXAL3D_STAGE_DUMP_DIR and create that directory
+// first.  Keeping the dump at the latent/PBR boundary lets us establish whether a visible atlas
+// fault came from M6 generation, M6 decode, or the later CPU UV bake without reinterpreting PNGs.
+static inline void dump_stage_blob(const char* name, const void* data, size_t bytes) {
+    const char* dir = std::getenv("PIXAL3D_STAGE_DUMP_DIR");
+    if (!dir || !*dir || !data || !bytes) return;
+    const std::string path = std::string(dir) + "/" + name;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { std::perror(("[dump] fopen " + path).c_str()); return; }
+    const size_t written = std::fwrite(data, 1, bytes, f);
+    std::fclose(f);
+    if (written != bytes) { std::fprintf(stderr, "[dump] short write %s: %zu/%zu bytes\n", path.c_str(), written, bytes); std::remove(path.c_str()); return; }
+    std::fprintf(stderr, "[dump] %s (%zu bytes)\n", path.c_str(), bytes);
+}
+
+static inline void dump_stage_note(const char* line) {
+    const char* dir = std::getenv("PIXAL3D_STAGE_DUMP_DIR");
+    if (!dir || !*dir || !line) return;
+    const std::string path = std::string(dir) + "/native_stage_manifest.txt";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (!f) return;
+    std::fputs(line, f);
+    std::fputc('\n', f);
+    std::fclose(f);
 }
 
 // DINOv3: normalized image CHW [3,IMG,IMG] -> global[5*1024] + patchmap[NP*1024] BHWC
@@ -186,7 +214,11 @@ static inline svae::Mesh build_mc_remesh(const std::vector<int32_t>& coords1024,
 // image -> mesh (+ optional texture outputs if in.textured). seed-42 noise reproduced.
 //   out_vcolors    : interim per-vertex RGB [V*3] (base_color), aligned 1:1 with mesh.verts.
 //   out_pbr_feats  : the full per-voxel 6-ch PBR volume [Nvox*6] (base_color3/metallic/roughness/alpha)
-//   out_pbr_coords : the matching voxel coords [Nvox*4] (b,x,y,z) on the grid-1024 lattice.
+//   out_pbr_coords : the matching voxel coords [Nvox*4] (b,x,y,z) on the grid-`in.resolution`
+//                    lattice -- 1024 by default, but 1536 for the 1536 HR cascade.  This lattice
+//                    scale is NOT implicit: whatever consumes (feats,coords) must sample at
+//                    (p+0.5)*in.resolution, so the value has to travel with the volume (image_to_rig
+//                    stages it as `resolution.bin` beside pbr_coords.bin).
 // The (feats,coords) volume feeds the UV-atlas bake (texatlas::bake); vcolors is the interim COLOR_0.
 static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = nullptr,
                                       std::vector<float>* out_vcolors = nullptr,
@@ -204,6 +236,12 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
     // (1) DINOv3@512 (shared by stage1 + stage2)
     std::vector<float> global512, patchmap512;
     { double t=now_s(); run_dinov3(img512_norm, dino::CFG512, cuda, global512, patchmap512); LOG("[1] DINOv3@512 (%.1fs)\n", now_s()-t); }
+    // The raw normalized image and DINO patch map are the causally earliest
+    // native/Python image-conditioning boundary.  Keep these diagnostic-only:
+    // production never sets PIXAL3D_STAGE_DUMP_DIR, but a trace can distinguish
+    // encoder drift from a later camera-projection calculation.
+    dump_stage_blob("native_stage1_normalized_input_f32.bin", img512_norm.data(), img512_norm.size()*sizeof(float));
+    dump_stage_blob("native_stage1_patchmap_f32.bin", patchmap512.data(), patchmap512.size()*sizeof(float));
 
     // (2) stage1: proj16 -> SS DiT -> SS VAE -> coords1
     std::vector<int32_t> coords1;
@@ -212,6 +250,30 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         const int NEL = ssdit::SEQ * ssdit::INCH;
         std::vector<float> noise1 = gen.randn(NEL);
         std::vector<float> z_s(NEL);
+        // Oracle-only injection for a causality check.  Supplying the Python
+        // stage-1 condition *and* noise lets us tell whether a small DINO/
+        // projection delta is being amplified by the flow, or whether the
+        // native DiT/sampler itself is wrong.  It is deliberately opt-in and
+        // never read by the production wrappers.
+        if (const char* oracle = std::getenv("PIXAL3D_STAGE1_ORACLE_DIR")) {
+            auto load_f32 = [&](const char* rel, std::vector<float>& dst, size_t want) {
+                NpyArray a = npy_load(std::string(oracle) + "/" + rel);
+                if (a.numel() != want) throw std::runtime_error(std::string("stage1 oracle size mismatch: ") + rel);
+                const float* p = a.f32(); dst.assign(p, p + want);
+            };
+            load_f32("stage1_cond/global.npy", global512, (size_t)5 * 1024);
+            load_f32("stage1_cond/proj.npy", proj_ss, (size_t)ssdit::SEQ * 1024);
+            load_f32("stage1_noise/noise.npy", noise1, (size_t)NEL);
+            dump_stage_note("stage1 input=python-oracle-npy");
+        }
+        // Capture every stage-1 boundary when explicitly requested.  This is
+        // diagnostic-only: stage 1 determines the subsequent sparse lattice,
+        // so even a one-voxel mismatch consumes a different random stream in
+        // every later flow stage and makes texture comparisons meaningless.
+        dump_stage_blob("native_stage1_global_f32.bin", global512.data(), global512.size()*sizeof(float));
+        dump_stage_blob("native_stage1_proj_f32.bin", proj_ss.data(), proj_ss.size()*sizeof(float));
+        dump_stage_blob("native_stage1_noise_f32.bin", noise1.data(), noise1.size()*sizeof(float));
+        dump_stage_note("stage1 normalized_input_f32=[3,512,512] patchmap_f32=[32,32,1024] global_f32=[5,1024] proj_f32=[4096,1024] noise_f32=[1,8,16,16,16]");
         {
             M1Harness Hf(SSF_W, 512, cuda);
             ggml_context* cf = Hf.ctx;
@@ -241,6 +303,7 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
             if (nsys_ss) cudaProfilerStop();
             LOG("[2] SS DiT (%.1fs)\n", now_s()-t);
         }
+        dump_stage_blob("native_stage1_z_s_f32.bin", z_s.data(), z_s.size()*sizeof(float));
         {
             M1Harness Hd(SSD_W, 256, cuda);
             ggml_context* cd = Hd.ctx;
@@ -250,10 +313,13 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
             ggml_cgraph* gfd = new_graph(cd, 8192); ggml_build_forward_expand(gfd, logits);
             Hd.alloc_and_upload(gfd); Hd.upload_input_raw(zin, z_s); Hd.compute(gfd);
             std::vector<float> L((size_t)64*64*64); ggml_backend_tensor_get(logits,L.data(),0,L.size()*4);
+            dump_stage_blob("native_stage1_ss_logits_f32.bin", L.data(), L.size()*sizeof(float));
             auto cs = ssvae::logits_to_coords(L);
             coords1.reserve(cs.size()*4);
             for (auto& c : cs) { coords1.push_back(0); coords1.push_back(c[0]); coords1.push_back(c[1]); coords1.push_back(c[2]); }
         }
+        dump_stage_blob("native_stage1_coords_i32.bin", coords1.data(), coords1.size()*sizeof(int32_t));
+        dump_stage_note(("stage1 coords_i32=[" + std::to_string(coords1.size()/4) + ",4]").c_str());
     }
     int N1 = (int)coords1.size()/4;
     if (V) printf("[2] stage1 coords N1=%d\n", N1);
@@ -332,6 +398,14 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         cond3b = geo::proj_cond_shape(coordsM.data(), M, patchmap1024.data(), 64, 64,
                                       naf_hr.data(), 512, 512, dino::HID, in.resolution/16, 1024, cam);
     }
+    // Stage-3b and Stage-4 use this exact projection conditioning.  Dump it with its coordinate
+    // lattice when diagnostics are enabled so a native/reference mismatch can be assigned to
+    // DINO/NAF/projection rather than being blamed on the M6 sampler or atlas.
+    dump_stage_blob("native_cond_coords_i32.bin", coordsM.data(), coordsM.size()*sizeof(int32_t));
+    dump_stage_blob("native_cond_global_f32.bin", global1024.data(), global1024.size()*sizeof(float));
+    dump_stage_blob("native_cond_proj_f32.bin", cond3b.data(), cond3b.size()*sizeof(float));
+    dump_stage_note(("condition coords_i32=[" + std::to_string(M) + ",4] global_f32=[5,1024] proj_f32=[" +
+                     std::to_string(M) + ",2048]").c_str());
 
     // (6) M3b DiT -> shape_slat (denorm)
     std::vector<float> shape_denorm;
@@ -362,6 +436,10 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         shape_denorm = hr_raw;
         geo::denorm_inplace(shape_denorm, in.norm_mean.data(), in.norm_std.data(), slatdit::INCH);
     }
+    dump_stage_blob("native_shape_coords_i32.bin", coordsM.data(), coordsM.size()*sizeof(int32_t));
+    dump_stage_blob("native_shape_slat_f32.bin", shape_denorm.data(), shape_denorm.size()*sizeof(float));
+    dump_stage_note(("shape_slat coords_i32=[" + std::to_string(M) + ",4] feats_f32=[" +
+                     std::to_string(M) + ",32]").c_str());
 
     // (7) M4 shape decoder + mesh (capture per-level subs for the tex branch; grid-1024 occupancy
     //     for the remesh). close_surface (the interim hole-fill hack) is skipped when remeshing.
@@ -512,6 +590,8 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
         }
         std::vector<float> tex_slat = tex_raw;
         geo::denorm_inplace(tex_slat, in.tex_mean.data(), in.tex_std.data(), INCH);
+        dump_stage_blob("native_tex_slat_f32.bin", tex_slat.data(), tex_slat.size()*sizeof(float));
+        dump_stage_note(("tex_slat feats_f32=[" + std::to_string(M) + ",32]").c_str());
         double tt=now_s();
         std::vector<int32_t> pbr_coords;
 #ifdef M3A_USE_CUDA
@@ -522,6 +602,10 @@ static inline svae::Mesh run_geometry(const ChainInput& in, ChainStats* stats = 
 #endif
         if (V) printf("[8] tex decoder: %d PBR voxels (%.1fs)\n", (int)pbr.size()/6, now_s()-tt);
         int V6 = (int)pbr.size()/6;
+        dump_stage_blob("native_pbr_coords_i32.bin", pbr_coords.data(), pbr_coords.size()*sizeof(int32_t));
+        dump_stage_blob("native_pbr_feats_f32.bin", pbr.data(), pbr.size()*sizeof(float));
+        dump_stage_note(("pbr coords_i32=[" + std::to_string(V6) + ",4] feats_f32=[" +
+                         std::to_string(V6) + ",6]").c_str());
         // full PBR volume (feeds the UV-atlas bake): feats [V6*6] + coords [V6*4]
         if (out_pbr_feats)  *out_pbr_feats  = pbr;
         if (out_pbr_coords) *out_pbr_coords = pbr_coords;

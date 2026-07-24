@@ -4,10 +4,73 @@
 // reference; identical math (mirrors tools/m1_ref/ss_dit.py).
 #pragma once
 #include "m1_ggml.hpp"
+#include <algorithm>
 #include <cmath>
 
 namespace ssdit {
 static const int C = 1536, NB = 30, NH = 12, HD = 128, SEQ = 4096, INCH = 8, TE_HALF = 128;
+
+// Pixal's flow torso is trained and deployed in mixed BF16/F32.  Its conversion
+// helper changes only Linear modules inside `blocks`; LayerNorm parameters,
+// RMSNorm gains, and the shared block modulation parameter remain F32.  The
+// input projection, time embedding/share-modulation, final norm, and output
+// projection also remain F32.
+// Keeping the old F32 port as the default preserves the existing component
+// parity tests.  PIXAL3D_SS_BF16=1 is the native-model-contract diagnostic
+// mode: it emulates BF16 block values as a BF16 round-trip around each block
+// operation.  ggml's CUDA elementwise broadcast/norm kernels do not accept
+// BF16 operands, so the actual operation remains F32 but sees and returns the
+// same BF16-representable values that the PyTorch torso carries between ops.
+static inline bool use_native_bf16() {
+    const char* e = std::getenv("PIXAL3D_SS_BF16");
+    return e && std::atoi(e) != 0;
+}
+
+static inline ggml_tensor* torso_cast(ggml_context* ctx, ggml_tensor* x, bool bf16) {
+    if (!bf16) return x;
+    // CUDA's add/norm paths reject a BF16 input, but F32<-BF16 preserves the
+    // exact BF16 rounding point and makes the result usable by those paths.
+    return ggml_cast(ctx, ggml_cast(ctx, x, GGML_TYPE_BF16), GGML_TYPE_F32);
+}
+
+// Tensor-core accumulation is F32, as in PyTorch.  PyTorch then stores the
+// linear result in BF16, represented here by torso_cast before the next op.
+static inline ggml_tensor* torso_lin(ggml_context* ctx, ggml_tensor* W, ggml_tensor* b,
+                                     ggml_tensor* x, bool bf16) {
+    if (!bf16) return lin(ctx, W, b, x);
+    // Diagnostic A/B: preserve the exact BF16 operands but execute the GEMM
+    // through F32 storage/accumulation.  This isolates cuBLAS BF16 output
+    // rounding/order from the surrounding model contract on the fixed M6
+    // oracle.  Production remains the direct BF16 tensor-core path.
+    const bool f32_gemm = std::getenv("PIXAL3D_BF16_F32_GEMM") != nullptr;
+    ggml_tensor* w = ggml_cast(ctx, W, GGML_TYPE_BF16);
+    ggml_tensor* a = ggml_cast(ctx, x, GGML_TYPE_BF16);
+    if (f32_gemm) { w = ggml_cast(ctx, w, GGML_TYPE_F32); a = ggml_cast(ctx, a, GGML_TYPE_F32); }
+    ggml_tensor* y = ggml_mul_mat(ctx, w, a);
+    ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+    if (b) y = ggml_add(ctx, y, torso_cast(ctx, b, true));
+    return torso_cast(ctx, y, true);
+}
+
+static inline ggml_tensor* torso_layernorm(ggml_context* ctx, ggml_tensor* x,
+                                            ggml_tensor* w, ggml_tensor* b, float eps,
+                                            bool bf16) {
+    if (!bf16) return layernorm(ctx, x, w, b, eps);
+    // LayerNorm32 upcasts its BF16 activation to F32; its affine parameters
+    // were never converted by Pixal's MIX_PRECISION_MODULES helper.
+    return torso_cast(ctx, layernorm(ctx, torso_cast(ctx, x, true),
+                                    w, b, eps), true);
+}
+
+static inline ggml_tensor* torso_rmsnorm(ggml_context* ctx, ggml_tensor* x,
+                                          ggml_tensor* gamma, bool bf16) {
+    if (!bf16) return mh_rms_norm(ctx, x, gamma);
+    // MultiHeadRMSNorm.gamma is a Parameter, not a Linear parameter, so it
+    // stays F32 in the reference.  The result is cast back to the activation
+    // dtype at the module boundary.
+    return torso_cast(ctx, mh_rms_norm(ctx, torso_cast(ctx, x, true),
+                                       gamma), true);
+}
 
 // complex interleaved RoPE: out=x*COS+rot(x)*SIN, rot[2p]=-x[2p+1],rot[2p+1]=x[2p].
 static inline ggml_tensor* rope_inter(ggml_context* ctx, ggml_tensor* t, ggml_tensor* COS, ggml_tensor* SIN) {
@@ -29,7 +92,10 @@ static inline void fill_cos_sin(const std::string& rope_npy, std::vector<float>&
 // Returns vout [token,8]; block0 optional.
 static inline ggml_tensor* build_ss_dit_forward(ggml_context* ctx, M1Harness& H,
         ggml_tensor* xin, ggml_tensor* tin, ggml_tensor* gin, ggml_tensor* pin,
-        ggml_tensor** block0_out = nullptr) {
+        ggml_tensor** block0_out = nullptr,
+        const std::vector<int>* block_tap_indices = nullptr,
+        std::vector<ggml_tensor*>* block_taps = nullptr) {
+    const bool bf16 = use_native_bf16();
     // rope constants (persistent — NOT gallocr-managed inputs)
     std::vector<float> frb; fill_freqs(frb);
     std::vector<float> cosb, sinb; fill_cos_sin(H.wdir + "/rope_phases.npy", cosb, sinb);
@@ -46,63 +112,80 @@ static inline ggml_tensor* build_ss_dit_forward(ggml_context* ctx, M1Harness& H,
     temb = lin(ctx, H.weight("t_embedder.mlp.2.weight"), H.weight("t_embedder.mlp.2.bias"), temb);
     temb = silu_(ctx, temb);
     ggml_tensor* tmod = lin(ctx, H.weight("adaLN_modulation.1.weight"), H.weight("adaLN_modulation.1.bias"), temb);
+    tmod = torso_cast(ctx, tmod, bf16);
 
     ggml_tensor* h = ggml_cont(ctx, ggml_transpose(ctx, xin));  // [8, token]
     h = lin(ctx, H.weight("input_layer.weight"), H.weight("input_layer.bias"), h);  // [1536, token]
+    h = torso_cast(ctx, h, bf16);
+    // The reference casts both projection-conditioning tensors before entering
+    // the BF16 torso.  They are not merely weights of a BF16 linear: the
+    // original values are otherwise retained through cross-attention/proj.
+    ggml_tensor* torso_gin = torso_cast(ctx, gin, bf16);
+    ggml_tensor* torso_pin = torso_cast(ctx, pin, bf16);
 
     for (int bi = 0; bi < NB; bi++) {
         std::string bp = "blocks." + std::to_string(bi) + ".";
-        ggml_tensor* mod6 = ggml_add(ctx, H.weight(bp + "modulation"), tmod);
+        // `modulation` is a raw Parameter and stays F32.  Python adds it to
+        // BF16 tmod in F32, then explicitly casts the sum to mod.dtype.
+        ggml_tensor* mod6 = torso_cast(ctx, ggml_add(ctx, H.weight(bp + "modulation"), tmod), bf16);
         auto chunk = [&](int i) { return ggml_view_1d(ctx, mod6, C, (size_t)i * C * ggml_element_size(mod6)); };
         ggml_tensor* s_msa = chunk(0), *sc_msa = chunk(1), *g_msa = chunk(2);
         ggml_tensor* s_mlp = chunk(3), *sc_mlp = chunk(4), *g_mlp = chunk(5);
 
-        ggml_tensor* a = layernorm(ctx, h, nullptr, nullptr, 1e-6f);
-        a = modulate(ctx, a, sc_msa, s_msa);
-        ggml_tensor* qkv = lin(ctx, H.weight(bp + "self_attn.to_qkv.weight"), H.weight(bp + "self_attn.to_qkv.bias"), a);
+        ggml_tensor* a = torso_layernorm(ctx, h, nullptr, nullptr, 1e-6f, bf16);
+        a = torso_cast(ctx, modulate(ctx, a, sc_msa, s_msa), bf16);
+        ggml_tensor* qkv = torso_lin(ctx, H.weight(bp + "self_attn.to_qkv.weight"), H.weight(bp + "self_attn.to_qkv.bias"), a, bf16);
         qkv = ggml_reshape_4d(ctx, qkv, HD, NH, 3, SEQ);
         auto take = [&](int three) {
             ggml_tensor* t = ggml_cont(ctx, ggml_view_4d(ctx, qkv, HD, NH, 1, SEQ, qkv->nb[1], qkv->nb[2], qkv->nb[3], (size_t)three * qkv->nb[2]));
             return ggml_reshape_3d(ctx, t, HD, NH, SEQ);
         };
         ggml_tensor* q = take(0), *k = take(1), *v = take(2);
-        q = mh_rms_norm(ctx, q, H.weight(bp + "self_attn.q_rms_norm.gamma"));
-        k = mh_rms_norm(ctx, k, H.weight(bp + "self_attn.k_rms_norm.gamma"));
-        q = rope_inter(ctx, q, COS, SIN);
-        k = rope_inter(ctx, k, COS, SIN);
-        ggml_tensor* sa = attention(ctx, q, k, v, 1.0f / std::sqrt((float)HD));
-        sa = lin(ctx, H.weight(bp + "self_attn.to_out.weight"), H.weight(bp + "self_attn.to_out.bias"), sa);
-        sa = ggml_mul(ctx, sa, g_msa);
-        h = ggml_add(ctx, h, sa);
+        q = torso_rmsnorm(ctx, q, H.weight(bp + "self_attn.q_rms_norm.gamma"), bf16);
+        k = torso_rmsnorm(ctx, k, H.weight(bp + "self_attn.k_rms_norm.gamma"), bf16);
+        q = torso_cast(ctx, rope_inter(ctx, q, COS, SIN), bf16);
+        k = torso_cast(ctx, rope_inter(ctx, k, COS, SIN), bf16);
+        ggml_tensor* sa = torso_cast(ctx, attention(ctx, q, k, torso_cast(ctx, v, bf16), 1.0f / std::sqrt((float)HD)), bf16);
+        sa = torso_lin(ctx, H.weight(bp + "self_attn.to_out.weight"), H.weight(bp + "self_attn.to_out.bias"), sa, bf16);
+        sa = torso_cast(ctx, ggml_mul(ctx, sa, g_msa), bf16);
+        h = torso_cast(ctx, ggml_add(ctx, h, sa), bf16);
 
-        ggml_tensor* hn = layernorm(ctx, h, H.weight(bp + "norm2.weight"), H.weight(bp + "norm2.bias"), 1e-6f);
+        ggml_tensor* hn = torso_layernorm(ctx, h, H.weight(bp + "norm2.weight"), H.weight(bp + "norm2.bias"), 1e-6f, bf16);
         std::string cab = bp + "cross_attn.cross_attn_block.";
-        ggml_tensor* cq = lin(ctx, H.weight(cab + "to_q.weight"), H.weight(cab + "to_q.bias"), hn);
+        ggml_tensor* cq = torso_lin(ctx, H.weight(cab + "to_q.weight"), H.weight(cab + "to_q.bias"), hn, bf16);
         cq = ggml_reshape_3d(ctx, cq, HD, NH, SEQ);
-        ggml_tensor* ckv = lin(ctx, H.weight(cab + "to_kv.weight"), H.weight(cab + "to_kv.bias"), gin);
+        ggml_tensor* ckv = torso_lin(ctx, H.weight(cab + "to_kv.weight"), H.weight(cab + "to_kv.bias"), torso_gin, bf16);
         ckv = ggml_reshape_4d(ctx, ckv, HD, NH, 2, 5);
         auto takekv = [&](int two) {
             ggml_tensor* t = ggml_cont(ctx, ggml_view_4d(ctx, ckv, HD, NH, 1, 5, ckv->nb[1], ckv->nb[2], ckv->nb[3], (size_t)two * ckv->nb[2]));
             return ggml_reshape_3d(ctx, t, HD, NH, 5);
         };
         ggml_tensor* ck = takekv(0), *cv = takekv(1);
-        cq = mh_rms_norm(ctx, cq, H.weight(cab + "q_rms_norm.gamma"));
-        ck = mh_rms_norm(ctx, ck, H.weight(cab + "k_rms_norm.gamma"));
-        ggml_tensor* ca = attention(ctx, cq, ck, cv, 1.0f / std::sqrt((float)HD));
-        ca = lin(ctx, H.weight(cab + "to_out.weight"), H.weight(cab + "to_out.bias"), ca);
-        ggml_tensor* pj = lin(ctx, H.weight(bp + "cross_attn.proj_linear.weight"), H.weight(bp + "cross_attn.proj_linear.bias"), pin);
-        h = ggml_add(ctx, h, ggml_add(ctx, ca, pj));
+        cq = torso_rmsnorm(ctx, cq, H.weight(cab + "q_rms_norm.gamma"), bf16);
+        ck = torso_rmsnorm(ctx, ck, H.weight(cab + "k_rms_norm.gamma"), bf16);
+        ggml_tensor* ca = torso_cast(ctx, attention(ctx, cq, ck, torso_cast(ctx, cv, bf16), 1.0f / std::sqrt((float)HD)), bf16);
+        ca = torso_lin(ctx, H.weight(cab + "to_out.weight"), H.weight(cab + "to_out.bias"), ca, bf16);
+        ggml_tensor* pj = torso_lin(ctx, H.weight(bp + "cross_attn.proj_linear.weight"), H.weight(bp + "cross_attn.proj_linear.bias"), torso_pin, bf16);
+        h = torso_cast(ctx, ggml_add(ctx, h, torso_cast(ctx, ggml_add(ctx, ca, pj), bf16)), bf16);
 
-        ggml_tensor* m = layernorm(ctx, h, nullptr, nullptr, 1e-6f);
-        m = modulate(ctx, m, sc_mlp, s_mlp);
-        m = lin(ctx, H.weight(bp + "mlp.mlp.0.weight"), H.weight(bp + "mlp.mlp.0.bias"), m);
-        m = gelu_tanh_(ctx, m);
-        m = lin(ctx, H.weight(bp + "mlp.mlp.2.weight"), H.weight(bp + "mlp.mlp.2.bias"), m);
-        m = ggml_mul(ctx, m, g_mlp);
-        h = ggml_add(ctx, h, m);
+        ggml_tensor* m = torso_layernorm(ctx, h, nullptr, nullptr, 1e-6f, bf16);
+        m = torso_cast(ctx, modulate(ctx, m, sc_mlp, s_mlp), bf16);
+        m = torso_lin(ctx, H.weight(bp + "mlp.mlp.0.weight"), H.weight(bp + "mlp.mlp.0.bias"), m, bf16);
+        m = torso_cast(ctx, gelu_tanh_(ctx, m), bf16);
+        m = torso_lin(ctx, H.weight(bp + "mlp.mlp.2.weight"), H.weight(bp + "mlp.mlp.2.bias"), m, bf16);
+        m = torso_cast(ctx, ggml_mul(ctx, m, g_mlp), bf16);
+        h = torso_cast(ctx, ggml_add(ctx, h, m), bf16);
 
         if (bi == 0 && block0_out) { h = ggml_cont(ctx, h); *block0_out = h; ggml_set_output(h); }
+        if (block_taps && block_tap_indices &&
+            std::find(block_tap_indices->begin(), block_tap_indices->end(), bi) != block_tap_indices->end()) {
+            h = ggml_cont(ctx, h);
+            block_taps->push_back(h);
+            ggml_set_output(h);
+        }
     }
+    // Explicit Python manual_cast(h, x.dtype) before the F32 final norm/head.
+    if (bf16) h = ggml_cast(ctx, h, GGML_TYPE_F32);
     h = layernorm(ctx, h, nullptr, nullptr, 1e-5f);
     h = lin(ctx, H.weight("out_layer.weight"), H.weight("out_layer.bias"), h);  // [8, token]
     return ggml_cont(ctx, ggml_transpose(ctx, h));  // [token, 8]

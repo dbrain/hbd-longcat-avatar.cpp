@@ -12,6 +12,8 @@ import cumesh
 import nvdiffrast.torch as dr
 from flex_gemm.ops.grid_sample import grid_sample_3d
 HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.environ.get("OUT_DIR", HERE)
+os.makedirs(OUT, exist_ok=True)
 REFS = os.path.join(HERE, "refs", "stage4")
 GOLD = os.path.join(HERE, "..", "..", "sparse_spike", "golden_stages", "stage5_mesh")
 RES = 1024
@@ -61,8 +63,8 @@ metal = cv2.inpaint(metal, mi, 1, cv2.INPAINT_TELEA)[..., None]
 rough = cv2.inpaint(rough, mi, 1, cv2.INPAINT_TELEA)[..., None]
 alpha = cv2.inpaint(alpha, mi, 1, cv2.INPAINT_TELEA)[..., None]
 
-Image.fromarray(np.concatenate([base, alpha], -1)).save(os.path.join(HERE, "pyref_base_color.png"))
-Image.fromarray(np.concatenate([np.zeros_like(metal), rough, metal], -1)).save(os.path.join(HERE, "pyref_metal_rough.png"))
+Image.fromarray(np.concatenate([base, alpha], -1)).save(os.path.join(OUT, "pyref_base_color.png"))
+Image.fromarray(np.concatenate([np.zeros_like(metal), rough, metal], -1)).save(os.path.join(OUT, "pyref_metal_rough.png"))
 
 material = trimesh.visual.material.PBRMaterial(
     baseColorTexture=Image.fromarray(np.concatenate([base, alpha], -1)),
@@ -72,6 +74,6 @@ material = trimesh.visual.material.PBRMaterial(
 uvs2 = uvs.copy(); uvs2[:,1] = 1 - uvs2[:,1]
 out = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals, process=False,
                       visual=trimesh.visual.TextureVisuals(uv=uvs2, material=material))
-out.export(os.path.join(HERE, "miku_uvatlas_pyref.glb"))
-print(f"[pyref] wrote miku_uvatlas_pyref.glb + pyref_base_color.png + pyref_metal_rough.png")
+out.export(os.path.join(OUT, "miku_uvatlas_python.glb"))
+print(f"[pyref] wrote {OUT}/miku_uvatlas_python.glb + pyref_base_color.png + pyref_metal_rough.png")
 print(f"[pyref] base_color valid-region mean = {base[m].mean(0) if m.any() else None}")

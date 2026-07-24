@@ -9,9 +9,11 @@
 // logits [vocab, S]. Weight keys = PyTorch state_dict suffixes under `prefix` (default "transformer.").
 #pragma once
 #include "m1_ggml.hpp"
+#include "qwen3_subtrace.hpp"
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cstdlib>
 
 struct Qwen3Cfg {
     int hidden = 896, n_layers = 28, n_heads = 16, n_kv = 8, head_dim = 128;
@@ -32,6 +34,14 @@ struct Qwen3Cfg {
     bool low_prec() const { return compute_type != GGML_TYPE_F32; }
 };
 
+// Full BF16 activation materialization is an explicit parity diagnostic until
+// its teacher-forced and free-running traces pass.  Existing production keeps
+// the previously validated F32-activation/BF16-matmul behavior by default.
+static inline bool qw_materialize_lowprec_activations() {
+    const char* e = std::getenv("RIG_BF16_ACTIVATIONS");
+    return e && e[0] != '\0' && e[0] != '0';
+}
+
 // Precision-aware Linear for the Qwen3 matmuls. When type == F32, delegate to lin() => the
 // validated fp32 path stays BIT-IDENTICAL (same ggml_mul_mat + GGML_PREC_F32). When type is
 // BF16/F16, cast BOTH the weight (src0) and the activation (src1) to `type` so the matmul runs on
@@ -45,16 +55,50 @@ static inline ggml_tensor* lin_lp(ggml_context* ctx, ggml_tensor* W, ggml_tensor
     ggml_tensor* xl = ggml_cast(ctx, x, type);                   // activation -> bf16/f16
     ggml_tensor* y  = ggml_mul_mat(ctx, Wl, xl);                 // low-prec matmul, F32 accum
     ggml_mul_mat_set_prec(y, GGML_PREC_F32);                     // accumulate in F32 (HF autocast)
-    return y;                                                    // [out, ...], F32 dst
+    // PyTorch Qwen3 stores the transformer in BF16: Linear's F32 accumulator
+    // is rounded at the activation boundary before residuals, norms, and the
+    // next Linear.  Keep the F32 path untouched; materialize that boundary
+    // explicitly for the low-precision graph.
+    return qw_materialize_lowprec_activations() ? ggml_cast(ctx, y, type) : y;
 }
 
 // RMSNorm over ne0 (* weight). x/sqrt(mean(x^2)+eps) * w.
 static inline ggml_tensor* qw_rmsnorm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, float eps) {
+    // Transformers Qwen3RMSNorm explicitly promotes the BF16 activation to
+    // F32 for the reduction, rounds the normalized activation back to BF16,
+    // then multiplies its BF16 weight.  The expanded B20 prefix arrives here
+    // as an F32 ggml input holding BF16-grid values, so reproduce that
+    // boundary explicitly when diagnosing Python parity.
+    const char * py_contract = std::getenv("RIG_PY_RMSNORM");
+    if (py_contract && py_contract[0] != '\0' && py_contract[0] != '0') {
+        ggml_tensor * xb = x->type == GGML_TYPE_BF16 ? x : ggml_cast(ctx, x, GGML_TYPE_BF16);
+        ggml_tensor * xf = ggml_cast(ctx, xb, GGML_TYPE_F32);
+        ggml_tensor * n = ggml_rms_norm(ctx, xf, eps);
+        n = ggml_cast(ctx, n, GGML_TYPE_BF16);
+        w = w->type == GGML_TYPE_BF16 ? w : ggml_cast(ctx, w, GGML_TYPE_BF16);
+        return ggml_mul(ctx, n, w);
+    }
+    if (qw_materialize_lowprec_activations() && (x->type == GGML_TYPE_BF16 || x->type == GGML_TYPE_F16))
+        w = ggml_cast(ctx, w, x->type);
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
 }
 
 // HF rope on x [head_dim, n_head, S]: x*cos + rotate_half(x)*sin. cos/sin [head_dim, 1, S].
 static inline ggml_tensor* qw_rope(ggml_context* ctx, ggml_tensor* x, ggml_tensor* cos, ggml_tensor* sin) {
+    const char * py_contract = std::getenv("RIG_PY_ROPE_BF16");
+    if (py_contract && py_contract[0] != '\0' && py_contract[0] != '0') {
+        x = x->type == GGML_TYPE_BF16 ? x : ggml_cast(ctx, x, GGML_TYPE_BF16);
+        cos = cos->type == GGML_TYPE_BF16 ? cos : ggml_cast(ctx, cos, GGML_TYPE_BF16);
+        sin = sin->type == GGML_TYPE_BF16 ? sin : ggml_cast(ctx, sin, GGML_TYPE_BF16);
+        return ggml_add(ctx, ggml_mul(ctx, x, cos), ggml_mul(ctx, rotate_half(ctx, x), sin));
+    }
+    // HF computes rotary tables in F32 from the (F32) hidden-state input and
+    // multiplies them with BF16 q/k projections.  That promotes the products
+    // to F32; rounding cos/sin to the activation dtype changes the phase and
+    // was the first layer-trace mismatch.  Keep the tables F32 here.
+    // ggml elementwise ops retain src0's dtype, unlike PyTorch promotion.
+    // Explicitly promote q/k so both products and their sum are F32.
+    if (x->type != GGML_TYPE_F32) x = ggml_cast(ctx, x, GGML_TYPE_F32);
     return ggml_add(ctx, ggml_mul(ctx, x, cos), ggml_mul(ctx, rotate_half(ctx, x), sin));
 }
 
@@ -89,9 +133,13 @@ static inline ggml_tensor* qw_causal_attn(ggml_context* ctx, ggml_tensor* q, ggm
 // one decoder layer.
 static inline ggml_tensor* qw_layer(M1Harness& H, ggml_context* ctx, const Qwen3Cfg& cfg,
                                     const std::string& p, ggml_tensor* x,
-                                    ggml_tensor* cos, ggml_tensor* sin, ggml_tensor* mask) {
+                                    ggml_tensor* cos, ggml_tensor* sin, ggml_tensor* mask,
+                                    Qwen3Subtrace* trace = nullptr, int layer = -1) {
     const int hd = cfg.head_dim, nh = cfg.n_heads, nkv = cfg.n_kv;
+    const std::string tn = trace && trace->enabled()
+        ? std::string("layer_") + (layer < 10 ? "0" : "") + std::to_string(layer) + "." : "";
     ggml_tensor* h = qw_rmsnorm(ctx, x, H.weight(p + "input_layernorm.weight"), cfg.eps);
+    if (trace) trace->add_last_2d(ctx, tn + "input_rmsnorm", h);
     const ggml_type ct = cfg.compute_type;
     ggml_tensor* q = lin_lp(ctx, H.weight(p + "self_attn.q_proj.weight"), h, ct);  // [nh*hd, S]
     ggml_tensor* k = lin_lp(ctx, H.weight(p + "self_attn.k_proj.weight"), h, ct);  // [nkv*hd, S]
@@ -99,33 +147,64 @@ static inline ggml_tensor* qw_layer(M1Harness& H, ggml_context* ctx, const Qwen3
     q = ggml_reshape_3d(ctx, q, hd, nh, q->ne[1]);
     k = ggml_reshape_3d(ctx, k, hd, nkv, k->ne[1]);
     v = ggml_reshape_3d(ctx, v, hd, nkv, v->ne[1]);
+    if (trace) {
+        trace->add_last_heads(ctx, tn + "q_proj", q);
+        trace->add_last_heads(ctx, tn + "k_proj", k);
+        trace->add_last_heads(ctx, tn + "v_proj", v);
+    }
     // qk-norm: RMSNorm over head_dim (* weight [hd]) BEFORE rope
     q = qw_rmsnorm(ctx, q, H.weight(p + "self_attn.q_norm.weight"), cfg.eps);
     k = qw_rmsnorm(ctx, k, H.weight(p + "self_attn.k_norm.weight"), cfg.eps);
+    if (trace) {
+        trace->add_last_heads(ctx, tn + "q_norm", q);
+        trace->add_last_heads(ctx, tn + "k_norm", k);
+    }
     q = qw_rope(ctx, q, cos, sin);
     k = qw_rope(ctx, k, cos, sin);
+    if (trace) {
+        trace->add_last_heads(ctx, tn + "q_post_rope", q);
+        trace->add_last_heads(ctx, tn + "k_post_rope", k);
+    }
     k = qw_repeat_kv(ctx, k, cfg.n_rep());
     v = ggml_cont(ctx, qw_repeat_kv(ctx, v, cfg.n_rep()));
     ggml_tensor* o = qw_causal_attn(ctx, q, k, v, mask, cfg.attn_scale());
+    if (trace) trace->add_last_2d(ctx, tn + "attn_pre_o", o);
     o = lin_lp(ctx, H.weight(p + "self_attn.o_proj.weight"), o, ct);
+    if (trace) trace->add_last_2d(ctx, tn + "o_proj", o);
     x = ggml_add(ctx, x, o);
+    if (trace) trace->add_last_2d(ctx, tn + "post_attn_residual", x);
     // SwiGLU MLP
     ggml_tensor* hn = qw_rmsnorm(ctx, x, H.weight(p + "post_attention_layernorm.weight"), cfg.eps);
     ggml_tensor* g = lin_lp(ctx, H.weight(p + "mlp.gate_proj.weight"), hn, ct);
     ggml_tensor* u = lin_lp(ctx, H.weight(p + "mlp.up_proj.weight"), hn, ct);
     ggml_tensor* m = ggml_mul(ctx, ggml_silu(ctx, g), u);
+    if (trace) {
+        trace->add_last_2d(ctx, tn + "post_attn_rmsnorm", hn);
+        trace->add_last_2d(ctx, tn + "gate_proj", g);
+        trace->add_last_2d(ctx, tn + "up_proj", u);
+        trace->add_last_2d(ctx, tn + "mlp_pre_down", m);
+    }
     m = lin_lp(ctx, H.weight(p + "mlp.down_proj.weight"), m, ct);
-    return ggml_add(ctx, x, m);
+    if (trace) trace->add_last_2d(ctx, tn + "down_proj", m);
+    x = ggml_add(ctx, x, m);
+    if (trace) trace->add_last_2d(ctx, tn + "layer_output", x);
+    return x;
 }
 
 // full forward. inputs_embeds [hidden, S]. cos/sin [head_dim, 1, S]. mask [S, S]. returns logits [vocab, S].
 static inline ggml_tensor* build_qwen3(M1Harness& H, ggml_context* ctx, const Qwen3Cfg& cfg,
                                        ggml_tensor* inputs_embeds, ggml_tensor* cos,
-                                       ggml_tensor* sin, ggml_tensor* mask) {
+                                       ggml_tensor* sin, ggml_tensor* mask,
+                                       Qwen3Subtrace* trace = nullptr) {
     const std::string m = cfg.prefix + "model.";
+    // The diagnostic oracle concatenates a native F32 mesh condition with
+    // BF16 token embeddings, so PyTorch promotes this boundary to F32. The
+    // first Linear autocast supplies the BF16 activation boundary; do not
+    // pre-round inputs_embeds here.
     ggml_tensor* x = inputs_embeds;
     for (int l = 0; l < cfg.n_layers; ++l)
-        x = qw_layer(H, ctx, cfg, m + "layers." + std::to_string(l) + ".", x, cos, sin, mask);
+        x = qw_layer(H, ctx, cfg, m + "layers." + std::to_string(l) + ".", x, cos, sin, mask, trace, l);
     x = qw_rmsnorm(ctx, x, H.weight(m + "norm.weight"), cfg.eps);
-    return lin_lp(ctx, H.weight(cfg.prefix + "lm_head.weight"), x, cfg.compute_type);   // [vocab, S]
+    ggml_tensor* logits = lin_lp(ctx, H.weight(cfg.prefix + "lm_head.weight"), x, cfg.compute_type);
+    return logits->type == GGML_TYPE_F32 ? logits : ggml_cast(ctx, logits, GGML_TYPE_F32); // host sampler reads F32
 }

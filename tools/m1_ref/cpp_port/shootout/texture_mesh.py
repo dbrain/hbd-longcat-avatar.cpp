@@ -28,13 +28,19 @@ ap.add_argument('--dino', default=None, help='local DINOv3 dir (redirects gated 
 ap.add_argument('--golden', default=None, help='dir to dump shape_slat/tex_slat goldens (for C++ port)')
 args = ap.parse_args()
 
-# redirect the image-cond model to a local DINOv3 mirror (facebook/dinov3-vitl16 is gated)
+# Redirect the image-cond model to a local DINOv3 mirror (facebook/dinov3-vitl16 is gated).
+# The weights directory is deliberately read-only on the render host, so never rewrite its
+# pipeline config during a run.  The supplied local config is part of the weight contract.
 config_file = 'texturing_pipeline.json'
 if args.dino:
-    cfg = json.load(open(os.path.join(args.weights, config_file)))
-    cfg['args']['image_cond_model']['args']['model_name'] = args.dino
     config_file = '_texturing_pipeline_local.json'
-    json.dump(cfg, open(os.path.join(args.weights, config_file), 'w'))
+    local_config = os.path.join(args.weights, config_file)
+    if not os.path.isfile(local_config):
+        raise RuntimeError(f'missing read-only local DINO config: {local_config}')
+    local_cfg = json.load(open(local_config))
+    configured_dino = local_cfg['args']['image_cond_model']['args']['model_name']
+    if os.path.realpath(configured_dino) != os.path.realpath(args.dino):
+        raise RuntimeError(f'local DINO config points to {configured_dino}, expected {args.dino}')
 
 print(f'[tex] loading Trellis2TexturingPipeline from {args.weights}', flush=True)
 pipe = Trellis2TexturingPipeline.from_pretrained(args.weights, config_file=config_file)
@@ -59,4 +65,7 @@ if args.golden:
 
 out = pipe.run(m, img, seed=args.seed, resolution=args.resolution, texture_size=args.texture_size)
 out.export(args.out)
+atlas_path = args.out + '.atlas.png'
+out.visual.material.baseColorTexture.convert('RGBA').save(atlas_path)
 print(f'[tex] wrote {args.out}', flush=True)
+print(f'[tex] base-color atlas {atlas_path}', flush=True)

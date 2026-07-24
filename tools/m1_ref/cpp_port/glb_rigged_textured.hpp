@@ -56,11 +56,15 @@ inline bool write_rigged_textured_glb(const char* path,
     const uint32_t V  = (uint32_t)(verts.size() / 3);
     const uint32_t F3 = (uint32_t)faces.size();   // index count = F*3
     const uint32_t J  = (uint32_t)(joints.size() / 3);
-    if (V == 0 || J == 0) return false;
-    if (parents.size() != J) return false;
-    if (skin_weights.size() != (size_t)V * J) return false;
-    if (uvs.size() != (size_t)V * 2) return false;
-    if (!tex_png || tex_png_len == 0) return false;
+    if (V == 0 || J == 0) { std::fprintf(stderr, "GLB write: empty mesh or skeleton\n"); return false; }
+    if (parents.size() != J) { std::fprintf(stderr, "GLB write: parent count mismatch\n"); return false; }
+    if (skin_weights.size() != (size_t)V * J) {
+        std::fprintf(stderr, "GLB write: skin shape mismatch (got %zu, expected %zu = V=%u * J=%u)\n",
+                     skin_weights.size(), (size_t)V * J, V, J);
+        return false;
+    }
+    if (uvs.size() != (size_t)V * 2) { std::fprintf(stderr, "GLB write: UV shape mismatch\n"); return false; }
+    if (!tex_png || tex_png_len == 0) { std::fprintf(stderr, "GLB write: missing texture bytes\n"); return false; }
 
     // normals: use supplied, else compute
     std::vector<float> nrm_local;
@@ -72,7 +76,7 @@ inline bool write_rigged_textured_glb(const char* path,
 
     // skeleton: local translations + inverse-bind matrices (shared with glb_rigged.hpp)
     std::vector<float> locals, ibm;
-    if (!rig_local_and_ibm(joints, parents, locals, ibm)) return false;
+    if (!rig_local_and_ibm(joints, parents, locals, ibm)) { std::fprintf(stderr, "GLB write: malformed skeleton forest\n"); return false; }
 
     // LBS top-4 encode (shared with glb_rigged.hpp)
     std::vector<uint16_t> joints4;
@@ -236,7 +240,7 @@ inline bool write_rigged_textured_glb(const char* path,
     uint32_t total      = 12 + 8 + json_chunk + 8 + bin_chunk;
 
     FILE* f = std::fopen(path, "wb");
-    if (!f) return false;
+    if (!f) { std::fprintf(stderr, "GLB write: cannot open output\n"); return false; }
     auto w32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
     auto wz  = [&](uint32_t n) { for (uint32_t i = 0; i < n; i++) std::fputc(0, f); };
     w32(0x46546C67u); w32(2u); w32(total);                 // header

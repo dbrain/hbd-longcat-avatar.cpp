@@ -59,15 +59,23 @@ int main(int argc, char** argv) {
     ggml_tensor* cos3 = ggml_reshape_3d(ctx, cosT, hd, 1, S);
     ggml_tensor* sin3 = ggml_reshape_3d(ctx, sinT, hd, 1, S);
 
-    ggml_tensor* logits = build_qwen3(H, ctx, cfg, inp, cos3, sin3, maskT);  // [vocab, S]
+    Qwen3Subtrace subtrace;
+    if (const char* dir = Qwen3Subtrace::env_dir()) {
+        subtrace.dir = dir;
+        printf("[qwen3_r2] subtrace enabled -> %s\n", dir);
+    }
+    ggml_tensor* logits = build_qwen3(H, ctx, cfg, inp, cos3, sin3, maskT,
+                                      subtrace.enabled() ? &subtrace : nullptr);  // [vocab, S]
     ggml_set_output(logits);
 
     ggml_cgraph* gf = new_graph(ctx, 32768);
     ggml_build_forward_expand(gf, logits);
+    subtrace.add_to_graph(gf);
     H.alloc_and_upload(gf);
     std::vector<float> ie_vec(ie.f32(), ie.f32() + ie.numel());
     H.upload_input_raw(inp, ie_vec);
     H.compute(gf);
+    subtrace.write(H);
 
     printf("[qwen3_r2] ran -> logits [%lld,%lld]\n", (long long)logits->ne[0], (long long)logits->ne[1]);
     CmpStats s = compare_to_npy(H, logits, golden + "/logits.npy", true, "logits");

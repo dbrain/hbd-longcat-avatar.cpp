@@ -31,6 +31,7 @@
 #include <vector>
 #include <stdexcept>
 #include <cstdlib>
+#include <cstring>
 
 struct Qwen3KvCache {
     // Persistent buffer (own ctx, like ctx_w) so gallocr never reuses the cache memory between
@@ -44,11 +45,20 @@ struct Qwen3KvCache {
 
     // Allocate the cache tensors in a dedicated persistent backend buffer. Call AFTER the harness
     // backend exists; sizes for `max_seq` positions (e.g. 1152 >= S=1079).
-    // KV-cache storage dtype. F16 by default (HALVES cache VRAM; Python's KV is bf16 so f16 is MORE
-    // faithful than our old f32). Toggle to f32 with env RIG_KV_F16=0 for an A/B parity check.
+    // Keep F16 as the production default until BF16 cache parity is proven.
+    // RIG_KV_TYPE=bf16 is a diagnostic mode for models whose native cache is
+    // BF16; the CUDA repeat/concat paths validate that mode explicitly.
     static ggml_type kv_dtype() {
+        const char* t = std::getenv("RIG_KV_TYPE");
+        if (t) {
+            if (std::strcmp(t, "bf16") == 0) return GGML_TYPE_BF16;
+            if (std::strcmp(t, "f16") == 0) return GGML_TYPE_F16;
+            if (std::strcmp(t, "f32") == 0) return GGML_TYPE_F32;
+            throw std::runtime_error("RIG_KV_TYPE must be bf16, f16, or f32");
+        }
         const char* e = std::getenv("RIG_KV_F16");
-        return (e && e[0] == '0') ? GGML_TYPE_F32 : GGML_TYPE_F16;
+        if (e && e[0] == '0') return GGML_TYPE_F32;
+        return GGML_TYPE_F16;
     }
     void init(M1Harness& H, const Qwen3Cfg& cfg, int max_seq_) {
         max_seq = max_seq_;
@@ -106,9 +116,13 @@ static inline void upload_weights_maybe_f16(M1Harness& H) {
 static inline void qw_qkv_for_chunk(M1Harness& H, ggml_context* ctx, const Qwen3Cfg& cfg,
                                     const std::string& p, ggml_tensor* x,
                                     ggml_tensor* cos, ggml_tensor* sin,
-                                    ggml_tensor*& q_out, ggml_tensor*& k_out, ggml_tensor*& v_out) {
+                                    ggml_tensor*& q_out, ggml_tensor*& k_out, ggml_tensor*& v_out,
+                                    Qwen3Subtrace* trace = nullptr, int layer = -1) {
     const int hd = cfg.head_dim, nh = cfg.n_heads, nkv = cfg.n_kv;
+    const std::string tn = trace && trace->enabled()
+        ? std::string("layer_") + (layer < 10 ? "0" : "") + std::to_string(layer) + "." : "";
     ggml_tensor* h = qw_rmsnorm(ctx, x, H.weight(p + "input_layernorm.weight"), cfg.eps);
+    if (trace) trace->add_last_2d(ctx, tn + "input_rmsnorm", h);
     const ggml_type ct = cfg.compute_type;
     ggml_tensor* q = lin_lp(ctx, H.weight(p + "self_attn.q_proj.weight"), h, ct);  // [nh*hd, L]
     ggml_tensor* k = lin_lp(ctx, H.weight(p + "self_attn.k_proj.weight"), h, ct);  // [nkv*hd, L]
@@ -116,10 +130,33 @@ static inline void qw_qkv_for_chunk(M1Harness& H, ggml_context* ctx, const Qwen3
     q = ggml_reshape_3d(ctx, q, hd, nh,  q->ne[1]);
     k = ggml_reshape_3d(ctx, k, hd, nkv, k->ne[1]);
     v = ggml_reshape_3d(ctx, v, hd, nkv, v->ne[1]);
+    if (trace) {
+        trace->add_last_heads(ctx, tn + "q_proj", q);
+        trace->add_last_heads(ctx, tn + "k_proj", k);
+        trace->add_last_heads(ctx, tn + "v_proj", v);
+        if (layer == 0 && std::getenv("RIG_QWEN3_SUBTRACE_FULL"))
+            trace->add(ctx, tn + "v_proj_full", v, {v->ne[2], v->ne[1], v->ne[0]});
+    }
     q = qw_rmsnorm(ctx, q, H.weight(p + "self_attn.q_norm.weight"), cfg.eps);
     k = qw_rmsnorm(ctx, k, H.weight(p + "self_attn.k_norm.weight"), cfg.eps);
+    if (trace) {
+        trace->add_last_heads(ctx, tn + "q_norm", q);
+        trace->add_last_heads(ctx, tn + "k_norm", k);
+    }
     q = qw_rope(ctx, q, cos, sin);
     k = qw_rope(ctx, k, cos, sin);
+    if (trace) {
+        trace->add_last_heads(ctx, tn + "q_post_rope", q);
+        trace->add_last_heads(ctx, tn + "k_post_rope", k);
+        // Full layer-0 prefix dump is a deliberately opt-in attention
+        // forensic: the final-token taps prove RoPE for one position, while
+        // attention consumes all 514 keys.  ggml's [d, heads, tokens] memory
+        // is NumPy C-order [tokens, heads, d].
+        if (layer == 0 && std::getenv("RIG_QWEN3_SUBTRACE_FULL")) {
+            trace->add(ctx, tn + "q_post_rope_full", q, {q->ne[2], q->ne[1], q->ne[0]});
+            trace->add(ctx, tn + "k_post_rope_full", k, {k->ne[2], k->ne[1], k->ne[0]});
+        }
+    }
     q_out = q;                         // [hd, nh,  L]
     k_out = ggml_cont(ctx, k);         // [hd, nkv, L]  (cont so the cpy into cache is clean)
     v_out = ggml_cont(ctx, v);         // [hd, nkv, L]
@@ -135,19 +172,16 @@ static inline ggml_tensor* qw_attn_over_cache(ggml_context* ctx, const Qwen3Cfg&
                                               ggml_tensor* q, ggml_tensor* k_new, ggml_tensor* v_new,
                                               ggml_tensor* mask,
                                               std::vector<ggml_tensor*>& writes,
-                                              Qwen3KvCache* pre = nullptr, int pre_len = 0) {
+                                              Qwen3KvCache* pre = nullptr, int pre_len = 0,
+                                              Qwen3Subtrace* trace = nullptr) {
     const int hd = cfg.head_dim, nkv = cfg.n_kv;
     ggml_tensor* kc = cache.k_cache[layer];   // [hd, nkv, max_seq]  (the beam's SUFFIX cache when pre!=0)
     ggml_tensor* vc = cache.v_cache[layer];
-    // KV-cache dtype (F16 by default — halves VRAM, matches Python's bf16 KV closer than f32). When
-    // F16, round the freshly-computed k/v to F16 so BOTH the cache write AND the in-graph attention use
-    // the same f16-rounded values for ALL positions (incl. the current one), mirroring Python which
-    // reads every position back from its bf16 cache. The matmul still accumulates in F32 (set_prec).
-    const bool kv_f16 = (kc->type == GGML_TYPE_F16);
-    if (kv_f16) {
-        k_new = ggml_cast(ctx, k_new, GGML_TYPE_F16);   // [hd, nkv, L] F16
-        v_new = ggml_cast(ctx, v_new, GGML_TYPE_F16);
-    }
+    // DynamicCache adopts post-RoPE K's dtype.  An F32 prefix therefore also
+    // promotes BF16 V on the same cache update; use the cache representation
+    // for both this attention and every later decode step.
+    if (k_new->type != kc->type) k_new = ggml_cast(ctx, k_new, kc->type);
+    if (v_new->type != vc->type) v_new = ggml_cast(ctx, v_new, vc->type);
     // cache write slice [hd, nkv, L] at ne2 offset write0 — for FUTURE steps only. write0 is a SUFFIX
     // offset when a shared read-only prefix cache `pre` is supplied (the n_cond mesh_cond prefix is
     // identical across all beams, so it is held ONCE in `pre` and never copied into the per-beam cache).
@@ -180,9 +214,36 @@ static inline ggml_tensor* qw_attn_over_cache(ggml_context* ctx, const Qwen3Cfg&
         kslice = ggml_concat(ctx, kslice, kparts[i], 2);   // [hd, nkv, klen]
         vslice = ggml_concat(ctx, vslice, vparts[i], 2);
     }
+    // Exact-HF attention for the shared B=1 causal prefix.  FA2 consumes
+    // BF16 Q/K/V even when the retained prefix cache uses a different
+    // precision.  The source-built bridge receives an operation-local
+    // causal-Qwen contract; no ordinary null-mask attention can enter this
+    // path.
+    if (!pre && write0 == 0 && L > 1 &&
+        cfg.head_dim == 128 && cfg.n_heads == 16 && cfg.n_kv == 8 &&
+        (kslice->type == GGML_TYPE_F32 || kslice->type == GGML_TYPE_BF16) &&
+        (vslice->type == GGML_TYPE_F32 || vslice->type == GGML_TYPE_BF16)) {
+        ggml_tensor* qf = ggml_cast(ctx, ggml_cont(ctx, ggml_permute(ctx, q,      0, 2, 1, 3)), GGML_TYPE_BF16);
+        ggml_tensor* kf = ggml_cast(ctx, ggml_cont(ctx, ggml_permute(ctx, kslice, 0, 2, 1, 3)), GGML_TYPE_BF16);
+        ggml_tensor* vf = ggml_cast(ctx, ggml_cont(ctx, ggml_permute(ctx, vslice, 0, 2, 1, 3)), GGML_TYPE_BF16);
+        ggml_tensor* fa = ggml_flash_attn_ext_qwen_causal_gqa(ctx, qf, kf, vf, cfg.attn_scale());
+        return ggml_reshape_2d(ctx, fa, hd * cfg.n_heads, L);
+    }
     // GQA repeat to n_heads (mirror qw_layer: cont both).
     ggml_tensor* kr = ggml_cont(ctx, qw_repeat_kv(ctx, kslice, cfg.n_rep()));  // [hd, nh, klen]
     ggml_tensor* vr = ggml_cont(ctx, qw_repeat_kv(ctx, vslice, cfg.n_rep()));  // [hd, nh, klen]
+    // The Tira oracle's F32 mesh-condition prefix promotes post-RoPE Q/K and
+    // the DynamicCache to F32, but HF's FlashAttention-2 wrapper explicitly
+    // casts all three operands back to BF16 immediately before the kernel.
+    // Keep the cache F32 (it is observed state), perform GQA repeat while it
+    // is F32 (ggml CUDA does not support BF16 repeat), then materialize only
+    // the kernel operands in BF16.  The attention matmuls still accumulate
+    // into F32 as ggml requires.
+    if (qw_materialize_lowprec_activations() && cfg.compute_type == GGML_TYPE_BF16) {
+        q  = ggml_cast(ctx, q,  GGML_TYPE_BF16);
+        kr = ggml_cast(ctx, kr, GGML_TYPE_BF16);
+        vr = ggml_cast(ctx, vr, GGML_TYPE_BF16);
+    }
     // attention: q [hd, nh, L] over k/v [hd, nh, klen]. Reuse the exact math of qw_causal_attn but
     // with an asymmetric (klen x L) mask (the helper assumes square S x S). Inline it here.
     int64_t d = q->ne[0], nhh = q->ne[1];
@@ -191,7 +252,11 @@ static inline ggml_tensor* qw_attn_over_cache(ggml_context* ctx, const Qwen3Cfg&
     ggml_tensor* vp = ggml_cont(ctx, ggml_permute(ctx, vr, 1, 2, 0, 3)); // [klen, d, head]
     ggml_tensor* kq = ggml_mul_mat(ctx, kp, qp);                         // [klen, L, head]
     ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    if (trace && trace->enabled() && layer == 0)
+        trace->add_final_query_scores(ctx, "layer_00.attn_qk_raw", kq);
     kq = ggml_soft_max_ext(ctx, kq, mask, cfg.attn_scale(), 0.0f);       // [klen, L, head]
+    if (trace && trace->enabled() && layer == 0)
+        trace->add_final_query_scores(ctx, "layer_00.attn_probs", kq);
     ggml_tensor* kqv = ggml_mul_mat(ctx, vp, kq);                        // [d, L, head]
     ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
     kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);                            // [d, head, L]
@@ -206,20 +271,35 @@ static inline ggml_tensor* qw_layer_cached(M1Harness& H, ggml_context* ctx, cons
                                            ggml_tensor* x, ggml_tensor* cos, ggml_tensor* sin,
                                            int write0, int L, ggml_tensor* mask,
                                            std::vector<ggml_tensor*>& writes,
-                                           Qwen3KvCache* pre = nullptr, int pre_len = 0) {
+                                           Qwen3KvCache* pre = nullptr, int pre_len = 0,
+                                           Qwen3Subtrace* trace = nullptr) {
     ggml_tensor *q, *k, *v;
-    qw_qkv_for_chunk(H, ctx, cfg, p, x, cos, sin, q, k, v);
-    ggml_tensor* o = qw_attn_over_cache(ctx, cfg, cache, layer, write0, L, q, k, v, mask, writes, pre, pre_len);
+    qw_qkv_for_chunk(H, ctx, cfg, p, x, cos, sin, q, k, v, trace, layer);
+    ggml_tensor* o = qw_attn_over_cache(ctx, cfg, cache, layer, write0, L, q, k, v, mask, writes, pre, pre_len, trace);
+    const std::string tn = trace && trace->enabled()
+        ? std::string("layer_") + (layer < 10 ? "0" : "") + std::to_string(layer) + "." : "";
+    if (trace) trace->add_last_2d(ctx, tn + "attn_pre_o", o);
     const ggml_type ct = cfg.compute_type;
     o = lin_lp(ctx, H.weight(p + "self_attn.o_proj.weight"), o, ct);
+    if (trace) trace->add_last_2d(ctx, tn + "o_proj", o);
     x = ggml_add(ctx, x, o);
+    if (trace) trace->add_last_2d(ctx, tn + "post_attn_residual", x);
     // SwiGLU MLP (identical to qw_layer)
     ggml_tensor* hn = qw_rmsnorm(ctx, x, H.weight(p + "post_attention_layernorm.weight"), cfg.eps);
     ggml_tensor* g  = lin_lp(ctx, H.weight(p + "mlp.gate_proj.weight"), hn, ct);
     ggml_tensor* u  = lin_lp(ctx, H.weight(p + "mlp.up_proj.weight"),   hn, ct);
     ggml_tensor* m  = ggml_mul(ctx, ggml_silu(ctx, g), u);
+    if (trace) {
+        trace->add_last_2d(ctx, tn + "post_attn_rmsnorm", hn);
+        trace->add_last_2d(ctx, tn + "gate_proj", g);
+        trace->add_last_2d(ctx, tn + "up_proj", u);
+        trace->add_last_2d(ctx, tn + "mlp_pre_down", m);
+    }
     m = lin_lp(ctx, H.weight(p + "mlp.down_proj.weight"), m, ct);
-    return ggml_add(ctx, x, m);
+    if (trace) trace->add_last_2d(ctx, tn + "down_proj", m);
+    x = ggml_add(ctx, x, m);
+    if (trace) trace->add_last_2d(ctx, tn + "layer_output", x);
+    return x;
 }
 
 // Build the cache-backed stack for a chunk of L tokens starting at absolute position write0.
@@ -230,12 +310,27 @@ static inline ggml_tensor* build_qwen3_cached(M1Harness& H, ggml_context* ctx, c
                                               ggml_tensor* cos, ggml_tensor* sin,
                                               int write0, int L, ggml_tensor* mask,
                                               std::vector<ggml_tensor*>& writes,
-                                              Qwen3KvCache* pre = nullptr, int pre_len = 0) {
+                                              Qwen3KvCache* pre = nullptr, int pre_len = 0,
+                                              std::vector<ggml_tensor*>* layer_last_taps = nullptr,
+                                              Qwen3Subtrace* trace = nullptr) {
     const std::string m = cfg.prefix + "model.";
     ggml_tensor* x = inputs_embeds;
-    for (int l = 0; l < cfg.n_layers; ++l)
+    for (int l = 0; l < cfg.n_layers; ++l) {
         x = qw_layer_cached(H, ctx, cfg, m + "layers." + std::to_string(l) + ".",
-                            cache, l, x, cos, sin, write0, L, mask, writes, pre, pre_len);
+                            cache, l, x, cos, sin, write0, L, mask, writes, pre, pre_len, trace);
+        if (layer_last_taps) {
+            // Diagnostic only: retain the final token's post-residual activation
+            // from each actual shared-B1 prefill layer.  The view is F32 unless
+            // full low-precision activation materialization is explicitly enabled.
+            ggml_tensor* last = ggml_view_2d(ctx, x, cfg.hidden, 1, x->nb[1],
+                                              (size_t)(L - 1) * x->nb[1]);
+            if (last->type != GGML_TYPE_F32) last = ggml_cast(ctx, last, GGML_TYPE_F32);
+            layer_last_taps->push_back(last);
+        }
+    }
     x = qw_rmsnorm(ctx, x, H.weight(m + "norm.weight"), cfg.eps);
-    return lin(ctx, H.weight(cfg.prefix + "lm_head.weight"), nullptr, x);   // [vocab, L]
+    // Generation is BF16 under TokenRig's CUDA autocast.  Match the full
+    // forward path: leaving only lm_head in F32 changes the sampled race.
+    ggml_tensor* logits = lin_lp(ctx, H.weight(cfg.prefix + "lm_head.weight"), x, cfg.compute_type);
+    return logits->type == GGML_TYPE_F32 ? logits : ggml_cast(ctx, logits, GGML_TYPE_F32); // host sampler reads F32
 }

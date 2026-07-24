@@ -1,6 +1,7 @@
 // mesh_sample_main.cpp — CLI front-end for the auto-rig mesh preprocessing.
 //
 //   mesh_sample <mesh.glb> <out_dir> [N=8192] [M=512] [seed=0]
+//               [guide=full|central-core|side-band]
 //
 // Loads an arbitrary GLB, normalizes to [-1,1]^3, area-weighted surface-samples N points + normals,
 // and derives the R1 VecSet query sampled_pc[M] (choice N->4M then FPS 4M->M from idx 0). Writes:
@@ -55,14 +56,38 @@ int main(int argc, char** argv) {
     int N = argc > 3 ? std::atoi(argv[3]) : 8192;
     int M = argc > 4 ? std::atoi(argv[4]) : 512;
     uint64_t seed = argc > 5 ? (uint64_t)std::strtoull(argv[5], nullptr, 10) : 0;
+    rig::RigGuideProxy guide = rig::RigGuideProxy::Full;
+    if (argc > 6 && !rig::parse_rig_guide_proxy(argv[6], guide)) {
+        std::fprintf(stderr, "unknown guide '%s' (expected full, central-core, or side-band)\n", argv[6]);
+        return 2;
+    }
 
-    rig::PrepResult R = rig::prep_mesh_for_rig(glb, N, M, seed);
+    rig::PrepResult R = rig::prep_mesh_for_rig(glb, N, M, seed, guide);
     if (!R.ok) { std::fprintf(stderr, "mesh_sample: prep failed\n"); return 1; }
 
     npy_write(out_dir + "/vertices.npy",      R.vertices.data(),      { R.N, 3 });
     npy_write(out_dir + "/normals.npy",       R.normals.data(),       { R.N, 3 });
     npy_write(out_dir + "/sampled_pc.npy",    R.sampled_pc.data(),    { R.M, 3 });
     npy_write(out_dir + "/sampled_feats.npy", R.sampled_feats.data(), { R.M, 3 });
+    // The sampled cloud and its learned skin field share the coordinate frame
+    // of this exact mesh input.  Keep that source beside the arrays so the
+    // transfer stage cannot accidentally combine an old sample set with a
+    // differently transformed delivery GLB (for example an FBX scene-node
+    // transform newly honoured by the GLB reader).
+    {
+        std::ofstream provenance(out_dir + "/sampling_provenance.txt");
+        if (!provenance) {
+            std::fprintf(stderr, "mesh_sample: cannot write sampling provenance\n");
+            return 1;
+        }
+        provenance << "schema_version=1\n"
+                   << "mesh_source_path=" << glb << "\n"
+                   << "normalization=bbox-midpoint; global-max-absolute-extent\n"
+                   << "sample_count=" << R.N << "\n"
+                   << "query_count=" << R.M << "\n"
+                   << "seed=" << seed << "\n"
+                   << "guide=" << rig::rig_guide_proxy_name(guide) << "\n";
+    }
 
     // ---- sanity stats ----
     auto bbox = [](const std::vector<float>& p, int n, double mn[3], double mx[3]) {
@@ -103,7 +128,8 @@ int main(int argc, char** argv) {
     }
 
     std::printf("[mesh_sample] mesh=%s -> %s\n", glb, out_dir.c_str());
-    std::printf("  N=%d  M=%d  seed=%llu\n", R.N, R.M, (unsigned long long)seed);
+    std::printf("  N=%d  M=%d  seed=%llu  guide=%s\n", R.N, R.M,
+                (unsigned long long)seed, rig::rig_guide_proxy_name(guide));
     std::printf("  samples bbox: [%.4f %.4f %.4f] .. [%.4f %.4f %.4f]\n",
                 smn[0], smn[1], smn[2], smx[0], smx[1], smx[2]);
     std::printf("  normals |n|: min=%.5f max=%.5f mean=%.5f  off-unit(>1e-3)=%d/%d %s\n",

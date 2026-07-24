@@ -9,8 +9,8 @@
 #   native_texture_run.sh <refined.glb> <source_rgba_or_black_matte.png> <out.glb> [texture_mesh_native args...]
 #
 # Common examples:
-#   native_texture_run.sh refined.glb input.png high_native.glb --resolution 512 --texsize 2048 --decimate 300000
-#   native_texture_run.sh refined.glb input.png med_native.glb  --resolution 512 --texsize 1024 --decimate 150000
+#   native_texture_run.sh refined.glb input.png high_native.glb --resolution 1024 --texsize 2048 --decimate 300000
+#   native_texture_run.sh refined.glb input.png med_native.glb  --resolution 1024 --texsize 1024 --decimate 150000
 set -euo pipefail
 
 CP="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,8 +20,16 @@ OUT="${3:?need output glb}"
 shift 3
 
 BIN="$CP/texture_mesh_native"
-WEIGHTS="${PIXAL3D_GGUF_DIR:-/mnt/hdd/pixal3d/weights_gguf}"
+# Match the geometry runner: local NVMe F16 control bundle while the clean recipe is
+# being verified.  Q8 remains the intended VRAM/performance target and is selected only
+# through an explicitly labelled PIXAL3D_GGUF_DIR A/B after this control path passes.
+WEIGHTS="${PIXAL3D_GGUF_DIR:-/home/dbrain/models/3d/geo_f16_native}"
 OUT_ROOT="${IMAGE_TO_RIG_OUT_ROOT:-/mnt/hdd/3d/avatar-shootout/_shootout_out/runbook_image_to_rig}"
+
+# The executable loads its checked-in NPY encoder/decoder fallbacks by relative
+# path.  A caller may invoke this runner from any directory, so anchor the child
+# at cpp_port rather than silently failing after it has reserved the 3060.
+cd "$CP"
 
 [[ -x "$BIN" ]] || { echo "missing $BIN; build it first: cd $CP && ./build.sh texture_mesh_native cuda" >&2; exit 2; }
 [[ -f "$MESH" ]] || { echo "missing mesh: $MESH" >&2; exit 2; }
@@ -33,6 +41,23 @@ QC_FILE="${OUT}.texture-qc.txt"
 STARTED_AT="$(date -Is)"
 START_SECONDS=$SECONDS
 STATUS_INITIALIZED=0
+# Keep measured resource evidence beside the artifact.  `texture_mesh_native`
+# has both CUDA inference and CPU atlas stages; a single end-of-run snapshot is
+# misleading because the CUDA graph has normally been released before encode.
+CPU_UTIL_PEAK=0
+GPU_VRAM_PEAK_MIB=0
+GPU_VRAM_LAST_MIB=0
+
+sample_resources() {
+  local cpu vram
+  cpu="$(ps -p "$CHILD_PID" -o %cpu= 2>/dev/null | awk '{printf "%d", $1 + 0}' || true)"
+  [[ "$cpu" =~ ^[0-9]+$ ]] || cpu=0
+  if (( cpu > CPU_UTIL_PEAK )); then CPU_UTIL_PEAK=$cpu; fi
+  vram="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU_3060_UUID" 2>/dev/null | awk 'NR==1 {print int($1)}' || true)"
+  [[ "$vram" =~ ^[0-9]+$ ]] || vram=0
+  GPU_VRAM_LAST_MIB=$vram
+  if (( vram > GPU_VRAM_PEAK_MIB )); then GPU_VRAM_PEAK_MIB=$vram; fi
+}
 
 # The executable writes QC only after it has written both GLB and atlas. Preserve
 # a previous sidecar for audit rather than letting a live rerun appear to inherit
@@ -47,23 +72,29 @@ MESH_SHA256="$(sha256sum "$MESH" | awk '{print $1}')"
 IMAGE_SHA256="$(sha256sum "$IMAGE" | awk '{print $1}')"
 BIN_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
 SOURCE_REVISION="$(git -C "$CP" rev-parse --verify HEAD 2>/dev/null || printf unknown)"
-TEXTURE_RESOLUTION=512
+TEXTURE_RESOLUTION=1024
 UNWRAP_MODE=reference
+ENCODER_DECIMATE=0
+TEXTURE_MODEL=generic-cross
 for ((arg_i=1; arg_i<=$#; arg_i++)); do
   case "${!arg_i}" in
     --resolution)
       ((arg_i += 1)); TEXTURE_RESOLUTION="${!arg_i}";;
     --unwrap)
       ((arg_i += 1)); UNWRAP_MODE="${!arg_i}";;
+    --encoder-decimate)
+      ((arg_i += 1)); ENCODER_DECIMATE="${!arg_i}";;
+    --texture-model)
+      ((arg_i += 1)); TEXTURE_MODEL="${!arg_i}";;
   esac
 done
 
-# PCI order is stable: physical GPU 0 is the reserved 3060.  Do not remove
-# CUDA_DEVICE_ORDER: a bare CVD=0 has historically selected the owner's 5060.
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=0
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -1)"
-[[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: PCI GPU 0 is '$GPU_NAME', expected RTX 3060" >&2; exit 1; }
+# Use the 3060 UUID directly. A bare CUDA ordinal has historically selected
+# the owner's busy 5060 after a host/device-order change.
+GPU_3060_UUID="${IMAGE_TO_RIG_GPU_3060_UUID:-$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | awk -F', ' '$2 ~ /RTX 3060/ {uuid=$1} END {print uuid}')}"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$GPU_3060_UUID" 2>/dev/null | head -1)"
+[[ "$GPU_NAME" == *"RTX 3060"* ]] || { echo "refusing: '$GPU_3060_UUID' is '$GPU_NAME', expected the reserved RTX 3060" >&2; exit 1; }
+export CUDA_VISIBLE_DEVICES="$GPU_3060_UUID"
 
 exec 9>"$OUT_ROOT/.3060-image-to-rig.lock"
 flock -n 9 || { echo "another image-to-rig job owns the 3060" >&2; exit 75; }
@@ -101,10 +132,16 @@ write_status() {
     printf 'elapsed_seconds=%s\n' "$((SECONDS-START_SECONDS))"
     printf 'exit_code=%s\n' "$rc"
     printf 'gpu=PCI GPU 0 / %s\n' "$GPU_NAME"
+    printf 'gpu_uuid=%s\n' "$GPU_3060_UUID"
+    printf 'gpu_vram_mib_last=%s\ngpu_vram_mib_peak=%s\n' "$GPU_VRAM_LAST_MIB" "$GPU_VRAM_PEAK_MIB"
+    printf 'cpu_util_percent_peak=%s\n' "$CPU_UTIL_PEAK"
+    printf 'scheduler=nice=%s; ionice=best-effort:7\n' "${IMAGE_TO_RIG_NICE_LEVEL:-10}"
     printf 'mesh=%s\nimage=%s\nout=%s\n' "$MESH" "$IMAGE" "$OUT"
     printf 'mesh_sha256=%s\nimage_sha256=%s\nbinary_sha256=%s\nsource_revision=%s\n' \
       "$MESH_SHA256" "$IMAGE_SHA256" "$BIN_SHA256" "$SOURCE_REVISION"
-    printf 'texture_model=TRELLIS-2 Texturing cross-attention (trellis2_tex_%s); native C++ only\n' "$TEXTURE_RESOLUTION"
+    printf 'texture_model=%s; native C++ only\n' "$TEXTURE_MODEL"
+    printf 'texture_lattice=%s\n' "$TEXTURE_RESOLUTION"
+    printf 'encoder_decimate_faces=%s\n' "$ENCODER_DECIMATE"
     printf 'unwrap_mode=%s\n' "$UNWRAP_MODE"
     printf 'texture_controls=%s\n' "${texture_controls:-default}"
     [[ -z "$stage_line" ]] || printf 'native_stage=%s\n' "$stage_line"
@@ -127,11 +164,15 @@ STATUS_INITIALIZED=1
 trap 'finish_status "$@"' EXIT
 
 echo "== native texture: $(basename "$MESH") + $(basename "$IMAGE") -> $OUT =="
-"$BIN" --model "$WEIGHTS" --mesh "$MESH" --image "$IMAGE" --out "$OUT" --status-file "$STATUS_FILE" "$@" &
+# Sparse texture decode, xatlas, and inpainting include CPU-heavy phases.  Keep the complete
+# 3060-owned child niced/ioniced; CUDA selection above remains physical PCI GPU 0.
+nice -n "${IMAGE_TO_RIG_NICE_LEVEL:-10}" ionice -c 2 -n 7 \
+  "$BIN" --model "$WEIGHTS" --mesh "$MESH" --image "$IMAGE" --out "$OUT" --status-file "$STATUS_FILE" "$@" &
 CHILD_PID=$!
 # Long direct unwraps are CPU-bound after native inference.  Refresh the status artifact while
 # the child runs so operators never have to guess whether the 3060 lane or chart solve is alive.
 while kill -0 "$CHILD_PID" 2>/dev/null; do
+  sample_resources
   write_status running 0 "$@"
   sleep 10
 done

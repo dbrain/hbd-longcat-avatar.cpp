@@ -31,6 +31,11 @@
 #   FOV=<deg>  bypass MoGe (controlled input)
 #   WORKDIR=<dir>  keep intermediates (default temp dir, cleaned unless WORKDIR_KEEP=1)
 set -euo pipefail
+
+echo "image2rig.sh is retired for production: it bypasses the native real-R1/R4 provenance and real-LBS publication gates." >&2
+echo "Use shootout/native_image_to_rig.sh, which must finish through rig_texture_chain.sh." >&2
+exit 64
+
 CP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IN="${1:?input image}"; OUT="${2:?out.glb}"; shift 2 || true
 EXTRA=(); if [[ "${1:-}" == "--" ]]; then shift; EXTRA=("$@"); fi

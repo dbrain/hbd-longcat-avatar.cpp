@@ -21,21 +21,112 @@
 //          rng = np.random.default_rng(seed=0)
 //          ind = rng.choice(N, M*4, replace = M*4 > N)        # 8192 -> 2048, replace=False
 //          fps(pc[ind], ratio=1/4, random_start=False)        # 2048 -> 512, start index 0
-//       i.e. random-choice N->(M*4), then FPS (M*4)->M from index 0. We replicate the SHAPE of this
-//       op (choose 4M, FPS down to M). The np.random.default_rng(seed=0) choice is replaced by a
-//       std::mt19937 partial Fisher-Yates draw of 4M distinct indices — so the resulting query set
-//       (and therefore the rig) will NOT bit-match the python banked giraffe, but is a valid query.
+//       i.e. random-choice N->(M*4), then FPS (M*4)->M from index 0.  The fixed-seed path below
+//       is an exact small port of NumPy 1.26's PCG64 + Floyd choice implementation, rather than a
+//       statistically-similar std::mt19937 substitute.  This is material: these points are learned
+//       encoder queries, so changing them changes the generated skeleton.
 #pragma once
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <limits>
 #include "glb_reader.hpp"
 
 namespace rig {
+
+// NumPy's `np.random.default_rng(0)` state after SeedSequence initialization.
+// The production SkinTokens capture fixes this seed to zero.  Keeping this narrowly-scoped avoids
+// silently claiming NumPy SeedSequence parity for arbitrary seeds while providing exact parity for
+// the only sequence used by the rig path.  PCG64 is XSL-RR 128/64; next32 has NumPy's low-half then
+// cached high-half ordering (numpy/random/src/pcg64/pcg64.h, v1.26.4).
+class NumpyPcg64Seed0 {
+public:
+    NumpyPcg64Seed0()
+        : state_(((__uint128_t)0x1aa1b5345996452dULL << 64) | 0x09585eb7a69561e3ULL),
+          inc_(((__uint128_t)0x418ddadb3af71a82ULL << 64) | 0x588133bc447873a9ULL) {}
+
+    uint64_t next64() {
+        static const __uint128_t mult = ((__uint128_t)2549297995355413924ULL << 64) |
+                                        4865540595714422341ULL;
+        state_ = state_ * mult + inc_;
+        const uint64_t hi = (uint64_t)(state_ >> 64);
+        const uint64_t lo = (uint64_t)state_;
+        const unsigned rot = (unsigned)(hi >> 58);
+        const uint64_t x = hi ^ lo;
+        return (x >> rot) | (x << ((-rot) & 63));
+    }
+
+    uint32_t next32() {
+        if (has_uint32_) { has_uint32_ = false; return uinteger_; }
+        const uint64_t v = next64();
+        has_uint32_ = true;
+        uinteger_ = (uint32_t)(v >> 32);
+        return (uint32_t)v;
+    }
+
+    // Equivalent to NumPy's random_bounded_uint64(bitgen, 0, inclusive_max, 0, 0)
+    // for the int64 ranges used by Generator.choice here (all <= uint32 max).
+    uint64_t bounded_inclusive(uint64_t inclusive_max) {
+        if (inclusive_max == 0) return 0;
+        if (inclusive_max == 0xffffffffULL) return next32();
+        const uint32_t range = (uint32_t)inclusive_max;
+        const uint32_t range_excl = range + 1;
+        uint64_t product = (uint64_t)next32() * range_excl;
+        uint32_t leftover = (uint32_t)product;
+        if (leftover < range_excl) {
+            const uint32_t threshold = (UINT32_MAX - range) % range_excl;
+            while (leftover < threshold) {
+                product = (uint64_t)next32() * range_excl;
+                leftover = (uint32_t)product;
+            }
+        }
+        return product >> 32;
+    }
+
+private:
+    __uint128_t state_, inc_;
+    bool has_uint32_ = false;
+    uint32_t uinteger_ = 0;
+};
+
+// Exact `np.random.default_rng(0).choice(population, count, replace=False)` for the range used by
+// SkinTokens. NumPy 1.26 chooses Floyd's algorithm when population <= 10000, then shuffles output.
+inline std::vector<int> numpy_choice_seed0_without_replacement(int population, int count) {
+    std::vector<int> out;
+    // Generator.choice changes to NumPy's tail-shuffle heuristic above this threshold.  The
+    // SkinTokens contract is exactly 8192 -> 2048, so fail closed rather than return a subtly
+    // non-NumPy sequence for an unsupported caller.
+    if (population < 0 || population > 10000 || count < 0 || count > population) return out;
+    out.resize((size_t)count);
+    if (count == 0) return out;
+    NumpyPcg64Seed0 rng;
+    uint64_t target = (uint64_t)(1.2 * (double)count); // exact C cast used by NumPy's Cython code
+    uint64_t mask = 1;
+    while (mask < target) mask = (mask << 1) | 1;       // _gen_mask: all ones above target
+    std::vector<uint64_t> hash_set((size_t)mask + 1, UINT64_MAX);
+    for (int j = population - count; j < population; ++j) {
+        const uint64_t value = rng.bounded_inclusive((uint64_t)j);
+        uint64_t loc = value & mask;
+        while (hash_set[(size_t)loc] != UINT64_MAX && hash_set[(size_t)loc] != value)
+            loc = (loc + 1) & mask;
+        if (hash_set[(size_t)loc] == UINT64_MAX) {
+            hash_set[(size_t)loc] = value;
+            out[(size_t)(j - population + count)] = (int)value;
+        } else {
+            loc = (uint64_t)j & mask;
+            while (hash_set[(size_t)loc] != UINT64_MAX) loc = (loc + 1) & mask;
+            hash_set[(size_t)loc] = (uint64_t)j;
+            out[(size_t)(j - population + count)] = j;
+        }
+    }
+    // NumPy _shuffle_int(bitgen, count, 1, data): descending Fisher-Yates with the same bounded draw.
+    for (int i = count - 1; i >= 1; --i) std::swap(out[(size_t)i], out[(size_t)rng.bounded_inclusive((uint64_t)i)]);
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // (1) normalize_mesh — in place. verts is V*3 (xyz interleaved).
@@ -196,11 +287,49 @@ struct PrepResult {
     bool ok = false;
 };
 
+// The SkeletonTokens encoder has no semantic distinction between an arm and a
+// long ponytail/cape/weapon.  These are deliberately *candidate* rig guides,
+// not geometry edits: the full mesh is still retained for the final skin
+// transfer, and callers must use the anatomy gate before accepting a result.
+// Coordinates are canonicalized by the image-to-rig path (Y up, X lateral).
+enum class RigGuideProxy { Full, CentralCore, SideBand };
+
+inline const char* rig_guide_proxy_name(RigGuideProxy p) {
+    switch (p) {
+        case RigGuideProxy::Full:        return "full";
+        case RigGuideProxy::CentralCore: return "central-core";
+        case RigGuideProxy::SideBand:    return "side-band";
+    }
+    return "unknown";
+}
+
+inline bool parse_rig_guide_proxy(const std::string& text, RigGuideProxy& out) {
+    if (text == "full") { out = RigGuideProxy::Full; return true; }
+    if (text == "central-core") { out = RigGuideProxy::CentralCore; return true; }
+    if (text == "side-band") { out = RigGuideProxy::SideBand; return true; }
+    return false;
+}
+
+inline bool keep_rig_guide_point(const float* p, RigGuideProxy proxy) {
+    const float x = std::fabs(p[0]);
+    if (proxy == RigGuideProxy::Full) return true;
+    // A central body guide removes long lateral accessories entirely.  It is
+    // intentionally conservative: legs and torso remain, while the full-guide
+    // candidate still covers wide poses and non-humanoids.
+    if (proxy == RigGuideProxy::CentralCore) return x <= 0.50f;
+    // Keep the near-body region everywhere.  Far-lateral samples survive only
+    // in the shoulder/hip band where a normal A/T-pose arm belongs; this breaks
+    // the long top-to-bottom traces that side hair, capes and weapons otherwise
+    // present to a point-cloud skeleton model as giant limbs.
+    return x <= 0.42f || (p[1] >= -0.32f && p[1] <= 0.32f);
+}
+
 // In-memory variant: same logic as prep_mesh_for_rig but on verts/faces already in RAM (the inline
 // image->rig API feeds the freshly-generated mesh straight in, no GLB round-trip). `verts` is copied
 // (it is normalized in place); `faces` is read-only.
 inline PrepResult prep_mesh_for_rig_inmem(std::vector<float> verts, const std::vector<int64_t>& faces,
-                                          int N = 8192, int M = 512, uint64_t seed = 0) {
+                                          int N = 8192, int M = 512, uint64_t seed = 0,
+                                          RigGuideProxy proxy = RigGuideProxy::Full) {
     PrepResult R;
     if (verts.empty() || faces.empty()) {
         std::fprintf(stderr, "prep_mesh_for_rig_inmem: empty mesh (V=%zu F=%zu)\n",
@@ -208,28 +337,45 @@ inline PrepResult prep_mesh_for_rig_inmem(std::vector<float> verts, const std::v
         return R;
     }
     normalize_mesh(verts);
-    if (!sample_surface(verts, faces, N, seed, R.vertices, R.normals)) {
+    // Rejection sample the guide instead of deleting vertices from the delivery
+    // mesh.  This preserves area-weighted surface sampling conditional on the
+    // proxy predicate and leaves the exact original mesh available for texture
+    // and skin transfer.
+    const int oversample = proxy == RigGuideProxy::Full ? N : N * 4;
+    std::vector<float> sampled_pts, sampled_nrm;
+    if (!sample_surface(verts, faces, oversample, seed, sampled_pts, sampled_nrm)) {
         std::fprintf(stderr, "prep_mesh_for_rig: sample_surface failed\n");
+        return R;
+    }
+    R.vertices.clear(); R.normals.clear();
+    R.vertices.reserve((size_t)N * 3); R.normals.reserve((size_t)N * 3);
+    for (int i = 0; i < oversample && (int)(R.vertices.size() / 3) < N; ++i) {
+        const float* p = &sampled_pts[(size_t)i * 3];
+        if (!keep_rig_guide_point(p, proxy)) continue;
+        R.vertices.insert(R.vertices.end(), p, p + 3);
+        const float* n = &sampled_nrm[(size_t)i * 3];
+        R.normals.insert(R.normals.end(), n, n + 3);
+    }
+    if ((int)(R.vertices.size() / 3) != N) {
+        std::fprintf(stderr, "prep_mesh_for_rig: proxy '%s' retained only %zu/%d samples\n",
+                     rig_guide_proxy_name(proxy), R.vertices.size() / 3, N);
         return R;
     }
     R.N = N;
     R.M = M;
 
-    // --- R1 query selection, mirroring capture_vecset_r0.py exactly in SHAPE ---
-    // ind = choice(N, M*4, replace = M*4 > N)  -> here 8192 -> 2048 distinct (replace=False).
+    // --- R1 query selection, mirroring capture_vecset_r0.py exactly ---
+    // ind = default_rng(0).choice(N, M*4, replace = M*4 > N), then FPS from index zero.
     int K = M * 4;
     std::vector<float> pre;          // K*3 candidate subset
     std::vector<int>   pre_idx(K);   // original surface-sample index of each candidate (-> normals)
-    std::mt19937_64 rng(seed);
     if (K <= N) {
-        // distinct draw of K indices (partial Fisher-Yates over 0..N-1)
-        std::vector<int> perm(N);
-        for (int i = 0; i < N; ++i) perm[i] = i;
-        for (int i = 0; i < K; ++i) {
-            std::uniform_int_distribution<int> D(i, N - 1);
-            int j = D(rng);
-            std::swap(perm[i], perm[j]);
+        if (seed != 0) {
+            std::fprintf(stderr, "prep_mesh_for_rig: exact NumPy PCG64 query path currently requires seed=0\n");
+            return R;
         }
+        const std::vector<int> perm = numpy_choice_seed0_without_replacement(N, K);
+        if ((int)perm.size() != K) return R;
         pre.resize((size_t)K * 3);
         for (int i = 0; i < K; ++i) {
             pre_idx[i] = perm[i];
@@ -239,6 +385,7 @@ inline PrepResult prep_mesh_for_rig_inmem(std::vector<float> verts, const std::v
     } else {
         // with replacement (K > N): pad by sampling with replacement
         pre.resize((size_t)K * 3);
+        std::mt19937_64 rng(seed);
         std::uniform_int_distribution<int> D(0, N - 1);
         for (int i = 0; i < K; ++i) {
             int j = D(rng);
@@ -262,13 +409,14 @@ inline PrepResult prep_mesh_for_rig_inmem(std::vector<float> verts, const std::v
     return R;
 }
 
-inline PrepResult prep_mesh_for_rig(const char* glb_path, int N = 8192, int M = 512, uint64_t seed = 0) {
+inline PrepResult prep_mesh_for_rig(const char* glb_path, int N = 8192, int M = 512, uint64_t seed = 0,
+                                    RigGuideProxy proxy = RigGuideProxy::Full) {
     glb::Mesh mesh;
     if (!glb::read_glb(glb_path, mesh)) {
         std::fprintf(stderr, "prep_mesh_for_rig: read_glb failed for '%s'\n", glb_path);
         return PrepResult{};
     }
-    return prep_mesh_for_rig_inmem(std::move(mesh.verts), mesh.faces, N, M, seed);
+    return prep_mesh_for_rig_inmem(std::move(mesh.verts), mesh.faces, N, M, seed, proxy);
 }
 
 }  // namespace rig

@@ -11,6 +11,9 @@
 #include <string>
 #include "tex_grid_sample.hpp"
 #include "tex_reproject.hpp"     // lap-18: closest-point-on-dense-mesh reproject (kills splatter/cracks)
+#ifdef TEXATLAS_CUDA_RASTER
+#include "tex_atlas_cuda.hpp"
+#endif
 #ifdef TEXATLAS_NATIVE_CUMESH
 #include "native_cumesh_bridge.hpp"
 #endif
@@ -159,9 +162,9 @@ static inline bool write_quality_report(const std::string& path, const BakedText
 // reliably remove those once a chart has been split. Only RGB is touched, and only when a voxel
 // differs materially from its occupied 3x3x3-neighbour median.
 static inline size_t filter_pbr_rgb_outliers(std::vector<float>& pbr, const std::vector<int32_t>& coords,
-                                             float threshold) {
+                                             float threshold, int passes = 1) {
     const size_t N=coords.size()/4;
-    if (threshold<=0.f || N==0 || pbr.size()!=N*6) return 0;
+    if (threshold<=0.f || N==0 || pbr.size()!=N*6 || passes<=0) return 0;
     auto key=[](int x,int y,int z)->uint64_t {
         return (uint64_t)(uint32_t)(x+2048) | ((uint64_t)(uint32_t)(y+2048)<<13) |
                ((uint64_t)(uint32_t)(z+2048)<<26);
@@ -170,28 +173,38 @@ static inline size_t filter_pbr_rgb_outliers(std::vector<float>& pbr, const std:
     index.reserve(N*2);
     for (uint32_t i=0;i<(uint32_t)N;i++)
         index.emplace(key(coords[(size_t)i*4+1],coords[(size_t)i*4+2],coords[(size_t)i*4+3]),i);
-    const std::vector<float> src=pbr;
-    std::vector<uint8_t> replace(N,0);
-    std::vector<std::array<float,3>> med(N);
-    #pragma omp parallel for schedule(static)
-    for (int64_t ii=0;ii<(int64_t)N;ii++) {
-        size_t i=(size_t)ii;
-        float vals[3][27]; int n=0;
-        const int x=coords[i*4+1],y=coords[i*4+2],z=coords[i*4+3];
-        for(int dz=-1;dz<=1;dz++) for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
-            auto it=index.find(key(x+dx,y+dy,z+dz)); if(it==index.end()) continue;
-            const float* q=&src[(size_t)it->second*6];
-            for(int c=0;c<3;c++) vals[c][n]=q[c];
-            n++;
-        }
-        if (n<7) continue;
-        float delta=0.f;
-        for(int c=0;c<3;c++) { std::nth_element(vals[c],vals[c]+n/2,vals[c]+n); med[i][c]=vals[c][n/2];
-            delta=std::max(delta,std::fabs(src[i*6+c]-med[i][c])); }
-        replace[i]=delta>threshold;
-    }
     size_t changed=0;
-    for(size_t i=0;i<N;i++) if(replace[i]) { for(int c=0;c<3;c++) pbr[i*6+c]=med[i][c]; changed++; }
+    // One pass is the locked production default.  A second pass is useful only
+    // for a labelled diagnostic: it can remove a two-voxel freckle revealed
+    // after its isolated neighbour was replaced, without ever averaging across
+    // a UV chart.  Every pass reads a frozen source volume, so it is stable
+    // under OpenMP scheduling.
+    for (int pass=0; pass<passes; pass++) {
+        const std::vector<float> src=pbr;
+        std::vector<uint8_t> replace(N,0);
+        std::vector<std::array<float,3>> med(N);
+        #pragma omp parallel for schedule(static)
+        for (int64_t ii=0;ii<(int64_t)N;ii++) {
+            size_t i=(size_t)ii;
+            float vals[3][27]; int n=0;
+            const int x=coords[i*4+1],y=coords[i*4+2],z=coords[i*4+3];
+            for(int dz=-1;dz<=1;dz++) for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
+                auto it=index.find(key(x+dx,y+dy,z+dz)); if(it==index.end()) continue;
+                const float* q=&src[(size_t)it->second*6];
+                for(int c=0;c<3;c++) vals[c][n]=q[c];
+                n++;
+            }
+            if (n<7) continue;
+            float delta=0.f;
+            for(int c=0;c<3;c++) { std::nth_element(vals[c],vals[c]+n/2,vals[c]+n); med[i][c]=vals[c][n/2];
+                delta=std::max(delta,std::fabs(src[i*6+c]-med[i][c])); }
+            replace[i]=delta>threshold;
+        }
+        size_t changed_this_pass=0;
+        for(size_t i=0;i<N;i++) if(replace[i]) { for(int c=0;c<3;c++) pbr[i*6+c]=med[i][c]; changed_this_pass++; }
+        changed += changed_this_pass;
+        if (!changed_this_pass) break;
+    }
     return changed;
 }
 
@@ -873,7 +886,11 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     // but never sees the bad global topology.  This is topology-driven, not model-name-driven.
     bool auto_precluster=false;
     size_t boundary_edges=0, nonmanifold_edges=0, sharp_edges=0;
-    if (!precluster && deci && !std::getenv("ATL_FORCE_DIRECT") && !std::getenv("ATL_AUTO_PRECLUSTER_OFF")) {
+    // Run the topology guard on the actual bake mesh whether it was decimated in this call or
+    // arrived pre-decimated. The latter is the normal clean-mesh texture path; restricting this
+    // guard to `deci` sends an already-750k non-manifold delivery mesh into xatlas' multi-minute
+    // direct half-edge solve while the equivalent 750,001-face input is protected.
+    if (!precluster && !std::getenv("ATL_FORCE_DIRECT") && !std::getenv("ATL_AUTO_PRECLUSTER_OFF")) {
         // Retain each edge's first face while counting it.  This gives the direct-unwrap safety
         // gate a geometric signal as well as a manifoldness signal: a dense folded surface can be
         // topologically valid yet make CPU xatlas split itself into an impractical number of charts.
@@ -1185,6 +1202,27 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
         for (uint32_t i=0;i<om.indexCount;i++) bt.faces[(size_t)ioff+i]=voff+om.indexArray[i];
         voff += om.vertexCount; ioff += om.indexCount;
     }
+    // CRISPNESS FIX (2026-07-24): rasterize at the DELIVERY resolution, not oversize-then-downsample.
+    // xatlas packs charts into an atlas whose pixel dimensions (texelsPerUnit * chart extent) routinely
+    // OVERSHOOT texture_size -- its resolution is a chart-spacing heuristic, not the delivery size. The
+    // old path rasterised/sampled at that oversize (e.g. 6168) then area-resized DOWN to texture_size
+    // (4096). That box downsample averages across the packing gutter between the thousands of tiny
+    // charts, mixing each chart's edge with its neighbour and softening every material boundary --
+    // exactly the "MORE pixels yet BLURRIER" symptom. Python instead rasterises the UV layout ONCE at
+    // texture_size (dr.rasterize(resolution=[texture_size]*2)). Match that: scale the atlas-pixel UV
+    // coords so the longer axis is exactly texture_size and rasterise there directly. The normalised
+    // UVs (bt.uvs = v.uv/W, set above) are unchanged and stay consistent because the texel at raster
+    // pixel px*(RW/W) still maps to UV px/W. The downstream final-resize then no-ops. TEX_KEEP_ATLAS_SIZE
+    // preserves the old oversize+downsample path for A/B.
+    if (!std::getenv("TEX_KEEP_ATLAS_SIZE") && texture_size > 0 && (W > texture_size || Ht > texture_size)) {
+        const double s = (double)texture_size / (double)std::max(W, Ht);
+        const int RW = std::max(1, (int)std::lround((double)W * s));
+        const int RH = std::max(1, (int)std::lround((double)Ht * s));
+        const float sx = (float)RW / (float)W, sy = (float)RH / (float)Ht;
+        for (int i=0;i<Vout;i++) { px[i]*=sx; py[i]*=sy; }
+        if (verbose) printf("[atlas] rasterize at delivery size: %dx%d -> %dx%d (no oversize downsample)\n", W, Ht, RW, RH);
+        W = RW; Ht = RH; bt.tw = W; bt.th = Ht;
+    }
     if (std::getenv("TEX_TOPO_NORMALS")) {
         // Python parity: vertex normals on the OUTPUT (chart-split) topology, exactly like bake_uv.py's
         // trimesh.Trimesh(verts,faces).vertex_normals. Area-weighted, NOT position-welded — welding
@@ -1237,7 +1275,29 @@ static inline BakedTexture bake(const std::vector<float>& in_verts0, const std::
     int raster_ss = std::getenv("TEX_RASTER_SS") ? atoi(std::getenv("TEX_RASTER_SS")) : 1;
     raster_ss = std::max(1, std::min(4, raster_ss));
     if (verbose && raster_ss > 1) printf("[atlas] raster supersample: %dx%d\n", raster_ss, raster_ss);
-    for (int t=0;t<Fout;t++){
+    bool used_cuda_raster=false;
+#ifdef TEXATLAS_CUDA_RASTER
+    // UV interiors are non-overlapping after xatlas packing, making triangle
+    // rasterisation a clean CUDA data-parallel stage. Chart ownership is only
+    // needed by the optional CPU median filter; retain the scalar path when
+    // that diagnostic is explicitly requested.
+    if (!std::getenv("TEX_ATLAS_CPU_RASTER") && !std::getenv("TEX_BASE_MEDIAN")) {
+        texatlas_cuda::RasterStats rs; std::string raster_error;
+        used_cuda_raster = texatlas_cuda::raster_uv(bt.verts, bt.normals, bt.faces, [&]() {
+            std::vector<float> out((size_t)Vout*2);
+            for (uint32_t i=0;i<Vout;i++) { out[(size_t)i*2]=px[i]; out[(size_t)i*2+1]=py[i]; }
+            return out;
+        }(), W, Ht, raster_ss, pos, nrm, mask, &rs, &raster_error);
+        if (used_cuda_raster) {
+            if (verbose) printf("[atlas] CUDA raster: upload %.3fs kernel %.3fs download %.3fs\n",
+                                rs.upload_seconds, rs.kernel_seconds, rs.download_seconds);
+            _stage("atlas_raster_cuda_complete");
+        } else if (verbose) {
+            printf("[atlas] CUDA raster unavailable (%s); using CPU raster\n", raster_error.c_str());
+        }
+    }
+#endif
+    if (!used_cuda_raster) for (int t=0;t<Fout;t++){
         uint32_t a=bt.faces[(size_t)t*3], b=bt.faces[(size_t)t*3+1], c=bt.faces[(size_t)t*3+2];
         float ax=px[a],ay=py[a], bx=px[b],by=py[b], cx=px[c],cy=py[c];
         float area = (bx-ax)*(cy-ay)-(by-ay)*(cx-ax);
