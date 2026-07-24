@@ -59,4 +59,23 @@ CUDA_VISIBLE_DEVICES="" RP_VOLUME_DIRECT=1 ATL_BASECOLOR_SRGB=0 \
     --out "$OUT/parity.glb" 2>&1 | tee "$OUT/04_bake.log"
 
 test -f "$OUT/parity.glb" || { echo "FAIL: no parity.glb produced"; exit 1; }
-echo "DONE -> $OUT/parity.glb  (geometry: O-Voxel DC; texture: direct volume-trilinear)"
+
+echo "[5/5] canonical scale normalize -> parity_norm.glb (center origin, height=$NORM_HEIGHT)"
+# Native/Python GLBs export at inconsistent scales (Python refs seen at 0.8 / 1.0 / 2.0). Emit a
+# canonically-scaled copy for consistent delivery + fair side-by-side. Affine => UVs/atlas untouched.
+NORM_HEIGHT="${NORM_HEIGHT:-1.0}"
+NORM_PY="${NORM_PY:-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python}"
+if [ -x "$NORM_PY" ]; then
+  "$NORM_PY" - "$OUT/parity.glb" "$OUT/parity_norm.glb" "$NORM_HEIGHT" <<'PYEOF'
+import sys, trimesh, numpy as np
+m = trimesh.load(sys.argv[1], process=False, force='mesh')  # force='mesh' bakes node transforms
+v = m.vertices; lo, hi = v.min(0), v.max(0)
+scale = float(sys.argv[3]) / (hi[1]-lo[1])
+m.vertices = (v - (lo+hi)/2) * scale
+m.export(sys.argv[2]); print("  normalized:", sys.argv[2].split('/')[-1])
+PYEOF
+else
+  echo "  (skip: NORM_PY not found; parity.glb keeps native scale)"
+fi
+echo "DONE -> $OUT/parity.glb (native scale) + $OUT/parity_norm.glb (canonical h=$NORM_HEIGHT)"
+echo "        geometry: O-Voxel DC; texture: direct volume-trilinear"
