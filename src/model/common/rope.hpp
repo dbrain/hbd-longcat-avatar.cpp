@@ -1013,6 +1013,22 @@ namespace Rope {
         int64_t n_head = x->ne[1];
         int64_t L      = x->ne[2];
         int64_t N      = x->ne[3];
+
+        // Fused interleaved RoPE (longcat-avatar): one CUDA kernel reads x + the
+        // precomputed pe and writes the rotated output directly, with NO
+        // cont+2*repeat+mul+add intermediates. DEFAULT-ON (opt out with
+        // LONGCAT_NO_FUSED_ROPE=1 for the old chain). ggml_rope_pe /
+        // ggml_rope_pe_ni are bit-identical to the fallback chain below
+        // (rope-pe.cu uses un-contractable __fmul_rn/__fsub_rn/__fadd_rn).
+        // x may be F32 (default) or F16; pe is always F32.
+        if (pe->ne[0] == 2 && pe->ne[1] == 2 &&
+            pe->ne[2] == d_head / 2 && pe->ne[3] == L &&
+            (x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16) && pe->type == GGML_TYPE_F32 &&
+            getenv("LONGCAT_NO_FUSED_ROPE") == nullptr) {
+            return rope_interleaved ? ggml_rope_pe(ctx, x, pe)
+                                    : ggml_rope_pe_ni(ctx, x, pe);
+        }
+
         x              = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, n_head, L, d_head]
         if (rope_interleaved) {
             x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);  // [N * n_head, L, d_head/2, 2]
