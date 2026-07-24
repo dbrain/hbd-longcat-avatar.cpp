@@ -2843,6 +2843,62 @@ public:
         }
 
         size_t steps       = sigmas.size() - 1;
+        // SA3 is FP4 approximate attention.  Its upstream implementation recommends
+        // a hybrid policy for models whose all-step FP4 path is not lossless: run a
+        // precise attention backend at the first (and optionally last/middle) denoise
+        // steps, and SA3 in the others.  The CUDA dispatcher reads GGML_LTX_SA3 at each
+        // attention call (ggml-cuda/fattn.cu ggml_cuda_flash_attn_ext, per-forward
+        // getenv, not cached), so we scope the process environment to this sample only.
+        // This is deliberately opt-in: GGML_LTX_SA3_POLICY unset => behaviour is exactly
+        // today's (whatever static GGML_LTX_SA3 the caller set, untouched).
+        const char* sa3_policy_env = std::getenv("GGML_LTX_SA3_POLICY");
+        const std::string sa3_policy = sa3_policy_env != nullptr ? sa3_policy_env : "";
+        const bool sa3_step_policy = sd_version_is_ltxav(version) &&
+                                     (sa3_policy == "first" || sa3_policy == "last" || sa3_policy == "middle");
+        // The precise cuDNN step needs two full-length F16 buffers (converted Q
+        // and output).  Tile only that step's independent query rows; the SA3
+        // steps retain their one-shot graph and throughput.  The legacy global
+        // LTX_ATTN_QTILE keeps precedence when explicitly configured.
+        const char* precision_qtile_env = std::getenv("GGML_LTX_SA3_PRECISION_QTILE");
+        const bool precision_qtile_enabled = sa3_step_policy && precision_qtile_env != nullptr &&
+                                             atoll(precision_qtile_env) > 0 &&
+                                             (std::getenv("LTX_ATTN_QTILE") == nullptr || atoll(std::getenv("LTX_ATTN_QTILE")) == 0);
+        struct SA3EnvRestore {
+            bool active = false;
+            bool had_value = false;
+            std::string value;
+            ~SA3EnvRestore() {
+                if (!active) return;
+                if (had_value) setenv("GGML_LTX_SA3", value.c_str(), 1);
+                else unsetenv("GGML_LTX_SA3");
+            }
+        } sa3_env_restore;
+        struct PrecisionQTileEnvRestore {
+            bool active = false;
+            bool had_value = false;
+            std::string value;
+            ~PrecisionQTileEnvRestore() {
+                if (!active) return;
+                if (had_value) setenv("GGML_CUDNN_LTX_QTILE", value.c_str(), 1);
+                else unsetenv("GGML_CUDNN_LTX_QTILE");
+            }
+        } precision_qtile_restore;
+        if (sa3_step_policy) {
+            if (const char* e = std::getenv("GGML_LTX_SA3")) {
+                sa3_env_restore.had_value = true;
+                sa3_env_restore.value = e;
+            }
+            sa3_env_restore.active = true;
+            LOG_INFO("LTX SA3 policy=%s (%zu total sampler steps)", sa3_policy.c_str(), steps);
+        }
+        if (precision_qtile_enabled) {
+            if (const char* e = std::getenv("GGML_CUDNN_LTX_QTILE")) {
+                precision_qtile_restore.had_value = true;
+                precision_qtile_restore.value = e;
+            }
+            precision_qtile_restore.active = true;
+            LOG_INFO("LTX SA3 precision-step query tile=%s", precision_qtile_env);
+        }
         bool has_skiplayer = (slg_scale != 0.0f || slg_uncond) && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
             has_skiplayer = false;
@@ -2884,6 +2940,25 @@ public:
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
                 last_progress_us = ggml_time_us();
+            }
+
+            // Per-step SA3 policy toggle. Sampler `step` is 1-based and its sign is a
+            // flag (a negative step marks the uncond/CFG pass), so compare on abs().
+            // Toggled via setenv BEFORE this step's DiT forward launches; the CUDA
+            // attention dispatcher re-reads GGML_LTX_SA3 each forward. No-op unless
+            // GGML_LTX_SA3_POLICY selected an LTX-AV policy above.
+            if (sa3_step_policy) {
+                const int sample_step = std::abs(step);
+                const bool use_sa3 = sa3_policy == "first" ? sample_step > 1
+                                     : sa3_policy == "last" ? sample_step < (int)steps
+                                                            : sample_step > 1 && sample_step < (int)steps;
+                setenv("GGML_LTX_SA3", use_sa3 ? "1" : "0", 1);
+                if (precision_qtile_enabled) {
+                    if (use_sa3) unsetenv("GGML_CUDNN_LTX_QTILE");
+                    else setenv("GGML_CUDNN_LTX_QTILE", precision_qtile_env, 1);
+                }
+                LOG_DEBUG("LTX SA3 policy=%s: step %d/%zu -> %s", sa3_policy.c_str(), sample_step, steps,
+                          use_sa3 ? "SA3" : "cuDNN");
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
