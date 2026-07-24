@@ -752,17 +752,21 @@ public:
         }
 
         // Say plainly whether the fold is actually live: registration alone is not enough,
-        // the FP4 cuBLASLt path also has to be enabled and the device Blackwell-class.
+        // a cuBLASLt path (FP4 alpha fold, or the FP8 FFN weight promotion) also has to be
+        // enabled and the device Blackwell-class.  NB this probes ONE representative name;
+        // the FP8 gate is per-name (GGML_FP8_LAYERS), so with FP8 on and FP4 off the true
+        // answer varies per Linear -- the per-Linear decision is made in
+        // ggml_ext_nvfp4_weight_global_folded_in_gemm(), this is only a startup summary.
         const bool folded = ggml_cuda_nvfp4_weight_global_folded(backend_manager.runtime_backend(SDBackendModule::DIFFUSION),
                                                                  by_ggml_name.begin()->first.c_str());
         if (folded) {
-            LOG_INFO("%s: folding %zu NVFP4 weight globals into the cuBLASLt FP4 GEMM alpha "
-                     "(per-Linear scale multiply elided)",
+            LOG_INFO("%s: folding %zu NVFP4 weight globals into the cuBLASLt GEMM "
+                     "(FP4 alpha / FP8 weight promotion; per-Linear scale multiply elided)",
                      context, by_ggml_name.size());
         } else {
-            LOG_WARN("%s: %zu NVFP4 weight globals registered but the cuBLASLt FP4 GEMM fold is not "
-                     "active for the diffusion backend (GGML_NVFP4_CUBLASLT off, non-CUDA, or "
-                     "pre-Blackwell); keeping the graph-level scale",
+            LOG_WARN("%s: %zu NVFP4 weight globals registered but the cuBLASLt GEMM fold is not "
+                     "active for the diffusion backend (GGML_NVFP4_CUBLASLT / GGML_FP8_FFN off, "
+                     "non-CUDA, or pre-Blackwell); keeping the graph-level scale",
                      context, by_ggml_name.size());
         }
     }
