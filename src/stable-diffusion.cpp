@@ -3640,10 +3640,32 @@ const char* sd_sample_method_name(enum sample_method_t sample_method) {
     return NONE_STR;
 }
 
+// Wire-compatibility aliases for sampler names upstream has renamed. Callers (koblem,
+// saved Director projects, stored presets) still send the older spelling, and an
+// unrecognised name silently degrades to the default sampler rather than erroring — so a
+// rename is a quiet output change, not a loud failure. Keep old names working forever.
+static const struct {
+    const char* alias;
+    const char* canonical;
+} sample_method_aliases[] = {
+    // upstream renamed euler_ancestral_cfg_pp -> euler_a_cfg_pp during the rebuild
+    {"euler_ancestral_cfg_pp", "euler_a_cfg_pp"},
+    {"euler_ancestral", "euler_a"},
+};
+
 enum sample_method_t str_to_sample_method(const char* str) {
     for (int i = 0; i < SAMPLE_METHOD_COUNT; i++) {
         if (!strcmp(str, sample_method_to_str[i])) {
             return (enum sample_method_t)i;
+        }
+    }
+    for (const auto& a : sample_method_aliases) {
+        if (!strcmp(str, a.alias)) {
+            for (int i = 0; i < SAMPLE_METHOD_COUNT; i++) {
+                if (!strcmp(a.canonical, sample_method_to_str[i])) {
+                    return (enum sample_method_t)i;
+                }
+            }
         }
     }
     return SAMPLE_METHOD_COUNT;

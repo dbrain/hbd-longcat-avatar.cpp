@@ -149,6 +149,15 @@ int main(int argc, const char** argv) {
 
     httplib::Server svr;
 
+    // Parity with the supervisor above — and with the pre-isolation server. Multipart
+    // image+audio renders plus base64-bloated JSON routinely exceed httplib's default
+    // limits, and the default 5 s read/write timeout drops the connection mid-body on a
+    // large upload (surfacing as an empty-bodied 400) or mid-response on a long render.
+    svr.set_payload_max_length(512ull * 1024 * 1024);
+    svr.set_read_timeout(60 * 60, 0);
+    svr.set_write_timeout(60 * 60, 0);
+    svr.set_idle_interval(60, 0);
+
     svr.set_pre_routing_handler([&runtime](const httplib::Request& req, httplib::Response& res) {
         std::string origin = req.get_header_value("Origin");
         if (origin.empty()) {

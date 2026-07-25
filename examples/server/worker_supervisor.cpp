@@ -99,11 +99,34 @@ bool delete_ltx_bank(const std::string& job_id, bool& deleted, std::string& erro
     return true;
 }
 
+// Header names are case-insensitive on the wire (RFC 9110 §5.1), and callers do not
+// agree on a spelling: curl sends "Content-Length", Rust hyper/reqwest (Koblem) sends
+// "content-length".  These names describe THIS hop's framing, so they must never be
+// forwarded — the proxy re-encodes the body and httplib re-derives them.  Matching them
+// case-sensitively let Koblem's lowercase content-length + stale multipart boundary
+// through, and because httplib's client looks headers up case-INsensitively it then
+// declined to emit its own Content-Length.  The child was therefore told to expect the
+// caller's byte count while receiving the (shorter) re-encoded body, starved on the
+// missing tail, and returned httplib's empty-bodied 400 after its 5 s read timeout.
+bool is_hop_by_hop_header(const std::string& name) {
+    static const char* const kDropped[] = {"host", "connection", "content-length", "content-type",
+                                           "transfer-encoding", "expect", "keep-alive", "upgrade", "te",
+                                           "trailer", "proxy-connection", "proxy-authorization"};
+    std::string lowered;
+    lowered.reserve(name.size());
+    for (const unsigned char c : name) lowered.push_back(static_cast<char>(std::tolower(c)));
+    for (const char* dropped : kDropped) {
+        if (lowered == dropped) return true;
+    }
+    return false;
+}
+
 void copy_response(const httplib::Response& source, httplib::Response& destination) {
     destination.status = source.status;
     for (const auto& header : source.headers) {
-        if (header.first == "Content-Length" || header.first == "Connection" ||
-            header.first == "Transfer-Encoding") {
+        // set_content() below erases and re-sets Content-Type from the source response,
+        // so dropping it here is a no-op rather than a loss.
+        if (is_hop_by_hop_header(header.first)) {
             continue;
         }
         destination.set_header(header.first, header.second);
@@ -555,8 +578,7 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
     client.set_write_timeout(60 * 60, 0);
     httplib::Headers headers;
     for (const auto& header : request.headers) {
-        if (header.first != "Host" && header.first != "Connection" && header.first != "Content-Length" &&
-            header.first != "Content-Type") {
+        if (!is_hop_by_hop_header(header.first)) {
             headers.emplace(header.first, header.second);
         }
     }
