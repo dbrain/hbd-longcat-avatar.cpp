@@ -40,6 +40,8 @@
 #include "quad_retopo.hpp"             // rung 2: quadwild-bimdf quad retopology (--quad, shell-out)
 #include "im_retopo.hpp"               // rung 2 (default): Instant Meshes retopo (clean organic flow)
 #include "normal_bake.hpp"             // tangent-space normal map: dense high-poly detail -> retopo low-poly
+#include "narrow_band_dc.hpp"          // --dc-remesh: Python-parity narrow-band DC of the O-Voxel mesh
+#include "mesh_taubin.hpp"             // --dc-remesh: feature-preserving Taubin post-smooth
 #ifdef PIXAL3D_PACK
 #include "glb_packed.hpp"              // packed writer (KTX2+meshopt) — the only textured writer that carries a normal map
 #endif
@@ -79,6 +81,14 @@ static void usage() {
            "                          makes the inline API 100%% camera-native)\n"
            "        [--refine | --no-refine]  (native UltraShape refine between geometry and bake; ON by\n"
            "                          default — the clean/watertight ~7.5x densify)\n"
+           "        [--dc-remesh] [--dc-band N=1] [--dc-taubin N=2]\n"
+           "                         (PYTHON-PARITY COARSE. Keeps the smooth O-Voxel dual-grid decoder\n"
+           "                          mesh and narrow-band dual-contours THAT (= Python o_voxel\n"
+           "                          to_glb(remesh=True)) instead of marching-cubes-soliding the binary\n"
+           "                          occupancy (a lego staircase), then Taubin-smooths it. Bake + rig\n"
+           "                          then run on the parity mesh in ONE call. Implies --no-refine (a\n"
+           "                          generative densify no longer aligns to the PBR volume, so texturing\n"
+           "                          it slides colour) and raises texsize/decimate defaults to 2048/220k.)\n"
            "        [--us-octree N] [--us-latents N] [--us-steps N] [--us-guidance F] [--us-chunk N]\n"
            "        [--us-gguf <dir>] [--us-dit-w <dir>] [--us-vae-w <dir>] [--us-cnd-w <dir>] [--us-meta <npy>]\n"
            "        [--stage-dir <dir>]   (emit coarse/refined/decimated GLB intermediates + resume caches)\n"
@@ -210,7 +220,21 @@ int main(int argc, char** argv) {
     // twintails into one cape); the finer stride-1 grid preserves them too but is ~12x slower for the
     // same result, so blur=0 at stride 2 is the default. --mc-blur/--mc-stride/--mc-smooth override.
     int mc_stride = 2, mc_blur = 0, mc_smooth = 1;
+    // --dc-remesh: THE PYTHON-PARITY COARSE PATH (2026-07-25). Instead of MC-soliding the binary
+    // occupancy (a lego staircase), keep the smooth O-Voxel dual-grid decoder mesh and narrow-band
+    // dual-contour THAT — Python's `o_voxel.postprocess.to_glb(remesh=True)` equivalent — then Taubin.
+    // The result IS the parity delivery mesh, so the bake and the rig both run on it in ONE binary
+    // call (shootout/native_ovoxel_dc_parity.sh does the same thing across four processes and stops
+    // before the rig). Implies --no-refine: refine is a GENERATIVE densify whose surface no longer
+    // aligns to the PBR volume, and texturing it reprojects/slides colour. See memory
+    // project_image_to_rig_coarse_parity_ovoxel_dc.
+    bool dc_remesh = false;
+    int   dc_band = 1;        // narrow-band width in voxels (Pixal3D postprocess default)
+    int   dc_taubin = 2;      // Taubin iterations on the DC output (parity wrapper default)
     int texsize = 1024, decimate = 150000, num_beams = 20;
+    // --dc-remesh raises the texture/decimate defaults to the parity wrapper's (2048 / 220k on a
+    // ~3.4M-face DC mesh); an explicit --texsize/--decimate/--refine still wins.
+    bool texsize_set = false, decimate_set = false, refine_set = false;
     // --dump-geo/--from-geo: cache the geometry volume (coords1024 + per-voxel PBR) so the cheap
     // post-geometry stages (MC-remesh + bake + rig, ~3min) can be iterated without re-paying the ~420s
     // diffusion. --no-rig writes a textured-only GLB (skips the 159s auto-rig) for fast mesh/texture A/B.
@@ -314,8 +338,8 @@ int main(int argc, char** argv) {
         // That is what OOM'd the refine (bigger subject -> N1 1227->1701 -> M 12541->18674 -> M^2).
         else if (a == "--fov"   && i+1 < argc) { cam = std::atof(argv[++i]) * (float)M_PI / 180.0f; dist = 0.5f / std::tan(cam * 0.5f); }
         else if (a == "--cam"   && i+3 < argc) { cam = std::atof(argv[++i]); dist = std::atof(argv[++i]); ms = std::atof(argv[++i]); }
-        else if (a == "--texsize" && i+1 < argc) texsize = std::atoi(argv[++i]);
-        else if (a == "--decimate" && i+1 < argc) decimate = std::atoi(argv[++i]);
+        else if (a == "--texsize" && i+1 < argc) { texsize = std::atoi(argv[++i]); texsize_set = true; }
+        else if (a == "--decimate" && i+1 < argc) { decimate = std::atoi(argv[++i]); decimate_set = true; }
         else if ((a == "--resolution" || a == "--res") && i+1 < argc) {
             in.resolution = std::atoi(argv[++i]);
             if (in.resolution % 16 != 0) { printf("--resolution must be a multiple of 16\n"); return 1; }
@@ -338,8 +362,11 @@ int main(int argc, char** argv) {
         else if (a == "--moge") use_moge = true;
         else if (a == "--moge-weights" && i+1 < argc) moge_w = argv[++i];
         // ---- UltraShape refine stage ----
-        else if (a == "--refine") refine = true;
-        else if (a == "--no-refine") refine = false;
+        else if (a == "--refine") { refine = true; refine_set = true; }
+        else if (a == "--no-refine") { refine = false; refine_set = true; }
+        else if (a == "--dc-remesh") dc_remesh = true;
+        else if (a == "--dc-band" && i+1 < argc) dc_band = std::atoi(argv[++i]);
+        else if (a == "--dc-taubin" && i+1 < argc) dc_taubin = std::atoi(argv[++i]);
         else if (a == "--us-octree" && i+1 < argc) uscfg.octree = std::atoi(argv[++i]);
         else if (a == "--us-latents" && i+1 < argc) uscfg.num_latents = std::atoi(argv[++i]);
         else if (a == "--us-steps" && i+1 < argc) uscfg.steps = std::atoi(argv[++i]);
@@ -410,8 +437,18 @@ int main(int argc, char** argv) {
     if (fast) { setenv("PIXAL3D_FAST", "1", 1); setenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F", "1", 1); }
 
     printf("==== image_to_rig (inline native image -> textured+rigged GLB) ====\n");
+    // --dc-remesh resolves its implied defaults here so the banner below reports what will actually run.
+    if (dc_remesh) {
+        if (!refine_set)   refine = false;      // parity mesh IS the coarse O-Voxel-DC surface
+        if (!texsize_set)  texsize = 2048;
+        if (!decimate_set) decimate = 220000;
+    }
+
     printf("  model=%s\n  image=%s\n  out=%s\n  cam: fov=%.4frad dist=%.4f scale=%.2f  backend=%s\n",
            model.c_str(), image.c_str(), out.c_str(), cam, dist, ms, use_cuda ? "cuda" : "cpu");
+    if (dc_remesh)
+        printf("  dc-remesh=yes (Python-parity O-Voxel narrow-band DC, band=%d, taubin=%d; refine=%s, texsize=%d, decimate=%d)\n",
+               dc_band, dc_taubin, refine ? "ON (explicit)" : "off", texsize, decimate);
     if (geometry_only) {
         printf("  geometry-only=yes (legacy PBR material, UV bake, and rig are skipped)\n");
     } else if (material_cache_only) {
@@ -465,7 +502,9 @@ int main(int argc, char** argv) {
     // as the textured path. Geometry-only suppresses M6 by passing no texture output buffers below;
     // flipping this flag changes M4's CUDA path and is not a harmless performance optimisation.
     in.textured = true; in.watertight = true; in.remesh = false;
-    in.mc_remesh = clean; in.mc_stride = mc_stride; in.mc_blur = mc_blur; in.mc_post_smooth = mc_smooth;
+    // --dc-remesh keeps the raw O-Voxel dual-grid mesh out of the chain (mc_remesh would replace it
+    // with the MC-solid staircase); the DC remesh below is what makes it manifold + smooth.
+    in.mc_remesh = clean && !dc_remesh; in.mc_stride = mc_stride; in.mc_blur = mc_blur; in.mc_post_smooth = mc_smooth;
     in.norm_mean = load_norm(model, "shape_slat", "mean");
     in.norm_std  = load_norm(model, "shape_slat", "std");
     in.tex_mean  = load_norm(model, "tex_slat", "mean");
@@ -524,6 +563,9 @@ int main(int argc, char** argv) {
         printf("  [1/4] from-geo: loaded %zu occ voxels, %zu PBR voxels from %s\n",
                coords1024.size()/4, pbr_coords.size()/4, from_geo.c_str());
         if (!clean) { printf("FAIL: --from-geo only supports the clean (MC-remesh) path\n"); return 1; }
+        // The geo cache holds the binary occupancy, not the O-Voxel decoder mesh, so a DC of it would
+        // contour the STAIRCASE — the exact mistake the parity work root-caused. Refuse instead.
+        if (dc_remesh) { printf("FAIL: --dc-remesh needs the O-Voxel decoder mesh; --from-geo only caches the occupancy grid\n"); return 1; }
         mesh = pix::build_mc_remesh(coords1024, in.resolution, mc_stride, mc_blur, mc_smooth, true);
     } else {
         mesh = pix::run_geometry(in, &st, nullptr,
@@ -544,8 +586,45 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---------- [1a0/4] --dc-remesh: Python-parity narrow-band DC of the O-Voxel mesh ----------
+    // `mesh` here is the raw dual-grid decoder surface (smooth QEF vertices, but non-manifold and
+    // ~3.4M faces). Dual-contouring its own narrow-band UDF is what Python's to_glb(remesh=True)
+    // does, and it yields the smooth watertight parity surface. The RAW mesh is kept as the bake's
+    // reproject shell: it is the surface the PBR volume was decoded on, so it stays volume-aligned.
+    if (dc_remesh && !did_refine_load) {
+        double t_dc = pix::now_s();
+        printf("  [1a0/4] dc-remesh: narrow-band DC of the O-Voxel mesh (%d v / %d f, res=%d band=%d)...\n",
+               mesh.N, mesh.F, in.resolution, dc_band);
+        shell_verts = mesh.verts; shell_faces = mesh.faces;   // volume-aligned generation surface
+        std::vector<float> dcv; std::vector<int64_t> dcf;
+        if (!nbdc::remesh(mesh.verts, mesh.faces, in.resolution, (float)dc_band, dcv, dcf)) {
+            printf("FAIL: --dc-remesh narrow-band dual contour\n"); return 1;
+        }
+        if (dc_taubin > 0) meshsmooth::taubin(dcv, dcf, dc_taubin);
+        mesh.verts = std::move(dcv); mesh.faces = std::move(dcf);
+        mesh.N = (int)(mesh.verts.size()/3); mesh.F = (int)(mesh.faces.size()/3);
+        printf("  [1a0/4] dc-remesh: -> %d v / %d f (taubin x%d)  (%.1fs)\n", mesh.N, mesh.F, dc_taubin, pix::now_s()-t_dc);
+        if (!stage_dir.empty()) {
+            mkdir(stage_dir.c_str(), 0755);
+            // coarse.glb = the RAW O-Voxel generation surface (what the PBR volume was decoded on and
+            // what the bake reprojects against); dc.glb = the parity delivery mesh. They are also
+            // written under the names --from-refined expects, so `--dc-remesh --from-refined <dir>`
+            // re-enters at the bake with no second diffusion — that is the LOD-tier / retexture loop.
+            if (glb::write_glb((stage_dir + "/coarse.glb").c_str(), shell_verts, shell_faces))
+                printf("  [stage] wrote %s/coarse.glb (raw O-Voxel mesh = bake shell)\n", stage_dir.c_str());
+            if (glb::write_glb((stage_dir + "/dc.glb").c_str(), mesh.verts, mesh.faces))
+                printf("  [stage] wrote %s/dc.glb (parity delivery mesh, %d v / %d f)\n", stage_dir.c_str(), mesh.N, mesh.F);
+            glb::write_glb((stage_dir + "/refined.glb").c_str(), mesh.verts, mesh.faces);   // --from-refined alias
+            sv_vec(stage_dir + "/pbr_feats.bin",  pbr_feats.data(),  pbr_feats.size()*sizeof(float));
+            sv_vec(stage_dir + "/pbr_coords.bin", pbr_coords.data(), pbr_coords.size()*sizeof(int32_t));
+            sv_i32(stage_dir + "/resolution.bin", (int32_t)in.resolution);
+            printf("  [stage] pbr cache written (resume: --dc-remesh --from-refined %s)\n", stage_dir.c_str());
+        }
+    }
+
     // stage-dir: snapshot the coarse (pre-refine) mesh as a named eye-test artifact.
-    if (!stage_dir.empty() && !did_refine_load) {
+    // (--dc-remesh staged its own coarse.glb above — the RAW mesh, not the DC output.)
+    if (!stage_dir.empty() && !did_refine_load && !dc_remesh) {
         mkdir(stage_dir.c_str(), 0755);
         if (glb::write_glb((stage_dir + "/coarse.glb").c_str(), mesh.verts, mesh.faces))
             printf("  [stage] wrote %s/coarse.glb (%d v / %d f)\n", stage_dir.c_str(), mesh.N, mesh.F);
@@ -663,7 +742,9 @@ int main(int argc, char** argv) {
     // clustering grows large charts on the manifold surface → ~18s bake, ~14k clusters, not the >400s /
     // tens-of-thousands-of-charts shatter on the non-manifold staircase). Raw path keeps precluster=false.
     double t_bake = pix::now_s();
-    const bool precluster = clean;
+    // The DC remesh output is manifold and clean, so it takes the precluster path too (the raw
+    // O-Voxel mesh is what shatters xatlas, and that mesh is now only the reproject shell).
+    const bool precluster = clean || dc_remesh;
     // REPROJECT bake when we have a coarse dense shell (i.e. UltraShape refine ran): snap each texel of
     // the refined/decimated mesh onto the coarse shell (volume frame) then grid_sample the PBR volume at
     // the snapped point. Robust to the refined mesh's proportional drift from the coarse mesh (the black-
@@ -684,15 +765,30 @@ int main(int argc, char** argv) {
             float q0=(shell_verts[i*3]+0.5f)*in.resolution, q1=(shell_verts[i*3+1]+0.5f)*in.resolution, q2=(shell_verts[i*3+2]+0.5f)*in.resolution;
             texgs::sample_one(vol, pbr_feats.data(), C, q0,q1,q2, &shell_attr[(size_t)i*C], 2);
         }
-        // default reproject mode = mesh-attr (barycentric shell colours); --tex-snap-volume opts out.
-        if (!tex_snap_volume) setenv("RP_ATTR", "1", 1); else unsetenv("RP_ATTR");
-        // --tex-volume-direct: read the volume at each texel's own position; the mode above becomes the
-        // guard for texels the volume has no data near. Default OFF = today's behaviour.
-        if (tex_volume_direct) setenv("RP_DIRECT", "1", 1); else unsetenv("RP_DIRECT");
+        if (dc_remesh && !refine) {
+            // PARITY BAKE (= texture_rebake_native --bake volume-trilinear, which is what produced the
+            // proven parity.glb). The mesh being textured is the DC of the shell, i.e. essentially the
+            // same surface, so the volume is read DIRECT at each texel's own position — one projection,
+            // no cross-surface slide (RP_ATTR/snap is what smeared tie colour onto the collar). The
+            // shell stays only as the guard for texels the sparse volume has no data near.
+            unsetenv("RP_ATTR"); setenv("RP_DIRECT", "1", 1);
+            setenv("RP_FRONTDOT", "-1", 0);        // guard snap takes the globally closest tri, like Python's BVH
+            setenv("ATL_BASECOLOR_SRGB", "0", 0);  // Python stores the RAW volume colour; sRGB OETF washes darks
+            setenv("TEX_TELEA_INPAINT", "1", 0);
+            setenv("TEX_TELEA_RADIUS", "3", 0);
+            setenv("TEX_FILL_BACKGROUND", "1", 0); // fill the gutter or chart edges bleed black = seam web
+        } else {
+            // default reproject mode = mesh-attr (barycentric shell colours); --tex-snap-volume opts out.
+            if (!tex_snap_volume) setenv("RP_ATTR", "1", 1); else unsetenv("RP_ATTR");
+            // --tex-volume-direct: read the volume at each texel's own position; the mode above becomes the
+            // guard for texels the volume has no data near. Default OFF = today's behaviour.
+            if (tex_volume_direct) setenv("RP_DIRECT", "1", 1); else unsetenv("RP_DIRECT");
+        }
     }
     // sample_fallback_r: 0 keeps today's snap-mode behaviour bit-for-bit; volume-direct needs a real
     // radius or every texel starves to black (that starvation IS the "black texture bug").
-    const int bake_fbr = tex_fallback_r >= 0 ? tex_fallback_r : (tex_volume_direct ? 8 : 0);
+    const int bake_fbr = tex_fallback_r >= 0 ? tex_fallback_r
+                       : ((tex_volume_direct || (dc_remesh && !refine)) ? 8 : 0);
     texatlas::BakedTexture bt = use_reproject
         ? texatlas::bake(mesh.verts, mesh.faces, pbr_feats, pbr_coords, in.resolution, texsize, decimate,
                          4, true, bake_fbr, precluster, 55.f, &shell_verts, &shell_faces, &shell_attr, /*reproject=*/true)

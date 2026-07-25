@@ -62,6 +62,7 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "ima
   # P3SAM_USE_CUDA so p3sam_postprocess.hpp routes the heads through the GPU (else they run ~30min CPU).
   P3SAM_OBJ=""; P3SAM_DEF=""
   RIG_PHILOX_OBJ=""
+  NBDC_OBJ=""
   if [ "$BASE" = "image_to_rig" ]; then
     "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$HOSTCXX" \
       -c "$HERE/p3sam_heads_cuda.cu" -o "$HERE/p3sam_heads_cuda.o"
@@ -74,11 +75,16 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "ima
     "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$HOSTCXX" \
       -c "$HERE/rig_philox_race.cu" -o "$HERE/rig_philox_race.o"
     RIG_PHILOX_OBJ="$HERE/rig_philox_race.o"
+    # image_to_rig --dc-remesh: the Python-parity narrow-band DC remesh (native BVH + CUDA UDF).
+    # Same TU the standalone narrow_band_dc_probe links, so in-process and probe results agree.
+    "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$HOSTCXX" \
+      -c "$HERE/narrow_band_dc_cuda.cu" -o "$HERE/narrow_band_dc.o"
+    NBDC_OBJ="$HERE/narrow_band_dc.o"
   fi
   "$HOSTCXX" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH -DTEXATLAS_CUDA_RASTER $P3SAM_DEF $PACK_DEFS $INC -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
     "$HERE/$SRC" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
     "$TP/meshoptimizer/vertexcodec.cpp" "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
-    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" "$HERE/tex_atlas_cuda.o" $CUMESH_OBJS $P3SAM_OBJ $RIG_PHILOX_OBJ \
+    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" "$HERE/tex_atlas_cuda.o" $CUMESH_OBJS $P3SAM_OBJ $RIG_PHILOX_OBJ $NBDC_OBJ \
     $BASISU_LIB -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
     -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
@@ -93,9 +99,13 @@ if [ "$BASE" = "narrow_band_dc_probe" ] && [ "$MODE" = "cuda" ]; then
   HOSTCXX="${PIXAL3D_HOST_CXX:-/usr/bin/g++-15}"
   TOOLLIB="$TOOL/lib64"; [ -d "$TOOLLIB" ] || TOOLLIB="$TOOL/lib"
   echo ">> CUDA build narrow_band_dc_probe (native BVH + narrow-band dual contour, no Python/Torch)"
-  "$TOOL/bin/nvcc" -x cu -O2 -std=c++17 -arch=sm_86 -ccbin "$HOSTCXX" -I"$TOOL/include" \
-    "$HERE/$SRC" -o "$HERE/$BIN" -L"$TOOLLIB" -lcudart -L/usr/lib -lcuda -lm -lpthread \
-    -Xlinker -rpath -Xlinker "$TOOLLIB" -Xlinker -rpath -Xlinker /usr/lib
+  # The remesh itself lives in narrow_band_dc_cuda.cu (shared with image_to_rig --dc-remesh); the
+  # probe TU is plain host code (GLB in/out) so it compiles as C++ and links the CUDA object.
+  "$TOOL/bin/nvcc" -O2 -std=c++17 -arch=sm_86 -ccbin "$HOSTCXX" \
+    -c "$HERE/narrow_band_dc_cuda.cu" -o "$HERE/narrow_band_dc.o"
+  "$HOSTCXX" -O2 -std=c++17 -I"$TOOL/include" \
+    "$HERE/$SRC" "$HERE/narrow_band_dc.o" -o "$HERE/$BIN" -L"$TOOLLIB" -lcudart -L/usr/lib -lcuda -lm -lpthread \
+    -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
   exit 0
 fi
