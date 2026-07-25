@@ -24,15 +24,19 @@ import shutil
 
 SHOOT = "/mnt/hdd/3d/avatar-shootout/_shootout_out"
 
+# NB: the Python-ref paths in HANDOFF-parity-to-rigged-api-2026-07-25.md were stale for miku and
+# gilly (both 404 on disk). These are the paths that actually exist -- verified, not copied.
+
 # model -> (input image, Python reference GLB or None, initial azimuth deg, note)
 MODELS: dict[str, tuple[str, str | None, int, str]] = {
     "miku": (f"{SHOOT}/v8_production_e2e_20260724/input_birefnet_rgba.png",
-             f"{SHOOT}/puppy-eyetest/python_pixal1024_sdpa.glb", 180, "canonical standing figure"),
+             f"{SHOOT}/runbook_image_to_rig/miku_python_pixal1536_reference_20260721/python_pixal1024_sdpa.glb",
+             180, "canonical standing figure"),
     "soldier": (f"{SHOOT}/soldier_matte.png",
                 f"{SHOOT}/runbook_image_to_rig/soldier_raw_full_e2e_probe/python_texture_oracle_sdpa.glb",
                 0, "bearskin busby = large rigid prop"),
     "gilly": (f"{SHOOT}/runbook_image_to_rig/gilly/gilly_matte.png",
-              f"{SHOOT}/runbook_image_to_rig/gilly_modelready_r4_generic_audit/gilly_python_r4_generic_audit.glb",
+              f"{SHOOT}/runbook_image_to_rig/gilly_modelready_cachefirst_generic_e2e_20260723/gilly_python_r4_generic_audit.glb",
               0, "generic creature namespace"),
     "char1": (f"{SHOOT}/char1_matte.png", None, 0, "no Python ref"),
     "toy1": (f"{SHOOT}/toy1_matte.png", None, 0, "no Python ref"),
