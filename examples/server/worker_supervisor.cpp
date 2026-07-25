@@ -1,10 +1,13 @@
 #include "worker_supervisor.h"
 
+#include "log.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -137,16 +140,55 @@ int WorkerSupervisor::worker_pid() {
     return pid_ > 0 ? pid_ : 0;
 }
 
+// Longest a drain may stay raised before it is treated as abandoned. A drain exists only
+// to bridge a gate's drain -> unload handover, which takes seconds; anything beyond this
+// means the gate died, timed out, or was interrupted (e.g. a cancelled
+// /gpu/services/<name> toggle) and is never coming back to unload us. Without a bound the
+// service refuses every generation request with 503 "service draining" indefinitely while
+// still holding its worker + VRAM, and only a manual POST /v1/admin/load recovers it.
+// Generous by default so a legitimately slow handover is never cut short.
+static long long drain_max_seconds() {
+    static const long long value = [] {
+        const char* env = getenv("SD_DRAIN_MAX_SECONDS");
+        if (env != nullptr && env[0] != '\0') {
+            const long long parsed = atoll(env);
+            if (parsed > 0) {
+                return parsed;
+            }
+        }
+        return 600LL;  // 10 minutes
+    }();
+    return value;
+}
+
 bool WorkerSupervisor::draining() const {
-    return draining_.load();
+    if (!draining_.load()) {
+        return false;
+    }
+    const long long started = drain_started_at_.load();
+    if (started > 0) {
+        const long long now = (long long)::time(nullptr);
+        if (now - started >= drain_max_seconds()) {
+            // Self-heal: report (and latch) not-draining so the service starts serving
+            // again instead of staying wedged behind an abandoned handover.
+            draining_.store(false);
+            drain_started_at_.store(0);
+            LOG_WARN("drain abandoned after %llds (no unload followed); reopening for requests",
+                     (long long)(now - started));
+            return false;
+        }
+    }
+    return true;
 }
 
 void WorkerSupervisor::drain() {
+    drain_started_at_.store((long long)::time(nullptr));
     draining_.store(true);
 }
 
 void WorkerSupervisor::reopen() {
     draining_.store(false);
+    drain_started_at_.store(0);
 }
 
 std::string WorkerSupervisor::active_model() {
@@ -227,13 +269,21 @@ bool WorkerSupervisor::unload_locked() {
 
 bool WorkerSupervisor::unload() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!unload_locked()) {
-        return false;
-    }
     // Koblem's normal gate sequence is drain -> unload; reopening makes a later
     // request able to lazily create a fresh worker without requiring an extra /load.
+    //
+    // Clear the flag on EVERY path, including when there was nothing to unload.
+    // "unload" is the end of the gate sequence regardless of whether a worker
+    // happened to be resident, so it must always reopen. Clearing it only on the
+    // success path meant a drain followed by an unload that found no worker (already
+    // exited, a raced double-unload, or a worker that died on its own) left
+    // draining_ latched true forever: every subsequent generation request 503s with
+    // "service draining" and nothing ever resets it, so the service looks hung and
+    // only a manual POST /v1/admin/load recovers it.
+    const bool unloaded = unload_locked();
     draining_.store(false);
-    return true;
+    drain_started_at_.store(0);
+    return unloaded;
 }
 
 int WorkerSupervisor::reserve_loopback_port() const {

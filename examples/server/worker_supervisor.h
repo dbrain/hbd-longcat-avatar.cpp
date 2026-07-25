@@ -66,7 +66,14 @@ private:
     mutable std::mutex mutex_;
     int pid_ = -1;
     int port_ = 0;
-    std::atomic<bool> draining_{false};
+    // mutable: draining() is const but self-heals an abandoned drain in place.
+    mutable std::atomic<bool> draining_{false};
+    // Wall-clock (seconds since epoch) when draining_ was last raised. A drain is only
+    // ever meant to bridge a gate's drain -> unload handover; if the gate dies, times
+    // out, or is otherwise abandoned mid-sequence, nothing clears the flag and the
+    // service refuses every generation request forever while still holding VRAM. Bound
+    // it so an abandoned drain self-heals. See draining().
+    mutable std::atomic<long long> drain_started_at_{0};
     std::atomic<int> active_generation_requests_{0};
     std::string active_model_;
     std::string active_gpu_;

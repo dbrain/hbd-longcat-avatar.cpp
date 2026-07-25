@@ -487,10 +487,17 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<SDGenerationParams> hires_stages;
             std::vector<sample_method_t> hires_stage_methods;
             std::vector<float> hires_stage_cfgs;
-            if (body.contains("hires_chain")) {
-                if (!body["hires_chain"].is_array() || body["hires_chain"].empty()) {
+            // An EMPTY hires_chain means "no refine chain", not "malformed request".
+            // koblem always emits the key and sends [] whenever upscaler_ratio is "none",
+            // so rejecting it 400s every un-refined render — which is most of them. The
+            // pre-rebuild engine had no hires_chain validation at all and simply ignored
+            // the field, so treating [] as absent is what restores that wire contract.
+            // A non-array is still an error; only the empty array is tolerated.
+            if (body.contains("hires_chain") &&
+                !(body["hires_chain"].is_array() && body["hires_chain"].empty())) {
+                if (!body["hires_chain"].is_array()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"hires_chain must be a non-empty array"})", "application/json");
+                    res.set_content(R"({"error":"hires_chain must be an array"})", "application/json");
                     return;
                 }
                 for (const auto& stage : body["hires_chain"]) {
