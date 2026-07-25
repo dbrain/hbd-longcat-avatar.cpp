@@ -11,7 +11,9 @@
 #   tier spec: name:faces:atlas   (default ladder below)
 set -euo pipefail
 
-IMG="${1:?input image (the stage cache's own source image)}"
+# NB: no apostrophes in a ${x:?msg} message — bash parses quoting inside it even within double
+# quotes, and one contraction here turned the whole script into "unexpected EOF".
+IMG="${1:?input image - must be the same source image the stage cache was built from}"
 STAGE="${2:?stage dir from a previous --dc-remesh run}"
 OUT="${3:?output dir}"
 shift 3 || true
