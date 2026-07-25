@@ -52,7 +52,12 @@ inline bool write_rigged_textured_glb(const char* path,
                                       size_t                       tex_png_len,
                                       const char*                  mime = "image/png",
                                       // optional [J] joint node names; nullptr => "bone_<j>"
-                                      const std::vector<std::string>* joint_names = nullptr) {
+                                      const std::vector<std::string>* joint_names = nullptr,
+                                      // optional tangent-space normal map (PNG bytes). A decimated
+                                      // LOD ("game asset") drops the dense surface relief; this is
+                                      // how it renders with that detail again. nullptr = no map.
+                                      const uint8_t*               nrm_png = nullptr,
+                                      size_t                       nrm_png_len = 0) {
     const uint32_t V  = (uint32_t)(verts.size() / 3);
     const uint32_t F3 = (uint32_t)faces.size();   // index count = F*3
     const uint32_t J  = (uint32_t)(joints.size() / 3);
@@ -102,6 +107,8 @@ inline bool write_rigged_textured_glb(const char* path,
     const uint32_t IDX = F3 * 4u;        // u32
     const uint32_t IBM = J * 16u * 4u;   // f32
     const uint32_t TEX = (uint32_t)tex_png_len;
+    const bool     have_nrm_map = nrm_png && nrm_png_len > 0;
+    const uint32_t NMP = have_nrm_map ? (uint32_t)nrm_png_len : 0u;
     uint32_t off = 0;
     auto alloc = [&](uint32_t len) { uint32_t o = off; off += len + pad4(len); return o; };
     const uint32_t POS_OFF = alloc(POS);
@@ -112,6 +119,7 @@ inline bool write_rigged_textured_glb(const char* path,
     const uint32_t IDX_OFF = alloc(IDX);
     const uint32_t IBM_OFF = alloc(IBM);
     const uint32_t TEX_OFF = alloc(TEX);
+    const uint32_t NMP_OFF = have_nrm_map ? alloc(NMP) : 0u;   // bufferView 8 when present
     const uint32_t BIN_LEN = off;
 
     // ---- build node tree from parents ----
@@ -178,18 +186,29 @@ inline bool write_rigged_textured_glb(const char* path,
     for (uint32_t j = 0; j < J; j++) { snprintf(buf, sizeof(buf), "%s%u", j ? "," : "", j); js += buf; }
     js += "]}],";
 
-    // material: PBR with baseColorTexture (texture 0), doubleSided (like glb_textured.hpp)
+    // material: PBR with baseColorTexture (texture 0), doubleSided (like glb_textured.hpp).
+    // No TANGENT attribute is written with the normal map: glTF lets the renderer derive the
+    // tangent frame from UV screen-space derivatives when it is absent, which is what
+    // model-viewer/three do, and a wrong stored tangent is worse than a derived one.
     js += "\"materials\":[{\"name\":\"rigged_pbr\",\"doubleSided\":true,\"alphaMode\":\"OPAQUE\","
           "\"pbrMetallicRoughness\":{"
           "\"baseColorTexture\":{\"index\":0,\"texCoord\":0},"
           "\"baseColorFactor\":[1,1,1,1],"
-          "\"metallicFactor\":0.0,\"roughnessFactor\":1.0}}],";
+          "\"metallicFactor\":0.0,\"roughnessFactor\":1.0}";
+    if (have_nrm_map) js += ",\"normalTexture\":{\"index\":1,\"texCoord\":0}";
+    js += "}],";
 
     // samplers / textures / images
     js += "\"samplers\":[{\"magFilter\":9729,\"minFilter\":9729,\"wrapS\":33071,\"wrapT\":33071}],";
-    js += "\"textures\":[{\"source\":0,\"sampler\":0}],";
-    snprintf(buf, sizeof(buf), "\"images\":[{\"bufferView\":7,\"mimeType\":\"%s\"}],", mime);
+    js += have_nrm_map ? "\"textures\":[{\"source\":0,\"sampler\":0},{\"source\":1,\"sampler\":0}],"
+                       : "\"textures\":[{\"source\":0,\"sampler\":0}],";
+    snprintf(buf, sizeof(buf), "\"images\":[{\"bufferView\":7,\"mimeType\":\"%s\"}", mime);
     js += buf;
+    if (have_nrm_map) {
+        snprintf(buf, sizeof(buf), ",{\"bufferView\":8,\"mimeType\":\"%s\"}", mime);
+        js += buf;
+    }
+    js += "],";
 
     // mesh
     js += "\"meshes\":[{\"primitives\":[{\"attributes\":{"
@@ -211,6 +230,10 @@ inline bool write_rigged_textured_glb(const char* path,
         POS_OFF, POS, NRM_OFF, NRM, UV_OFF, UV, JNT_OFF, JNT, WGT_OFF, WGT,
         IDX_OFF, IDX, IBM_OFF, IBM, TEX_OFF, TEX);
     js += buf;
+    if (have_nrm_map) {   // bufferView 8: the normal-map image
+        snprintf(buf, sizeof(buf), ",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}", NMP_OFF, NMP);
+        js += buf;
+    }
     js += "],";
 
     // accessors
@@ -260,6 +283,7 @@ inline bool write_rigged_textured_glb(const char* path,
     }
     std::fwrite(ibm.data(), 4, (size_t)J * 16, f); wz(pad4(IBM));
     std::fwrite(tex_png, 1, tex_png_len, f); wz(pad4(TEX));
+    if (have_nrm_map) { std::fwrite(nrm_png, 1, nrm_png_len, f); wz(pad4(NMP)); }
     for (uint32_t i = 0; i < bin_pad; i++) std::fputc(0, f);
     std::fclose(f);
     return true;

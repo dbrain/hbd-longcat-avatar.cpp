@@ -742,6 +742,15 @@ int main(int argc, char** argv) {
     // clustering grows large charts on the manifold surface → ~18s bake, ~14k clusters, not the >400s /
     // tens-of-thousands-of-charts shatter on the non-manifold staircase). Raw path keeps precluster=false.
     double t_bake = pix::now_s();
+    // LOD / "game asset" tiers: the bake decimates internally, and decimation is exactly where the
+    // dense surface relief goes. Keep the pre-bake mesh as the normal-map source whenever the target
+    // is a real reduction, so the low-poly tier renders WITH that detail instead of losing it. The
+    // retopo paths above already set this; RETOPO_NO_NORMAL=1 opts out of the bake either way.
+    if (nrm_src_verts.empty() && decimate > 0 && mesh.F > 2 * decimate && !std::getenv("RETOPO_NO_NORMAL")) {
+        nrm_src_verts = mesh.verts; nrm_src_faces = mesh.faces;
+        printf("  [1c/4] normal-map source: pre-decimation mesh (%d v / %d f -> ~%d faces)\n",
+               mesh.N, mesh.F, decimate);
+    }
     // The DC remesh output is manifold and clean, so it takes the precluster path too (the raw
     // O-Voxel mesh is what shatters xatlas, and that mesh is now only the reproject shell).
     const bool precluster = clean || dc_remesh;
@@ -956,12 +965,18 @@ int main(int argc, char** argv) {
 
     // baseColor RGBA atlas -> PNG (the only texture the rigged-textured writer carries, matching combine).
     std::vector<uint8_t> base_png = glb::encode_png(bt.base_color.data(), bt.tw, bt.th, 4);
+    // The tangent-space normal map baked above is what makes a decimated tier still look dense;
+    // carry it into the rigged delivery (the packed --no-rig writer already did).
+    std::vector<uint8_t> nrm_png;
+    if (!nmap.empty()) nrm_png = glb::encode_png(nmap.data(), bt.tw, bt.th, 3);
     bool have_nrm = bt.normals.size() == bt.verts.size();
     bool ok = glb::write_rigged_textured_glb(out.c_str(), verts_norm, faces64, bt.uvs,
                                              R.joints, R.parents, dst_w,
                                              have_nrm ? &bt.normals : nullptr,
                                              base_png.data(), base_png.size(), "image/png",
-                                             jnames.empty() ? nullptr : &jnames);
+                                             jnames.empty() ? nullptr : &jnames,
+                                             nrm_png.empty() ? nullptr : nrm_png.data(),
+                                             nrm_png.size());
     if (!ok) { printf("FAIL: write_rigged_textured_glb\n"); return 1; }
     printf("==== DONE -> %s  (verts=%zu faces=%zu J=%d, %.1fs total) ====\n",
            out.c_str(), verts_norm.size()/3, faces64.size()/3, R.J, pix::now_s() - t_geo);
