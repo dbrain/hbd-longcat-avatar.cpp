@@ -2477,6 +2477,19 @@ protected:
             return ensure_sched(gf);
         }
         if (compute_allocr != nullptr) {
+            // Diagnostic: SD_GRAPH_CUT_RESERVE_PER_SEGMENT=1 re-runs the reserve on every
+            // graph while keeping the gallocr object (and its buffer). ggml_gallocr_alloc_graph
+            // only re-plans when ggml_gallocr_needs_realloc() trips, and that compares node/leaf
+            // COUNTS and sizes — never tensor identity — so two same-shaped segment graphs can
+            // silently inherit the previous segment's positional address map.
+            static const bool reserve_per_graph = [] {
+                const char* v = std::getenv("SD_GRAPH_CUT_RESERVE_PER_SEGMENT");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            if (reserve_per_graph && !ggml_gallocr_reserve(compute_allocr, gf)) {
+                LOG_ERROR("%s: failed to re-reserve the compute buffer\n", get_desc().c_str());
+                return false;
+            }
             return true;
         }
         compute_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime_backend));
@@ -2673,6 +2686,14 @@ protected:
             }
         }
         ggml_backend_synchronize(runtime_backend);
+        for (const auto& kv : source_to_cache_tensors) {
+            // kv.first is what cache_source_tensor() RESOLVED to; kv.second is the cache
+            // entry named after the requested cut. If the resolved source's name is not the
+            // cut's own name, the copy took its value from an ancestor — i.e. the cache is
+            // storing the wrong tensor's contents under this name.
+            log_handoff_checksum("CACHE-OUT", kv.second->name, kv.second);
+            log_handoff_checksum("CACHE-SRC", std::string(kv.second->name) + " <= " + kv.first->name, kv.first);
+        }
         size_t cache_buffer_size = ggml_backend_buffer_get_size(cache_buffer);
         LOG_DEBUG("%s cache backend buffer size = % 6.2f MB(%s) (%i tensors)",
                   get_desc().c_str(),
@@ -2788,6 +2809,32 @@ protected:
     }
 
     bool should_use_graph_cut_segmented_compute(const GraphCutPlan& plan) {
+        // Diagnostic: SD_GRAPH_CUT_DISABLE_FOR=<substr>[,<substr>...] forces the
+        // named runners onto execute_graph while everything else stays
+        // segmented — isolates which stage a segmentation bug lives in without
+        // paying the whole-pipeline VRAM cost of --max-vram 0.
+        static const std::vector<std::string> disabled_descs = [] {
+            std::vector<std::string> out;
+            const char* env = std::getenv("SD_GRAPH_CUT_DISABLE_FOR");
+            if (env != nullptr && env[0] != '\0') {
+                std::stringstream ss(env);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    if (!item.empty()) {
+                        out.push_back(item);
+                    }
+                }
+            }
+            return out;
+        }();
+        if (!disabled_descs.empty()) {
+            const std::string desc = get_desc();
+            for (const auto& d : disabled_descs) {
+                if (desc.find(d) != std::string::npos) {
+                    return false;
+                }
+            }
+        }
         return plan.has_cuts &&
                plan.valid &&
                max_graph_vram_bytes > 0 &&
@@ -3137,6 +3184,14 @@ protected:
         }
     }
 
+    static bool reset_param_views_enabled() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("SD_GRAPH_CUT_RESET_PARAM_VIEWS");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return enabled;
+    }
+
     void reset_segment_runtime_tensors(const GraphCutSegment& segment,
                                        ggml_cgraph* gf,
                                        const std::unordered_map<ggml_tensor*, PersistentExternalBinding>* persistent_externals = nullptr) {
@@ -3176,6 +3231,18 @@ protected:
                     break;
                 }
                 case GraphCutSegment::INPUT_PARAM:
+                    // A VIEW of a param counts as INPUT_PARAM (is_params_tensor in
+                    // ggml_graph_cut.cpp also matches tensor->view_src), so it is left
+                    // bound here. But a view's data pointer was baked at graph-build time
+                    // from the view_src's then-current staging address; if the param is
+                    // re-staged per segment, the view still points at the old storage.
+                    // SD_GRAPH_CUT_RESET_PARAM_VIEWS=1 clears param VIEWS so that
+                    // ggml_backend_view_init re-derives them from the live view_src.
+                    if (reset_param_views_enabled() && input_tensor->view_src != nullptr) {
+                        input_tensor->buffer = nullptr;
+                        input_tensor->data   = nullptr;
+                        input_tensor->extra  = nullptr;
+                    }
                     break;
             }
         }
@@ -3189,6 +3256,46 @@ protected:
             node->data   = nullptr;
             node->extra  = nullptr;
         }
+    }
+
+    // Diagnostic: SD_GRAPH_CUT_HANDOFF_DIAG=1 checksums every cross-cut tensor as it is
+    // bound into a segment. Compare against the producing segment's node-trace hash for the
+    // same name: if they differ, the cache round-trip (copy out / bind back in) corrupted
+    // the value; if they match, the corruption is inside the consuming segment's compute.
+    void log_handoff_checksum(const char* stage, const std::string& name, ggml_tensor* t) {
+        static const bool diag = [] {
+            const char* v = std::getenv("SD_GRAPH_CUT_HANDOFF_DIAG");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (!diag || t == nullptr) {
+            return;
+        }
+        ggml_backend_buffer_t buf = t->view_src != nullptr ? t->view_src->buffer : t->buffer;
+        const size_t nbytes       = ggml_nbytes(t);
+        if (buf == nullptr || nbytes == 0 || t->data == nullptr) {
+            LOG_INFO("[HANDOFF] %s %s '%s': UNBOUND (buffer=%p data=%p)",
+                     get_desc().c_str(), stage, name.c_str(), (void*)buf, t->data);
+            return;
+        }
+        std::vector<uint8_t> host(nbytes);
+        ggml_backend_tensor_get(t, host.data(), 0, nbytes);
+        uint64_t hash = 1469598103934665603ull;
+        double sum = 0.0;
+        for (size_t i = 0; i < nbytes; ++i) {
+            hash = (hash ^ host[i]) * 1099511628211ull;
+        }
+        if (t->type == GGML_TYPE_F32) {
+            const float* d = (const float*)host.data();
+            for (size_t i = 0; i < nbytes / sizeof(float); ++i) {
+                if (!std::isnan(d[i]) && !std::isinf(d[i])) {
+                    sum += d[i];
+                }
+            }
+        }
+        LOG_INFO("[HANDOFF] %s %s '%s': %lldx%lldx%lldx%lld sum=%.9e hash=%016llx",
+                 get_desc().c_str(), stage, name.c_str(),
+                 (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                 sum, (unsigned long long)hash);
     }
 
     bool bind_segment_cached_inputs(ggml_cgraph* gf, const GraphCutSegment& segment) {
@@ -3223,6 +3330,7 @@ protected:
                         input_tensor->src[src_idx] = nullptr;
                     }
                     input_tensor->op = GGML_OP_NONE;
+                    log_handoff_checksum("BIND-IN", input.display_name, input_tensor);
                     break;
                 }
                 case GraphCutSegment::INPUT_EXTERNAL:
@@ -3346,6 +3454,7 @@ protected:
                 ggml_backend_sched_synchronize(sched);
             }
         } else {
+            sd_set_trace_runner_desc(get_desc().c_str());
             status = sd_backend_graph_compute_with_eval_callback(runtime_backend,
                                                                  gf,
                                                                  sd_get_backend_eval_callback(),
@@ -3554,17 +3663,49 @@ protected:
 
             ggml_context* segment_graph_ctx = nullptr;
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
-            const bool keep_segment_params  = segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT;
+            // Diagnostic: SD_GRAPH_CUT_KEEP_SEGMENT_PARAMS=1 keeps every segment's staged
+            // weights resident instead of releasing them at segment end. Costs VRAM, but
+            // isolates per-segment weight staging/eviction as the variable — the residual
+            // hand-off is already proven byte-identical across the cut.
+            static const bool force_keep_params = [] {
+                const char* v = std::getenv("SD_GRAPH_CUT_KEEP_SEGMENT_PARAMS");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            const bool keep_segment_params  = force_keep_params ||
+                                              segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT;
             const int segment_nodes          = ggml_graph_n_nodes(segment_graph);
             const int segment_leafs          = sd::ggml_graph_cut::leaf_count(segment_graph);
             const int64_t segment_start_ms   = segment_profile ? ggml_time_ms() : 0;
+            // Diagnostic: identical (nodes, leafs) on consecutive segments is the precondition
+            // for ggml_gallocr_needs_realloc() to return false and replay the previous
+            // segment's address map onto this one.
+            static const bool segment_shape_diag = [] {
+                const char* v = std::getenv("SD_GRAPH_CUT_SEGMENT_DIAG");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            if (segment_shape_diag) {
+                LOG_INFO("[SEGMENT_SHAPE] %s %zu/%zu %s: nodes=%d leafs=%d",
+                         get_desc().c_str(),
+                         seg_idx + 1,
+                         plan.segments.size(),
+                         segment.group_name.c_str(),
+                         segment_nodes,
+                         segment_leafs);
+            }
+            // Diagnostic: SD_GRAPH_CUT_FREE_BUF_PER_SEGMENT=1 restores the pre-rebuild
+            // behaviour of tearing down the compute allocator after every segment (the
+            // known-good fork passes true here), at the cost of cudaMalloc/cudaFree churn.
+            static const bool free_buf_per_segment = [] {
+                const char* v = std::getenv("SD_GRAPH_CUT_FREE_BUF_PER_SEGMENT");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
                                                    // Reuse the compute allocator through the complete
                                                    // graph-cut loop.  Recreating it per segment causes
                                                    // multi-GiB cudaMalloc/cudaFree churn and fragments the
                                                    // driver heap before the next DMD step.
-                                                   false,
+                                                   free_buf_per_segment,
                                                    !keep_segment_params,
                                                    true,
                                                    !is_last || no_return,
@@ -3759,11 +3900,34 @@ public:
         };
         const std::string identity = cache_identity(name);
         ggml_tensor* source = sd::ggml_graph_cut::cache_source_tensor(tensor);
-        for (const auto& cached : cache_tensor_map) {
-            if (cache_identity(cached.first) == identity ||
-                sd::ggml_graph_cut::cache_source_tensor(cached.second) == source) {
-                cache_tensor_aliases[name] = cached.first;
-                return;
+        // Diagnostic: SD_GRAPH_CUT_NO_CACHE_ALIAS=1 skips alias detection entirely
+        // (the known-good fork had no alias map). cache() runs AFTER
+        // reset_segment_runtime_tensors has nulled every internal node's buffer, so
+        // cache_source_tensor() takes its recursive src[0] branch and can walk a whole
+        // same-shaped residual chain — collapsing two distinct cuts onto one entry.
+        // SD_GRAPH_CUT_CACHE_ALIAS_DIAG=1 logs every alias actually taken.
+        static const bool no_cache_alias = [] {
+            const char* v = std::getenv("SD_GRAPH_CUT_NO_CACHE_ALIAS");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        static const bool cache_alias_diag = [] {
+            const char* v = std::getenv("SD_GRAPH_CUT_CACHE_ALIAS_DIAG");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (!no_cache_alias) {
+            for (const auto& cached : cache_tensor_map) {
+                if (cache_identity(cached.first) == identity ||
+                    sd::ggml_graph_cut::cache_source_tensor(cached.second) == source) {
+                    if (cache_alias_diag) {
+                        LOG_INFO("[CACHE_ALIAS] %s: '%s' -> '%s' (%s)",
+                                 get_desc().c_str(),
+                                 name.c_str(),
+                                 cached.first.c_str(),
+                                 cache_identity(cached.first) == identity ? "same-identity" : "same-source");
+                    }
+                    cache_tensor_aliases[name] = cached.first;
+                    return;
+                }
             }
         }
         cache_tensor_aliases.erase(name);

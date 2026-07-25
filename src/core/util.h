@@ -101,6 +101,10 @@ bool sd_should_preview_noisy();
 sd_graph_eval_callback_t sd_get_backend_eval_callback();
 void* sd_get_backend_eval_callback_data();
 
+// Names the runner whose graph is currently executing, so SD_NODE_TRACE can be scoped to one
+// stage (e.g. the DiT) instead of burning its node budget on the text/audio encoders.
+void sd_set_trace_runner_desc(const char* desc);
+
 // test if the backend is a specific one, e.g. "CUDA", "ROCm", "Vulkan" etc.
 bool sd_backend_is(ggml_backend_t backend, const std::string& name);
 

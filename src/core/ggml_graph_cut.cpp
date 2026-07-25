@@ -677,6 +677,18 @@ namespace sd::ggml_graph_cut {
                 continue;
             }
             ggml_set_output(output);
+            // A segment output is copied to the cross-segment cache AFTER the segment has
+            // finished computing, so it must stay live for the whole segment. The OUTPUT
+            // flag is what stops ggml-alloc recycling it — but when the output is a VIEW
+            // (a cut marked on a RESHAPE, e.g. longcat's `prelude|t_emb`) the flag lands on
+            // the view, not on the tensor that owns the bytes. ggml_gallocr_free_node()
+            // only tests node->flags (ggml-alloc.c), unlike the in-place check next to it
+            // which also tests view_src, so the parent gets freed and reused and the view
+            // then reads whatever was written over it. Propagate the flag to the storage
+            // owner so the bytes survive until the cache copy.
+            for (ggml_tensor* alias = output->view_src; alias != nullptr; alias = alias->view_src) {
+                ggml_set_output(alias);
+            }
         }
         for (int node_idx : segment.internal_node_indices) {
             ggml_graph_add_node(segment_graph, ggml_graph_node(gf, node_idx));

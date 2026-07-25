@@ -19,6 +19,13 @@
 #endif
 #endif
 
+// The LongCat avatar model has a FIXED native save_fps: video frame k always carries the
+// mouth shape for audio time k/SD_AVATAR_NATIVE_FPS, independent of the requested output fps.
+// The audio window config and the output-fps default must agree on this value or lipsync
+// drifts (muxing at 16 instead of 25 plays the mouth at 0.64x). Defined once so the engine
+// and the CLI/server layer cannot disagree.
+#define SD_AVATAR_NATIVE_FPS 25
+
 #ifdef __cplusplus
 extern "C" {
 #endif

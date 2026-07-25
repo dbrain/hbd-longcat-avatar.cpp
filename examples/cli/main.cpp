@@ -302,6 +302,16 @@ void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextP
         exit(cli_params.normal_exit ? 0 : 1);
     }
 
+    // parse_options() writes through opaque target pointers, so it cannot tell us which
+    // flags were actually supplied. Record --fps explicitly: resolve_and_validate() promotes
+    // an unset fps to the avatar's native rate, and must not override a deliberate --fps.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fps") == 0) {
+            gen_params.fps_explicit = true;
+            break;
+        }
+    }
+
     bool valid = cli_params.resolve_and_validate();
     if (valid && cli_params.mode != METADATA) {
         valid = ctx_params.resolve_and_validate(cli_params.mode) &&

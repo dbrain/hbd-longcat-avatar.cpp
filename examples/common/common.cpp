@@ -1890,6 +1890,9 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("qwen_image_layers", qwen_image_layers);
     load_if_exists("video_frames", video_frames);
     load_if_exists("fps", fps);
+    if (j.contains("fps")) {
+        fps_explicit = true;
+    }
     load_if_exists("upscale_repeats", upscale_repeats);
     load_if_exists("seed", seed);
 
@@ -2387,6 +2390,22 @@ bool SDGenerationParams::validate(SDMode mode) {
 
     if (mode == VID_GEN && fps <= 0) {
         return false;
+    }
+
+    // The LongCat avatar renders at a fixed native save_fps (SD_AVATAR_NATIVE_FPS, mirroring
+    // avatar_fps in stable-diffusion.cpp): video frame k carries the mouth shape for audio
+    // time k/25, regardless of the output fps. If the clip is then muxed at the generic
+    // default 16, the mouth plays at 16/25 = 0.64x — in sync at t=0 and lagging further every
+    // second. Both the audio trim and the video mux consume the same fps, so the container is
+    // internally consistent and the drift is the only symptom.
+    //
+    // Gate on "nobody asked" rather than "fps happens to equal the default", so that an
+    // explicit --fps 16 is still honoured and this does not silently stop working if the
+    // generic default ever changes.
+    if (mode == VID_GEN && !audio_path.empty() && !fps_explicit) {
+        fps = SD_AVATAR_NATIVE_FPS;
+        LOG_INFO("avatar: defaulting output fps to %d (native save_fps); pass --fps to override",
+                 SD_AVATAR_NATIVE_FPS);
     }
 
     if (mode == VID_GEN && audio_frame_offset < 0) {

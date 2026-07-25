@@ -163,7 +163,10 @@ bool parse_avatar_video_request(const json& body,
         request.gen_params.video_frames = body["video_frames"].get<int>();
     }
     if (body.contains("fps") && body["fps"].is_number_integer()) {
-        request.gen_params.fps = body["fps"].get<int>();
+        request.gen_params.fps      = body["fps"].get<int>();
+        // Mark it explicit so resolve_and_validate() does not promote to the avatar's
+        // native fps over the top of a caller who deliberately asked for something else.
+        request.gen_params.fps_explicit = true;
     }
     request.output_format = "webm";
     request.output_compression = body.value("output_compression", 100);
@@ -261,8 +264,19 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
             apply_avatar_bsa(body, params);
             int segment_count = body.value("segments", 1);
             const int continuation_frames = body.value("cont_cond_frames", 13);
+            // `cont_cond_frames` is a count of PIXEL (decoded) frames. The chain API wants
+            // LATENT frames, and the VAE is 4x temporal, so the two must be converted — not
+            // used interchangeably. Mirrors prod's avatar_render.cpp:
+            //   13 pixel -> num_cond_latents = 1 + (13-1)/4 = 4 latent -> 1 + 3*4 = 13 pixel.
+            // Treating 13 as latent instead expands the overlap to 1 + 12*4 = 49 pixel frames,
+            // leaving only 4 new frames per segment (so a 2.25 s clip wants ~14 segments
+            // instead of 2) and passing a 13 that the engine reads as latent — which is why
+            // chained avatar renders failed outright while single-segment ones were fine.
+            const int cond_vframes     = std::max(1, continuation_frames);
+            const int num_cond_latents = 1 + (cond_vframes - 1) / 4;
+            const int cond_decoded_v   = 1 + (num_cond_latents - 1) * 4;
             if (body.contains("duration_sec") && body["duration_sec"].is_number()) {
-                const int overlap = 1 + (std::max(1, continuation_frames) - 1) * 4;
+                const int overlap = cond_decoded_v;
                 const int new_frames = std::max(1, params.video_frames - overlap);
                 const int target_frames = std::max(1, static_cast<int>(std::round(body["duration_sec"].get<double>() * 25.0)));
                 segment_count = target_frames <= params.video_frames
@@ -287,7 +301,9 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
                 } else {
                     sd_vid_chain_params_t chain = {};
                     chain.n_segments = segment_count;
-                    chain.cont_latent_frames = continuation_frames;
+                    // LATENT frames (see the pixel->latent conversion above), not the raw
+                    // pixel `cont_cond_frames` the request carries.
+                    chain.cont_latent_frames = num_cond_latents;
                     generated = generate_video_chain(runtime->sd_ctx,
                                                        &params,
                                                        &chain,

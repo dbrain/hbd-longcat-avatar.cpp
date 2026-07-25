@@ -660,11 +660,231 @@ bool sd_should_preview_noisy() {
     return sd_preview_noisy;
 }
 
+// ── SD_NODE_TRACE — per-node tensor checksum tracer ───────────────────────────
+//
+// Diagnostic only. `SD_NODE_TRACE=<path>` installs an eval callback that reads
+// every computed node back to the host and appends a checksum line. Two runs
+// (segmented vs execute_graph) produce two traces; the first line whose hash
+// differs names the op that diverges. `SD_NODE_TRACE_FILTER` (substring, comma
+// list) narrows the nodes; `SD_NODE_TRACE_MAX_GRAPHS` caps how many graph
+// computes are traced so a multi-step sampler does not write gigabytes.
+namespace {
+
+std::string g_trace_runner_desc;
+
+struct NodeTraceState {
+    FILE* out            = nullptr;
+    std::vector<std::string> filters;
+    std::string runner;        // only trace while this runner is executing
+    long long skip       = 0;  // skip this many eligible nodes before recording
+    long long seen       = 0;
+    long long max_nodes  = 0;  // 0 = unlimited
+    long long node_index = 0;
+    std::string dump_dir;      // when set, raw bytes are written per traced node
+    std::vector<uint8_t> buf;
+};
+
+NodeTraceState* sd_node_trace_state() {
+    static NodeTraceState* state = [] () -> NodeTraceState* {
+        const char* path = getenv("SD_NODE_TRACE");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        auto* s = new NodeTraceState();
+        s->out  = fopen(path, "w");
+        if (s->out == nullptr) {
+            fprintf(stderr, "[node-trace] cannot open %s\n", path);
+            delete s;
+            return nullptr;
+        }
+        if (const char* f = getenv("SD_NODE_TRACE_FILTER"); f != nullptr && f[0] != '\0') {
+            std::stringstream ss(f);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) {
+                    s->filters.push_back(item);
+                }
+            }
+        }
+        if (const char* m = getenv("SD_NODE_TRACE_MAX_NODES"); m != nullptr && m[0] != '\0') {
+            s->max_nodes = atoll(m);
+        }
+        if (const char* d = getenv("SD_NODE_TRACE_DUMP_DIR"); d != nullptr && d[0] != '\0') {
+            s->dump_dir = d;
+        }
+        if (const char* r = getenv("SD_NODE_TRACE_RUNNER"); r != nullptr && r[0] != '\0') {
+            s->runner = r;
+        }
+        if (const char* k = getenv("SD_NODE_TRACE_SKIP"); k != nullptr && k[0] != '\0') {
+            s->skip = atoll(k);
+        }
+        fprintf(stderr, "[node-trace] writing %s (filters=%zu max_nodes=%lld dump=%s)\n",
+                path, s->filters.size(), s->max_nodes,
+                s->dump_dir.empty() ? "off" : s->dump_dir.c_str());
+        return s;
+    }();
+    return state;
+}
+
+bool sd_node_trace_wanted(const NodeTraceState* s, const ggml_tensor* t) {
+    if (s->filters.empty()) {
+        return true;
+    }
+    for (const auto& f : s->filters) {
+        if (strstr(t->name, f.c_str()) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool sd_node_trace_cb(ggml_tensor* t, bool ask, void* user_data) {
+    auto* s = (NodeTraceState*)user_data;
+    if (s == nullptr || t == nullptr) {
+        return true;
+    }
+    if (ask) {
+        if (s->max_nodes > 0 && s->node_index >= s->max_nodes) {
+            return false;
+        }
+        if (!s->runner.empty() && g_trace_runner_desc.find(s->runner) == std::string::npos) {
+            return false;
+        }
+        if (!sd_node_trace_wanted(s, t)) {
+            return false;
+        }
+        if (s->skip > 0 && s->seen++ < s->skip) {
+            return false;
+        }
+        return true;
+    }
+
+    const size_t nbytes = ggml_nbytes(t);
+    ggml_backend_buffer_t buffer = t->view_src != nullptr ? t->view_src->buffer : t->buffer;
+    if (buffer == nullptr || nbytes == 0) {
+        return true;
+    }
+    s->buf.resize(nbytes);
+    ggml_backend_tensor_get(t, s->buf.data(), 0, nbytes);
+
+    // FNV-1a over the raw bytes: catches bit-level divergence regardless of type.
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < nbytes; ++i) {
+        hash = (hash ^ s->buf[i]) * 1099511628211ull;
+    }
+
+    double sum = 0.0, absmax = 0.0;
+    long long nan_count = 0;
+    if (t->type == GGML_TYPE_F32) {
+        const float* d = (const float*)s->buf.data();
+        for (size_t i = 0; i < nbytes / sizeof(float); ++i) {
+            const float v = d[i];
+            if (std::isnan(v) || std::isinf(v)) {
+                nan_count++;
+                continue;
+            }
+            sum += v;
+            absmax = std::max(absmax, (double)std::fabs(v));
+        }
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t* d = (const ggml_fp16_t*)s->buf.data();
+        for (size_t i = 0; i < nbytes / sizeof(ggml_fp16_t); ++i) {
+            const float v = ggml_fp16_to_fp32(d[i]);
+            if (std::isnan(v) || std::isinf(v)) {
+                nan_count++;
+                continue;
+            }
+            sum += v;
+            absmax = std::max(absmax, (double)std::fabs(v));
+        }
+    }
+
+    // Sources + the buffer this node's data actually lives in. When the same node is
+    // executed in two segments and disagrees, this says WHICH input moved: a src whose
+    // buffer pointer changed between executions was reset/reallocated rather than
+    // restored, which is the whole question for the graph-cut recompute bug.
+    auto src_desc = [](ggml_tensor* s0) -> std::string {
+        if (s0 == nullptr) {
+            return "-";
+        }
+        char b[256];
+        ggml_backend_buffer_t sb = s0->view_src != nullptr ? s0->view_src->buffer : s0->buffer;
+        snprintf(b, sizeof(b), "%s[buf=%p,data=%p]", s0->name, (void*)sb, s0->data);
+        return std::string(b);
+    };
+    ggml_backend_buffer_t own = t->view_src != nullptr ? t->view_src->buffer : t->buffer;
+    fprintf(s->out,
+            "%08lld\t%s\t%s\t%s\t%lldx%lldx%lldx%lld\tnan=%lld\tsum=%.9e\tabsmax=%.9e\thash=%016llx"
+            "\tbuf=%p\tsrc0=%s\tsrc1=%s\n",
+            s->node_index++,
+            t->name,
+            ggml_op_name(t->op),
+            ggml_type_name(t->type),
+            (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+            nan_count,
+            sum,
+            absmax,
+            (unsigned long long)hash,
+            (void*)own,
+            src_desc(t->src[0]).c_str(),
+            src_desc(t->src[1]).c_str());
+    fflush(s->out);
+
+    if (!s->dump_dir.empty()) {
+        std::string safe = t->name;
+        std::replace(safe.begin(), safe.end(), '/', '_');
+        std::replace(safe.begin(), safe.end(), ':', '_');
+        std::replace(safe.begin(), safe.end(), '|', '_');
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%08lld_%s.bin", s->dump_dir.c_str(), s->node_index - 1, safe.c_str());
+        if (FILE* f = fopen(path, "wb"); f != nullptr) {
+            fwrite(s->buf.data(), 1, nbytes, f);
+            fclose(f);
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+// SD_FORCE_SERIAL_EXEC=1 — execute the graph one node at a time (each node becomes its own
+// graph view, with a backend synchronize between them) but do NOT read anything back. This
+// isolates "execution batching" as a variable with none of the tracer's PCIe cost, so a
+// hazard that only appears when consecutive nodes are dispatched together can be confirmed
+// end-to-end on the rendered output rather than inferred from a node checksum.
+namespace {
+bool sd_force_serial_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("SD_FORCE_SERIAL_EXEC");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool sd_force_serial_cb(ggml_tensor*, bool ask, void*) {
+    // ask -> "yes, I want this node on its own"; eval -> "carry on".
+    return ask ? true : true;
+}
+}  // namespace
+
+void sd_set_trace_runner_desc(const char* desc) {
+    g_trace_runner_desc = desc == nullptr ? "" : desc;
+}
+
 sd_graph_eval_callback_t sd_get_backend_eval_callback() {
+    if (sd_backend_eval_cb == nullptr && sd_node_trace_state() != nullptr) {
+        return sd_node_trace_cb;
+    }
+    if (sd_backend_eval_cb == nullptr && sd_force_serial_enabled()) {
+        return sd_force_serial_cb;
+    }
     return sd_backend_eval_cb;
 }
 
 void* sd_get_backend_eval_callback_data() {
+    if (sd_backend_eval_cb == nullptr && sd_node_trace_state() != nullptr) {
+        return sd_node_trace_state();
+    }
     return sd_backend_eval_cb_data;
 }
 

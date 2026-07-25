@@ -234,6 +234,10 @@ struct SDGenerationParams {
     float moe_boundary                   = 0.875f;
     int video_frames                     = 1;
     int fps                              = 16;
+    // True once a caller has actually asked for an fps (CLI --fps, a JSON "fps" field, or a
+    // route setting it directly). Lets resolve_and_validate() tell "caller wants 16" apart
+    // from "nobody said, so it's the generic default" without hard-coding the default value.
+    bool fps_explicit                    = false;
     float vace_strength                  = 1.f;
     int audio_frame_offset                = 0;
     // LTXAV LipDub modality guidance. Defaults are intentionally inert.

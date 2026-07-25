@@ -1797,7 +1797,13 @@ public:
                 }
             }
 
-            if (sd_ctx_params->vae_conv_direct) {
+            // GGML_CUDNN_CONV is the route prod uses to enable this: the flux2 entrypoint
+            // passes no --vae-conv-direct, so the env gate was the ONLY way in, and the
+            // rebuild dropping it left every VAE 2D conv on ggml_conv_2d -> IM2COL + MUL_MAT.
+            // At 1920x1088 that im2col arena asks for a single ~9.9 GB compute buffer and
+            // OOMs; conv-direct + the cuDNN interceptor (conv2d-cudnn.cu) is both smaller
+            // and faster. Measured: 1024^2 11210 -> 8070 MiB, 1920x1088 OOM -> 10288 MiB.
+            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV")) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {
@@ -7965,7 +7971,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 return false;
             }
 
-            constexpr int avatar_fps = 25;
+            constexpr int avatar_fps = SD_AVATAR_NATIVE_FPS;
             LONGCAT_AUDIO::AudioWindowConfig audio_config;
             audio_config.fps = static_cast<float>(avatar_fps);
             const int video_length = std::max(1, static_cast<int>(avatar_input_wav.size() * avatar_fps / 16000));
