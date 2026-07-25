@@ -91,6 +91,10 @@ static void usage() {
            "                          it slides colour) and raises texsize/decimate defaults to 2048/220k.)\n"
            "        [--us-octree N] [--us-latents N] [--us-steps N] [--us-guidance F] [--us-chunk N]\n"
            "        [--us-gguf <dir>] [--us-dit-w <dir>] [--us-vae-w <dir>] [--us-cnd-w <dir>] [--us-meta <npy>]\n"
+           "        [--rig-cache <dir>]   (write the skeleton+skin field on the first run, reuse it on every\n"
+           "                          later run. LOD tiers of one asset MUST share a skeleton or a clip\n"
+           "                          authored for the hero cannot play on the game tier; re-rigging per\n"
+           "                          tier also re-rolls the rig's failure modes. Also skips ~16-30s/tier.)\n"
            "        [--stage-dir <dir>]   (emit coarse/refined/decimated GLB intermediates + resume caches)\n"
            "        [--image-model-ready] (diagnostic only: input already is Pixal's final square/black frame;\n"
            "                          bypass native alpha/crop framing to isolate downstream geometry)\n"
@@ -239,6 +243,9 @@ int main(int argc, char** argv) {
     // post-geometry stages (MC-remesh + bake + rig, ~3min) can be iterated without re-paying the ~420s
     // diffusion. --no-rig writes a textured-only GLB (skips the 159s auto-rig) for fast mesh/texture A/B.
     std::string dump_geo, from_geo;
+    // --rig-cache: generate the skeleton once, then reuse it for every LOD tier so all tiers of an
+    // asset share ONE skeleton (a prerequisite for a clip to play on any tier).
+    std::string rig_cache;
     bool no_rig = false;
     bool geometry_only = false;
     bool material_cache_only = false;
@@ -421,6 +428,7 @@ int main(int argc, char** argv) {
         else if (a == "--mc-stride" && i+1 < argc) mc_stride = std::atoi(argv[++i]);
         else if (a == "--mc-blur" && i+1 < argc) mc_blur = std::atoi(argv[++i]);
         else if (a == "--mc-smooth" && i+1 < argc) mc_smooth = std::atoi(argv[++i]);
+        else if (a == "--rig-cache" && i+1 < argc) rig_cache = argv[++i];
         else if (a == "--dump-geo" && i+1 < argc) dump_geo = argv[++i];
         else if (a == "--from-geo" && i+1 < argc) from_geo = argv[++i];
         else if (a == "--no-rig") no_rig = true;
@@ -914,19 +922,69 @@ int main(int argc, char** argv) {
 
     // ---------- [2/4] rig cond points (native, in RAM) ----------
     std::vector<int64_t> faces64(bt.faces.begin(), bt.faces.end());
-    rig::PrepResult P = rig::prep_mesh_for_rig_inmem(bt.verts, faces64, 8192, 512, rig_seed);
-    if (!P.ok) { printf("FAIL: mesh prep failed\n"); return 1; }
-    printf("  [2/4] rig prep: N=%d sampled, M=%d FPS queries\n", P.N, P.M);
+    rig::PrepResult P;
+    rig::RigResult  R;
 
-    // ---------- [3/4] auto-rig (R1->R3->R5->R4) ----------
-    rig::RigOpts ro;
-    ro.r1w = r1w; ro.qwen3_w = qwen3_w; ro.skin_vae_gguf = skinvae;
-    ro.use_cuda = use_cuda; ro.num_beams = num_beams; ro.seed = rig_seed; ro.verbose = true;
-    ro.do_sample = rig_sample;   // default false = deterministic fan-free beam (gilly audit)
-    double t_rig = pix::now_s();
-    rig::RigResult R = rig::run_rig_pipeline(P.vertices, P.normals, P.sampled_pc, P.sampled_feats, ro);
-    if (!R.ok) { printf("FAIL: rig pipeline failed\n"); return 1; }
-    printf("  [3/4] rig: J=%d joints  (%.1fs)\n", R.J, pix::now_s() - t_rig);
+    // --rig-cache: SHARE ONE SKELETON ACROSS LOD TIERS.
+    // Re-running the rig per tier gives every tier a DIFFERENT skeleton (measured on the first
+    // ladder: miku 34/44/60/42 joints, char1 57/20/58/207 across hero/high/medium/game). That is
+    // wrong twice over — LOD tiers of one asset MUST share a skeleton or a clip authored for the
+    // hero cannot play on the game tier, and re-rolling the rig per tier re-rolls its failure
+    // modes too (char1's game tier landed on the runaway attractor, J=207 maxfan=128 score 0.000).
+    // So rig ONCE, cache the skeleton + the skin field it is defined on, and transfer that same
+    // field onto each tier's mesh. Skipping the rig also drops ~16-30s per tier.
+    bool rig_from_cache = false;
+    if (!rig_cache.empty()) {
+        std::vector<uint8_t> bj, bp, bs, bv;
+        if (ld_vec(rig_cache + "/rig_joints.bin",  bj) && ld_vec(rig_cache + "/rig_parents.bin", bp) &&
+            ld_vec(rig_cache + "/rig_skin.bin",    bs) && ld_vec(rig_cache + "/rig_points.bin",  bv)) {
+            R.joints.assign((float*)bj.data(), (float*)(bj.data()+bj.size()));
+            R.parents.assign((int*)bp.data(),  (int*)(bp.data()+bp.size()));
+            R.skin_pred.assign((float*)bs.data(), (float*)(bs.data()+bs.size()));
+            P.vertices.assign((float*)bv.data(), (float*)(bv.data()+bv.size()));
+            R.J = (int)(R.joints.size()/3);
+            R.N = (int)(P.vertices.size()/3);
+            if (R.J > 0 && R.N > 0 && R.parents.size() == (size_t)R.J &&
+                R.skin_pred.size() == (size_t)R.N * R.J) {
+                R.ok = rig_from_cache = true;
+                printf("  [2/4] rig: loaded cached skeleton J=%d over N=%d skin points from %s"
+                       " (shared across tiers; rig stage skipped)\n", R.J, R.N, rig_cache.c_str());
+            } else {
+                printf("  [2/4] rig cache in %s is malformed (J=%d N=%d) — regenerating\n",
+                       rig_cache.c_str(), R.J, R.N);
+                R = rig::RigResult{}; P = rig::PrepResult{};
+            }
+        }
+    }
+
+    if (!rig_from_cache) {
+        P = rig::prep_mesh_for_rig_inmem(bt.verts, faces64, 8192, 512, rig_seed);
+        if (!P.ok) { printf("FAIL: mesh prep failed\n"); return 1; }
+        printf("  [2/4] rig prep: N=%d sampled, M=%d FPS queries\n", P.N, P.M);
+
+        // ---------- [3/4] auto-rig (R1->R3->R5->R4) ----------
+        rig::RigOpts ro;
+        ro.r1w = r1w; ro.qwen3_w = qwen3_w; ro.skin_vae_gguf = skinvae;
+        ro.use_cuda = use_cuda; ro.num_beams = num_beams; ro.seed = rig_seed; ro.verbose = true;
+        ro.do_sample = rig_sample;   // default false = deterministic fan-free beam (gilly audit)
+        double t_rig = pix::now_s();
+        R = rig::run_rig_pipeline(P.vertices, P.normals, P.sampled_pc, P.sampled_feats, ro);
+        if (!R.ok) { printf("FAIL: rig pipeline failed\n"); return 1; }
+        printf("  [3/4] rig: J=%d joints  (%.1fs)\n", R.J, pix::now_s() - t_rig);
+
+        if (!rig_cache.empty()) {
+            mkdir(rig_cache.c_str(), 0755);
+            bool ok1 = sv_vec(rig_cache + "/rig_joints.bin",  R.joints.data(),    R.joints.size()*sizeof(float));
+            bool ok2 = sv_vec(rig_cache + "/rig_parents.bin", R.parents.data(),   R.parents.size()*sizeof(int));
+            bool ok3 = sv_vec(rig_cache + "/rig_skin.bin",    R.skin_pred.data(), R.skin_pred.size()*sizeof(float));
+            bool ok4 = sv_vec(rig_cache + "/rig_points.bin",  P.vertices.data(),  P.vertices.size()*sizeof(float));
+            if (ok1 && ok2 && ok3 && ok4)
+                printf("  [3/4] rig cache written -> %s (reuse with --rig-cache for every other tier)\n",
+                       rig_cache.c_str());
+            else
+                printf("  WARN: could not write the rig cache to %s\n", rig_cache.c_str());
+        }
+    }
 
     // ---------- [4/4] combine: kNN skin-transfer onto the textured mesh + write ----------
     // Normalize the textured mesh into the rig frame (prep_mesh_for_rig_inmem normalized its copy the

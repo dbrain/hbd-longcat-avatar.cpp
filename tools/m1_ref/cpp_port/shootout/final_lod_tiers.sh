@@ -25,13 +25,26 @@ TIERS=("$@")
 test -f "$STAGE/refined.glb" || { echo "FAIL: $STAGE has no refined.glb (not a --dc-remesh stage dir)"; exit 1; }
 mkdir -p "$OUT"
 
+# ONE skeleton for the whole ladder. The first tier generates and caches it; the rest load it and
+# transfer the same skin field onto their own mesh. Delete this dir to re-rig from scratch.
+RIG_CACHE_DIR="$OUT/rig_cache"
+mkdir -p "$RIG_CACHE_DIR"
+
 for spec in "${TIERS[@]}"; do
   IFS=: read -r name faces atlas <<< "$spec"
   echo "===== tier $name: ${faces} faces / ${atlas}px atlas ====="
-  RESUME_STAGE="$STAGE" SKIP_ANIM=1 \
+  RESUME_STAGE="$STAGE" RIG_CACHE="$RIG_CACHE_DIR" SKIP_ANIM=1 \
     bash "$CPP_DIR/shootout/final_e2e_dc_rig.sh" "$IMG" "$OUT/$name" "$atlas" "$faces" \
     || { echo "  tier $name FAILED"; continue; }
 done
+
+# One exercise clip on the hero. Because every tier now shares the skeleton, this clip is valid
+# for the whole ladder — which is the point of caching the rig.
+if [ -f "$OUT/hero/rigged.glb" ] && [ -z "${SKIP_ANIM:-}" ]; then
+  "${RIG_POSE_GATE_PYTHON:-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python}" \
+    "$CPP_DIR/rig_exercise_anim.py" "$OUT/hero/rigged.glb" "$OUT/hero/rigged.anim.glb" \
+    > "$OUT/hero/anim.log" 2>&1 || echo "  WARN: exercise animation failed (see $OUT/hero/anim.log)"
+fi
 
 echo "===================== tier ladder ====================="
 printf '%-8s %10s %10s %8s %10s %s\n' tier verts faces atlas normalmap rig

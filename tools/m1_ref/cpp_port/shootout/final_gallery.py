@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import re
 import json
 import os
 import shutil
@@ -56,6 +57,10 @@ model-viewer{width:100%;height:100%;background:radial-gradient(circle at 50% 40%
 img.src{width:100%;height:100%;object-fit:contain;background:#000}
 .metrics{font:11px ui-monospace,monospace;color:#8c94ab;padding:6px 10px;white-space:pre-wrap}
 .miss{display:grid;place-items:center;color:#5c637a;font-size:12px;height:100%}
+table.tiers{border-collapse:collapse;margin:6px 0 2px;font:11px ui-monospace,monospace}
+table.tiers th,table.tiers td{border:1px solid #292938;padding:3px 9px;text-align:right}
+table.tiers th{color:#8c94ab;font-weight:600;background:#0e0e14}
+table.tiers td:first-child,table.tiers th:first-child{text-align:left;color:#d8dbe8}
 @media(max-width:1100px){.row{grid-template-columns:repeat(2,minmax(0,1fr))}}
 """
 
@@ -85,7 +90,11 @@ def main() -> int:
 
     sections = []
     for model, (src_img, pyref, azimuth, note) in MODELS.items():
-        run = os.path.join(args.runs, model)
+        # A tier ladder puts the deliverable under <model>/hero/; a plain e2e run puts it at
+        # <model>/. Accept either so the page works before and after the ladder has been built.
+        run = os.path.join(args.runs, model, "hero")
+        if not os.path.exists(os.path.join(run, "rigged.glb")):
+            run = os.path.join(args.runs, model)
         rigged = os.path.join(run, "rigged.glb")
         if not os.path.exists(rigged):
             continue
@@ -107,14 +116,41 @@ def main() -> int:
         u_rig = link(rigged, "rigged.glb")
         u_anim = link(os.path.join(run, "rigged.anim.glb"), "rigged_anim.glb")
 
+        # Tier ladder table: hero -> game. Every tier shares one skeleton (--rig-cache), which is
+        # what makes a single clip valid across the ladder, so J is reported once per tier as
+        # evidence of that rather than as a per-tier property.
+        rows = []
+        for tier in ("hero", "high", "medium", "game"):
+            tdir = os.path.join(args.runs, model, tier)
+            log = os.path.join(tdir, "01_e2e.log")
+            if not os.path.exists(log):
+                continue
+            with open(log) as fh:
+                text = fh.read()
+            vf = re.findall(r"verts=(\d+) faces=(\d+)", text)
+            nmap = "yes" if "normal map baked" in text else "no"
+            score = joints = "?"
+            qc = os.path.join(tdir, "qc_rig_score.txt")
+            if os.path.exists(qc):
+                with open(qc) as fh:
+                    q = fh.read()
+                m_j = re.search(r"J=(\d+)", q); m_s = re.search(r"TOTAL=([0-9.]+)", q)
+                joints = m_j.group(1) if m_j else "?"
+                score = m_s.group(1) if m_s else "?"
+            if vf:
+                rows.append(f"<tr><td>{tier}</td><td>{int(vf[-1][1]):,}</td><td>{int(vf[-1][0]):,}</td>"
+                            f"<td>{nmap}</td><td>{joints}</td><td>{score}</td></tr>")
         metrics = ""
         mpath = os.path.join(run, "metrics.txt")
         if os.path.exists(mpath):
             with open(mpath) as fh:
                 keep = [ln for ln in fh.read().splitlines()
-                        if ln.startswith(("wall_total_s", "peak_mib", "texsize"))
-                        or "rig_score" in ln or "joints" in ln or "influential" in ln]
-            metrics = f'<div class="metrics">{html.escape(" | ".join(keep[:6]))}</div>'
+                        if ln.startswith(("wall_total_s", "peak_mib"))]
+            metrics = f'<div class="metrics">{html.escape("  ".join(keep[:4]))}</div>'
+        if rows:
+            metrics += ('<table class="tiers"><tr><th>tier</th><th>faces</th><th>verts</th>'
+                        '<th>normal map</th><th>joints</th><th>rig score</th></tr>'
+                        + "".join(rows) + "</table>")
 
         tiles = [
             tile("input", "matte fed to the pipeline",

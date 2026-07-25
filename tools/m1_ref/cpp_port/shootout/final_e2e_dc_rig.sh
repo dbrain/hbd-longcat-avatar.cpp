@@ -33,6 +33,12 @@ if [ -n "${RESUME_STAGE:-}" ]; then
   RESUME_ARGS=(--from-refined "$RESUME_STAGE")
   echo "[resume] bake+rig only, from $RESUME_STAGE (no diffusion, no DC)"
 fi
+# RIG_CACHE: every tier of one asset must come out with the SAME skeleton, so the first run
+# writes it and the rest load it. Without this each tier gets its own skeleton and no single clip
+# plays across the ladder.
+if [ -n "${RIG_CACHE:-}" ]; then
+  RESUME_ARGS+=(--rig-cache "$RIG_CACHE")
+fi
 
 echo "[1/3] image_to_rig --dc-remesh (geometry -> DC parity mesh -> bake -> rig)  [3060]"
 SAMPLER=$(bash "$CPP_DIR/shootout/gpu_sample.sh" start "$OUT/vram.csv")
