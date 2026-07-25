@@ -1,6 +1,6 @@
 #include "worker_supervisor.h"
 
-#include "log.h"
+#include "common/log.h"
 
 #include <algorithm>
 #include <chrono>
