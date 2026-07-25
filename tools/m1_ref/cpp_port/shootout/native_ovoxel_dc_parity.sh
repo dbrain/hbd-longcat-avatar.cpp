@@ -60,11 +60,13 @@ CUDA_VISIBLE_DEVICES="" RP_VOLUME_DIRECT=1 ATL_BASECOLOR_SRGB=0 \
 
 test -f "$OUT/parity.glb" || { echo "FAIL: no parity.glb produced"; exit 1; }
 
-echo "[5/5] canonical scale normalize -> parity_norm.glb (center origin, height=$NORM_HEIGHT)"
 # Native/Python GLBs export at inconsistent scales (Python refs seen at 0.8 / 1.0 / 2.0). Emit a
 # canonically-scaled copy for consistent delivery + fair side-by-side. Affine => UVs/atlas untouched.
+# NOTE: these defaults MUST come before the echo that reads them — `set -u` aborts the script on an
+# unset $NORM_HEIGHT, which is why this whole step silently never ran until 2026-07-25.
 NORM_HEIGHT="${NORM_HEIGHT:-1.0}"
 NORM_PY="${NORM_PY:-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python}"
+echo "[5/5] canonical scale normalize -> parity_norm.glb (center origin, height=$NORM_HEIGHT)"
 if [ -x "$NORM_PY" ]; then
   "$NORM_PY" - "$OUT/parity.glb" "$OUT/parity_norm.glb" "$NORM_HEIGHT" <<'PYEOF'
 import sys, trimesh, numpy as np
