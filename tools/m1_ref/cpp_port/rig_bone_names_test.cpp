@@ -112,7 +112,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- collect the bone_* skeleton, ordered by bone NUMBER ----
+    // ---- collect the skeleton ----
+    // Anonymous rigs order by bone NUMBER. An ALREADY-NAMED rig (everything the production
+    // writer emits, since bone naming is on by default) has no bone_N to sort by, so fall back
+    // to skins[0].joints — that IS the canonical joint order the writer used, and skinning is by
+    // node index, so it is the same order the rig pipeline produced. Without this the harness
+    // could only inspect pre-naming GLBs, i.e. never a shipped asset.
     std::map<int,int> num_to_node;
     for (int i = 0; i < NN; i++) {
         const glb::detail::JVal* n = nodes->arr[i].find("name");
@@ -120,12 +125,27 @@ int main(int argc, char** argv) {
         if (n->str.rfind("bone_", 0) != 0) continue;
         num_to_node[std::atoi(n->str.c_str()+5)] = i;
     }
-    if (num_to_node.empty()) { std::fprintf(stderr, "no bone_* nodes in %s\n", path); return 2; }
-
     std::map<int,int> node_to_local;
     std::vector<int> local_to_node;
-    for (auto& kv : num_to_node) { node_to_local[kv.second] = (int)local_to_node.size();
-                                   local_to_node.push_back(kv.second); }
+    if (!num_to_node.empty()) {
+        for (auto& kv : num_to_node) { node_to_local[kv.second] = (int)local_to_node.size();
+                                       local_to_node.push_back(kv.second); }
+    } else {
+        const glb::detail::JVal* skins = root.find("skins");
+        const glb::detail::JVal* sj = (skins && skins->is_arr() && !skins->arr.empty())
+                                    ? skins->arr[0].find("joints") : nullptr;
+        if (!sj || !sj->is_arr() || sj->arr.empty()) {
+            std::fprintf(stderr, "no bone_* nodes and no skins[0].joints in %s\n", path);
+            return 2;
+        }
+        for (const auto& jv : sj->arr) {
+            const int ni = (int)jv.as_int();
+            if (ni < 0 || ni >= NN) { std::fprintf(stderr, "skin joint index out of range\n"); return 2; }
+            node_to_local[ni] = (int)local_to_node.size();
+            local_to_node.push_back(ni);
+            num_to_node[(int)num_to_node.size()] = ni;   // keeps the per-joint printout working
+        }
+    }
     const int J = (int)local_to_node.size();
     std::vector<float> joints((size_t)J*3);
     std::vector<int>   parents(J, -1);

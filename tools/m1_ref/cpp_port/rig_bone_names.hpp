@@ -420,26 +420,51 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
         std::vector<int> depth(J, -1), q{t.root}; depth[t.root] = 0;
         for (size_t qi=0; qi<q.size(); qi++)
             for (int c : t.ch[q[qi]]) { depth[c]=depth[q[qi]]+1; q.push_back(c); }
+        // Two passes. Pass 0 EXCLUDES each hub's own spine continuation (the child whose subtree
+        // climbs highest), exactly as FIX-1 does at the root; pass 1 allows it, preserving the
+        // original behaviour for skeletons that can only be named that way.
+        //
+        // Why the exclusion matters: a figure with long HANGING HAIR defeats both filters below.
+        // Standing-Miku's twintails fall from the head past the hips, so the NECK's subtree both
+        // dips under the root AND out-reaches the legs laterally (0.512 vs 0.246) — the spine was
+        // picked as a leg, then collided with Neck/Head during slot assignment, which is what
+        // named one of her real legs as the arm chain. Same trap FIX-1/FIX-2 describe for the
+        // soldier's hanging hands; this fallback path just never applied it.
         int hub = -1;
         std::vector<int> hub_legs;
-        for (int n=0; n<J; n++) {
-            if (n == t.root || t.ch[n].size() < 2) continue;
-            std::vector<int> cand;
-            bool neg=false, pos=false;
-            for (int c : t.ch[n]) {
-                if (t.up_min[c] >= jat(joints, t.root, AX_UP) - 1e-3f) continue;
-                cand.push_back(c);
-                neg = neg || jat(joints,c,AX_LAT) < 0.f;
-                pos = pos || jat(joints,c,AX_LAT) > 0.f;
+        bool hub_kept_climber = false;
+        for (int pass = 0; pass < 2 && hub < 0; pass++) {
+            for (int n=0; n<J; n++) {
+                if (n == t.root || t.ch[n].size() < 2) continue;
+                int climber = -1;
+                if (pass == 0)
+                    for (int c : t.ch[n]) if (climber < 0 || t.up_max[c] > t.up_max[climber]) climber = c;
+                std::vector<int> cand;
+                bool neg=false, pos=false;
+                for (int c : t.ch[n]) {
+                    if (c == climber) continue;
+                    if (t.up_min[c] >= jat(joints, t.root, AX_UP) - 1e-3f) continue;
+                    cand.push_back(c);
+                    neg = neg || jat(joints,c,AX_LAT) < 0.f;
+                    pos = pos || jat(joints,c,AX_LAT) > 0.f;
+                }
+                if (!neg || !pos || cand.size() < 2) continue;
+                // Rank by DESCENT, not lateral reach: the lowest thing on a standing figure is a
+                // foot. Lateral reach is what hair and outstretched hands win on.
+                std::sort(cand.begin(), cand.end(), [&](int a, int b) { return t.up_min[a] < t.up_min[b]; });
+                if (hub < 0 || depth[n] < depth[hub]) {
+                    hub=n; hub_legs.assign(cand.begin(), cand.begin()+2);
+                    hub_kept_climber = (pass == 1);
+                }
             }
-            if (!neg || !pos || cand.size() < 2) continue;
-            std::sort(cand.begin(), cand.end(), [&](int a, int b) { return t.lat_max[a] > t.lat_max[b]; });
-            if (hub < 0 || depth[n] < depth[hub]) { hub=n; hub_legs.assign(cand.begin(), cand.begin()+2); }
         }
         if (hub >= 0) {
             legs = std::move(hub_legs);
-            char b[160];
-            std::snprintf(b, sizeof(b), "legs found below root via pelvis connector joint %d", hub);
+            char b[200];
+            std::snprintf(b, sizeof(b), "legs found below root via pelvis connector joint %d%s", hub,
+                          hub_kept_climber
+                            ? " (spine continuation NOT excludable — one of these may be the spine)"
+                            : "");
             R.notes.push_back(b);
         }
     }
@@ -470,6 +495,12 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
             int neg = -1, pos = -1;
             for (int c : t.ch[cur]) {
                 if (c == up_kid) continue;
+                // The LEGS also straddle the midline. When the pelvis is a connector joint the
+                // legs hang off a spine joint, so without this the first "chest" found is the
+                // pelvis connector and its legs get named as the arm chains as well — which is
+                // exactly the collision set standing-Miku produced (LeftUpLeg + LeftShoulder on
+                // one joint), and it also drags Neck/Head two joints too low down the spine.
+                if (!legs.empty() && (c == legs[0] || c == legs[1])) continue;
                 float x = jat(joints, c, AX_LAT);
                 if (x < 0 && (neg < 0 || t.lat_max[c] > t.lat_max[neg])) neg = c;
                 if (x > 0 && (pos < 0 || t.lat_max[c] > t.lat_max[pos])) pos = c;
