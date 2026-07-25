@@ -28,6 +28,33 @@ QC_PY="${RIG_POSE_GATE_PYTHON:-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/pyt
 mkdir -p "$OUT/stage"
 cd "$CPP_DIR"
 
+# ---- [0/3] MATTE GUARD ---------------------------------------------------------------------
+# This driver used to assume its input was already a model-facing matte, and a file merely NAMED
+# *_matte.png was trusted. toy1_matte.png is a framed studio render with a WHITE background, so
+# 63% of the image was consumed as subject and the framing was baked into the mesh. Classify the
+# input and matte it with BiRefNet when it is not already a matte.
+#
+# BiRefNet (ZhengPeng7's exact weights) is the production matter: it is what Python's
+# preprocess_image uses, and native's geometric border-flood picks a different silhouette that the
+# chaotically sensitive SS-DiT amplifies into a stage-1 collapse. The kobbler RMBG-2.0 service is a
+# labelled A/B only (~91.7% stage-1 agreement), not the default.
+#   MATTE=skip  trust the input verbatim (for an already-prepared frame)
+if [ "${MATTE:-auto}" != "skip" ]; then
+  KIND="$(./make_matte --inspect-input "$IMG" | awk -F= '$1=="input_kind" {print $2}')"
+  echo "[0/3] input classified: ${KIND:-unknown}"
+  case "$KIND" in
+    black-matte|rgba-cutout)
+      echo "      already model-facing; no matting needed" ;;
+    *)
+      MATTED="$OUT/input_birefnet_rgba.png"
+      echo "      NOT a matte -> BiRefNet neural matte [3060]"
+      CUDA_VISIBLE_DEVICES="$GPU3060" flock -w 3600 "$LOCK" \
+        "$QC_PY" shootout/birefnet_matte.py "$IMG" "$MATTED" --device cuda 2>&1 | tee "$OUT/00_matte.log"
+      test -s "$MATTED" || { echo "FAIL: BiRefNet produced no cutout"; exit 1; }
+      IMG="$MATTED" ;;
+  esac
+fi
+
 RESUME_ARGS=()
 if [ -n "${RESUME_STAGE:-}" ]; then
   RESUME_ARGS=(--from-refined "$RESUME_STAGE")

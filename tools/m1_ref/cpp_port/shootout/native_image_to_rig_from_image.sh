@@ -353,7 +353,7 @@ case "$INPUT_MODE:$INPUT_KIND" in
     echo "== $LABEL: make deterministic matte from RGBA cutout =="
     "$CP/make_matte" --rgba "$IMAGE" "$PIPELINE_IMAGE"
     ;;
-  auto:black-matte)
+  auto:framed-opaque|auto:black-matte)
     if [[ "$MATTE_MODEL" == geometric ]]; then
       PIPELINE_IMAGE="$OUT/input_matte.png"
       MODEL_FRAME_READY=1

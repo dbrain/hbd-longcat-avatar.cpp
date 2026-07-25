@@ -29,16 +29,48 @@ int main(int argc, char** argv) {
             transparent = transparent || a < 255;
             visible = visible || a > 8;
         }
-        int border=0, black=0;
-        for (int y=0; y<H; y++) for (int x=0; x<W; x++) if (x==0 || y==0 || x==W-1 || y==H-1) {
-            border++;
-            const unsigned char* p=&d[(size_t)(y*W+x)*4];
-            if (std::max({p[0],p[1],p[2]}) <= 8) black++;
-        }
-        const char* kind = (transparent && visible) ? "rgba-cutout" : (border && black*100 >= border*95 ? "black-matte" : "opaque");
+        // TWO rings, not one. The outermost 1px ring alone is satisfied by a PICTURE FRAME: a
+        // studio render with a WHITE background and a thin black border passes it and gets called
+        // a black-matte, so the pipeline consumes the entire background as subject. That is exactly
+        // what happened to toy1_matte.png (outer ring 0, but inner ring luma 231, 63% near-white)
+        // and it produced a mesh with the framing baked in. Sample a ring set 6% in as well: a real
+        // black-matte is black on BOTH, a frame is black only on the outer one.
+        auto ring_black = [&](int inset, int& count) {
+            int black = 0; count = 0;
+            const int x0 = inset, x1 = W-1-inset, y0 = inset, y1 = H-1-inset;
+            if (x0 >= x1 || y0 >= y1) return 0;
+            for (int y=y0; y<=y1; y++) for (int x=x0; x<=x1; x++) {
+                if (x!=x0 && x!=x1 && y!=y0 && y!=y1) continue;
+                count++;
+                const unsigned char* p=&d[(size_t)(y*W+x)*4];
+                if (std::max({p[0],p[1],p[2]}) <= 8) black++;
+            }
+            return black;
+        };
+        int border=0, inner_count=0;
+        const int black = ring_black(0, border);
+        const int inset = std::max(2, (int)(std::min(W,H) * 0.06f));
+        const int inner_black = ring_black(inset, inner_count);
+        const int outer_pct = border ? black*100/border : 0;
+        const int inner_pct = inner_count ? inner_black*100/inner_count : 0;
+
+        // Inner-ring threshold is deliberately LOOSE (60, not 95): a standing subject's arms and
+        // feet legitimately cross a ring 6% in, so a genuine matte measures 90-96 there, not 100.
+        // Calibrated on real inputs — genuine mattes: char1 96, gilly 93, soldier 90, toy2 90;
+        // the framed white-background render: toy1 0. The question is "is the interior background
+        // dark at all", not "is it pristine".
+        const int INNER_MIN = 60;
+        const char* kind;
+        if (transparent && visible)            kind = "rgba-cutout";
+        else if (outer_pct >= 95 && inner_pct >= INNER_MIN) kind = "black-matte";
+        // Black frame, non-black interior: NOT a matte. Must go through the neural matte lane, so
+        // give it a distinct name rather than letting it masquerade as a prepared frame.
+        else if (outer_pct >= 95)              kind = "framed-opaque";
+        else                                   kind = "opaque";
         std::printf("input_kind=%s\n", kind);
         std::printf("source_channels=%d\n", C);
-        std::printf("black_border_percent=%d\n", border ? black*100/border : 0);
+        std::printf("black_border_percent=%d\n", outer_pct);
+        std::printf("black_inner_ring_percent=%d\n", inner_pct);
         stbi_image_free(d);
         return 0;
     }
