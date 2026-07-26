@@ -63,6 +63,11 @@ struct SegmentPreviewWriter {
     int segment = -1;
     int stage = 4;
     std::vector<sd_image_t> frames;
+    // Owned copy of the segment's audio. The chain frees its own immediately after the callback
+    // returns, and this writer encodes on a background thread, so borrowing would be a use-after-free.
+    std::vector<float> audio_samples;
+    uint32_t audio_rate = 0;
+    uint32_t audio_channels = 0;
     bool pending = false;
     bool busy = false;
     bool stop = false;
@@ -74,6 +79,9 @@ struct SegmentPreviewWriter {
                 int queued_segment = -1;
                 int queued_stage = 4;
                 std::vector<sd_image_t> queued_frames;
+                std::vector<float> queued_audio;
+                uint32_t queued_rate = 0;
+                uint32_t queued_channels = 0;
                 {
                     std::unique_lock<std::mutex> lock(mutex);
                     cv.wait(lock, [&] { return stop || pending; });
@@ -81,11 +89,26 @@ struct SegmentPreviewWriter {
                     queued_segment = segment;
                     queued_stage = stage;
                     queued_frames = std::move(frames);
+                    queued_audio = std::move(audio_samples);
+                    queued_rate = audio_rate;
+                    queued_channels = audio_channels;
                     pending = false;
                     busy = true;
                 }
+                // Give the preview its own sound. A silent per-shot preview is a poor proxy for a
+                // shot whose whole point may be the audio (lipsync, music reactivity), and the
+                // encoder already takes a track -- only the plumbing was missing.
+                sd_audio_t queued_audio_view{};
+                const sd_audio_t* audio_arg = nullptr;
+                if (!queued_audio.empty() && queued_rate > 0 && queued_channels > 0) {
+                    queued_audio_view.sample_rate = queued_rate;
+                    queued_audio_view.channels = queued_channels;
+                    queued_audio_view.sample_count = queued_audio.size() / queued_channels;
+                    queued_audio_view.data = queued_audio.data();
+                    audio_arg = &queued_audio_view;
+                }
                 const auto bytes = create_video_from_sd_images_to_vector(
-                    "webm", queued_frames.data(), static_cast<int>(queued_frames.size()), fps, quality, nullptr);
+                    "webm", queued_frames.data(), static_cast<int>(queued_frames.size()), fps, quality, audio_arg);
                 if (!bytes.empty()) {
                     const std::string name = queued_stage == 4
                                                  ? "seg_" + std::to_string(queued_segment) + ".webm"
@@ -111,7 +134,11 @@ struct SegmentPreviewWriter {
         });
     }
 
-    void enqueue(int index, int preview_stage, const sd_image_t* source, int count) {
+    void enqueue(int index,
+                 int preview_stage,
+                 const sd_image_t* source,
+                 int count,
+                 const sd_audio_t* source_audio) {
         std::unique_lock<std::mutex> lock(mutex);
         cv.wait(lock, [&] { return stop || (!pending && !busy); });
         if (stop) return;
@@ -128,9 +155,24 @@ struct SegmentPreviewWriter {
             memcpy(copy.data, source[frame].data, size);
             copies.push_back(copy);
         }
+        // Copy the samples too: the chain frees its sd_audio_t as soon as this returns, and the
+        // encode happens later on the writer thread.
+        std::vector<float> audio_copy;
+        uint32_t rate = 0;
+        uint32_t channels = 0;
+        if (source_audio != nullptr && source_audio->data != nullptr &&
+            source_audio->sample_count > 0 && source_audio->channels > 0) {
+            const size_t total = static_cast<size_t>(source_audio->sample_count) * source_audio->channels;
+            audio_copy.assign(source_audio->data, source_audio->data + total);
+            rate = source_audio->sample_rate;
+            channels = source_audio->channels;
+        }
         segment = index;
         stage = preview_stage;
         frames = std::move(copies);
+        audio_samples = std::move(audio_copy);
+        audio_rate = rate;
+        audio_channels = channels;
         pending = true;
         lock.unlock();
         cv.notify_all();
@@ -147,13 +189,20 @@ struct SegmentPreviewWriter {
     }
 };
 
-void write_segment_preview(int segment, const sd_image_t* frames, int count, void* user) {
-    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, 4, frames, count);
+void write_segment_preview(int segment,
+                           const sd_image_t* frames,
+                           int count,
+                           const sd_audio_t* audio,
+                           void* user) {
+    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, 4, frames, count, audio);
 }
 
+// The hires-stage previews are intermediate upscales of a shot whose audio is unchanged by the
+// refine, and the stage callback carries none — so they stay silent, deliberately. Only the
+// completed shot preview gets sound.
 void write_ltx_stage_preview(int segment, int stage, int, int,
                              const sd_image_t* frames, int count, void* user) {
-    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, stage, frames, count);
+    static_cast<SegmentPreviewWriter*>(user)->enqueue(segment, stage, frames, count, nullptr);
 }
 
 }  // namespace

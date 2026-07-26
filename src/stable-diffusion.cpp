@@ -9781,9 +9781,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return fail();
         }
         if (chain_params->on_segment != nullptr) {
+            // Frames AND audio are both still untrimmed here -- adopt_frames() applies the seam
+            // drop below, and append_audio() applies the matching audio_drop. So the preview is the
+            // shot exactly AS RENDERED, overlap head included, and its picture and sound stay in
+            // sync with each other. The trim belongs to the stitched timeline, not to a preview of
+            // one shot.
             chain_params->on_segment(segment,
                                      segment_frames,
                                      segment_count,
+                                     segment_audio,
                                      chain_params->on_segment_user);
         }
         free(latent);

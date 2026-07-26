@@ -592,9 +592,18 @@ typedef struct {
     // Optional notification after a complete segment has been sampled and
     // decoded. The frame storage remains owned by the chain and is valid only
     // for the callback; consumers that need it asynchronously must copy it.
+    //
+    // `audio` is that segment's own decoded audio, already trimmed to the kept
+    // (post-overlap) portion of the shot, or null when the render has no audio.
+    // It carries the same borrowed-for-the-callback lifetime as `frames`: the
+    // chain frees it immediately afterwards, so a consumer that encodes
+    // asynchronously must copy the samples. Supplying it is what lets a
+    // progressive per-shot preview have SOUND — without it every preview is
+    // silent while only the final stitched clip carries the track.
     void (*on_segment)(int segment_index,
                        const sd_image_t* frames,
                        int frame_count,
+                       const sd_audio_t* audio,
                        void* user);
     void* on_segment_user;
     // Re-render one durable banked shot in place.  `enable_retake` is separate
