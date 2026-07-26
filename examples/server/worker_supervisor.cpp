@@ -651,10 +651,36 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
                                    {"worker_pid", supervisor.worker_pid() > 0 ? json(supervisor.worker_pid()) : json(nullptr)}}).dump(),
                              "application/json");
     });
+    // Drain must BLOCK until in-flight work finishes, because that is the contract Koblem's GPU
+    // gate relies on. evict_for_placement() does:
+    //     drain (long-timeout client, return value discarded) -> unload with force=true
+    // and the force flag deliberately bypasses the "busy" guard in /v1/admin/unload below. So a
+    // drain that returns immediately means the gate SIGKILLs a live render: the caller then sees
+    // its next job/media poll answered with the supervisor's 410 "worker is unloaded" — observed
+    // in prod as a render dying 92 s in. Returning only once the work is done makes the gate's
+    // "drain then force" sequence safe, which is what it already assumes ("so an in-flight
+    // multi-minute review finishes before we unload").
+    //
+    // Bounded so a wedged worker cannot pin the gate forever; on timeout we still return and the
+    // gate's force-unload proceeds exactly as before. LTX renders at 1920x1088/145f take ~6 min,
+    // so the default allows for a comfortably longer chain.
     server.Post("/v1/admin/drain", [&supervisor](const httplib::Request&, httplib::Response& response) {
         supervisor.drain();
-        const int in_flight = supervisor.in_flight();
-        response.set_content(json({{"status", "draining"}, {"busy", in_flight > 0}, {"in_flight", in_flight}}).dump(),
+        int wait_seconds = 1800;
+        if (const char* e = std::getenv("SD_DRAIN_WAIT_SECONDS")) {
+            wait_seconds = std::max(0, atoi(e));
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
+        int in_flight = supervisor.in_flight();
+        while (in_flight > 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            in_flight = supervisor.in_flight();
+        }
+        const bool timed_out = in_flight > 0;
+        response.set_content(json({{"status", timed_out ? "drain timed out" : "drained"},
+                                   {"busy", in_flight > 0},
+                                   {"in_flight", in_flight},
+                                   {"timed_out", timed_out}}).dump(),
                              "application/json");
     });
     server.Post("/v1/admin/unload", [&supervisor](const httplib::Request& request, httplib::Response& response) {
