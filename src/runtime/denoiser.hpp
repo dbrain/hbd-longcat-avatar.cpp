@@ -2577,24 +2577,55 @@ static sd::Tensor<float> sample_euler_ancestral_cfg_pp(denoise_cb_t model,
                                                        sd::Tensor<float> x,
                                                        const std::vector<float>& sigmas,
                                                        std::shared_ptr<RNG> rng,
-                                                       float eta) {
+                                                       float eta,
+                                                       bool is_flow_denoiser) {
     int steps = static_cast<int>(sigmas.size()) - 1;
     for (int i = 0; i < steps; i++) {
         float sigma       = sigmas[i];
+        float sigma_to    = sigmas[i + 1];
         auto denoised_opt = model(x, sigma, i + 1);
         if (denoised_opt.pred.empty() || denoised_opt.pred_uncond.empty()) {
             return {};
         }
 
-        sd::Tensor<float> denoised        = std::move(denoised_opt.pred);
-        sd::Tensor<float> uncond_denoised = std::move(denoised_opt.pred_uncond);
-        sd::Tensor<float> d               = (x - uncond_denoised) / sigma;
+        sd::Tensor<float> denoised        = std::move(denoised_opt.pred);         // cfg-combined x0 (== cond x0 at cfg 1)
+        sd::Tensor<float> uncond_denoised = std::move(denoised_opt.pred_uncond);  // uncond x0
 
-        auto [sigma_down, sigma_up] = get_ancestral_step(sigmas[i], sigmas[i + 1], eta);
+        if (sigma_to == 0.f) {
+            x = denoised;
+            continue;
+        }
 
-        x = denoised + d * sigma_down;
-
-        if (sigmas[i + 1] > 0) {
+        if (is_flow_denoiser) {
+            // ComfyUI sample_euler_ancestral_cfg_pp for a CONST/flow model (LTX).
+            // CONST: half_log_snr = logit(sigma).neg()  =>  alpha = sigma*exp(half_log_snr) = 1 - sigma.
+            // Comfy normalizes flow -> VP space (sigma_hat = sigma/(1-sigma)), runs the VP
+            // ancestral step THERE, then rescales by alpha_t. Running the VP step on RAW flow
+            // sigmas (what this function did before) over-guides ~2.5x and over-weights the
+            // denoised anchor: it under-noises every step and never applies the alpha
+            // contraction, so the latent magnitude compounds upward across the schedule.
+            // Symptom that found this: LTX i2v latent std ramping 1.18 -> 1.85 across four
+            // latent frames (pinned anchor frame flat, generated frames blown out), which
+            // decodes as a progressively oversaturated blue cast. Flat again with this branch.
+            float alpha_s = 1.0f - sigma;     // sigma * exp(sigma_to_half_log_snr(sigma))
+            float alpha_t = 1.0f - sigma_to;  // sigma_to * exp(sigma_to_half_log_snr(sigma_to))
+            if (alpha_s < 1e-6f) {
+                alpha_s = 1e-6f;  // guard the sigma->1 endpoint (comfy offset_first_sigma_for_snr)
+            }
+            float s_hat         = sigma / alpha_s;     // VP-normalized current sigma
+            float t_hat         = sigma_to / alpha_t;  // VP-normalized next sigma
+            auto [sd_vp, su_vp] = get_ancestral_step(s_hat, t_hat, eta);  // VP form, ON NORMALIZED sigmas
+            float sigma_down    = alpha_t * sd_vp;
+            sd::Tensor<float> d = (x - uncond_denoised * alpha_s) / sigma;  // direction from uncond
+            x                   = denoised * alpha_t + d * sigma_down;
+            if (eta > 0.f) {
+                x += sd::Tensor<float>::randn_like(x, rng) * (alpha_t * su_vp);
+            }
+        } else {
+            // Original VP path — unchanged.
+            sd::Tensor<float> d         = (x - uncond_denoised) / sigma;
+            auto [sigma_down, sigma_up] = get_ancestral_step(sigma, sigma_to, eta);
+            x                           = denoised + d * sigma_down;
             x += sd::Tensor<float>::randn_like(x, rng) * sigma_up;
         }
     }
@@ -2717,7 +2748,7 @@ static sd::Tensor<float> sample_k_diffusion(sample_method_t method,
         case EULER_CFG_PP_SAMPLE_METHOD:
             return sample_euler_cfg_pp(model, std::move(x), sigmas);
         case EULER_A_CFG_PP_SAMPLE_METHOD:
-            return sample_euler_ancestral_cfg_pp(model, std::move(x), sigmas, rng, eta);
+            return sample_euler_ancestral_cfg_pp(model, std::move(x), sigmas, rng, eta, is_flow_denoiser);
         case EULER_GE_SAMPLE_METHOD:
             return sample_gradient_estimation(model, std::move(x), sigmas, rng, is_flow_denoiser, eta, extra_args);
         default:

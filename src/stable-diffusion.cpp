@@ -4760,6 +4760,51 @@ struct GenerationRequest {
             shifted_timestep = 0;
         }
     }
+
+    // Reconcile a CFG++ sampler with the guidance scale actually in force. Must run AFTER
+    // SamplePlan has resolved the method, since only then is the sampler final.
+    //
+    // A CFG++ sampler steps along the UNCOND direction while anchoring on the cfg-combined
+    // x0. That differs from the plain ancestral step ONLY through the cond/uncond gap, so it
+    // needs a real uncond prediction on EVERY step — a second model evaluation, which the
+    // usual cfg == 1 optimisation skips (ComfyUI forces it via disable_cfg1_optimization).
+    //
+    // At cfg == 1 there is no gap: pred == pred_uncond, and the CFG++ update is algebraically
+    // the plain ancestral update. Paying for the uncond pass there buys nothing — measured on
+    // the 960x544/145f-schedule i2v repro at 25 frames: sampling 27.2 s -> 56.3 s (+107%) for
+    // identical colour metrics (SATAVG drift -2.0% vs -2.1%, latent ramp 0.985 vs 0.986).
+    // So at cfg == 1 fall back to the plain sampler and say so; the distilled LTX recipes all
+    // run cfg 1, which is why koblem's euler_ancestral_cfg_pp requests land here.
+    //
+    // Above cfg 1 the gap is real: honour CFG++ and take the uncond pass.
+    //
+    // LTXAV_CFG_PP_FORCE_UNCOND=1 keeps true CFG++ at cfg == 1 (what the pre-rebuild engine
+    // did) for A/B measurement — it is a comparison escape, not a quality setting.
+    void reconcile_cfg_pp_sampler(enum sample_method_t* sample_method) {
+        GGML_ASSERT(sample_method != nullptr);
+        if (*sample_method != EULER_CFG_PP_SAMPLE_METHOD && *sample_method != EULER_A_CFG_PP_SAMPLE_METHOD) {
+            return;
+        }
+        const char* force = getenv("LTXAV_CFG_PP_FORCE_UNCOND");
+        const bool forced = force != nullptr && force[0] != '0';
+        const bool cfg_is_one = guidance.txt_cfg == 1.f && guidance.img_cfg == 1.f;
+
+        if (cfg_is_one && !forced) {
+            enum sample_method_t plain = *sample_method == EULER_A_CFG_PP_SAMPLE_METHOD
+                                             ? EULER_A_SAMPLE_METHOD
+                                             : EULER_SAMPLE_METHOD;
+            LOG_INFO("sampling using %s method (requested %s; at cfg 1.0 CFG++ is algebraically "
+                     "the plain step, so the per-step uncond pass would cost ~2x for nothing)",
+                     sd_sample_method_name(plain),
+                     sd_sample_method_name(*sample_method));
+            *sample_method = plain;
+            return;
+        }
+        if (!use_uncond) {
+            LOG_INFO("CFG++ sampler: forcing an uncond prediction per step (cfg=%.2f)", guidance.txt_cfg);
+        }
+        use_uncond = true;
+    }
 };
 
 struct SamplePlan {
@@ -4871,6 +4916,8 @@ struct SamplePlan {
             LOG_DEBUG("switching from high noise model at step %d", high_noise_sample_steps);
         }
 
+        // The REQUESTED sampler. reconcile_cfg_pp_sampler() may still swap a CFG++ method for
+        // its plain equivalent at cfg 1 after this point, and logs the swap when it does.
         LOG_INFO("sampling using %s method", sampling_methods_str[sample_method]);
         if (high_noise_sample_steps > 0) {
             high_noise_sample_method = resolve_sample_method(sd_ctx,
@@ -6262,6 +6309,7 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
+    request.reconcile_cfg_pp_sampler(&plan.sample_method);
     auto latents_opt = prepare_image_generation_latents(sd_ctx,
                                                         sd_img_gen_params,
                                                         &request,
@@ -7845,6 +7893,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     sd_ctx->sd->reset_generation_extensions();
 
     SamplePlan plan(sd_ctx, sd_vid_gen_params, request);
+    request.reconcile_cfg_pp_sampler(&plan.sample_method);
     auto latent_inputs_opt = prepare_video_generation_latents(sd_ctx, sd_vid_gen_params, &request);
     if (!latent_inputs_opt.has_value()) {
         return false;
