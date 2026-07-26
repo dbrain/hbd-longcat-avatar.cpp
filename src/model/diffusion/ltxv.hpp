@@ -1444,12 +1444,18 @@ namespace LTXV {
             return attn->forward(ctx, q, context, attention_mask, nullptr, nullptr);
         }
 
+        // `v_attention_mask` biases the VIDEO text cross-attention and
+        // `a_attention_mask` the AUDIO one. They are separate parameters
+        // because the two streams have different query->time mappings: a video
+        // query is a (frame, h, w) patch token and an audio query is an audio
+        // latent frame, so one mask cannot serve both.
         std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
                                                       ggml_tensor* vx,
                                                       ggml_tensor* ax,
                                                       ggml_tensor* v_context,
                                                       ggml_tensor* a_context,
-                                                      ggml_tensor* attention_mask,
+                                                      ggml_tensor* v_attention_mask,
+                                                      ggml_tensor* a_attention_mask,
                                                       ggml_tensor* v_timestep,
                                                       ggml_tensor* a_timestep,
                                                       ggml_tensor* v_pe,
@@ -1496,7 +1502,7 @@ namespace LTXV {
                                                      v_timestep,
                                                      v_prompt_timestep,
                                                      v_dim,
-                                                     attention_mask,
+                                                     v_attention_mask,
                                                      ctx->ltx_video_token_sel);
             vx          = ggml_add(ctx->ggml_ctx, vx, v_txt);
 
@@ -1516,7 +1522,7 @@ namespace LTXV {
                                                          a_timestep,
                                                          a_prompt_timestep,
                                                          a_dim,
-                                                         attention_mask);
+                                                         a_attention_mask);
                 ax          = ggml_add(ctx->ggml_ctx, ax, a_txt);
 
                 auto vx_norm3 = rms_norm(ctx->ggml_ctx, vx);
@@ -1841,7 +1847,9 @@ namespace LTXV {
                                                       ggml_tensor* v_cross_pe,
                                                       ggml_tensor* a_cross_pe,
                                                       ggml_tensor* video_connector_pe,
-                                                      ggml_tensor* audio_connector_pe) {
+                                                      ggml_tensor* audio_connector_pe,
+                                                      ggml_tensor* v_relay_mask = nullptr,
+                                                      ggml_tensor* a_relay_mask = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1975,7 +1983,8 @@ namespace LTXV {
                                             ax,
                                             v_context,
                                             a_context,
-                                            nullptr,
+                                            v_relay_mask,
+                                            a_relay_mask,
                                             v_timestep_mod,
                                             a_timestep_mod,
                                             v_pe,
@@ -2036,6 +2045,19 @@ namespace LTXV {
         // externally-backed graph input.
         sd::Tensor<float> v_timestep_compact_cache;
         std::vector<int32_t> v_token_sel_vec;
+        // Prompt Relay masks. Same lifetime requirement, plus a cache: the mask
+        // is identical for every step of a window, so it is materialised once
+        // per (plan revision, shape) rather than on every graph build.
+        std::vector<ggml_fp16_t> relay_video_mask_vec;
+        std::vector<ggml_fp16_t> relay_audio_mask_vec;
+        std::tuple<uint64_t, int64_t, int64_t> relay_video_key{0, 0, 0};
+        std::tuple<uint64_t, int64_t, int64_t> relay_audio_key{0, 0, 0};
+
+        static std::tuple<uint64_t, int64_t, int64_t> relay_mask_key(const sd::ltx_relay::Plan* relay,
+                                                                    int64_t L_q,
+                                                                    int64_t L_k) {
+            return {relay->revision, L_q, L_k};
+        }
 
         LTXAVRunner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -2129,7 +2151,8 @@ namespace LTXV {
                                  float frame_rate                                = 24.f,
                                  const sd::Tensor<float>& video_positions_tensor = {},
                                  const sd::Tensor<float>& audio_positions_tensor = {},
-                                 bool skip_a2v                                  = false) {
+                                 bool skip_a2v                                  = false,
+                                 const sd::ltx_relay::Plan* relay               = nullptr) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -2302,11 +2325,17 @@ namespace LTXV {
                    context->ne[0] == config.caption_channels * 2) &&
                   context->ne[1] < 1024));
             ggml_tensor* video_connector_pe = nullptr;
+            // Key length the video text cross-attention will actually see. The
+            // connector appends learnable registers, so the post-connector
+            // sequence is longer than the conditioner's token count; the relay
+            // mask has to be built against this, not against context->ne[1].
+            int64_t video_context_len = context != nullptr ? context->ne[1] : 0;
             if (needs_video_connector_pe) {
                 int64_t seq_len      = context->ne[1];
                 int64_t target_len   = std::max<int64_t>(1024, seq_len);
                 int64_t duplications = (target_len + config.connector_num_registers - 1) / config.connector_num_registers;
                 int64_t full_len     = seq_len + duplications * config.connector_num_registers - seq_len;
+                video_context_len    = std::max(full_len, seq_len);
                 connector_pe_vec     = build_1d_rope_matrix(full_len, static_cast<int>(config.connector_hidden_size), static_cast<int>(config.connector_num_heads), 10000.f, 4096.f, true);
                 video_connector_pe   = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.connector_head_dim / 2, full_len * config.connector_num_heads);
                 ggml_set_name(video_connector_pe, "ltxav_video_connector_pe");
@@ -2326,15 +2355,70 @@ namespace LTXV {
                    context->ne[0] == config.caption_channels * 2) &&
                   context->ne[1] < 1024));
             ggml_tensor* audio_connector_pe = nullptr;
+            int64_t audio_context_len       = context != nullptr ? context->ne[1] : 0;
             if (needs_audio_connector_pe) {
                 int64_t seq_len        = context->ne[1];
                 int64_t target_len     = std::max<int64_t>(1024, seq_len);
                 int64_t duplications   = (target_len + config.audio_connector_num_registers - 1) / config.audio_connector_num_registers;
                 int64_t full_len       = seq_len + duplications * config.audio_connector_num_registers - seq_len;
+                audio_context_len      = std::max(full_len, seq_len);
                 audio_connector_pe_vec = build_1d_rope_matrix(full_len, static_cast<int>(config.audio_connector_hidden_size), static_cast<int>(config.audio_connector_num_heads), 10000.f, 4096.f, true);
                 audio_connector_pe     = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.audio_connector_head_dim / 2, full_len * config.audio_connector_num_heads);
                 ggml_set_name(audio_connector_pe, "ltxav_audio_connector_pe");
                 set_backend_tensor_data(audio_connector_pe, audio_connector_pe_vec.data());
+            }
+
+            // Prompt Relay masks. Built on CPU, uploaded pre-shaped
+            // ([L_k, L_q], ne1 == L_q) and pre-F16 so that
+            // ggml_ext_attention_ext's ggml_repeat + ggml_cast fallback never
+            // fires -- that fallback is the difference between one mask and
+            // ~48x its size in graph churn. A null plan leaves both null and
+            // the graph identical to a build without relay.
+            ggml_tensor* v_relay_mask = nullptr;
+            ggml_tensor* a_relay_mask = nullptr;
+            if (relay != nullptr && context != nullptr) {
+                const int64_t tokens_per_frame = vx->ne[0] * vx->ne[1];
+                if (relay->has_video() && video_context_len > 0 &&
+                    static_cast<int64_t>(relay->video_frame_time.size()) == vx->ne[2]) {
+                    const int64_t L_q = static_cast<int64_t>(relay->video_frame_time.size()) * tokens_per_frame;
+                    if (relay_video_key != relay_mask_key(relay, L_q, video_context_len)) {
+                        sd::ltx_relay::build_mask_f16(*relay,
+                                                      relay->video_frame_time,
+                                                      tokens_per_frame,
+                                                      video_context_len,
+                                                      relay->eps,
+                                                      relay_video_mask_vec);
+                        relay_video_key = relay_mask_key(relay, L_q, video_context_len);
+                        LOG_DEBUG("ltxav prompt relay: video mask [%lld,%lld] F16 (%.1f MiB), %zu beats",
+                                  (long long)video_context_len,
+                                  (long long)L_q,
+                                  relay_video_mask_vec.size() * sizeof(ggml_fp16_t) / 1048576.0,
+                                  relay->beats.size());
+                    }
+                    v_relay_mask = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F16, video_context_len, L_q);
+                    ggml_set_name(v_relay_mask, "ltxav_relay_video_mask");
+                    set_backend_tensor_data(v_relay_mask, relay_video_mask_vec.data());
+                } else if (relay->has_video()) {
+                    LOG_WARN("ltxav prompt relay: video mask skipped (frame table %zu vs %lld latent frames)",
+                             relay->video_frame_time.size(),
+                             (long long)vx->ne[2]);
+                }
+                if (ax != nullptr && relay->has_audio() && audio_context_len > 0 &&
+                    static_cast<int64_t>(relay->audio_frame_time.size()) == ax->ne[1]) {
+                    const int64_t L_q = static_cast<int64_t>(relay->audio_frame_time.size());
+                    if (relay_audio_key != relay_mask_key(relay, L_q, audio_context_len)) {
+                        sd::ltx_relay::build_mask_f16(*relay,
+                                                      relay->audio_frame_time,
+                                                      1,
+                                                      audio_context_len,
+                                                      relay->audio_eps > 0.f ? relay->audio_eps : relay->eps,
+                                                      relay_audio_mask_vec);
+                        relay_audio_key = relay_mask_key(relay, L_q, audio_context_len);
+                    }
+                    a_relay_mask = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F16, audio_context_len, L_q);
+                    ggml_set_name(a_relay_mask, "ltxav_relay_audio_mask");
+                    set_backend_tensor_data(a_relay_mask, relay_audio_mask_vec.data());
+                }
             }
 
             auto runner_ctx = get_context();
@@ -2351,7 +2435,9 @@ namespace LTXV {
                                             video_cross_pe,
                                             audio_cross_pe,
                                             video_connector_pe,
-                                            audio_connector_pe);
+                                            audio_connector_pe,
+                                            v_relay_mask,
+                                            a_relay_mask);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
@@ -2367,7 +2453,8 @@ namespace LTXV {
                                   float frame_rate                         = 24.f,
                                   const sd::Tensor<float>& video_positions = {},
                                   const sd::Tensor<float>& audio_positions = {},
-                                  bool skip_a2v = false) {
+                                  bool skip_a2v = false,
+                                  const sd::ltx_relay::Plan* relay = nullptr) {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x,
                                    timesteps,
@@ -2378,7 +2465,8 @@ namespace LTXV {
                                    frame_rate,
                                    video_positions,
                                    audio_positions,
-                                   skip_a2v);
+                                   skip_a2v,
+                                   relay);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
             return out;
@@ -2399,7 +2487,8 @@ namespace LTXV {
                            extra->frame_rate,
                            tensor_or_empty(extra->video_positions),
                            tensor_or_empty(extra->audio_positions),
-                           extra->skip_a2v);
+                           extra->skip_a2v,
+                           extra->relay);
         }
 
         void test(const std::string& x_path,

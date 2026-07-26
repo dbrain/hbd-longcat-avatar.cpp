@@ -35,6 +35,10 @@ public:
 
     void add_special_token(const std::string& token);
     bool is_special_token(const std::string& token) const;
+    // Callers that need to map a padded token sequence back onto the text it
+    // came from have to know whether pad_tokens() bracketed the body.
+    bool adds_bos_token() const { return add_bos_token; }
+    bool adds_eos_token() const { return add_eos_token; }
     virtual std::vector<int> encode(const std::string& text, on_new_token_cb_t on_new_token_cb = nullptr) = 0;
     std::vector<int> tokenize(const std::string& text,
                               on_new_token_cb_t on_new_token_cb = nullptr,

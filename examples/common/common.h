@@ -245,6 +245,14 @@ struct SDGenerationParams {
     float a2v_ramp_end                    = 1.f;
     int relip_ref_tstride                 = 1;
     bool lipdub_two_stage                  = false;
+    // LTX Prompt Relay. `relay_beats_arg` is the raw CLI/JSON form: repeatable
+    // "<frame>:<text>" entries joined by '|'. Per-beat strength and window are
+    // deliberately env-only (LTX_RELAY_STRENGTH / LTX_RELAY_W) so an epsilon or
+    // window sweep needs no rebuild.
+    std::string relay_beats_arg;
+    float relay_eps                        = 0.f;
+    float relay_audio_eps                  = 0.f;
+    float relay_steps_frac                 = 0.f;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
 
@@ -298,6 +306,9 @@ struct SDGenerationParams {
     std::vector<sd_image_t> ref_image_views;
     std::vector<sd_image_t> pm_id_image_views;
     std::vector<sd_image_t> control_frame_views;
+    // Backing storage for the sd_vid_gen_params_t relay beat views.
+    std::vector<std::string> relay_beat_texts;
+    std::vector<sd_ltx_beat_t> relay_beat_views;
 
     SDGenerationParams();
     SDGenerationParams(const SDGenerationParams& other)                = default;

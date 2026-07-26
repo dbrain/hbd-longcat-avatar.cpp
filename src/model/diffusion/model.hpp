@@ -8,6 +8,7 @@
 #include "core/ggml_extend.hpp"
 #include "core/tensor_ggml.hpp"
 #include "model/common/rope.hpp"
+#include "model/diffusion/ltx_relay.hpp"
 #include "model_manager.h"
 
 enum class RefImageResizeMode {
@@ -85,6 +86,12 @@ struct LTXAVDiffusionExtra {
     const sd::Tensor<float>* video_positions = nullptr;
     const sd::Tensor<float>* audio_positions = nullptr;
     bool skip_a2v                           = false;
+    // Prompt Relay. Null is the ordinary path: no cross-attention mask is
+    // built, the flash fast path keeps its null-mask shape, and the graph is
+    // byte-identical to a build without relay. The sampler nulls this out for
+    // the unconditional pass (whose token ranges do not match) and once the
+    // configured step fraction has elapsed.
+    const sd::ltx_relay::Plan* relay = nullptr;
 };
 
 struct LongCatAvatarDiffusionExtra {

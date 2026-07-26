@@ -396,12 +396,43 @@ typedef struct {
     bool circular_y;
 } sd_img_gen_params_t;
 
+// Prompt Relay beat (arXiv 2604.10030). The shot's `prompt` stays the global
+// setting and conditions every frame with zero penalty; each beat is a short
+// clause that is given cross-attention priority around its own moment. Fewer
+// than one beat leaves the ordinary null-mask path byte-identical.
+typedef struct {
+    // Pixel-frame index on the RENDERED segment timeline (continuation frames
+    // included; the caller is responsible for adding its own seam drop).
+    int frame;
+    const char* text;
+    // Multiplies the attention penalty. Zero or negative selects 1.0.
+    float strength;
+    // Flat-top half-width in seconds. Negative selects the paper's ablated
+    // best, w = L - 2 latent frames, i.e. a two-latent-frame crossfade.
+    float window;
+} sd_ltx_beat_t;
+
 typedef struct {
     const sd_lora_t* loras;
     uint32_t lora_count;
     const char* prompt;
     const char* negative_prompt;
     int clip_skip;
+    // Prompt Relay. `prompt` remains the global anchor; these are the timed
+    // sub-prompts. A non-empty list is REQUIRED to have a non-empty global
+    // prompt: the zero-penalty global tokens are what keeps the masked softmax
+    // from degenerating far away from every beat.
+    const sd_ltx_beat_t* beats;
+    int beat_count;
+    // Gaussian tail floor. Zero selects 0.01 (the paper uses 0.001, which is
+    // near-hard partitioning at our latent-frame counts).
+    float relay_eps;
+    // Separate floor for the audio cross-attention stream. Zero inherits
+    // relay_eps; a negative value disables the audio relay mask entirely.
+    float relay_audio_eps;
+    // Fraction of the base sampling schedule that carries the mask. Semantic
+    // layout is decided early, so a value below one costs less. Zero selects 1.
+    float relay_steps_frac;
     sd_image_t init_image;
     sd_image_t end_image;
     // LTXAV frame-pinned image guides. Each image is frozen at the matching
@@ -585,6 +616,22 @@ typedef struct {
     // portion of that shot (padding short tracks with silence).
     const char* const* segment_audio_full;
     const char* const* segment_audio_track;
+    // Optional per-shot Prompt Relay beats.  Frame indices are on that shot's
+    // own rendered timeline.  A null array, or a zero count for a shot, leaves
+    // that shot on the byte-identical null-mask path.
+    const sd_ltx_beat_t* const* segment_beats;
+    const int* segment_beat_counts;
+    // Optional per-shot sampling overrides.  These exist so one shot can be
+    // retaken, or pushed onto a cfg-capable variant for relay, without
+    // disturbing the rest of the chain.  A null array inherits everywhere.
+    // Seeds: negative entries inherit `base_params->seed + segment`.
+    const int64_t* segment_seeds;
+    // Steps: entries <= 0 inherit the base sample step count.
+    const int* segment_steps;
+    // Text CFG: entries < 0 inherit the base guidance.
+    const float* segment_cfg;
+    // Negative prompts: null or empty entries inherit the base negative prompt.
+    const char* const* segment_negative_prompts;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;

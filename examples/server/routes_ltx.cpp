@@ -251,6 +251,13 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<int> segment_v2v_modes;
             std::vector<float> segment_v2v_strengths;
             std::vector<std::string> segment_v2v_guide_latent_paths;
+            std::vector<std::vector<LtxSegmentBeat>> segment_beats;
+            std::vector<int64_t> segment_seeds;
+            std::vector<int> segment_steps;
+            std::vector<float> segment_cfg;
+            std::vector<std::string> segment_negative_prompts;
+            bool any_segment_beats     = false;
+            bool any_segment_overrides = false;
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
@@ -265,6 +272,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
                         segment_v2v_guide_latent_paths.emplace_back();
+                        segment_beats.emplace_back();
+                        segment_seeds.push_back(-1);
+                        segment_steps.push_back(0);
+                        segment_cfg.push_back(-1.f);
+                        segment_negative_prompts.emplace_back();
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
                         if (segment.contains("model") && !segment["model"].is_string()) {
@@ -384,6 +396,60 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_modes.push_back(v2v_mode);
                         segment_v2v_strengths.push_back(v2v_strength);
                         segment_v2v_guide_latent_paths.push_back(std::move(guide_latent_path));
+
+                        // Prompt Relay beats. The shot's own `prompt` stays the
+                        // global setting; each beat is a short clause pinned to a
+                        // frame on this shot's rendered timeline. Zero beats is
+                        // the ordinary byte-identical path.
+                        std::vector<LtxSegmentBeat> beats;
+                        if (segment.contains("beats")) {
+                            if (!segment["beats"].is_array()) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"LTX beats must be an array of {frame, text}"})", "application/json");
+                                return;
+                            }
+                            for (const auto& beat : segment["beats"]) {
+                                if (!beat.is_object() ||
+                                    !beat.contains("frame") || !beat["frame"].is_number_integer() ||
+                                    beat["frame"].get<int>() < 0 ||
+                                    !beat.contains("text") || !beat["text"].is_string() ||
+                                    beat["text"].get<std::string>().empty()) {
+                                    res.status = 400;
+                                    res.set_content(R"({"error":"each LTX beat needs a non-negative integer frame and non-empty text"})", "application/json");
+                                    return;
+                                }
+                                LtxSegmentBeat parsed;
+                                parsed.frame    = beat["frame"].get<int>();
+                                parsed.text     = beat["text"].get<std::string>();
+                                parsed.strength = beat.value("strength", 0.f);
+                                parsed.window   = beat.value("window", -1.f);
+                                beats.push_back(std::move(parsed));
+                            }
+                            if (!beats.empty() && segment.value("prompt", std::string()).empty()) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"LTX beats require a non-empty shot prompt to anchor them"})", "application/json");
+                                return;
+                            }
+                        }
+                        any_segment_beats = any_segment_beats || !beats.empty();
+                        segment_beats.push_back(std::move(beats));
+
+                        // Per-shot sampling overrides.
+                        const int64_t shot_seed = segment.value("seed", static_cast<int64_t>(-1));
+                        const int shot_steps    = segment.value("steps", 0);
+                        const float shot_cfg    = segment.value("cfg", -1.f);
+                        if (shot_steps < 0 || shot_steps > 200) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"LTX segment steps must be between 0 (inherit) and 200"})", "application/json");
+                            return;
+                        }
+                        segment_seeds.push_back(shot_seed);
+                        segment_steps.push_back(shot_steps);
+                        segment_cfg.push_back(shot_cfg);
+                        segment_negative_prompts.push_back(segment.value("negative_prompt", std::string()));
+                        any_segment_overrides = any_segment_overrides ||
+                                                shot_seed >= 0 || shot_steps > 0 || shot_cfg >= 0.f ||
+                                                !segment_negative_prompts.back().empty();
                     }
                 }
             } else if (body.contains("prompts") && body["prompts"].is_array()) {
@@ -400,6 +466,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
                         segment_v2v_guide_latent_paths.emplace_back();
+                        segment_beats.emplace_back();
+                        segment_seeds.push_back(-1);
+                        segment_steps.push_back(0);
+                        segment_cfg.push_back(-1.f);
+                        segment_negative_prompts.emplace_back();
                     }
                 }
             }
@@ -620,6 +691,19 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
+            // Only carry the per-shot arrays when a shot actually asked for
+            // something: an all-inert array would make the chain treat every
+            // shot as "explicitly no beats", which is the same result but costs
+            // durable job state on every ordinary render.
+            if (any_segment_beats) {
+                job->ltx_segment_beats = std::move(segment_beats);
+            }
+            if (any_segment_overrides) {
+                job->ltx_segment_seeds = std::move(segment_seeds);
+                job->ltx_segment_steps = std::move(segment_steps);
+                job->ltx_segment_cfg = std::move(segment_cfg);
+                job->ltx_segment_negative_prompts = std::move(segment_negative_prompts);
+            }
             job->ltx_cont_latent_frames = continuation_frames;
             job->ltx_emit_segments = body.value("emit_segments", false);
             const bool persist_bank = body.value("persist", false);

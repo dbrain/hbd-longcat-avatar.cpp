@@ -2817,7 +2817,9 @@ public:
                              const sd::Tensor<float>& audio_positions = {},
                              bool ltxav_audio_fixed                   = false,
                              float a2v_guidance_scale                 = 1.f,
-                             float a2v_ramp_end                       = 1.f) {
+                             float a2v_ramp_end                       = 1.f,
+                             const sd::ltx_relay::Plan* relay_plan    = nullptr,
+                             float relay_steps_frac                   = 1.f) {
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
             ~RunnerDoneOnExit() {
@@ -3078,6 +3080,18 @@ public:
                                               !ref_latents.empty() &&
                                               sd_version_supports_ref_latent_img_cfg(version);
 
+            // Prompt Relay is a bias on the POSITIVE prompt's cross-attention
+            // only. The unconditional encode is a different string with a
+            // different token count, so its key axis does not match the mask at
+            // all; and the mask only shapes semantic layout, which is decided in
+            // the first steps, so it can be retired early (relay_steps_frac).
+            const int relay_last_step = relay_plan == nullptr
+                                            ? -1
+                                            : static_cast<int>(std::ceil(std::clamp(relay_steps_frac, 0.f, 1.f) *
+                                                                         static_cast<float>(steps))) -
+                                                  1;
+            const sd::ltx_relay::Plan* step_relay = step <= relay_last_step ? relay_plan : nullptr;
+
             auto run_condition = [&](const SDCondition& condition,
                                      const sd::Tensor<float>* c_concat_override                 = nullptr,
                                      const std::vector<int>* local_skip_layers                  = nullptr,
@@ -3119,6 +3133,11 @@ public:
                         condition.c_vinput_mask.empty() ? nullptr : &condition.c_vinput_mask,
                         condition.c_image_embeds.empty() ? nullptr : &condition.c_image_embeds};
                 } else if (sd_version_is_ltxav(version)) {
+                    // c_token_pieces is populated only by the piece-wise
+                    // positive encode, so it is exactly the discriminator for
+                    // "this condition's key axis is the one the mask was built
+                    // against" -- the unconditional encode, and any condition an
+                    // extension substituted, leave it empty.
                     diffusion_params.extra = LTXAVDiffusionExtra{
                         nullptr,
                         audio_timesteps_tensor.empty() ? nullptr : &audio_timesteps_tensor,
@@ -3126,7 +3145,8 @@ public:
                         frame_rate,
                         video_positions.empty() ? nullptr : &video_positions,
                         audio_positions.empty() ? nullptr : &audio_positions,
-                        skip_a2v_pass};
+                        skip_a2v_pass,
+                        condition.c_token_pieces.empty() ? nullptr : step_relay};
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};
                 } else if (sd_version_is_minit2i(version)) {
@@ -4196,6 +4216,11 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->keyframes                             = nullptr;
     sd_vid_gen_params->keyframe_frame_indices                = nullptr;
     sd_vid_gen_params->keyframes_size                        = 0;
+    sd_vid_gen_params->beats                                 = nullptr;
+    sd_vid_gen_params->beat_count                            = 0;
+    sd_vid_gen_params->relay_eps                             = 0.f;
+    sd_vid_gen_params->relay_audio_eps                       = 0.f;
+    sd_vid_gen_params->relay_steps_frac                      = 0.f;
     sd_vid_gen_params->seed                                  = -1;
     sd_vid_gen_params->video_frames                          = 6;
     sd_vid_gen_params->fps                                   = 16;
@@ -4966,6 +4991,153 @@ static float ltxv_latent_corner_to_pixel_frame(int64_t corner_index,
         pixel_t = std::max(0.f, pixel_t + 1.f - static_cast<float>(temporal_scale));
     }
     return pixel_t;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt Relay plan assembly (arXiv 2604.10030; see model/diffusion/ltx_relay.hpp)
+// ---------------------------------------------------------------------------
+
+static float ltx_relay_env_float(const char* name, float fallback) {
+    if (const char* value = std::getenv(name); value != nullptr && value[0] != '\0') {
+        return std::strtof(value, nullptr);
+    }
+    return fallback;
+}
+
+// Seconds occupied by one video latent frame at this frame rate. The paper's
+// ablated-best flat top is L minus two latent frames, so this is the unit the
+// default crossfade is measured in.
+static float ltx_relay_latent_frame_seconds(int fps, int temporal_scale) {
+    const int safe_fps = std::max(1, fps);
+    return static_cast<float>(temporal_scale) / static_cast<float>(safe_fps);
+}
+
+// Beats carry a time, not a span. Derive spans by Voronoi over the rendered
+// segment: beat s owns the interval to the midpoints of its neighbours, the
+// first beat reaches back to frame zero and the last forward to the final
+// frame. L is the larger half of that cell, which is the permissive reading
+// (the penalty reaches eps at the far edge rather than before it).
+static bool build_ltx_relay_plan(const sd_vid_gen_params_t* params,
+                                 const std::vector<int32_t>& token_pieces,
+                                 int fps,
+                                 int rendered_frames,
+                                 int temporal_scale,
+                                 sd::ltx_relay::Plan* plan) {
+    if (params == nullptr || plan == nullptr || params->beats == nullptr || params->beat_count < 1) {
+        return false;
+    }
+    if (token_pieces.empty()) {
+        LOG_WARN("LTX prompt relay: no token->piece map from the text encoder, relay disabled");
+        return false;
+    }
+    if (params->prompt == nullptr || params->prompt[0] == '\0') {
+        // The zero-penalty global tokens are the only guarantee that a query
+        // token far from every beat keeps an unpenalised key. Without them the
+        // masked softmax is degenerate, so this is a hard requirement.
+        LOG_WARN("LTX prompt relay: beats require a non-empty global prompt, relay disabled");
+        return false;
+    }
+
+    const int safe_fps      = std::max(1, fps);
+    const float latent_secs = ltx_relay_latent_frame_seconds(safe_fps, temporal_scale);
+    const float clip_secs   = static_cast<float>(std::max(1, rendered_frames) - 1) / static_cast<float>(safe_fps);
+
+    struct Sorted {
+        int index;
+        float time;
+    };
+    std::vector<Sorted> sorted;
+    sorted.reserve(static_cast<size_t>(params->beat_count));
+    for (int beat = 0; beat < params->beat_count; ++beat) {
+        const float time = std::clamp(static_cast<float>(params->beats[beat].frame) / static_cast<float>(safe_fps),
+                                      0.f,
+                                      clip_secs);
+        sorted.push_back({beat, time});
+    }
+    std::stable_sort(sorted.begin(), sorted.end(), [](const Sorted& a, const Sorted& b) { return a.time < b.time; });
+
+    const float env_window   = ltx_relay_env_float("LTX_RELAY_W", -1.f);
+    const float env_strength = ltx_relay_env_float("LTX_RELAY_STRENGTH", -1.f);
+
+    // Beats stay in the CALLER's order: the plan's beat k must line up with
+    // prompt piece k+1, which the conditioner encoded in that order.
+    plan->beats.assign(static_cast<size_t>(params->beat_count), sd::ltx_relay::Beat{});
+    for (size_t position = 0; position < sorted.size(); ++position) {
+        const int beat_index = sorted[position].index;
+        const float time     = sorted[position].time;
+        const float lo       = position == 0 ? 0.f : 0.5f * (sorted[position - 1].time + time);
+        const float hi       = position + 1 == sorted.size() ? clip_secs : 0.5f * (time + sorted[position + 1].time);
+        const float span     = std::max({time - lo, hi - time, latent_secs});
+
+        const float requested_window = env_window >= 0.f ? env_window : params->beats[beat_index].window;
+        const float window           = requested_window >= 0.f
+                                           ? std::min(requested_window, span - 0.05f * latent_secs)
+                                           : std::max(0.f, span - 2.f * latent_secs);
+        const float requested_strength = env_strength > 0.f ? env_strength : params->beats[beat_index].strength;
+
+        auto& beat     = plan->beats[static_cast<size_t>(beat_index)];
+        beat.mid       = time;
+        beat.half_span = span;
+        beat.window    = std::max(0.f, window);
+        beat.strength  = requested_strength > 0.f ? requested_strength : 1.f;
+    }
+
+    plan->token_beat = token_pieces;
+    plan->eps        = ltx_relay_env_float("LTX_RELAY_EPS",
+                                    params->relay_eps > 0.f ? params->relay_eps : 0.01f);
+    plan->audio_eps  = ltx_relay_env_float("LTX_RELAY_AUDIO_EPS",
+                                          params->relay_audio_eps != 0.f ? params->relay_audio_eps : plan->eps);
+    plan->max_cost   = ltx_relay_env_float("LTX_RELAY_MAX_COST", 60.f);
+    plan->revision   = 1;
+
+    int32_t mapped_beats = 0;
+    for (int32_t piece : plan->token_beat) {
+        mapped_beats += static_cast<int32_t>(piece >= 0);
+    }
+    LOG_INFO("LTX prompt relay: %d beat(s) over %.2fs, eps=%.4g audio_eps=%.4g, %d/%zu prompt tokens beat-owned",
+             params->beat_count,
+             clip_secs,
+             plan->eps,
+             plan->audio_eps,
+             mapped_beats,
+             plan->token_beat.size());
+    for (size_t beat = 0; beat < plan->beats.size(); ++beat) {
+        LOG_DEBUG("  beat %zu: mid=%.3fs L=%.3fs w=%.3fs sigma=%.4f strength=%.2f",
+                  beat,
+                  plan->beats[beat].mid,
+                  plan->beats[beat].half_span,
+                  plan->beats[beat].window,
+                  sd::ltx_relay::beat_sigma(plan->beats[beat], plan->eps),
+                  plan->beats[beat].strength);
+    }
+    return true;
+}
+
+// Per-latent-frame query times, in seconds, for one sampler grid. When the
+// caller already built an explicit RoPE position table (i2v, keyframes,
+// continuation, windowed tiles) that table is authoritative -- it is what the
+// model itself uses for time, appended reference tokens included.
+static std::vector<float> ltx_relay_video_frame_times(const sd::Tensor<float>& video_positions,
+                                                      int64_t latent_width,
+                                                      int64_t latent_height,
+                                                      int64_t latent_frames,
+                                                      int64_t latent_frame_offset,
+                                                      int fps,
+                                                      int temporal_scale) {
+    std::vector<float> times(static_cast<size_t>(std::max<int64_t>(0, latent_frames)), 0.f);
+    const int safe_fps         = std::max(1, fps);
+    const int64_t tokens_frame = std::max<int64_t>(1, latent_width * latent_height);
+    const bool from_positions  = !video_positions.empty() &&
+                                video_positions.dim() == 4 &&
+                                video_positions.shape()[2] >= latent_frames * tokens_frame;
+    for (int64_t frame = 0; frame < latent_frames; ++frame) {
+        times[static_cast<size_t>(frame)] =
+            from_positions
+                ? video_positions.index(0, 0, frame * tokens_frame, 0)
+                : ltxv_latent_corner_to_pixel_frame(latent_frame_offset + frame, temporal_scale, true) /
+                      static_cast<float>(safe_fps);
+    }
+    return times;
 }
 
 static void set_ltxv_video_position(sd::Tensor<float>* positions,
@@ -7360,6 +7532,23 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
         condition_params.ref_image_params.vlm_resize_mode = RefImageResizeMode::AREA;
     }
 
+    // Prompt Relay: piece 0 is the shot prompt (the global anchor, zero penalty
+    // everywhere) and pieces 1..N are the beat clauses, in the caller's order.
+    // Encoding them as separate pieces of ONE Gemma pass is what makes the
+    // per-beat token ranges exact. Gemma is causal, so beat k sees the setting
+    // and every earlier beat but no later one, which is the right dependency
+    // direction inside a shot.
+    std::vector<std::string> relay_pieces;
+    if (sd_version_is_ltxav(sd_ctx->sd->version) &&
+        sd_vid_gen_params->beats != nullptr && sd_vid_gen_params->beat_count > 0) {
+        relay_pieces.reserve(static_cast<size_t>(sd_vid_gen_params->beat_count) + 1);
+        relay_pieces.push_back(request.prompt);
+        for (int beat = 0; beat < sd_vid_gen_params->beat_count; ++beat) {
+            relay_pieces.push_back(SAFE_STR(sd_vid_gen_params->beats[beat].text));
+        }
+        condition_params.text_pieces = &relay_pieces;
+    }
+
     int64_t prepare_start_ms = ggml_time_ms();
     const bool use_avatar_chain_cache =
         sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
@@ -7383,6 +7572,9 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
                                                                             condition_params);
         if (request.use_uncond) {
             condition_params.text = request.negative_prompt;
+            // The negative prompt has no beats; leaving pieces set would encode
+            // the positive beats into the unconditional branch.
+            condition_params.text_pieces = nullptr;
             embeds.uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                    condition_params);
         }
@@ -8164,12 +8356,56 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
     int64_t sampling_start = ggml_time_ms();
+
+    // Prompt Relay. Built once per shot from the caller's beats and the
+    // positive encode's token->piece map; the per-window query-time tables are
+    // filled in immediately before each sample() so a temporal tile is
+    // penalised against GLOBAL time, not against its own frame zero.
+    constexpr int kLtxTemporalScale = 8;
+    sd::ltx_relay::Plan relay_plan;
+    uint64_t relay_revision = 0;
+    const bool relay_enabled =
+        sd_version_is_ltxav(sd_ctx->sd->version) &&
+        build_ltx_relay_plan(sd_vid_gen_params,
+                             embeds.cond.c_token_pieces,
+                             request.fps,
+                             request.frames,
+                             kLtxTemporalScale,
+                             &relay_plan);
+    const float relay_steps_frac = std::clamp(sd_vid_gen_params->relay_steps_frac > 0.f
+                                                  ? sd_vid_gen_params->relay_steps_frac
+                                                  : ltx_relay_env_float("LTX_RELAY_STEPS_FRAC", 1.f),
+                                              0.f,
+                                              1.f);
+
     auto sample_base_window = [&](const sd::Tensor<float>& window_latent,
                                   sd::Tensor<float> window_noise,
                                   const sd::Tensor<float>& window_mask,
                                   int window_audio_length,
                                   const sd::Tensor<float>& window_video_positions,
-                                  const sd::Tensor<float>& window_audio_positions = {}) {
+                                  const sd::Tensor<float>& window_audio_positions = {},
+                                  int64_t window_latent_start                     = 0,
+                                  int64_t window_audio_start                      = 0) {
+        const sd::ltx_relay::Plan* window_relay = nullptr;
+        if (relay_enabled) {
+            relay_plan.video_frame_time = ltx_relay_video_frame_times(window_video_positions,
+                                                                      window_latent.shape()[0],
+                                                                      window_latent.shape()[1],
+                                                                      window_latent.shape()[2],
+                                                                      window_latent_start,
+                                                                      request.fps,
+                                                                      kLtxTemporalScale);
+            relay_plan.audio_frame_time.clear();
+            if (window_audio_length > 0) {
+                relay_plan.audio_frame_time.resize(static_cast<size_t>(window_audio_length));
+                for (int frame = 0; frame < window_audio_length; ++frame) {
+                    relay_plan.audio_frame_time[static_cast<size_t>(frame)] =
+                        LTXV::audio_latent_start_time_sec(window_audio_start + frame);
+                }
+            }
+            relay_plan.revision = ++relay_revision;
+            window_relay        = &relay_plan;
+        }
         return sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                   true,
                                   window_latent,
@@ -8198,7 +8434,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                   window_audio_positions,
                                   latents.audio_fixed,
                                   sd_vid_gen_params->a2v_guidance,
-                                  sd_vid_gen_params->a2v_ramp_end);
+                                  sd_vid_gen_params->a2v_ramp_end,
+                                  window_relay,
+                                  relay_steps_frac);
     };
 
     sd::Tensor<float> final_latent;
@@ -8348,7 +8586,9 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                    mask_tile,
                                                    has_fixed_audio ? static_cast<int>(audio_tile.shape()[1]) : 0,
                                                    video_positions,
-                                                   audio_positions);
+                                                   audio_positions,
+                                                   tile_start,
+                                                   audio_start);
                     if (tile.empty()) {
                         final_latent = {};
                         break;
@@ -9293,8 +9533,38 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             params.video_frames = chain_params->segment_video_frames[segment];
         }
         params.seed = base_params->seed < 0 ? base_params->seed : base_params->seed + segment;
+        if (chain_params->segment_seeds != nullptr && chain_params->segment_seeds[segment] >= 0) {
+            params.seed = chain_params->segment_seeds[segment];
+        }
         if (chain_params->segment_prompts != nullptr && chain_params->segment_prompts[segment] != nullptr) {
             params.prompt = chain_params->segment_prompts[segment];
+        }
+        if (chain_params->segment_negative_prompts != nullptr &&
+            chain_params->segment_negative_prompts[segment] != nullptr &&
+            chain_params->segment_negative_prompts[segment][0] != '\0') {
+            params.negative_prompt = chain_params->segment_negative_prompts[segment];
+        }
+        if (chain_params->segment_steps != nullptr && chain_params->segment_steps[segment] > 0) {
+            params.sample_params.sample_steps = chain_params->segment_steps[segment];
+            // A per-shot step count and a baked custom sigma schedule are
+            // mutually exclusive -- the schedule already fixes the step count,
+            // and it would silently win.
+            params.sample_params.custom_sigmas       = nullptr;
+            params.sample_params.custom_sigmas_count = 0;
+        }
+        if (chain_params->segment_cfg != nullptr && chain_params->segment_cfg[segment] >= 0.f) {
+            params.sample_params.guidance.txt_cfg = chain_params->segment_cfg[segment];
+        }
+        // A supplied per-shot array is authoritative, including when a shot's
+        // count is zero. Only a chain that carries no beat array at all falls
+        // back to whatever the base params hold (the single-shot CLI/HTTP form).
+        if (chain_params->segment_beats != nullptr && chain_params->segment_beat_counts != nullptr) {
+            params.beats      = chain_params->segment_beat_counts[segment] > 0
+                                    ? chain_params->segment_beats[segment]
+                                    : nullptr;
+            params.beat_count = chain_params->segment_beat_counts[segment] > 0
+                                    ? chain_params->segment_beat_counts[segment]
+                                    : 0;
         }
         const int v2v_mode = chain_params->segment_v2v_modes == nullptr ? 0 : chain_params->segment_v2v_modes[segment];
         const bool has_v2v_control = chain_params->segment_control_frames != nullptr &&

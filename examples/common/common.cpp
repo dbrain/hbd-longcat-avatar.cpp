@@ -979,6 +979,14 @@ ArgOptions SDGenerationParams::get_options() {
          0,
          &audio_path},
         {"",
+         "--relay-beat",
+         "LTX Prompt Relay beat as `<frame>:<text>`, repeatable. The main --prompt stays the "
+         "global setting and each beat gets cross-attention priority around its own frame. "
+         "Fewer than one beat leaves rendering byte-identical. Sweep the shape with "
+         "LTX_RELAY_EPS / LTX_RELAY_W / LTX_RELAY_STRENGTH / LTX_RELAY_STEPS_FRAC",
+         '|',
+         &relay_beats_arg},
+        {"",
          "--pm-id-images-dir",
          "path to PHOTOMAKER input id images dir",
          0,
@@ -1175,6 +1183,20 @@ ArgOptions SDGenerationParams::get_options() {
          "--vace-strength",
          "wan vace strength",
          &vace_strength},
+        {"",
+         "--relay-eps",
+         "LTX Prompt Relay Gaussian tail floor (default: 0.01; the paper's 0.001 is near-hard "
+         "partitioning at our latent-frame counts)",
+         &relay_eps},
+        {"",
+         "--relay-audio-eps",
+         "LTX Prompt Relay tail floor for the audio cross-attention stream (default: --relay-eps; "
+         "negative disables the audio mask)",
+         &relay_audio_eps},
+        {"",
+         "--relay-steps-frac",
+         "fraction of the base schedule that carries the relay mask (default: 1.0)",
+         &relay_steps_frac},
         {"",
          "--vae-tile-overlap",
          "tile overlap for vae tiling, in fraction of tile size (default: 0.5)",
@@ -1928,6 +1950,9 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("a2v_ramp_end", a2v_ramp_end);
     load_if_exists("relip_ref_tstride", relip_ref_tstride);
     load_if_exists("two_stage", lipdub_two_stage);
+    load_if_exists("relay_eps", relay_eps);
+    load_if_exists("relay_audio_eps", relay_audio_eps);
+    load_if_exists("relay_steps_frac", relay_steps_frac);
 
     load_if_exists("auto_resize_ref_image", auto_resize_ref_image);
     load_if_exists("increase_ref_index", increase_ref_index);
@@ -2664,6 +2689,41 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.hires.cfg                 = hires_cfg;
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
+
+    // Prompt Relay beats: "<frame>:<text>" entries joined by '|'. A malformed
+    // entry is dropped with a warning rather than silently shifting the beat
+    // indices, which would misalign the mask against the encoded pieces.
+    relay_beat_texts.clear();
+    relay_beat_views.clear();
+    if (!relay_beats_arg.empty()) {
+        size_t cursor = 0;
+        while (cursor <= relay_beats_arg.size()) {
+            const size_t end   = relay_beats_arg.find('|', cursor);
+            const std::string entry = relay_beats_arg.substr(cursor, end == std::string::npos ? std::string::npos : end - cursor);
+            cursor             = end == std::string::npos ? relay_beats_arg.size() + 1 : end + 1;
+            const size_t colon = entry.find(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 >= entry.size()) {
+                if (!entry.empty()) {
+                    LOG_WARN("ignoring malformed --relay-beat entry '%s' (expected <frame>:<text>)", entry.c_str());
+                }
+                continue;
+            }
+            relay_beat_texts.push_back(entry.substr(colon + 1));
+            relay_beat_views.push_back(sd_ltx_beat_t{std::atoi(entry.substr(0, colon).c_str()),
+                                                     nullptr,
+                                                     0.f,
+                                                     -1.f});
+        }
+        // The text pointers are taken only after the vector has stopped growing.
+        for (size_t beat = 0; beat < relay_beat_views.size(); ++beat) {
+            relay_beat_views[beat].text = relay_beat_texts[beat].c_str();
+        }
+    }
+    params.beats            = relay_beat_views.empty() ? nullptr : relay_beat_views.data();
+    params.beat_count       = static_cast<int>(relay_beat_views.size());
+    params.relay_eps        = relay_eps;
+    params.relay_audio_eps  = relay_audio_eps;
+    params.relay_steps_frac = relay_steps_frac;
     return params;
 }
 

@@ -645,6 +645,47 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                     segment_audio_track.push_back(path.empty() ? nullptr : path.c_str());
                 }
             }
+            // Prompt Relay beat views. The sd_ltx_beat_t text pointers borrow
+            // the job's own strings, which outlive this call.
+            std::vector<std::vector<sd_ltx_beat_t>> segment_beat_storage;
+            std::vector<const sd_ltx_beat_t*> segment_beat_views;
+            std::vector<int> segment_beat_counts;
+            if (!job.ltx_segment_beats.empty()) {
+                segment_beat_storage.resize(job.ltx_prompts.size());
+                segment_beat_views.resize(job.ltx_prompts.size(), nullptr);
+                segment_beat_counts.resize(job.ltx_prompts.size(), 0);
+                for (size_t segment = 0;
+                     segment < job.ltx_segment_beats.size() && segment < job.ltx_prompts.size();
+                     ++segment) {
+                    const auto& beats = job.ltx_segment_beats[segment];
+                    if (beats.empty()) {
+                        continue;
+                    }
+                    auto& storage = segment_beat_storage[segment];
+                    storage.reserve(beats.size());
+                    for (const auto& beat : beats) {
+                        storage.push_back(sd_ltx_beat_t{beat.frame,
+                                                        beat.text.c_str(),
+                                                        beat.strength,
+                                                        beat.window});
+                    }
+                    segment_beat_views[segment]  = storage.data();
+                    segment_beat_counts[segment] = static_cast<int>(storage.size());
+                }
+                chain.segment_beats       = segment_beat_views.data();
+                chain.segment_beat_counts = segment_beat_counts.data();
+            }
+            std::vector<const char*> segment_negative_prompts;
+            if (!job.ltx_segment_negative_prompts.empty()) {
+                segment_negative_prompts.reserve(job.ltx_segment_negative_prompts.size());
+                for (const auto& negative : job.ltx_segment_negative_prompts) {
+                    segment_negative_prompts.push_back(negative.empty() ? nullptr : negative.c_str());
+                }
+                chain.segment_negative_prompts = segment_negative_prompts.data();
+            }
+            chain.segment_seeds = job.ltx_segment_seeds.empty() ? nullptr : job.ltx_segment_seeds.data();
+            chain.segment_steps = job.ltx_segment_steps.empty() ? nullptr : job.ltx_segment_steps.data();
+            chain.segment_cfg   = job.ltx_segment_cfg.empty() ? nullptr : job.ltx_segment_cfg.data();
             chain.retake_segment = job.ltx_retake_segment;
             chain.enable_retake = job.ltx_retake_segment >= 0;
             chain.cont_seam_drop_frames = job.ltx_cont_seam_drop_frames;

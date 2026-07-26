@@ -29,6 +29,12 @@ struct SDCondition {
 
     std::vector<sd::Tensor<float>> extra_c_crossattns;
 
+    // Prompt Relay: for each token of c_crossattn, which prompt piece it came
+    // from. -1 is the global anchor (piece 0, plus BOS/EOS); >= 0 is a beat
+    // index. Empty on every conditioner that does not encode pieces, which is
+    // every path except LTX-AV with beats.
+    std::vector<int32_t> c_token_pieces;
+
     SDCondition() = default;
 
     SDCondition(sd::Tensor<float> c_crossattn,
@@ -103,6 +109,13 @@ static inline sd::Tensor<float> apply_token_weights(sd::Tensor<float> hidden_sta
 
 struct ConditionerParams {
     std::string text;
+    // Prompt Relay. When non-empty, `text` is ignored by the LTX-AV embedder in
+    // favour of these pieces: piece 0 is the global/setting prompt and pieces
+    // 1..N are the timed beats. Each piece is tokenized INDEPENDENTLY and the
+    // id vectors are concatenated, so the per-piece token ranges are correct by
+    // construction -- tokenizing a joined string would let Gemma's BPE merge
+    // across a boundary and drift the ranges.
+    const std::vector<std::string>* text_pieces      = nullptr;
     int clip_skip                                    = -1;
     int width                                        = -1;
     int height                                       = -1;
@@ -2915,14 +2928,59 @@ struct LTXAVEmbedder : public Conditioner {
         return {tokens, weights, mask};
     }
 
+    // Prompt Relay piece tokenization. Each piece is tokenized on its own and
+    // the id vectors are concatenated, so a piece's token range is exact rather
+    // than inferred -- Gemma's BPE would otherwise merge across a piece
+    // boundary and silently shift every later range. Piece 0 is the global
+    // prompt and maps to beat -1; piece k maps to beat k-1. Both specials that
+    // pad_tokens() adds belong to the global anchor.
+    struct PieceTokenization {
+        std::vector<int> tokens;
+        std::vector<float> weights;
+        std::vector<float> mask;
+        // Beat id per token of the VALID (unpadded) region, in order.
+        std::vector<int32_t> valid_pieces;
+    };
+
+    PieceTokenization tokenize_pieces(const std::vector<std::string>& pieces) {
+        PieceTokenization out;
+        std::vector<int32_t> body_pieces;
+        for (size_t piece = 0; piece < pieces.size(); ++piece) {
+            const int32_t beat = static_cast<int32_t>(piece) - 1;
+            for (const auto& item : parse_prompt_attention(pieces[piece])) {
+                auto ids = tokenizer->encode(item.first, nullptr);
+                out.tokens.insert(out.tokens.end(), ids.begin(), ids.end());
+                out.weights.insert(out.weights.end(), ids.size(), item.second);
+                body_pieces.insert(body_pieces.end(), ids.size(), beat);
+            }
+        }
+        tokenizer->pad_tokens(out.tokens, &out.weights, &out.mask, kMinLength);
+        if (tokenizer->adds_bos_token()) {
+            out.valid_pieces.push_back(-1);
+        }
+        out.valid_pieces.insert(out.valid_pieces.end(), body_pieces.begin(), body_pieces.end());
+        if (tokenizer->adds_eos_token()) {
+            out.valid_pieces.push_back(-1);
+        }
+        return out;
+    }
+
     sd::Tensor<float> encode_prompt(int n_threads,
                                     const std::string& prompt,
                                     const std::pair<int, int>& prompt_attn_range) {
         auto tokens_weights_mask = tokenize(prompt, prompt_attn_range);
-        auto& tokens             = std::get<0>(tokens_weights_mask);
-        auto& weights            = std::get<1>(tokens_weights_mask);
-        auto& mask               = std::get<2>(tokens_weights_mask);
+        return encode_tokenized(n_threads,
+                                std::get<0>(tokens_weights_mask),
+                                std::get<1>(tokens_weights_mask),
+                                std::get<2>(tokens_weights_mask),
+                                nullptr);
+    }
 
+    sd::Tensor<float> encode_tokenized(int n_threads,
+                                       std::vector<int>& tokens,
+                                       std::vector<float>& weights,
+                                       std::vector<float>& mask,
+                                       int64_t* valid_tokens_out) {
         sd::Tensor<int32_t> input_ids({static_cast<int64_t>(tokens.size())}, std::vector<int32_t>(tokens.begin(), tokens.end()));
         sd::Tensor<float> attention_mask;
         if (!mask.empty()) {
@@ -2959,6 +3017,9 @@ struct LTXAVEmbedder : public Conditioner {
             valid_tokens += static_cast<int64_t>(value > 0.0f);
         }
         GGML_ASSERT(valid_tokens > 0);
+        if (valid_tokens_out != nullptr) {
+            *valid_tokens_out = valid_tokens;
+        }
 
         hidden_states = sd::ops::slice(hidden_states,
                                        1,
@@ -3016,19 +3077,42 @@ struct LTXAVEmbedder : public Conditioner {
                                       const ConditionerParams& conditioner_params) override {
         int64_t t0 = ggml_time_ms();
 
-        std::string prompt;
-        std::pair<int, int> prompt_attn_range;
-        prompt_attn_range.first = static_cast<int>(prompt.size());
-        prompt += conditioner_params.text;
-        prompt_attn_range.second = static_cast<int>(prompt.size());
+        SDCondition result;
+        sd::Tensor<float> hidden_states;
 
-        auto hidden_states = encode_prompt(n_threads, prompt, prompt_attn_range);
-        GGML_ASSERT(!hidden_states.empty());
+        if (conditioner_params.text_pieces != nullptr && conditioner_params.text_pieces->size() > 1) {
+            auto pieces          = tokenize_pieces(*conditioner_params.text_pieces);
+            int64_t valid_tokens = 0;
+            hidden_states        = encode_tokenized(n_threads,
+                                             pieces.tokens,
+                                             pieces.weights,
+                                             pieces.mask,
+                                             &valid_tokens);
+            GGML_ASSERT(!hidden_states.empty());
+            if (valid_tokens == static_cast<int64_t>(pieces.valid_pieces.size())) {
+                result.c_token_pieces = std::move(pieces.valid_pieces);
+            } else {
+                // Without an exact token->piece map a relay mask would penalise
+                // the wrong keys, which is worse than no relay at all. Drop the
+                // map; the caller treats an empty map as "relay unavailable".
+                LOG_WARN("LTXAV prompt pieces: %lld encoded tokens vs %zu mapped -- relay disabled for this encode",
+                         (long long)valid_tokens,
+                         pieces.valid_pieces.size());
+            }
+        } else {
+            std::string prompt;
+            std::pair<int, int> prompt_attn_range;
+            prompt_attn_range.first = static_cast<int>(prompt.size());
+            prompt += conditioner_params.text;
+            prompt_attn_range.second = static_cast<int>(prompt.size());
+
+            hidden_states = encode_prompt(n_threads, prompt, prompt_attn_range);
+            GGML_ASSERT(!hidden_states.empty());
+        }
 
         int64_t t1 = ggml_time_ms();
         LOG_DEBUG("computing LTXAV condition graph completed, taking %" PRId64 " ms", t1 - t0);
 
-        SDCondition result;
         result.c_crossattn = std::move(hidden_states);
         return result;
     }

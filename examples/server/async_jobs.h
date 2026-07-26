@@ -28,6 +28,15 @@ enum class AsyncJobStatus {
 const char* async_job_kind_name(AsyncJobKind kind);
 const char* async_job_status_name(AsyncJobStatus status);
 
+// One LTX Prompt Relay beat as it arrived on the wire. Frame indices are on
+// that shot's own rendered timeline (the caller adds its own seam drop).
+struct LtxSegmentBeat {
+    int frame      = 0;
+    std::string text;
+    float strength = 0.f;
+    float window   = -1.f;
+};
+
 struct AsyncGenerationJob {
     std::string id;
     AsyncJobKind kind     = AsyncJobKind::ImgGen;
@@ -84,6 +93,14 @@ struct AsyncGenerationJob {
     std::vector<int> ltx_segment_seam_drop_frames;
     std::vector<std::string> ltx_segment_audio_full;
     std::vector<std::string> ltx_segment_audio_track;
+    // Per-shot Prompt Relay beats and sampling overrides. Empty vectors mean
+    // "nothing per-shot"; within a populated vector, an inert entry (zero beats,
+    // negative seed, non-positive steps, negative cfg, empty string) inherits.
+    std::vector<std::vector<LtxSegmentBeat>> ltx_segment_beats;
+    std::vector<int64_t> ltx_segment_seeds;
+    std::vector<int> ltx_segment_steps;
+    std::vector<float> ltx_segment_cfg;
+    std::vector<std::string> ltx_segment_negative_prompts;
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;
     bool ltx_emit_segments = false;
