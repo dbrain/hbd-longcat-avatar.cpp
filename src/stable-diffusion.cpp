@@ -1932,9 +1932,18 @@ public:
         ignore_tensors.insert("model.diffusion_model.__32x32__");
         ignore_tensors.insert("model.diffusion_model.__index_timestep_zero__");
 
-        if (audio_vae_model) {
-            ignore_tensors.insert("audio_vae.encoder");
-        }
+        // NOTE: do NOT add "audio_vae.encoder" here. This set is handed to
+        // ModelManager::set_common_ignore_tensors() below, and should_ignore() gates not just
+        // metadata validation but LOADING (model_manager.cpp:337) and STAGING TO THE COMPUTE
+        // BACKEND (model_manager.cpp:398) as well. The audio VAE encoder ships in its own GGUF
+        // (LTX_AUDIO_VAE=..._audio_vae-ENC-f16.gguf), so ignoring it as "absent from the main
+        // checkpoint" is right for validation and catastrophic for staging: its weights are then
+        // never managed, and after the first chain window tears down its params-backend storage
+        // they fall back to the raw mmap host address forever. The next window hands that HOST
+        // pointer to cublasSgemm, which returns a bare "an internal operation failed" —
+        // killing every multi-segment render WITH audio at window 2 while the window that
+        // caused it completed perfectly. Named by GGML_CUDA_CHECK_MM_PTRS=1 as
+        // 'audio_vae.encoder.mel_stft.forward_basis (reshaped)' at a stable host address.
         if (version == VERSION_OVIS_IMAGE) {
             ignore_tensors.insert("text_encoders.llm.vision_model.");
             ignore_tensors.insert("text_encoders.llm.visual_tokenizer.");
