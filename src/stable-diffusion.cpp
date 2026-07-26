@@ -384,6 +384,31 @@ public:
     // its graph-cut cache. This is an upstream weight-manager boundary, not a
     // return to the fork's resident-weight implementation.
     void reclaim_ltx_chain_window_gpu_memory() {
+        // LTXAV_CHAIN_RECLAIM=0 disables this boundary reclaim. Default 1 = current behaviour.
+        //
+        // Suspect in a reproducible mid-chain crash: segment 1 of a chained render dies on its
+        // FIRST cuBLAS GEMM immediately after this runs —
+        //     LTX chain boundary: reclaimed transient staged weights, CUDA VMM pages, ...
+        //     resize input image from 1920x1088 to 960x544
+        //     sampling using Euler A CFG++ method
+        //     [ERROR] CUDA error: an internal operation failed   (cublasGemmEx, ggml-cuda.cu:110)
+        // seen at 92.1 s and 94.7 s into two different renders (koblem gpu_logs 845, 847), i.e.
+        // deterministic rather than a random eviction. The worker then dies, so the caller's next
+        // poll gets the supervisor's "worker is unloaded" 410 and it LOOKS like the gate evicted it.
+        //
+        // Mechanism to test: ggml_backend_cuda_trim_memory() hands VMM pages back to the driver and
+        // ggml_backend_cuda_release_cudnn_conv3d_weights() frees raw cudaMalloc'd buffers. If cuBLAS
+        // still holds a workspace carved from that pool, pulling it out from under the handle fails
+        // the next GEMM exactly this way. The fork gated the equivalent trim behind opt-in
+        // LTXAV_CHAIN_POOL_TRIM and measured it peak-NEUTRAL; the rebuild made it unconditional.
+        static const bool chain_reclaim_enabled = [] {
+            const char* s = getenv("LTXAV_CHAIN_RECLAIM");
+            return s == nullptr || s[0] != '0';
+        }();
+        if (!chain_reclaim_enabled) {
+            LOG_INFO("LTX chain boundary: reclaim DISABLED (LTXAV_CHAIN_RECLAIM=0)");
+            return;
+        }
         auto finish_runner = [](auto& runner) {
             if (!runner) {
                 return;
