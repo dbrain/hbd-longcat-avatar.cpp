@@ -216,6 +216,20 @@ void purge_expired_jobs(AsyncJobManager& manager) {
     }
 }
 
+bool async_job_in_flight(AsyncJobManager* manager) {
+    if (manager == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(manager->mutex);
+    for (const auto& entry : manager->jobs) {
+        const auto& job = entry.second;
+        if (job && (job->status == AsyncJobStatus::Queued || job->status == AsyncJobStatus::Generating)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t count_pending_jobs(const AsyncJobManager& manager) {
     size_t pending = 0;
     for (const auto& entry : manager.jobs) {

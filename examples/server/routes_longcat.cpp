@@ -191,9 +191,20 @@ void apply_avatar_bsa(const json& body, sd_vid_gen_params_t& params) {
 void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) {
     ServerRuntime* runtime = &rt;
 
+    // `avatar_rendering` is set ONLY by the synchronous LongCat /generate route below. Every other
+    // render path — /ltx/v1/generate, /wan/v1/generate, /sdcpp/v1/{img,vid}_gen — returns 202
+    // immediately and runs on the async job worker, so that flag stays false for the whole render.
+    //
+    // The supervisor's in_flight() is `active_generation_requests + (child_busy ? 1 : 0)`, and
+    // active_generation_requests drops back to 0 the moment the proxied submit returns its 202.
+    // So with only avatar_rendering behind child_busy, an LTX render reported busy:false /
+    // in_flight:0 for its entire duration — the service looked IDLE while it was rendering.
+    // Koblem's GPU gate then evicts it to reclaim VRAM, and the next job/media poll lands on the
+    // supervisor's deliberate "worker is unloaded" branch => the caller sees a mid-render 410.
+    // Counting live async jobs closes that hole.
     svr.Get("/health", [runtime](const httplib::Request&, httplib::Response& res) {
         res.set_content(json({{"status", "ok"},
-                              {"busy", avatar_rendering.load()},
+                              {"busy", avatar_rendering.load() || async_job_in_flight(runtime->async_job_manager)},
                               {"draining", runtime_is_draining(*runtime)},
                               {"loaded", runtime->gpu_sharing == nullptr || runtime->gpu_sharing->diffusion_loaded.load()}})
                             .dump(),

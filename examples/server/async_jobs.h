@@ -112,6 +112,10 @@ struct AsyncJobManager {
 
 void purge_expired_jobs(AsyncJobManager& manager);
 size_t count_pending_jobs(const AsyncJobManager& manager);
+// True while any job is Queued or Generating. Used by the child's /health `busy` field so the
+// supervisor's in_flight() (and therefore Koblem's GPU gate) can see async renders, which return
+// 202 immediately and would otherwise look idle for their whole duration.
+bool async_job_in_flight(AsyncJobManager* manager);
 std::string make_async_job_id(AsyncJobManager& manager);
 bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job);
 json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJob& job);
