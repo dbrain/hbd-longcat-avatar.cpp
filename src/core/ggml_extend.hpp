@@ -4303,8 +4303,15 @@ public:
         // scalar straight into the matmul alpha for free.  Elide the graph multiply ONLY
         // when that fold is proven to happen for this exact matmul -- if it is not, the
         // GEMM multiplies by 1.0 and the output would be silently wrong.
+        // Whether the GEMM folds the scalar is a property of the BACKEND (a name-keyed
+        // registry consulted inside ggml_cuda_mul_mat), not of who builds the graph.  A
+        // weight adapter cannot un-register it, so this predicate must NOT be conditioned
+        // on `ctx->weight_adapter`: doing so made the LoRA path re-apply a scalar the GEMM
+        // had already applied, scaling every DiT Linear by wglobal^2 (~2.5e-7) and
+        // collapsing the render to pure noise for ANY runtime LoRA -- including one at
+        // multiplier 0.0, which is how the delta was proven innocent.
         const bool fold_weight_global =
-            has_weight_global && !ctx->weight_adapter &&
+            has_weight_global &&
             ggml_ext_nvfp4_weight_global_folded_in_gemm(ctx->backend, w, x);
         const bool scale_weight_global_in_graph = has_weight_global && !fold_weight_global;
 
@@ -4322,7 +4329,7 @@ public:
                                                                                            linear_bias,
                                                                                            prefix,
                                                                                            forward_params,
-                                                                                           has_weight_global ? params["weight.wglobal"] : nullptr);
+                                                                                           scale_weight_global_in_graph ? params["weight.wglobal"] : nullptr);
         } else {
             out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
         }
