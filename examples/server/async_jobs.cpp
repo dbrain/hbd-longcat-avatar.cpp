@@ -639,6 +639,45 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         }
     }
 
+    // TASS overlap character references. These are the one image input the
+    // engine deliberately does NOT force into the render bucket: the sheet is
+    // appended on the DiT token axis, so `native_resolution` keeps every pixel
+    // of a 1536x1024 sheet while the video stays 768x448.
+    std::vector<SDImageOwner> ltx_character_ref_owners;
+    std::vector<sd_image_t> ltx_character_ref_images;
+    std::vector<int> ltx_character_ref_source_ids;
+    if (!job.ltx_character_refs.empty()) {
+        ltx_character_ref_owners.resize(job.ltx_character_refs.size());
+        ltx_character_ref_images.reserve(job.ltx_character_refs.size());
+        ltx_character_ref_source_ids.reserve(job.ltx_character_refs.size());
+        for (size_t index = 0; index < job.ltx_character_refs.size(); ++index) {
+            const LtxCharacterRef& reference = job.ltx_character_refs[index];
+            const int target_width  = reference.match_target ? params.width : 0;
+            const int target_height = reference.match_target ? params.height : 0;
+            if (!reference.image.empty() && reference.image[0] == '/') {
+                sd_image_t loaded = {};
+                if (!load_sd_image_from_file(&loaded, reference.image.c_str(), target_width, target_height, 3)) {
+                    error_message = "failed to load LTX character reference " + std::to_string(index + 1);
+                    return false;
+                }
+                ltx_character_ref_owners[index].reset(loaded);
+            } else if (!decode_base64_image(reference.image,
+                                            3,
+                                            target_width,
+                                            target_height,
+                                            ltx_character_ref_owners[index])) {
+                error_message = "failed to decode LTX character reference " + std::to_string(index + 1);
+                return false;
+            }
+            ltx_character_ref_images.push_back(ltx_character_ref_owners[index].get());
+            ltx_character_ref_source_ids.push_back(reference.source_id);
+        }
+        params.character_refs           = ltx_character_ref_images.data();
+        params.character_ref_source_ids = ltx_character_ref_source_ids.data();
+        params.character_refs_size      = static_cast<int>(ltx_character_ref_images.size());
+        params.tass_phase_scale         = job.ltx_tass_phase_scale;
+    }
+
     SegmentPreviewWriter segment_writer;
     const bool write_segment_previews = !job.ltx_prompts.empty() && (job.ltx_emit_segments || job.ltx_emit_stages) &&
                                         !job.ltx_bank_dir.empty();

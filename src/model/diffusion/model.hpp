@@ -86,6 +86,21 @@ struct LTXAVDiffusionExtra {
     const sd::Tensor<float>* video_positions = nullptr;
     const sd::Tensor<float>* audio_positions = nullptr;
     bool skip_a2v                           = false;
+    // TASS overlap reference conditioning (LTX-Best-Face-ID identity transfer).
+    //
+    // `ref_video_x` is one or more already-VAE-encoded reference latents packed on
+    // the frame axis. They are patchified with the SAME patchify_proj as the target
+    // and appended on the token axis, so a reference may carry its own spatial grid
+    // (a 1536x1024 character sheet next to a 768x448 video) — after patchify the
+    // sequence is flat and all geometry lives in the positions/source-id vectors.
+    //
+    // `video_source_ids` is per-token over (target tokens ++ reference tokens):
+    // 0 for target (exact RoPE no-op), 2/3/4/... one distinct id per reference
+    // subject. Null => no references, and the graph is identical to a build
+    // without TASS.
+    const sd::Tensor<float>* ref_video_x     = nullptr;
+    const std::vector<float>* video_source_ids = nullptr;
+    float tass_phase_scale                   = 1.f;
     // Prompt Relay. Null is the ordinary path: no cross-attention mask is
     // built, the flash fast path keeps its null-mask shape, and the graph is
     // byte-identical to a build without relay. The sampler nulls this out for

@@ -2537,8 +2537,10 @@ public:
 
     std::vector<float> process_ltxav_video_timesteps(const std::vector<float>& timesteps,
                                                      const sd::Tensor<float>& init_latent,
-                                                     const sd::Tensor<float>& denoise_mask) {
+                                                     const sd::Tensor<float>& denoise_mask,
+                                                     int64_t ref_token_count = 0) {
         if (timesteps.empty() || denoise_mask.empty() || init_latent.dim() < 4 || denoise_mask.dim() < 4) {
+            GGML_ASSERT(ref_token_count == 0);
             return timesteps;
         }
 
@@ -2550,10 +2552,15 @@ public:
             denoise_mask.shape()[2] != frames ||
             denoise_mask.shape()[3] < 1) {
             LOG_WARN("unexpected LTXAV denoise mask shape for timestep processing");
+            GGML_ASSERT(ref_token_count == 0);
             return timesteps;
         }
 
-        std::vector<float> video_timesteps(static_cast<size_t>(width * height * frames));
+        // TASS reference tokens are appended after the target grid and are never
+        // denoised, so they carry timestep 0.  They must be present: the graph
+        // sizes its per-token modulation over target ++ reference.  The
+        // modulation-collapse dedup folds them all into one bucket.
+        std::vector<float> video_timesteps(static_cast<size_t>(width * height * frames + ref_token_count), 0.f);
         size_t idx = 0;
         for (int64_t t = 0; t < frames; ++t) {
             for (int64_t h = 0; h < height; ++h) {
@@ -2819,7 +2826,13 @@ public:
                              float a2v_guidance_scale                 = 1.f,
                              float a2v_ramp_end                       = 1.f,
                              const sd::ltx_relay::Plan* relay_plan    = nullptr,
-                             float relay_steps_frac                   = 1.f) {
+                             float relay_steps_frac                   = 1.f,
+                             // TASS overlap references. Empty is the ordinary path:
+                             // no extra tokens, source ids null, and the RoPE phase
+                             // is an exact no-op.
+                             const sd::Tensor<float>& ref_video_x     = {},
+                             const std::vector<float>* video_source_ids = nullptr,
+                             float tass_phase_scale                   = 1.f) {
         struct RunnerDoneOnExit {
             GGMLRunner* runner = nullptr;
             ~RunnerDoneOnExit() {
@@ -2831,6 +2844,16 @@ public:
         RunnerDoneOnExit sample_diffusion_runner_done{work_diffusion_model.get()};
 
         RunnerDoneOnExit sample_control_runner_done{!control_image.empty() && control_net != nullptr ? control_net.get() : nullptr};
+
+        // TASS overlap references extend every per-token vector the DiT builds
+        // (positions, source ids, timesteps).  A reference is a clean latent, so
+        // its tokens are pinned at timestep zero; the per-token timestep vector
+        // only exists on the LTXAV masked path, which is why the caller is
+        // required to have supplied a denoise mask alongside the references.
+        const int64_t ref_video_token_count =
+            ref_video_x.empty() ? 0
+                                : ref_video_x.shape()[0] * ref_video_x.shape()[1] * ref_video_x.shape()[2];
+        GGML_ASSERT(ref_video_token_count == 0 || (sd_version_is_ltxav(version) && !denoise_mask.empty()));
 
         a2v_ramp_end = std::clamp(a2v_ramp_end, 0.f, 1.f);
         if (a2v_guidance_scale != 1.f && sd_version_is_ltxav(version)) {
@@ -3013,7 +3036,8 @@ public:
             std::vector<float> timesteps_vec      = base_timesteps_vec;
             sd::Tensor<float> audio_timesteps_tensor;
             if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
-                timesteps_vec          = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask);
+                timesteps_vec          = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask,
+                                                                       ref_video_token_count);
                 const std::vector<float> audio_timesteps = ltxav_audio_fixed
                                                                ? std::vector<float>{0.f}
                                                                : base_timesteps_vec;
@@ -3146,6 +3170,9 @@ public:
                         video_positions.empty() ? nullptr : &video_positions,
                         audio_positions.empty() ? nullptr : &audio_positions,
                         skip_a2v_pass,
+                        ref_video_x.empty() ? nullptr : &ref_video_x,
+                        (ref_video_x.empty() || video_source_ids == nullptr) ? nullptr : video_source_ids,
+                        tass_phase_scale,
                         condition.c_token_pieces.empty() ? nullptr : step_relay};
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};
@@ -4216,6 +4243,10 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->keyframes                             = nullptr;
     sd_vid_gen_params->keyframe_frame_indices                = nullptr;
     sd_vid_gen_params->keyframes_size                        = 0;
+    sd_vid_gen_params->character_refs                        = nullptr;
+    sd_vid_gen_params->character_ref_source_ids              = nullptr;
+    sd_vid_gen_params->character_refs_size                   = 0;
+    sd_vid_gen_params->tass_phase_scale                      = 0.f;
     sd_vid_gen_params->beats                                 = nullptr;
     sd_vid_gen_params->beat_count                            = 0;
     sd_vid_gen_params->relay_eps                             = 0.f;
@@ -4962,12 +4993,45 @@ struct SamplePlan {
     }
 };
 
+// TASS overlap reference conditioning (LTX-Best-Face-ID identity transfer).
+//
+// Layout: the generated target grid first, then one block per reference. Every
+// reference sits on the target's FRAME-0 temporal grid ("overlap") while keeping
+// its OWN spatial extent, so a native-resolution 1536x1024 character sheet can
+// condition a 768x448 render without being squashed to the video's bucket.
+//
+// What separates a reference from the real first frame is not its position but the
+// per-token source id: targets are 0 (an exact RoPE no-op) and references are
+// 2, 3, 4, ... — one distinct rotary tag per subject, which is also what lets
+// several character sheets coexist in one shot.
+struct LtxvTassRefGrid {
+    int64_t width     = 0;
+    int64_t height    = 0;
+    int64_t frames    = 0;
+    float source_id   = 0.f;
+};
+
 struct ImageGenerationLatents {
     sd::Tensor<float> init_latent;
     sd::Tensor<float> concat_latent;
     sd::Tensor<float> img_uncond_concat_latent;
     sd::Tensor<float> audio_latent;
     sd::Tensor<float> video_positions;
+    // TASS overlap reference conditioning. `ref_video_x` is the character-sheet
+    // latents packed on the frame axis; `video_source_ids` is per-token over
+    // (target tokens ++ reference tokens) and is empty when no sheet was given,
+    // which keeps the RoPE phase an exact no-op.
+    sd::Tensor<float> ref_video_x;
+    std::vector<float> video_source_ids;
+    // The reference grids that produced the tail of `video_positions`.  Kept so a
+    // temporal window can rebuild "tile target grid ++ the same reference block"
+    // for its own frame range instead of inheriting the full-length layout.
+    std::vector<LtxvTassRefGrid> ref_grids;
+    // True when the TASS layout was built over an EMPTY base, i.e. the target part
+    // of `video_positions` is exactly the implicit plain-t2v grid.  Only then may a
+    // temporal window regenerate the target positions from scratch.
+    bool tass_positions_only = false;
+    float tass_phase_scale = 1.f;
     sd::Tensor<float> control_image;
     std::vector<sd::Tensor<float>> ref_images;
     std::vector<sd::Tensor<float>> ref_latents;
@@ -5286,6 +5350,91 @@ static sd::Tensor<float> build_ltxv_relip_video_positions(int64_t width,
     };
     append(target_latent_frames, 1);
     append(reference_latent_frames, reference_temporal_stride);
+    return positions;
+}
+
+// `base_positions` is whatever position layout the shot already committed to
+// (keyframe, relip, end-image, ...).  It is copied through unchanged so TASS
+// composes with every existing conditioning path; when it is empty the plain
+// t2v grid is generated here, byte-for-byte the same coordinates the implicit
+// `build_video_rope_matrix` path would have produced.
+//
+// `ref_frame_origin` is the LATENT FRAME the references overlap.  It is 0 for a
+// full-length pass (overlap the shot's first frame, as trained).  A temporal
+// window passes its own tile start so the reference keeps the SAME zero temporal
+// offset from the frames that tile is generating: a tile is a self-contained
+// denoise, and pinning the sheet at global t=0 would place it seconds in the past
+// for every tile but the first — a temporal relationship the checkpoint never saw.
+static sd::Tensor<float> build_ltxv_tass_ref_video_positions(const sd::Tensor<float>& base_positions,
+                                                             int64_t target_width,
+                                                             int64_t target_height,
+                                                             int64_t target_frames,
+                                                             const std::vector<LtxvTassRefGrid>& refs,
+                                                             int fps,
+                                                             int spatial_scale,
+                                                             int temporal_scale,
+                                                             std::vector<float>* source_ids_out,
+                                                             int64_t ref_frame_origin = 0) {
+    GGML_ASSERT(target_width > 0 && target_height > 0 && target_frames > 0 && fps > 0);
+    GGML_ASSERT(!refs.empty());
+
+    const bool have_base = !base_positions.empty();
+    if (have_base) {
+        GGML_ASSERT(base_positions.dim() == 4);
+        GGML_ASSERT(base_positions.shape()[0] == 2 && base_positions.shape()[1] == 3);
+    }
+    const int64_t base_tokens = have_base ? base_positions.shape()[2]
+                                          : target_width * target_height * target_frames;
+
+    int64_t total_tokens = base_tokens;
+    for (const auto& ref : refs) {
+        GGML_ASSERT(ref.width > 0 && ref.height > 0 && ref.frames > 0);
+        total_tokens += ref.width * ref.height * ref.frames;
+    }
+
+    sd::Tensor<float> positions({2, 3, total_tokens, 1});
+    if (source_ids_out != nullptr) {
+        source_ids_out->assign(static_cast<size_t>(total_tokens), 0.f);
+    }
+
+    int64_t token = 0;
+    if (have_base) {
+        for (int64_t base_token = 0; base_token < base_tokens; ++base_token, ++token) {
+            for (int corner = 0; corner < 2; ++corner) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    positions.index(corner, axis, token, 0) = base_positions.index(corner, axis, base_token, 0);
+                }
+            }
+        }
+    }
+
+    auto append = [&](int64_t w_count, int64_t h_count, int64_t f_count, float source_id, int64_t frame_origin) {
+        for (int64_t t = 0; t < f_count; ++t) {
+            // The reference "overlaps" the target's first frame; only the source tag
+            // tells it apart from the frame being generated.  `frame_origin` is 0 for
+            // a full-length pass and the tile start under temporal windowing.
+            const float t_start = ltxv_latent_corner_to_pixel_frame(frame_origin + t, temporal_scale, true) / static_cast<float>(fps);
+            const float t_end   = ltxv_latent_corner_to_pixel_frame(frame_origin + t + 1, temporal_scale, true) / static_cast<float>(fps);
+            for (int64_t h = 0; h < h_count; ++h) {
+                for (int64_t w = 0; w < w_count; ++w) {
+                    if (source_ids_out != nullptr && source_id != 0.f) {
+                        (*source_ids_out)[static_cast<size_t>(token)] = source_id;
+                    }
+                    set_ltxv_video_position(&positions, token++, t_start, t_end,
+                                            static_cast<float>(h * spatial_scale), static_cast<float>((h + 1) * spatial_scale),
+                                            static_cast<float>(w * spatial_scale), static_cast<float>((w + 1) * spatial_scale));
+                }
+            }
+        }
+    };
+
+    if (!have_base) {
+        append(target_width, target_height, target_frames, 0.f, 0);
+    }
+    for (const auto& ref : refs) {
+        append(ref.width, ref.height, ref.frames, ref.source_id, ref_frame_origin);
+    }
+    GGML_ASSERT(token == total_tokens);
     return positions;
 }
 
@@ -7503,6 +7652,119 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                  sd_vid_gen_params->v2v_mode == 2 ? sd_vid_gen_params->v2v_guide_strength : sd_vid_gen_params->strength);
     }
 
+    // TASS overlap reference conditioning (LTX-Best-Face-ID character sheets).
+    // Deliberately the LAST thing done to the video grid: it composes with every
+    // conditioning path above by copying whatever positions that path committed
+    // to and appending reference blocks after them.  Unlike the keyframe/relip
+    // references these are NOT frame-axis concatenations, so they are exempt from
+    // the matching-spatial-dims requirement -- carrying a 1536x1024 sheet into a
+    // 768x448 render at full detail is the entire point.
+    if (sd_version_is_ltxav(sd_ctx->sd->version) && sd_vid_gen_params->character_refs != nullptr &&
+        sd_vid_gen_params->character_refs_size > 0) {
+        if (latents.init_latent.empty()) {
+            LOG_ERROR("LTXAV character references need a target latent grid");
+            return std::nullopt;
+        }
+        const int scale = std::max(1, request->vae_scale_factor);
+        std::vector<sd::Tensor<float>> ref_latents;
+        std::vector<LtxvTassRefGrid> ref_grids;
+        int next_source_id = 2;
+        for (int i = 0; i < sd_vid_gen_params->character_refs_size; ++i) {
+            const sd_image_t& ref_image = sd_vid_gen_params->character_refs[i];
+            if (ref_image.data == nullptr || ref_image.width == 0 || ref_image.height == 0) {
+                LOG_ERROR("LTXAV character reference %d has no image data", i);
+                return std::nullopt;
+            }
+            // The caller already chose the resolution (the sheet's native size, or
+            // the render bucket); all that is left is snapping it onto the VAE's
+            // spatial grid.
+            const int ref_width  = std::max<int>(scale, static_cast<int>((ref_image.width + scale / 2) / scale) * scale);
+            const int ref_height = std::max<int>(scale, static_cast<int>((ref_image.height + scale / 2) / scale) * scale);
+            auto image           = sd_image_to_tensor(ref_image, ref_width, ref_height);
+            auto ref_latent      = encode_ltxav_condition_image(sd_ctx, image, "character reference");
+            if (ref_latent.empty() || ref_latent.dim() < 4) {
+                return std::nullopt;
+            }
+            if (ref_latent.shape()[3] != latents.init_latent.shape()[3]) {
+                LOG_ERROR("LTXAV character reference %d encoded to %lld channels, expected %lld",
+                          i,
+                          (long long)ref_latent.shape()[3],
+                          (long long)latents.init_latent.shape()[3]);
+                return std::nullopt;
+            }
+            // The references are packed on the frame axis of ONE tensor, so they
+            // have to share a spatial grid with each other.  They still need not
+            // match the target: the token axis is what frees them from that.
+            if (!ref_latents.empty() &&
+                (ref_latent.shape()[0] != ref_latents.front().shape()[0] ||
+                 ref_latent.shape()[1] != ref_latents.front().shape()[1])) {
+                LOG_ERROR("LTXAV character reference %d is %lldx%lld latent but reference 0 is %lldx%lld; "
+                          "all references in one shot must share a resolution",
+                          i,
+                          (long long)ref_latent.shape()[0],
+                          (long long)ref_latent.shape()[1],
+                          (long long)ref_latents.front().shape()[0],
+                          (long long)ref_latents.front().shape()[1]);
+                return std::nullopt;
+            }
+            int source_id = next_source_id;
+            if (sd_vid_gen_params->character_ref_source_ids != nullptr &&
+                sd_vid_gen_params->character_ref_source_ids[i] > 1) {
+                source_id = sd_vid_gen_params->character_ref_source_ids[i];
+            }
+            next_source_id = source_id + 1;
+            ref_grids.push_back(LtxvTassRefGrid{ref_latent.shape()[0],
+                                                ref_latent.shape()[1],
+                                                ref_latent.shape()[2],
+                                                static_cast<float>(source_id)});
+            LOG_INFO("LTXAV character reference %d/%d: %ux%u px -> %lldx%lldx%lld latent, source_id=%d",
+                     i + 1,
+                     sd_vid_gen_params->character_refs_size,
+                     ref_image.width,
+                     ref_image.height,
+                     (long long)ref_latent.shape()[0],
+                     (long long)ref_latent.shape()[1],
+                     (long long)ref_latent.shape()[2],
+                     source_id);
+            ref_latents.push_back(std::move(ref_latent));
+        }
+
+        sd::Tensor<float> packed_refs = ref_latents.front();
+        for (size_t i = 1; i < ref_latents.size(); ++i) {
+            packed_refs = sd::ops::concat(packed_refs, ref_latents[i], 2);
+        }
+        latents.ref_video_x = std::move(packed_refs);
+        if (latents.denoise_mask.empty()) {
+            // Plain t2v carries a scalar timestep. The references need their own
+            // (clean) timestep, which only the masked per-token path can express.
+            latents.denoise_mask = make_ltxav_video_denoise_mask(latents.init_latent, 1.f);
+        }
+        // Remembered so a temporal window can rebuild "tile grid ++ the same
+        // reference block" for its own frame range; `tass_positions_only` records
+        // that nothing but TASS wrote these positions, which is what makes that
+        // rebuild safe (any other conditioning path owns a layout we must not
+        // regenerate).
+        latents.tass_positions_only = latents.video_positions.empty();
+        latents.ref_grids           = ref_grids;
+        latents.video_positions  = build_ltxv_tass_ref_video_positions(latents.video_positions,
+                                                                      latents.init_latent.shape()[0],
+                                                                      latents.init_latent.shape()[1],
+                                                                      latents.init_latent.shape()[2],
+                                                                      ref_grids,
+                                                                      request->fps,
+                                                                      request->vae_scale_factor,
+                                                                      8,
+                                                                      &latents.video_source_ids);
+        latents.tass_phase_scale = sd_vid_gen_params->tass_phase_scale > 0.f
+                                       ? sd_vid_gen_params->tass_phase_scale
+                                       : 1.f;
+        LOG_INFO("LTXAV TASS overlap references: %d sheet(s), %lld reference token(s), phase_scale=%.2f",
+                 sd_vid_gen_params->character_refs_size,
+                 (long long)(latents.ref_video_x.shape()[0] * latents.ref_video_x.shape()[1] *
+                             latents.ref_video_x.shape()[2]),
+                 latents.tass_phase_scale);
+    }
+
     if (sd_version_is_ltxav(sd_ctx->sd->version) && !latents.audio_latent.empty()) {
         if (!latents.denoise_mask.empty()) {
             latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
@@ -8385,7 +8647,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                   const sd::Tensor<float>& window_video_positions,
                                   const sd::Tensor<float>& window_audio_positions = {},
                                   int64_t window_latent_start                     = 0,
-                                  int64_t window_audio_start                      = 0) {
+                                  int64_t window_audio_start                      = 0,
+                                  // TASS source ids for THIS window (target tokens ++ reference
+                                  // tokens). Null falls back to the full-pass vector.
+                                  const std::vector<float>* window_source_ids     = nullptr) {
         const sd::ltx_relay::Plan* window_relay = nullptr;
         if (relay_enabled) {
             relay_plan.video_frame_time = ltx_relay_video_frame_times(window_video_positions,
@@ -8436,7 +8701,12 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                   sd_vid_gen_params->a2v_guidance,
                                   sd_vid_gen_params->a2v_ramp_end,
                                   window_relay,
-                                  relay_steps_frac);
+                                  relay_steps_frac,
+                                  latents.ref_video_x,
+                                  window_source_ids != nullptr
+                                      ? window_source_ids
+                                      : (latents.video_source_ids.empty() ? nullptr : &latents.video_source_ids),
+                                  latents.tass_phase_scale);
     };
 
     sd::Tensor<float> final_latent;
@@ -8444,14 +8714,39 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // This is deliberately the small, safe subset of production temporal tiling:
     // supplied fixed audio and unconditioned video only.  I2V/keyframe/continuation
     // guides and V2V need appended-reference position handling and stay full-pass.
+    //
+    // TASS references DO tile.  The reference latent is a separate tensor from the
+    // target, so a tile only has to rebuild the per-token vectors: its own frame
+    // range's positions, then the same reference block re-appended (see
+    // `base_window_tass`).  What it may NOT do is inherit a position layout some
+    // other conditioning path committed to, which is what `tass_positions_only`
+    // gates -- with references present the positions are non-empty by construction,
+    // so the plain "positions must be empty" test has to be relaxed to "positions
+    // are nothing but the implicit t2v grid plus the reference tail".
     const bool base_window_unconditioned =
         sd_vid_gen_params->init_image.data == nullptr && sd_vid_gen_params->end_image.data == nullptr &&
         sd_vid_gen_params->keyframes_size == 0 && sd_vid_gen_params->cont_latent == nullptr &&
         sd_vid_gen_params->end_cont_latent == nullptr;
+    const bool base_window_tass =
+        !latents.ref_video_x.empty() && latents.tass_positions_only && !latents.ref_grids.empty();
+    const bool base_window_positions_plain =
+        latents.video_positions.empty() || (base_window_tass && !latents.video_positions.empty());
+    // Where a tile's reference block sits on the timeline.  Default: the tile's OWN
+    // first frame, so the sheet keeps the zero temporal offset it was trained with
+    // for every tile.  Pinning it at global frame 0 instead (LTX_TASS_WINDOW_REF_ABS=1)
+    // puts it seconds in the past for tiles 1..N, a relationship the checkpoint never
+    // saw; kept as an env switch so the two can be A/B'd without a rebuild.
+    const bool tass_ref_abs_origin = [] {
+        const char* env = std::getenv("LTX_TASS_WINDOW_REF_ABS");
+        return env != nullptr && env[0] != '\0' && std::string(env) != "0";
+    }();
+    auto tass_ref_frame_origin = [&](int64_t tile_start) -> int64_t {
+        return tass_ref_abs_origin ? 0 : tile_start;
+    };
     const bool base_window_fixed_audio =
-        base_window_unconditioned && latents.audio_fixed && latents.video_positions.empty() && !latents.v2v_sdedit;
+        base_window_unconditioned && latents.audio_fixed && base_window_positions_plain && !latents.v2v_sdedit;
     const bool base_window_plain_t2v =
-        base_window_unconditioned && !latents.audio_fixed && latents.audio_length == 0 && latents.video_positions.empty() &&
+        base_window_unconditioned && !latents.audio_fixed && latents.audio_length == 0 && base_window_positions_plain &&
         !latents.v2v_sdedit;
     const bool base_temporal_windowing =
         base_window_env != nullptr && base_window_env[0] != '\0' && std::string(base_window_env) != "0" &&
@@ -8571,16 +8866,46 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                                                 length,
                                                                                 request.fps,
                                                                                 request.vae_scale_factor);
+                    // TASS overlap references ride along with EVERY tile.  The
+                    // reference latent itself is tile-invariant (it is a separate
+                    // tensor, never sliced), so all a tile rebuilds is the per-token
+                    // tail: the same reference grids, tagged with the same source ids,
+                    // placed on THIS tile's first frame.  Handing them only to tile 0
+                    // would leave every later tile holding the identity through four
+                    // frozen overlap frames alone -- which is the drift this whole
+                    // feature exists to remove -- and would silently switch the model
+                    // between a tagged and an untagged graph mid-shot.
+                    std::vector<float> tile_source_ids;
+                    if (base_window_tass) {
+                        video_positions = build_ltxv_tass_ref_video_positions(video_positions,
+                                                                              video_tile.shape()[0],
+                                                                              video_tile.shape()[1],
+                                                                              length,
+                                                                              latents.ref_grids,
+                                                                              request.fps,
+                                                                              request.vae_scale_factor,
+                                                                              kLtxTemporalScale,
+                                                                              &tile_source_ids,
+                                                                              tass_ref_frame_origin(tile_start));
+                    }
                     auto audio_positions = has_fixed_audio
                                                ? build_ltxav_window_audio_positions(audio_start, audio_tile.shape()[1])
                                                : sd::Tensor<float>();
-                    LOG_INFO("LTX base temporal-window tile %d: latent [%lld,%lld), frozen-overlap=%lld, audio [%lld,%lld)",
+                    LOG_INFO("LTX base temporal-window tile %d: latent [%lld,%lld), frozen-overlap=%lld, audio [%lld,%lld)%s",
                              tile_index,
                              (long long)tile_start,
                              (long long)end,
                              (long long)frozen,
                              (long long)audio_start,
-                             (long long)audio_end);
+                             (long long)audio_end,
+                             base_window_tass
+                                 ? (", +" + std::to_string(latents.ref_video_x.shape()[0] *
+                                                           latents.ref_video_x.shape()[1] *
+                                                           latents.ref_video_x.shape()[2]) +
+                                    " TASS ref token(s) @ latent frame " +
+                                    std::to_string(tass_ref_frame_origin(tile_start)))
+                                       .c_str()
+                                 : "");
                     auto tile = sample_base_window(latent_tile,
                                                    std::move(packed_noise),
                                                    mask_tile,
@@ -8588,7 +8913,8 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                                                    video_positions,
                                                    audio_positions,
                                                    tile_start,
-                                                   audio_start);
+                                                   audio_start,
+                                                   tile_source_ids.empty() ? nullptr : &tile_source_ids);
                     if (tile.empty()) {
                         final_latent = {};
                         break;

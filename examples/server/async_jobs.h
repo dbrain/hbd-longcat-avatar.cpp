@@ -37,6 +37,16 @@ struct LtxSegmentBeat {
     float window   = -1.f;
 };
 
+// One LTX TASS character reference as it arrived on the wire. `image` is either
+// a base64 payload or a trusted absolute path; `source_id` zero means "assign
+// 2, 3, 4, ... in array order", and `match_target` selects resizing to the
+// render bucket instead of keeping the sheet's native resolution.
+struct LtxCharacterRef {
+    std::string image;
+    int source_id     = 0;
+    bool match_target = false;
+};
+
 struct AsyncGenerationJob {
     std::string id;
     AsyncJobKind kind     = AsyncJobKind::ImgGen;
@@ -69,6 +79,11 @@ struct AsyncGenerationJob {
     std::vector<std::vector<std::string>> ltx_segment_keyframes;
     std::vector<std::vector<int>> ltx_segment_keyframe_indices;
     std::vector<std::vector<std::string>> ltx_segment_control_frames;
+    // TASS overlap character references (LTX-Best-Face-ID sheets). Applies to
+    // every segment of the request: a sheet is an identity, not a shot.
+    std::vector<LtxCharacterRef> ltx_character_refs;
+    // Zero inherits the checkpoint's trained default of 1.0.
+    float ltx_tass_phase_scale = 0.f;
     std::vector<int> ltx_segment_v2v_modes;
     std::vector<float> ltx_segment_v2v_strengths;
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;

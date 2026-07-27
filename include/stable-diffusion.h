@@ -441,6 +441,20 @@ typedef struct {
     sd_image_t* keyframes;
     int* keyframe_frame_indices;
     int keyframes_size;
+    // LTXAV TASS overlap reference conditioning (LTX-Best-Face-ID character
+    // sheets). Each image is VAE encoded AT THE RESOLUTION IT IS HANDED IN --
+    // the caller decides between the sheet's native resolution and the render
+    // bucket -- then appended on the DiT token axis with its own rotary source
+    // tag, so a shot can hold an identity without spending an i2v guide frame.
+    // A zero count leaves every existing path bit-identical.
+    sd_image_t* character_refs;
+    // Optional per-reference rotary source ids. A null pointer, or a
+    // non-positive entry, assigns 2, 3, 4, ... in array order. Zero and one are
+    // reserved (zero is the target's exact no-op tag).
+    int* character_ref_source_ids;
+    int character_refs_size;
+    // Rotary source-phase multiplier. Zero selects the trained default of 1.0.
+    float tass_phase_scale;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;

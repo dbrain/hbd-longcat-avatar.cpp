@@ -595,12 +595,48 @@ namespace LTXV {
         return build_rope_matrix_from_frequencies(freqs, dim);
     }
 
+    // TASS-RoPE source-phase tag (LTX-Best-Face-ID / ST-DRC arXiv:2606.02441).
+    //
+    // Overlap reference conditioning places the reference latent on the target's
+    // frame-0 RoPE grid.  To stop the reference from being confused with the first
+    // frame the model is asked to GENERATE, every token carries a per-source
+    // multiplicative rotary phase:
+    //
+    //     phase[d] = source_id * phase_scale * theta^(-d / L)
+    //
+    // `d` and `L` are PER ATTENTION HEAD, not over the flat rotary half-dim.  Upstream
+    // (ComfyUI `freqs_cis_matrix`) reshapes the flat freq vector to
+    // [B, T, num_heads, inner_dim / (2*num_heads), 2, 2] before the reference node's
+    // `_rotate_ref_block` reads `L = matrix.shape[-3]`, so L = attention_head_dim / 2
+    // and the SAME phase ramp is broadcast to every head.  Indexing `d` across the flat
+    // half-dim instead gives head h a near-constant phase of seg * theta^(-h/num_heads):
+    // the first couple of heads get their whole position encoding rotated by ~2 rad
+    // while the remaining heads get no tag at all.
+    //
+    // Target tokens use source_id = 0, which makes the phase identically zero and
+    // therefore an EXACT no-op — a run with no references is bit-identical to the
+    // pre-TASS path.  References use source_id = 2, 3, 4, ... so multiple distinct
+    // subjects stay separable ("who is who").
+    //
+    // The phase is an angle offset: RoPE rotates by exp(i*freq), so multiplying by
+    // exp(i*phase) is the same as adding phase to the angle before cos/sin.
+    __STATIC_INLINE__ float ltxv_tass_source_phase(float source_id, float phase_scale, float theta, int d, int head_half_dim) {
+        if (source_id == 0.f || phase_scale == 0.f || head_half_dim <= 0) {
+            return 0.f;
+        }
+        const double ratio = static_cast<double>(d % head_half_dim) / static_cast<double>(head_half_dim);
+        return static_cast<float>(static_cast<double>(source_id) * static_cast<double>(phase_scale) *
+                                  std::pow(static_cast<double>(theta), -ratio));
+    }
+
     __STATIC_INLINE__ std::vector<float> build_video_rope_matrix_from_positions(const sd::Tensor<float>& positions,
                                                                                 int dim,
                                                                                 int num_heads,
                                                                                 float theta,
                                                                                 const std::vector<int>& max_pos,
-                                                                                bool use_middle_indices_grid) {
+                                                                                bool use_middle_indices_grid,
+                                                                                const std::vector<float>* source_ids = nullptr,
+                                                                                float phase_scale                    = 1.f) {
         GGML_ASSERT(max_pos.size() == 3);
         GGML_ASSERT(dim % num_heads == 0);
         GGML_ASSERT(positions.dim() == 3 || positions.dim() == 4);
@@ -615,6 +651,10 @@ namespace LTXV {
         const int half_dim               = dim / 2;
         const int pad_size               = half_dim - static_cast<int>(indices.size()) * 3;
         std::vector<std::vector<float>> freqs(static_cast<size_t>(tokens), std::vector<float>(half_dim, 0.f));
+
+        if (source_ids != nullptr) {
+            GGML_ASSERT(static_cast<int64_t>(source_ids->size()) == tokens);
+        }
 
         for (int64_t token = 0; token < tokens; token++) {
             int out_idx = 0;
@@ -635,6 +675,17 @@ namespace LTXV {
             for (float index : indices) {
                 for (int axis = 0; axis < 3; axis++) {
                     freqs[token][out_idx++] = index * (coords[axis] * 2.f - 1.f);
+                }
+            }
+
+            // Apply the source-phase tag.  The ramp is per attention head: `d` restarts at
+            // every head boundary (see ltxv_tass_source_phase).  source_id == 0
+            // short-circuits to a no-op so the untagged path stays bit-identical.
+            const float source_id = source_ids != nullptr ? (*source_ids)[static_cast<size_t>(token)] : 0.f;
+            if (source_id != 0.f) {
+                const int head_half_dim = half_dim / std::max(num_heads, 1);
+                for (int d = 0; d < half_dim; d++) {
+                    freqs[token][d] += ltxv_tass_source_phase(source_id, phase_scale, theta, d, head_half_dim);
                 }
             }
         }
@@ -1849,7 +1900,8 @@ namespace LTXV {
                                                       ggml_tensor* video_connector_pe,
                                                       ggml_tensor* audio_connector_pe,
                                                       ggml_tensor* v_relay_mask = nullptr,
-                                                      ggml_tensor* a_relay_mask = nullptr) {
+                                                      ggml_tensor* a_relay_mask = nullptr,
+                                                      ggml_tensor* ref_vx       = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1868,6 +1920,24 @@ namespace LTXV {
 
             vx = patchify_video(ctx, vx, n);
             vx = patchify_proj->forward(ctx, vx);
+
+            // TASS overlap references. Patchified with the SAME projection as the
+            // target and appended on the token axis (ne[1]); after patchify the
+            // sequence is flat, so a reference may carry a different spatial grid
+            // (native-resolution 1536x1024 character sheet vs a 768x448 video) with
+            // all geometry supplied by the positions + source-phase RoPE tag.
+            // Target tokens stay FIRST and contiguous so the tail can be dropped
+            // before unpatchify.
+            const int64_t target_tokens = width * height * frames;
+            if (ref_vx != nullptr && ggml_nelements(ref_vx) > 0) {
+                GGML_ASSERT(ref_vx->ne[3] % config.in_channels == 0);
+                const int64_t ref_n = ref_vx->ne[3] / config.in_channels;
+                GGML_ASSERT(ref_n == n);
+                ggml_tensor* rx = patchify_video(ctx, ref_vx, ref_n);
+                rx              = patchify_proj->forward(ctx, rx);
+                vx              = ggml_concat(ctx->ggml_ctx, vx, rx, 1);
+            }
+
             if (ax != nullptr && ggml_nelements(ax) > 0 && audio_time > 0) {
                 ax = patchify_audio(ctx, ax);
                 ax = audio_patchify_proj->forward(ctx, ax);
@@ -2013,6 +2083,15 @@ namespace LTXV {
             vx                 = norm_out->forward(ctx, vx);
             vx                 = LTXV::modulate_v2(ctx->ggml_ctx, vx, v_shift_scale[0], v_shift_scale[1]);
             vx                 = proj_out->forward(ctx, vx);
+            // Drop the TASS reference tokens before unpatchify: they were appended
+            // after the target tokens, are pure conditioning, and have no place in
+            // the decoded w*h*f grid.
+            if (vx->ne[1] > target_tokens) {
+                vx = ggml_cont(ctx->ggml_ctx,
+                               ggml_view_3d(ctx->ggml_ctx, vx,
+                                            vx->ne[0], target_tokens, vx->ne[2],
+                                            vx->nb[1], vx->nb[2], 0));
+            }
             vx                 = unpatchify_video(ctx, vx, width, height, frames);
 
             if (ax != nullptr && audio_time > 0) {
@@ -2041,6 +2120,8 @@ namespace LTXV {
         std::vector<float> audio_connector_pe_vec;
         sd::Tensor<float> vx_input_cache;
         sd::Tensor<float> ax_input_cache;
+        // TASS overlap reference latents (may carry a different spatial grid than vx).
+        sd::Tensor<float> ref_vx_input_cache;
         // These must outlive graph construction because the selector is an
         // externally-backed graph input.
         sd::Tensor<float> v_timestep_compact_cache;
@@ -2152,7 +2233,10 @@ namespace LTXV {
                                  const sd::Tensor<float>& video_positions_tensor = {},
                                  const sd::Tensor<float>& audio_positions_tensor = {},
                                  bool skip_a2v                                  = false,
-                                 const sd::ltx_relay::Plan* relay               = nullptr) {
+                                 const sd::ltx_relay::Plan* relay               = nullptr,
+                                 const sd::Tensor<float>& ref_video_x_tensor    = {},
+                                 const std::vector<float>* video_source_ids     = nullptr,
+                                 float tass_phase_scale                         = 1.f) {
             auto split_inputs = split_av_latents(x_tensor, audio_length);
             vx_input_cache    = split_inputs.first;
             if (!audio_x_tensor.empty()) {
@@ -2162,6 +2246,10 @@ namespace LTXV {
             }
 
             ggml_tensor* vx         = make_input(vx_input_cache);
+            // TASS overlap references: a separate latent block carrying its own spatial
+            // grid. Kept out of vx so the target keeps a clean w*h*f grid for unpatchify.
+            ref_vx_input_cache      = ref_video_x_tensor;
+            ggml_tensor* ref_vx     = make_optional_input(ref_vx_input_cache);
             ggml_tensor* ax         = make_optional_input(ax_input_cache);
             ggml_tensor* timesteps  = nullptr;
             ggml_tensor* v_token_sel_input = nullptr;
@@ -2216,16 +2304,29 @@ namespace LTXV {
             ggml_cgraph* gf = new_graph_custom(LTXAV_GRAPH_SIZE);
 
             float video_frame_rate    = frame_rate > 0.f ? frame_rate : 24.f;
-            int64_t video_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2];
+            int64_t target_token_count = vx->ne[0] * vx->ne[1] * vx->ne[2];
+            // TASS reference tokens are appended after the target tokens, so every
+            // per-token vector (positions, source ids, timesteps, RoPE rows) is sized
+            // over target ++ reference.
+            int64_t ref_token_count   = (ref_vx != nullptr && ggml_nelements(ref_vx) > 0)
+                                            ? ref_vx->ne[0] * ref_vx->ne[1] * ref_vx->ne[2]
+                                            : 0;
+            int64_t video_token_count = target_token_count + ref_token_count;
             bool has_video_positions  = !video_positions_tensor.empty();
+            GGML_ASSERT(ref_token_count == 0 || has_video_positions);
             if (has_video_positions) {
                 GGML_ASSERT(video_positions_tensor.shape()[2] == video_token_count);
+                if (video_source_ids != nullptr) {
+                    GGML_ASSERT(static_cast<int64_t>(video_source_ids->size()) == video_token_count);
+                }
                 video_pe_vec = build_video_rope_matrix_from_positions(video_positions_tensor,
                                                                       static_cast<int>(config.hidden_size),
                                                                       static_cast<int>(config.num_attention_heads),
                                                                       config.positional_embedding_theta,
                                                                       config.positional_embedding_max_pos,
-                                                                      config.use_middle_indices_grid);
+                                                                      config.use_middle_indices_grid,
+                                                                      video_source_ids,
+                                                                      tass_phase_scale);
             } else {
                 video_pe_vec = build_video_rope_matrix(vx->ne[0],
                                                        vx->ne[1],
@@ -2380,7 +2481,13 @@ namespace LTXV {
                 const int64_t tokens_per_frame = vx->ne[0] * vx->ne[1];
                 if (relay->has_video() && video_context_len > 0 &&
                     static_cast<int64_t>(relay->video_frame_time.size()) == vx->ne[2]) {
-                    const int64_t L_q = static_cast<int64_t>(relay->video_frame_time.size()) * tokens_per_frame;
+                    // The mask is built over the TARGET frames only. TASS reference
+                    // tokens are appended after them and get zero bias rows: a
+                    // reference is not on the timeline, so no beat should penalise
+                    // its view of the prompt. Zero rows are also exactly what the
+                    // no-relay path feeds, so relay + references compose.
+                    const int64_t L_q = static_cast<int64_t>(relay->video_frame_time.size()) * tokens_per_frame +
+                                        ref_token_count;
                     if (relay_video_key != relay_mask_key(relay, L_q, video_context_len)) {
                         sd::ltx_relay::build_mask_f16(*relay,
                                                       relay->video_frame_time,
@@ -2388,6 +2495,8 @@ namespace LTXV {
                                                       video_context_len,
                                                       relay->eps,
                                                       relay_video_mask_vec);
+                        relay_video_mask_vec.resize(static_cast<size_t>(L_q * video_context_len),
+                                                    ggml_fp32_to_fp16(0.f));
                         relay_video_key = relay_mask_key(relay, L_q, video_context_len);
                         LOG_DEBUG("ltxav prompt relay: video mask [%lld,%lld] F16 (%.1f MiB), %zu beats",
                                   (long long)video_context_len,
@@ -2437,7 +2546,8 @@ namespace LTXV {
                                             video_connector_pe,
                                             audio_connector_pe,
                                             v_relay_mask,
-                                            a_relay_mask);
+                                            a_relay_mask,
+                                            ref_vx);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
@@ -2454,7 +2564,10 @@ namespace LTXV {
                                   const sd::Tensor<float>& video_positions = {},
                                   const sd::Tensor<float>& audio_positions = {},
                                   bool skip_a2v = false,
-                                  const sd::ltx_relay::Plan* relay = nullptr) {
+                                  const sd::ltx_relay::Plan* relay = nullptr,
+                                  const sd::Tensor<float>& ref_video_x       = {},
+                                  const std::vector<float>* video_source_ids = nullptr,
+                                  float tass_phase_scale                     = 1.f) {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x,
                                    timesteps,
@@ -2466,7 +2579,10 @@ namespace LTXV {
                                    video_positions,
                                    audio_positions,
                                    skip_a2v,
-                                   relay);
+                                   relay,
+                                   ref_video_x,
+                                   video_source_ids,
+                                   tass_phase_scale);
             };
             auto out = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
             return out;
@@ -2488,7 +2604,10 @@ namespace LTXV {
                            tensor_or_empty(extra->video_positions),
                            tensor_or_empty(extra->audio_positions),
                            extra->skip_a2v,
-                           extra->relay);
+                           extra->relay,
+                           tensor_or_empty(extra->ref_video_x),
+                           extra->video_source_ids,
+                           extra->tass_phase_scale);
         }
 
         void test(const std::string& x_path,

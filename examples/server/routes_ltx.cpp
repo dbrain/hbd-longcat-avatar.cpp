@@ -619,6 +619,94 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     hires_stage_cfgs.push_back(cfg);
                 }
             }
+            // TASS overlap character references (LTX-Best-Face-ID sheets).
+            //   "character_refs": [{"image": "<base64|/abs/path>",
+            //                       "source_id": 2,
+            //                       "resize_mode": "native_resolution"}]
+            // The sheet is an identity, not a shot, so this is a top-level list
+            // that applies to every segment of the request. Absent, everything
+            // below is inert and the render is unchanged.
+            std::vector<LtxCharacterRef> character_refs;
+            if (body.contains("character_refs") && !body["character_refs"].is_null()) {
+                if (!body["character_refs"].is_array()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"character_refs must be an array"})", "application/json");
+                    return;
+                }
+                std::vector<int> explicit_source_ids;
+                for (const auto& entry : body["character_refs"]) {
+                    if (!entry.is_object() || !entry.contains("image") || !entry["image"].is_string() ||
+                        entry["image"].get<std::string>().empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"each character_ref needs a non-empty image: base64 or absolute path"})",
+                                        "application/json");
+                        return;
+                    }
+                    LtxCharacterRef reference;
+                    reference.image = entry["image"].get<std::string>();
+                    if (reference.image[0] == '/') {
+                        std::error_code error;
+                        if (!fs::is_regular_file(reference.image, error)) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"character_ref image path is not a readable file"})",
+                                            "application/json");
+                            return;
+                        }
+                    }
+                    if (entry.contains("source_id") && !entry["source_id"].is_null()) {
+                        // Zero is the target's own tag (an exact RoPE no-op) and one
+                        // is reserved by the checkpoint, so subjects start at two.
+                        if (!entry["source_id"].is_number_integer() || entry["source_id"].get<int>() < 2) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"character_ref source_id must be an integer >= 2"})",
+                                            "application/json");
+                            return;
+                        }
+                        reference.source_id = entry["source_id"].get<int>();
+                        if (std::find(explicit_source_ids.begin(), explicit_source_ids.end(), reference.source_id) !=
+                            explicit_source_ids.end()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"character_ref source_id values must be distinct"})",
+                                            "application/json");
+                            return;
+                        }
+                        explicit_source_ids.push_back(reference.source_id);
+                    }
+                    if (entry.contains("resize_mode") && !entry["resize_mode"].is_null()) {
+                        if (!entry["resize_mode"].is_string()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"character_ref resize_mode must be a string"})",
+                                            "application/json");
+                            return;
+                        }
+                        const std::string mode = entry["resize_mode"].get<std::string>();
+                        if (mode == "match_target") {
+                            reference.match_target = true;
+                        } else if (mode != "native_resolution") {
+                            res.status = 400;
+                            res.set_content(R"({"error":"character_ref resize_mode must be native_resolution or match_target"})",
+                                            "application/json");
+                            return;
+                        }
+                    }
+                    character_refs.push_back(std::move(reference));
+                }
+            }
+            float tass_phase_scale = 0.f;
+            if (body.contains("tass_phase_scale") && !body["tass_phase_scale"].is_null()) {
+                if (!body["tass_phase_scale"].is_number()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"tass_phase_scale must be numeric"})", "application/json");
+                    return;
+                }
+                tass_phase_scale = body["tass_phase_scale"].get<float>();
+                if (!(tass_phase_scale > 0.f)) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"tass_phase_scale must be positive"})", "application/json");
+                    return;
+                }
+            }
+
             const std::string default_model = body.value("model", std::string("base"));
             const auto variants = runtime_diffusion_model_variants(*runtime);
             if (variants.find(default_model) == variants.end()) {
@@ -688,6 +776,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_keyframes = std::move(segment_keyframes);
             job->ltx_segment_keyframe_indices = std::move(segment_keyframe_indices);
             job->ltx_segment_control_frames = std::move(segment_control_frames);
+            job->ltx_character_refs = std::move(character_refs);
+            job->ltx_tass_phase_scale = tass_phase_scale;
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);

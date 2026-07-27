@@ -1271,6 +1271,48 @@ re-rendering its completed prefix. Set `resume_job_id` to the prior response's s
 The request's segment list must include the complete prefix plus new tail because the
 server reconstructs the stitched media from the durable banks.
 
+#### Character references (TASS overlap conditioning)
+
+An LTX request may carry a top-level `character_refs` array to hold one identity
+across shots without spending an i2v guide frame. It pairs with a character-sheet
+checkpoint (`model: "faceid-sheet"`) and a prompt prefixed `ref_t2v:`.
+
+```json
+"character_refs": [
+  { "image": "<base64 png/jpg or absolute path>",
+    "source_id": 2,
+    "resize_mode": "native_resolution" }
+],
+"tass_phase_scale": 1.0
+```
+
+Each reference is VAE-encoded and appended on the DiT **token** axis with its own
+rotary source tag, so it keeps its own spatial grid: a 1536x1024 sheet conditions a
+768x448 render at full detail. `resize_mode` defaults to `native_resolution`;
+`match_target` resizes to the render bucket first (use it for tight close-up
+references, not for sheets). `source_id` is optional and must be `>= 2` and distinct
+— zero is the target's own tag and one is reserved; omitted, the engine assigns
+`2, 3, 4, ...` in array order, and the same subject should keep the same id across
+shots. `tass_phase_scale` defaults to `1.0`, the trained value.
+
+The references apply to every segment of the request, and multiple references in one
+shot are architecturally supported but were not trained. All references in one request
+must decode to the same resolution. They condition the base pass only, not the
+hires-chain refine stages.
+
+References compose with the `LTX_BASE_TEMPORAL_WINDOW` tiling path. The reference
+latent is a tensor of its own rather than part of the target grid, so a temporal tile
+re-appends the identical reference block to its own frame range and rebuilds only the
+per-token tail (positions, source ids, timesteps). Every tile gets the references, not
+just the first: a later tile that lost them would be holding the identity through the
+frozen overlap alone — the drift the feature exists to remove — and would silently
+switch between a tagged and an untagged graph mid-shot. Each tile places the references
+on *its own* first frame, so the reference keeps the zero temporal offset it was trained
+with; set `LTX_TASS_WINDOW_REF_ABS=1` to pin them at global frame 0 instead. Tiling
+still requires the rest of its preconditions — no i2v/keyframe/continuation guide, no
+V2V, and either fixed (driving) audio or an audio-free model, since jointly generated
+audio cannot be tiled across video windows.
+
 Set `persist:true` on a new LTX request to store its bank under `$LTX_PERSIST_DIR`
 (default `/var/lib/ltx-video/persist`) instead of the FIFO `$LTX_JOB_DIR`; resumes
 and V2V job references search both roots. `DELETE /ltx/v1/job?id=<engine-job-id>`
