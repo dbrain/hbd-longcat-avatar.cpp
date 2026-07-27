@@ -401,8 +401,9 @@ typedef struct {
 // clause that is given cross-attention priority around its own moment. Fewer
 // than one beat leaves the ordinary null-mask path byte-identical.
 typedef struct {
-    // Pixel-frame index on the RENDERED segment timeline (continuation frames
-    // included; the caller is responsible for adding its own seam drop).
+    // Pixel-frame index on the shot's VISIBLE timeline -- the frame a viewer sees, counting from
+    // the start of the shot as it appears in the finished clip. On a continuation shot the chain
+    // adds that shot's seam drop internally, so callers never handle the trim.
     int frame;
     const char* text;
     // Multiplies the attention penalty. Zero or negative selects 1.0.

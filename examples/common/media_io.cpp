@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1159,6 +1160,24 @@ struct EncodedWebmPacket {
 };
 
 #ifdef SD_USE_VPX
+// VP9 encode tunables. The encoder itself is fixed 10-bit (profile 2) BT.709 studio range; these
+// only move quality/speed:
+//   LTXAV_VP9_CQ         constant-quality level 4..63 (default 20; LOWER = higher quality/bigger).
+//   LTXAV_VP9_CPU_USED   libvpx good-quality speed 0..8 (default 4; higher = faster/worse).
+//   LTXAV_VP9_KF_SECONDS max keyframe interval in seconds, for seeking (default 2).
+static float vp9_env_float(const char* name, float fallback, float lo, float hi) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(raw, &end);
+    if (end == raw) {
+        return fallback;
+    }
+    return std::min(hi, std::max(lo, parsed));
+}
+
 class Vp9Encoder {
 public:
     ~Vp9Encoder() {
@@ -1193,15 +1212,20 @@ public:
         cfg.rc_end_usage = VPX_Q;
         cfg.rc_target_bitrate = 0;
         cfg.kf_mode = VPX_KF_AUTO;
-        cfg.kf_max_dist = static_cast<unsigned int>(std::max(1, (fps > 0 ? fps : 24) * 2));
+        const float kf_seconds = vp9_env_float("LTXAV_VP9_KF_SECONDS", 2.0f, 0.0f, 100.0f);
+        cfg.kf_max_dist = static_cast<unsigned int>(
+            std::max(1, static_cast<int>((fps > 0 ? fps : 24) * kf_seconds)));
         cfg.g_threads = std::max(1U, std::min(8U, std::thread::hardware_concurrency()));
         if (vpx_codec_enc_init(&codec_, vpx_codec_vp9_cx(), &cfg, VPX_CODEC_USE_HIGHBITDEPTH) != VPX_CODEC_OK) {
             fprintf(stderr, "Error: Failed to initialize VP9 encoder: %s\\n", vpx_codec_error(&codec_));
             return false;
         }
         initialized_ = true;
-        vpx_codec_control(&codec_, VP8E_SET_CPUUSED, 4);
-        vpx_codec_control(&codec_, VP8E_SET_CQ_LEVEL, 20);
+        const int cpu_used = static_cast<int>(vp9_env_float("LTXAV_VP9_CPU_USED", 4.0f, 0.0f, 8.0f));
+        const int cq_level = static_cast<int>(vp9_env_float("LTXAV_VP9_CQ", 20.0f, 4.0f, 63.0f));
+        vpx_codec_control(&codec_, VP8E_SET_CPUUSED, cpu_used);
+        vpx_codec_control(&codec_, VP8E_SET_CQ_LEVEL, cq_level);  // shared VP8/VP9 constant-quality control
+        vpx_codec_control(&codec_, VP9E_SET_ROW_MT, 1);
         vpx_codec_control(&codec_, VP9E_SET_COLOR_SPACE, VPX_CS_BT_709);
         vpx_codec_control(&codec_, VP9E_SET_COLOR_RANGE, VPX_CR_STUDIO_RANGE);
         if (vpx_img_alloc(&image_, VPX_IMG_FMT_I42016, width, height, 1) == nullptr) {
@@ -1287,18 +1311,96 @@ bool webm_vp9_enabled() {
 #ifdef SD_USE_OPUS
 struct OpusPacket { uint64_t timestamp_ns; std::vector<uint8_t> data; };
 
+// Band-limited resample to Opus' native 48 kHz. Nearest-neighbour sample-and-hold (what this
+// regressed to in the upstream rebuild) aliases anything the source carries above the destination
+// Nyquist straight back into the audible band, and adds jitter because each output sample snaps to
+// whichever input sample happens to be nearest. This is a windowed-sinc (squared-cosine / Hann
+// window, 6-lobe, 0.99 rolloff) polyphase kernel instead.
+//
+// Inert for today's LTX output, which is already 48 kHz and takes the straight-copy path below --
+// but the LongCat avatar path is 16 kHz, where the difference is audible.
+static std::vector<float> resample_interleaved_hann_sinc(const float* src,
+                                                         uint64_t src_n,
+                                                         uint32_t src_ch,
+                                                         uint32_t dst_ch,
+                                                         uint32_t src_sr,
+                                                         uint32_t dst_sr) {
+    if (src == nullptr || src_n == 0 || src_ch == 0 || dst_ch == 0 || src_sr == 0 || dst_sr == 0) {
+        return {};
+    }
+
+    const uint64_t dst_n = static_cast<uint64_t>(
+        std::ceil(static_cast<double>(dst_sr) * static_cast<double>(src_n) / static_cast<double>(src_sr)));
+    std::vector<float> dst(static_cast<size_t>(dst_n * dst_ch), 0.0f);
+
+    int orig = static_cast<int>(src_sr);
+    int neo  = static_cast<int>(dst_sr);
+    int gcd  = std::gcd(orig, neo);
+    orig /= gcd;
+    neo /= gcd;
+
+    constexpr int lowpass_filter_width = 6;
+    constexpr double rolloff           = 0.99;
+    constexpr double pi                = 3.14159265358979323846;
+    const double base_freq             = static_cast<double>(std::min(orig, neo)) * rolloff;
+    const int width                    = static_cast<int>(std::ceil(lowpass_filter_width * static_cast<double>(orig) / base_freq));
+    const double scale                 = base_freq / static_cast<double>(orig);
+
+    for (uint64_t i = 0; i < dst_n; ++i) {
+        const double center = static_cast<double>(i) * static_cast<double>(src_sr) / static_cast<double>(dst_sr);
+        const int64_t left  = static_cast<int64_t>(std::floor(center)) - width - 1;
+        const int64_t right = static_cast<int64_t>(std::floor(center)) + width + 1;
+        for (uint32_t c = 0; c < dst_ch; ++c) {
+            double acc = 0.0;
+            for (int64_t j = left; j <= right; ++j) {
+                if (j < 0 || j >= static_cast<int64_t>(src_n)) {
+                    continue;
+                }
+                double t = (static_cast<double>(j) / static_cast<double>(orig) -
+                            static_cast<double>(i) / static_cast<double>(neo)) *
+                           base_freq;
+                t = std::clamp(t, -static_cast<double>(lowpass_filter_width), static_cast<double>(lowpass_filter_width));
+                double window = std::cos(t * pi / static_cast<double>(lowpass_filter_width) / 2.0);
+                window *= window;
+                double t_pi = t * pi;
+                double sinc = t_pi == 0.0 ? 1.0 : std::sin(t_pi) / t_pi;
+                const uint32_t src_c = src_ch == 1 ? 0 : std::min<uint32_t>(c, src_ch - 1);
+                acc += static_cast<double>(src[static_cast<size_t>(j * src_ch + src_c)]) * sinc * window * scale;
+            }
+            dst[static_cast<size_t>(i * dst_ch + c)] = static_cast<float>(acc);
+        }
+    }
+    return dst;
+}
+
 bool encode_audio_to_opus(const sd_audio_t* audio, std::vector<OpusPacket>& packets,
                           std::vector<uint8_t>& header, uint64_t& codec_delay_ns, uint32_t& channels) {
     if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 || audio->channels == 0 || audio->sample_rate == 0) return false;
     channels = audio->channels == 1 ? 1 : 2;
-    const uint64_t output_samples = (audio->sample_count * 48000ULL + audio->sample_rate - 1) / audio->sample_rate;
+    std::vector<float> resampled;
+    if (audio->sample_rate == 48000) {
+        // Already at Opus' native rate: straight channel map, no filtering at all.
+        resampled.resize(static_cast<size_t>(audio->sample_count * channels));
+        for (uint64_t i = 0; i < audio->sample_count; ++i) {
+            for (uint32_t c = 0; c < channels; ++c) {
+                const uint32_t input_channel = audio->channels == 1 ? 0 : std::min(c, audio->channels - 1);
+                resampled[static_cast<size_t>(i * channels + c)] =
+                    audio->data[static_cast<size_t>(i * audio->channels + input_channel)];
+            }
+        }
+    } else {
+        resampled = resample_interleaved_hann_sinc(audio->data, audio->sample_count, audio->channels,
+                                                   channels, audio->sample_rate, 48000);
+    }
+    if (resampled.empty()) {
+        return false;
+    }
+    const uint64_t output_samples = static_cast<uint64_t>(resampled.size() / channels);
     std::vector<int16_t> pcm(static_cast<size_t>(output_samples * channels));
     for (uint64_t i = 0; i < output_samples; ++i) {
-        const uint64_t input = std::min<uint64_t>(audio->sample_count - 1,
-                                                  (i * static_cast<uint64_t>(audio->sample_rate)) / 48000ULL);
         for (uint32_t c = 0; c < channels; ++c) {
-            const uint32_t input_channel = audio->channels == 1 ? 0 : std::min(c, audio->channels - 1);
-            pcm[static_cast<size_t>(i * channels + c)] = static_cast<int16_t>(std::lrint(std::clamp(audio->data[input * audio->channels + input_channel], -1.0f, 1.0f) * 32767.0f));
+            pcm[static_cast<size_t>(i * channels + c)] = static_cast<int16_t>(
+                std::lrint(std::clamp(resampled[static_cast<size_t>(i * channels + c)], -1.0f, 1.0f) * 32767.0f));
         }
     }
     int error = OPUS_OK;

@@ -258,6 +258,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<std::string> segment_negative_prompts;
             bool any_segment_beats     = false;
             bool any_segment_overrides = false;
+            // Only needed to turn a beat's `time` (seconds) into a frame index; the authoritative
+            // fps is parsed later with the rest of the generation params.
+            int beat_fps = body.value("fps", 24);
+            if (beat_fps <= 0) {
+                beat_fps = 24;
+            }
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {
@@ -409,17 +415,27 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                                 return;
                             }
                             for (const auto& beat : segment["beats"]) {
-                                if (!beat.is_object() ||
-                                    !beat.contains("frame") || !beat["frame"].is_number_integer() ||
-                                    beat["frame"].get<int>() < 0 ||
+                                // `time` (seconds into the shot as the viewer sees it) is the
+                                // natural unit for a caller; `frame` stays accepted for exact
+                                // control. Both are on the shot's VISIBLE timeline -- the engine
+                                // adds a continuation shot's seam drop itself.
+                                const bool has_time = beat.is_object() && beat.contains("time") &&
+                                                      beat["time"].is_number();
+                                const bool has_frame = beat.is_object() && beat.contains("frame") &&
+                                                       beat["frame"].is_number_integer();
+                                if (!beat.is_object() || (!has_time && !has_frame) ||
+                                    (has_frame && beat["frame"].get<int>() < 0) ||
+                                    (has_time && beat["time"].get<double>() < 0.0) ||
                                     !beat.contains("text") || !beat["text"].is_string() ||
                                     beat["text"].get<std::string>().empty()) {
                                     res.status = 400;
-                                    res.set_content(R"({"error":"each LTX beat needs a non-negative integer frame and non-empty text"})", "application/json");
+                                    res.set_content(R"({"error":"each LTX beat needs a non-negative time (seconds) or frame, and non-empty text"})", "application/json");
                                     return;
                                 }
                                 LtxSegmentBeat parsed;
-                                parsed.frame    = beat["frame"].get<int>();
+                                parsed.frame = has_frame
+                                                   ? beat["frame"].get<int>()
+                                                   : static_cast<int>(std::lround(beat["time"].get<double>() * beat_fps));
                                 parsed.text     = beat["text"].get<std::string>();
                                 parsed.strength = beat.value("strength", 0.f);
                                 parsed.window   = beat.value("window", -1.f);
