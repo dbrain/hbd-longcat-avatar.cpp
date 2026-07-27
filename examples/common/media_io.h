@@ -2,6 +2,7 @@
 #define __MEDIA_IO_H__
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -90,6 +91,44 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images,
                                                           int quality             = 90,
                                                           const sd_audio_t* audio = nullptr);
 #endif
+
+// One encoded video frame as it comes out of the codec, before muxing.
+struct EncodedWebmPacket {
+    std::vector<uint8_t> data;
+    bool keyframe = false;
+};
+
+// Streaming WebM encode. Encodes each frame on arrival and retains only the compressed packet,
+// so a long chain never holds its decoded timeline in RAM (a raw 1280x704 frame is 2.7 MB; its
+// VP9 packet is tens of KB). begin() returns false when VP9 is unavailable, in which case the
+// caller should fall back to accumulating frames and calling the one-shot encoder.
+class Vp9Encoder;
+class IncrementalWebmEncoder {
+public:
+    IncrementalWebmEncoder();
+    ~IncrementalWebmEncoder();
+    IncrementalWebmEncoder(const IncrementalWebmEncoder&)            = delete;
+    IncrementalWebmEncoder& operator=(const IncrementalWebmEncoder&) = delete;
+
+    bool begin(int width, int height, int fps);
+    // The caller retains ownership of `image` and may free it as soon as this returns.
+    bool append(const sd_image_t& image);
+    std::vector<uint8_t> finalize(const sd_audio_t* audio, int quality);
+
+    int  frames() const { return frames_; }
+    bool failed() const { return failed_; }
+    bool active() const { return encoder_ != nullptr; }
+
+private:
+    std::unique_ptr<Vp9Encoder> encoder_;
+    std::vector<EncodedWebmPacket> packets_;
+    int  width_  = 0;
+    int  height_ = 0;
+    int  fps_    = 0;
+    int  frames_ = 0;
+    bool failed_ = false;
+};
+
 
 int create_video_from_sd_images(const char* filename,
                                 sd_image_t* images,

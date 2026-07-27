@@ -316,6 +316,21 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     return true;
 }
 
+namespace {
+// Chain flush callback: the chain hands over frames that are final and TRANSFERS OWNERSHIP, so we
+// encode each one and free it immediately. That is what keeps a long chain's peak memory at one
+// segment rather than the whole decoded timeline.
+void stream_flush_frames(const sd_image_t* frames, int frame_count, void* user) {
+    auto* encoder = static_cast<IncrementalWebmEncoder*>(user);
+    for (int i = 0; i < frame_count; ++i) {
+        if (encoder != nullptr) {
+            encoder->append(frames[i]);
+        }
+        free(frames[i].data);
+    }
+}
+}  // namespace
+
 json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJob& job) {
     json result;
     result["id"]             = job.id;
@@ -688,6 +703,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         segment_writer.start();
     }
 
+    IncrementalWebmEncoder stream_encoder;
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
@@ -791,6 +807,17 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.before_segment_user = job.ltx_segment_models.empty() ? nullptr : &model_lease;
             chain.on_segment = write_segment_previews ? write_segment_preview : nullptr;
             chain.on_segment_user = write_segment_previews ? &segment_writer : nullptr;
+            // STREAM the timeline out instead of accumulating it. A 3.5-minute 1280x704 chain
+            // holds ~14 GB of decoded frames if we keep them all (~32 GB at 1920x1088); with
+            // this the chain hands over each frame as it becomes final and we encode it
+            // immediately, so only compressed packets survive. Only for webm - the other
+            // containers have no incremental path - and begin() fails without VP9, in which
+            // case we simply do not set the callback and the old behaviour stands.
+            if (job.vid_gen.output_format == "webm" &&
+                stream_encoder.begin(params.width, params.height, params.fps)) {
+                chain.on_flush_frames = stream_flush_frames;
+                chain.on_flush_frames_user = &stream_encoder;
+            }
             params.emit_stages = job.ltx_emit_stages ? 1 : 0;
             params.on_stage = job.ltx_emit_stages ? write_ltx_stage_preview : nullptr;
             params.on_stage_user = job.ltx_emit_stages ? &segment_writer : nullptr;
@@ -843,19 +870,24 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         segment_writer.finish();
     }
 
-    num_results = results.count();
+    // When the chain streamed, the frames were encoded and freed as they arrived, so `results`
+    // is deliberately empty and the frame count comes from the encoder.
+    const bool streamed = stream_encoder.active() && stream_encoder.frames() > 0;
+    num_results = streamed ? stream_encoder.frames() : results.count();
     if (num_results <= 0) {
         free_sd_audio(generated_audio);
         error_message = "generate_video returned no results";
         return false;
     }
 
-    std::vector<uint8_t> video_bytes = create_video_from_sd_images_to_vector(job.vid_gen.output_format,
-                                                                             results.data(),
-                                                                             num_results,
-                                                                             job.vid_gen.gen_params.fps,
-                                                                             job.vid_gen.output_compression,
-                                                                             generated_audio);
+    std::vector<uint8_t> video_bytes =
+        streamed ? stream_encoder.finalize(generated_audio, job.vid_gen.output_compression)
+                 : create_video_from_sd_images_to_vector(job.vid_gen.output_format,
+                                                         results.data(),
+                                                         num_results,
+                                                         job.vid_gen.gen_params.fps,
+                                                         job.vid_gen.output_compression,
+                                                         generated_audio);
     free_sd_audio(generated_audio);
     if (video_bytes.empty()) {
         error_message = "failed to encode generated video container";

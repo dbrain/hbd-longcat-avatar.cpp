@@ -10082,6 +10082,45 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
         stitched.clear();
     };
+
+    // WINDOWED STREAMING FINALIZE. Without it `stitched` grows to the entire decoded timeline --
+    // about 14 GB for a 3.5-minute 1280x704 chain and 32 GB at 1920x1088, which is swap-thrash or
+    // an OOM rather than a slow render. With on_flush_frames set we instead keep only the last
+    // WINDOW_KEEP frames: the furthest back any later operation can still reach.
+    //
+    // What reaches backwards, and how far:
+    //   * ltxav_auto_trim_drop compares against stitched.back()      -> 1 frame
+    //   * a future seam polish (exposure match) reads the last 16    -> 16 frames
+    // Everything older than that suffix is final forever, so it is handed to the caller's encoder
+    // (which takes ownership and frees it) as we go. Because the retained window is always a
+    // SUFFIX of the full timeline, every one of those operations sees byte-identical input to the
+    // accumulate-everything path -- streaming changes memory, not pixels.
+    const bool streaming = chain_params->on_flush_frames != nullptr;
+    constexpr int WINDOW_KEEP = 16;
+    long long flushed_total = 0;
+    if (streaming) {
+        LOG_INFO("generate_video_chain: streaming finalize ON (keeping a %d-frame window; frames are "
+                 "handed over and freed as they become final)", WINDOW_KEEP);
+    }
+    auto flush_window = [&](bool final_flush) {
+        if (!streaming) {
+            return;
+        }
+        const int keep = final_flush ? 0 : WINDOW_KEEP;
+        if (static_cast<int>(stitched.size()) <= keep) {
+            return;
+        }
+        const int n_flush = static_cast<int>(stitched.size()) - keep;
+        // Hand the now-final prefix over IN ORDER; the callee consumes and frees each .data.
+        chain_params->on_flush_frames(stitched.data(), n_flush, chain_params->on_flush_frames_user);
+        stitched.erase(stitched.begin(), stitched.begin() + n_flush);
+        flushed_total += n_flush;
+    };
+    // Frames emitted so far, whether still resident or already flushed. This is the true timeline
+    // position -- stitched.size() alone is only the resident tail once streaming is on.
+    auto timeline_frames = [&]() -> long long {
+        return flushed_total + static_cast<long long>(stitched.size());
+    };
     auto fail = [&]() {
         release_stitched();
         // Reclaim GPU memory on a failed/aborted job too, so a persistent worker
@@ -10326,6 +10365,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             }
         }
         adopt_frames(banked_frames, count, drop);
+        // Restored prefix frames are final the moment they land -- nothing re-renders them.
+        flush_window(false);
     }
 
     for (int segment = sample_start; segment <= sample_end; ++segment) {
@@ -10538,7 +10579,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             params.drive_audio_path = drive_audio_path.c_str();
         } else if (drive_audio.loaded()) {
             const int drop = seam_drop;
-            const int64_t timeline_start = static_cast<int64_t>(stitched.size()) - drop;
+            const int64_t timeline_start = static_cast<int64_t>(timeline_frames()) - drop;
             const auto slice = drive_audio.window(timeline_start,
                                                   params.video_frames,
                                                   std::max(1, params.fps),
@@ -10674,6 +10715,9 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
         free_sd_audio(segment_audio);
         adopt_frames(segment_frames, segment_count, audio_drop);
+        // Everything but the retained suffix is final now; hand it over before the next window
+        // allocates, so peak RAM is one segment plus the window rather than the whole clip.
+        flush_window(false);
         if (ltx_chain && segment + 1 < chain_params->n_segments) {
             // previous_tail and the adopted frames are host-owned now; no GPU
             // allocation from this window is needed by the continuation setup.
@@ -10711,25 +10755,40 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 return fail();
             }
             adopt_frames(segment_frames, segment_count, drop);
+            flush_window(false);
         }
         LOG_INFO("generate_video_chain: retook segment %d and spliced %d banked suffix segment(s)",
                  sample_end, chain_params->n_segments - sample_end - 1);
     }
 
-    if (stitched.empty()) {
+    // The deliverable track is cut against the FULL timeline, including anything already flushed.
+    const int64_t final_frame_count = static_cast<int64_t>(timeline_frames());
+    if (final_frame_count <= 0) {
         return fail();
     }
-    auto* output = static_cast<sd_image_t*>(malloc(stitched.size() * sizeof(sd_image_t)));
-    if (output == nullptr) {
-        return fail();
+    if (streaming) {
+        // Drain the residual window and hand back metadata only -- the frames were flushed and
+        // freed as they became final, which is the entire point. Peak frame RAM stayed at roughly
+        // one segment plus WINDOW_KEEP instead of the whole clip.
+        flush_window(true);
+        LOG_INFO("generate_video_chain: streamed %lld frame(s) out; peak frame memory stayed at one "
+                 "segment plus the window instead of the whole timeline",
+                 (long long)flushed_total);
+        *frames_out = nullptr;
+        *num_frames_out = static_cast<int>(final_frame_count);
+    } else {
+        auto* output = static_cast<sd_image_t*>(malloc(stitched.size() * sizeof(sd_image_t)));
+        if (output == nullptr) {
+            return fail();
+        }
+        std::memcpy(output, stitched.data(), stitched.size() * sizeof(sd_image_t));
+        *frames_out = output;
+        *num_frames_out = static_cast<int>(stitched.size());
     }
-    std::memcpy(output, stitched.data(), stitched.size() * sizeof(sd_image_t));
-    *frames_out = output;
-    *num_frames_out = static_cast<int>(stitched.size());
     if (audio_out != nullptr) {
         if (track_audio.loaded()) {
             const auto track = track_audio.window(0,
-                                                  static_cast<int64_t>(stitched.size()),
+                                                  final_frame_count,
                                                   std::max(1, base_params->fps),
                                                   audio_offset);
             *audio_out = make_ltx_chain_audio(track, track_audio.sample_rate, track_audio.channels);

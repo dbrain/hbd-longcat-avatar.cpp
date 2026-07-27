@@ -1154,11 +1154,6 @@ int create_animated_webp_from_sd_images(const char* filename, sd_image_t* images
 #ifdef SD_USE_WEBM
 namespace {
 
-struct EncodedWebmPacket {
-    std::vector<uint8_t> data;
-    bool keyframe = false;
-};
-
 #ifdef SD_USE_VPX
 // VP9 encode tunables. The encoder itself is fixed 10-bit (profile 2) BT.709 studio range; these
 // only move quality/speed:
@@ -1178,6 +1173,7 @@ static float vp9_env_float(const char* name, float fallback, float lo, float hi)
     return std::min(hi, std::max(lo, parsed));
 }
 
+}  // namespace
 class Vp9Encoder {
 public:
     ~Vp9Encoder() {
@@ -1301,6 +1297,7 @@ private:
     int height_ = 0;
     vpx_codec_pts_t pts_ = 0;
 };
+namespace {
 
 bool webm_vp9_enabled() {
     const char* codec = getenv("LTXAV_WEBM_CODEC");
@@ -1428,7 +1425,17 @@ bool encode_audio_to_opus(const sd_audio_t* audio, std::vector<OpusPacket>& pack
 #endif
 }  // namespace
 
-std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio) {
+// Shared WebM muxer. `images` drives the VP8 fallback and the dimension check; `pre_encoded`, when
+// non-null, supplies VP9 packets that were already encoded (one per frame, in order) so a caller
+// can encode INCREMENTALLY and never hold the raw timeline. Exactly one of them may be null.
+static std::vector<uint8_t> mux_webm(sd_image_t* images,
+                                     const std::vector<EncodedWebmPacket>* pre_encoded,
+                                     int num_images,
+                                     int width_in,
+                                     int height_in,
+                                     int fps,
+                                     int quality,
+                                     const sd_audio_t* audio) {
     if (num_images == 0) {
         fprintf(stderr, "Error: Image array is empty.\n");
         return {};
@@ -1438,8 +1445,8 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
         return {};
     }
 
-    const int width  = static_cast<int>(images[0].width);
-    const int height = static_cast<int>(images[0].height);
+    const int width  = images != nullptr ? static_cast<int>(images[0].width) : width_in;
+    const int height = images != nullptr ? static_cast<int>(images[0].height) : height_in;
     if (width <= 0 || height <= 0) {
         fprintf(stderr, "Error: Invalid frame dimensions.\n");
         return {};
@@ -1448,8 +1455,10 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
     bool use_vp9 = false;
     std::vector<EncodedWebmPacket> vp9_packets;
 #ifdef SD_USE_VPX
-    use_vp9 = webm_vp9_enabled();
-    if (use_vp9) {
+    use_vp9 = pre_encoded != nullptr || webm_vp9_enabled();
+    if (pre_encoded != nullptr) {
+        vp9_packets = *pre_encoded;
+    } else if (use_vp9) {
         Vp9Encoder encoder;
         if (!encoder.init(width, height, fps)) {
             return {};
@@ -1563,10 +1572,12 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
 #endif
 
         for (int i = 0; i < num_images; ++i) {
-            const sd_image_t& image = images[i];
-            if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
-                fprintf(stderr, "Error: Frame dimensions do not match.\n");
-                return -1;
+            if (images != nullptr) {
+                const sd_image_t& image = images[i];
+                if (static_cast<int>(image.width) != width || static_cast<int>(image.height) != height) {
+                    fprintf(stderr, "Error: Frame dimensions do not match.\n");
+                    return -1;
+                }
             }
 
             std::vector<uint8_t> encoded_frame;
@@ -1574,7 +1585,8 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
             if (use_vp9) {
                 encoded_frame = std::move(vp9_packets[static_cast<size_t>(i)].data);
                 keyframe = vp9_packets[static_cast<size_t>(i)].keyframe;
-            } else if (!encode_sd_image_to_vp8_frame(image, quality, encoded_frame)) {
+            } else if (images == nullptr ||
+                       !encode_sd_image_to_vp8_frame(images[i], quality, encoded_frame)) {
                 fprintf(stderr, "Error: Failed to encode frame %d as VP8.\n", i);
                 return -1;
             }
@@ -1642,6 +1654,10 @@ std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, in
     }
     return writer.data();
 }
+std::vector<uint8_t> create_webm_from_sd_images_to_vector(sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio) {
+    return mux_webm(images, nullptr, num_images, 0, 0, fps, quality, audio);
+}
+
 
 int create_webm_from_sd_images(const char* filename, sd_image_t* images, int num_images, int fps, int quality, const sd_audio_t* audio) {
     std::vector<uint8_t> webm_data = create_webm_from_sd_images_to_vector(images, num_images, fps, quality, audio);
@@ -1749,3 +1765,76 @@ bool write_wav_to_file(const std::string& path,
     file.write(reinterpret_cast<const char*>(pcm.data()), static_cast<std::streamsize>(pcm.size() * sizeof(int16_t)));
     return file.good();
 }
+
+// ── Incremental WebM writer ──────────────────────────────────────────────────────────────
+// Encodes each frame AS IT ARRIVES and keeps only the compressed packet, so a caller never has
+// to hold the decoded timeline. That is the whole difference: a raw 1280x704 RGB frame is
+// 2.7 MB, its VP9 packet is tens of KB, so a 3.5-minute chain goes from ~14 GB of frames to a
+// couple of hundred MB of packets (and ~32 GB -> similar at 1920x1088).
+//
+// VP9 only. Without libvpx there is no stateful encoder to drive frame-by-frame, so callers
+// fall back to the accumulate-everything path rather than get a silently different codec.
+bool IncrementalWebmEncoder::begin(int width, int height, int fps) {
+#ifdef SD_USE_VPX
+    if (width <= 0 || height <= 0 || fps <= 0 || !webm_vp9_enabled()) {
+        return false;
+    }
+    encoder_ = std::make_unique<Vp9Encoder>();
+    if (!encoder_->init(width, height, fps)) {
+        encoder_.reset();
+        return false;
+    }
+    width_ = width;
+    height_ = height;
+    fps_ = fps;
+    frames_ = 0;
+    failed_ = false;
+    packets_.clear();
+    return true;
+#else
+    (void)width; (void)height; (void)fps;
+    return false;
+#endif
+}
+
+bool IncrementalWebmEncoder::append(const sd_image_t& image) {
+#ifdef SD_USE_VPX
+    if (failed_ || encoder_ == nullptr) {
+        return false;
+    }
+    if (static_cast<int>(image.width) != width_ || static_cast<int>(image.height) != height_) {
+        fprintf(stderr, "Error: incremental WebM frame dimensions do not match.\n");
+        failed_ = true;
+        return false;
+    }
+    if (!encoder_->encode(image, packets_)) {
+        failed_ = true;
+        return false;
+    }
+    ++frames_;
+    return true;
+#else
+    (void)image;
+    return false;
+#endif
+}
+
+std::vector<uint8_t> IncrementalWebmEncoder::finalize(const sd_audio_t* audio, int quality) {
+#ifdef SD_USE_VPX
+    if (failed_ || encoder_ == nullptr || frames_ == 0) {
+        return {};
+    }
+    if (!encoder_->finish(packets_) || static_cast<int>(packets_.size()) != frames_) {
+        fprintf(stderr, "Error: incremental VP9 encoder did not emit one packet per frame.\n");
+        return {};
+    }
+    encoder_.reset();
+    return mux_webm(nullptr, &packets_, frames_, width_, height_, fps_, quality, audio);
+#else
+    (void)audio; (void)quality;
+    return {};
+#endif
+}
+
+IncrementalWebmEncoder::IncrementalWebmEncoder()  = default;
+IncrementalWebmEncoder::~IncrementalWebmEncoder() = default;

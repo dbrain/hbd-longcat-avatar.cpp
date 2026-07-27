@@ -621,6 +621,16 @@ typedef struct {
                        const sd_audio_t* audio,
                        void* user);
     void* on_segment_user;
+    // WINDOWED STREAMING FINALIZE.  Set this and the chain stops accumulating the whole decoded
+    // timeline in host RAM: everything older than the small suffix a future seam op can still
+    // reach into is handed over here, IN ORDER, as it becomes final.  Peak frame memory drops
+    // from the entire clip to roughly one segment plus that suffix, which is the difference
+    // between ~14 GB and ~200 MB on a 3.5-minute 1280x704 chain (and ~32 GB at 1920x1088).
+    //
+    // The callee TAKES OWNERSHIP of each frame's .data and must free it.  Leaving this null keeps
+    // the historical accumulate-everything behaviour, so existing callers are unaffected.
+    void (*on_flush_frames)(const sd_image_t* frames, int frame_count, void* user);
+    void* on_flush_frames_user;
     // Re-render one durable banked shot in place.  `enable_retake` is separate
     // so legacy zero-initialized chain structs retain their ordinary behavior;
     // set it whenever retake_segment is supplied (including segment zero).
