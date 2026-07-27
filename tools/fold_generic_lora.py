@@ -13,6 +13,37 @@ LoRA key convention (matches the engine's native convention, verified on lipdub 
 fal audio-reactive): keys are `<prefix><layer>.lora_A.weight` / `.lora_B.weight`,
 delta[out,in] = scale * (B @ A), B=lora_B[out,r], A=lora_A[r,in].
 
+=============================== .wglobal / UNITS ===============================
+CRITICAL, and the cause of a whole family of silently-inert folds (2026-07-16..27).
+
+There are TWO on-disk nvfp4 conventions and they need DIFFERENT arithmetic:
+
+  FOLDED (legacy, 4444 tensors, no `.wglobal`):
+      true_weight == dequant_block(...)
+      The ModelOpt per-tensor global (weight_scale_2) is baked into the per-16 e4m3
+      block scale. dq(base) is already in TRUE weight units, so a LoRA delta — which
+      is always in true units — is added directly. fold_lipdub_lora.py assumed this
+      and was CORRECT for its inputs.
+
+  UNFOLDED (current, 5788 tensors, one `<weight>.wglobal` F32 sidecar per nvfp4
+  tensor — see import_ltx_nvfp4.py):
+      true_weight == dequant_block(...) * wglobal          (wglobal ~= 5e-5 .. 5e-4)
+      The global is kept OUT of the block scale (folding it underflows ~85% of blocks
+      into e4m3 subnormals = the patchy-colour bug) and is applied at the GEMM as
+      `out = ggml_mul(out, wglobal)` (ggml_extend.hpp:4330).
+      dq(base) is therefore ~2000-19000x LARGER than the true weight. Adding a
+      true-units delta straight onto it attenuates the delta by wglobal, making the
+      fold a NO-OP: measured 0.0003%-0.018% of one quantisation step, i.e. 0.0000%
+      of elements change.
+
+This tool now reads the `.wglobal` sidecars and converts the delta into whichever
+domain the base file uses:  W_block += delta_true / wglobal   (wglobal defaults to
+1.0 when absent, preserving the legacy behaviour exactly).
+
+ALWAYS run tools/verify_fold.py on the output before deploying. Coverage counts
+("480/480 folded") measure targets, not effect.
+===============================================================================
+
 See fold_lipdub_lora.py's docstring for WHY we fold onto dq(base), not bf16.
 Usage:
   python3 tools/fold_generic_lora.py \
@@ -25,6 +56,7 @@ import sys, os, json, struct, shutil, argparse
 import numpy as np
 
 GT_NVFP4 = 40
+GT_F32 = 0
 
 # ---------- primitives (byte-identical to fold_lipdub_lora.py) ----------
 def st_open(p):
@@ -115,6 +147,25 @@ def main():
     nvfp4 = [(n, d, o) for (n, d, t, o) in infos if t == GT_NVFP4]
     print(f"base: {args.base}\n  {len(infos)} tensors, {len(nvfp4)} nvfp4, data_start={data_start}")
 
+    # ---- .wglobal sidecars: decide which domain dq(base) is in (see docstring) ----
+    wg_off = {n[:-len('.wglobal')]: o for (n, d, t, o) in infos
+              if t == GT_F32 and n.endswith('.wglobal')}
+    wglobals = {}
+    if wg_off:
+        with open(args.base, 'rb') as fw:
+            for stem, o in wg_off.items():
+                fw.seek(data_start + o)
+                wglobals[stem] = struct.unpack('<f', fw.read(4))[0]
+    if wglobals:
+        vals = np.array(list(wglobals.values()), dtype=np.float64)
+        print(f"  convention: UNFOLDED — {len(wglobals)} .wglobal sidecars "
+              f"(min={vals.min():.3e} max={vals.max():.3e}); delta will be divided by wglobal")
+        bad = [k for k, v in wglobals.items() if not np.isfinite(v) or v == 0.0]
+        if bad:
+            sys.exit(f"FATAL: {len(bad)} .wglobal are zero/non-finite, e.g. {bad[:3]}")
+    else:
+        print("  convention: FOLDED (legacy) — no .wglobal; dq(base) is already in true units")
+
     fl, bl, hl = st_open(args.lora)
     lora_mods = set()
     for k in hl:
@@ -156,6 +207,7 @@ def main():
     fbase = open(args.base, 'rb')
     o = open(args.out, 'r+b')
     done = 0
+    changed_frac = []      # per-tensor % of elements whose DEQUANTISED value moved
     for (name, dims, off, ka, kb) in targets:
         inn, out = dims[0], dims[1]; nblk = inn // 64; nbytes = out * nblk * 36
         r = hl[ka]['shape'][0]                                                # dynamic rank
@@ -164,17 +216,38 @@ def main():
         Wcl = dequant_block(raw, out, inn, nblk)                             # base = dq(base)
         A = bf16_to_f32(st_raw(fl, bl, hl, ka)[0].view(np.uint16)).reshape(r, inn)
         B = bf16_to_f32(st_raw(fl, bl, hl, kb)[0].view(np.uint16)).reshape(out, r)
-        delta = (args.scale * (B @ A)).astype(np.float32)                    # [out,in]
+        delta = (args.scale * (B @ A)).astype(np.float32)                    # [out,in], TRUE units
+        if wglobals:
+            if name not in wglobals:
+                sys.exit(f"FATAL: {name} is nvfp4 and the file has .wglobal sidecars, "
+                         f"but this tensor has none — refusing to fold in an unknown domain")
+            delta = delta / np.float32(wglobals[name])                       # -> block domain
         Wm = (Wcl + delta).astype(np.float64)
         nib, byte = quant_folded(Wm, out, inn)
         data = pack(nib, byte, out, inn)
         assert len(data) == nbytes, f"{name}: {len(data)} vs {nbytes}"
         o.seek(data_start + off); o.write(data)
+
+        # effect check: compare DEQUANTISED values, not bytes (+0/-0 codes are redundant)
+        nib0, byte0 = quant_folded(Wcl.astype(np.float64), out, inn)
+        v0 = e2m1_decode(nib0) * np.repeat(e4m3_dec_byte(byte0), 16, axis=1)
+        v1 = e2m1_decode(nib) * np.repeat(e4m3_dec_byte(byte), 16, axis=1)
+        changed_frac.append(float((v0 != v1).mean()) * 100.0)
+
         done += 1
         if done % 200 == 0:
-            print(f"  ...{done}/{len(targets)}")
+            print(f"  ...{done}/{len(targets)}  (running mean changed = {np.mean(changed_frac):.3f}%)")
     o.close(); fbase.close()
+
+    cf = np.array(changed_frac)
     print(f"wrote {args.out} ({os.path.getsize(args.out)} bytes); folded {done} nvfp4 tensors @ scale {args.scale}")
+    print(f"EFFECT: dequantised elements changed — mean {cf.mean():.4f}%  "
+          f"median {np.median(cf):.4f}%  min {cf.min():.4f}%  max {cf.max():.4f}%")
+    if cf.mean() < 0.01:
+        print("*** FAIL: this fold is a NO-OP. The weights did not move. Do NOT deploy. ***")
+        print("*** Check the .wglobal/units domain and the --scale. See verify_fold.py. ***")
+        sys.exit(2)
+    print("run tools/verify_fold.py on this output before deploying.")
 
 if __name__ == '__main__':
     main()
