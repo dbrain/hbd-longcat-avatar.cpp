@@ -538,7 +538,8 @@ std::string WorkerSupervisor::request_gpu(const httplib::Request& request) {
 bool WorkerSupervisor::proxy(const httplib::Request& request,
                              httplib::Response& response,
                              const std::string& requested_model) {
-    if (draining() && is_generation_request(request)) {
+    const bool generation = is_generation_request(request);
+    if (draining() && generation) {
         response.status = 503;
         response.set_content(R"({"error":"service draining — not accepting new generation requests"})", "application/json");
         return true;
@@ -547,7 +548,7 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
         std::atomic<int>* counter = nullptr;
         ~ActiveGenerationGuard() { if (counter != nullptr) counter->fetch_sub(1); }
     } active_guard;
-    if (is_generation_request(request)) {
+    if (generation) {
         active_generation_requests_.fetch_add(1);
         active_guard.counter = &active_generation_requests_;
     } else if (!loaded()) {
@@ -564,11 +565,43 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
     int worker_port = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::string error;
-        if (!ensure_worker_locked(requested_model, request_gpu(request), error)) {
-            response.status = error == "model or GPU switch requires the active worker to be idle" ? 409 : 503;
-            response.set_content(json({{"error", "worker unavailable"}, {"message", error}}).dump(), "application/json");
-            return true;
+        reap_exited_locked();
+        // Only a GENERATION request may move the worker between DiT variants or
+        // cards.  A status/media poll carries neither field — request_model() and
+        // request_gpu() both return early for non-POST — so resolving one through
+        // ensure_worker_locked() compares the RUNNING worker against the spawn
+        // DEFAULTS rather than against anything the caller asked for.  Whenever
+        // Koblem's GPU gate placed the worker via the per-request `gpu` field and
+        // that UUID differs from WORKER_DEFAULT_GPU (unset counts: the fallback is
+        // then ""), every poll for the life of that render read as a pending GPU
+        // switch and was answered 409 "requires the active worker to be idle".
+        // Observed 2026-07-27: ltx-video recreated without docker-compose.override.yml
+        // lost WORKER_DEFAULT_GPU, so the render ran to completion on the GPU while
+        // Koblem 409'd on all 20 poll attempts and abandoned the job.
+        //
+        // A poll must therefore attach to whatever worker is already up.  Cold
+        // start stays a generation-only privilege: the !loaded() check above is
+        // unlocked, so a worker that exits (or is evicted by the gate) in the
+        // window before we take the mutex would otherwise fall through to
+        // ensure_worker_locked() and let a poll spawn a fresh CUDA child —
+        // precisely the residency violation that 410 exists to prevent.  Re-test
+        // it here, where the answer cannot go stale.
+        if (!generation) {
+            if (pid_ <= 0) {
+                response.status = 410;
+                response.set_content(
+                    R"({"error":"worker is unloaded; submit a new generation request to start it"})",
+                    "application/json");
+                return true;
+            }
+        } else {
+            std::string error;
+            if (!ensure_worker_locked(requested_model, request_gpu(request), error)) {
+                response.status = error == "model or GPU switch requires the active worker to be idle" ? 409 : 503;
+                response.set_content(json({{"error", "worker unavailable"}, {"message", error}}).dump(),
+                                     "application/json");
+                return true;
+            }
         }
         worker_port = port_;
     }
