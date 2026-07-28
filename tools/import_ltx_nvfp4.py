@@ -98,6 +98,10 @@ infos=[]
 for _ in range(nt):
     kl=struct.unpack('<Q',f.read(8))[0];name=f.read(kl).decode();nd=struct.unpack('<I',f.read(4))[0]
     dims=[struct.unpack('<Q',f.read(8))[0] for _ in range(nd)];tt=struct.unpack('<I',f.read(4))[0];off=struct.unpack('<Q',f.read(8))[0]
+    # A SRC gguf produced by THIS tool already carries the per-tensor .wglobal sidecars. They are
+    # ours, not official's (no such key exists in the ModelOpt safetensors), and the wglobals loop
+    # below re-emits one per nvfp4 tensor — so drop them here or the official lookup asserts.
+    if name.endswith('.wglobal'): nt-=1; continue
     infos.append([name,dims])
 
 def nbytes_of(tt,dims):

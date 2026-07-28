@@ -199,6 +199,7 @@ def nbytes_of(tt, dims):
 plan = []
 hist = collections.Counter()
 missing = []
+n_ws_from_file = 0   # how many per-tensor scales came from the file vs bf16-amax recovery
 wglobals = {}   # bare weight name -> recovery scale (amax(|bf16|)/448); folded into the FP8 GEMM A-scale
 for name, dims in infos:
     if name.endswith('.wglobal'):
@@ -222,8 +223,20 @@ for name, dims in infos:
     plan.append((name, oname, dims, ot, dt))
     hist[ot] += 1
     if ot == GT_F8_E4M3:
-        amax = bf16_amax(oname)
-        wglobals[name] = (amax / FP8_E4M3_MAX) if amax > 0.0 else 1.0
+        # Lightricks' OFFICIAL fp8 release (Lightricks/LTX-2.3-fp8) is a ModelOpt-style export
+        # and ships the exact per-tensor `<name>.weight_scale` alongside each fp8 weight.
+        # ComfyUI's dev-fp8 does NOT (its scale lives in a runtime Params object), which is why
+        # this tool recovers amax(|bf16|)/448 from the original checkpoint. Prefer the file's own
+        # scale whenever it is present: the recovery is only accurate to ~0.3% (measured ratio
+        # 0.9975..1.0031 on the official distilled-fp8), and that error lands straight on the
+        # GEMM A-scale.
+        wsk = oname.replace('.weight', '.weight_scale')
+        if wsk in ho:
+            wglobals[name] = float(st_raw(fo, bo, ho, wsk)[0].view(np.float32).ravel()[0])
+            n_ws_from_file += 1
+        else:
+            amax = bf16_amax(oname)
+            wglobals[name] = (amax / FP8_E4M3_MAX) if amax > 0.0 else 1.0
 
 if missing:
     print(f"[WARN] {len(missing)} SRC tensors missing from fp8 safetensors (first 10): {missing[:10]}")
@@ -236,6 +249,7 @@ for wname in wglobals:
 nt_out = len(plan)
 _sc = np.array(list(wglobals.values()), dtype=np.float64) if wglobals else np.array([1.0])
 print(f"plan: {nt_out} tensors  |  F8_E4M3={hist[GT_F8_E4M3]}  F16={hist[GT_F16]}  F32={hist[GT_F32]}  wglobal={len(wglobals)}")
+print(f"wglobal source: {n_ws_from_file} from file weight_scale, {len(wglobals)-n_ws_from_file} from bf16 amax/448")
 print(f"wglobal scale stats: min={_sc.min():.6g}  median={np.median(_sc):.6g}  max={_sc.max():.6g}  mean={_sc.mean():.6g}")
 
 def build_data(name, oname, dims, ot, dt):
