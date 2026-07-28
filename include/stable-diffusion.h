@@ -710,6 +710,18 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
 // before the replacement is registered.
 SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_model_path);
 
+// Re-apply the runtime LoRA set on an already-loaded context, REPLACING whatever is active
+// (pass lora_count = 0 to clear). Same serialization requirement as the DiT swap above: the
+// caller must not have generation in flight.
+//
+// Exists so a chain can vary adapters PER SEGMENT the way it already varies the DiT variant.
+// Safe to call repeatedly: apply_loras_at_runtime() clears set_loras/runtime_lora_models and
+// the adapters before rebuilding, so this is a replace and not an accumulate.
+//
+// NOTE the asymmetry with the DiT swap: a variant swap re-registers weights, but an adapter
+// change only rebuilds the MultiLoraAdapter, so it is far cheaper (~1s measured vs ~4s).
+SD_API bool sd_ctx_apply_loras(sd_ctx_t* sd_ctx, const sd_lora_t* loras, uint32_t lora_count);
+
 // ControlNet hot-swap APIs are not safe to call while generation is in flight.
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);
 SD_API bool sd_ctx_unload_control_net(sd_ctx_t* sd_ctx);

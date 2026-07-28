@@ -22,32 +22,83 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// Per-segment DiT variant AND runtime-LoRA state for one chain. Both ride the SAME
+// `chain.before_segment` hook, because that hook is a plain bool(int, void*) with nothing
+// model-specific about it. Either array may be empty; whichever is populated is leased.
+using LTXLoraSet = std::vector<std::pair<std::string, float>>;   // resolved full path -> multiplier
+
 struct LTXModelLease {
     ServerRuntime* runtime = nullptr;
     const std::vector<std::string>* models = nullptr;
+    // Per-segment adapter sets. A non-empty entry REPLACES the request's top-level set for that
+    // segment (it does not add to it), so a segment can also drop an inherited adapter by
+    // naming a different set. An EMPTY entry means "inherit", i.e. leave whatever is active.
+    const std::vector<LTXLoraSet>* loras = nullptr;
     std::map<std::string, std::string> variants;
     std::string active;
+    // What the adapter stack currently holds, so an unchanged segment costs nothing. Seeded by
+    // the caller with the request's top-level set (see the chain wiring below), otherwise the
+    // first segment would re-apply an identical stack for ~1s of nothing.
+    LTXLoraSet active_loras;
     std::string error;
 };
 
+// Apply one segment's adapter set, if it differs from what is resident. Split out so the
+// end-of-chain restore can reuse it verbatim rather than duplicating the sd_lora_t marshalling.
+bool apply_ltx_lora_set(LTXModelLease* lease, const LTXLoraSet& wanted) {
+    if (wanted == lease->active_loras) return true;
+    std::vector<sd_lora_t> specs;
+    specs.reserve(wanted.size());
+    for (const auto& [path, multiplier] : wanted) {
+        sd_lora_t spec{};
+        spec.path          = path.c_str();
+        spec.multiplier    = multiplier;
+        spec.is_high_noise = false;
+        specs.push_back(spec);
+    }
+    // Empty set is legal and meaningful: it CLEARS the adapters for this segment.
+    if (!sd_ctx_apply_loras(lease->runtime->sd_ctx, specs.empty() ? nullptr : specs.data(),
+                            static_cast<uint32_t>(specs.size()))) {
+        lease->error = "could not apply LTX segment LoRAs";
+        return false;
+    }
+    lease->active_loras = wanted;
+    return true;
+}
+
 bool lease_ltx_segment_model(int segment, void* user) {
     auto* lease = static_cast<LTXModelLease*>(user);
-    if (lease == nullptr || lease->runtime == nullptr || lease->models == nullptr ||
-        segment < 0 || static_cast<size_t>(segment) >= lease->models->size()) {
+    if (lease == nullptr || lease->runtime == nullptr || segment < 0) {
         return false;
     }
-    const std::string& wanted = (*lease->models)[segment];
-    if (wanted.empty() || wanted == lease->active) return true;
-    const auto variant = lease->variants.find(wanted);
-    if (variant == lease->variants.end()) {
-        lease->error = "unknown LTX segment model variant '" + wanted + "'";
-        return false;
+    // The DiT variant first: swapping weights rebuilds the runner, and an adapter is bound to
+    // the model it was applied to, so re-applying AFTER the swap is the only safe order.
+    if (lease->models != nullptr && static_cast<size_t>(segment) < lease->models->size()) {
+        const std::string& wanted = (*lease->models)[segment];
+        if (!wanted.empty() && wanted != lease->active) {
+            const auto variant = lease->variants.find(wanted);
+            if (variant == lease->variants.end()) {
+                lease->error = "unknown LTX segment model variant '" + wanted + "'";
+                return false;
+            }
+            if (!sd_ctx_swap_diffusion_model(lease->runtime->sd_ctx, variant->second.c_str())) {
+                lease->error = "could not load LTX segment model variant '" + wanted + "'";
+                return false;
+            }
+            lease->active = wanted;
+            // A variant swap re-registers the DiT weights, so the adapter stack that was bound
+            // to the outgoing model is gone. Forget it, or the next comparison would wrongly
+            // conclude the wanted set is already resident and skip re-applying it.
+            lease->active_loras.clear();
+        }
     }
-    if (!sd_ctx_swap_diffusion_model(lease->runtime->sd_ctx, variant->second.c_str())) {
-        lease->error = "could not load LTX segment model variant '" + wanted + "'";
-        return false;
+    if (lease->loras != nullptr && static_cast<size_t>(segment) < lease->loras->size()) {
+        const LTXLoraSet& wanted = (*lease->loras)[segment];
+        // Empty entry = inherit whatever is active (the top-level set, or the previous shot's).
+        if (!wanted.empty() && !apply_ltx_lora_set(lease, wanted)) {
+            return false;
+        }
     }
-    lease->active = wanted;
     return true;
 }
 
@@ -835,10 +886,18 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             LTXModelLease model_lease;
             model_lease.runtime = &runtime;
             model_lease.models = &job.ltx_segment_models;
+            model_lease.loras = &job.ltx_segment_loras;
             model_lease.variants = runtime_diffusion_model_variants(runtime);
             model_lease.active = job.ltx_default_model;
-            chain.before_segment = job.ltx_segment_models.empty() ? nullptr : lease_ltx_segment_model;
-            chain.before_segment_user = job.ltx_segment_models.empty() ? nullptr : &model_lease;
+            // Seed with the request's TOP-LEVEL adapter stack, which sd_vid_gen_params already
+            // applied before the chain started. Without this the first segment that names the
+            // same set would re-apply an identical stack for ~1s of nothing.
+            model_lease.active_loras = job.ltx_default_loras;
+            // One hook serves both knobs; arm it if EITHER array is populated.
+            const bool lease_per_segment =
+                !job.ltx_segment_models.empty() || !job.ltx_segment_loras.empty();
+            chain.before_segment = lease_per_segment ? lease_ltx_segment_model : nullptr;
+            chain.before_segment_user = lease_per_segment ? &model_lease : nullptr;
             chain.on_segment = write_segment_previews ? write_segment_preview : nullptr;
             chain.on_segment_user = write_segment_previews ? &segment_writer : nullptr;
             // STREAM the timeline out instead of accumulating it. A 3.5-minute 1280x704 chain
@@ -870,6 +929,19 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                     !sd_ctx_swap_diffusion_model(runtime.sd_ctx, default_variant->second.c_str())) {
                     generated = false;
                     error_message = "could not restore LTX default model variant '" + job.ltx_default_model + "'";
+                } else {
+                    // The swap dropped the adapter stack with the outgoing DiT, so the restore
+                    // below must re-apply rather than compare against a stale record.
+                    model_lease.active_loras.clear();
+                }
+            }
+            // Same contract for the adapters: a per-shot override must not leak into the next
+            // request. Restoring to the job's TOP-LEVEL set (not to empty) is what makes the
+            // next job's first render match a fresh worker's.
+            if (!job.ltx_segment_loras.empty() && !apply_ltx_lora_set(&model_lease, job.ltx_default_loras)) {
+                generated = false;
+                if (error_message.empty()) {
+                    error_message = "could not restore LTX default runtime LoRAs";
                 }
             }
             if (!generated && error_message.empty() && !model_lease.error.empty()) {

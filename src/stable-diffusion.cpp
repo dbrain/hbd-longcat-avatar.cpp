@@ -4380,6 +4380,19 @@ SD_API bool sd_ctx_swap_diffusion_model(sd_ctx_t* sd_ctx, const char* diffusion_
            sd_ctx->sd->swap_diffusion_model(diffusion_model_path);
 }
 
+SD_API bool sd_ctx_apply_loras(sd_ctx_t* sd_ctx, const sd_lora_t* loras, uint32_t lora_count) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    if (lora_count > 0 && loras == nullptr) {
+        return false;
+    }
+    // apply_loras() tolerates an empty set: apply_loras_at_runtime() clears the adapters and
+    // returns early, which is exactly how a segment drops an inherited adapter.
+    sd_ctx->sd->apply_loras(loras, lora_count);
+    return true;
+}
+
 SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode) {
     if (sd_ctx && sd_ctx->sd) {
         if (mode < SD_CANCEL_ALL || mode > SD_CANCEL_RESET) {

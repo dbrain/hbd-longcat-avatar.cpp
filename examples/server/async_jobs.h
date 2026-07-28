@@ -76,6 +76,15 @@ struct AsyncGenerationJob {
     // only at core-provided segment boundaries.
     std::vector<std::string> ltx_segment_models;
     std::string ltx_default_model = "base";
+    // Per-segment runtime LoRAs, already resolved to full on-disk paths by the route (so the
+    // worker never re-resolves a caller-supplied name). Entry i empty => segment i inherits
+    // whatever is active; non-empty REPLACES the set for that segment. Rides the same
+    // `chain.before_segment` hook as ltx_segment_models.
+    std::vector<std::vector<std::pair<std::string, float>>> ltx_segment_loras;
+    // The request's top-level adapter stack, resolved the same way. Used to seed the lease (so
+    // an unchanged first segment costs nothing) and to restore after the chain, so a per-shot
+    // override cannot leak into the next job on this worker.
+    std::vector<std::pair<std::string, float>> ltx_default_loras;
     // Top-level V2V selector is retained separately because SDGenerationParams
     // deliberately has no LTX-specific transport fields.  Mode 0 is LipDub.
     int ltx_v2v_mode = 0;

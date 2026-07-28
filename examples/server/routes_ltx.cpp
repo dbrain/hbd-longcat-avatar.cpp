@@ -242,6 +242,8 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
             std::vector<std::string> prompts;
             std::vector<std::string> segment_models;
+            // Per-segment runtime LoRAs, resolved here to full paths (empty entry = inherit).
+            std::vector<std::vector<std::pair<std::string, float>>> segment_loras;
             std::vector<int> segment_frames;
             std::vector<int> segment_scene_cuts;
             std::vector<std::string> segment_init_images;
@@ -269,6 +271,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     if (segment.is_string()) {
                         prompts.push_back(segment.get<std::string>());
                         segment_models.emplace_back();
+                        segment_loras.emplace_back();   // keep per-segment arrays aligned
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
@@ -291,6 +294,36 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             return;
                         }
                         segment_models.push_back(segment.value("model", std::string()));
+                        // Per-shot adapters. Same object shape as the request-root `lora`
+                        // array, and resolved through the SAME cache, so a bare stem (no
+                        // extension) hard-fails here instead of silently rendering the shot
+                        // without its adapter.
+                        std::vector<std::pair<std::string, float>> seg_loras;
+                        if (segment.contains("lora") && !segment["lora"].is_null()) {
+                            if (!segment["lora"].is_array()) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"each LTX segment lora must be an array"})", "application/json");
+                                return;
+                            }
+                            for (const auto& item : segment["lora"]) {
+                                if (!item.is_object()) {
+                                    res.status = 400;
+                                    res.set_content(R"({"error":"each LTX segment lora entry must be an object"})", "application/json");
+                                    return;
+                                }
+                                const std::string lora_path = item.value("path", std::string());
+                                const std::string resolved = lora_path.empty() ? std::string()
+                                                                               : get_lora_full_path(*runtime, lora_path);
+                                if (resolved.empty()) {
+                                    res.status = 400;
+                                    res.set_content(json({{"error", "unknown LTX segment lora '" + lora_path + "'"}}).dump(),
+                                                    "application/json");
+                                    return;
+                                }
+                                seg_loras.emplace_back(resolved, item.value("multiplier", 1.0f));
+                            }
+                        }
+                        segment_loras.push_back(std::move(seg_loras));
                         const int frames = segment.value("frames", 0);
                         if (frames < 0 || (frames > 0 && (frames - 1) % 8 != 0)) {
                             res.status = 400;
@@ -473,6 +506,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     if (prompt.is_string()) {
                         prompts.push_back(prompt.get<std::string>());
                         segment_models.emplace_back();
+                        segment_loras.emplace_back();   // keep per-segment arrays aligned
                         segment_frames.push_back(0);
                         segment_scene_cuts.push_back(0);
                         segment_init_images.emplace_back();
@@ -827,6 +861,17 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_prompts = std::move(prompts);
             job->ltx_segment_models = std::move(segment_models);
             job->ltx_default_model = default_model;
+            // Only carry the per-segment adapter arrays when at least one shot actually names
+            // a set — an all-empty array would arm the before_segment hook for nothing.
+            if (std::any_of(segment_loras.begin(), segment_loras.end(),
+                            [](const auto& set) { return !set.empty(); })) {
+                job->ltx_segment_loras = std::move(segment_loras);
+            }
+            // The already-resolved top-level stack, so the lease can seed from it and restore
+            // to it after the chain.
+            for (const auto& [path, multiplier] : request.gen_params.lora_map) {
+                job->ltx_default_loras.emplace_back(path, multiplier);
+            }
             job->ltx_segment_frames = std::move(segment_frames);
             job->ltx_segment_scene_cuts = std::move(segment_scene_cuts);
             job->ltx_segment_init_images = std::move(segment_init_images);
