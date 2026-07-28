@@ -21,6 +21,7 @@ Usage:
 import sys, json, struct, argparse
 import numpy as np
 
+GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
 QK8_0 = 32
 
@@ -109,11 +110,21 @@ def main():
 
     def load_q8(name):
         ne, tt, off = infos[name]
-        assert tt == GGML_TYPE_Q8_0, f"{name}: type {tt} != Q8_0"
-        nb = int(np.prod(ne)) // QK8_0 * (2 + QK8_0)
-        fg.seek(dstart + off)
-        raw = bytearray(fg.read(nb))
-        w = dequant_q8(bytes(raw), ne)
+        assert tt in (GGML_TYPE_Q8_0, GGML_TYPE_F16), f"{name}: type {tt} not Q8_0/F16"
+        n = int(np.prod(ne))
+        if tt == GGML_TYPE_F16:
+            fg.seek(dstart + off)
+            w = np.frombuffer(fg.read(n * 2), dtype=np.float16).astype(np.float64)
+            w = w.reshape(ne[1], ne[0]) if len(ne) > 1 else w
+            # F16 has 5 exponent bits vs BF16's 8: in-range values gain precision (10 vs 7
+            # mantissa bits) but anything past +-65504 saturates and denormals below ~6e-8
+            # flush. LoRA weights sit around 1e-3 so both are far away — but CHECK, don't assume.
+            if not np.isfinite(w).all():
+                raise AssertionError(f"{name}: non-finite after F16 cast (BF16 range overflow)")
+        else:
+            nb = n // QK8_0 * (2 + QK8_0)
+            fg.seek(dstart + off)
+            w = dequant_q8(fg.read(nb), ne)
         if a.corrupt and name.endswith('.lora_B.weight'):
             if a.corrupt == 'inert':
                 w = np.zeros_like(w)

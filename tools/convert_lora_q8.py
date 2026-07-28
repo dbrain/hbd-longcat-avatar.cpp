@@ -38,9 +38,19 @@ Usage:
 import sys, json, struct, argparse
 import numpy as np
 
+GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
 QK8_0 = 32
 ALIGN = 32
+
+# WHY --dtype f16 EXISTS (perf, not size):
+# ggml_ext_linear's fast path is self-gated on `w->type == GGML_TYPE_NVFP4` (ggml_extend.hpp:1039),
+# so the BASE Linear runs cuBLASLt FP4 on tensor cores with an F16 dst, while a Q8_0 LoRA falls to
+# ggml's generic quantised mul_mat at F32 dst — no tensor cores. At 1920x1088 the LoRA is only
+# ~3.1% of the FLOPs (rank 64, M=38760, K=N=4096) yet costs ~23.6% of sampling: a ~7.6x throughput
+# gap. F16 src0 goes through cuBLAS GEMM instead, which does use tensor cores. Costs ~2x the VRAM
+# of Q8_0 (still ~half of BF16 for a 2-byte type... identical, in fact — F16 and BF16 are both
+# 2 bytes, so this is purely Q8_0's 2x saving given back in exchange for the faster path).
 
 
 def st_open(p):
@@ -79,6 +89,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('src')
     ap.add_argument('out')
+    ap.add_argument('--dtype', choices=['q8_0', 'f16'], default='q8_0',
+                    help='q8_0 = smallest (0.4%% error); f16 = 2x the size but lands on a '
+                         'tensor-core GEMM path instead of ggml quantised mul_mat')
     a = ap.parse_args()
 
     fs_, base, h = st_open(a.src)
@@ -90,15 +103,21 @@ def main():
         shp = h[name]['shape']
         # safetensors is row-major [d0, d1, ...]; ggml ne is reversed, so ne[0] = last dim
         ne = list(reversed(shp))
-        if len(ne) == 2 and ne[0] % QK8_0 == 0:
+        if a.dtype == 'f16':
+            plan.append((name, ne, GGML_TYPE_F16)); n_q8 += 1
+        elif len(ne) == 2 and ne[0] % QK8_0 == 0:
             plan.append((name, ne, GGML_TYPE_Q8_0)); n_q8 += 1
         else:
             plan.append((name, ne, 0)); n_f32 += 1   # F32 fallback (never hit for these LoRAs)
-    print(f"plan: {n_q8} Q8_0 + {n_f32} F32 = {len(plan)} tensors")
+    print(f"plan: {n_q8} {a.dtype.upper()} + {n_f32} F32 = {len(plan)} tensors")
 
     def nbytes_of(tt, ne):
         n = int(np.prod(ne))
-        return (n // QK8_0) * (2 + QK8_0) if tt == GGML_TYPE_Q8_0 else n * 4
+        if tt == GGML_TYPE_Q8_0:
+            return (n // QK8_0) * (2 + QK8_0)
+        if tt == GGML_TYPE_F16:
+            return n * 2
+        return n * 4
 
     o = open(a.out, 'wb')
     o.write(b'GGUF')
@@ -123,7 +142,12 @@ def main():
         raw = np.frombuffer(fs_.read(b0 - a0), dtype=np.uint8)
         x = bf16_to_f32(raw) if m['dtype'] == 'BF16' else raw.view(np.float32)
         x = x.reshape(m['shape'])
-        data = quantize_q8_0(x) if tt == GGML_TYPE_Q8_0 else np.ascontiguousarray(x, dtype=np.float32).tobytes()
+        if tt == GGML_TYPE_Q8_0:
+            data = quantize_q8_0(x)
+        elif tt == GGML_TYPE_F16:
+            data = np.ascontiguousarray(x, dtype=np.float16).tobytes()
+        else:
+            data = np.ascontiguousarray(x, dtype=np.float32).tobytes()
         nb = nbytes_of(tt, ne)
         assert len(data) == nb, f"{name}: {len(data)} vs {nb}"
         o.write(data); o.write(b'\x00' * ((-len(data)) % ALIGN))
