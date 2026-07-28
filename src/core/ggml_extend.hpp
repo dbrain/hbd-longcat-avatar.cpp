@@ -1191,15 +1191,43 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
     if (cudnn_conv == nullptr) {
         cudnn_conv = std::getenv("GGML_CUDNN_CONV");
     }
-    const bool use_cudnn = cudnn_conv != nullptr && std::atoi(cudnn_conv) != 0 &&
-                           !force_prec_f32 && s0 == 1 && s1 == 1 && s2 == 1 &&
-                           d0 == 1 && d1 == 1 && d2 == 1;
+    // GGML_CUDNN_CONV3D asks for the fused GGML_OP_CONV_3D node instead of im2col+mul_mat.
+    // The env var alone is NOT sufficient authority to emit it: GGML_OP_CONV_3D has exactly
+    // one CUDA implementation, ggml_cuda_op_conv3d_cudnn, and ggml-cuda.cu:2359 does
+    //     if (!ggml_cuda_op_conv3d_cudnn(ctx, dst)) GGML_ABORT(...)
+    // -- there is no non-cuDNN CUDA kernel to fall back to. In a build configured without
+    // GGML_CUDNN that function is the `#else` stub and returns false for EVERY node, and the
+    // wrapper also returns false for a dtype/weight-layout it cannot take. Either way the
+    // decode dies on abort(), which surfaces as exit 139 with no [ERROR] line, because the VAE
+    // graph is handed straight to the backend (GGMLRunner::execute_graph ->
+    // ggml_backend_graph_compute) with no ggml_backend_sched in between -- so nothing ever
+    // consults supports_op and reroutes the node. Ask the backend ourselves, per node.
+    const bool want_cudnn = cudnn_conv != nullptr && std::atoi(cudnn_conv) != 0 &&
+                            !force_prec_f32 && s0 == 1 && s1 == 1 && s2 == 1 &&
+                            d0 == 1 && d1 == 1 && d2 == 1;
     auto conv_once = [&](ggml_tensor* xin, int p0u, int p1u) -> ggml_tensor* {
-        if (use_cudnn) {
+        // The IC divisibility tests mirror the wrapper's own structural guards
+        // (kernel->ne[3] == c*oc, input->ne[3] == c*n); supports_op does not check them, and
+        // violating either is an unconditional reject -> abort at execution time.
+        if (want_cudnn && IC > 0 && w->ne[3] % IC == 0 && xin->ne[3] % IC == 0) {
             const int64_t OC = w->ne[3] / IC;
             const int64_t N  = xin->ne[3] / IC;
-            return ggml_conv_3d_direct(ctx, w, xin, s0, s1, s2, p0u, p1u, p2, d0, d1, d2,
-                                       (int) IC, (int) N, (int) OC, cudnn_hi_prec ? 1 : 0);
+            auto direct      = ggml_conv_3d_direct(ctx, w, xin, s0, s1, s2, p0u, p1u, p2, d0, d1, d2,
+                                                   (int) IC, (int) N, (int) OC, cudnn_hi_prec ? 1 : 0);
+            // backend == nullptr: nothing to ask, so keep the historical behaviour rather than
+            // silently changing the graph for a caller that never had a backend to check.
+            if (backend == nullptr || ggml_backend_supports_op(backend, direct)) {
+                return direct;
+            }
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                LOG_WARN("GGML_CUDNN_CONV3D is set but this backend cannot execute GGML_OP_CONV_3D "
+                         "(built without GGML_CUDNN, or a dtype/layout the cuDNN wrapper rejects); "
+                         "using the im2col conv3d path instead. Emitting the node anyway would abort "
+                         "the run at ggml-cuda.cu:2359 -- there is no CUDA fallback for that op.");
+            }
+            // `direct` is deliberately dropped. It is never wired into the graph, so it is
+            // never allocated and never executed; only its tensor struct stays in the context.
         }
         if (force_prec_f32) {
             ggml_tensor* im2col = ggml_im2col_3d(ctx, w, xin, IC, s0, s1, s2, p0u, p1u, p2, d0, d1, d2, w->type);

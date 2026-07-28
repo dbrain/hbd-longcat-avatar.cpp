@@ -877,6 +877,261 @@ namespace LTXV {
         return temp;
     }
 
+    // ---------------------------------------------------------------------
+    // Relay self-mask, SPATIALLY FOLDED (LTX_RELAY_SELF_MASK_FOLD).
+    // ---------------------------------------------------------------------
+    //
+    // Everything the folded path needs to rebuild the video self-attention with
+    // the frame axis, rather than the token axis, on Q's query dimension. See
+    // ltx_relay.hpp self_mask_fold() for why that is the whole trick. `mask` is
+    // null on every path that has not opted in, and the struct is then never
+    // constructed at all.
+    // LTX_RELAY_SEGMENT_MERGE -- the MASK-FREE key split. See ltx_relay.hpp
+    // build_self_segment_bias() for why a piecewise-constant bias can be replaced by
+    // per-segment unmasked attention plus a log-sum-exp recombination, and for the
+    // measured cost of the mask this exists to avoid.
+    struct SelfSegmentPlan {
+        // First KEY TOKEN of each segment; strictly increasing, [0] == 0, and the last
+        // segment runs to L_k. TASS reference keys sit after the target tokens and are
+        // off the timeline, so when they are present they form their own final segment
+        // with a zero bias column.
+        std::vector<int64_t> start_token;
+        // [F_q, n_seg] F32, contiguous, ne0 == query frame: the constant additive bias
+        // every key in segment s carries for query frame q. Compact and expanded to the
+        // token axis inside each graph-cut segment, exactly like the dense mask -- see
+        // expand_self_frame_bias() for why the expansion is GPU-side.
+        ggml_tensor* bias        = nullptr;
+        int64_t frames           = 0;
+        int64_t tokens_per_frame = 0;
+        int64_t target_tokens    = 0;
+    };
+
+    struct SelfAttnPlan {
+        // LTX_RELAY_SELF_MASK_FOLD.
+        ggml_tensor* mask        = nullptr;  // [L_k, frames*fold] F16, contiguous
+        int64_t fold             = 1;        // m: mask rows per frame
+        int64_t tokens_per_frame = 0;        // W_lat * H_lat
+        int64_t frames           = 0;        // latent frames
+        int64_t target_tokens    = 0;        // frames * tokens_per_frame
+        // LTX_RELAY_SEGMENT_MERGE. Mutually exclusive with `mask` above: the segment
+        // merge exists precisely so that no mask reaches the kernel.
+        const SelfSegmentPlan* segments = nullptr;
+
+        bool active() const { return mask != nullptr || segments != nullptr; }
+    };
+
+    // Video self-attention with the folded mask.
+    //
+    // q/k/v arrive exactly as ggml_ext_attention_ext would receive them --
+    // [n_head*d_head, L, 1], post-RoPE, q already normalised to F32 -- and the
+    // result comes back in the same [C, L, 1] layout, so the caller's gating and
+    // to_out are untouched.
+    //
+    // Query order is preserved by construction: the fold is a pure PERMUTATION of
+    // Q's axes (token == frame*tpf + spatial, spatial == a*(tpf/m) + b, so
+    // (frame, a) is a contiguous outer axis and b an inner one), and the inverse
+    // permutation is applied to the result. No token is reordered relative to any
+    // other; only which axis the kernel calls "query" changes.
+    //
+    // TASS reference tokens sit AFTER the target tokens on the sequence axis and
+    // may carry a different spatial grid (ltxv.hpp:2044-2049), so L is not
+    // guaranteed to factor. They are therefore run as a second, unmasked
+    // attention against the SAME K/V and concatenated back on -- which is what a
+    // zero bias row would have produced anyway.
+    inline ggml_tensor* ltx_folded_self_attention(GGMLRunnerContext* ctx,
+                                                  ggml_tensor* q,
+                                                  ggml_tensor* k,
+                                                  ggml_tensor* v,
+                                                  int64_t n_head,
+                                                  int64_t d_head,
+                                                  const SelfAttnPlan& fold) {
+        ggml_context* gctx = ctx->ggml_ctx;
+        const int64_t C    = n_head * d_head;
+        const int64_t L    = q->ne[1];
+        const int64_t L_k  = k->ne[1];
+        const int64_t T    = fold.target_tokens;
+        const int64_t R    = L - T;
+        const int64_t m    = fold.fold;
+        const int64_t rows = fold.frames * m;          // mask rows == folded query count
+        const int64_t g    = fold.tokens_per_frame / m;  // queries hidden on the head axis
+        const float scale  = 1.0f / std::sqrt((float)d_head);
+
+        // Every reshape below reads q/k/v as flat [token][head][channel]; a
+        // non-contiguous projection output would silently reinterpret. No-op on
+        // the path that actually runs (Linear returns contiguous).
+        q = ggml_ext_cont(gctx, q);
+        k = ggml_ext_cont(gctx, k);
+        v = ggml_ext_cont(gctx, v);
+
+        // K and V as [d_head, L_k, 1, n_head]: one KV head shared by all `g`
+        // fake query heads (GQA), batched over the real heads. The cont here is
+        // the same copy ggml_ext_attention_ext already makes at
+        // ggml_extend.hpp:1463 -- same bytes, different destination shape.
+        auto to_kv = [&](ggml_tensor* t) {
+            auto t4 = ggml_reshape_4d(gctx, t, d_head, n_head, L_k, 1);
+            t4      = ggml_ext_cont(gctx, ggml_permute(gctx, t4, 0, 3, 1, 2));
+            if (t4->type != GGML_TYPE_F16) {
+                t4 = ggml_cast(gctx, t4, GGML_TYPE_F16);
+            }
+            return t4;
+        };
+        auto k4 = to_kv(k);
+        auto v4 = to_kv(v);
+
+        // Target tokens, folded. The prefix view is contiguous (offset 0), so the
+        // reshape below is free and the cont costs exactly what the unfolded
+        // permute+cont at ggml_extend.hpp:1459 costs.
+        auto q_t = ggml_view_3d(gctx, q, C, T, 1, q->nb[1], q->nb[1] * T, 0);
+        auto q_f = ggml_reshape_4d(gctx, q_t, d_head, n_head, g, rows);
+        q_f      = ggml_ext_cont(gctx, ggml_permute(gctx, q_f, 0, 3, 2, 1));  // [d_head, rows, g, n_head]
+
+        auto out = ggml_flash_attn_ext(gctx, q_f, k4, v4, fold.mask, scale, 0.f, 0.f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        // [d_head, g, rows, n_head] -> [d_head, n_head, g, rows] -> [C, T, 1]
+        out = ggml_ext_cont(gctx, ggml_permute(gctx, out, 0, 2, 3, 1));
+        out = ggml_reshape_3d(gctx, out, C, T, 1);
+
+        if (R > 0) {
+            auto q_r = ggml_view_3d(gctx, q, C, R, 1, q->nb[1], q->nb[1] * R, q->nb[1] * T);
+            q_r      = ggml_ext_cont(gctx, q_r);
+            auto q_r4 = ggml_reshape_4d(gctx, q_r, d_head, n_head, R, 1);
+            q_r4      = ggml_ext_cont(gctx, ggml_permute(gctx, q_r4, 0, 3, 1, 2));  // [d_head, R, 1, n_head]
+
+            auto out_r = ggml_flash_attn_ext(gctx, q_r4, k4, v4, nullptr, scale, 0.f, 0.f);
+            ggml_flash_attn_ext_set_prec(out_r, GGML_PREC_F32);
+            out_r = ggml_ext_cont(gctx, ggml_permute(gctx, out_r, 0, 2, 3, 1));
+            out_r = ggml_reshape_3d(gctx, out_r, C, R, 1);
+            out   = ggml_concat(gctx, out, out_r, 1);
+        }
+        return out;
+    }
+
+    // Video self-attention with a MASK-FREE temporal restriction (LTX_RELAY_SEGMENT_MERGE).
+    //
+    // q/k/v arrive exactly as ggml_ext_attention_ext would receive them -- [C, L, 1],
+    // post-RoPE, q already F32 -- and the result comes back in the same layout, so the
+    // caller's gating and to_out are untouched.
+    //
+    // The key axis is cut at the points where the relay's frame-pair bias changes, each
+    // piece runs an ORDINARY unmasked attention against the full Q, and the pieces are
+    // recombined with the per-segment log-sum-exp:
+    //
+    //     O = sum_s w_s O_s,   w_s = softmax_s(LSE_s + b_s)
+    //
+    // which is algebraically the same softmax the mask would have produced -- the segments
+    // partition the keys, so the denominators simply add. Every ggml_flash_attn_ext_lse
+    // call here passes mask == nullptr and the un-folded BHSD shape, which is what keeps
+    // BOTH fast kernels eligible (cuDNN's mask-free window; SA3's q->ne[2] == 32, no GQA).
+    //
+    // Cost, at 1920x1088x121 (L = 32640, H = 32, D = 128), per attention call:
+    //   * the per-segment ggml_ext_cont of K/V is ONE full copy of each in total (the
+    //     segments partition the key axis, they do not duplicate it): 510 MiB written,
+    //     ~1.07 GB of traffic, ~2.4 ms at 448 GB/s -- against the ~320 s a mask costs over
+    //     a whole render, this is noise. It exists because a key-axis slice is contiguous
+    //     only WITHIN a head's slab, not across the 32 of them.
+    //   * one extra full-size F32 attention output per extra segment, live simultaneously
+    //     for the merge (510 MiB each). That, not the copy, is the reason for the
+    //     LTX_RELAY_SEGMENT_MAX ceiling.
+    //
+    // TASS reference tokens need no special case: they are off the timeline, so their bias
+    // column is zero, and a query whose bias is equal across every segment recombines to
+    // exactly the unsegmented attention.
+    inline ggml_tensor* ltx_segmented_self_attention(GGMLRunnerContext* ctx,
+                                                     ggml_tensor* q,
+                                                     ggml_tensor* k,
+                                                     ggml_tensor* v,
+                                                     int64_t n_head,
+                                                     int64_t d_head,
+                                                     const SelfSegmentPlan& seg) {
+        ggml_context* gctx  = ctx->ggml_ctx;
+        const int64_t C     = n_head * d_head;
+        const int64_t L     = q->ne[1];
+        const int64_t L_k   = k->ne[1];
+        const int64_t n_seg = (int64_t)seg.start_token.size();
+        const float scale   = 1.0f / std::sqrt((float)d_head);
+
+        GGML_ASSERT(n_seg >= 2);
+        GGML_ASSERT(seg.bias != nullptr && seg.bias->ne[0] == seg.frames && seg.bias->ne[1] == n_seg);
+
+        // Plain BHSD, the same tensors ggml_ext_attention_ext builds: [d_head, L, n_head, 1].
+        // No fold -- without a mask the fold has nothing left to buy, and the un-folded shape
+        // is the one SA3's contract demands.
+        auto to_bhsd = [&](ggml_tensor* t, bool as_f16) {
+            auto t4 = ggml_reshape_4d(gctx, t, d_head, n_head, t->ne[1], 1);
+            t4      = ggml_ext_cont(gctx, ggml_permute(gctx, t4, 0, 2, 1, 3));
+            if (as_f16 && t4->type != GGML_TYPE_F16) {
+                t4 = ggml_cast(gctx, t4, GGML_TYPE_F16);
+            }
+            return t4;
+        };
+        auto q4 = to_bhsd(q, false);
+        auto k4 = to_bhsd(k, true);
+        auto v4 = to_bhsd(v, true);
+
+        // Segment s of the compact bias, expanded from one entry per query FRAME to one per
+        // query TOKEN. Video tokens are frame-major (patchify_video: token == frame*tpf +
+        // spatial), so a single repeat over a size-1 inner axis does it exactly. Reference
+        // queries are appended with a zero bias, which is the additive identity.
+        auto bias_tokens = [&](int64_t s) {
+            auto col = ggml_view_2d(gctx, seg.bias, seg.frames, 1, seg.bias->nb[1], (size_t)s * seg.bias->nb[1]);
+            auto e   = ggml_reshape_4d(gctx, col, 1, seg.frames, 1, 1);
+            auto rep = ggml_repeat_4d(gctx, e, seg.tokens_per_frame, seg.frames, 1, 1);
+            auto flat = ggml_reshape_1d(gctx, rep, seg.target_tokens);
+            if (L > seg.target_tokens) {
+                flat = ggml_pad(gctx, flat, (int)(L - seg.target_tokens), 0, 0, 0);
+            }
+            return flat;  // [L]
+        };
+
+        std::vector<ggml_tensor*> outs((size_t)n_seg, nullptr);
+        ggml_tensor* stacked = nullptr;
+        for (int64_t s = 0; s < n_seg; ++s) {
+            const int64_t off = seg.start_token[(size_t)s];
+            const int64_t len = (s + 1 < n_seg ? seg.start_token[(size_t)(s + 1)] : L_k) - off;
+            GGML_ASSERT(len > 0 && off + len <= L_k);
+
+            // A key-axis slice is strided across the head axis, and every consumer here
+            // (cuDNN's packed BHSD plan, SA3's packed preprocessing) reads packed pointers,
+            // so materialise it. Summed over the segments this is exactly one copy of K/V.
+            auto ks = ggml_ext_cont(gctx, ggml_view_4d(gctx, k4, d_head, len, n_head, 1,
+                                                       k4->nb[1], k4->nb[2], k4->nb[3],
+                                                       (size_t)off * k4->nb[1]));
+            auto vs = ggml_ext_cont(gctx, ggml_view_4d(gctx, v4, d_head, len, n_head, 1,
+                                                       v4->nb[1], v4->nb[2], v4->nb[3],
+                                                       (size_t)off * v4->nb[1]));
+
+            auto node = ggml_flash_attn_ext_lse(gctx, q4, ks, vs, nullptr, scale, 0.f, 0.f);
+            ggml_flash_attn_ext_set_prec(node, GGML_PREC_F32);
+
+            outs[(size_t)s] = ggml_flash_attn_ext_lse_out(gctx, node);  // [d_head, n_head, L, 1]
+            auto lse        = ggml_flash_attn_ext_lse_stats(gctx, node);  // [L, n_head, 1]
+
+            // LSE_s + b_s, then stacked on a new INNERMOST axis so one soft_max normalises
+            // across segments per (query, head) -- that softmax is exactly w_s.
+            auto biased = ggml_add(gctx, lse, bias_tokens(s));
+            auto row    = ggml_reshape_4d(gctx, biased, 1, L, n_head, 1);
+            stacked     = stacked == nullptr ? row : ggml_concat(gctx, stacked, row, 0);
+        }
+
+        auto weights = ggml_soft_max(gctx, stacked);  // [n_seg, L, n_head, 1]
+
+        ggml_tensor* out = nullptr;
+        for (int64_t s = 0; s < n_seg; ++s) {
+            auto w = ggml_view_4d(gctx, weights, 1, L, n_head, 1,
+                                  weights->nb[1], weights->nb[2], weights->nb[3],
+                                  (size_t)s * weights->nb[0]);
+            // [1, L, n_head, 1] -> [1, n_head, L, 1], the axis order of the attention output.
+            w        = ggml_ext_cont(gctx, ggml_permute(gctx, w, 0, 2, 1, 3));
+            auto term = ggml_mul(gctx, outs[(size_t)s], w);
+            out       = out == nullptr ? term : ggml_add(gctx, out, term);
+        }
+
+        // The flash output's memory order is already (L, n_head, d_head) with d_head
+        // innermost, so this is the same free reshape ggml_ext_attention_ext ends on.
+        out = ggml_ext_cont(gctx, out);
+        return ggml_reshape_3d(gctx, out, C, L, 1);
+    }
+
     struct CrossAttention : public GGMLBlock {
         int64_t heads;
         int64_t dim_head;
@@ -907,7 +1162,11 @@ namespace LTXV {
                              ggml_tensor* mask    = nullptr,
                              ggml_tensor* pe      = nullptr,
                              ggml_tensor* k_pe    = nullptr,
-                             float logit_scale    = 1.f) {
+                             float logit_scale    = 1.f,
+                             // LTX_RELAY_SELF_MASK_FOLD. Null everywhere except the
+                             // video self-attention of an opted-in relay render, so
+                             // every other call site keeps the graph it always had.
+                             const SelfAttnPlan* fold = nullptr) {
             if (context == nullptr) {
                 context = x;
             }
@@ -967,18 +1226,31 @@ namespace LTXV {
             // because the F16 attention output has exactly one consumer: to_out.0 below.
             const bool f16_out_ok = ltx_attn_f16_out_enabled(ctx, to_out_0->get_weight());
 
-            auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
-                                              ctx->backend,
-                                              q,
-                                              k,
-                                              v,
-                                              heads,
-                                              mask,
-                                              false,
-                                              ctx->flash_attn_enabled,
-                                              /*kv_scale=*/1.0f,
-                                              /*kv_prescaled_f16=*/false,
-                                              /*f16_out_ok=*/f16_out_ok);
+            ggml_tensor* out = nullptr;
+            if (fold != nullptr && fold->segments != nullptr) {
+                // MASK-FREE: `mask` is deliberately ignored, exactly as in the folded path --
+                // the segment split IS the bias, and passing both would apply it twice.
+                out = ltx_segmented_self_attention(ctx, q, k, v, heads, dim_head, *fold->segments);
+            } else if (fold != nullptr && fold->mask != nullptr) {
+                // Same softmax, same bias values, same query order -- only the
+                // axis the kernel calls "query" differs. `mask` is deliberately
+                // ignored here: the folded mask IS the expanded one, so passing
+                // both would double the bias.
+                out = ltx_folded_self_attention(ctx, q, k, v, heads, dim_head, *fold);
+            } else {
+                out = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                             ctx->backend,
+                                             q,
+                                             k,
+                                             v,
+                                             heads,
+                                             mask,
+                                             false,
+                                             ctx->flash_attn_enabled,
+                                             /*kv_scale=*/1.0f,
+                                             /*kv_prescaled_f16=*/false,
+                                             /*f16_out_ok=*/f16_out_ok);
+            }
 
             if (blocks.count("to_gate_logits") > 0) {
                 auto to_gate_logits = std::dynamic_pointer_cast<Linear>(blocks["to_gate_logits"]);
@@ -1577,7 +1849,10 @@ namespace LTXV {
                                                       ggml_tensor* a_cross_gate_timestep,
                                                       ggml_tensor* v_prompt_timestep,
                                                       ggml_tensor* a_prompt_timestep,
-                                                      ggml_tensor* self_attention_mask = nullptr) {
+                                                      ggml_tensor* self_attention_mask = nullptr,
+                                                      // LTX_RELAY_SELF_MASK_FOLD; mutually exclusive
+                                                      // with self_attention_mask above.
+                                                      const SelfAttnPlan* self_attention_fold = nullptr) {
             auto attn1               = std::dynamic_pointer_cast<CrossAttention>(blocks["attn1"]);
             auto audio_attn1         = std::dynamic_pointer_cast<CrossAttention>(blocks["audio_attn1"]);
             auto attn2               = std::dynamic_pointer_cast<CrossAttention>(blocks["attn2"]);
@@ -1604,7 +1879,8 @@ namespace LTXV {
             // Unset (1.0) emits no node at all -- see ltxv_video_self_attn_temp().
             const float v_sa_temp = ltxv_video_self_attn_temp();
             auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe, nullptr,
-                                         v_sa_temp == 1.f ? 1.f : 1.f / v_sa_temp);
+                                         v_sa_temp == 1.f ? 1.f : 1.f / v_sa_temp,
+                                         self_attention_fold);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
             auto v_txt  = apply_text_cross_attention(ctx,
                                                      vx,
@@ -1793,6 +2069,96 @@ namespace LTXV {
             return x;
         }
 
+        // Expand the relay's compact [F_k, F_q] frame-pair bias into the dense
+        // [L_k, L_q] F16 self-attention mask ggml_flash_attn_ext demands.
+        //
+        // Done with ggml ops, on the GPU, INSIDE each block's graph-cut segment,
+        // rather than by uploading a dense CPU-built mask like the text relay
+        // does. Two reasons, both structural:
+        //   * A graph-cut segment re-uploads every INPUT_EXTERNAL it touches
+        //     (ggml_extend.hpp copy_data_to_backend_tensor, called per segment
+        //     with the data map preserved). A dense mask is an external input to
+        //     all ~48 block segments, so at 1280x704 that is 48 x 378 MiB of
+        //     host->device traffic PER DENOISE STEP. The compact seed is 512
+        //     bytes, so its 48 uploads are free.
+        //   * Built here, the dense tensor is an ordinary intermediate: it dies
+        //     with the segment that made it instead of staying resident for the
+        //     whole forward.
+        //
+        // The expansion is exact, not an approximation, because patchify_video
+        // lays video tokens out FRAME-MAJOR (token == frame * W*H + spatial), so
+        // the dense mask is the compact matrix tensored with an all-ones
+        // [tokens_per_frame, tokens_per_frame] block. Two ggml_repeats over a
+        // size-1 axis do that; the reshapes between them are views.
+        ggml_tensor* expand_self_frame_bias(GGMLRunnerContext* ctx,
+                                            ggml_tensor* seed,
+                                            int64_t tokens_per_frame,
+                                            int64_t ref_tokens) {
+            const int64_t key_frames   = seed->ne[0];
+            const int64_t query_frames = seed->ne[1];
+            const int64_t L_k          = key_frames * tokens_per_frame;
+
+            // [1, F_k, F_q] -> [tpf, F_k, F_q]: broadcast over the KEY's spatial
+            // slot, then fold it into ne0 so ne0 == k_frame * tpf + k_spatial.
+            auto mask = ggml_reshape_4d(ctx->ggml_ctx, seed, 1, key_frames, query_frames, 1);
+            mask      = ggml_repeat_4d(ctx->ggml_ctx, mask, tokens_per_frame, key_frames, query_frames, 1);
+            mask      = ggml_reshape_4d(ctx->ggml_ctx, mask, L_k, 1, query_frames, 1);
+            // [L_k, 1, F_q] -> [L_k, tpf, F_q]: same trick on the QUERY axis, so
+            // ne1 == q_frame * tpf + q_spatial.
+            mask = ggml_repeat_4d(ctx->ggml_ctx, mask, L_k, tokens_per_frame, query_frames, 1);
+            mask = ggml_reshape_2d(ctx->ggml_ctx, mask, L_k, query_frames * tokens_per_frame);
+
+            if (ref_tokens > 0) {
+                // TASS reference tokens are appended after the target tokens and
+                // are not on the timeline, so they get zero bias in both
+                // directions -- exactly what the no-mask path feeds. ggml_pad
+                // fills with zero, which IS the identity for an additive bias.
+                mask = ggml_pad(ctx->ggml_ctx, mask, (int)ref_tokens, (int)ref_tokens, 0, 0);
+            }
+            return mask;
+        }
+
+        // The SPATIALLY FOLDED mask: [L_k, frames * fold] instead of [L_k, L_q].
+        //
+        // Only the KEY axis is expanded to tokens; the query axis keeps one row
+        // per (frame, fold slot), which is all the bias ever distinguishes. The
+        // attention side then permutes Q so its query dimension is exactly that
+        // axis and the remaining tokens_per_frame/fold spatial positions ride the
+        // head axis, which ggml_flash_attn_ext DOES broadcast the mask over
+        // (ggml.c:5541). Result: 3.98 MiB instead of 2.03 GiB at 1920x1088x121.
+        //
+        // `fold` rows per frame rather than one, because the CUDA selector tiles
+        // the query axis in 64s (fattn.cu:25-37) and a 16-row mask would leave
+        // 48/64 of every tile idle. See ltx_relay.hpp self_mask_fold().
+        ggml_tensor* fold_self_frame_bias(GGMLRunnerContext* ctx,
+                                          ggml_tensor* seed,
+                                          int64_t tokens_per_frame,
+                                          int64_t fold,
+                                          int64_t ref_tokens) {
+            const int64_t key_frames   = seed->ne[0];
+            const int64_t query_frames = seed->ne[1];
+            const int64_t L_k          = key_frames * tokens_per_frame;
+
+            // Key axis: identical to the dense builder.
+            auto mask = ggml_reshape_4d(ctx->ggml_ctx, seed, 1, key_frames, query_frames, 1);
+            mask      = ggml_repeat_4d(ctx->ggml_ctx, mask, tokens_per_frame, key_frames, query_frames, 1);
+            mask      = ggml_reshape_4d(ctx->ggml_ctx, mask, L_k, 1, query_frames, 1);
+            // Query axis: `fold` copies of each frame's row, NOT tokens_per_frame.
+            // Row index comes out as q_frame * fold + slot, which is the order the
+            // attention side's permutation produces.
+            mask = ggml_repeat_4d(ctx->ggml_ctx, mask, L_k, fold, query_frames, 1);
+            mask = ggml_reshape_2d(ctx->ggml_ctx, mask, L_k, query_frames * fold);
+
+            if (ref_tokens > 0) {
+                // Reference KEYS still have to exist on the key axis (the kernel
+                // reads a full K->ne[1] row); zero is the additive identity, so
+                // padding is exactly "no bias". Reference QUERIES are not here at
+                // all -- they get their own unmasked attention call.
+                mask = ggml_pad(ctx->ggml_ctx, mask, (int)ref_tokens, 0, 0, 0);
+            }
+            return mask;
+        }
+
         ggml_tensor* unpatchify_video(GGMLRunnerContext* ctx,
                                       ggml_tensor* x,
                                       int64_t width,
@@ -1967,7 +2333,19 @@ namespace LTXV {
                                                       ggml_tensor* a_relay_mask     = nullptr,
                                                       ggml_tensor* ref_vx           = nullptr,
                                                       ggml_tensor* v_connector_mask = nullptr,
-                                                      ggml_tensor* a_connector_mask = nullptr) {
+                                                      ggml_tensor* a_connector_mask = nullptr,
+                                                      // Compact [F_k, F_q] relay self-attention bias, or null.
+                                                      // Null is the only value the production path has ever
+                                                      // passed, so the graph is unchanged unless
+                                                      // LTX_RELAY_SELF_MASK is set.
+                                                      ggml_tensor* v_self_mask_seed = nullptr,
+                                                      // LTX_RELAY_SEGMENT_MERGE. Null unless the
+                                                      // env gate is set AND the split fits under
+                                                      // LTX_RELAY_SEGMENT_MAX; when it is non-null
+                                                      // it REPLACES the mask above, and it falls
+                                                      // back to it if the backend cannot serve
+                                                      // ggml_flash_attn_ext_lse.
+                                                      SelfSegmentPlan* v_self_segments = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -2113,8 +2491,128 @@ namespace LTXV {
                 sd::ggml_graph_cut::mark_graph_cut(av_ca_v2a_gate_noise_timestep, "ltxav.prelude", "av_ca_v2a_gate_noise");
             }
 
+            // Video self-attention leak block. The seed is null unless
+            // LTX_RELAY_SELF_MASK is set AND a relay plan with beats exists, so
+            // `v_self_mask` stays null and attn1 keeps the exact argument it has
+            // always had. Expanded per block rather than once above the loop
+            // because every graph-cut segment reconstructs its own dependencies
+            // anyway (ggml_graph_cut.cpp:378-420 walks back from the segment's
+            // outputs), so hoisting it would buy nothing and only blur which
+            // segment owns the ~378 MiB intermediate.
+            // LTX_RELAY_SELF_MASK_FOLD: resolve the fold factor ONCE, before the
+            // loop, because it also decides whether the dense expansion above runs
+            // at all. `fold` divides tokens_per_frame and is raised until the mask
+            // has at least 64 rows, so the CUDA query tiling (fattn.cu:25-37,
+            // ncols1 == 64 whenever the GQA path is off, which it always is here
+            // because L_k is never a multiple of FATTN_KQ_STRIDE) sees a full tile
+            // and the launch geometry matches the unfolded attention exactly.
+            // LTX_RELAY_SEGMENT_MERGE: viability probe, once, before the loop.
+            //
+            // ggml_flash_attn_ext_lse is only implementable where a backend can hand back the
+            // softmax denominator -- today that is cuDNN SDPA on Blackwell and nothing else --
+            // so ASK rather than assume, exactly like the folded-mask probe below. A rejection
+            // here silently falls back to the mask path, which is the reference oracle and is
+            // still correct, just slow. These probe tensors are never added to the graph;
+            // supports_op reads metadata only.
+            if (v_self_segments != nullptr) {
+                const int64_t d_head = config.attention_head_dim;
+                const int64_t n_head = config.num_attention_heads;
+                const int64_t L      = vx->ne[1];
+                auto probe_q         = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F32, d_head, L, n_head, 1);
+                auto probe_k         = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F16, d_head, L, n_head, 1);
+                auto probe           = ggml_flash_attn_ext_lse(ctx->ggml_ctx, probe_q, probe_k, probe_k, nullptr,
+                                                     1.f / std::sqrt((float)d_head), 0.f, 0.f);
+                ggml_flash_attn_ext_set_prec(probe, GGML_PREC_F32);
+                if (!ctx->flash_attn_enabled || !ggml_backend_supports_op(ctx->backend, probe)) {
+                    LOG_WARN("ltxav relay segment merge: backend cannot serve ggml_flash_attn_ext_lse "
+                             "(flash_attn=%d); falling back to the LTX_RELAY_SELF_MASK path",
+                             (int)ctx->flash_attn_enabled);
+                    v_self_segments = nullptr;
+                } else {
+                    LOG_DEBUG("ltxav relay segment merge: %zu key segments, no mask -- "
+                              "%.0f MiB of extra F32 attention outputs held live for the merge",
+                              v_self_segments->start_token.size(),
+                              (double)(v_self_segments->start_token.size() - 1) * (double)d_head *
+                                  (double)n_head * (double)L * sizeof(float) / 1048576.0);
+                }
+            }
+
+            int64_t self_fold = 0;
+            if (v_self_segments == nullptr && v_self_mask_seed != nullptr && sd::ltx_relay::self_mask_fold() > 0) {
+                const int64_t tpf     = width * height;
+                const int64_t frames  = v_self_mask_seed->ne[1];
+                const int64_t want    = sd::ltx_relay::self_mask_fold();
+                for (int64_t m = want; m <= tpf; ++m) {
+                    if (tpf % m == 0 && frames * m >= 64) {
+                        self_fold = m;
+                        break;
+                    }
+                }
+                if (self_fold == 0) {
+                    LOG_WARN("ltxav relay self-mask fold: no divisor of tokens_per_frame=%lld at or above %lld "
+                             "reaches 64 rows; falling back to the dense mask",
+                             (long long)tpf,
+                             (long long)want);
+                } else {
+                    const int64_t L_k  = frames * tpf + (vx->ne[1] - target_tokens);
+                    const int64_t rows = frames * self_fold;
+                    // The folded geometry is unusual (one KV head serving
+                    // tokens_per_frame/fold query heads, batched over the real
+                    // heads), so ASK the backend rather than assume. A rejection
+                    // here would otherwise land in ggml_ext_attention_ext's
+                    // non-flash fallback, which builds KQ at [L_k, L_q, n_head] --
+                    // ~19 GiB at 1280x704 and an instant OOM. These probe tensors
+                    // are never added to the graph; supports_op reads metadata only.
+                    const int64_t d_head = config.attention_head_dim;
+                    const int64_t n_head = config.num_attention_heads;
+                    auto probe_q         = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F32, d_head, rows, tpf / self_fold, n_head);
+                    auto probe_k         = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F16, d_head, L_k, 1, n_head);
+                    auto probe_m         = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F16, L_k, rows, 1, 1);
+                    auto probe           = ggml_flash_attn_ext(ctx->ggml_ctx, probe_q, probe_k, probe_k, probe_m,
+                                                     1.f / std::sqrt((float)d_head), 0.f, 0.f);
+                    ggml_flash_attn_ext_set_prec(probe, GGML_PREC_F32);
+                    if (!ctx->flash_attn_enabled || !ggml_backend_supports_op(ctx->backend, probe)) {
+                        LOG_WARN("ltxav relay self-mask fold: backend rejects the folded attention shape "
+                                 "(flash_attn=%d); falling back to the dense mask",
+                                 (int)ctx->flash_attn_enabled);
+                        self_fold = 0;
+                    }
+                }
+                if (self_fold > 0) {
+                    const int64_t L_k  = frames * tpf + (vx->ne[1] - target_tokens);
+                    const int64_t rows = frames * self_fold;
+                    LOG_DEBUG("ltxav relay self-mask fold: m=%lld -> mask [%lld,%lld] F16 (%.2f MiB), "
+                              "%lld spatial positions per row on the broadcast head axis",
+                              (long long)self_fold,
+                              (long long)L_k,
+                              (long long)rows,
+                              (double)L_k * (double)rows * sizeof(ggml_fp16_t) / 1048576.0,
+                              (long long)(tpf / self_fold));
+                }
+            }
+
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<BasicAVTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
+                ggml_tensor* v_self_mask = nullptr;
+                SelfAttnPlan v_self_fold;
+                if (v_self_segments != nullptr) {
+                    v_self_fold.segments = v_self_segments;
+                } else if (v_self_mask_seed != nullptr && self_fold > 0) {
+                    v_self_fold.mask             = fold_self_frame_bias(ctx,
+                                                                        v_self_mask_seed,
+                                                                        width * height,
+                                                                        self_fold,
+                                                                        vx->ne[1] - target_tokens);
+                    v_self_fold.fold             = self_fold;
+                    v_self_fold.tokens_per_frame = width * height;
+                    v_self_fold.frames           = v_self_mask_seed->ne[1];
+                    v_self_fold.target_tokens    = target_tokens;
+                } else if (v_self_mask_seed != nullptr) {
+                    v_self_mask = expand_self_frame_bias(ctx,
+                                                         v_self_mask_seed,
+                                                         width * height,
+                                                         vx->ne[1] - target_tokens);
+                }
                 auto out   = block->forward(ctx,
                                             vx,
                                             ax,
@@ -2133,7 +2631,9 @@ namespace LTXV {
                                             av_ca_a2v_gate_noise_timestep,
                                             av_ca_v2a_gate_noise_timestep,
                                             v_prompt_timestep_mod,
-                                            a_prompt_timestep_mod);
+                                            a_prompt_timestep_mod,
+                                            v_self_mask,
+                                            v_self_fold.active() ? &v_self_fold : nullptr);
                 vx         = out.first;
                 ax         = out.second;
                 sd::ggml_graph_cut::mark_graph_cut(vx, "ltxav.transformer_blocks." + std::to_string(i), "vx");
@@ -2207,6 +2707,18 @@ namespace LTXV {
         std::pair<uint64_t, int64_t> relay_key_beat_key{0, 0};
         std::tuple<uint64_t, int64_t, int64_t> relay_video_key{0, 0, 0};
         std::tuple<uint64_t, int64_t, int64_t> relay_audio_key{0, 0, 0};
+        // Compact [F_k, F_q] video self-attention bias (LTX_RELAY_SELF_MASK).
+        // Keyed on latent frames rather than a token count: the dense mask this
+        // seeds is derived, so the seed is invariant across spatial resolution.
+        std::vector<ggml_fp16_t> relay_self_bias_vec;
+        std::pair<uint64_t, int64_t> relay_self_key{0, 0};
+        // LTX_RELAY_SEGMENT_MERGE: the key-frame cuts and the [F_q, n_seg] F32 segment bias,
+        // cached against the same {revision, frames} key as the mask above. The extra
+        // all-zero column for the TASS reference keys is part of the cached vector, so the
+        // cache key also carries whether references are present.
+        std::vector<int64_t> relay_seg_cut_frames;
+        std::vector<float> relay_seg_bias_vec;
+        std::tuple<uint64_t, int64_t, int64_t> relay_seg_key{0, 0, 0};
 
         // LTX_RELAY_ISOLATE partitions the connector's registers across the
         // pieces; without it the map is the conditioner's token map and every
@@ -2642,6 +3154,134 @@ namespace LTXV {
                 }
             }
 
+            // Relay temporal SELF-attention bias (LTX_RELAY_SELF_MASK), EXPERIMENTAL.
+            //
+            // Uploaded COMPACT, one entry per (key frame, query frame); the DiT
+            // expands it to the dense [L, L] mask inside each block's segment.
+            // See ltx_relay.hpp for why the bias is one-sided and
+            // LTXAVModelBlock::expand_self_frame_bias for why the expansion is
+            // GPU-side. Deliberately independent of relay->token_beat, so the
+            // self-attention half can be A/B'd against the text half alone.
+            //
+            // Off (unset / <= 0) allocates nothing and never names a tensor, so
+            // the graph is byte-identical to a build without this feature -- which
+            // matters here because relay renders are gated on a graph-shape
+            // fingerprint.
+            ggml_tensor* v_self_mask_seed = nullptr;
+            if (relay != nullptr && sd::ltx_relay::self_mask_strength() > 0.f && !relay->beats.empty() &&
+                static_cast<int64_t>(relay->video_frame_time.size()) == vx->ne[2]) {
+                const int64_t frames           = vx->ne[2];
+                const int64_t tokens_per_frame = vx->ne[0] * vx->ne[1];
+                const int64_t L                = frames * tokens_per_frame + ref_token_count;
+                const double dense_mib         = (double)L * (double)L * sizeof(ggml_fp16_t) / 1048576.0;
+                // LTX_RELAY_SELF_MASK_FOLD never materialises the dense mask, so
+                // the MiB refusal below does not apply to it. The DiT still
+                // downgrades to dense (and hence back under this ceiling) if the
+                // backend rejects the folded shape, so the ceiling is not lost --
+                // it just stops being the thing that decides.
+                const bool folded = sd::ltx_relay::self_mask_fold() > 0;
+                if (!folded && dense_mib > (double)sd::ltx_relay::self_mask_max_mib()) {
+                    // Refuse rather than OOM mid-render: ggml_ext_attention_ext
+                    // casts the mask again on the way into flash attention, so the
+                    // live peak is twice what is printed here.
+                    LOG_WARN("ltxav relay self-mask: REFUSED, dense [%lld,%lld] F16 needs %.0f MiB (x2 live) > "
+                             "LTX_RELAY_SELF_MASK_MAX_MIB=%lld",
+                             (long long)L,
+                             (long long)L,
+                             dense_mib,
+                             (long long)sd::ltx_relay::self_mask_max_mib());
+                } else {
+                    if (relay_self_key != std::make_pair(relay->revision, frames)) {
+                        sd::ltx_relay::build_self_frame_bias_f16(*relay,
+                                                                 sd::ltx_relay::self_mask_strength(),
+                                                                 relay_self_bias_vec);
+                        relay_self_key = {relay->revision, frames};
+                        LOG_DEBUG("ltxav relay self-mask: seed [%lld,%lld] F16 -> dense [%lld,%lld] (%.0f MiB), "
+                                  "%zu beats, strength %.3f",
+                                  (long long)frames,
+                                  (long long)frames,
+                                  (long long)L,
+                                  (long long)L,
+                                  dense_mib,
+                                  relay->beats.size(),
+                                  sd::ltx_relay::self_mask_strength());
+                    }
+                    v_self_mask_seed = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F16, frames, frames);
+                    ggml_set_name(v_self_mask_seed, "ltxav_relay_self_bias");
+                    set_backend_tensor_data(v_self_mask_seed, relay_self_bias_vec.data());
+                }
+            }
+
+            // LTX_RELAY_SEGMENT_MERGE -- the MASK-FREE form of the same bias.
+            //
+            // Built INDEPENDENTLY of the dense-mask refusal above: the whole point is that no
+            // dense [L, L] tensor is ever materialised, so the MiB ceiling that governs the
+            // mask has nothing to say here. Deliberately gated on the same
+            // LTX_RELAY_SELF_MASK strength so the two paths are A/B-comparable by flipping one
+            // extra variable, and the mask seed is still built above so the DiT can fall back
+            // to it if the backend cannot serve ggml_flash_attn_ext_lse.
+            SelfSegmentPlan v_self_segments;
+            if (sd::ltx_relay::segment_merge_enabled() && relay != nullptr &&
+                sd::ltx_relay::self_mask_strength() > 0.f && !relay->beats.empty() &&
+                static_cast<int64_t>(relay->video_frame_time.size()) == vx->ne[2]) {
+                const int64_t frames           = vx->ne[2];
+                const int64_t tokens_per_frame = vx->ne[0] * vx->ne[1];
+                const int64_t target_tokens    = frames * tokens_per_frame;
+
+                if (relay_seg_key != std::make_tuple(relay->revision, frames, ref_token_count)) {
+                    std::vector<float> seg_bias;
+                    relay_seg_cut_frames.clear();
+                    relay_seg_bias_vec.clear();
+                    if (sd::ltx_relay::build_self_segment_bias(*relay,
+                                                               sd::ltx_relay::self_mask_strength(),
+                                                               // one slot is spent on the
+                                                               // reference-key segment
+                                                               sd::ltx_relay::segment_merge_max() -
+                                                                   (ref_token_count > 0 ? 1 : 0),
+                                                               relay_seg_cut_frames,
+                                                               seg_bias)) {
+                        relay_seg_bias_vec = std::move(seg_bias);
+                        if (ref_token_count > 0) {
+                            // Reference keys are off the timeline: one more segment, zero bias.
+                            relay_seg_bias_vec.resize(relay_seg_bias_vec.size() + (size_t)frames, 0.f);
+                        }
+                    } else {
+                        LOG_WARN("ltxav relay segment merge: the bias does not split into at most "
+                                 "LTX_RELAY_SEGMENT_MAX=%lld key segments (or is uniform); "
+                                 "using the LTX_RELAY_SELF_MASK path",
+                                 (long long)sd::ltx_relay::segment_merge_max());
+                    }
+                    relay_seg_key = {relay->revision, frames, ref_token_count};
+                }
+
+                if (!relay_seg_cut_frames.empty()) {
+                    const int64_t n_seg = (int64_t)relay_seg_cut_frames.size() + (ref_token_count > 0 ? 1 : 0);
+                    v_self_segments.start_token.reserve((size_t)n_seg);
+                    for (int64_t cut : relay_seg_cut_frames) {
+                        v_self_segments.start_token.push_back(cut * tokens_per_frame);
+                    }
+                    if (ref_token_count > 0) {
+                        v_self_segments.start_token.push_back(target_tokens);
+                    }
+                    v_self_segments.bias = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, frames, n_seg);
+                    ggml_set_name(v_self_segments.bias, "ltxav_relay_segment_bias");
+                    set_backend_tensor_data(v_self_segments.bias, relay_seg_bias_vec.data());
+                    v_self_segments.frames           = frames;
+                    v_self_segments.tokens_per_frame = tokens_per_frame;
+                    v_self_segments.target_tokens    = target_tokens;
+                    std::string cut_list;
+                    for (int64_t cut : relay_seg_cut_frames) {
+                        cut_list += std::to_string(cut) + " ";
+                    }
+                    LOG_DEBUG("ltxav relay segment merge: %lld key segments, cuts at frames %s(+refs), "
+                              "%zu beats, strength %.3f",
+                              (long long)n_seg,
+                              cut_list.c_str(),
+                              relay->beats.size(),
+                              sd::ltx_relay::self_mask_strength());
+                }
+            }
+
             auto runner_ctx = get_context();
             runner_ctx.ltx_video_token_sel = v_token_sel_input;
             runner_ctx.ltx_skip_a2v_cross_attn = skip_a2v;
@@ -2661,7 +3301,9 @@ namespace LTXV {
                                             a_relay_mask,
                                             ref_vx,
                                             v_connector_mask,
-                                            a_connector_mask);
+                                            a_connector_mask,
+                                            v_self_mask_seed,
+                                            v_self_segments.bias != nullptr ? &v_self_segments : nullptr);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;
