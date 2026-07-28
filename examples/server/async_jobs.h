@@ -98,8 +98,17 @@ struct AsyncGenerationJob {
     // TASS overlap character references (LTX-Best-Face-ID sheets). Applies to
     // every segment of the request: a sheet is an identity, not a shot.
     std::vector<LtxCharacterRef> ltx_character_refs;
-    // Zero inherits the checkpoint's trained default of 1.0.
-    float ltx_tass_phase_scale = 0.f;
+    // NEGATIVE inherits the checkpoint's trained default of 1.0. Zero is meaningful
+    // and selects the UNTAGGED layout, so it cannot double as the "unset" sentinel.
+    float ltx_tass_phase_scale = -1.f;
+    // MSR (Licon Multiple-Subject-Reference) in-context reference strip, as it
+    // arrived on the wire: base64 payloads or trusted absolute paths. The engine
+    // composites the strip itself because the canvas layout -- background cover-
+    // cropped as the substrate, subjects letterboxed on white -- is a trained
+    // convention, not a presentation choice. Zero frames leaves the path inert.
+    std::string ltx_msr_background;
+    std::vector<std::string> ltx_msr_subjects;
+    int ltx_msr_frames = 0;
     std::vector<int> ltx_segment_v2v_modes;
     std::vector<float> ltx_segment_v2v_strengths;
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;

@@ -778,6 +778,56 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         }
     }
 
+    // MSR reference strip. The images are decoded at their NATIVE size -- the engine
+    // fits them onto the render canvas itself, because cover-crop for the background
+    // and letterbox-on-white for a subject are different operations and only the
+    // engine knows which is which. Owners live to the end of the render, like every
+    // other image view handed across the C API.
+    SDImageOwner ltx_msr_background_owner;
+    std::vector<SDImageOwner> ltx_msr_subject_owners;
+    std::vector<sd_image_t> ltx_msr_subject_images;
+    if (job.ltx_msr_frames > 0) {
+        auto load_msr_image = [&](const std::string& source, SDImageOwner& owner, const std::string& what) {
+            if (!source.empty() && source[0] == '/') {
+                sd_image_t loaded = {};
+                if (!load_sd_image_from_file(&loaded, source.c_str(), 0, 0, 3)) {
+                    error_message = "failed to load LTX MSR " + what;
+                    return false;
+                }
+                owner.reset(loaded);
+                return true;
+            }
+            if (!decode_base64_image(source, 3, 0, 0, owner)) {
+                error_message = "failed to decode LTX MSR " + what;
+                return false;
+            }
+            return true;
+        };
+        if (!load_msr_image(job.ltx_msr_background, ltx_msr_background_owner, "background")) {
+            return false;
+        }
+        ltx_msr_subject_owners.resize(job.ltx_msr_subjects.size());
+        ltx_msr_subject_images.reserve(job.ltx_msr_subjects.size());
+        for (size_t index = 0; index < job.ltx_msr_subjects.size(); ++index) {
+            if (!load_msr_image(job.ltx_msr_subjects[index],
+                                ltx_msr_subject_owners[index],
+                                "subject " + std::to_string(index + 1))) {
+                return false;
+            }
+            ltx_msr_subject_images.push_back(ltx_msr_subject_owners[index].get());
+        }
+        params.msr_background    = &ltx_msr_background_owner.get();
+        params.msr_subjects      = ltx_msr_subject_images.empty() ? nullptr : ltx_msr_subject_images.data();
+        params.msr_subjects_size = static_cast<int>(ltx_msr_subject_images.size());
+        params.msr_frames        = job.ltx_msr_frames;
+        // The strip and the sheets share ONE TASS block, so the phase scale is a
+        // single decision for the request. The character-ref path already forwarded
+        // it when there were sheets; forward it here only when there were none.
+        if (job.ltx_character_refs.empty()) {
+            params.tass_phase_scale = job.ltx_tass_phase_scale;
+        }
+    }
+
     SegmentPreviewWriter segment_writer;
     const bool write_segment_previews = !job.ltx_prompts.empty() && (job.ltx_emit_segments || job.ltx_emit_stages) &&
                                         !job.ltx_bank_dir.empty();

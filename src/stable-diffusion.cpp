@@ -4275,6 +4275,10 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     // requests the untagged / JoyAI-Echo overlap layout, so it cannot double as
     // the "not set" sentinel the way it used to.
     sd_vid_gen_params->tass_phase_scale                      = -1.f;
+    sd_vid_gen_params->msr_background                        = nullptr;
+    sd_vid_gen_params->msr_subjects                          = nullptr;
+    sd_vid_gen_params->msr_subjects_size                     = 0;
+    sd_vid_gen_params->msr_frames                            = 0;
     sd_vid_gen_params->beats                                 = nullptr;
     sd_vid_gen_params->beat_count                            = 0;
     sd_vid_gen_params->relay_eps                             = 0.f;
@@ -5799,6 +5803,173 @@ static sd::Tensor<float> encode_ltxav_condition_image(sd_ctx_t* sd_ctx,
         LOG_ERROR("failed to encode LTXAV %s image", name);
     }
     return condition_latent;
+}
+
+// Fit one image onto a `width` x `height` canvas.
+//
+// `cover` scales by max() and centre-CROPS the excess -- what a background plate
+// wants, since it must fill the frame. Otherwise we scale by min() and centre the
+// whole image on a WHITE canvas, never cropping it: that letterbox is the trained
+// convention for an MSR subject, not a presentation choice, so the padding value
+// matters as much as the geometry.
+//
+// Both modes are the same sampling loop. The source-space offset is positive when
+// covering (we start inside the image) and negative when containing (we start
+// outside it), and every destination pixel that lands outside the resized source
+// is white by construction.
+static sd::Tensor<float> ltxav_fit_image_to_canvas(const sd_image_t& image,
+                                                   int width,
+                                                   int height,
+                                                   bool cover,
+                                                   const char* name) {
+    if (image.data == nullptr || image.width == 0 || image.height == 0) {
+        LOG_ERROR("LTXAV MSR %s has no image data", name);
+        return {};
+    }
+    auto source = sd_image_to_tensor(image);
+    if (source.empty() || source.dim() != 4) {
+        LOG_ERROR("failed to read LTXAV MSR %s", name);
+        return {};
+    }
+    const int64_t source_width  = source.shape()[0];
+    const int64_t source_height = source.shape()[1];
+    const int64_t channels      = source.shape()[2];
+
+    const double scale_x = static_cast<double>(width) / static_cast<double>(source_width);
+    const double scale_y = static_cast<double>(height) / static_cast<double>(source_height);
+    const double scale   = cover ? std::max(scale_x, scale_y) : std::min(scale_x, scale_y);
+
+    int64_t resized_width  = std::max<int64_t>(1, static_cast<int64_t>(std::llround(scale * static_cast<double>(source_width))));
+    int64_t resized_height = std::max<int64_t>(1, static_cast<int64_t>(std::llround(scale * static_cast<double>(source_height))));
+    // Rounding can leave a cover one pixel short of the canvas (or a contain one
+    // pixel over it), which would show as a white seam on a background plate.
+    if (cover) {
+        resized_width  = std::max<int64_t>(resized_width, width);
+        resized_height = std::max<int64_t>(resized_height, height);
+    } else {
+        resized_width  = std::min<int64_t>(resized_width, width);
+        resized_height = std::min<int64_t>(resized_height, height);
+    }
+
+    auto resized = sd::ops::interpolate(source,
+                                        {resized_width, resized_height, channels, 1},
+                                        sd::ops::InterpolateMode::Bilinear);
+    if (resized.empty()) {
+        LOG_ERROR("failed to resize LTXAV MSR %s", name);
+        return {};
+    }
+
+    const int64_t offset_x = (resized_width - static_cast<int64_t>(width)) / 2;
+    const int64_t offset_y = (resized_height - static_cast<int64_t>(height)) / 2;
+
+    auto canvas = sd::zeros<float>({width, height, channels, 1});
+    for (int64_t x = 0; x < width; ++x) {
+        const int64_t sx = x + offset_x;
+        for (int64_t y = 0; y < height; ++y) {
+            const int64_t sy      = y + offset_y;
+            const bool    covered = sx >= 0 && sx < resized_width && sy >= 0 && sy < resized_height;
+            for (int64_t c = 0; c < channels; ++c) {
+                canvas.index(x, y, c, 0) = covered ? resized.index(sx, sy, c, 0) : 1.f;
+            }
+        }
+    }
+    return canvas;
+}
+
+// Composite an MSR (Licon Multiple-Subject-Reference) in-context reference strip.
+//
+// The strip is a VIDEO, and its layout is a TRAINED convention that
+// ComfyUI-Licon-MSR builds before handing it to LTXAddVideoICLoRAGuide:
+//
+//   * the BACKGROUND covers the canvas and initialises EVERY frame -- it is the
+//     substrate the shot happens in, not one slot among many;
+//   * each SUBJECT is letterboxed on white and overwrites its own frame window.
+//
+// Windows are aligned to the temporal VAE's 8x compression so a subject lands on
+// whole latent frames: latent slot 0 is pixel frame 0, and slot N >= 1 covers
+// pixel frames [1 + (N-1)*8 .. N*8].
+//
+// With K subjects and L latent slots the subjects share slots 1..L-1. The exactly
+// known case is L-1 == K -- one slot each, i.e. `frames == 8*K + 1` -- and that is
+// what the 17/25/33 end of the checkpoint's menu is for. When there are spare slots
+// they are shared out with the remainder going to the EARLIER subjects, matching the
+// plugin's documented "prioritise the first subject" budgeting.
+static sd::Tensor<float> build_ltxav_msr_strip(const sd_image_t& background,
+                                               const sd_image_t* subjects,
+                                               int subjects_size,
+                                               int width,
+                                               int height,
+                                               int frames) {
+    if (width <= 0 || height <= 0 || frames <= 0) {
+        LOG_ERROR("LTXAV MSR strip needs a positive canvas and frame count");
+        return {};
+    }
+    if (frames % 8 != 1) {
+        LOG_ERROR("LTXAV MSR strip frames must be 1 modulo 8 (17/25/33/41/49/57/65), got %d", frames);
+        return {};
+    }
+    const int64_t latent_slots = (frames - 1) / 8 + 1;
+    if (subjects_size < 0 || (subjects_size > 0 && subjects == nullptr)) {
+        LOG_ERROR("LTXAV MSR subject array is inconsistent");
+        return {};
+    }
+    if (static_cast<int64_t>(subjects_size) > latent_slots - 1) {
+        LOG_ERROR("LTXAV MSR strip has %d subjects but only %lld slots at %d frames; use at least %d frames",
+                  subjects_size,
+                  (long long)(latent_slots - 1),
+                  frames,
+                  subjects_size * 8 + 1);
+        return {};
+    }
+
+    auto background_canvas = ltxav_fit_image_to_canvas(background, width, height, true, "background");
+    if (background_canvas.empty()) {
+        return {};
+    }
+    const int64_t channels = background_canvas.shape()[2];
+
+    std::vector<sd::Tensor<float>> subject_canvases;
+    subject_canvases.reserve(static_cast<size_t>(subjects_size));
+    for (int i = 0; i < subjects_size; ++i) {
+        const std::string name = "subject " + std::to_string(i + 1);
+        auto canvas            = ltxav_fit_image_to_canvas(subjects[i], width, height, false, name.c_str());
+        if (canvas.empty()) {
+            return {};
+        }
+        subject_canvases.push_back(std::move(canvas));
+    }
+
+    // Slot -1 stays background. Slot 0 is always background: it is pixel frame 0,
+    // which the temporal VAE treats as its own causal anchor.
+    std::vector<int> slot_owner(static_cast<size_t>(latent_slots), -1);
+    if (subjects_size > 0) {
+        const int64_t available = latent_slots - 1;
+        const int64_t base      = available / subjects_size;
+        const int64_t remainder = available % subjects_size;
+        int64_t slot            = 1;
+        for (int i = 0; i < subjects_size; ++i) {
+            const int64_t count = base + (i < remainder ? 1 : 0);
+            for (int64_t n = 0; n < count && slot < latent_slots; ++n, ++slot) {
+                slot_owner[static_cast<size_t>(slot)] = i;
+            }
+        }
+    }
+
+    sd::Tensor<float> strip({width, height, frames, channels, 1});
+    for (int frame = 0; frame < frames; ++frame) {
+        const int64_t slot  = frame == 0 ? 0 : (frame - 1) / 8 + 1;
+        const int     owner = slot < latent_slots ? slot_owner[static_cast<size_t>(slot)] : -1;
+        const sd::Tensor<float>& canvas =
+            owner >= 0 ? subject_canvases[static_cast<size_t>(owner)] : background_canvas;
+        sd::ops::slice_assign(&strip, 2, frame, frame + 1, canvas.unsqueeze(2));
+    }
+    LOG_INFO("LTXAV MSR strip: %dx%d, %d frames -> %lld latent slots, %d subject(s) + background",
+             width,
+             height,
+             frames,
+             (long long)latent_slots,
+             subjects_size);
+    return strip;
 }
 
 static bool apply_ltxav_condition_by_latent_index(sd::Tensor<float>* video_latent,
@@ -7900,8 +8071,10 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     // references these are NOT frame-axis concatenations, so they are exempt from
     // the matching-spatial-dims requirement -- carrying a 1536x1024 sheet into a
     // 768x448 render at full detail is the entire point.
-    if (sd_version_is_ltxav(sd_ctx->sd->version) && sd_vid_gen_params->character_refs != nullptr &&
-        sd_vid_gen_params->character_refs_size > 0) {
+    const bool has_character_refs = sd_vid_gen_params->character_refs != nullptr &&
+                                    sd_vid_gen_params->character_refs_size > 0;
+    const bool has_msr_strip = sd_vid_gen_params->msr_frames > 0;
+    if (sd_version_is_ltxav(sd_ctx->sd->version) && (has_character_refs || has_msr_strip)) {
         if (latents.init_latent.empty()) {
             LOG_ERROR("LTXAV character references need a target latent grid");
             return std::nullopt;
@@ -7910,7 +8083,52 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         std::vector<sd::Tensor<float>> ref_latents;
         std::vector<LtxvTassRefGrid> ref_grids;
         int next_source_id = 2;
-        for (int i = 0; i < sd_vid_gen_params->character_refs_size; ++i) {
+        // The MSR strip goes FIRST so its slot order -- background, then subject 1,
+        // 2, ... -- is the order the prompt's numbered figures refer to. It is also
+        // the one reference encoded as a video rather than a still, and it is
+        // composited at the RENDER resolution: the checkpoint ships
+        // `reference_downscale_factor = 1`, so the guide shares the target's grid.
+        if (has_msr_strip) {
+            if (sd_vid_gen_params->msr_background == nullptr) {
+                LOG_ERROR("LTXAV MSR needs a background image; it is the substrate every frame starts from");
+                return std::nullopt;
+            }
+            auto strip = build_ltxav_msr_strip(*sd_vid_gen_params->msr_background,
+                                               sd_vid_gen_params->msr_subjects,
+                                               sd_vid_gen_params->msr_subjects_size,
+                                               request->width,
+                                               request->height,
+                                               sd_vid_gen_params->msr_frames);
+            if (strip.empty()) {
+                return std::nullopt;
+            }
+            auto strip_latent = sd_ctx->sd->encode_first_stage(strip);
+            if (strip_latent.empty() || strip_latent.dim() < 4) {
+                LOG_ERROR("failed to encode the LTXAV MSR reference strip");
+                return std::nullopt;
+            }
+            if (strip_latent.shape()[3] != latents.init_latent.shape()[3]) {
+                LOG_ERROR("LTXAV MSR strip encoded to %lld channels, expected %lld",
+                          (long long)strip_latent.shape()[3],
+                          (long long)latents.init_latent.shape()[3]);
+                return std::nullopt;
+            }
+            const int source_id = next_source_id++;
+            ref_grids.push_back(LtxvTassRefGrid{strip_latent.shape()[0],
+                                                strip_latent.shape()[1],
+                                                strip_latent.shape()[2],
+                                                static_cast<float>(source_id)});
+            LOG_INFO("LTXAV MSR reference strip: %dx%d px x %d frames -> %lldx%lldx%lld latent, source_id=%d",
+                     request->width,
+                     request->height,
+                     sd_vid_gen_params->msr_frames,
+                     (long long)strip_latent.shape()[0],
+                     (long long)strip_latent.shape()[1],
+                     (long long)strip_latent.shape()[2],
+                     source_id);
+            ref_latents.push_back(std::move(strip_latent));
+        }
+        for (int i = 0; has_character_refs && i < sd_vid_gen_params->character_refs_size; ++i) {
             const sd_image_t& ref_image = sd_vid_gen_params->character_refs[i];
             if (ref_image.data == nullptr || ref_image.width == 0 || ref_image.height == 0) {
                 LOG_ERROR("LTXAV character reference %d has no image data", i);
@@ -7970,6 +8188,10 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             ref_latents.push_back(std::move(ref_latent));
         }
 
+        if (ref_latents.empty()) {
+            LOG_ERROR("LTXAV reference conditioning produced no references");
+            return std::nullopt;
+        }
         sd::Tensor<float> packed_refs = ref_latents.front();
         for (size_t i = 1; i < ref_latents.size(); ++i) {
             packed_refs = sd::ops::concat(packed_refs, ref_latents[i], 2);
@@ -7998,11 +8220,15 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                                       &latents.video_source_ids);
         // >= 0 is an explicit request; exactly 0 means UNTAGGED (Echo's native layout:
         // references share the target's RoPE grid with no source-phase tag at all).
+        // An unsupplied phase scale defaults to the Best-Face-ID convention of 1.0,
+        // EXCEPT when an MSR strip is present: MSR was trained through ComfyUI's
+        // IC-LoRA guide, which tags nothing, so tagging it would be off-recipe. A
+        // caller that asks for a scale explicitly still gets exactly what it asked for.
         latents.tass_phase_scale = sd_vid_gen_params->tass_phase_scale >= 0.f
                                        ? sd_vid_gen_params->tass_phase_scale
-                                       : 1.f;
+                                       : (has_msr_strip ? 0.f : 1.f);
         LOG_INFO("LTXAV TASS overlap references: %d sheet(s), %lld reference token(s), phase_scale=%.2f%s",
-                 sd_vid_gen_params->character_refs_size,
+                 static_cast<int>(ref_grids.size()),
                  (long long)(latents.ref_video_x.shape()[0] * latents.ref_video_x.shape()[1] *
                              latents.ref_video_x.shape()[2]),
                  latents.tass_phase_scale,

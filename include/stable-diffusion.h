@@ -470,8 +470,27 @@ typedef struct {
     // generate_video_chain, where a single render is the whole request.
     int* character_ref_segments;
     int* character_ref_segment_counts;
-    // Rotary source-phase multiplier. Zero selects the trained default of 1.0.
+    // Rotary source-phase multiplier. NEGATIVE means "unsupplied" and selects the
+    // trained default of 1.0; ZERO is a meaningful value that selects the UNTAGGED
+    // layout (phase = source_id * scale * theta^-d/L collapses to an exact no-op, so
+    // the references sit on the target's own RoPE grid with nothing marking them).
+    // Echo- and MSR-derived weights never saw a phase tag in training and need zero.
     float tass_phase_scale;
+    // LTXAV MSR (Licon Multiple-Subject-Reference) in-context reference STRIP.
+    //
+    // Unlike `character_refs` -- a set of stills, each encoded to one latent frame --
+    // this is a short VIDEO composited to the RENDER RESOLUTION and encoded in ONE
+    // VAE pass, so a subject occupies whole latent frames rather than a single slot.
+    // The strip is appended by the same TASS overlap path, so it composes with every
+    // conditioning layout and costs nothing when `msr_frames` is zero.
+    //
+    // `msr_frames` must be 1 modulo 8 (the checkpoint's menu is 17/25/33/41/49/57/65);
+    // zero disables the whole path. `msr_background` is REQUIRED when enabled -- it is
+    // the substrate every frame starts from, not one slot among many.
+    sd_image_t* msr_background;
+    sd_image_t* msr_subjects;
+    int msr_subjects_size;
+    int msr_frames;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;

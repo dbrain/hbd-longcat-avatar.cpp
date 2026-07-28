@@ -805,6 +805,113 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
             }
 
+            // MSR (Licon Multiple-Subject-Reference) in-context reference strip:
+            //   "msr": {"background": "<base64|/abs/path>",
+            //           "subjects": ["<base64|/abs/path>", ...],
+            //           "frames": 17}
+            // The BACKGROUND is required -- it is the substrate every frame of the strip
+            // starts from, not one slot among many. `frames` defaults to the tightest
+            // strip that gives each subject its own latent slot (8*K + 1).
+            std::string msr_background;
+            std::vector<std::string> msr_subjects;
+            int msr_frames = 0;
+            if (body.contains("msr") && !body["msr"].is_null()) {
+                const auto& msr = body["msr"];
+                if (!msr.is_object()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"msr must be an object"})", "application/json");
+                    return;
+                }
+                auto read_msr_image = [&](const json& value, const char* what, std::string* out) {
+                    if (!value.is_string() || value.get<std::string>().empty()) {
+                        res.status = 400;
+                        res.set_content(json({{"error", std::string("msr ") + what +
+                                                            " must be a non-empty base64 payload or absolute path"}})
+                                            .dump(),
+                                        "application/json");
+                        return false;
+                    }
+                    *out = value.get<std::string>();
+                    if ((*out)[0] == '/') {
+                        std::error_code error;
+                        if (!fs::is_regular_file(*out, error)) {
+                            res.status = 400;
+                            res.set_content(json({{"error", std::string("msr ") + what +
+                                                                " path is not a readable file"}})
+                                                .dump(),
+                                            "application/json");
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                if (!msr.contains("background") || msr["background"].is_null()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"msr needs a background image"})", "application/json");
+                    return;
+                }
+                if (!read_msr_image(msr["background"], "background", &msr_background)) {
+                    return;
+                }
+                if (msr.contains("subjects") && !msr["subjects"].is_null()) {
+                    if (!msr["subjects"].is_array()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"msr subjects must be an array"})", "application/json");
+                        return;
+                    }
+                    // Four is the checkpoint's trained ceiling (plus the background, that is
+                    // the "2 to 5 reference images" the model card describes).
+                    if (msr["subjects"].size() > 4) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"msr supports at most 4 subjects"})", "application/json");
+                        return;
+                    }
+                    for (const auto& entry : msr["subjects"]) {
+                        std::string subject;
+                        if (!read_msr_image(entry, "subject", &subject)) {
+                            return;
+                        }
+                        msr_subjects.push_back(std::move(subject));
+                    }
+                }
+                msr_frames = static_cast<int>(msr_subjects.size()) * 8 + 1;
+                if (msr.contains("frames") && !msr["frames"].is_null()) {
+                    if (!msr["frames"].is_number_integer()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"msr frames must be an integer"})", "application/json");
+                        return;
+                    }
+                    msr_frames = msr["frames"].get<int>();
+                }
+                // 1 modulo 8 is what makes each reference land on a whole latent frame;
+                // the checkpoint's own menu is 17/25/33/41/49/57/65.
+                if (msr_frames < 9 || msr_frames > 65 || msr_frames % 8 != 1) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"msr frames must be one of 17, 25, 33, 41, 49, 57, 65"})",
+                                    "application/json");
+                    return;
+                }
+                if (static_cast<int>(msr_subjects.size()) > (msr_frames - 1) / 8) {
+                    res.status = 400;
+                    res.set_content(json({{"error", "msr has " + std::to_string(msr_subjects.size()) +
+                                                        " subjects but only " + std::to_string((msr_frames - 1) / 8) +
+                                                        " slots at " + std::to_string(msr_frames) + " frames"}})
+                                        .dump(),
+                                    "application/json");
+                    return;
+                }
+                // MSR was trained through ComfyUI's IC-LoRA guide, which tags nothing. A
+                // positive phase scale would put the strip on the Best-Face-ID convention
+                // the checkpoint never saw, so refuse it rather than render it off-recipe.
+                if (tass_phase_scale > 0.f) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"msr requires the untagged layout; tass_phase_scale must be 0"})",
+                                    "application/json");
+                    return;
+                }
+                tass_phase_scale = 0.f;
+            }
+
             const std::string default_model = body.value("model", std::string("base"));
             const auto variants = runtime_diffusion_model_variants(*runtime);
             if (variants.find(default_model) == variants.end()) {
@@ -887,6 +994,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_control_frames = std::move(segment_control_frames);
             job->ltx_character_refs = std::move(character_refs);
             job->ltx_tass_phase_scale = tass_phase_scale;
+            job->ltx_msr_background   = std::move(msr_background);
+            job->ltx_msr_subjects     = std::move(msr_subjects);
+            job->ltx_msr_frames       = msr_frames;
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
