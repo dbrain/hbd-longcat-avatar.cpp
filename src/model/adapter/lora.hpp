@@ -733,11 +733,35 @@ struct LoraModel : public GGMLRunner {
             scale_value *= multiplier;
 
             ggml_tensor* lx;
+            // Whether the LoRA strength has already been folded into the RANK-WIDE intermediate
+            // below, so the full-width scale at the end can be skipped.
+            bool scale_folded = false;
             if (!is_conv2d) {
                 lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
                 if (lora_mid) {
                     lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
                 }
+                // Apply the strength HERE, on the [tokens x rank] intermediate, instead of on the
+                // [tokens x out] result after lora_up: rank is 32..128 against out 4096..16384,
+                // so this touches ~1.6% of the elements for the same intended maths.
+                //
+                // MEASURED WIN (nsys, 1920x1088/145f, 2 steps, audio-reactive, rebuilt binary):
+                // scale_f32 +4295 ms -> +46 ms, cutting the adapter's total GPU overhead from
+                // +15841 ms to +11530 ms (-27%), every other kernel unchanged. The full-width
+                // scale had been the 2nd-largest line in the profile, above the LoRA's own GEMMs.
+                //
+                // NUMERICS: **UNVALIDATED**. It commutes in exact arithmetic, but lora_up is Q8_0
+                // so this GEMM takes ggml's MMQ route and quantises the ACTIVATION to q8_1 first;
+                // scaling before that quantisation need not be bit-identical to scaling after.
+                // An A/B at 768x448/25f measured mean |dLuma| 2.75/255 against the unpatched
+                // build -- but the SAME binary run twice at that shape differs by 2.36, so that
+                // comparison sits in the noise and proves nothing either way. The LoRA path is
+                // NON-DETERMINISTIC at small shapes; 1920x1088/145f server renders of one seed
+                // were previously bit-identical, so that is the shape to validate on, and the CLI
+                // cannot reach it (VAE decode OOMs without the server's tiling). Needs a server
+                // build. Do not claim neutrality — in either direction — until that A/B is run.
+                lx = ggml_ext_scale(ctx, lx, scale_value, true);
+                scale_folded = true;
                 lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
             } else {  // OP_CONV2D
                 lx = ggml_ext_conv_2d(ctx,
@@ -786,7 +810,9 @@ struct LoraModel : public GGMLRunner {
                                       forward_params.conv2d.scale);
             }
 
-            auto curr_out_diff = ggml_ext_scale(ctx, lx, scale_value, true);
+            // Conv2d still scales at full width (its intermediate is not narrower, so there is
+            // nothing to win); the linear path already folded it into the rank-wide tensor.
+            auto curr_out_diff = scale_folded ? lx : ggml_ext_scale(ctx, lx, scale_value, true);
 
             if (out_diff == nullptr) {
                 out_diff = curr_out_diff;
