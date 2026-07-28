@@ -45,6 +45,13 @@ struct LtxCharacterRef {
     std::string image;
     int source_id     = 0;
     bool match_target = false;
+    // Optional SHOT SCOPE, in rendered-segment index space (the same space as the
+    // request's own `segments[]` positions). `scoped == false` means the sheet
+    // applies to every segment, which is what an absent key must keep doing.
+    // `scoped == true` with an EMPTY list is inert -- it applies to no segment --
+    // so an empty array is never confused with "all".
+    bool scoped = false;
+    std::vector<int> segments;
 };
 
 struct AsyncGenerationJob {

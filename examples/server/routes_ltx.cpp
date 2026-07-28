@@ -638,10 +638,16 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             // TASS overlap character references (LTX-Best-Face-ID sheets).
             //   "character_refs": [{"image": "<base64|/abs/path>",
             //                       "source_id": 2,
-            //                       "resize_mode": "native_resolution"}]
-            // The sheet is an identity, not a shot, so this is a top-level list
-            // that applies to every segment of the request. Absent, everything
-            // below is inert and the render is unchanged.
+            //                       "resize_mode": "native_resolution",
+            //                       "segments": [0, 2]}]
+            // The sheet is an identity, not a shot, so this stays a TOP-LEVEL list
+            // and the per-segment `segments[i].character_refs` copies remain
+            // ignored -- this scope is authoritative. Absent, everything below is
+            // inert and the render is unchanged.
+            //
+            // `segments` is optional and is in RENDERED SEGMENT INDEX space. Absent
+            // means every segment (the original behaviour, which callers rely on
+            // being byte-identical); an explicit empty array applies to NO segment.
             std::vector<LtxCharacterRef> character_refs;
             if (body.contains("character_refs") && !body["character_refs"].is_null()) {
                 if (!body["character_refs"].is_array()) {
@@ -705,10 +711,44 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             return;
                         }
                     }
+                    if (entry.contains("segments") && !entry["segments"].is_null()) {
+                        if (!entry["segments"].is_array()) {
+                            res.status = 400;
+                            res.set_content(R"({"error":"character_ref segments must be an array of segment indices"})",
+                                            "application/json");
+                            return;
+                        }
+                        // Present-but-empty is a real state, not a missing key: it scopes the
+                        // sheet to nothing. Recorded via `scoped` so the two never collapse.
+                        reference.scoped = true;
+                        for (const auto& index : entry["segments"]) {
+                            if (!index.is_number_integer() || index.get<int>() < 0 ||
+                                index.get<int>() >= static_cast<int>(prompts.size())) {
+                                res.status = 400;
+                                res.set_content(json({{"error", "character_ref segments must be integers in [0, " +
+                                                                    std::to_string(prompts.size()) + ")"}}).dump(),
+                                                "application/json");
+                                return;
+                            }
+                            const int segment_index = index.get<int>();
+                            if (std::find(reference.segments.begin(), reference.segments.end(), segment_index) ==
+                                reference.segments.end()) {
+                                reference.segments.push_back(segment_index);
+                            }
+                        }
+                    }
                     character_refs.push_back(std::move(reference));
                 }
             }
-            float tass_phase_scale = 0.f;
+            // Negative == "not supplied" -> the engine picks its 1.0 default.
+            //
+            // ZERO IS NOW LEGAL and means UNTAGGED: phase = source_id * scale * theta^-d/L,
+            // so a zero scale makes the source tag an exact no-op and the references sit on
+            // the target's own RoPE grid with nothing distinguishing them -- which is
+            // precisely JoyAI-Echo's native memory layout (`position_mode: reference`).
+            // Echo-derived weights never saw a phase tag during training, so running them
+            // with the Best-Face-ID tagging convention would be off-recipe.
+            float tass_phase_scale = -1.f;
             if (body.contains("tass_phase_scale") && !body["tass_phase_scale"].is_null()) {
                 if (!body["tass_phase_scale"].is_number()) {
                     res.status = 400;
@@ -716,9 +756,10 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     return;
                 }
                 tass_phase_scale = body["tass_phase_scale"].get<float>();
-                if (!(tass_phase_scale > 0.f)) {
+                if (!(tass_phase_scale >= 0.f)) {
                     res.status = 400;
-                    res.set_content(R"({"error":"tass_phase_scale must be positive"})", "application/json");
+                    res.set_content(R"({"error":"tass_phase_scale must be zero (untagged) or positive"})",
+                                    "application/json");
                     return;
                 }
             }

@@ -4246,7 +4246,14 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->character_refs                        = nullptr;
     sd_vid_gen_params->character_ref_source_ids              = nullptr;
     sd_vid_gen_params->character_refs_size                   = 0;
-    sd_vid_gen_params->tass_phase_scale                      = 0.f;
+    // Null counts == every reference in every segment, so an untouched params
+    // block keeps the unscoped behaviour.
+    sd_vid_gen_params->character_ref_segments                = nullptr;
+    sd_vid_gen_params->character_ref_segment_counts          = nullptr;
+    // Negative == unsupplied (engine default 1.0). Zero is a MEANINGFUL value: it
+    // requests the untagged / JoyAI-Echo overlap layout, so it cannot double as
+    // the "not set" sentinel the way it used to.
+    sd_vid_gen_params->tass_phase_scale                      = -1.f;
     sd_vid_gen_params->beats                                 = nullptr;
     sd_vid_gen_params->beat_count                            = 0;
     sd_vid_gen_params->relay_eps                             = 0.f;
@@ -7887,14 +7894,17 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                                       request->vae_scale_factor,
                                                                       8,
                                                                       &latents.video_source_ids);
-        latents.tass_phase_scale = sd_vid_gen_params->tass_phase_scale > 0.f
+        // >= 0 is an explicit request; exactly 0 means UNTAGGED (Echo's native layout:
+        // references share the target's RoPE grid with no source-phase tag at all).
+        latents.tass_phase_scale = sd_vid_gen_params->tass_phase_scale >= 0.f
                                        ? sd_vid_gen_params->tass_phase_scale
                                        : 1.f;
-        LOG_INFO("LTXAV TASS overlap references: %d sheet(s), %lld reference token(s), phase_scale=%.2f",
+        LOG_INFO("LTXAV TASS overlap references: %d sheet(s), %lld reference token(s), phase_scale=%.2f%s",
                  sd_vid_gen_params->character_refs_size,
                  (long long)(latents.ref_video_x.shape()[0] * latents.ref_video_x.shape()[1] *
                              latents.ref_video_x.shape()[2]),
-                 latents.tass_phase_scale);
+                 latents.tass_phase_scale,
+                 latents.tass_phase_scale == 0.f ? " (UNTAGGED / Echo layout)" : "");
     }
 
     if (sd_version_is_ltxav(sd_ctx->sd->version) && !latents.audio_latent.empty()) {
@@ -9713,6 +9723,10 @@ static int ltxav_auto_trim_drop(const sd_image_t& prev_last,
     // reads as a slight hitch or jump rather than a cut. Drop it as well, so the join ADVANCES by
     // one frame of motion instead of repeating one. Bounded by the search band (hi <= n_frames-2),
     // so this stays inside the array.
+    //
+    // +1 AND NO FURTHER (tested, negative): advancing past the duplicate by 7 or 8 frames, to make
+    // the trim land on 8*K, visibly JUMPED on a locked-off constant-velocity walk. Those frames
+    // carry real motion -- only best_frame is a duplicate.
     return std::min(best_frame + 1, n_frames - 1);
 }
 
@@ -10005,16 +10019,30 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // previous measurement is a far better predictor than a fixed 8*K -- and it self-corrects
     // instead of being wrong the same way at every join. -1 = nothing measured yet.
     int last_measured_seam_drop = -1;
+    // Per-seam (predicted, applied) log so a long chain reports its trim behaviour in ONE
+    // line at the end, instead of the operator having to spot a mid-render WARN. A chain
+    // whose trims all agree is the normal case; any wandering shows up as a spread.
+    std::vector<std::pair<int, int>> seam_trims;
     int carried_frames = std::max(1, chain_params->cont_latent_frames);
     const int overlap_frames = 1 + (carried_frames - 1) * (ltx_chain ? 8 : 4);
-    // Seam trim fallback when the caller supplies no pin. This is NOT overlap_frames: the K
-    // carried latents own one 8-frame latent group EACH, so the causal VAE decodes them to
-    // overlap_px = 1+(K-1)*8 real frames and the model re-renders the remaining 7 settling in.
-    // 8*K = (1+(K-1)*8) + 7 is the true trim; anchoring it to overlap_px instead under-trims by
-    // 7 frames and desyncs audio after every seam (it fell 17->9 when K went 3->2, while the
-    // real trim stayed 8*K). Callers that know better still win via cont_seam_drop_frames /
-    // segment_seam_drop_frames.
-    const int seam_drop_default = ltx_chain ? 8 * carried_frames : overlap_frames;
+    // Seam trim fallback when the caller supplies no pin.
+    //
+    // This USED to be 8*K on the theory that the causal VAE decodes the K carried latents to
+    // overlap_px = 1+(K-1)*8 real frames and the model then re-renders 7 "settling" frames, making
+    // 8*K = overlap_px + 7 the true trim. EYE TEST 2026-07-28 REFUTES THAT: on a locked-off
+    // constant-velocity walk (the case where a skip is unmissable), trimming to 8*K visibly JUMPS,
+    // while trimming to overlap_px is clean. Those 7 frames carry real motion, they are not
+    // duplicates of content already shown.
+    //
+    // Which also resolves the A/V desync properly. The rule is `drop_applied == drop_predicted`,
+    // and drop_predicted must be known BEFORE the render because it cuts the drive audio. It does
+    // not have to be 8*K to satisfy that — overlap_px is equally a pure function of K. The
+    // auto-trim search independently lands on overlap_px (measured: 9 at K=2, 17 at K=3), so
+    // predicting overlap_px makes prediction and application agree WITHOUT forcing the picture to
+    // a cut that jumps. 8*K made them agree by moving the wrong one.
+    //
+    // Callers that know better still win via cont_seam_drop_frames / segment_seam_drop_frames.
+    const int seam_drop_default = overlap_frames;
     if (overlap_frames >= base_params->video_frames &&
         (chain_params->segment_video_frames == nullptr || chain_params->segment_video_frames[0] <= 0)) {
         LOG_ERROR("generate_video_chain: continuation overlap %d leaves no new frames in a %d-frame segment",
@@ -10064,6 +10092,69 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             !track_audio.loaded()) {
             LOG_ERROR("generate_video_chain: track audio is not a readable WAV");
             return false;
+        }
+    }
+
+    // ── SEAM TRIM: PINNED vs CONTENT-ADAPTIVE ───────────────────────────────────────────────
+    // A/V is exact IFF the trim actually APPLIED equals the trim this segment's drive-audio window
+    // was CUT against. The window is cut before the render; a content-adaptive trim can only be
+    // measured after it. Nothing closes that gap -- not even feeding the previous measurement
+    // forward, which is wrong at the very first seam by construction and wrong again at every seam
+    // whose content differs from the last one. Whatever the search returns that the estimate did
+    // not predict lands as a within-shot A/V offset, and the damage is not just the audible
+    // repeat in the generated track: the shot was RENDERED against audio in the wrong place, so
+    // the lip-sync error is baked into the pixels and survives any re-mux of the source song.
+    //
+    // Therefore: PIN the trim whenever the engine owns the audio -- i.e. whenever there is anything
+    // to desync -- and let the adaptive search run only when a miss cannot cost anything (a
+    // picture-only chain). Seam smoothness on the pinned path is the job of frame-count-PRESERVING
+    // polish, not of moving the cut. Caller pin wins; cont_seam_drop_frames == 0 derives 8*K; a
+    // NEGATIVE cont_seam_drop_frames forces the adaptive search back on even with audio (a
+    // diagnostic escape hatch -- it will desync, and the tripwire below says so).
+    const bool has_shot_audio    = chain_params->segment_audio_full != nullptr ||
+                                   chain_params->segment_audio_track != nullptr;
+    const bool has_windowed_audio_dir = chain_params->chain_audio_dir != nullptr &&
+                                        chain_params->chain_audio_dir[0] != '\0';
+    const bool engine_owns_audio = drive_audio.loaded() || track_audio.loaded() || has_shot_audio ||
+                                   has_windowed_audio_dir;
+    const bool force_adaptive_seam = chain_params->cont_seam_drop_frames < 0;
+    // ADAPT BY DEFAULT. A derived pin was tried and is wrong for this engine: auto-trim exists
+    // BECAUSE the fixed derived value (8*K) does not hold — the real trim moves per clip, and
+    // assuming it was constant is what made audio skip in the first place. Pinning "fixes" A/V by
+    // forcing the picture to a cut the content did not ask for.
+    //
+    // Instead, the PREDICTION adapts: `last_measured_seam_drop` feeds the previous seam's measured
+    // trim forward into the next window's drive-audio cut (seams within one clip sit close
+    // together), and `seam_drop_default` = overlap_px is the first-seam guess, which is what the
+    // search empirically returns. Residual error is therefore bounded to the first seam of a chain
+    // rather than systematic at every join, and the tripwire warning reports any remainder.
+    //
+    // LTXAV_PIN_SEAM=1 restores the pinned behaviour for diagnosis.
+    static const bool pin_seam_env = [] {
+        const char* raw = getenv("LTXAV_PIN_SEAM");
+        return raw != nullptr && *raw == '1';
+    }();
+    const bool pin_derived_seam = pin_seam_env && engine_owns_audio && !force_adaptive_seam &&
+                                  chain_params->cont_seam_drop_frames == 0;
+    if (ltx_chain && chain_params->n_segments > 1) {
+        if (chain_params->cont_seam_drop_frames > 0) {
+            LOG_INFO("generate_video_chain: seam trim PINNED by the caller to %d frames%s -> the "
+                     "drive-audio window and the applied trim agree by construction",
+                     chain_params->cont_seam_drop_frames,
+                     chain_params->segment_seam_drop_frames != nullptr ? " (per-shot entries supersede)" : "");
+        } else if (pin_derived_seam) {
+            LOG_INFO("generate_video_chain: seam trim PINNED to the derived %d frames (K=%d -> 8*K; guide "
+                     "overlap_px=%d) because the engine owns the audio -> picture and sound are "
+                     "frame-exact at every seam",
+                     seam_drop_default, carried_frames, overlap_frames);
+        } else {
+            LOG_INFO("generate_video_chain: seam trim CONTENT-ADAPTIVE (search centred on %d, guide "
+                     "overlap_px=%d)%s",
+                     seam_drop_default,
+                     overlap_frames,
+                     engine_owns_audio ? " -- FORCED ON with audio present: A/V will wander by the "
+                                         "per-segment prediction error"
+                                       : "");
         }
     }
 
@@ -10369,6 +10460,43 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         flush_window(false);
     }
 
+    // TASS character-reference SHOT SCOPING. A sheet is an identity, so it arrives once at the top
+    // level, but a chain's shots do not all contain the same people: a reference scoped to shot 1
+    // must contribute no tokens at all to shot 0, not merely be ignored there.
+    //
+    // The rotary source ids are settled ONCE, over the whole array, using the same rule the encode
+    // path applies (2, 3, 4, ... in order, resuming one past any explicit id). Recomputing them per
+    // segment would renumber whatever survived the filter, and an identity that changes its source
+    // tag between shots is a different identity to the model.
+    std::vector<int> tass_source_ids;
+    const bool tass_scoped = base_params->character_refs != nullptr && base_params->character_refs_size > 0 &&
+                             base_params->character_ref_segment_counts != nullptr;
+    std::vector<int> tass_scope_offsets;
+    if (base_params->character_refs != nullptr && base_params->character_refs_size > 0) {
+        tass_source_ids.reserve(base_params->character_refs_size);
+        int next_source_id = 2;
+        for (int i = 0; i < base_params->character_refs_size; ++i) {
+            int source_id = next_source_id;
+            if (base_params->character_ref_source_ids != nullptr && base_params->character_ref_source_ids[i] > 1) {
+                source_id = base_params->character_ref_source_ids[i];
+            }
+            next_source_id = source_id + 1;
+            tass_source_ids.push_back(source_id);
+        }
+        if (tass_scoped) {
+            tass_scope_offsets.reserve(base_params->character_refs_size);
+            int offset = 0;
+            for (int i = 0; i < base_params->character_refs_size; ++i) {
+                tass_scope_offsets.push_back(offset);
+                offset += std::max(0, base_params->character_ref_segment_counts[i]);
+            }
+        }
+    }
+    // Backing storage for the per-segment filtered views. Rebuilt each iteration and only ever read
+    // by the generate_video call inside that same iteration.
+    std::vector<sd_image_t> segment_character_refs;
+    std::vector<int> segment_character_ref_source_ids;
+
     for (int segment = sample_start; segment <= sample_end; ++segment) {
         if (chain_params->before_segment != nullptr &&
             !chain_params->before_segment(segment, chain_params->before_segment_user)) {
@@ -10376,6 +10504,46 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return fail();
         }
         sd_vid_gen_params_t params = *base_params;
+        // Narrow the references to the ones this shot is in scope for. Handing the encode path a
+        // null pointer and a zero count is exactly the state a request with no character_refs
+        // arrives in, so a shot that scopes out every sheet takes the untouched code path -- no
+        // reference tokens, no denoise-mask forcing, no change to its output.
+        if (!tass_source_ids.empty()) {
+            params.character_ref_segments       = nullptr;
+            params.character_ref_segment_counts = nullptr;
+            if (tass_scoped) {
+                segment_character_refs.clear();
+                segment_character_ref_source_ids.clear();
+                for (int i = 0; i < base_params->character_refs_size; ++i) {
+                    const int count = std::max(0, base_params->character_ref_segment_counts[i]);
+                    // Zero is inert, and it is also the one case where the flat index buffer is
+                    // allowed to be null, so it has to be answered before the pointer arithmetic.
+                    if (count == 0 || base_params->character_ref_segments == nullptr) {
+                        continue;
+                    }
+                    const int* scope = base_params->character_ref_segments + tass_scope_offsets[i];
+                    if (std::find(scope, scope + count, segment) == scope + count) {
+                        continue;
+                    }
+                    segment_character_refs.push_back(base_params->character_refs[i]);
+                    segment_character_ref_source_ids.push_back(tass_source_ids[i]);
+                }
+                params.character_refs           = segment_character_refs.empty() ? nullptr
+                                                                                 : segment_character_refs.data();
+                params.character_ref_source_ids = segment_character_ref_source_ids.empty()
+                                                      ? nullptr
+                                                      : segment_character_ref_source_ids.data();
+                params.character_refs_size      = static_cast<int>(segment_character_refs.size());
+                LOG_INFO("LTXAV TASS scope: window %d takes %d of %d character reference(s)",
+                         segment + 1,
+                         params.character_refs_size,
+                         base_params->character_refs_size);
+            } else {
+                // Unscoped: every sheet, but still carrying the settled numbering so the ids a
+                // scoped and an unscoped request produce are the same function of the array.
+                params.character_ref_source_ids = tass_source_ids.data();
+            }
+        }
         if (chain_params->segment_video_frames != nullptr && chain_params->segment_video_frames[segment] > 0) {
             params.video_frames = chain_params->segment_video_frames[segment];
         }
@@ -10530,9 +10698,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                       ? chain_params->segment_seam_drop_frames[segment]
                                       : -1;
         // A-priori estimate: it cuts this segment's drive-audio window, so the closer it is to the
-        // trim we will actually apply, the tighter A/V stays. Prefer the last measured seam.
+        // trim we will actually apply, the tighter A/V stays. This now runs for AUDIO chains too:
+        // pinning is off by default (see pin_derived_seam), so the prediction is what adapts.
+        // Seams within one clip sit close together, so the previous seam's MEASURED trim predicts
+        // the next far better than any fixed derivation -- and it self-corrects instead of being
+        // wrong the same way at every join. Only the first seam of a chain falls back to
+        // seam_drop_default (= overlap_px, what the search empirically returns).
         const int seam_drop_estimate =
-            (declared_drop < 0 && chain_params->cont_seam_drop_frames <= 0 && last_measured_seam_drop >= 0)
+            (declared_drop < 0 && chain_params->cont_seam_drop_frames <= 0 && !pin_derived_seam &&
+             last_measured_seam_drop >= 0)
                 ? last_measured_seam_drop
                 : seam_drop_default;
         const int seam_drop = segment == 0 || fresh_scene
@@ -10661,27 +10835,33 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                      chain_params->on_segment_user);
         }
         free(latent);
-        // The trim: an explicit pin from the caller is authoritative (koblem sends 8*K, and a pinned
-        // trim is what makes A/V EXACT because the drive slice is cut a priori). With no pin, align
-        // the cut to the smoothest continuation instead of trusting the 8*K estimate -- over-trimming
-        // discards freshly rendered frames and reads as a jump forward at the join.
+        // The trim: an explicit pin from the caller is authoritative (koblem sends 8*K), and the
+        // derived 8*K is itself a pin whenever the engine owns the audio -- because the drive slice
+        // was cut a priori against exactly this number, and only equality makes A/V exact. The
+        // content-adaptive search, which aligns the cut to the smoothest continuation rather than
+        // trusting 8*K, therefore runs ONLY on a picture-only chain (or when a caller forces it),
+        // where a miss costs nothing but a slightly different join.
         //
         // Using the measured drop for BOTH the video trim and this segment's audio head-drop keeps
-        // the two aligned within the segment, and the next segment re-anchors its drive window to
-        // the true accumulated timeline, so an adaptive miss cannot accumulate across seams.
+        // those two aligned within the segment, and the next segment re-anchors its drive window to
+        // the true accumulated timeline, so an adaptive miss cannot accumulate across seams. It
+        // still cannot undo the fact that the shot was RENDERED against a mispositioned drive
+        // window -- which is why the pin exists.
         int effective_seam_drop = seam_drop;
-        const bool seam_drop_pinned = declared_drop >= 0 || chain_params->cont_seam_drop_frames > 0;
+        const bool seam_drop_pinned = declared_drop >= 0 || chain_params->cont_seam_drop_frames > 0 ||
+                                      pin_derived_seam;
         if (seam_drop > 0 && !seam_drop_pinned && !stitched.empty() && segment_count > 2) {
             const int measured = ltxav_auto_trim_drop(stitched.back(), segment_frames, segment_count, seam_drop);
-            // The drive window for THIS segment was already cut against seam_drop, so a measured
-            // trim that differs by delta offsets this segment's A/V by delta. Warn once it is big
-            // enough to see (>2 frames ~ 80ms at 24fps) rather than letting it pass silently; the
-            // feed-forward estimate above should keep it at zero from the second seam onward.
+            // TRIPWIRE. The drive window for THIS segment was already cut against seam_drop, so a
+            // measured trim that differs by delta offsets this segment's A/V by delta -- baked into
+            // the pixels, not fixable by re-muxing. With the pin above this branch is unreachable
+            // whenever there is any audio at all, so the warning should NEVER fire; if it does,
+            // either a caller forced the adaptive search on over audio or the pin has regressed.
             if (measured != seam_drop) {
                 const int delta = std::abs(measured - seam_drop);
                 LOG_INFO("generate_video_chain: window %d seam auto-trim -> drop %d (estimate was %d)",
                          segment + 1, measured, seam_drop);
-                if (delta > 2) {
+                if (engine_owns_audio) {
                     LOG_WARN("generate_video_chain: window %d drive audio was cut for a %d-frame trim "
                              "but %d was applied — this shot's A/V is offset by %d frame(s); the next "
                              "shot re-anchors to the true timeline so it cannot accumulate",
@@ -10690,6 +10870,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             }
             effective_seam_drop = measured;
             last_measured_seam_drop = measured;
+            seam_trims.emplace_back(seam_drop, measured);
         }
         const int audio_drop = std::min(effective_seam_drop, segment_count);
         if (chain_params->segment_audio_track != nullptr) {
@@ -10774,6 +10955,21 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         LOG_INFO("generate_video_chain: streamed %lld frame(s) out; peak frame memory stayed at one "
                  "segment plus the window instead of the whole timeline",
                  (long long)flushed_total);
+        if (!seam_trims.empty()) {
+            std::string detail;
+            int worst = 0;
+            for (const auto& [predicted, applied] : seam_trims) {
+                detail += " " + std::to_string(applied);
+                if (predicted != applied) {
+                    detail += "(pred " + std::to_string(predicted) + ")";
+                }
+                worst = std::max(worst, std::abs(applied - predicted));
+            }
+            LOG_INFO("generate_video_chain: seam trims applied:%s | worst predicted-vs-applied gap %d "
+                     "frame(s)%s",
+                     detail.c_str(), worst,
+                     worst == 0 ? " — A/V exact at every seam" : " (that shot's mouths sit that far off)");
+        }
         *frames_out = nullptr;
         *num_frames_out = static_cast<int>(final_frame_count);
     } else {

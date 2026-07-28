@@ -454,6 +454,22 @@ typedef struct {
     // reserved (zero is the target's exact no-op tag).
     int* character_ref_source_ids;
     int character_refs_size;
+    // Optional per-reference SEGMENT SCOPE for chained renders, as two parallel
+    // flat arrays: `character_ref_segment_counts` holds one count per reference
+    // (`character_refs_size` entries) and `character_ref_segments` is their
+    // concatenation in reference order, so reference i owns the counts[i] entries
+    // starting at sum(counts[0..i-1]).
+    //
+    // A NULL counts pointer means every reference applies to every segment, which
+    // is what every caller predating this field gets. A count of ZERO scopes that
+    // reference to no segment at all -- deliberately distinct from the null case,
+    // never a synonym for "all". A segment left with no references in scope
+    // renders exactly as if the request carried no character_refs.
+    //
+    // Indices are in rendered-segment index space and are ignored outside
+    // generate_video_chain, where a single render is the whole request.
+    int* character_ref_segments;
+    int* character_ref_segment_counts;
     // Rotary source-phase multiplier. Zero selects the trained default of 1.0.
     float tass_phase_scale;
     sd_image_t* control_frames;
@@ -641,8 +657,12 @@ typedef struct {
     // disabled when enable_retake is false.
     int retake_segment;
     // Continuation seam policy.  A positive scalar pins every ordinary
-    // continuation; zero retains the derived latent-overlap drop.  Per-shot
-    // entries supersede it; a negative entry selects the scalar/derived value.
+    // continuation.  Zero uses the derived 8*K drop, and PINS it whenever the
+    // engine owns the audio -- the drive window is cut a priori against that
+    // number, so only equality keeps A/V frame-exact.  A NEGATIVE scalar forces
+    // the content-adaptive seam search back on even with audio present, which
+    // desyncs by the per-segment prediction error; diagnostics only.  Per-shot
+    // entries supersede it; a negative ENTRY selects the scalar/derived value.
     int cont_seam_drop_frames;
     const int* segment_seam_drop_frames;
     // Optional per-shot audio files.  full drives that window's LTX audio

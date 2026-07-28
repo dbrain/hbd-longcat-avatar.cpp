@@ -682,7 +682,9 @@ namespace LTXV {
             // every head boundary (see ltxv_tass_source_phase).  source_id == 0
             // short-circuits to a no-op so the untagged path stays bit-identical.
             const float source_id = source_ids != nullptr ? (*source_ids)[static_cast<size_t>(token)] : 0.f;
-            if (source_id != 0.f) {
+            // phase_scale == 0 is the UNTAGGED (Echo overlap) layout: skip the whole
+            // per-dim loop rather than adding a column of exact zeros.
+            if (source_id != 0.f && phase_scale != 0.f) {
                 const int head_half_dim = half_dim / std::max(num_heads, 1);
                 for (int d = 0; d < half_dim; d++) {
                     freqs[token][d] += ltxv_tass_source_phase(source_id, phase_scale, theta, d, head_half_dim);
@@ -851,6 +853,30 @@ namespace LTXV {
         }
     };
 
+    // Target-video self-attention temperature (JoyAI-Echo §3.4). Reference tokens
+    // dilute the target's own self-attention; sharpening it back is an inference-only
+    // counterweight -- softmax(QK^T / (tau * sqrt(d))) == softmax((Q/tau) K^T / sqrt(d)),
+    // so it is a scale on Q and nothing else. tau < 1 sharpens.
+    //
+    // 1.0 is an EXACT no-op: the scale node is not emitted at all, so the untagged
+    // graph stays bit-identical to a build without this knob.
+    inline float ltxv_video_self_attn_temp() {
+        static const float temp = [] {
+            const char* raw = getenv("LTX_TASS_VSELF_TEMP");
+            if (raw == nullptr || *raw == '\0') {
+                return 1.f;
+            }
+            const float parsed = std::strtof(raw, nullptr);
+            if (!(parsed > 0.f)) {
+                LOG_WARN("LTX_TASS_VSELF_TEMP=%s is not positive; ignoring", raw);
+                return 1.f;
+            }
+            LOG_INFO("LTX_TASS_VSELF_TEMP=%.3f (target-video self-attention temperature)", parsed);
+            return parsed;
+        }();
+        return temp;
+    }
+
     struct CrossAttention : public GGMLBlock {
         int64_t heads;
         int64_t dim_head;
@@ -880,7 +906,8 @@ namespace LTXV {
                              ggml_tensor* context = nullptr,
                              ggml_tensor* mask    = nullptr,
                              ggml_tensor* pe      = nullptr,
-                             ggml_tensor* k_pe    = nullptr) {
+                             ggml_tensor* k_pe    = nullptr,
+                             float logit_scale    = 1.f) {
             if (context == nullptr) {
                 context = x;
             }
@@ -927,6 +954,13 @@ namespace LTXV {
             // the flag on or off.
             if (q->type != GGML_TYPE_F32) {
                 q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+            }
+
+            // Attention temperature, applied to Q only. Deliberately AFTER the F32
+            // normalization above: ggml_scale is F32-only on CUDA (scale.cu:28-29
+            // asserts, no fallback), so scaling an LTX_DIT_F16 Q would abort here.
+            if (logit_scale != 1.f) {
+                q = ggml_scale(ctx->ggml_ctx, q, logit_scale);
             }
 
             // GGML_CUDNN_ATTN_F16_OUT opt-in. Decided per Linear (see ltx_attn_f16_out_enabled)
@@ -1542,7 +1576,11 @@ namespace LTXV {
             auto v_mods = get_ada_values(ctx, v_table, v_timestep, v_dim, cross_attention_adaln ? 9 : 6, 0, -1, ctx->ltx_video_token_sel, {1});
             auto v_norm = rms_norm(ctx->ggml_ctx, vx);
             v_norm      = LTXV::modulate_v2(ctx->ggml_ctx, v_norm, v_mods[0], v_mods[1]);
-            auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe);
+            // 1/tau: sharpen target-video self-attention against reference-token dilution.
+            // Unset (1.0) emits no node at all -- see ltxv_video_self_attn_temp().
+            const float v_sa_temp = ltxv_video_self_attn_temp();
+            auto v_sa   = attn1->forward(ctx, v_norm, nullptr, self_attention_mask, v_pe, nullptr,
+                                         v_sa_temp == 1.f ? 1.f : 1.f / v_sa_temp);
             vx          = ggml_add(ctx->ggml_ctx, vx, apply_gate(ctx->ggml_ctx, v_sa, v_mods[2]));
             auto v_txt  = apply_text_cross_attention(ctx,
                                                      vx,

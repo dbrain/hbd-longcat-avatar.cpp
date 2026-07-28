@@ -661,6 +661,12 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     std::vector<SDImageOwner> ltx_character_ref_owners;
     std::vector<sd_image_t> ltx_character_ref_images;
     std::vector<int> ltx_character_ref_source_ids;
+    // Optional per-sheet shot scope, flattened for the C API: one count per reference plus the
+    // concatenation of their segment-index lists. Left empty -- and the params pointers left null
+    // -- unless at least one reference actually carries a scope, so unscoped requests reach the
+    // engine in exactly the shape they always did.
+    std::vector<int> ltx_character_ref_segments;
+    std::vector<int> ltx_character_ref_segment_counts;
     if (!job.ltx_character_refs.empty()) {
         ltx_character_ref_owners.resize(job.ltx_character_refs.size());
         ltx_character_ref_images.reserve(job.ltx_character_refs.size());
@@ -691,6 +697,34 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         params.character_ref_source_ids = ltx_character_ref_source_ids.data();
         params.character_refs_size      = static_cast<int>(ltx_character_ref_images.size());
         params.tass_phase_scale         = job.ltx_tass_phase_scale;
+
+        const bool any_scoped = std::any_of(job.ltx_character_refs.begin(),
+                                            job.ltx_character_refs.end(),
+                                            [](const LtxCharacterRef& ref) { return ref.scoped; });
+        if (any_scoped) {
+            // The flat form has no "applies everywhere" encoding, so once ANY sheet is scoped the
+            // unscoped ones are written out as the full segment enumeration. That keeps a count of
+            // zero unambiguously meaning "no segment".
+            const int segment_count = std::max<int>(1, static_cast<int>(job.ltx_prompts.size()));
+            ltx_character_ref_segment_counts.reserve(job.ltx_character_refs.size());
+            for (const LtxCharacterRef& reference : job.ltx_character_refs) {
+                if (reference.scoped) {
+                    ltx_character_ref_segment_counts.push_back(static_cast<int>(reference.segments.size()));
+                    ltx_character_ref_segments.insert(ltx_character_ref_segments.end(),
+                                                      reference.segments.begin(),
+                                                      reference.segments.end());
+                } else {
+                    ltx_character_ref_segment_counts.push_back(segment_count);
+                    for (int segment = 0; segment < segment_count; ++segment) {
+                        ltx_character_ref_segments.push_back(segment);
+                    }
+                }
+            }
+            params.character_ref_segments       = ltx_character_ref_segments.empty()
+                                                      ? nullptr
+                                                      : ltx_character_ref_segments.data();
+            params.character_ref_segment_counts = ltx_character_ref_segment_counts.data();
+        }
     }
 
     SegmentPreviewWriter segment_writer;
