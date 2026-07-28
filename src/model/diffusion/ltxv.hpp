@@ -1164,6 +1164,30 @@ namespace LTXV {
         }
     };
 
+    // Post-connector text context length -- the key axis every text
+    // cross-attention in the DiT sees. LTX-2 tops the prompt up to this many keys
+    // with learnable registers (128 unique vectors, tiled); upstream ComfyUI's
+    // Embeddings1DConnector uses the same ceil(max(1024, seq_len)/num_registers).
+    //
+    // Do NOT shorten it to give Prompt Relay a larger share of the keys. Tried and
+    // GPU-disproven 2026-07-28: the registers are the channel the DiT reads the
+    // prompt THROUGH, not padding diluting it. Suppressing the block rendered a
+    // completely different scene (a one-woman cream-wall prompt came back as two
+    // people in a corner) -- sharp and coherent, but unrelated to the prompt.
+    constexpr int64_t kConnectorTargetLen = 1024;
+
+    // Post-connector length for a `seq_len`-token context. The register top-up is
+    // tiled in whole copies of the register table, so the result is a multiple of
+    // num_registers. Shared by the connector, the RoPE-table planner and the relay
+    // mask so the three can never disagree about how long the key axis is.
+    __STATIC_INLINE__ int64_t ltx_connector_output_len(int64_t seq_len, int64_t num_registers) {
+        if (num_registers <= 0 || kConnectorTargetLen <= seq_len) {
+            return seq_len;
+        }
+        const int64_t duplications = (kConnectorTargetLen + num_registers - 1) / num_registers;
+        return std::max(duplications * num_registers, seq_len);
+    }
+
     struct Embeddings1DConnector : public GGMLBlock {
         int64_t hidden_size;
         int64_t num_attention_heads;
@@ -1213,12 +1237,12 @@ namespace LTXV {
             }
 
             int64_t seq_len       = hidden_states->ne[1];
-            int64_t target_len    = std::max<int64_t>(1024, seq_len);
-            int64_t duplications  = (target_len + num_learnable_registers - 1) / num_learnable_registers;
-            int64_t total_to_keep = duplications * num_learnable_registers - seq_len;
+            int64_t out_len       = ltx_connector_output_len(seq_len, num_learnable_registers);
+            int64_t total_to_keep = out_len - seq_len;
             if (total_to_keep <= 0) {
                 return hidden_states;
             }
+            int64_t duplications = (out_len + num_learnable_registers - 1) / num_learnable_registers;
 
             auto regs = ggml_reshape_3d(ctx->ggml_ctx, params["learnable_registers"], hidden_size, num_learnable_registers, 1);
             // NVFP4 GGUFs may keep the learned registers in BF16 while the
@@ -1808,7 +1832,9 @@ namespace LTXV {
                                                                   ggml_tensor* context,
                                                                   ggml_tensor* video_connector_pe,
                                                                   ggml_tensor* audio_connector_pe,
-                                                                  bool process_audio_context) {
+                                                                  bool process_audio_context,
+                                                                  ggml_tensor* v_connector_mask = nullptr,
+                                                                  ggml_tensor* a_connector_mask = nullptr) {
             if (context == nullptr) {
                 return {nullptr, nullptr};
             }
@@ -1869,14 +1895,14 @@ namespace LTXV {
 
             if (config.use_connector && v_context != nullptr && v_context->ne[0] == config.connector_hidden_size) {
                 auto connector = std::dynamic_pointer_cast<Embeddings1DConnector>(blocks["video_embeddings_connector"]);
-                v_context      = connector->forward(ctx, v_context, video_connector_pe);
+                v_context      = connector->forward(ctx, v_context, video_connector_pe, v_connector_mask);
             }
             if (process_audio_context &&
                 config.use_audio_connector &&
                 a_context != nullptr &&
                 a_context->ne[0] == config.audio_connector_hidden_size) {
                 auto connector = std::dynamic_pointer_cast<Embeddings1DConnector>(blocks["audio_embeddings_connector"]);
-                a_context      = connector->forward(ctx, a_context, audio_connector_pe);
+                a_context      = connector->forward(ctx, a_context, audio_connector_pe, a_connector_mask);
             }
 
             if (!config.caption_proj_before_connector &&
@@ -1937,9 +1963,11 @@ namespace LTXV {
                                                       ggml_tensor* a_cross_pe,
                                                       ggml_tensor* video_connector_pe,
                                                       ggml_tensor* audio_connector_pe,
-                                                      ggml_tensor* v_relay_mask = nullptr,
-                                                      ggml_tensor* a_relay_mask = nullptr,
-                                                      ggml_tensor* ref_vx       = nullptr) {
+                                                      ggml_tensor* v_relay_mask     = nullptr,
+                                                      ggml_tensor* a_relay_mask     = nullptr,
+                                                      ggml_tensor* ref_vx           = nullptr,
+                                                      ggml_tensor* v_connector_mask = nullptr,
+                                                      ggml_tensor* a_connector_mask = nullptr) {
             auto patchify_proj       = std::dynamic_pointer_cast<Linear>(blocks["patchify_proj"]);
             auto audio_patchify_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patchify_proj"]);
             auto adaln_single        = std::dynamic_pointer_cast<AdaLayerNormSingle>(blocks["adaln_single"]);
@@ -1998,7 +2026,8 @@ namespace LTXV {
             }
 
             bool run_ax    = ax != nullptr && ggml_nelements(ax) > 0 && audio_time > 0;
-            auto contexts  = preprocess_contexts(ctx, context, video_connector_pe, audio_connector_pe, run_ax);
+            auto contexts  = preprocess_contexts(ctx, context, video_connector_pe, audio_connector_pe, run_ax,
+                                                v_connector_mask, a_connector_mask);
             auto v_context = contexts.first;
             auto a_context = contexts.second != nullptr ? contexts.second : contexts.first;
             if (contexts.second != nullptr) {
@@ -2169,8 +2198,32 @@ namespace LTXV {
         // per (plan revision, shape) rather than on every graph build.
         std::vector<ggml_fp16_t> relay_video_mask_vec;
         std::vector<ggml_fp16_t> relay_audio_mask_vec;
+        std::vector<ggml_fp16_t> connector_isolate_vec;
+        std::pair<uint64_t, int64_t> connector_isolate_key{0, 0};
+        // Post-connector beat ownership. Without piece isolation this is just the
+        // conditioner's token map (registers stay global); with it, the registers
+        // are split per piece so relay can address them.
+        std::vector<int32_t> relay_key_beat;
+        std::pair<uint64_t, int64_t> relay_key_beat_key{0, 0};
         std::tuple<uint64_t, int64_t, int64_t> relay_video_key{0, 0, 0};
         std::tuple<uint64_t, int64_t, int64_t> relay_audio_key{0, 0, 0};
+
+        // LTX_RELAY_ISOLATE partitions the connector's registers across the
+        // pieces; without it the map is the conditioner's token map and every
+        // register stays global (the historical behaviour).
+        const std::vector<int32_t>& relay_key_beat_for(const sd::ltx_relay::Plan* relay, int64_t length) {
+            if (!sd::ltx_relay::isolate_enabled()) {
+                return relay->token_beat;
+            }
+            if (relay_key_beat_key != std::make_pair(relay->revision, length)) {
+                sd::ltx_relay::build_connector_key_beat(relay->token_beat,
+                                                        relay->beats.size(),
+                                                        length,
+                                                        relay_key_beat);
+                relay_key_beat_key = {relay->revision, length};
+            }
+            return relay_key_beat;
+        }
 
         static std::tuple<uint64_t, int64_t, int64_t> relay_mask_key(const sd::ltx_relay::Plan* relay,
                                                                     int64_t L_q,
@@ -2470,11 +2523,9 @@ namespace LTXV {
             // mask has to be built against this, not against context->ne[1].
             int64_t video_context_len = context != nullptr ? context->ne[1] : 0;
             if (needs_video_connector_pe) {
-                int64_t seq_len      = context->ne[1];
-                int64_t target_len   = std::max<int64_t>(1024, seq_len);
-                int64_t duplications = (target_len + config.connector_num_registers - 1) / config.connector_num_registers;
-                int64_t full_len     = seq_len + duplications * config.connector_num_registers - seq_len;
-                video_context_len    = std::max(full_len, seq_len);
+                int64_t seq_len   = context->ne[1];
+                int64_t full_len  = ltx_connector_output_len(seq_len, config.connector_num_registers);
+                video_context_len = full_len;
                 connector_pe_vec     = build_1d_rope_matrix(full_len, static_cast<int>(config.connector_hidden_size), static_cast<int>(config.connector_num_heads), 10000.f, 4096.f, true);
                 video_connector_pe   = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.connector_head_dim / 2, full_len * config.connector_num_heads);
                 ggml_set_name(video_connector_pe, "ltxav_video_connector_pe");
@@ -2496,15 +2547,36 @@ namespace LTXV {
             ggml_tensor* audio_connector_pe = nullptr;
             int64_t audio_context_len       = context != nullptr ? context->ne[1] : 0;
             if (needs_audio_connector_pe) {
-                int64_t seq_len        = context->ne[1];
-                int64_t target_len     = std::max<int64_t>(1024, seq_len);
-                int64_t duplications   = (target_len + config.audio_connector_num_registers - 1) / config.audio_connector_num_registers;
-                int64_t full_len       = seq_len + duplications * config.audio_connector_num_registers - seq_len;
-                audio_context_len      = std::max(full_len, seq_len);
+                int64_t seq_len   = context->ne[1];
+                int64_t full_len  = ltx_connector_output_len(seq_len, config.audio_connector_num_registers);
+                audio_context_len = full_len;
                 audio_connector_pe_vec = build_1d_rope_matrix(full_len, static_cast<int>(config.audio_connector_hidden_size), static_cast<int>(config.audio_connector_num_heads), 10000.f, 4096.f, true);
                 audio_connector_pe     = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.audio_connector_head_dim / 2, full_len * config.audio_connector_num_heads);
                 ggml_set_name(audio_connector_pe, "ltxav_audio_connector_pe");
                 set_backend_tensor_data(audio_connector_pe, audio_connector_pe_vec.data());
+            }
+
+            // Connector self-attention isolation. Off unless LTX_RELAY_ISOLATE=1,
+            // and null without a relay plan, so the ordinary graph is untouched.
+            ggml_tensor* v_connector_mask = nullptr;
+            ggml_tensor* a_connector_mask = nullptr;
+            if (sd::ltx_relay::isolate_enabled() && relay != nullptr && !relay->token_beat.empty() && context != nullptr) {
+                if (needs_video_connector_pe && video_context_len > 0) {
+                    if (connector_isolate_key != std::make_pair(relay->revision, video_context_len)) {
+                        sd::ltx_relay::build_connector_isolation_mask_f16(relay_key_beat_for(relay, video_context_len),
+                                                                          video_context_len,
+                                                                          connector_isolate_vec);
+                        connector_isolate_key = {relay->revision, video_context_len};
+                    }
+                    v_connector_mask = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F16, video_context_len, video_context_len);
+                    ggml_set_name(v_connector_mask, "ltxav_connector_isolate_video");
+                    set_backend_tensor_data(v_connector_mask, connector_isolate_vec.data());
+                }
+                if (needs_audio_connector_pe && audio_context_len == video_context_len && v_connector_mask != nullptr) {
+                    // Same token map and same length, so the video mask is the
+                    // audio mask; sharing it keeps one upload instead of two.
+                    a_connector_mask = v_connector_mask;
+                }
             }
 
             // Prompt Relay masks. Built on CPU, uploaded pre-shaped
@@ -2528,6 +2600,7 @@ namespace LTXV {
                                         ref_token_count;
                     if (relay_video_key != relay_mask_key(relay, L_q, video_context_len)) {
                         sd::ltx_relay::build_mask_f16(*relay,
+                                                      relay_key_beat_for(relay, video_context_len),
                                                       relay->video_frame_time,
                                                       tokens_per_frame,
                                                       video_context_len,
@@ -2555,6 +2628,7 @@ namespace LTXV {
                     const int64_t L_q = static_cast<int64_t>(relay->audio_frame_time.size());
                     if (relay_audio_key != relay_mask_key(relay, L_q, audio_context_len)) {
                         sd::ltx_relay::build_mask_f16(*relay,
+                                                      relay_key_beat_for(relay, audio_context_len),
                                                       relay->audio_frame_time,
                                                       1,
                                                       audio_context_len,
@@ -2585,7 +2659,9 @@ namespace LTXV {
                                             audio_connector_pe,
                                             v_relay_mask,
                                             a_relay_mask,
-                                            ref_vx);
+                                            ref_vx,
+                                            v_connector_mask,
+                                            a_connector_mask);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);
             return gf;

@@ -3109,12 +3109,22 @@ public:
             // different token count, so its key axis does not match the mask at
             // all; and the mask only shapes semantic layout, which is decided in
             // the first steps, so it can be retired early (relay_steps_frac).
+            // `step` is ONE-based here (the denoiser calls model(x, sigma, i+1)), so the
+            // count of masked steps IS the last masked step -- no -1. The -1 that used to
+            // be here assumed a 0-based counter and retired the mask a step early: at the
+            // default frac=1.0 the FINAL step ran unmasked, and at small fractions it cost
+            // a whole step out of two or three.
             const int relay_last_step = relay_plan == nullptr
-                                            ? -1
-                                            : static_cast<int>(std::ceil(std::clamp(relay_steps_frac, 0.f, 1.f) *
-                                                                         static_cast<float>(steps))) -
-                                                  1;
-            const sd::ltx_relay::Plan* step_relay = step <= relay_last_step ? relay_plan : nullptr;
+                                            ? 0
+                                            : std::max(1, static_cast<int>(std::ceil(
+                                                              std::clamp(relay_steps_frac, 0.f, 1.f) *
+                                                              static_cast<float>(steps))));
+            // A NEGATIVE step is some samplers' marker for "this is the primary
+            // evaluation", not a position in the schedule. Those keep the mask
+            // unconditionally, exactly as before -- narrowing them to "unmasked" here
+            // would silently switch relay off for every sampler except euler_a.
+            const sd::ltx_relay::Plan* step_relay =
+                (relay_plan != nullptr && (step < 0 || step <= relay_last_step)) ? relay_plan : nullptr;
 
             auto run_condition = [&](const SDCondition& condition,
                                      const sd::Tensor<float>* c_concat_override                 = nullptr,
@@ -5179,7 +5189,40 @@ static bool build_ltx_relay_plan(const sd_vid_gen_params_t* params,
         const float time     = sorted[position].time;
         const float lo       = position == 0 ? 0.f : 0.5f * (sorted[position - 1].time + time);
         const float hi       = position + 1 == sorted.size() ? clip_secs : 0.5f * (time + sorted[position + 1].time);
-        const float span     = std::max({time - lo, hi - time, latent_secs});
+        // The NEARER cell edge, not the further one.
+        //
+        // This was max() -- the "permissive reading", so the penalty only reached eps at
+        // the far edge. It silently disables the mask whenever a beat sits off-centre in
+        // CAP the beat's reach. This one line is what makes Prompt Relay work.
+        //
+        // eps DEFINES the penalty at distance L -- that is the paper's construction -- so
+        // the strongest suppression available anywhere INSIDE a beat's own cell is eps
+        // itself, 100x at the default 0.01. That is nowhere near enough to stop the model
+        // establishing an object. Suppression only becomes total OUTSIDE the cell, where
+        // the quadratic runs past the floor toward max_cost.
+        //
+        // A lone beat owns the whole clip under Voronoi, so uncapped its cell radius is
+        // seconds wide and no frame is ever outside it -- the mask is then a formality.
+        // GPU-proven 2026-07-28, one beat, one continuous action, same prompt and seed
+        // (the model's own default is the object present from frame 0):
+        //
+        //   beat 4.0s, L=1.0s (t=0 sits 4L away) -> object arrives ON the beat
+        //   beat 4.0s, L=4.0s (t=0 exactly 1L)   -> object present from frame 0
+        //
+        // Evenly-spaced beats hid this for months: their cells are already ~1s, so the cap
+        // barely binds and the defaults looked fine right up until a shot carried one beat.
+        //
+        // KNOWN BOUND: a beat before ~3s of a 5s shot may still not hold, even at total
+        // suppression -- the model cannot be stopped from establishing something the scene
+        // needs early. That is not a mask problem; do not chase it with strength or eps.
+        const float max_span = ltx_relay_env_float("LTX_RELAY_MAX_L", 1.0f);
+        // Keep max() for the half-cell. min() was tried and is a REGRESSION: it narrows
+        // multi-beat windows 4x (0.33s -> 0.08s on a 3-beat shot) and the model then fails
+        // to express the beat at all -- measured, an "eyes glow red" beat stopped firing
+        // entirely. The cap alone fixes the lone-beat case without disturbing the rest.
+        const float span     = std::clamp(std::max({time - lo, hi - time, latent_secs}),
+                                      latent_secs,
+                                      std::max(latent_secs, max_span));
 
         const float requested_window = env_window >= 0.f ? env_window : params->beats[beat_index].window;
         const float window           = requested_window >= 0.f
@@ -5200,27 +5243,62 @@ static bool build_ltx_relay_plan(const sd_vid_gen_params_t* params,
     plan->audio_eps  = ltx_relay_env_float("LTX_RELAY_AUDIO_EPS",
                                           params->relay_audio_eps != 0.f ? params->relay_audio_eps : plan->eps);
     plan->max_cost   = ltx_relay_env_float("LTX_RELAY_MAX_COST", 60.f);
-    plan->revision   = 1;
+    // LTX_RELAY_SIGMA_LF selects the reference implementation's sigma: a constant
+    // in LATENT FRAMES rather than the paper's cell-scaled one. 0.1448 is what
+    // WhatDreamsCost-ComfyUI/prompt_relay.py renders with at its default eps.
+    const float sigma_lf = ltx_relay_env_float("LTX_RELAY_SIGMA_LF", 0.f);
+    plan->sigma_fixed    = sigma_lf > 0.f ? sigma_lf * latent_secs : 0.f;
+    // Set from the mask's own content, per window, in sample_base_window: a
+    // counter here would alias across shots in a chain.
+    plan->revision = 0;
 
     int32_t mapped_beats = 0;
     for (int32_t piece : plan->token_beat) {
         mapped_beats += static_cast<int32_t>(piece >= 0);
     }
-    LOG_INFO("LTX prompt relay: %d beat(s) over %.2fs, eps=%.4g audio_eps=%.4g, %d/%zu prompt tokens beat-owned",
+    // Both denominators, because they differ by ~30x and only the second one is
+    // the relay's actual authority. The connector tops the prompt up to
+    // kConnectorTargetLen keys with learnable registers, and a register key sits
+    // past token_beat -- permanently unpenalised. Reporting the share of prompt
+    // tokens alone reads as ~45% when the share of cross-attention keys is ~1%.
+    const size_t key_count = std::max<size_t>(static_cast<size_t>(LTXV::kConnectorTargetLen),
+                                              plan->token_beat.size());
+    // With piece isolation the registers are beat-owned too, so the key figure is
+    // not the token figure. Keep both: the first says how much of the PROMPT is
+    // beat text, the second how much of the mask can actually act.
+    int32_t mapped_keys = mapped_beats;
+    if (sd::ltx_relay::isolate_enabled()) {
+        std::vector<int32_t> key_beat;
+        sd::ltx_relay::build_connector_key_beat(plan->token_beat,
+                                                plan->beats.size(),
+                                                static_cast<int64_t>(key_count),
+                                                key_beat);
+        mapped_keys = 0;
+        for (int32_t piece : key_beat) {
+            mapped_keys += static_cast<int32_t>(piece >= 0);
+        }
+    }
+    LOG_INFO("LTX prompt relay: %d beat(s) over %.2fs, eps=%.4g audio_eps=%.4g%s%s, %d/%zu prompt tokens "
+             "beat-owned = %d/%zu cross-attention keys addressable (%.1f%%)",
              params->beat_count,
              clip_secs,
              plan->eps,
              plan->audio_eps,
+             plan->sigma_fixed > 0.f ? " [fixed sigma]" : "",
+             sd::ltx_relay::isolate_enabled() ? " [piece isolation]" : "",
              mapped_beats,
-             plan->token_beat.size());
+             plan->token_beat.size(),
+             mapped_keys,
+             key_count,
+             100.0 * static_cast<double>(mapped_keys) / static_cast<double>(std::max<size_t>(1, key_count)));
     for (size_t beat = 0; beat < plan->beats.size(); ++beat) {
-        LOG_DEBUG("  beat %zu: mid=%.3fs L=%.3fs w=%.3fs sigma=%.4f strength=%.2f",
-                  beat,
-                  plan->beats[beat].mid,
-                  plan->beats[beat].half_span,
-                  plan->beats[beat].window,
-                  sd::ltx_relay::beat_sigma(plan->beats[beat], plan->eps),
-                  plan->beats[beat].strength);
+        LOG_INFO("  beat %zu: mid=%.3fs L=%.3fs w=%.3fs sigma=%.4fs strength=%.2f",
+                 beat,
+                 plan->beats[beat].mid,
+                 plan->beats[beat].half_span,
+                 plan->beats[beat].window,
+                 sd::ltx_relay::beat_sigma(plan->beats[beat], plan->eps, plan->sigma_fixed),
+                 plan->beats[beat].strength);
     }
     return true;
 }
@@ -8801,7 +8879,6 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     // penalised against GLOBAL time, not against its own frame zero.
     constexpr int kLtxTemporalScale = 8;
     sd::ltx_relay::Plan relay_plan;
-    uint64_t relay_revision = 0;
     const bool relay_enabled =
         sd_version_is_ltxav(sd_ctx->sd->version) &&
         build_ltx_relay_plan(sd_vid_gen_params,
@@ -8844,7 +8921,11 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                         LTXV::audio_latent_start_time_sec(window_audio_start + frame);
                 }
             }
-            relay_plan.revision = ++relay_revision;
+            // Content-addressed, NOT a counter. The runner's mask cache outlives
+            // this call, so a per-shot counter makes shot 2's first window
+            // collide with shot 1's -- same revision, and on a uniform chain the
+            // same L_q and L_k too -- and shot 2 silently renders shot 1's beats.
+            relay_plan.revision = sd::ltx_relay::plan_fingerprint(relay_plan);
             window_relay        = &relay_plan;
         }
         return sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
@@ -10848,8 +10929,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // still cannot undo the fact that the shot was RENDERED against a mispositioned drive
         // window -- which is why the pin exists.
         int effective_seam_drop = seam_drop;
+        // Beats pin the trim for exactly the reason audio does. This shot's beat
+        // frames were already shifted by `seam_drop` (the a-priori estimate) so
+        // that a beat authored at visible t=0 lands on the first frame the viewer
+        // keeps. If the adaptive search then applies a different trim, every beat
+        // in the shot is off by the difference -- baked into the pixels, and not
+        // knowable at shift time because the search runs after the render. One
+        // seam joined at 8*K instead of the smoothest cut is the cheaper error.
         const bool seam_drop_pinned = declared_drop >= 0 || chain_params->cont_seam_drop_frames > 0 ||
-                                      pin_derived_seam;
+                                      pin_derived_seam || params.beat_count > 0;
         if (seam_drop > 0 && !seam_drop_pinned && !stitched.empty() && segment_count > 2) {
             const int measured = ltxav_auto_trim_drop(stitched.back(), segment_frames, segment_count, seam_drop);
             // TRIPWIRE. The drive window for THIS segment was already cut against seam_drop, so a
