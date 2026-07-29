@@ -758,7 +758,18 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
             // The runtime multiplies this Linear's output by `.wglobal` (or folds it into
             // the cuBLASLt alpha), so the stored nibbles live in a scaled domain and the
             // TRUE-unit delta has to be divided by it before it can be merged.
-            ggml_tensor* wg = find_tensor(state->name + ".wglobal");
+            // The sidecar usually is NOT in this graph's required tensors, and therefore is
+            // not loaded yet: Linear::forward elides the graph-level multiply whenever the
+            // CUDA FP4 cuBLASLt GEMM folds the scalar into its matmul alpha, which is the
+            // production path on sm120. Load it on demand rather than declining the fold --
+            // treating "not loaded" as "absent" silently disabled the fold for every nvfp4
+            // tensor on exactly the hardware this is meant to run on.
+            auto wg_it      = tensor_states_by_name_.find(state->name + ".wglobal");
+            TensorState* wg_state = wg_it == tensor_states_by_name_.end() ? nullptr : wg_it->second;
+            if (wg_state != nullptr && !wg_state->loaded_to_params_backend) {
+                load_tensors_to_params_backend({wg_state});
+            }
+            ggml_tensor* wg = wg_state != nullptr ? wg_state->tensor : nullptr;
             if (wg == nullptr || wg->data == nullptr) {
                 LOG_WARN("lora fold-at-load: no .wglobal for nvfp4 tensor '%s'; leaving it to the runtime path",
                          state->name.c_str());
