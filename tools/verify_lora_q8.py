@@ -135,7 +135,14 @@ def main():
                 w[::20] = 0.0
         return w
 
+    # A module whose SOURCE delta is exactly zero (lora_B never trained off its zero init —
+    # Best_FaceID_v1.0 ships 864 such modules) has no direction to compare against: relerr,
+    # projection and cosine are all 0/0 = nan. Those must NOT enter the means, because every
+    # threshold here is written `if mean > limit: FAIL` and **`nan > x` is False** — a single
+    # nan used to sail through as a green PASS. Inert modules are checked separately (Q8 must
+    # keep them exactly zero) and any nan from a LIVE module is a hard failure.
     rel, prj, cs = [], [], []
+    inert_ok, inert_bad = 0, []
     for s in sample:
         A0 = st_get(fs_, base, h, s + '.lora_A.weight')
         B0 = st_get(fs_, base, h, s + '.lora_B.weight')
@@ -144,26 +151,54 @@ def main():
         d0 = B0 @ A0
         d1 = B1 @ A1
         n0 = np.linalg.norm(d0)
-        e = float(np.linalg.norm(d1 - d0) / n0) if n0 else float('nan')
+        label = s[len('diffusion_model.'):][:51]
+        if not n0:
+            # inert by construction: the only correct Q8 image of 0 is 0
+            if np.any(d1):
+                inert_bad.append(s)
+                print(f"{label:<52}{A0.shape[0]:>6}{'INERT':>10}{'NONZERO':>8}{'BAD':>8}")
+            else:
+                inert_ok += 1
+                print(f"{label:<52}{A0.shape[0]:>6}{'inert':>10}{'0':>8}{'0':>8}")
+            continue
+        e = float(np.linalg.norm(d1 - d0) / n0)
         dd = float((d0 * d0).sum())
-        p = float((d1 * d0).sum() / dd) if dd else float('nan')
-        c = float((d1 * d0).sum() / (np.linalg.norm(d1) * n0)) if n0 else float('nan')
+        p = float((d1 * d0).sum() / dd)
+        c = float((d1 * d0).sum() / (np.linalg.norm(d1) * n0))
         rel.append(e); prj.append(p); cs.append(c)
-        print(f"{s[len('diffusion_model.'):][:51]:<52}{A0.shape[0]:>6}{e:>10.4f}{p:>8.4f}{c:>8.4f}")
+        print(f"{label:<52}{A0.shape[0]:>6}{e:>10.4f}{p:>8.4f}{c:>8.4f}")
 
-    mr, mp, mc = float(np.mean(rel)), float(np.mean(prj)), float(np.mean(cs))
-    print(f"\n  L2 FIDELITY : mean relative error {mr:.4f}  (max {max(rel):.4f})")
-    if mr > a.max_relerr:
-        fails.append(f"L2 FIDELITY: mean relative error {mr:.4f} > {a.max_relerr}")
-        print(f"  L2 FIDELITY : FAIL")
+    if inert_ok or inert_bad:
+        print(f"\n  L0 INERT    : {inert_ok} zero-delta module(s) preserved exactly"
+              + (f", {len(inert_bad)} CORRUPTED" if inert_bad else ""))
+    if inert_bad:
+        fails.append(f"L0 INERT: {len(inert_bad)} zero-delta module(s) became non-zero in the gguf")
+        print(f"  L0 INERT    : FAIL")
+
+    if not rel:
+        fails.append("L2/L3: every sampled module was inert — nothing was actually verified")
+        print("\n  L2 FIDELITY : FAIL (no live modules in the sample)")
+        print("  L3 DIRECTION: FAIL (no live modules in the sample)")
+        mr = mp = mc = float('nan')
     else:
-        print(f"  L2 FIDELITY : PASS (<= {a.max_relerr})")
-    print(f"  L3 DIRECTION: mean projection {mp:.4f}, mean cosine {mc:.4f}")
-    if mp < a.min_projection:
-        fails.append(f"L3 DIRECTION: projection {mp:.4f} < {a.min_projection}")
-        print(f"  L3 DIRECTION: FAIL")
-    else:
-        print(f"  L3 DIRECTION: PASS (>= {a.min_projection})")
+        mr, mp, mc = float(np.mean(rel)), float(np.mean(prj)), float(np.mean(cs))
+        if not all(np.isfinite([mr, mp, mc])):
+            fails.append(f"L2/L3: non-finite statistic (relerr {mr}, proj {mp}, cos {mc})")
+            print(f"\n  L2/L3       : FAIL (non-finite statistic — refusing to pass)")
+        else:
+            print(f"\n  L2 FIDELITY : mean relative error {mr:.4f}  (max {max(rel):.4f})"
+                  f"  [{len(rel)} live]")
+            if mr > a.max_relerr:
+                fails.append(f"L2 FIDELITY: mean relative error {mr:.4f} > {a.max_relerr}")
+                print(f"  L2 FIDELITY : FAIL")
+            else:
+                print(f"  L2 FIDELITY : PASS (<= {a.max_relerr})")
+            print(f"  L3 DIRECTION: mean projection {mp:.4f}, mean cosine {mc:.4f}")
+            if mp < a.min_projection:
+                fails.append(f"L3 DIRECTION: projection {mp:.4f} < {a.min_projection}")
+                print(f"  L3 DIRECTION: FAIL")
+            else:
+                print(f"  L3 DIRECTION: PASS (>= {a.min_projection})")
 
     print()
     if fails:

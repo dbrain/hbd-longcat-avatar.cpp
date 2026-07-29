@@ -36,9 +36,16 @@ CHECKS
   C4 COLLATERAL  nvfp4 tensors the LoRA does NOT target must be bit-identical. (needs --lora)
   C5 WGLOBAL     .wglobal sidecars must be unchanged (the fold must not touch the GEMM alpha).
 
+  ROUTE A ONLY: C4 and C5 assume an IN-PLACE fold onto the frozen fp4 grid. A route-B build
+  (build_folded_nvfp4.py — merge in bf16, then requantise) legitimately re-derives every block
+  scale, so it reports "C5 WGLOBAL: FAIL (~1342/1344 changed)" and trips C4 by design. On a
+  route-B variant, judge by C2 + C3 alone: projection ~0.99 is a correct fold, ~0.36 is a
+  frozen-grid fold, ~0.0 is inert. Verified 2026-07-29 — every shipped route-B variant fails
+  C5 identically, including known-good ones, so C5 on a route-B file is noise, not a defect.
+
 USAGE
   python3 tools/verify_fold.py \
-      --base   models/ltx2/nvfp4-dev050.gguf \
+      --base   models/ltx2/nvfp4-CLEAN.gguf \
       --folded models/ltx2/nvfp4-dev050-faceid-sheet.gguf \
       --lora   /mnt/ssd/models/ltx-best-face-id/Best_FaceID_CharacterSheet_v1.0_LoRA.safetensors \
       --scale  1.0
