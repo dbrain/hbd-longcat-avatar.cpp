@@ -491,6 +491,13 @@ typedef struct {
     sd_image_t* msr_subjects;
     int msr_subjects_size;
     int msr_frames;
+    // Optional SEGMENT SCOPE for the strip, in rendered-segment index space -- the same
+    // space as `character_ref_segments`. A NULL pointer means every segment, which is what
+    // a single render and every caller predating this field gets. A shot that scopes the
+    // strip out takes the untouched no-reference path, so injecting a location into shot 2
+    // leaves shot 1 bit-identical to a request that never mentioned MSR.
+    int* msr_segments;
+    int msr_segments_size;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;

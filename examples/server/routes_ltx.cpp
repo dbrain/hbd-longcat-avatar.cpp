@@ -814,6 +814,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             // strip that gives each subject its own latent slot (8*K + 1).
             std::string msr_background;
             std::vector<std::string> msr_subjects;
+            std::vector<int> msr_segments;
             int msr_frames = 0;
             if (body.contains("msr") && !body["msr"].is_null()) {
                 const auto& msr = body["msr"];
@@ -832,7 +833,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         return false;
                     }
                     *out = value.get<std::string>();
-                    if ((*out)[0] == '/') {
+                    if (ltx_source_is_path(*out)) {
                         std::error_code error;
                         if (!fs::is_regular_file(*out, error)) {
                             res.status = 400;
@@ -899,6 +900,33 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                                         .dump(),
                                     "application/json");
                     return;
+                }
+                // Optional shot scope. Absent means every segment; an explicit list injects the
+                // location only where it belongs, which is the whole point when shot 1 is
+                // somewhere else entirely.
+                if (msr.contains("segments") && !msr["segments"].is_null()) {
+                    if (!msr["segments"].is_array() || msr["segments"].empty()) {
+                        res.status = 400;
+                        res.set_content(R"({"error":"msr segments must be a non-empty array of segment indices"})",
+                                        "application/json");
+                        return;
+                    }
+                    for (const auto& index : msr["segments"]) {
+                        if (!index.is_number_integer() || index.get<int>() < 0 ||
+                            index.get<int>() >= static_cast<int>(prompts.size())) {
+                            res.status = 400;
+                            res.set_content(json({{"error", "msr segments must be integers in [0, " +
+                                                                std::to_string(prompts.size()) + ")"}})
+                                                .dump(),
+                                            "application/json");
+                            return;
+                        }
+                        const int segment_index = index.get<int>();
+                        if (std::find(msr_segments.begin(), msr_segments.end(), segment_index) ==
+                            msr_segments.end()) {
+                            msr_segments.push_back(segment_index);
+                        }
+                    }
                 }
                 // MSR was trained through ComfyUI's IC-LoRA guide, which tags nothing. A
                 // positive phase scale would put the strip on the Best-Face-ID convention
@@ -997,6 +1025,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_msr_background   = std::move(msr_background);
             job->ltx_msr_subjects     = std::move(msr_subjects);
             job->ltx_msr_frames       = msr_frames;
+            job->ltx_msr_segments     = std::move(msr_segments);
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);

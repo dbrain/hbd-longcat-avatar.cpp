@@ -4279,6 +4279,8 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->msr_subjects                          = nullptr;
     sd_vid_gen_params->msr_subjects_size                     = 0;
     sd_vid_gen_params->msr_frames                            = 0;
+    sd_vid_gen_params->msr_segments                          = nullptr;
+    sd_vid_gen_params->msr_segments_size                     = 0;
     sd_vid_gen_params->beats                                 = nullptr;
     sd_vid_gen_params->beat_count                            = 0;
     sd_vid_gen_params->relay_eps                             = 0.f;
@@ -10882,6 +10884,23 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // null pointer and a zero count is exactly the state a request with no character_refs
         // arrives in, so a shot that scopes out every sheet takes the untouched code path -- no
         // reference tokens, no denoise-mask forcing, no change to its output.
+        // The MSR strip carries its own scope. It is ONE reference rather than an array, so
+        // scoping it out is just making it inert -- and clearing the images too keeps the
+        // shot's params indistinguishable from a request that never carried a strip.
+        params.msr_segments      = nullptr;
+        params.msr_segments_size = 0;
+        if (base_params->msr_frames > 0 && base_params->msr_segments != nullptr) {
+            const int* scope = base_params->msr_segments;
+            const int count  = std::max(0, base_params->msr_segments_size);
+            if (std::find(scope, scope + count, segment) == scope + count) {
+                params.msr_background    = nullptr;
+                params.msr_subjects      = nullptr;
+                params.msr_subjects_size = 0;
+                params.msr_frames        = 0;
+            } else {
+                LOG_INFO("LTXAV MSR scope: window %d takes the reference strip", segment + 1);
+            }
+        }
         if (!tass_source_ids.empty()) {
             params.character_ref_segments       = nullptr;
             params.character_ref_segment_counts = nullptr;

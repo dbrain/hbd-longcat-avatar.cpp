@@ -788,7 +788,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     std::vector<sd_image_t> ltx_msr_subject_images;
     if (job.ltx_msr_frames > 0) {
         auto load_msr_image = [&](const std::string& source, SDImageOwner& owner, const std::string& what) {
-            if (!source.empty() && source[0] == '/') {
+            if (ltx_source_is_path(source)) {
                 sd_image_t loaded = {};
                 if (!load_sd_image_from_file(&loaded, source.c_str(), 0, 0, 3)) {
                     error_message = "failed to load LTX MSR " + what;
@@ -820,6 +820,10 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         params.msr_subjects      = ltx_msr_subject_images.empty() ? nullptr : ltx_msr_subject_images.data();
         params.msr_subjects_size = static_cast<int>(ltx_msr_subject_images.size());
         params.msr_frames        = job.ltx_msr_frames;
+        if (!job.ltx_msr_segments.empty()) {
+            params.msr_segments      = job.ltx_msr_segments.data();
+            params.msr_segments_size = static_cast<int>(job.ltx_msr_segments.size());
+        }
         // The strip and the sheets share ONE TASS block, so the phase scale is a
         // single decision for the request. The character-ref path already forwarded
         // it when there were sheets; forward it here only when there were none.

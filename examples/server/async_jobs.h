@@ -123,6 +123,10 @@ struct AsyncGenerationJob {
     std::string ltx_msr_background;
     std::vector<std::string> ltx_msr_subjects;
     int ltx_msr_frames = 0;
+    // Optional shot scope, in rendered-segment index space. EMPTY means every segment --
+    // there is no "applies to nothing" state here, because a strip scoped to no shot is
+    // just a request without a strip.
+    std::vector<int> ltx_msr_segments;
     std::vector<int> ltx_segment_v2v_modes;
     std::vector<float> ltx_segment_v2v_strengths;
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;
