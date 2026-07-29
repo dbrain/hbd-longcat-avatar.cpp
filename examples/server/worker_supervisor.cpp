@@ -697,7 +697,10 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
     // Bounded so a wedged worker cannot pin the gate forever; on timeout we still return and the
     // gate's force-unload proceeds exactly as before. LTX renders at 1920x1088/145f take ~6 min,
     // so the default allows for a comfortably longer chain.
-    server.Post("/v1/admin/drain", [&supervisor](const httplib::Request&, httplib::Response& response) {
+    //
+    // Kept as a named lambda (not an inline route body) because the pre-routing hook has to be
+    // able to run it too — see the empty-body dispatch there.
+    const auto admin_drain = [&supervisor](const httplib::Request&, httplib::Response& response) {
         supervisor.drain();
         int wait_seconds = 1800;
         if (const char* e = std::getenv("SD_DRAIN_WAIT_SECONDS")) {
@@ -715,8 +718,9 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
                                    {"in_flight", in_flight},
                                    {"timed_out", timed_out}}).dump(),
                              "application/json");
-    });
-    server.Post("/v1/admin/unload", [&supervisor](const httplib::Request& request, httplib::Response& response) {
+    };
+    server.Post("/v1/admin/drain", admin_drain);
+    const auto admin_unload = [&supervisor](const httplib::Request& request, httplib::Response& response) {
         bool force = false;
         if (!request.body.empty()) {
             try {
@@ -745,59 +749,15 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
                                    {"cuda_context_released", true}, {"worker_pid", nullptr},
                                    {"forced", force && in_flight > 0}}).dump(),
                              "application/json");
-    });
-    server.Post("/v1/admin/load", [&supervisor](const httplib::Request&, httplib::Response& response) {
+    };
+    server.Post("/v1/admin/unload", admin_unload);
+    const auto admin_load = [&supervisor](const httplib::Request&, httplib::Response& response) {
         supervisor.reopen();
         response.set_content(json({{"status", "ok"}, {"loaded", supervisor.loaded()}}).dump(), "application/json");
-    });
-    server.set_pre_routing_handler([&supervisor](const httplib::Request& request, httplib::Response& response) {
-        std::string origin = request.get_header_value("Origin");
-        if (origin.empty()) origin = "*";
-        response.set_header("Access-Control-Allow-Origin", origin);
-        response.set_header("Access-Control-Allow-Credentials", "true");
-        response.set_header("Access-Control-Allow-Methods", "*");
-        response.set_header("Access-Control-Allow-Headers", "*");
-        if (request.method == "OPTIONS") {
-            response.status = 204;
-            return httplib::Server::HandlerResponse::Handled;
-        }
-        // cpp-httplib attempts to read a POST body before ordinary route dispatch.
-        // A perfectly valid `POST /v1/admin/unload` with no Content-Length can
-        // therefore wait forever for a body that the client did not send.  Handle
-        // the established empty-body unload contract here; requests with JSON
-        // (notably {"force":true}) continue to the regular handler below.
-        const std::string content_length = request.get_header_value("Content-Length");
-        if (request.method == "POST" && request.path == "/v1/admin/unload" &&
-            (content_length.empty() || content_length == "0")) {
-            const int in_flight = supervisor.in_flight();
-            if (in_flight > 0) {
-                response.set_content(json({{"status", "busy (pass force=true to cancel + unload)"},
-                                           {"busy", true}, {"in_flight", in_flight}}).dump(),
-                                     "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            const bool was_loaded = supervisor.loaded();
-            if (!supervisor.unload()) {
-                response.status = 503;
-                response.set_content(json({{"status", "unload failed"}, {"loaded", supervisor.loaded()},
-                                           {"worker_pid", supervisor.worker_pid()},
-                                           {"cuda_context_released", false}}).dump(),
-                                     "application/json");
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            response.set_content(json({{"status", was_loaded ? "unloaded" : "idle"},
-                                       {"unloaded", was_loaded}, {"cuda_context_released", true},
-                                       {"worker_pid", nullptr}, {"forced", false}}).dump(),
-                                 "application/json");
-            return httplib::Server::HandlerResponse::Handled;
-        }
-        // cpp-httplib invokes this hook before it consumes a request body.
-        // Leave normal requests unhandled so the regular route handlers below
-        // receive JSON and multipart payloads intact.
-        return httplib::Server::HandlerResponse::Unhandled;
-    });
+    };
+    server.Post("/v1/admin/load", admin_load);
 
-    server.Delete("/ltx/v1/job", [&supervisor](const httplib::Request& request, httplib::Response& response) {
+    const auto ltx_delete_job = [&supervisor](const httplib::Request& request, httplib::Response& response) {
         // Durable LTX cleanup is metadata/filesystem-only. Let Koblem delete a
         // retired Director bank after /unload without cold-starting a CUDA child.
         if (supervisor.in_flight() > 0) {
@@ -814,11 +774,77 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
         }
         response.set_content(json({{"status", deleted ? "deleted" : "missing"}, {"deleted", deleted}}).dump(),
                              "application/json");
-    });
+    };
+    server.Delete("/ltx/v1/job", ltx_delete_job);
 
     const auto proxy_request = [&supervisor](const httplib::Request& request, httplib::Response& response) {
         supervisor.proxy(request, response, WorkerSupervisor::request_model(request));
     };
+
+    server.set_pre_routing_handler([&admin_drain, &admin_load, &admin_unload, &ltx_delete_job,
+                                    &proxy_request](const httplib::Request& request,
+                                                    httplib::Response& response) {
+        std::string origin = request.get_header_value("Origin");
+        if (origin.empty()) origin = "*";
+        response.set_header("Access-Control-Allow-Origin", origin);
+        response.set_header("Access-Control-Allow-Credentials", "true");
+        response.set_header("Access-Control-Allow-Methods", "*");
+        response.set_header("Access-Control-Allow-Headers", "*");
+        if (request.method == "OPTIONS") {
+            response.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        // cpp-httplib consumes a request body before ordinary route dispatch, and
+        // with NEITHER Content-Length NOR Transfer-Encoding it has no way to know
+        // where that body ends — so it waits for a close that a keep-alive client
+        // never sends. Every bodyless request to a body-bearing method therefore
+        // hangs until the read timeout, which this server sets long enough for a
+        // multi-minute render. Both curl (`curl -X POST url`) and reqwest's
+        // bodyless `.post(url).send()` send exactly that shape.
+        //
+        // This hook runs BEFORE the body read, so it is the only place the request
+        // can still be rescued. It used to rescue /v1/admin/unload alone, which
+        // silently left every other bodyless caller hanging:
+        //   - POST /v1/admin/drain          — koblem's GPU gate evicts with
+        //     "drain (900s client) then force unload" and its drain carries no
+        //     body. The drain never returned, so the force unload after it never
+        //     ran, the worker was never killed, and the gate kept the service's
+        //     whole VRAM reservation while reporting it disabled. Symptom: an idle,
+        //     not-busy engine that cannot be evicted and a
+        //     `POST /api/v1/gpu/services/{name}` that never answers.
+        //   - POST /v1/admin/load           — the documented way to clear a stuck
+        //     drain flag, itself stuck.
+        //   - POST /sdcpp/v1/jobs/{id}/cancel — every cancel path in koblem
+        //     (flux2.rs, krea2.rs, ltx_video.rs) posts it with no body, so a
+        //     cancel hung and took its GPU guard with it.
+        //   - DELETE /ltx/v1/job            — bodyless by nature.
+        //
+        // So dispatch generically rather than per-route: anything with no body gets
+        // answered here, admin routes inline and everything else through the same
+        // proxy the catch-all would have used. Requests that DO carry a body (or
+        // are chunked) fall through untouched, so JSON and multipart still reach
+        // the regular handlers intact.
+        const bool has_length = !request.get_header_value("Content-Length").empty();
+        const bool chunked = !request.get_header_value("Transfer-Encoding").empty();
+        const bool body_bearing = request.method == "POST" || request.method == "PUT" ||
+                                  request.method == "PATCH" || request.method == "DELETE";
+        if (body_bearing && !has_length && !chunked) {
+            if (request.method == "POST" && request.path == "/v1/admin/drain") {
+                admin_drain(request, response);
+            } else if (request.method == "POST" && request.path == "/v1/admin/load") {
+                admin_load(request, response);
+            } else if (request.method == "POST" && request.path == "/v1/admin/unload") {
+                admin_unload(request, response);
+            } else if (request.method == "DELETE" && request.path == "/ltx/v1/job") {
+                ltx_delete_job(request, response);
+            } else {
+                proxy_request(request, response);
+            }
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
     constexpr const char* kAnyPath = R"(/.*)";
     server.Get(kAnyPath, proxy_request);
     server.Post(kAnyPath, proxy_request);
