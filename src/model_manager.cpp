@@ -12,6 +12,9 @@
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
 #include "model/adapter/lora_fold.hpp"
+#ifdef SD_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
     GGML_ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
@@ -673,7 +676,13 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
     }
 
     const int64_t t0 = ggml_time_ms();
-    size_t folded = 0, declined = 0;
+    size_t folded = 0, declined = 0, gpu_folded = 0;
+    // Prefer the GPU fold; SD_LORA_FOLD_CPU=1 forces the CPU path (A/B and fallback test).
+    const char* cpu_env = std::getenv("SD_LORA_FOLD_CPU");
+    const bool use_gpu_fold = !(cpu_env != nullptr && cpu_env[0] != '\0' && cpu_env[0] != '0');
+    auto in_of  = [](const ggml_tensor* t) { return (int64_t)t->ne[0]; };
+    auto out_of = [](const ggml_tensor* t) { return (int64_t)t->ne[1]; };
+    (void)use_gpu_fold; (void)in_of; (void)out_of;
     // deque: never reallocates, so the f32 pointers handed to ModuleDelta stay valid
     std::deque<std::vector<float>> owned;  // keeps the dequantised adapters alive per tensor
     std::vector<float> host_scratch;
@@ -790,7 +799,36 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
             ggml_backend_tensor_get(w, host_scratch.data(), 0, ggml_nbytes(w));
             data = host_scratch.data();
         }
-        if (!sd_lora_fold::fold_into_tensor(w, data, wglobal, deltas, state->name, n_threads_)) {
+        bool merged = false;
+#ifdef SD_USE_CUDA
+        // The GPU is idle during model load and this work is trivially parallel, so prefer
+        // it: the CPU fold is ~80 s for a 1632-module adapter, which loses to the ~44 s the
+        // per-step adapter costs for a SINGLE render. Only NVFP4 goes to the GPU -- the
+        // BF16/F32 targets are a plain add and are not worth a round trip.
+        if (use_gpu_fold && w->type == GGML_TYPE_NVFP4) {
+            std::vector<ggml_cuda_lora_module> gmods;
+            gmods.reserve(deltas.size());
+            for (const sd_lora_fold::ModuleDelta& d : deltas) {
+                if (d.mid != nullptr) {   // lora_mid needs the chained CPU path
+                    gmods.clear();
+                    break;
+                }
+                gmods.push_back({d.down, d.up, d.rank, d.row_begin, d.rows, d.scale});
+            }
+            if (!gmods.empty()) {
+                merged = ggml_cuda_lora_fold_nvfp4(data, in_of(w), out_of(w),
+                                                   wglobal != 0.0f ? 1.0f / wglobal : 1.0f,
+                                                   gmods.data(), (int)gmods.size(),
+                                                   sd_lora_fold::seed_of(state->name));
+                if (!merged && !warned_gpu_fold_) {
+                    LOG_WARN("lora fold-at-load: GPU fold unavailable, falling back to CPU");
+                    warned_gpu_fold_ = true;
+                }
+                gpu_folded += merged ? 1 : 0;
+            }
+        }
+#endif
+        if (!merged && !sd_lora_fold::fold_into_tensor(w, data, wglobal, deltas, state->name, n_threads_)) {
             state->lora_fold_declined = true;
             declined++;
             continue;
@@ -803,8 +841,8 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
     }
 
     if (folded > 0 || declined > 0) {
-        LOG_INFO("lora fold-at-load: merged %zu tensor(s), declined %zu, taking %.2fs",
-                 folded, declined, (ggml_time_ms() - t0) * 1.0f / 1000);
+        LOG_INFO("lora fold-at-load: merged %zu tensor(s) (%zu on GPU), declined %zu, taking %.2fs",
+                 folded, gpu_folded, declined, (ggml_time_ms() - t0) * 1.0f / 1000);
     }
     return true;
 }

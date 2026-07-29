@@ -81,6 +81,7 @@ private:
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
     bool warned_split_lora_skip_ = false;
+    bool warned_gpu_fold_        = false;
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
     // LoRA files kept open only for the duration of one fold epoch. Held here rather than
