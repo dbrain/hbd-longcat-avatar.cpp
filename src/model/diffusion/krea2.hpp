@@ -201,9 +201,19 @@ namespace Krea2 {
             auto up   = std::dynamic_pointer_cast<Linear>(blocks["up"]);
             auto down = std::dynamic_pointer_cast<Linear>(blocks["down"]);
 
-            auto gated = ggml_silu(ctx->ggml_ctx, gate->forward(ctx, x));
+            // ⚠️ OPERAND ORDER IS LOAD-BEARING. ggml only fuses ops at strictly consecutive node
+            // indices (ggml_can_fuse_ext, ggml-impl.h:669) and the graph DFS visits src[0] before
+            // src[1]. With the SiLU as src[0] the DFS emits MM(gate), SILU, MM(up), MUL — two apart
+            // — so {UNARY(SILU), MUL} (ggml-cuda.cu:3941) never matches and the SiLU runs as its own
+            // full pass over [16384, L]. With the SiLU as src[1] it emits MM(up), MM(gate), SILU,
+            // MUL and ggml_cuda_op_unary_mul (unary.cu:578) fires: 5 memory passes -> 3.
+            // Bit-exact: FP multiply is commutative and no intermediate is round-tripped (verified
+            // by md5-identical renders across a 4-arm A/B).
+            // KreaAttention (below, ~line 289) already had the lucky order, which is why the profile
+            // showed its sigmoid fused while this SiLU was not.
             auto up_x  = up->forward(ctx, x);
-            x          = ggml_mul(ctx->ggml_ctx, gated, up_x);
+            auto gated = ggml_silu(ctx->ggml_ctx, gate->forward(ctx, x));
+            x          = ggml_mul(ctx->ggml_ctx, up_x, gated);
             return down->forward(ctx, x);
         }
     };

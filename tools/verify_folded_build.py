@@ -26,6 +26,7 @@ LORA_PFX = "diffusion_model."
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from verify_fold import st_open, st_raw, bf16_to_f32, dequant_block, parse_gguf
+from build_folded_nvfp4 import adapter_stems, lokr_delta
 
 
 def main():
@@ -36,7 +37,14 @@ def main():
     ap.add_argument("--mult", type=float, required=True)
     ap.add_argument("--tensors", type=int, default=10)
     ap.add_argument("--min-projection", type=float, default=0.85)
-    ap.add_argument("--min-changed", type=float, default=20.0)
+    # ★ B2's floor is CONVENTION-DEPENDENT, so it defaults to None and is resolved below.
+    # UNFOLDED builds recompute a per-tensor wglobal from the MERGED weights, which shifts the
+    # effective scale of every block a hair -> ~94% of elements "move" no matter how small the
+    # delta. FLAT builds have no such global: an element only moves when its e2m1 code crosses a
+    # rounding boundary, so a legitimate 1-4% delta moves ~16% (independently re-derived: 16.00%
+    # expected vs 14.86% observed on txtfusion.refiner_blocks.1.mlp.up). Judging a flat build by
+    # the unfolded floor reports FAIL on a correct fold — B3 projection is the real signal.
+    ap.add_argument("--min-changed", type=float, default=None)
     a = ap.parse_args()
     fails = []
 
@@ -79,8 +87,18 @@ def main():
             x = np.frombuffer(fh.read(ne * 4), dtype=np.float32)
         return x.reshape(d[1], d[0]).astype(np.float64) if len(d) == 2 else x.astype(np.float64)
 
+    # Resolve B2's floor from the build's own convention (presence of .wglobal siblings).
+    folded_is_unfolded = any(n.endswith(".wglobal") for n in fmap)
+    if a.min_changed is None:
+        a.min_changed = 20.0 if folded_is_unfolded else 5.0
+    print(f"  convention: {'UNFOLDED (+wglobal)' if folded_is_unfolded else 'FLAT (no wglobal)'}"
+          f"  -> B2 floor {a.min_changed}%")
+
     fl, bl, hl = st_open(a.lora)
-    stems = {k[:-len(".lora_A.weight")] for k in hl if k.endswith(".lora_A.weight")}
+    # LoRA and LoKr both supported; adapter_stems/lokr_delta are the SAME code the builder
+    # used, so B3 is not an independent re-derivation of the delta — it verifies that what
+    # landed in the gguf is that delta, at the right scale, in the right places.
+    stems = adapter_stems(hl)
     tgt = [n for n in bmap if not n.endswith(".wglobal")
            and n.endswith(".weight") and LORA_PFX + n[:-len(".weight")] in stems]
     non = [n for n in bmap if not n.endswith(".wglobal")
@@ -102,11 +120,14 @@ def main():
         Wb = load(fb, bstart, bmap, name)
         Wf = load(ff, fstart, fmap, name)
         stem = LORA_PFX + name[:-len(".weight")]
-        A = bf16_to_f32(st_raw(fl, bl, hl, stem + ".lora_A.weight")[0]).reshape(
-            hl[stem + ".lora_A.weight"]["shape"]).astype(np.float64)
-        B = bf16_to_f32(st_raw(fl, bl, hl, stem + ".lora_B.weight")[0]).reshape(
-            hl[stem + ".lora_B.weight"]["shape"]).astype(np.float64)
-        delta = a.mult * (B @ A)
+        if stems[stem] == "lokr":
+            delta = a.mult * lokr_delta(fl, bl, hl, stem)
+        else:
+            A = bf16_to_f32(st_raw(fl, bl, hl, stem + ".lora_A.weight")[0]).reshape(
+                hl[stem + ".lora_A.weight"]["shape"]).astype(np.float64)
+            B = bf16_to_f32(st_raw(fl, bl, hl, stem + ".lora_B.weight")[0]).reshape(
+                hl[stem + ".lora_B.weight"]["shape"]).astype(np.float64)
+            delta = a.mult * (B @ A)
         dW = Wf - Wb
         pct = float((dW != 0).mean()) * 100.0
         dd = float((delta * delta).sum())

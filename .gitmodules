@@ -1,6 +1,11 @@
 [submodule "ggml"]
     path = ggml
-	url = https://github.com/leejet/ggml.git
+	# ⚠️ dbrain/ggml, NOT leejet/ggml. This fork's ggml pin (2eb82c09 and later) exists ONLY in
+	# our fork — upstream leejet/ggml does not contain it, so `git clone --recurse-submodules`
+	# of this repo against the old URL could not fetch its own submodule and every remote build
+	# had to fall back to local source. HTTPS (not SSH) because the Docker builders clone with
+	# no SSH agent; dbrain/ggml is public, verified with an anonymous `git ls-remote`.
+	url = https://github.com/dbrain/ggml.git
 [submodule "examples/server/frontend"]
 	path = examples/server/frontend
 	url = https://github.com/leejet/sdcpp-webui.git

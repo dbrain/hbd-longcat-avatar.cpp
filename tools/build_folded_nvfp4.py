@@ -21,14 +21,34 @@ tools/import_ltx_nvfp4.py does, so the loader sees a byte-compatible layout. Per
 siblings are RECOMPUTED (amax/(6*448)) — a rebuild legitimately changes them, which is why
 verify_fold.py's C5 does not apply here; use tools/verify_folded_build.py instead.
 
+ADAPTER FORMATS
+---------------
+  LoRA  <stem>.lora_A.weight / .lora_B.weight        dW = mult * (B @ A)
+  LoKr  <stem>.lokr_w1[_a/_b] / .lokr_w2[_a/_b]      dW = mult * scale * kron(w1, w2)
+        Scale mirrors the engine EXACTLY (model/adapter/lora.hpp:494-505): rank starts at 1 and
+        is only set when a factor is DECOMPOSED, so a full w1 + full w2 pair always lands on
+        scale = 1.0 regardless of the stored alpha. ai-toolkit writes alpha ~ 1e10 for full LoKr
+        precisely because it is meant to be ignored — do not divide by it.
+
+--lora is OPTIONAL. With no adapter this is a pure requantise of the bf16 through the SRC
+template, which is the BETTER way to build a plain base gguf: measured 0.9956-0.9962 against
+`-M convert`'s 0.9918. Build the base and its folded variants the same way so an A/B differs
+only by the delta.
+
 Usage:
+  # folded variant
   build_folded_nvfp4.py --src <template.gguf> --bf16 <base.safetensors> \
                         --lora <lora.safetensors> --mult 1.5 --out <out.gguf>
+  # plain requantise (no adapter), bare-named checkpoint (e.g. Krea2's turbo.safetensors)
+  build_folded_nvfp4.py --src <template.gguf> --bf16 <base.safetensors> \
+                        --base-prefix "" --out <out.gguf>
 """
 import argparse, json, os, struct, sys
 import numpy as np
 
 GT_F32, GT_BF16, GT_NVFP4 = 0, 30, 40
+# Defaults suit the LTX DiTs (checkpoint names carry `model.diffusion_model.`, adapters
+# `diffusion_model.`). Krea2's turbo.safetensors is BARE — pass --base-prefix "".
 BASE_PFX, LORA_PFX = "model.diffusion_model.", "diffusion_model."
 E2M1_MAX, E4M3_MAX, E4M3_MIN_SUB = 6.0, 448.0, 2.0 ** -9
 
@@ -77,12 +97,26 @@ def e2m1_nearest(t):
     return (s << 3) | np.where(np.abs(LUTm[i] - m) < np.abs(LUTm[lo] - m), i, lo).astype(np.uint8)
 
 
-def quant_nvfp4_unfolded(W):
-    """W [out,in] f64 -> (packed ggml block bytes, wglobal). ModelOpt UNFOLDED convention:
-    per-tensor wglobal = amax/(6*448), per-16 e4m3 block scale expressed in units of wglobal."""
+def quant_nvfp4_unfolded(W, flat=False):
+    """W [out,in] f64 -> (packed ggml block bytes, wglobal).
+
+    UNFOLDED (ModelOpt) convention: per-tensor wglobal = amax/(6*448), per-16 e4m3 block scale
+    expressed in UNITS OF wglobal, carried as a `<weight>.wglobal` sibling.
+
+    FLAT (ggml's own quantize_row_nvfp4_ref) convention: wg == 1, so the block scale is the
+    absolute ue4m3(amax_sub/6) and there is no sibling at all.
+
+    ★ THE CHOICE IS NOT COSMETIC — IT IS A CORRECTNESS REQUIREMENT.
+    Only the cuBLASLt FP4 GEMM folds a wglobal into the GEMM alpha. Any NVFP4 mul_mat that the
+    CUDA backend routes to MMQ / dequant-cuBLAS / CPU multiplies by 1.0 instead, so every
+    unfolded tensor that misses cuBLASLt comes out scaled wrong by a per-tensor constant. The
+    graph-level compensation in ggml_ext_linear cannot save you: it decides at GRAPH BUILD time
+    whether to elide the explicit multiply, while MMQ-vs-cuBLASLt is a RUNTIME shape decision it
+    cannot see. Krea2 routes 144 of its NVFP4 matmuls through MMQ per step -> saturated colour
+    patches. Emit UNFOLDED only when you have proven every NVFP4 matmul hits cuBLASLt."""
     out, inn = W.shape
     amax = float(np.abs(W).max())
-    wg = (amax / (E2M1_MAX * E4M3_MAX)) if amax > 0 else 1.0
+    wg = 1.0 if flat else ((amax / (E2M1_MAX * E4M3_MAX)) if amax > 0 else 1.0)
     b16 = W.reshape(out, inn // 16, 16)
     sc = np.clip(np.abs(b16).max(axis=2) / (E2M1_MAX * wg), E4M3_MIN_SUB, E4M3_MAX)
     byte = e4m3_enc_pos(sc)                                     # [out, nb16]
@@ -98,6 +132,48 @@ def quant_nvfp4_unfolded(W):
     return np.concatenate([db, qs], axis=2).tobytes(), wg
 
 
+def adapter_stems(h):
+    """{stem: kind} for every module in an adapter safetensors. kind is 'lora' or 'lokr'."""
+    out = {}
+    for k in h:
+        if k.endswith(".lora_A.weight"):
+            out[k[:-len(".lora_A.weight")]] = "lora"
+        elif k.endswith(".lokr_w1"):
+            out[k[:-len(".lokr_w1")]] = "lokr"
+        elif k.endswith(".lokr_w1_a"):
+            out[k[:-len(".lokr_w1_a")]] = "lokr"
+    return out
+
+
+def _st_f32(f, base, h, key):
+    u, dt, sh = st_raw(f, base, h, key)
+    x = bf16_to_f32(u) if dt == "BF16" else u.view(np.float32)
+    return x.reshape(sh).astype(np.float64) if sh else x.astype(np.float64)
+
+
+def lokr_delta(f, base, h, stem):
+    """dW for one LoKr module, WITHOUT the multiplier. Mirrors get_lokr_weight_diff():
+    rank defaults to 1 and only a DECOMPOSED factor sets it, so full w1 x full w2 => scale 1.0
+    and the (deliberately absurd) stored alpha is never applied."""
+    rank = 1
+    if stem + ".lokr_w1" in h:
+        w1 = _st_f32(f, base, h, stem + ".lokr_w1")
+    else:
+        w1_a, w1_b = _st_f32(f, base, h, stem + ".lokr_w1_a"), _st_f32(f, base, h, stem + ".lokr_w1_b")
+        rank = w1_b.shape[-1]
+        w1 = w1_b @ w1_a
+    if stem + ".lokr_w2" in h:
+        w2 = _st_f32(f, base, h, stem + ".lokr_w2")
+    else:
+        w2_a, w2_b = _st_f32(f, base, h, stem + ".lokr_w2_a"), _st_f32(f, base, h, stem + ".lokr_w2_b")
+        rank = w2_b.shape[-1]
+        w2 = w2_b @ w2_a
+    scale = 1.0
+    if rank != 1 and stem + ".alpha" in h:
+        scale = float(_st_f32(f, base, h, stem + ".alpha").reshape(-1)[0]) / rank
+    return scale * np.kron(w1, w2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="template gguf (tensor list/dims/types/KV)")
@@ -105,21 +181,36 @@ def main():
     # Repeatable and PAIRWISE: --lora A --mult 2.0 --lora B --mult 1.5 stacks both, which is how
     # a "omninft-ar"-style variant is built (OmniNFT@2.0 + audio-reactive@1.5). Stacking in bf16
     # is exact — the deltas simply sum before the single quantisation.
-    ap.add_argument("--lora", action="append", required=True)
-    ap.add_argument("--mult", action="append", type=float, required=True)
+    # OPTIONAL: with none, this is a straight requantise of --bf16 through the template.
+    ap.add_argument("--lora", action="append", default=[])
+    ap.add_argument("--mult", action="append", type=float, default=[])
+    ap.add_argument("--base-prefix", default=BASE_PFX,
+                    help='prefix the CHECKPOINT puts on the template\'s bare names '
+                         f'(default "{BASE_PFX}"; pass "" for a bare checkpoint like Krea2)')
+    ap.add_argument("--lora-prefix", default=LORA_PFX,
+                    help=f'prefix the ADAPTER puts on those names (default "{LORA_PFX}")')
+    ap.add_argument("--flat", dest="flat", action="store_true", default=None,
+                    help="force FLAT nvfp4 (no .wglobal siblings); default follows the template")
+    ap.add_argument("--unfolded", dest="flat", action="store_false",
+                    help="force UNFOLDED nvfp4 (+ .wglobal siblings) — only if every NVFP4 "
+                         "matmul is proven to hit the cuBLASLt FP4 GEMM")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if len(a.lora) != len(a.mult):
         sys.exit(f"--lora given {len(a.lora)}x but --mult {len(a.mult)}x; they must pair up")
+    base_pfx, lora_pfx = a.base_prefix, a.lora_prefix
 
     fb, bb, hb = st_open(a.bf16)
     loras = []
     for path, mult in zip(a.lora, a.mult):
         fl_, bl_, hl_ = st_open(path)
-        st = {k[:-len(".lora_A.weight")] for k in hl_ if k.endswith(".lora_A.weight")}
+        st = adapter_stems(hl_)
+        kinds = sorted(set(st.values()))
         loras.append((os.path.basename(path), fl_, bl_, hl_, st, mult))
-        print(f"  lora {os.path.basename(path)} @ {mult}  ({len(st)} modules)")
-    stems = set().union(*(l[4] for l in loras))
+        print(f"  lora {os.path.basename(path)} @ {mult}  ({len(st)} modules, {'+'.join(kinds)})")
+    stems = set().union(*(set(l[4]) for l in loras)) if loras else set()
+    if not loras:
+        print("  no adapter: straight requantise of --bf16 through the template")
 
     # ---- parse SRC gguf: KV verbatim, tensor list minus our own .wglobal siblings ----
     f = open(a.src, "rb")
@@ -152,15 +243,24 @@ def main():
     kv_end = f.tell(); f.seek(kv_start); KV = f.read(kv_end - kv_start)
 
     infos = []
+    src_has_wglobal = False
     for _ in range(nt):
         kl = struct.unpack("<Q", f.read(8))[0]; name = f.read(kl).decode()
         nd = struct.unpack("<I", f.read(4))[0]
         dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
         tt = struct.unpack("<I", f.read(4))[0]; struct.unpack("<Q", f.read(8))[0]
         if name.endswith(".wglobal"):
+            src_has_wglobal = True
             continue                      # ours; regenerated below
         infos.append((name, dims, tt))
     f.close()
+
+    # Clone the template's CONVENTION, not just its tensor list. A template with no .wglobal
+    # siblings is a flat ggml build, and emitting unfolded weights against it silently breaks
+    # every matmul the backend routes away from cuBLASLt (see quant_nvfp4_unfolded).
+    flat = (not src_has_wglobal) if a.flat is None else a.flat
+    print(f"  convention: {'FLAT (no wglobal siblings)' if flat else 'UNFOLDED (+ wglobal siblings)'}"
+          f"  [template {'has' if src_has_wglobal else 'has no'} wglobal]")
 
     def nbytes_of(tt, dims):
         ne = int(np.prod(dims))
@@ -172,20 +272,22 @@ def main():
     plan = [(n, d, t) for (n, d, t) in infos]
     nvnames = [n for (n, d, t) in plan if t == GT_NVFP4]
     n_lora_hit = sum(1 for (n, d, t) in plan
-                     if LORA_PFX + n[:-len(".weight")] in stems)
+                     if n.endswith(".weight") and lora_pfx + n[:-len(".weight")] in stems)
     print(f"src: {len(plan)} tensors ({len(nvnames)} nvfp4) | lora stems {len(stems)} | "
           f"lora-matched tensors {n_lora_hit} | mult {a.mult}")
 
     o = open(a.out, "wb")
     o.write(magic); o.write(struct.pack("<I", ver))
-    o.write(struct.pack("<Q", len(plan) + len(nvnames))); o.write(struct.pack("<Q", nkv))
+    n_extra = 0 if flat else len(nvnames)
+    o.write(struct.pack("<Q", len(plan) + n_extra)); o.write(struct.pack("<Q", nkv))
     o.write(KV)
     off = 0
     hdr = []
     for (n, d, t) in plan:
         hdr.append((n, d, t, off)); nb = nbytes_of(t, d); off += nb + ((-nb) % align)
-    for n in nvnames:
-        hdr.append((n + ".wglobal", [1], GT_F32, off)); off += 4 + ((-4) % align)
+    if not flat:
+        for n in nvnames:
+            hdr.append((n + ".wglobal", [1], GT_F32, off)); off += 4 + ((-4) % align)
     for (n, d, t, oo) in hdr:
         nbk = n.encode(); o.write(struct.pack("<Q", len(nbk))); o.write(nbk)
         o.write(struct.pack("<I", len(d)))
@@ -195,27 +297,32 @@ def main():
 
     wglobals = {}
     folded = 0
+    applied = {l[0]: set() for l in loras}
     for i, (n, d, t) in enumerate(plan):
-        oname = BASE_PFX + n
+        oname = base_pfx + n
         u, dt, sh = st_raw(fb, bb, hb, oname)
         x = bf16_to_f32(u) if dt == "BF16" else u.view(np.float32)
         x = x.reshape(sh).astype(np.float64)
-        stem = LORA_PFX + n[:-len(".weight")] if n.endswith(".weight") else None
+        stem = lora_pfx + n[:-len(".weight")] if n.endswith(".weight") else None
         hit = False
-        for (_nm, fl_, bl_, hl_, st_, mult) in loras:
+        for (nm_, fl_, bl_, hl_, st_, mult) in loras:
             if stem not in st_:
                 continue
-            A = bf16_to_f32(st_raw(fl_, bl_, hl_, stem + ".lora_A.weight")[0]).reshape(
-                hl_[stem + ".lora_A.weight"]["shape"]).astype(np.float32)
-            B = bf16_to_f32(st_raw(fl_, bl_, hl_, stem + ".lora_B.weight")[0]).reshape(
-                hl_[stem + ".lora_B.weight"]["shape"]).astype(np.float32)
-            x = x + mult * (B.astype(np.float64) @ A.astype(np.float64))
+            if st_[stem] == "lokr":
+                dW = lokr_delta(fl_, bl_, hl_, stem)
+            else:
+                A = _st_f32(fl_, bl_, hl_, stem + ".lora_A.weight")
+                B = _st_f32(fl_, bl_, hl_, stem + ".lora_B.weight")
+                dW = B @ A
+            assert dW.shape == x.shape, f"{n}: delta {dW.shape} vs base {x.shape}"
+            x = x + mult * dW
+            applied[nm_].add(stem)
             hit = True
         if hit:
             folded += 1
         if t == GT_NVFP4:
             assert d[0] == x.shape[1] and d[1] == x.shape[0], f"{n}: dims {d} vs {x.shape}"
-            data, wg = quant_nvfp4_unfolded(x)
+            data, wg = quant_nvfp4_unfolded(x, flat=flat)
             wglobals[n] = wg
         elif t == GT_BF16:
             data = f32_to_bf16(x).tobytes()
@@ -225,10 +332,21 @@ def main():
         o.write(data); o.write(b"\x00" * ((-len(data)) % align))
         if (i + 1) % 500 == 0:
             print(f"  ...{i+1}/{len(plan)}  (folded {folded})", flush=True)
-    for n in nvnames:
-        o.write(struct.pack("<f", wglobals[n])); o.write(b"\x00" * ((-4) % align))
+    if not flat:
+        for n in nvnames:
+            o.write(struct.pack("<f", wglobals[n])); o.write(b"\x00" * ((-4) % align))
     o.close()
     print(f"wrote {a.out} ({os.path.getsize(a.out)} bytes); folded {folded} tensors @ {a.mult}")
+    # An adapter whose modules match NOTHING produces a file byte-identical to the plain
+    # requantise and looks like a successful build. That exact failure has already cost this
+    # tree a round of "the LoRA didn't do much" — make it loud.
+    for (nm_, _f, _b, _h, st_, _m) in loras:
+        missed = set(st_) - applied[nm_]
+        if missed:
+            print(f"!! {nm_}: {len(missed)}/{len(st_)} modules matched NO template tensor, e.g. "
+                  f"{sorted(missed)[:3]} -- check --lora-prefix/--base-prefix", file=sys.stderr)
+            if len(missed) == len(st_):
+                sys.exit(f"!! {nm_} folded NOTHING; refusing to pass this off as a folded build")
     print("run tools/verify_folded_build.py on this output before deploying.")
 
 
