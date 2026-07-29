@@ -606,10 +606,12 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
             // discarded. Leave the epoch unset so it is folded once it is unstaged.
             continue;
         }
-        if (ggml_n_dims(state->tensor) != 2) {
-            state->lora_fold_declined = true;
-            continue;
-        }
+        // Deliberately NOT pre-filtered on rank/type here. `lora_fold_declined` means "hand
+        // this one to the graph apply path", and that path reloads the whole adapter onto the
+        // COMPUTE backend for any group it is given -- so declining every bias and norm up
+        // front would drag a 1.3 GB LoRA back onto the GPU on every prepare_params, which is
+        // exactly the per-graph cost this fold exists to remove. A tensor is only declined
+        // below, once a LoRA is known to actually target it.
         candidates.push_back(state);
     }
     if (candidates.empty()) {
