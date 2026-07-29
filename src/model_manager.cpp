@@ -840,6 +840,16 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
         folded++;
     }
 
+#ifdef SD_USE_CUDA
+    // Hand back the fold's device scratch (delta buffer + staging). It is cached across
+    // tensors so the pass does not cudaMalloc 1344 times, but keeping it afterwards costs
+    // ~364 MiB of VRAM for the life of the worker -- measured as peak 12513 MiB against a
+    // 12149 MiB base, i.e. the GPU fold gave back less than the CPU fold did, which defeats
+    // half the point. Re-allocating on the next prepare_params is a couple of mallocs.
+    if (gpu_folded > 0) {
+        ggml_cuda_lora_fold_release();
+    }
+#endif
     if (folded > 0 || declined > 0) {
         LOG_INFO("lora fold-at-load: merged %zu tensor(s) (%zu on GPU), declined %zu, taking %.2fs",
                  folded, gpu_folded, declined, (ggml_time_ms() - t0) * 1.0f / 1000);
