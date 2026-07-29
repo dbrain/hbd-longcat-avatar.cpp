@@ -875,7 +875,10 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         msr_subjects.push_back(std::move(subject));
                     }
                 }
-                msr_frames = static_cast<int>(msr_subjects.size()) * 8 + 1;
+                // 8*K+1 gives each subject its own latent slot. With NO subjects every slot is
+                // background, which is the highest-weight form of a location injection -- so it
+                // gets the checkpoint menu's shortest real strip rather than a nonsensical 1.
+                msr_frames = msr_subjects.empty() ? 17 : static_cast<int>(msr_subjects.size()) * 8 + 1;
                 if (msr.contains("frames") && !msr["frames"].is_null()) {
                     if (!msr["frames"].is_number_integer()) {
                         res.status = 400;
@@ -928,16 +931,14 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         }
                     }
                 }
-                // MSR was trained through ComfyUI's IC-LoRA guide, which tags nothing. A
-                // positive phase scale would put the strip on the Best-Face-ID convention
-                // the checkpoint never saw, so refuse it rather than render it off-recipe.
-                if (tass_phase_scale > 0.f) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"msr requires the untagged layout; tass_phase_scale must be 0"})",
-                                    "application/json");
-                    return;
-                }
-                tass_phase_scale = 0.f;
+                // MSR trained through ComfyUI's IC-LoRA guide, which tags nothing, so the strip
+                // needs the untagged layout. That resolution is left to the ENGINE, which does
+                // it PER SEGMENT: a shot carrying the strip gets 0, a shot the strip is scoped
+                // out of keeps the Best-Face-ID default of 1.0 for its own character sheets.
+                //
+                // Forcing 0 here instead would apply it to the whole request and silently flip
+                // the sheets on every shot the strip does not appear in -- the exact opposite of
+                // what scoping promises. An explicit caller-supplied scale is still honoured.
             }
 
             const std::string default_model = body.value("model", std::string("base"));

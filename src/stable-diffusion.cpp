@@ -5833,9 +5833,39 @@ static sd::Tensor<float> ltxav_fit_image_to_canvas(const sd_image_t& image,
         LOG_ERROR("failed to read LTXAV MSR %s", name);
         return {};
     }
-    const int64_t source_width  = source.shape()[0];
-    const int64_t source_height = source.shape()[1];
-    const int64_t channels      = source.shape()[2];
+    int64_t source_width  = source.shape()[0];
+    int64_t source_height = source.shape()[1];
+    const int64_t channels = source.shape()[2];
+
+    // COVER CROPS IN SOURCE SPACE FIRST. Scaling the whole source and cropping afterwards
+    // makes the intermediate grow with the SOURCE's aspect ratio, which is request-controlled
+    // and unbounded: a 1x10000 PNG is ~1 KB on the wire and asks for a 1280 x 12,800,000
+    // float tensor -- ~196 GB. That allocation throws, and the async job worker is a
+    // std::thread entry point with no catch, so it would take the whole engine process down
+    // rather than failing one render. Cropping first bounds every intermediate to the canvas.
+    if (cover) {
+        const double target_aspect = static_cast<double>(width) / static_cast<double>(height);
+        const double source_aspect = static_cast<double>(source_width) / static_cast<double>(source_height);
+        int64_t crop_w = source_width;
+        int64_t crop_h = source_height;
+        if (source_aspect > target_aspect) {
+            crop_w = std::max<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(source_height) * target_aspect)));
+        } else if (source_aspect < target_aspect) {
+            crop_h = std::max<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(source_width) / target_aspect)));
+        }
+        if (crop_w != source_width || crop_h != source_height) {
+            const int64_t left = (source_width - crop_w) / 2;
+            const int64_t top  = (source_height - crop_h) / 2;
+            auto cropped = sd::ops::slice(sd::ops::slice(source, 0, left, left + crop_w), 1, top, top + crop_h);
+            if (cropped.empty()) {
+                LOG_ERROR("failed to crop LTXAV MSR %s", name);
+                return {};
+            }
+            source        = std::move(cropped);
+            source_width  = crop_w;
+            source_height = crop_h;
+        }
+    }
 
     const double scale_x = static_cast<double>(width) / static_cast<double>(source_width);
     const double scale_y = static_cast<double>(height) / static_cast<double>(source_height);
@@ -5851,6 +5881,13 @@ static sd::Tensor<float> ltxav_fit_image_to_canvas(const sd_image_t& image,
     } else {
         resized_width  = std::min<int64_t>(resized_width, width);
         resized_height = std::min<int64_t>(resized_height, height);
+    }
+    // Post-crop this can only exceed the canvas by rounding, but the bound is cheap and it
+    // is the last thing standing between a malformed reference and a dead worker.
+    if (resized_width > width * 4 || resized_height > height * 4) {
+        LOG_ERROR("LTXAV MSR %s would resize to %lldx%lld for a %dx%d canvas; refusing",
+                  name, (long long)resized_width, (long long)resized_height, width, height);
+        return {};
     }
 
     // Bicubic + antialias matches the plugin's torch fallback; its cv2 path uses

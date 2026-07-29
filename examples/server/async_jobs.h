@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -37,24 +38,32 @@ struct LtxSegmentBeat {
     float window   = -1.f;
 };
 
+// Is this image field a trusted absolute PATH rather than a base64 payload?
+//
+// A leading '/' alone is not enough: base64-encoded JPEG begins "/9j/", so a JPEG
+// handed in as base64 reads as an absolute path and is rejected as an unreadable
+// file. A length bound alone is not enough either -- base64 of a small JPEG (a
+// 64x64 crop is ~2 KB) is under PATH_MAX and still starts with '/'.
+//
+// So ASK THE FILESYSTEM. A real reference path exists; base64 never does. That is
+// definitive rather than heuristic, and it degrades the right way: a path that is
+// gone is treated as a payload and fails to decode, with a clear error.
+//
+// Parse and load MUST agree, which is why this lives in the header rather than in
+// either translation unit.
+inline bool ltx_source_is_path(const std::string& source) {
+    if (source.empty() || source[0] != '/' || source.size() >= 4096 ||
+        source.find('\n') != std::string::npos) {
+        return false;
+    }
+    std::error_code error;
+    return std::filesystem::is_regular_file(source, error);
+}
+
 // One LTX TASS character reference as it arrived on the wire. `image` is either
 // a base64 payload or a trusted absolute path; `source_id` zero means "assign
 // 2, 3, 4, ... in array order", and `match_target` selects resizing to the
 // render bucket instead of keeping the sheet's native resolution.
-// Is this image field a trusted absolute PATH rather than a base64 payload?
-//
-// A leading '/' alone is not enough: base64-encoded JPEG begins "/9j/", so every
-// JPEG handed in as base64 reads as an absolute path and is rejected as an
-// unreadable file. Length settles it -- PATH_MAX is 4096 and a base64 image is
-// orders of magnitude longer -- and no legitimate path can be lost this way.
-//
-// Parse and load MUST agree on this, which is why it lives here rather than in
-// either translation unit.
-inline bool ltx_source_is_path(const std::string& source) {
-    return !source.empty() && source[0] == '/' && source.size() < 4096 &&
-           source.find('\n') == std::string::npos;
-}
-
 struct LtxCharacterRef {
     std::string image;
     int source_id     = 0;
