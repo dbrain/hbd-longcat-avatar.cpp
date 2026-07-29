@@ -1273,7 +1273,18 @@ public:
             // Avoid full-model LoRA merge buffers on constrained setups.
             const bool params_offloaded      = params_backend_for(SDBackendModule::DIFFUSION) != backend_for(SDBackendModule::DIFFUSION);
             const bool streaming_constrained = stream_layers || params_offloaded;
-            if (have_quantized_weight || streaming_constrained || row_split_active()) {
+            // SD_LORA_FOLD=1 selects the params-backend fold (model/adapter/lora_fold.hpp),
+            // which is exactly the case these two exclusions were written for: it merges on
+            // the HOST copy before staging, so offload is fine, and it writes NVFP4 block
+            // bytes directly, so a quantised base is fine. Row split still is not -- those
+            // tensors are sharded across backends and the fold only sees one shard.
+            const char* fold_env  = std::getenv("SD_LORA_FOLD");
+            const bool fold_loras = fold_env != nullptr && fold_env[0] != '\0' && fold_env[0] != '0';
+            if (row_split_active()) {
+                apply_lora_immediately = false;
+            } else if (fold_loras) {
+                apply_lora_immediately = true;
+            } else if (have_quantized_weight || streaming_constrained) {
                 apply_lora_immediately = false;
             } else {
                 apply_lora_immediately = true;

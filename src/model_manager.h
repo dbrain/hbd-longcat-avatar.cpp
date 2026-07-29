@@ -12,6 +12,10 @@
 #include "model_loader.h"
 #include "weight_manager.h"
 
+// Only ever held by shared_ptr here; lora.hpp includes this header, so the full type is
+// deliberately not visible until model_manager.cpp, which does include it.
+struct LoraModel;
+
 class ModelManager : public RunnerWeightManager {
 public:
     enum class ResidencyMode {
@@ -46,6 +50,15 @@ private:
         bool loaded_to_params_backend  = false;
         bool staged_to_compute_backend = false;
         uint64_t applied_lora_epoch    = UINT64_MAX;
+        // Set once the LoRA delta has been merged into the PARAMS-backend copy of this
+        // tensor. Distinct from applied_lora_epoch, which tracks the compute-staged copy
+        // and is therefore reset every time a staging block is freed -- a fold survives
+        // re-staging and is only invalidated when the params storage itself is released
+        // (which re-reads the pristine weights from the model file).
+        uint64_t folded_lora_epoch = UINT64_MAX;
+        // A LoRA target this fold cannot handle (non-2D, or a row length that is not a
+        // whole number of NVFP4 blocks). Left to the graph-based apply path.
+        bool lora_fold_declined = false;
     };
 
     struct ParamsStorageBlock {
@@ -68,8 +81,16 @@ private:
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
     bool warned_split_lora_skip_ = false;
+    bool warned_gpu_fold_        = false;
     std::set<std::string> common_ignore_tensors_;
     std::vector<LoraSpec> loras_;
+    // LoRA files kept open only for the duration of one fold epoch. Held here rather than
+    // reloaded per prepare_params() because under weight offload prepare_params() runs
+    // once per graph, and re-reading a 1.3 GB adapter each time would dwarf the fold.
+    std::vector<std::shared_ptr<LoraModel>> fold_loras_;
+    ggml_backend_t fold_cpu_backend_ = nullptr;
+    uint64_t fold_loras_epoch_       = UINT64_MAX;
+    bool fold_loras_failed_          = false;
     SDVersion lora_version_      = VERSION_COUNT;
     uint64_t current_lora_epoch_ = 0;
     int n_threads_               = 0;
@@ -87,6 +108,8 @@ private:
 
     bool load_tensors_to_params_backend(const std::vector<TensorState*>& states);
     bool apply_loras_to_params(const std::vector<TensorState*>& states);
+    bool fold_loras_into_params(const std::vector<TensorState*>& states);
+    void release_fold_loras();
     bool mmap_params(const std::vector<TensorState*>& states,
                      std::vector<ParamsStorageBlock*>& created_storage_blocks);
     bool can_mmap_storage(const TensorState& state) const;

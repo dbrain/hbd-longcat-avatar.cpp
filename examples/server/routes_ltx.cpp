@@ -266,6 +266,13 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             if (beat_fps <= 0) {
                 beat_fps = 24;
             }
+            // Per-segment `lora` names are resolved inside the loop below, but the cache they
+            // resolve against is only refreshed by parse_ltx_video_request(), ~300 lines later.
+            // On a cold process it is therefore EMPTY here and every per-shot adapter 400s with
+            // "unknown LTX segment lora" -- including names that demonstrably work at request
+            // root. It only ever appeared to work when some earlier request in the same process
+            // had already warmed the cache, which is why this survived being tested.
+            refresh_lora_cache(*runtime);
             if (body.contains("segments") && body["segments"].is_array()) {
                 for (const auto& segment : body["segments"]) {
                     if (segment.is_string()) {

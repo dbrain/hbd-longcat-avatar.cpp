@@ -1,15 +1,26 @@
 #include "model_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <cstdint>
 #include <iterator>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
+#include "model/adapter/lora_fold.hpp"
+#ifdef SD_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
     GGML_ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
@@ -52,6 +63,48 @@ static bool backend_supports_host_buffer(ggml_backend_t backend) {
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
     return props.caps.buffer_from_host_ptr;
+}
+
+// Fold-at-load is OFF by default: it is a numerics change (see the header comment in
+// model/adapter/lora_fold.hpp -- stochastic rounding trades ~13% more weight noise for
+// getting the delta applied at all) and has NOT been quality-checked on a GPU render.
+// SD_LORA_FOLD=1 opts in; SD_LORA_FOLD=0 or unset keeps the per-step adapter branch.
+static bool lora_fold_at_load_enabled() {
+    const char* value = std::getenv("SD_LORA_FOLD");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// Break copy-on-write on a range we are about to have the GPU DMA into, ahead of time.
+//
+// WHY. The fold's write-back is a D2H into the mmap'd model, and those pages have never
+// been written, so essentially every one of them takes a COW fault DURING the copy, one at
+// a time, with the DMA engine waiting. MEASURED on this card: a D2H into already-faulted
+// pages runs 11.49 GB/s, into fresh ones 2.12 GB/s -- a 5.4x penalty that accounts for the
+// fold's 5.5 ms/tensor download exactly.
+//
+// This is NOT the pinned-staging idea, which was tried and failed. Pinning relocated the
+// fault (DMA into pinned memory, then a memcpy that faults) rather than removing it, and
+// measured as noise. Nor is it LONGCAT_DIT_NO_MMAP=1, which swaps COW faults for
+// first-touch anonymous faults -- also still faults, also no change.
+//
+// MADV_POPULATE_WRITE does the whole range in one syscall, in the kernel, without a trap
+// per page. The manual touch loop is the fallback for kernels/mappings that reject it.
+static void prefault_for_write(void* addr, size_t bytes) {
+    if (addr == nullptr || bytes == 0) {
+        return;
+    }
+    const size_t page   = (size_t)sysconf(_SC_PAGESIZE);
+    const uintptr_t beg = (uintptr_t)addr & ~(uintptr_t)(page - 1);
+    const uintptr_t end = ((uintptr_t)addr + bytes + page - 1) & ~(uintptr_t)(page - 1);
+#ifdef MADV_POPULATE_WRITE
+    if (madvise((void*)beg, (size_t)(end - beg), MADV_POPULATE_WRITE) == 0) {
+        return;
+    }
+#endif
+    for (uintptr_t p = beg; p < end; p += page) {
+        volatile char* c = (volatile char*)p;
+        *c               = *c;  // read-modify-write: breaks COW without changing the byte
+    }
 }
 
 static bool model_manager_profile_enabled() {
@@ -508,6 +561,615 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
     return true;
 }
 
+void ModelManager::release_fold_loras() {
+    for (auto& lora : fold_loras_) {
+        if (lora != nullptr) {
+            lora->release_loaded_tensors();
+        }
+    }
+    fold_loras_.clear();
+    if (fold_cpu_backend_ != nullptr) {
+        ggml_backend_free(fold_cpu_backend_);
+        fold_cpu_backend_ = nullptr;
+    }
+    fold_loras_epoch_ = UINT64_MAX;
+    fold_loras_failed_ = false;
+}
+
+// Dequantise a whole host-resident LoRA tensor to f32. LoRA ggufs here are Q8_0 (see
+// tools/convert_lora_q8.py), so this is not optional.
+static bool lora_tensor_to_f32(const ggml_tensor* t, std::vector<float>& out) {
+    if (t == nullptr || t->data == nullptr) {
+        return false;
+    }
+    const int64_t n = ggml_nelements(t);
+    out.resize((size_t)n);
+    if (t->type == GGML_TYPE_F32) {
+        std::memcpy(out.data(), t->data, sizeof(float) * (size_t)n);
+        return true;
+    }
+    const ggml_type_traits* traits = ggml_get_type_traits(t->type);
+    if (traits == nullptr || traits->to_float == nullptr) {
+        return false;
+    }
+    // Rows must be whole blocks for to_float; LoRA tensors are 2-D and contiguous.
+    const int64_t row = t->ne[0];
+    if (row % ggml_blck_size(t->type) != 0) {
+        return false;
+    }
+    const int64_t nrows   = n / row;
+    const size_t row_size = ggml_row_size(t->type, row);
+    for (int64_t r = 0; r < nrows; ++r) {
+        traits->to_float((const char*)t->data + (size_t)r * row_size, out.data() + (size_t)r * row, row);
+    }
+    return true;
+}
+
+static float lora_scalar(const ggml_tensor* t) {
+    if (t == nullptr || t->data == nullptr) {
+        return 0.0f;
+    }
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            return *(const float*)t->data;
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(*(const ggml_fp16_t*)t->data);
+        case GGML_TYPE_BF16:
+            return ggml_bf16_to_fp32(*(const ggml_bf16_t*)t->data);
+        default: {
+            std::vector<float> v;
+            return lora_tensor_to_f32(t, v) && !v.empty() ? v[0] : 0.0f;
+        }
+    }
+}
+
+// Merge the LoRA delta into the PARAMS-backend copy of every candidate weight, once per
+// LoRA epoch. Runs BEFORE staging, which is the whole point: a compute staging block is
+// rebuilt every graph, so anything written there is thrown away under weight offload.
+bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& states) {
+    if (loras_.empty() || !lora_fold_at_load_enabled() || fold_loras_failed_) {
+        return true;
+    }
+
+    std::vector<TensorState*> candidates;
+    for (TensorState* state : states) {
+        if (state == nullptr || state->tensor == nullptr || state->lora_fold_declined ||
+            should_ignore(*state) || is_optional_missing_tensor(state->name)) {
+            continue;
+        }
+        if (state->folded_lora_epoch == current_lora_epoch_ || !state->loaded_to_params_backend) {
+            continue;
+        }
+        if (state->desc == "LoRA") {
+            continue;  // the adapters themselves are never fold targets
+        }
+        if (state->staged_to_compute_backend) {
+            // Its params copy is not the live one right now; folding it would be silently
+            // discarded. Leave the epoch unset so it is folded once it is unstaged.
+            continue;
+        }
+        // Deliberately NOT pre-filtered on rank/type here. `lora_fold_declined` means "hand
+        // this one to the graph apply path", and that path reloads the whole adapter onto the
+        // COMPUTE backend for any group it is given -- so declining every bias and norm up
+        // front would drag a 1.3 GB LoRA back onto the GPU on every prepare_params, which is
+        // exactly the per-graph cost this fold exists to remove. A tensor is only declined
+        // below, once a LoRA is known to actually target it.
+        candidates.push_back(state);
+    }
+    if (candidates.empty()) {
+        return true;
+    }
+
+    if (enable_mmap_ && !writable_mmap_) {
+        LOG_ERROR("lora fold-at-load needs a writable mmap; refusing to fold read-only weights");
+        fold_loras_failed_ = true;
+        return false;
+    }
+
+    if (fold_loras_epoch_ != current_lora_epoch_) {
+        release_fold_loras();
+        fold_cpu_backend_ = sd_backend_cpu_init();
+        if (fold_cpu_backend_ == nullptr) {
+            LOG_ERROR("lora fold-at-load could not create a CPU backend");
+            fold_loras_failed_ = true;
+            return false;
+        }
+        if (n_threads_ > 0) {
+            sd_backend_cpu_set_n_threads(fold_cpu_backend_, n_threads_);
+        }
+        const std::set<std::string> all_names = tensor_names();
+        for (const LoraSpec& spec : loras_) {
+            auto lora = std::make_shared<LoraModel>(lora_id(spec),
+                                                    fold_cpu_backend_,
+                                                    fold_cpu_backend_,
+                                                    spec.path,
+                                                    spec.is_high_noise ? "model.high_noise_" : "",
+                                                    lora_version_);
+            LoraModel::filter_t filter = nullptr;
+            if (!spec.tensor_name_prefix_filter.empty()) {
+                filter = [&spec](const std::string& tensor_name) {
+                    return starts_with(tensor_name, spec.tensor_name_prefix_filter);
+                };
+            }
+            if (!lora->load_from_file(n_threads_, filter) || lora->lora_tensors.empty()) {
+                LOG_WARN("lora fold-at-load could not read %s", spec.path.c_str());
+                if (spec.required) {
+                    fold_loras_failed_ = true;
+                    return false;
+                }
+                continue;
+            }
+            lora->preprocess_lora_tensors(all_names);
+            lora->multiplier = spec.multiplier;
+            fold_loras_.push_back(std::move(lora));
+        }
+        fold_loras_epoch_ = current_lora_epoch_;
+        LOG_INFO("lora fold-at-load: %zu adapter(s) resident on CPU for epoch %llu",
+                 fold_loras_.size(), (unsigned long long)current_lora_epoch_);
+    }
+    if (fold_loras_.empty()) {
+        for (TensorState* state : candidates) {
+            state->folded_lora_epoch = current_lora_epoch_;
+        }
+        return true;
+    }
+
+    const int64_t t0 = ggml_time_ms();
+    size_t folded = 0, declined = 0, gpu_folded = 0;
+    // Prefer the GPU fold; SD_LORA_FOLD_CPU=1 forces the CPU path (A/B and fallback test).
+    const char* cpu_env = std::getenv("SD_LORA_FOLD_CPU");
+    const bool use_gpu_fold = !(cpu_env != nullptr && cpu_env[0] != '\0' && cpu_env[0] != '0');
+
+    // Fault in every page the fold is about to write, in parallel, before writing any of
+    // them. See prefault_for_write: the download leg is 5.4x slower into never-written
+    // pages, and it is ~10 GB of them. Doing it here costs one bulk populate per tensor
+    // instead of ~2400 in-DMA faults per tensor, and it also pre-warms the SOURCE side of
+    // the upload leg, since that reads the same pages.
+    //
+    // Only tensors a LoRA actually targets: `candidates` deliberately contains every weight
+    // that has not been folded yet, most of which nothing targets, and COW-breaking those
+    // would fault in the whole model for no reason.
+    {
+        std::vector<TensorState*> targets;
+        targets.reserve(candidates.size());
+        for (TensorState* state : candidates) {
+            if (state->tensor == nullptr || state->tensor->data == nullptr) {
+                continue;
+            }
+            if (state->tensor->buffer != nullptr && !ggml_backend_buffer_is_host(state->tensor->buffer)) {
+                continue;  // device memory: no host pages to fault
+            }
+            for (auto& lora : fold_loras_) {
+                if (lora->lora_tensors.count("lora." + state->name + ".lora_down") > 0) {
+                    targets.push_back(state);
+                    break;
+                }
+            }
+        }
+        if (!targets.empty()) {
+            const int64_t t_pf   = ggml_time_ms();
+            const int nthreads   = std::max(1, std::min(n_threads_ > 0 ? n_threads_ : 8, (int)targets.size()));
+            std::atomic<size_t> next{0};
+            auto worker = [&]() {
+                for (size_t i = next++; i < targets.size(); i = next++) {
+                    prefault_for_write(targets[i]->tensor->data, ggml_nbytes(targets[i]->tensor));
+                }
+            };
+            std::vector<std::thread> pool;
+            pool.reserve((size_t)nthreads - 1);
+            for (int t = 1; t < nthreads; ++t) {
+                pool.emplace_back(worker);
+            }
+            worker();
+            for (std::thread& th : pool) {
+                th.join();
+            }
+            LOG_DEBUG("lora fold-at-load: pre-faulted %zu target(s) on %d threads, taking %.2fs",
+                      targets.size(), nthreads, (ggml_time_ms() - t_pf) * 1.0f / 1000);
+        }
+    }
+    auto in_of  = [](const ggml_tensor* t) { return (int64_t)t->ne[0]; };
+    auto out_of = [](const ggml_tensor* t) { return (int64_t)t->ne[1]; };
+    (void)use_gpu_fold; (void)in_of; (void)out_of;
+    std::vector<float> host_scratch;
+
+    // Host-side phase timers. The CUDA profiler only ever saw its own phases, which summed
+    // to half the pass -- the other half was invisible and was assumed to be transfers. It
+    // was the CPU fold. Do not remove these: the split between "building the delta" and
+    // "merging it" is the only thing that says which half to attack next.
+    int64_t us_delta = 0, us_gpu = 0, us_cpu = 0;
+    size_t cpu_folded = 0;
+
+    // SD_LORA_FOLD_VERIFY=1: fold every DENSE tensor BOTH ways and report the difference.
+    //
+    // Moving the dense targets from the CPU fold to a CUDA kernel is the only arithmetic
+    // change in this pass, and "the render still looked right" cannot distinguish a correct
+    // kernel from one that is subtly wrong on a minority of tensors. These two paths SHOULD
+    // agree to within float rounding -- unlike the NVFP4 pair, which cannot be compared this
+    // way because stochastic rounding turns a 1 ULP GEMM difference into a flipped nibble.
+    // SD_LORA_FOLD_DENSE=0 -> dense targets go back to the CPU fold (isolating control).
+    const char* dense_env = std::getenv("SD_LORA_FOLD_DENSE");
+    const bool dense_gpu_enabled = dense_env == nullptr || dense_env[0] == '\0' || dense_env[0] != '0';
+    // Only read inside the SD_USE_CUDA block below; keep a CPU-only build warning-free.
+    (void)dense_gpu_enabled;
+
+    const char* verify_env = std::getenv("SD_LORA_FOLD_VERIFY");
+    const bool verify_dense = verify_env != nullptr && verify_env[0] != '\0' && verify_env[0] != '0';
+    std::vector<uint8_t> verify_pre;
+    double verify_max_abs = 0.0, verify_max_rel = 0.0, verify_sum_abs = 0.0;
+    size_t verify_n = 0, verify_elems = 0, verify_differing = 0;
+    int64_t verify_max_ulps = 0;
+
+    // ---- pre-pass: load every `.wglobal` sidecar the fold will need ------------------
+    // load_tensors_to_params_backend() mutates shared loader and storage-block state, so it
+    // cannot run inside the threaded build below. Hoisting it here is precisely what makes
+    // that build parallelisable; leaving it in the per-tensor path would be a data race
+    // that only shows up under load.
+    {
+        std::vector<TensorState*> wg_needed;
+        for (TensorState* state : candidates) {
+            if (state->tensor == nullptr || state->tensor->type != GGML_TYPE_NVFP4) {
+                continue;
+            }
+            auto it = tensor_states_by_name_.find(state->name + ".wglobal");
+            if (it != tensor_states_by_name_.end() && it->second != nullptr &&
+                !it->second->loaded_to_params_backend) {
+                wg_needed.push_back(it->second);
+            }
+        }
+        if (!wg_needed.empty()) {
+            load_tensors_to_params_backend(wg_needed);
+        }
+    }
+
+    // One tensor's delta inputs. The f32 buffers live in `owned` and the ModuleDelta
+    // pointers point into them, so a FoldWork must outlive the merge that consumes it.
+    // Buffers are reused across chunks (a `used` cursor, not clear()) because handing
+    // megabyte blocks back to the allocator per tensor means the next tensor takes a page
+    // fault on every byte it writes into their replacements.
+    struct FoldWork {
+        TensorState* state = nullptr;
+        std::vector<sd_lora_fold::ModuleDelta> deltas;
+        std::deque<std::vector<float>> owned;  // deque: element addresses stay stable
+        size_t used     = 0;
+        float wglobal   = 1.0f;
+        bool declined   = false;
+        bool no_wglobal = false;
+        std::vector<float>& next_buf() {
+            if (used == owned.size()) {
+                owned.emplace_back();
+            }
+            return owned[used++];
+        }
+        void reset(TensorState* s) {
+            state      = s;
+            deltas.clear();
+            used       = 0;
+            wglobal    = 1.0f;
+            declined   = false;
+            no_wglobal = false;
+        }
+    };
+
+    // Build one tensor's deltas. MUST stay free of shared mutable state: it runs on
+    // `build_threads` threads at once. Reading fold_loras_, tensor_states_by_name_ and
+    // already-loaded tensor data is fine; anything that loads, logs or counts is not, so
+    // those are deferred to the sequential merge below via the flags on FoldWork.
+    auto build_one = [&](FoldWork& work) {
+        TensorState* state = work.state;
+        ggml_tensor* w     = state->tensor;
+        for (auto& lora : fold_loras_) {
+            int64_t row_begin = 0;
+            for (int index = 0;; ++index) {
+                const std::string key = index == 0 ? state->name : state->name + "." + std::to_string(index);
+                auto down_it = lora->lora_tensors.find("lora." + key + ".lora_down");
+                auto up_it   = lora->lora_tensors.find("lora." + key + ".lora_up");
+                if (down_it == lora->lora_tensors.end() || up_it == lora->lora_tensors.end()) {
+                    break;
+                }
+                ggml_tensor* down = down_it->second;
+                ggml_tensor* up   = up_it->second;
+                if (ggml_n_dims(down) != 2 || ggml_n_dims(up) != 2) {
+                    work.declined = true;
+                    break;
+                }
+                const int64_t rank = down->ne[1];
+
+                float scale = 1.0f;
+                auto scale_it = lora->lora_tensors.find("lora." + key + ".scale");
+                if (scale_it != lora->lora_tensors.end()) {
+                    scale = lora_scalar(scale_it->second);
+                } else {
+                    auto alpha_it = lora->lora_tensors.find("lora." + key + ".alpha");
+                    if (alpha_it != lora->lora_tensors.end() && rank > 0) {
+                        scale = lora_scalar(alpha_it->second) / (float)rank;
+                    }
+                }
+                scale *= lora->multiplier;
+
+                std::vector<float>& down_f32 = work.next_buf();
+                std::vector<float>& up_f32   = work.next_buf();
+                if (!lora_tensor_to_f32(down, down_f32) || !lora_tensor_to_f32(up, up_f32)) {
+                    work.declined = true;
+                    break;
+                }
+                sd_lora_fold::ModuleDelta d;
+                d.down      = down_f32.data();
+                d.up        = up_f32.data();
+                d.in        = down->ne[0];
+                d.rank      = rank;
+                d.rows      = up->ne[1];
+                d.row_begin = row_begin;
+                d.scale     = scale;
+
+                auto mid_it = lora->lora_tensors.find("lora." + key + ".lora_mid");
+                if (mid_it != lora->lora_tensors.end()) {
+                    std::vector<float>& mid_f32 = work.next_buf();
+                    if (!lora_tensor_to_f32(mid_it->second, mid_f32)) {
+                        work.declined = true;
+                        break;
+                    }
+                    d.mid = mid_f32.data();
+                }
+                work.deltas.push_back(d);
+                row_begin += d.rows;
+            }
+            if (work.declined) {
+                break;
+            }
+        }
+        if (work.declined || work.deltas.empty() || w->type != GGML_TYPE_NVFP4) {
+            return;
+        }
+        // The runtime multiplies this Linear's output by `.wglobal` (or folds it into the
+        // cuBLASLt alpha), so the stored nibbles live in a scaled domain and the TRUE-unit
+        // delta has to be divided by it before it can be merged. The sidecar was loaded by
+        // the pre-pass above; this only reads it.
+        auto wg_it            = tensor_states_by_name_.find(state->name + ".wglobal");
+        TensorState* wg_state = wg_it == tensor_states_by_name_.end() ? nullptr : wg_it->second;
+        ggml_tensor* wg       = wg_state != nullptr ? wg_state->tensor : nullptr;
+        if (wg == nullptr || wg->data == nullptr) {
+            work.no_wglobal = true;
+            work.declined   = true;
+            return;
+        }
+        ggml_backend_tensor_get(wg, &work.wglobal, 0, sizeof(float));
+        if (!(work.wglobal > 0.0f)) {
+            work.wglobal = 1.0f;
+        }
+    };
+
+    // Build a CHUNK of tensors' deltas on every core, then merge that chunk on the GPU.
+    //
+    // MEASURED before this change: delta-build was 14.27 s of an 18.92 s fold -- 75% of it
+    // -- purely because it ran one tensor at a time while every other core and the GPU sat
+    // idle. It is per-tensor CPU work (Q8_0 -> f32 for each module) with no cross-tensor
+    // dependency, so it parallelises exactly.
+    //
+    // Chunked rather than all-at-once because the f32 expansion of a whole 1632-module
+    // adapter is gigabytes; a chunk bounds it to build_threads*2 tensors' worth.
+    const int build_threads = std::max(1, n_threads_ > 0 ? n_threads_ : 8);
+    const size_t chunk      = (size_t)build_threads * 2;
+    std::vector<FoldWork> works(chunk);
+    size_t work_index = 0, work_n = 0;
+
+    for (size_t ci = 0; ci < candidates.size(); ++ci) {
+        if (work_index == work_n) {
+            work_n = std::min(chunk, candidates.size() - ci);
+            for (size_t i = 0; i < work_n; ++i) {
+                works[i].reset(candidates[ci + i]);
+            }
+            const int64_t t_build0 = ggml_time_us();
+            std::atomic<size_t> next{0};
+            auto worker = [&]() {
+                for (size_t i = next++; i < work_n; i = next++) {
+                    build_one(works[i]);
+                }
+            };
+            std::vector<std::thread> pool;
+            pool.reserve((size_t)build_threads - 1);
+            for (int t = 1; t < build_threads; ++t) {
+                pool.emplace_back(worker);
+            }
+            worker();
+            for (std::thread& th : pool) {
+                th.join();
+            }
+            us_delta += ggml_time_us() - t_build0;
+            work_index = 0;
+        }
+
+        FoldWork& work                                 = works[work_index++];
+        TensorState* state                             = work.state;
+        ggml_tensor* w                                 = state->tensor;
+        std::vector<sd_lora_fold::ModuleDelta>& deltas = work.deltas;
+        const float wglobal                            = work.wglobal;
+
+        if (work.no_wglobal) {
+            LOG_WARN("lora fold-at-load: no .wglobal for nvfp4 tensor '%s'; leaving it to the runtime path",
+                     state->name.c_str());
+        }
+        if (work.declined) {
+            state->lora_fold_declined = true;
+            declined++;
+            continue;
+        }
+        if (deltas.empty()) {
+            state->folded_lora_epoch = current_lora_epoch_;  // nothing targets it; done
+            continue;
+        }
+
+        const bool host = w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer);
+        void* data      = w->data;
+        if (!host) {
+            host_scratch.resize(ggml_nbytes(w) / sizeof(float) + 1);
+            ggml_backend_tensor_get(w, host_scratch.data(), 0, ggml_nbytes(w));
+            data = host_scratch.data();
+        }
+        bool merged = false;
+#ifdef SD_USE_CUDA
+        // The GPU is idle during model load and this work is trivially parallel, so prefer
+        // it for EVERY supported weight type, not just NVFP4.
+        //
+        // Sending only NVFP4 to the GPU was the earlier rule, on the reasoning that a plain
+        // BF16/F32 add is not worth a round trip. That reasoning was wrong, and measurably:
+        // the merge is cheap for those types but the DELTA is not, and building it on the
+        // CPU means `accumulate_rows` doing a [rows, in] x rank GEMM by hand. MEASURED on
+        // the full 1632-module adapter, the 288 tensors left on the CPU cost 14.8 s of a
+        // 29 s fold -- more than the entire CUDA half. The round trip is ~2 ms; the CPU GEMM
+        // it replaces is ~50.
+        if (use_gpu_fold) {
+            // The dense kernel indexes the weight linearly over in*out, so it needs a
+            // contiguous tensor; the CPU fold walks rows and does not.
+            //
+            // SD_LORA_FOLD_DENSE=0 sends these back to the CPU fold. That is the ISOLATING
+            // CONTROL for this whole change: the dense kernel is the only edit here that can
+            // alter a weight value, so with it off the fold must come out BIT-IDENTICAL to
+            // the pre-change engine. If it does not, the pre-faulting or the threaded
+            // delta-build has a bug, and the render diff is not the rounding story it looks
+            // like. Keep it -- "I believe the difference is benign" is not a measurement.
+            const bool dense = (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 ||
+                                w->type == GGML_TYPE_BF16) &&
+                               ggml_is_contiguous(w) && dense_gpu_enabled;
+            if ((w->type == GGML_TYPE_NVFP4 || dense) && ggml_n_dims(w) == 2) {
+                std::vector<ggml_cuda_lora_module> gmods;
+                gmods.reserve(deltas.size());
+                for (const sd_lora_fold::ModuleDelta& d : deltas) {
+                    if (d.mid != nullptr) {  // lora_mid needs the chained CPU path
+                        gmods.clear();
+                        break;
+                    }
+                    gmods.push_back({d.down, d.up, d.rank, d.row_begin, d.rows, d.scale});
+                }
+                if (!gmods.empty()) {
+                    if (verify_dense && dense) {
+                        // Capture the pristine bytes BEFORE the GPU writes them, so the CPU
+                        // fold below starts from the same input rather than a folded one.
+                        const uint8_t* src = (const uint8_t*)data;
+                        verify_pre.assign(src, src + ggml_nbytes(w));
+                    }
+                    const int64_t t_gpu0 = ggml_time_us();
+                    // A dense weight carries no `.wglobal` scaling, so the delta goes in as
+                    // it comes out of the GEMM; only NVFP4 needs the divide.
+                    merged = dense ? ggml_cuda_lora_fold_dense(data, w->type, in_of(w), out_of(w),
+                                                               gmods.data(), (int)gmods.size())
+                                   : ggml_cuda_lora_fold_nvfp4(data, in_of(w), out_of(w),
+                                                               wglobal != 0.0f ? 1.0f / wglobal : 1.0f,
+                                                               gmods.data(), (int)gmods.size(),
+                                                               sd_lora_fold::seed_of(state->name));
+                    us_gpu += ggml_time_us() - t_gpu0;
+                    if (!merged && !warned_gpu_fold_) {
+                        LOG_WARN("lora fold-at-load: GPU fold unavailable, falling back to CPU");
+                        warned_gpu_fold_ = true;
+                    }
+                    gpu_folded += merged ? 1 : 0;
+                    if (merged && verify_dense && dense) {
+                        sd_lora_fold::fold_into_tensor(w, verify_pre.data(), wglobal, deltas,
+                                                       state->name, n_threads_);
+                        // Distance in ULPs, not just in absolute value. A max|d| alone
+                        // cannot separate "the two paths rounded the last bit differently"
+                        // from "the kernel is subtly wrong", and a max RELATIVE error is
+                        // misleading here because the worst case always lands on some
+                        // near-cancelling element where one quantum is a large fraction.
+                        // IEEE formats are monotonic in their bit pattern within a sign, so
+                        // mapping to a signed ordinal makes |ord(a) - ord(b)| the exact
+                        // number of representable steps between them. 1 means adjacent.
+                        auto ord16 = [](uint16_t bits) -> int64_t {
+                            return (bits & 0x8000u) ? (int64_t)0x8000 - (int64_t)(bits & 0x7FFFu)
+                                                    : (int64_t)0x8000 + (int64_t)bits;
+                        };
+                        auto ord32 = [](uint32_t bits) -> int64_t {
+                            return (bits & 0x80000000u) ? (int64_t)0x80000000 - (int64_t)(bits & 0x7FFFFFFFu)
+                                                        : (int64_t)0x80000000 + (int64_t)bits;
+                        };
+                        const int64_t n = ggml_nelements(w);
+                        for (int64_t i = 0; i < n; ++i) {
+                            float a = 0.0f, b = 0.0f;  // a = GPU result, b = CPU result
+                            int64_t ulps = 0;
+                            if (w->type == GGML_TYPE_F32) {
+                                const uint32_t ba = ((const uint32_t*)data)[i];
+                                const uint32_t bb = ((const uint32_t*)verify_pre.data())[i];
+                                std::memcpy(&a, &ba, 4);
+                                std::memcpy(&b, &bb, 4);
+                                ulps = std::llabs(ord32(ba) - ord32(bb));
+                            } else if (w->type == GGML_TYPE_F16) {
+                                a = ggml_fp16_to_fp32(((const ggml_fp16_t*)data)[i]);
+                                b = ggml_fp16_to_fp32(((const ggml_fp16_t*)verify_pre.data())[i]);
+                                ulps = std::llabs(ord16(((const uint16_t*)data)[i]) -
+                                                  ord16(((const uint16_t*)verify_pre.data())[i]));
+                            } else {
+                                a = ggml_bf16_to_fp32(((const ggml_bf16_t*)data)[i]);
+                                b = ggml_bf16_to_fp32(((const ggml_bf16_t*)verify_pre.data())[i]);
+                                ulps = std::llabs(ord16(((const uint16_t*)data)[i]) -
+                                                  ord16(((const uint16_t*)verify_pre.data())[i]));
+                            }
+                            const double d = std::fabs((double)a - (double)b);
+                            verify_max_abs = std::max(verify_max_abs, d);
+                            const double mag = std::max(std::fabs((double)a), std::fabs((double)b));
+                            if (mag > 0.0) {
+                                verify_max_rel = std::max(verify_max_rel, d / mag);
+                            }
+                            verify_sum_abs += d;
+                            verify_elems++;
+                            if (ulps != 0) {
+                                verify_differing++;
+                                verify_max_ulps = std::max(verify_max_ulps, ulps);
+                            }
+                        }
+                        verify_n++;
+                    }
+                }
+            }
+        }
+#endif
+        if (!merged) {
+            const int64_t t_cpu0 = ggml_time_us();
+            const bool ok = sd_lora_fold::fold_into_tensor(w, data, wglobal, deltas, state->name, n_threads_);
+            us_cpu += ggml_time_us() - t_cpu0;
+            cpu_folded++;
+            if (!ok) {
+                state->lora_fold_declined = true;
+                declined++;
+                continue;
+            }
+        }
+        if (!host) {
+            ggml_backend_tensor_set(w, data, 0, ggml_nbytes(w));
+        }
+        state->folded_lora_epoch = current_lora_epoch_;
+        folded++;
+    }
+
+#ifdef SD_USE_CUDA
+    // Hand back the fold's device scratch (delta buffer + staging). It is cached across
+    // tensors so the pass does not cudaMalloc 1344 times, but keeping it afterwards costs
+    // ~364 MiB of VRAM for the life of the worker -- measured as peak 12513 MiB against a
+    // 12149 MiB base, i.e. the GPU fold gave back less than the CPU fold did, which defeats
+    // half the point. Re-allocating on the next prepare_params is a couple of mallocs.
+    if (gpu_folded > 0) {
+        ggml_cuda_lora_fold_release();
+    }
+#endif
+    if (folded > 0 || declined > 0) {
+        LOG_INFO("lora fold-at-load: merged %zu tensor(s) (%zu on GPU), declined %zu, taking %.2fs",
+                 folded, gpu_folded, declined, (ggml_time_ms() - t0) * 1.0f / 1000);
+        LOG_INFO("lora fold-at-load: delta-build %.2fs | gpu-merge %.2fs | cpu-merge %.2fs (%zu tensors)",
+                 us_delta / 1e6, us_gpu / 1e6, us_cpu / 1e6, cpu_folded);
+        if (verify_n > 0) {
+            LOG_INFO("lora fold-at-load: VERIFY dense gpu-vs-cpu over %zu tensor(s), %zu elements:",
+                     verify_n, verify_elems);
+            LOG_INFO("  max ULP distance %lld  (1 = adjacent representable values, i.e. a rounding tie)",
+                     (long long)verify_max_ulps);
+            LOG_INFO("  differing %zu / %zu (%.4f%%), mean|d| %.3e, max|d| %.3e, max rel %.3e",
+                     verify_differing, verify_elems,
+                     verify_elems ? 100.0 * (double)verify_differing / (double)verify_elems : 0.0,
+                     verify_elems ? verify_sum_abs / (double)verify_elems : 0.0,
+                     verify_max_abs, verify_max_rel);
+        }
+    }
+    return true;
+}
+
 bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states) {
     if (loras_.empty()) {
         return true;
@@ -525,6 +1187,11 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
             continue;
         }
         if (state->applied_lora_epoch == current_lora_epoch_) {
+            continue;
+        }
+        if (state->folded_lora_epoch == current_lora_epoch_) {
+            // Already merged into the params copy; adding it again here would double it.
+            state->applied_lora_epoch = current_lora_epoch_;
             continue;
         }
         if (state->compute_backend == nullptr) {
@@ -610,8 +1277,11 @@ void ModelManager::reset_lora_applied_params() {
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
     for (auto& state : tensor_states_) {
-        state->applied_lora_epoch = UINT64_MAX;
+        state->applied_lora_epoch  = UINT64_MAX;
+        state->folded_lora_epoch   = UINT64_MAX;
+        state->lora_fold_declined  = false;
     }
+    release_fold_loras();
 }
 
 bool ModelManager::should_ignore(const TensorState& state) const {
@@ -999,6 +1669,10 @@ void ModelManager::free_params_storage_block(ParamsStorageBlock& block) {
 
         state->loaded_to_params_backend = false;
         state->applied_lora_epoch       = UINT64_MAX;
+        // The next load re-reads pristine weights from the model file, so any merged
+        // LoRA delta is gone with them.
+        state->folded_lora_epoch  = UINT64_MAX;
+        state->lora_fold_declined = false;
     }
     block.states.clear();
 }
@@ -1049,9 +1723,11 @@ void ModelManager::release_all() {
     for (auto& state : tensor_states_) {
         state->active_prepare_count = 0;
         state->applied_lora_epoch   = UINT64_MAX;
+        state->folded_lora_epoch    = UINT64_MAX;
     }
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
+    release_fold_loras();
 }
 
 bool ModelManager::resolve_required_tensor_states(const std::vector<ggml_tensor*>& tensors,
@@ -1146,6 +1822,13 @@ bool ModelManager::prepare_params(const std::vector<ggml_tensor*>& tensors) {
         return false;
     }
 
+    // Merge before staging: a fold written to a compute staging block would be discarded
+    // the next time that block is rebuilt, which under weight offload is every graph.
+    if (!fold_loras_into_params(required_states)) {
+        release_params_storage_blocks(false);
+        return false;
+    }
+
     if (!stage_tensors_to_compute_backend(required_states)) {
         release_compute_staging_blocks(false);
         release_params_storage_blocks(false);
@@ -1215,7 +1898,10 @@ bool ModelManager::retain_compute_backend_params(const std::vector<ggml_tensor*>
         }
     }
 
+    // Same ordering rule as prepare_params: merge into the params copy BEFORE it is staged,
+    // or a retained resident tensor would be pinned on the GPU without the LoRA in it.
     if (!load_tensors_to_params_backend(required_states) ||
+        !fold_loras_into_params(required_states) ||
         !stage_tensors_to_compute_backend(required_states)) {
         release_compute_staging_blocks(false);
         release_params_storage_blocks(false);
