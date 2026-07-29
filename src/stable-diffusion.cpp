@@ -5851,9 +5851,14 @@ static sd::Tensor<float> ltxav_fit_image_to_canvas(const sd_image_t& image,
         resized_height = std::min<int64_t>(resized_height, height);
     }
 
+    // Bicubic + antialias matches the plugin's torch fallback; its cv2 path uses
+    // INTER_AREA/LANCZOS4. Bilinear without antialias visibly softens a 2848px sheet
+    // being pulled down to a 1280px canvas, and the sheet's detail IS the reference.
     auto resized = sd::ops::interpolate(source,
                                         {resized_width, resized_height, channels, 1},
-                                        sd::ops::InterpolateMode::Bilinear);
+                                        sd::ops::InterpolateMode::Bicubic,
+                                        false,
+                                        true);
     if (resized.empty()) {
         LOG_ERROR("failed to resize LTXAV MSR %s", name);
         return {};
@@ -5939,26 +5944,64 @@ static sd::Tensor<float> build_ltxav_msr_strip(const sd_image_t& background,
         subject_canvases.push_back(std::move(canvas));
     }
 
-    // Slot -1 stays background. Slot 0 is always background: it is pixel frame 0,
-    // which the temporal VAE treats as its own causal anchor.
-    std::vector<int> slot_owner(static_cast<size_t>(latent_slots), -1);
+    // Frame ownership, ported from ComfyUI-Licon-MSR `_expand_frames` /
+    // `_allocate_subject_latent_counts` / `_latent_to_frame_range`. Two details here are
+    // NOT what you would guess and were read from that source rather than inferred:
+    //
+    //   * the subject cursor starts at latent 0, so subject 1 owns pixel frame 0 -- the
+    //     causal anchor -- and the BACKGROUND is what fills the tail slots, not the head;
+    //   * spare slots go to the FIRST subject (up to three) before anyone else gets a
+    //     second, rather than being shared out evenly.
+    //
+    // Background initialises every frame and subjects overwrite their own windows, so any
+    // slot nobody claims stays background for free.
+    std::vector<int> frame_owner(static_cast<size_t>(frames), -1);
     if (subjects_size > 0) {
-        const int64_t available = latent_slots - 1;
-        const int64_t base      = available / subjects_size;
-        const int64_t remainder = available % subjects_size;
-        int64_t slot            = 1;
+        const int64_t budget = std::max<int64_t>(0, latent_slots - 1);
+        std::vector<int64_t> counts(static_cast<size_t>(subjects_size), 1);
+        int64_t extra = budget - subjects_size;
+        if (extra > 0) {
+            counts[0] += 1;
+            extra -= 1;
+        }
+        for (int index = 1; extra > 0 && subjects_size > 1;) {
+            bool any_short = false;
+            for (int i = 1; i < subjects_size; ++i) {
+                if (counts[static_cast<size_t>(i)] < 2) any_short = true;
+            }
+            if (!any_short) break;
+            if (counts[static_cast<size_t>(index)] < 2) {
+                counts[static_cast<size_t>(index)] += 1;
+                extra -= 1;
+            }
+            index = (index + 1 < subjects_size) ? index + 1 : 1;
+        }
+        if (extra > 0 && counts[0] < 3) {
+            counts[0] += 1;
+            extra -= 1;
+        }
+        for (int index = 0; extra > 0; index = (index + 1) % subjects_size) {
+            counts[static_cast<size_t>(index)] += 1;
+            extra -= 1;
+        }
+
+        int64_t cursor = 0;
         for (int i = 0; i < subjects_size; ++i) {
-            const int64_t count = base + (i < remainder ? 1 : 0);
-            for (int64_t n = 0; n < count && slot < latent_slots; ++n, ++slot) {
-                slot_owner[static_cast<size_t>(slot)] = i;
+            const int64_t latent_start = cursor;
+            const int64_t latent_end   = cursor + counts[static_cast<size_t>(i)] - 1;
+            cursor                     = latent_end + 1;
+            const int64_t frame_start  = latent_start <= 0 ? 0 : 1 + (latent_start - 1) * 8;
+            const int64_t frame_end    = latent_end <= 0 ? 0 : latent_end * 8;
+            for (int64_t f = std::max<int64_t>(0, frame_start);
+                 f <= std::min<int64_t>(frames - 1, frame_end); ++f) {
+                frame_owner[static_cast<size_t>(f)] = i;
             }
         }
     }
 
     sd::Tensor<float> strip({width, height, frames, channels, 1});
     for (int frame = 0; frame < frames; ++frame) {
-        const int64_t slot  = frame == 0 ? 0 : (frame - 1) / 8 + 1;
-        const int     owner = slot < latent_slots ? slot_owner[static_cast<size_t>(slot)] : -1;
+        const int owner = frame_owner[static_cast<size_t>(frame)];
         const sd::Tensor<float>& canvas =
             owner >= 0 ? subject_canvases[static_cast<size_t>(owner)] : background_canvas;
         sd::ops::slice_assign(&strip, 2, frame, frame + 1, canvas.unsqueeze(2));
