@@ -41,6 +41,20 @@ struct LtxSegmentBeat {
 // a base64 payload or a trusted absolute path; `source_id` zero means "assign
 // 2, 3, 4, ... in array order", and `match_target` selects resizing to the
 // render bucket instead of keeping the sheet's native resolution.
+// Is this image field a trusted absolute PATH rather than a base64 payload?
+//
+// A leading '/' alone is not enough: base64-encoded JPEG begins "/9j/", so every
+// JPEG handed in as base64 reads as an absolute path and is rejected as an
+// unreadable file. Length settles it -- PATH_MAX is 4096 and a base64 image is
+// orders of magnitude longer -- and no legitimate path can be lost this way.
+//
+// Parse and load MUST agree on this, which is why it lives here rather than in
+// either translation unit.
+inline bool ltx_source_is_path(const std::string& source) {
+    return !source.empty() && source[0] == '/' && source.size() < 4096 &&
+           source.find('\n') == std::string::npos;
+}
+
 struct LtxCharacterRef {
     std::string image;
     int source_id     = 0;

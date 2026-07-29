@@ -726,7 +726,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             const LtxCharacterRef& reference = job.ltx_character_refs[index];
             const int target_width  = reference.match_target ? params.width : 0;
             const int target_height = reference.match_target ? params.height : 0;
-            if (!reference.image.empty() && reference.image[0] == '/') {
+            if (ltx_source_is_path(reference.image)) {
                 sd_image_t loaded = {};
                 if (!load_sd_image_from_file(&loaded, reference.image.c_str(), target_width, target_height, 3)) {
                     error_message = "failed to load LTX character reference " + std::to_string(index + 1);

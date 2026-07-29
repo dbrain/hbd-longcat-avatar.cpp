@@ -707,7 +707,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     }
                     LtxCharacterRef reference;
                     reference.image = entry["image"].get<std::string>();
-                    if (reference.image[0] == '/') {
+                    if (ltx_source_is_path(reference.image)) {
                         std::error_code error;
                         if (!fs::is_regular_file(reference.image, error)) {
                             res.status = 400;
