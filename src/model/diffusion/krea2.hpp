@@ -23,6 +23,112 @@
 namespace Krea2 {
     constexpr int KREA2_GRAPH_SIZE = 65536;
 
+    // ---------------------------------------------------------------------------------------
+    // KREA2_DIT_F16 — run the DiT residual stream (the [features x tokens] hidden state that
+    // flows through `blocks.*`) in F16 instead of F32.
+    //
+    // WHY: at 2048x2048 there are 16,384 image tokens and the sampling peak is the DiT's own
+    // activation working set (~4,000 MB), not the VAE. The SwiGLU dominates it: the
+    // intermediate is [16384, 16384] and SwiGLU materializes gate + up + product, i.e.
+    // 3 x 1,024 MB in F32. Lowering KREA2_MAX_VRAM does NOT help — a graph cut splits the
+    // BLOCK sequence, but every activation inside a segment still spans the full token
+    // sequence (measured: 11 -> 9 -> 7 GiB moved the peak by 2 MiB). Halving the element width
+    // is the only lever that touches those tensors.
+    //
+    // HOW IT IS SAFE: ggml_ext_linear (ggml_extend.hpp) emits an F16 matmul DESTINATION when
+    // the activation is F16 and the weight is NVFP4, because the cuBLASLt FP4 GEMM accumulates
+    // in F32 and stores F16. That GEMM is ALSO the only route in ggml_cuda_mul_mat() that can
+    // consume an F16 activation against a quantized weight at all: for anything else
+    // ggml_backend_cuda_device_supports_op() REJECTS an F16 src1 (ggml-cuda.cu ~5334), and a
+    // rejected DiT Linear is not slow, it is silently dropped to the CPU backend. So this is a
+    // correctness gate, not a perf one — hence the device probe AND the weight-type probe
+    // below rather than a bare env check.
+    //
+    // Value-honouring: `KREA2_DIT_F16=0` must DISABLE it. A presence-only test (getenv() !=
+    // nullptr) would silently keep F16 on for anyone bisecting with an explicit 0.
+    __STATIC_INLINE__ bool krea2_dit_f16_env() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = getenv("KREA2_DIT_F16");
+            v             = (e != nullptr && atoi(e) != 0) ? 1 : 0;
+        }
+        return v == 1;
+    }
+
+    // Device/backend half of the gate: will this backend serve an NVFP4 mul_mat with an F16
+    // activation AND an F16 destination? True only for CUDA + GGML_NVFP4_CUBLASLT=1 +
+    // Blackwell. On the sm86 3060 that the same image is deployed to this is false and the
+    // well-tested F32 stream runs unchanged — there is no F16-Q path there, and an ungated
+    // LTX_DIT_F16 is exactly what crashed a 3060 once already.
+    //
+    // Also refused with a runtime weight adapter attached: LoRA takes
+    // WeightAdapter::forward_with_lora(), whose delta chain runs `x @ A^T @ B^T` against
+    // adapter tensors of unknown type. An F32 adapter weight against an F16 x is precisely the
+    // supports_op rejection above, so the F16 stream would move Linears to the CPU. The
+    // shipping checkpoint (krea2-bf16hold-snofs.gguf) has its LoKr already folded in, so this
+    // only costs the runtime `lora` request field.
+    __STATIC_INLINE__ bool krea2_dit_f16_device_ok(GGMLRunnerContext* ctx) {
+        if (ctx == nullptr || ctx->weight_adapter != nullptr) {
+            return false;
+        }
+        return ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
+    }
+    // ---------------------------------------------------------------------------------------
+
+    // Self-attention for the F16 residual stream: RoPE, then attention, with the two type
+    // normalizations the CUDA kernels actually require.
+    //
+    //   * Q BACK TO F32. Rope::apply_rope keeps F16 end to end (rope-pe.cu is templated on the
+    //     element type and does its math in F32 either way), but ggml's native CUDA flash
+    //     kernels assert Q->type == GGML_TYPE_F32 (fattn-common.cuh:990). Only the Blackwell
+    //     cuDNN SDPA takes an F16 Q, and ggml_cuda_get_best_fattn_kernel() never inspects
+    //     Q->type — so it would happily pick a native kernel and abort mid-render. Normalizing
+    //     Q here makes the F16 stream independent of that selection instead of silently
+    //     depending on it. K/V are unaffected: they are F16 on both streams (the wrapper casts
+    //     them anyway), which is what kv_prescaled_f16 then lets us skip re-doing.
+    //
+    //   * f16_out_ok. Only meaningful under the F16 stream, and deliberately NOT enabled for
+    //     the F32 one even though GGML_CUDNN_ATTN_F16_OUT is set in the service env: Krea2's
+    //     attention output is immediately multiplied by sigmoid(gate(x)), and ggml fuses that
+    //     pair into ggml_cuda_op_unary_mul, which GGML_ASSERTs both operands share a type
+    //     (unary.cu ~592). An F16 attention output against an F32 gate — which is what a
+    //     bare GGML_CUDNN_ATTN_F16_OUT would produce on the F32 stream — aborts the render.
+    //     The caller re-normalizes `out` to F16 for the same reason, since this flag can still
+    //     decline on shape/env grounds.
+    __STATIC_INLINE__ ggml_tensor* krea2_rope_attention(GGMLRunnerContext* ctx,
+                                                        ggml_tensor* q,
+                                                        ggml_tensor* k,
+                                                        ggml_tensor* v,
+                                                        ggml_tensor* pe,
+                                                        ggml_tensor* mask,
+                                                        bool f16_stream) {
+        int64_t n_head = q->ne[1];
+
+        q = Rope::apply_rope(ctx->ggml_ctx, q, pe);  // [N*n_head, L, d_head]
+        k = Rope::apply_rope(ctx->ggml_ctx, k, pe);  // [N*n_kv_head, L, d_head]
+
+        if (q->type != GGML_TYPE_F32) {
+            q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+        }
+
+        // kv_scale stays 1.0, so "prescaled" here just means "already F16" and skips a
+        // redundant full-size ggml_cast of K and V inside the wrapper.
+        const bool kv_prescaled_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+
+        return ggml_ext_attention_ext(ctx->ggml_ctx,
+                                      ctx->backend,
+                                      q,
+                                      k,
+                                      v,
+                                      n_head,
+                                      mask,
+                                      /*skip_reshape=*/true,
+                                      ctx->flash_attn_enabled,
+                                      /*kv_scale=*/1.0f,
+                                      kv_prescaled_f16,
+                                      /*f16_out_ok=*/f16_stream);
+    }
+
     struct Krea2Config {
         int patch_size            = 2;
         int64_t in_channels       = 16;
@@ -216,6 +322,18 @@ namespace Krea2 {
             x          = ggml_mul(ctx->ggml_ctx, up_x, gated);
             return down->forward(ctx, x);
         }
+
+        // See KreaAttention::linears_all_nvfp4().
+        bool linears_all_nvfp4() {
+            for (const char* name : {"gate", "up", "down"}) {
+                auto linear = std::dynamic_pointer_cast<Linear>(blocks[name]);
+                if (linear == nullptr || linear->get_weight() == nullptr ||
+                    linear->get_weight()->type != GGML_TYPE_NVFP4) {
+                    return false;
+                }
+            }
+            return true;
+        }
     };
 
     class KreaAttention : public GGMLBlock {
@@ -236,6 +354,13 @@ namespace Krea2 {
             q          = ggml_reshape_3d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, q), head_dim_ * heads, Lq, N);
             k          = ggml_reshape_3d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, k), head_dim_ * kv_heads, Lk, N);
             v          = ggml_reshape_3d(ctx->ggml_ctx, ggml_cont(ctx->ggml_ctx, v), head_dim_ * kv_heads, Lk, N);
+            // Same Q-must-be-F32 rule as krea2_rope_attention (native CUDA fattn kernels assert
+            // it). Unreachable today — this branch is txtfusion's, which stays F32 — but the
+            // invariant "no fattn kernel ever sees a non-F32 Q" should hold by construction,
+            // not by which caller happens to be F32 this week.
+            if (q->type != GGML_TYPE_F32) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_F32);
+            }
             return ggml_ext_attention_ext(ctx->ggml_ctx,
                                           ctx->backend,
                                           q,
@@ -294,11 +419,43 @@ namespace Krea2 {
             q = qnorm->forward(ctx, q);
             k = knorm->forward(ctx, k);
 
-            auto out = pe != nullptr ? Rope::attention(ctx, q, k, v, pe, mask)
+            // The residual stream's own type IS the mode flag: under KREA2_DIT_F16 `x` arrives
+            // F16, and every Linear here has an NVFP4 weight, so wq/wk/wv/gate all come back
+            // F16 from ggml_ext_linear's F16-dst gate. Deriving it from `x` instead of
+            // plumbing a bool down means the block body cannot desync from the stream.
+            const bool f16_stream = x->type == GGML_TYPE_F16;
+
+            auto out = pe != nullptr ? krea2_rope_attention(ctx, q, k, v, pe, mask, f16_stream)
                                      : attention_no_rope(ctx, q, k, v, mask);
-            out      = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
-            out      = wo->forward(ctx, out);
+
+            // Re-join the stream. `out` is F16 already when GGML_CUDNN_ATTN_F16_OUT is on AND
+            // the shape gate fired; it is F32 when that flag is off, or when flash attention
+            // declined and the manual mul_mat fallback ran (that path always writes F32).
+            // Both must end up F16 here, because the multiply below fuses with the sigmoid
+            // into ggml_cuda_op_unary_mul, which GGML_ASSERTs its two operands share a type —
+            // and gate->forward(x) is F16. A mismatch is an abort, not a slow path.
+            if (f16_stream && out->type != GGML_TYPE_F16) {
+                out = ggml_cast(ctx->ggml_ctx, out, GGML_TYPE_F16);
+            }
+
+            // ⚠️ OPERAND ORDER IS LOAD-BEARING here too, for the same reason as KreaSwiGLU:
+            // the SiLU/sigmoid must be src[1] so the DFS emits UNARY then MUL adjacently.
+            out = ggml_mul(ctx->ggml_ctx, out, ggml_sigmoid(ctx->ggml_ctx, gate->forward(ctx, x)));
+            out = wo->forward(ctx, out);
             return out;
+        }
+
+        // True iff every Linear in this attention carries an NVFP4 weight — i.e. every one of
+        // them can be fed an F16 activation. See Krea2Model::blocks_accept_f16().
+        bool linears_all_nvfp4() {
+            for (const char* name : {"wq", "wk", "wv", "gate", "wo"}) {
+                auto linear = std::dynamic_pointer_cast<Linear>(blocks[name]);
+                if (linear == nullptr || linear->get_weight() == nullptr ||
+                    linear->get_weight()->type != GGML_TYPE_NVFP4) {
+                    return false;
+                }
+            }
+            return true;
         }
     };
 
@@ -522,6 +679,16 @@ namespace Krea2 {
             GGML_ABORT("KreaSingleStreamBlock requires conditioning");
             return nullptr;
         }
+
+        // See KreaAttention::linears_all_nvfp4(). `mod`, `prenorm` and `postnorm` are not
+        // asked about on purpose: they are plain F32 parameter tensors consumed by
+        // rms_norm / binbcast, all of which take an F16 activation against an F32 operand.
+        bool linears_all_nvfp4() {
+            auto attn = std::dynamic_pointer_cast<KreaAttention>(blocks["attn"]);
+            auto mlp  = std::dynamic_pointer_cast<KreaSwiGLU>(blocks["mlp"]);
+            return attn != nullptr && mlp != nullptr &&
+                   attn->linears_all_nvfp4() && mlp->linears_all_nvfp4();
+        }
     };
 
     class KreaTimeMLP : public UnaryBlock {
@@ -620,6 +787,29 @@ namespace Krea2 {
             blocks["last"] = std::make_shared<KreaLastLayer>(this->config);
         }
 
+        // Weight half of the KREA2_DIT_F16 gate: EVERY Linear inside `blocks.*` must be NVFP4,
+        // because the F16 stream is all-or-nothing — a single non-NVFP4 weight on the path is
+        // an F16 src1 that ggml_backend_cuda_device_supports_op() refuses, and ggml_backend_sched
+        // then runs that Linear on the CPU.
+        //
+        // This is NOT hypothetical for Krea2. The shipping checkpoint is
+        // krea2-bf16hold-snofs.gguf — "bf16 holdouts" — and it really does keep 5 weights in
+        // BF16: tmlp.0, tmlp.2, tproj.1, txtmlp.1, txtmlp.3. All five sit OUTSIDE the block
+        // stack (timestep/text projection), which is exactly why the F16 region below starts
+        // after `first` and after `txtmlp`, and ends before `last` (both of which are F32
+        // weights in that same checkpoint). Verified per-tensor: all 224 block Linears
+        // (28 x {wq,wk,wv,gate,wo,mlp.gate,mlp.up,mlp.down}) are NVFP4. A future re-quant that
+        // holds one of them back turns the stream off here rather than falling off a cliff.
+        bool blocks_accept_f16() {
+            for (int i = 0; i < config.layers; ++i) {
+                auto block = std::dynamic_pointer_cast<KreaSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
+                if (block == nullptr || !block->linears_all_nvfp4()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* timestep,
@@ -650,6 +840,35 @@ namespace Krea2 {
             int64_t ref_len = img->ne[1] - img_len;
             img             = first->forward(ctx, img);
 
+            // KREA2_DIT_F16: enter the F16 residual stream.
+            //
+            // The cast is AFTER `first`, not before it: first.weight is F32 in the shipping
+            // checkpoint, and an F16 activation against an F32 weight is the supports_op
+            // rejection described on blocks_accept_f16() — it would move the patch embed to
+            // the CPU. Same reasoning at the other end: `last.linear.weight` is F32 too, so
+            // the stream leaves F16 before the head.
+            //
+            // txt is cast separately rather than casting the concat, so the [features x
+            // tokens] F32 concat buffer is never materialized: img is ~16,384 tokens at
+            // 2048x2048 and txt is a few hundred, so this trades one 384 MB F32 intermediate
+            // for a 192 MB F16 one.
+            const bool dit_f16 = krea2_dit_f16_env() && krea2_dit_f16_device_ok(ctx) && blocks_accept_f16();
+            if (dit_f16) {
+                img = ggml_cast(ctx->ggml_ctx, img, GGML_TYPE_F16);
+            }
+            // graph_build runs once per sampler step, so log the DECISION, not every build.
+            // Worth logging at all because every way this gate can decline (wrong card, LoRA
+            // attached, GGML_NVFP4_CUBLASLT unset, a re-quant that held a block weight back)
+            // is silent otherwise — the render just stays at the F32 VRAM peak.
+            {
+                static int logged = -1;
+                const int decision = dit_f16 ? 1 : 0;
+                if (logged != decision) {
+                    logged = decision;
+                    LOG_INFO("krea2: DiT residual stream = %s", dit_f16 ? "F16 (KREA2_DIT_F16)" : "F32");
+                }
+            }
+
             auto t    = ggml_ext_timestep_embedding(ctx->ggml_ctx, timestep, static_cast<int>(config.timestep_dim), 10000, 1000.f);
             t         = tmlp->forward(ctx, t);
             t         = ggml_reshape_3d(ctx->ggml_ctx, t, t->ne[0], 1, t->ne[1]);
@@ -665,10 +884,27 @@ namespace Krea2 {
                 tvec_0          = tproj->forward(ctx, t_0);
             }
 
+            // txtfusion (2 layerwise + 2 refiner blocks at width 2560) deliberately stays F32.
+            // Its Linears ARE NVFP4, so it COULD run F16 — but it is not worth the risk:
+            //   * it is not where the memory is. It runs on text tokens (a few hundred) x 12
+            //     encoder layers, at width 2560 with a 6912 intermediate. That working set is
+            //     ~2 orders of magnitude below the image stack's, which is the whole problem.
+            //   * its consumer forces F32 anyway: txtmlp.1 / txtmlp.3 are BF16 in the shipping
+            //     checkpoint, so txtfusion's output has to be F32 by the time it gets there.
+            //     Running the middle in F16 would buy nothing and add two casts.
+            //   * `projector` is a Linear(12 -> 1) applied across a permuted layer axis — a
+            //     12-element reduction where F16 rounding is proportionally worst, feeding
+            //     every downstream token. Bad place to spend precision for no VRAM.
             auto txt        = txtfusion->forward(ctx, context);
             txt             = txtmlp->forward(ctx, txt);
             int64_t txt_len = txt->ne[1];
 
+            if (dit_f16) {
+                txt = ggml_cast(ctx->ggml_ctx, txt, GGML_TYPE_F16);
+            }
+
+            // ggml_concat requires src0->type == src1->type == dst->type (concat.cu:287), so
+            // both halves must have been cast by here.
             auto hidden_states = ggml_concat(ctx->ggml_ctx, txt, img, 1);
             int64_t ref_start  = hidden_states->ne[1] - ref_len;
             for (int i = 0; i < config.layers; ++i) {
@@ -678,6 +914,14 @@ namespace Krea2 {
             }
 
             hidden_states = ggml_ext_slice(ctx->ggml_ctx, hidden_states, 1, txt_len, txt_len + img_len);
+            // Leave the F16 stream before the head. Cast AFTER the slice, so only the image
+            // tokens pay for it, and the text and ref tokens are dropped while still half
+            // width. KreaLastLayer is F32 throughout: last.norm is an RMSNorm whose output
+            // feeds Flux::modulate, and last.linear.weight is an F32 tensor that would refuse
+            // an F16 activation outright. The sampler and VAE downstream want F32 anyway.
+            if (dit_f16 && hidden_states->type != GGML_TYPE_F32) {
+                hidden_states = ggml_cast(ctx->ggml_ctx, hidden_states, GGML_TYPE_F32);
+            }
             hidden_states = last->forward(ctx, hidden_states, t);
             hidden_states = DiT::unpatchify_and_crop(ctx->ggml_ctx, hidden_states, H, W, config.patch_size, config.patch_size, true);
             return hidden_states;
