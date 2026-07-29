@@ -781,9 +781,15 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
         supervisor.proxy(request, response, WorkerSupervisor::request_model(request));
     };
 
-    server.set_pre_routing_handler([&admin_drain, &admin_load, &admin_unload, &ltx_delete_job,
-                                    &proxy_request](const httplib::Request& request,
-                                                    httplib::Response& response) {
+    // Capture the handlers BY VALUE. This function only registers and returns —
+    // listen() happens later in main.cpp — so the lambdas above are dead by the time
+    // any request arrives. The route table is safe because httplib copies each
+    // handler it is given; the pre-routing hook has to copy them too. Capturing them
+    // by reference here crashed the supervisor on the first bodyless request. Each
+    // copy still holds &supervisor, which is caller-owned and outlives the server.
+    server.set_pre_routing_handler([admin_drain, admin_load, admin_unload, ltx_delete_job,
+                                    proxy_request](const httplib::Request& request,
+                                                   httplib::Response& response) {
         std::string origin = request.get_header_value("Origin");
         if (origin.empty()) origin = "*";
         response.set_header("Access-Control-Allow-Origin", origin);
