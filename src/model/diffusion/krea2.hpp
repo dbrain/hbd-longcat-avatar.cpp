@@ -1262,6 +1262,28 @@ namespace Krea2 {
             return "krea2";
         }
 
+        // THE OTHER WAY THE TEXT CACHE CAN GO STALE. `cache_identity()` covers the adapter, but
+        // the txtfusion/txtmlp WEIGHTS can change under a live runner too:
+        // sd_ctx_swap_diffusion_model (stable-diffusion.cpp:807) switches the DiT variant IN
+        // PROCESS — it keeps this same Krea2Runner and reloads its params, calling
+        // `diffusion_model->runner_done()` on the way through. So runner_done is exactly the
+        // "your parameters are no longer what you computed against" signal, and dropping the
+        // cache here makes a variant switch safe by construction rather than by remembering.
+        //
+        // Cheap: krea2's own compute() passes auto_free=false, so this is NOT called per render
+        // or per sampling step (measured: one `text branch computed` per render, not ten). It
+        // fires on swap and on unload, which is precisely when the entries are worthless.
+        void runner_done() override {
+            for (auto& entry : txt_cache) {
+                entry.key = 0;
+                entry.txt = {};
+            }
+            txt_cache_next = 0;
+            pe_key         = 0;
+            pe_vec.clear();
+            GGMLRunner::runner_done();
+        }
+
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
             model.get_param_tensors(tensors, prefix);
         }
@@ -1319,17 +1341,44 @@ namespace Krea2 {
         // empty conditioning TENSOR — the encoder still emits a full-length embedding of the
         // empty string — so the common t2i case takes the normal cached path, and at cfg 1.0
         // there is one conditioning, hence one text pass and nine hits per 10-step render.
+        //
+        // ⚠️⚠️ THE ADAPTER IS PART OF THE KEY, AND MUST STAY PART OF THE KEY. The text branch is
+        // pure in the CONDITIONING, but it is NOT pure in the model: 32 of a 256-module
+        // identity-edit LoRA are inside txtfusion (e.g.
+        // `...txtfusion.refiner_blocks.0.attn.wq.weight.lora_up`). Keyed on the conditioning
+        // alone, a worker that renders `no-lora` first and `restage` second serves the
+        // NO-ADAPTER text into the adapter render — the adapter is silently partly disabled and
+        // the image still looks plausible. That is exactly what shipped in cee21b4 and what this
+        // key fixes. Any future cache in this file whose value can be touched by a patched
+        // weight must key on WeightAdapter::cache_identity() the same way.
+        //
+        // An adapter that cannot identify itself returns 0 and we DO NOT CACHE AT ALL — losing
+        // the optimisation is the correct failure, not serving a stale entry.
         const sd::Tensor<float>* get_or_build_txt(int n_threads, const sd::Tensor<float>& context_tensor) {
             static const bool enabled = krea2_env_flag("KREA2_TXT_CACHE", true);
             if (!enabled || context_tensor.empty()) {
                 return nullptr;
             }
+            // "No adapter" needs its own constant: it must differ from every real adapter AND
+            // from the 0 that means "unidentifiable", so absence can be cached but unknown
+            // cannot.
+            constexpr uint64_t KREA2_TXT_NO_ADAPTER = 0x6b7265613274786eull;  // "krea2txn"
+            uint64_t adapter_id                     = KREA2_TXT_NO_ADAPTER;
+            if (weight_adapter != nullptr) {
+                adapter_id = weight_adapter->cache_identity();
+                if (adapter_id == 0) {
+                    LOG_DEBUG("krea2: adapter has no cache identity; text branch stays in-graph");
+                    return nullptr;
+                }
+            }
+
             uint64_t key = krea2_bulk_hash(context_tensor.data(),
                                            static_cast<size_t>(context_tensor.numel()) * sizeof(float));
             key          = krea2_fnv1a_val(key, static_cast<uint64_t>(context_tensor.dim()));
             for (int64_t d : context_tensor.shape()) {
                 key = krea2_fnv1a_val(key, d);
             }
+            key = krea2_fnv1a_val(key, adapter_id);
             if (key == 0) {
                 key = 1;
             }

@@ -1,7 +1,10 @@
 #ifndef __SD_MODEL_ADAPTER_LORA_HPP__
 #define __SD_MODEL_ADAPTER_LORA_HPP__
 
+#include <algorithm>
 #include <mutex>
+#include <string>
+#include <vector>
 #include "core/ggml_extend.hpp"
 #include "model_loader.h"
 #include "model_manager.h"
@@ -969,6 +972,80 @@ public:
         }
         // An adapter that has not loaded its tensors yet must not be waved through.
         return saw_any;
+    }
+
+    // See WeightAdapter::cache_identity(). Identifies WHICH adapters are attached and with what
+    // strength, for callers caching an adapter-dependent subgraph across renders.
+    //
+    // Keyed on WHAT the adapter is, not WHERE its bytes happen to live this request:
+    //   * file_path + lora_id     which adapter, and under which request-level name
+    //   * multiplier (raw bits)   strength; 0.0 and 1.0 are genuinely different results
+    //   * every tensor's name, type and ne[0..3], in SORTED name order because lora_tensors is
+    //     an unordered_map whose iteration order is not stable across rehashes.
+    //
+    // ⚠️ `t->data` is deliberately NOT hashed, and this is load-bearing rather than an omission.
+    // apply_loras_at_runtime CLEARS AND RELOADS runtime_lora_models on every img_gen, so the
+    // tensor allocations are fresh each request: hashing the pointers made this identity change
+    // every render, which turned every cache lookup into a miss and silently reverted the whole
+    // optimisation (MEASURED: 3 text-branch computes across 3 identical renders instead of 1).
+    // The identity must be stable for the same adapter file at the same strength, and it is the
+    // file path + tensor-set shape that carry that. A file mutated on disk mid-process under an
+    // unchanged path is the one case this cannot see; it is not a mode this service has.
+    //
+    // Cost is a few thousand short string hashes once per render, against a text branch worth
+    // ~2.5 TFLOP.
+    //
+    // Returns 0 ("do not cache") if ANY attached model is still loading or failed, because an
+    // adapter whose tensors are not resident yet would otherwise hash as a stable identity and
+    // then change underneath the entry.
+    uint64_t cache_identity() const override {
+        uint64_t h    = 1469598103934665603ull;
+        auto mix_bytes = [&h](const void* data, size_t bytes) {
+            const auto* p = static_cast<const unsigned char*>(data);
+            for (size_t i = 0; i < bytes; ++i) {
+                h = (h ^ p[i]) * 1099511628211ull;
+            }
+        };
+        auto mix_str = [&](const std::string& s) {
+            mix_bytes(s.data(), s.size());
+            const unsigned char sep = 0x1f;  // keep "ab"+"c" from colliding with "a"+"bc"
+            mix_bytes(&sep, 1);
+        };
+
+        const uint64_t n_models = lora_models.size();
+        mix_bytes(&n_models, sizeof(n_models));
+        for (const auto& lora_model : lora_models) {
+            if (lora_model == nullptr || lora_model->load_failed || lora_model->lora_tensors.empty()) {
+                return 0;  // unidentifiable right now -> caller must not cache
+            }
+            mix_str(lora_model->file_path);
+            mix_str(lora_model->lora_id);
+            mix_bytes(&lora_model->multiplier, sizeof(lora_model->multiplier));
+
+            std::vector<const std::string*> names;
+            names.reserve(lora_model->lora_tensors.size());
+            for (const auto& kv : lora_model->lora_tensors) {
+                names.push_back(&kv.first);
+            }
+            std::sort(names.begin(), names.end(),
+                      [](const std::string* a, const std::string* b) { return *a < *b; });
+            const uint64_t n_tensors = names.size();
+            mix_bytes(&n_tensors, sizeof(n_tensors));
+            for (const std::string* name : names) {
+                mix_str(*name);
+                const ggml_tensor* t = lora_model->lora_tensors.at(*name);
+                if (t == nullptr) {
+                    return 0;
+                }
+                const int type = static_cast<int>(t->type);
+                mix_bytes(&type, sizeof(type));
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    mix_bytes(&t->ne[d], sizeof(t->ne[d]));
+                }
+            }
+        }
+        // 0 is the "do not cache" sentinel, so a real identity must never be 0.
+        return h == 0 ? 1 : h;
     }
 
     ggml_tensor* patch_weight(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* weight, const std::string& weight_name, bool with_lora_and_lokr) {
