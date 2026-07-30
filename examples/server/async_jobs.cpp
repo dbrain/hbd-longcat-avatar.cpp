@@ -585,6 +585,10 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     // job state so queued requests cannot inherit a previous worker setting.
     params.v2v_mode = job.ltx_v2v_mode;
     params.relip_ref_tstride = std::max(1, job.ltx_relip_ref_tstride);
+    // Opt-in reference head-frame trim (0 off / -1 auto / >0 explicit). Durable job state for the
+    // same reason the seam policy is: a queued request must render under the contract it was
+    // staged with, not under whatever the worker happens to default to.
+    params.reference_head_trim = job.ltx_reference_head_trim;
     std::vector<sd_hires_params_t> ltx_hires_chain;
     if (!job.ltx_hires_stages.empty()) {
         ltx_hires_chain.reserve(job.ltx_hires_stages.size());
@@ -929,6 +933,9 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.segment_seeds = job.ltx_segment_seeds.empty() ? nullptr : job.ltx_segment_seeds.data();
             chain.segment_steps = job.ltx_segment_steps.empty() ? nullptr : job.ltx_segment_steps.data();
             chain.segment_cfg   = job.ltx_segment_cfg.empty() ? nullptr : job.ltx_segment_cfg.data();
+            chain.segment_reference_head_trim = job.ltx_segment_reference_head_trim.empty()
+                                                    ? nullptr
+                                                    : job.ltx_segment_reference_head_trim.data();
             chain.retake_segment = job.ltx_retake_segment;
             chain.enable_retake = job.ltx_retake_segment >= 0;
             chain.cont_seam_drop_frames = job.ltx_cont_seam_drop_frames;

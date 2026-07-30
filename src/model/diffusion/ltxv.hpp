@@ -860,6 +860,66 @@ namespace LTXV {
     //
     // 1.0 is an EXACT no-op: the scale node is not emitted at all, so the untagged
     // graph stays bit-identical to a build without this knob.
+    // Fold factor for the reference-bias mask: how many mask rows each query frame gets.
+    //
+    // This is a pure COST knob -- every row of a frame carries the same bias, so any divisor is
+    // numerically identical. It trades mask size against kernel shape, and the shape is what
+    // matters: m = 1 leaves `tokens_per_frame` broadcast query-heads (880 at 1280x704), which
+    // MEASURED 2x slower than no mask at all. Picking m so the broadcast lands near 64 costs a few
+    // MB of mask and gives the kernel something it likes.
+    //
+    // `m` must divide tokens_per_frame, so this walks the divisors rather than guessing.
+    inline int64_t ltxav_reference_mask_fold(int64_t tokens_per_frame) {
+        if (const char* raw = getenv("LTX_REF_MASK_FOLD"); raw != nullptr && *raw != '\0') {
+            const long forced = std::strtol(raw, nullptr, 10);
+            if (forced > 0 && tokens_per_frame % forced == 0) {
+                return forced;
+            }
+            LOG_WARN("LTX_REF_MASK_FOLD=%s does not divide %lld tokens per frame; auto-selecting",
+                     raw, (long long)tokens_per_frame);
+        }
+        constexpr int64_t kTargetBroadcast = 64;
+        int64_t best = 1;
+        for (int64_t m = 1; m <= tokens_per_frame; ++m) {
+            if (tokens_per_frame % m != 0) {
+                continue;
+            }
+            best = m;
+            if (tokens_per_frame / m <= kTargetBroadcast) {
+                break;
+            }
+        }
+        return best;
+    }
+
+    // How hard the TASS reference block bites: LTX-2's IC-LoRA `conditioning_attention_strength`.
+    // Implemented with its real semantics -- an additive log(strength) bias on the reference KEYS,
+    // PRE-SOFTMAX -- so reducing it hands the reference's attention mass back to the target rather
+    // than merely fading the reference out. See `ref_strength_bias_vec` for how it is made cheap.
+    //
+    // Useful because reference influence is currently all-or-nothing. Measured earlier: a
+    // reference taking 39.5% of the sequence CAPTURES the shot's framing while 11.8% is clean, and
+    // the only remedies available today are fewer references, longer shots or a bigger render --
+    // all of which change the shot rather than the reference. This turns it down instead.
+    //
+    // 1.0 is an EXACT no-op: no node is emitted, so the graph stays bit-identical without it.
+    inline float ltxav_reference_strength() {
+        static const float strength = [] {
+            const char* raw = getenv("LTX_REF_STRENGTH");
+            if (raw == nullptr || *raw == '\0') {
+                return 1.f;
+            }
+            const float parsed = std::strtof(raw, nullptr);
+            if (!(parsed >= 0.f)) {
+                LOG_WARN("LTX_REF_STRENGTH=%s is negative; ignoring", raw);
+                return 1.f;
+            }
+            LOG_INFO("LTX_REF_STRENGTH=%.3f (TASS reference contribution)", parsed);
+            return parsed;
+        }();
+        return strength;
+    }
+
     inline float ltxv_video_self_attn_temp() {
         static const float temp = [] {
             const char* raw = getenv("LTX_TASS_VSELF_TEMP");
@@ -2339,6 +2399,11 @@ namespace LTXV {
                                                       // passed, so the graph is unchanged unless
                                                       // LTX_RELAY_SELF_MASK is set.
                                                       ggml_tensor* v_self_mask_seed = nullptr,
+                                                      // TASS reference-strength bias: [L_k, 1] F16,
+                                                      // zero on target keys and log(strength) on
+                                                      // the reference block's. Null = no-op.
+                                                      ggml_tensor* ref_strength_mask = nullptr,
+                                                      int64_t ref_strength_fold      = 1,
                                                       // LTX_RELAY_SEGMENT_MERGE. Null unless the
                                                       // env gate is set AND the split fits under
                                                       // LTX_RELAY_SEGMENT_MAX; when it is non-null
@@ -2591,6 +2656,37 @@ namespace LTXV {
                 }
             }
 
+            // BACKEND PROBE for the reference-strength bias, mirroring what the relay does for its
+            // identical folded path. `ltx_folded_self_attention` calls ggml_flash_attn_ext with no
+            // fallback, so a backend that rejects this shape does not degrade gracefully -- the
+            // relay's own comment records that a rejection lands in a ~19 GiB KQ allocation. The
+            // >= 64 row floor is the relay's too. On rejection we drop the BIAS, never the render:
+            // the reference simply keeps full strength.
+            bool ref_strength_fold_ok = false;
+            if (ref_strength_mask != nullptr) {
+                const int64_t probe_rows = ref_strength_mask->ne[1];
+                ref_strength_fold_ok     = probe_rows >= 64;
+                if (ref_strength_fold_ok) {
+                    const int64_t d_head = config.attention_head_dim;
+                    const int64_t n_head = config.num_attention_heads;
+                    const int64_t L_k    = ref_strength_mask->ne[0];
+                    auto probe_q = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F32, d_head, probe_rows,
+                                                      (width * height) / ref_strength_fold, n_head);
+                    auto probe_k = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F16, d_head, L_k, 1, n_head);
+                    auto probe_m = ggml_new_tensor_4d(ctx->ggml_ctx, GGML_TYPE_F16, L_k, probe_rows, 1, 1);
+                    auto probe   = ggml_flash_attn_ext(ctx->ggml_ctx, probe_q, probe_k, probe_k, probe_m,
+                                                       1.f / std::sqrt((float)d_head), 0.f, 0.f);
+                    ggml_flash_attn_ext_set_prec(probe, GGML_PREC_F32);
+                    ref_strength_fold_ok = ctx->flash_attn_enabled &&
+                                           ggml_backend_supports_op(ctx->backend, probe);
+                }
+                if (!ref_strength_fold_ok) {
+                    LOG_WARN("LTX_REF_STRENGTH ignored: backend rejects the folded attention shape "
+                             "(rows=%lld, needs >= 64 and flash-attn). Reference keeps full strength.",
+                             (long long)probe_rows);
+                }
+            }
+
             for (int i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<BasicAVTransformerBlock>(blocks["transformer_blocks." + std::to_string(i)]);
                 ggml_tensor* v_self_mask = nullptr;
@@ -2612,6 +2708,13 @@ namespace LTXV {
                                                          v_self_mask_seed,
                                                          width * height,
                                                          vx->ne[1] - target_tokens);
+                } else if (ref_strength_mask != nullptr && ref_strength_fold_ok) {
+                    // Already [L_k, frames * fold], built once outside the block loop.
+                    v_self_fold.mask             = ref_strength_mask;
+                    v_self_fold.fold             = ref_strength_fold;
+                    v_self_fold.tokens_per_frame = width * height;
+                    v_self_fold.frames           = frames;
+                    v_self_fold.target_tokens    = target_tokens;
                 }
                 auto out   = block->forward(ctx,
                                             vx,
@@ -2711,6 +2814,18 @@ namespace LTXV {
         // Keyed on latent frames rather than a token count: the dense mask this
         // seeds is derived, so the seed is invariant across spatial resolution.
         std::vector<ggml_fp16_t> relay_self_bias_vec;
+        // TASS reference-strength bias, PRE-SOFTMAX. One F16 per key: zero for the target's keys
+        // and log(strength) for the reference block's, so the softmax weight on every reference
+        // key is multiplied by `strength` and the mass it loses is redistributed across the
+        // target's own keys. That redistribution is what makes this the real
+        // `conditioning_attention_strength` rather than a post-softmax attenuation.
+        //
+        // It rides the RELAY'S FOLDED-MASK PATH with fold m = 1, which is what makes it
+        // affordable: the kernel then sees `rows = latent frames` queries instead of L, so the
+        // mask is [L_k, frames] -- ~1.7 MiB at 13k tokens -- rather than the [L_k, L] dense form,
+        // which is ~350 MB and is re-uploaded per step. The bias depends only on the KEY index, so
+        // every query row is identical and the fold costs nothing in accuracy.
+        std::vector<ggml_fp16_t> ref_strength_bias_vec;
         std::pair<uint64_t, int64_t> relay_self_key{0, 0};
         // LTX_RELAY_SEGMENT_MERGE: the key-frame cuts and the [F_q, n_seg] F32 segment bias,
         // cached against the same {revision, frames} key as the mask above. The extra
@@ -3212,6 +3327,49 @@ namespace LTXV {
                 }
             }
 
+            // TASS reference-strength bias. Built only when there IS a reference block and the
+            // strength is off its no-op, and only when the relay is not already driving the video
+            // self-attention -- the two would otherwise both claim `SelfAttnPlan`, and the relay's
+            // bias is per-frame-pair where this one is per-key, so they cannot simply be added
+            // without deciding whose fold factor wins. The relay keeps priority; a render asking
+            // for both logs and takes the relay.
+            ggml_tensor* ref_strength_mask = nullptr;
+            int64_t ref_strength_fold      = 1;
+            const float ref_strength       = ltxav_reference_strength();
+            if (ref_token_count > 0 && ref_strength != 1.f) {
+                const int64_t frames           = vx->ne[2];
+                const int64_t tokens_per_frame = vx->ne[0] * vx->ne[1];
+                const int64_t L_k              = tokens_per_frame * frames + ref_token_count;
+                const int64_t target           = L_k - ref_token_count;
+                ref_strength_fold              = ltxav_reference_mask_fold(tokens_per_frame);
+                // log(0) is -inf, the additive identity for "cannot attend". It is clamped, and
+                // the clamp VALUE matters: -1e4 produced pure garbage in the suppressed frame even
+                // though it is representable in F16. exp(-30) is ~1e-13, which is zero for every
+                // practical purpose while staying in the range the kernel's accumulation handles,
+                // and it is what the usual masking convention uses. Do not make this more extreme.
+                auto to_bias = [](float s) { return s > 0.f ? std::max(std::log(s), -30.f) : -30.f; };
+
+                // ONE key-row, uploaded and repeated ON DEVICE: the host sends L_k halves (~26 KB)
+                // rather than the whole mask (~5 MB), and the earlier attention-mask work measured
+                // re-upload as the dominant cost.
+                ref_strength_bias_vec.assign(static_cast<size_t>(L_k), ggml_fp32_to_fp16(0.f));
+                for (int64_t i = target; i < L_k; ++i) {
+                    ref_strength_bias_vec[static_cast<size_t>(i)] = ggml_fp32_to_fp16(to_bias(ref_strength));
+                }
+                auto key_row = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F16, L_k, 1);
+                ggml_set_name(key_row, "ltxav_ref_strength_row");
+                set_backend_tensor_data(key_row, ref_strength_bias_vec.data());
+                ref_strength_mask = ggml_repeat_4d(compute_ctx, key_row, L_k, frames * ref_strength_fold, 1, 1);
+                LOG_INFO("ltxav reference strength %.3f, fold m=%lld -> "
+                         "mask [%lld,%lld] F16 (%.2f MiB), %lld broadcast query-heads",
+                         ref_strength,
+                         (long long)ref_strength_fold,
+                         (long long)L_k,
+                         (long long)(frames * ref_strength_fold),
+                         (double)L_k * (double)(frames * ref_strength_fold) * sizeof(ggml_fp16_t) / 1048576.0,
+                         (long long)(tokens_per_frame / ref_strength_fold));
+            }
+
             // LTX_RELAY_SEGMENT_MERGE -- the MASK-FREE form of the same bias.
             //
             // Built INDEPENDENTLY of the dense-mask refusal above: the whole point is that no
@@ -3303,6 +3461,8 @@ namespace LTXV {
                                             v_connector_mask,
                                             a_connector_mask,
                                             v_self_mask_seed,
+                                            ref_strength_mask,
+                                            ref_strength_fold,
                                             v_self_segments.bias != nullptr ? &v_self_segments : nullptr);
             auto out        = merge_av_latents(compute_ctx, out_pair.first, out_pair.second);
             ggml_build_forward_expand(gf, out);

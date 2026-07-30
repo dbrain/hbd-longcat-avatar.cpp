@@ -1313,6 +1313,60 @@ still requires the rest of its preconditions — no i2v/keyframe/continuation gu
 V2V, and either fixed (driving) audio or an audio-free model, since jointly generated
 audio cannot be tiled across video windows.
 
+#### `reference_head_trim` — dropping the reference out of frame 0
+
+A TASS reference sits at the target's **latent frame 0** RoPE address, and on some
+checkpoints the decoder hands that address straight back: the opening pixel frame of a
+bare **t2v** shot renders the reference verbatim. With a location plate in the reference
+set, frame 0 is the empty plate (which reads as "the subject never appears"); with only a
+character sheet, frame 0 is that sheet's own source photo, background and all.
+
+`reference_head_trim` is an opt-in, request-level (and per-segment) integer that drops the
+contaminated head frames from a shot's decoded output:
+
+| value | meaning |
+| --- | --- |
+| `0` (default) | **off** — byte-identical to a request that never sent the field |
+| `-1` | **auto** — the engine derives the amount itself |
+| `1..512` | trim exactly that many pixel frames |
+
+```json
+{
+  "reference_head_trim": -1,
+  "segments": [
+    { "prompt": "ref_t2v: ...", "reference_head_trim": -1 },
+    { "prompt": "...", "reference_head_trim": 0 }
+  ]
+}
+```
+
+A `reference_head_trim` on a segment object overrides the request-level value for that
+shot, including an explicit `0` ("off here"). A segment that omits the key inherits.
+
+**Never compute the amount yourself.** Auto is `1 + 8*(K-1)` pixel frames, where `K` is the
+largest reference's *latent* frame count — for stills (`K == 1`) exactly **one** pixel
+frame — and the engine reads `K` off the references it actually encoded for that shot.
+Reference *count* does not change it: every reference is given the same latent-frame
+origin, and latent frame 0 is the only latent frame that decodes to a single pixel frame.
+
+The trim **self-gates to a no-op** on any shot that already pins frame 0 — an i2v
+`init_image`, a keyframe at index `0`, or a continuation segment — and on any shot that
+carries no references in scope. i2v and continuation shots were measured not to leak. Each
+gate logs a line naming the reason, so `auto` is safe to leave on for a whole project: only
+a bare t2v shot that actually carries references is affected.
+
+The shot is **trimmed, not re-rendered**: it returns `N - trim` frames. Rendering the
+frames back is not offered, because LTX requires `frames % 8 == 1` and the smallest legal
+increase is a whole latent frame (8 pixel frames). A matching `trim / fps` seconds is cut
+off the **head of the output audio** so A/V stays frame-exact; the pre-render drive-audio
+window is untouched. The durable bank keeps the shot as rendered — `seg_<n>.bin` is the
+full latent and `seg_<n>.len` records the kept length — so a resume or retake reproduces
+the same cut.
+
+Whether you want this is a property of the **checkpoint**, which is why it is not
+automatic: `echo-e50` leaks and wants `auto`; `msr-v2` and `echo-full` do not leak and
+should leave it off.
+
 Set `persist:true` on a new LTX request to store its bank under `$LTX_PERSIST_DIR`
 (default `/var/lib/ltx-video/persist`) instead of the FIFO `$LTX_JOB_DIR`; resumes
 and V2V job references search both roots. `DELETE /ltx/v1/job?id=<engine-job-id>`

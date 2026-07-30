@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
+#include <thread>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <set>
@@ -4281,6 +4284,9 @@ void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params) {
     sd_vid_gen_params->msr_frames                            = 0;
     sd_vid_gen_params->msr_segments                          = nullptr;
     sd_vid_gen_params->msr_segments_size                     = 0;
+    // OFF. The trim is checkpoint-specific (echo-e50 leaks, msr-v2 and echo-full do
+    // not), so it is opt-in and an untouched params block renders exactly as before.
+    sd_vid_gen_params->reference_head_trim                   = 0;
     sd_vid_gen_params->beats                                 = nullptr;
     sd_vid_gen_params->beat_count                            = 0;
     sd_vid_gen_params->relay_eps                             = 0.f;
@@ -5104,6 +5110,153 @@ static float ltxv_latent_corner_to_pixel_frame(int64_t corner_index,
     return pixel_t;
 }
 
+// ── REFERENCE HEAD-FRAME TRIM ────────────────────────────────────────────────────────────────
+//
+// The LTX VAE's temporal stride. `build_ltxv_tass_ref_video_positions` places every reference on
+// the causal grid with this same scale, which is what makes the contaminated run derivable rather
+// than a magic number.
+static constexpr int kLtxvTemporalScale = 8;
+// A caller cannot ask for an unbounded trim. This is deliberately generous -- it only has to catch
+// a units mistake (milliseconds, samples, a whole clip length) before it reaches the frame loop;
+// the real bound is the shot's own length, applied in ltxv_resolve_reference_head_trim().
+static constexpr int kLtxvMaxReferenceHeadTrim = 512;
+
+// Resolve sd_vid_gen_params_t::reference_head_trim for ONE rendered shot: AUTO derivation,
+// self-gating, and the upper bound. Returns the number of PIXEL frames to drop off the head, or
+// zero for "leave this shot exactly as it rendered".
+//
+// The AUTO derivation lives here, and nowhere else, so no caller ever hard-codes 1 + 8*(K-1).
+// K is read off the reference grids the encode path ACTUALLY built, not off the request: a shot
+// that scoped every reference out has no grids and therefore no trim.
+static int ltxv_resolve_reference_head_trim(const sd_vid_gen_params_t* params,
+                                            const ImageGenerationLatents& latents,
+                                            bool is_ltxav,
+                                            int frame_count) {
+    if (params == nullptr || params->reference_head_trim == 0 || frame_count <= 0) {
+        return 0;
+    }
+    if (params->reference_head_trim < -1 || params->reference_head_trim > kLtxvMaxReferenceHeadTrim) {
+        LOG_WARN("reference_head_trim=%d is out of range [-1, %d]; treating it as OFF",
+                 params->reference_head_trim, kLtxvMaxReferenceHeadTrim);
+        return 0;
+    }
+    if (!is_ltxav) {
+        LOG_WARN("reference_head_trim is an LTXAV TASS-reference control; ignoring it on this model");
+        return 0;
+    }
+    // No references encoded == nothing sitting at latent frame 0's address == nothing to trim.
+    // This is the state a shot that scoped every sheet out arrives in, so it is a silent no-op
+    // at DEBUG rather than a warning.
+    if (latents.ref_grids.empty()) {
+        LOG_DEBUG("reference head trim: no TASS references on this shot; nothing to trim");
+        return 0;
+    }
+    // SELF-GATES. Every one of these already pins pixel frame 0 with real content, and i2v and
+    // continuation shots were measured NOT to leak. Trimming them would silently shorten a shot
+    // for no reason, so the gate is the engine's job and not the caller's.
+    const char* gate = nullptr;
+    if (params->init_image.data != nullptr) {
+        gate = "an i2v init image pins frame 0";
+    } else if (params->cont_latent != nullptr && params->cont_latent_frames > 0) {
+        gate = "this is a continuation segment";
+    } else if (params->keyframes != nullptr && params->keyframe_frame_indices != nullptr) {
+        for (int i = 0; i < params->keyframes_size; ++i) {
+            if (params->keyframe_frame_indices[i] == 0) {
+                gate = "a keyframe is pinned at frame 0";
+                break;
+            }
+        }
+    }
+    if (gate != nullptr) {
+        LOG_INFO("reference head trim: SELF-GATED to a no-op -- %s", gate);
+        return 0;
+    }
+
+    int64_t ref_latent_frames = 0;
+    for (const auto& grid : latents.ref_grids) {
+        ref_latent_frames = std::max(ref_latent_frames, grid.frames);
+    }
+    // 1 + 8*(K-1), spelled as the position math it comes from: the references occupy latent
+    // corners [0, K), and corner K maps to pixel frame max(0, 8K-7).
+    const int derived = static_cast<int>(
+        ltxv_latent_corner_to_pixel_frame(ref_latent_frames, kLtxvTemporalScale, true));
+    int trim = params->reference_head_trim < 0 ? derived : params->reference_head_trim;
+    if (trim <= 0) {
+        return 0;
+    }
+    // NEVER trim a shot away. One frame has to survive or the caller gets an empty render out of
+    // a successful sample.
+    const int max_trim = frame_count - 1;
+    if (trim > max_trim) {
+        LOG_WARN("reference head trim: %d frame(s) would leave nothing of a %d-frame shot; "
+                 "clamping to %d",
+                 trim, frame_count, max_trim);
+        trim = max_trim;
+    }
+    if (trim <= 0) {
+        return 0;
+    }
+    LOG_INFO("reference head trim: dropping %d head pixel frame(s) of %d (%s; %d reference(s), "
+             "largest is %lld latent frame(s) -> 1 + 8*(K-1) = %d)",
+             trim,
+             frame_count,
+             params->reference_head_trim < 0 ? "AUTO" : "caller-specified",
+             static_cast<int>(latents.ref_grids.size()),
+             (long long)ref_latent_frames,
+             derived);
+    return trim;
+}
+
+// Drop `trim` pixel frames off the head of a decoded shot AND the matching trim/fps seconds off
+// the head of its audio, so the two stay frame-exact.
+//
+// This is an OUTPUT-side cut, deliberately not routed through the pre-render drive-audio window.
+// That contract (`drop_applied == drop_predicted`, see the seam-trim block in
+// generate_video_chain) exists because a seam trim is measured AFTER the render while the drive
+// audio must be cut BEFORE it. This trim moves no content and is a pure function of the
+// references, so cutting both outputs by the same amount is exact and needs no prediction.
+static void ltxv_apply_reference_head_trim(sd_image_t** frames,
+                                           int* frame_count,
+                                           sd_audio_t* audio,
+                                           int trim,
+                                           int fps) {
+    if (trim <= 0 || frames == nullptr || *frames == nullptr || frame_count == nullptr ||
+        *frame_count <= trim) {
+        return;
+    }
+    sd_image_t* list = *frames;
+    for (int i = 0; i < trim; ++i) {
+        free(list[i].data);
+    }
+    const int kept = *frame_count - trim;
+    std::memmove(list, list + trim, static_cast<size_t>(kept) * sizeof(sd_image_t));
+    *frame_count = kept;
+
+    if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0 ||
+        audio->channels == 0 || audio->sample_rate == 0) {
+        return;
+    }
+    const int safe_fps = std::max(1, fps);
+    const uint64_t drop = std::min<uint64_t>(
+        audio->sample_count,
+        static_cast<uint64_t>(std::llround(static_cast<double>(trim) * audio->sample_rate / safe_fps)));
+    if (drop == 0) {
+        return;
+    }
+    const uint64_t remaining = audio->sample_count - drop;
+    if (remaining > 0) {
+        std::memmove(audio->data,
+                     audio->data + static_cast<size_t>(drop) * audio->channels,
+                     static_cast<size_t>(remaining) * audio->channels * sizeof(float));
+    }
+    audio->sample_count = remaining;
+    LOG_INFO("reference head trim: cut %llu audio sample(s) (%.3fs) off the head to match the "
+             "%d trimmed frame(s)",
+             (unsigned long long)drop,
+             static_cast<double>(drop) / audio->sample_rate,
+             trim);
+}
+
 // [SEAM] An appended guide block's temporal grid MUST match the target's, or the guide claims
 // coordinates for content that lives somewhere else on the timeline.
 //
@@ -5515,12 +5668,33 @@ static sd::Tensor<float> build_ltxv_relip_video_positions(int64_t width,
 // t2v grid is generated here, byte-for-byte the same coordinates the implicit
 // `build_video_rope_matrix` path would have produced.
 //
-// `ref_frame_origin` is the LATENT FRAME the references overlap.  It is 0 for a
-// full-length pass (overlap the shot's first frame, as trained).  A temporal
-// window passes its own tile start so the reference keeps the SAME zero temporal
-// offset from the frames that tile is generating: a tile is a self-contained
-// denoise, and pinning the sheet at global t=0 would place it seconds in the past
-// for every tile but the first — a temporal relationship the checkpoint never saw.
+// The frame-0 artifact: a reference sharing target latent frame 0's RoPE address is decoded into
+// frame 0. SEVEN lever classes were tried and REMOVED, all failing the same way -- they reduced the
+// leak only by reducing the conditioning, because on echo-e50 the reference's pull on frame 0 and
+// its hold on identity are the same attention:
+//   * 9-frame clip encode (content)         -- no effect at all
+//   * rescaling the reference (extent)      -- no effect, and CANNOT work: these are absolute pixel
+//                                              coords from a shared origin, so a bigger reference
+//                                              adds tokens at the SAME coords, it does not move them
+//   * reference ORDER                       -- no effect; with a plate present the plate always wins
+//   * temporal placement prefix/suffix/gap  -- relocates the leak (suffix dissolves the tail,
+//                                              prefix opens on the reference's own scene)
+//   * spatial coord scale (upstream's       -- removes the leak by DISABLING the reference: at 1.2
+//     memory_downscale_factor)                 and above the render collapses to prompt-only
+//   * uniform attention strength            -- clears frame 0 but changes the character
+//   * frame-0-only attention suppression    -- hard: frame 0 renders garbage; half: works but the
+//                                              composition shifts, since frame 0 seeds it
+// The reference is ALREADY "unrenderable but referrable": pinned at timestep zero and sliced off
+// before decode. The leak is frame 0's own token being denoised toward it, which is the mechanism
+// i2v relies on deliberately. Do not re-try an address- or weight-based fix without a
+// NO-REFERENCE arm alongside -- that control is what exposed the spatial one as a disable.
+
+// `ref_frame_origin` is the LATENT FRAME the references are placed RELATIVE TO.  It is
+// 0 for a full-length pass and the tile start under temporal windowing, so a tile keeps
+// the same relationship to its own frames that a full pass has to the whole shot:
+// pinning the sheet at global t=0 would place it seconds in the past for every tile but
+// the first — a temporal relationship the checkpoint never saw. The placement mode above
+// decides whether the references land ON that frame, before it, or after the target.
 static sd::Tensor<float> build_ltxv_tass_ref_video_positions(const sd::Tensor<float>& base_positions,
                                                              int64_t target_width,
                                                              int64_t target_height,
@@ -5564,11 +5738,12 @@ static sd::Tensor<float> build_ltxv_tass_ref_video_positions(const sd::Tensor<fl
         }
     }
 
-    auto append = [&](int64_t w_count, int64_t h_count, int64_t f_count, float source_id, int64_t frame_origin) {
+    auto append = [&](int64_t w_count, int64_t h_count, int64_t f_count, float source_id,
+                      int64_t frame_origin) {
+        const float step = static_cast<float>(spatial_scale);
         for (int64_t t = 0; t < f_count; ++t) {
-            // The reference "overlaps" the target's first frame; only the source tag
-            // tells it apart from the frame being generated.  `frame_origin` is 0 for
-            // a full-length pass and the tile start under temporal windowing.
+            // `frame_origin` is 0 for a full-length pass and the tile start under temporal
+            // windowing; the placement mode decides what it is relative to.
             const float t_start = ltxv_latent_corner_to_pixel_frame(frame_origin + t, temporal_scale, true) / static_cast<float>(fps);
             const float t_end   = ltxv_latent_corner_to_pixel_frame(frame_origin + t + 1, temporal_scale, true) / static_cast<float>(fps);
             for (int64_t h = 0; h < h_count; ++h) {
@@ -5577,8 +5752,8 @@ static sd::Tensor<float> build_ltxv_tass_ref_video_positions(const sd::Tensor<fl
                         (*source_ids_out)[static_cast<size_t>(token)] = source_id;
                     }
                     set_ltxv_video_position(&positions, token++, t_start, t_end,
-                                            static_cast<float>(h * spatial_scale), static_cast<float>((h + 1) * spatial_scale),
-                                            static_cast<float>(w * spatial_scale), static_cast<float>((w + 1) * spatial_scale));
+                                            static_cast<float>(h) * step, static_cast<float>(h + 1) * step,
+                                            static_cast<float>(w) * step, static_cast<float>(w + 1) * step);
                 }
             }
         }
@@ -5588,6 +5763,9 @@ static sd::Tensor<float> build_ltxv_tass_ref_video_positions(const sd::Tensor<fl
         append(target_width, target_height, target_frames, 0.f, 0);
     }
     for (const auto& ref : refs) {
+        // Every reference overlaps the SAME frame. Upstream (JoyAI-Echo `legacy`) spreads them
+        // 0..K-1 instead; that was tried and changed nothing about the artifact, so this stays as
+        // it shipped rather than carrying an untested divergence.
         append(ref.width, ref.height, ref.frames, ref.source_id, ref_frame_origin);
     }
     GGML_ASSERT(token == total_tokens);
@@ -5805,6 +5983,216 @@ static sd::Tensor<float> encode_ltxav_condition_image(sd_ctx_t* sd_ctx,
         LOG_ERROR("failed to encode LTXAV %s image", name);
     }
     return condition_latent;
+}
+
+// How many pixel frames a TASS reference still is expanded to before its LAST
+// latent frame is kept. ONE -- the default -- encodes the still directly, which is
+// what has always shipped.
+//
+// Nine is what JoyAI-Echo's own pipeline does (`utils.py:99-101`,
+// `clip_num_frames: 9`, `latent[:, -1:]`; the community node spells it
+// `[_ref_pil] * 9`), and the reasoning for adopting it was that encoding ONE image
+// yields latent frame 0 -- the causal SEED latent, bit-for-bit what an i2v pin
+// writes into that slot -- so the model would be reading the reference as an
+// opening-frame pin. A last-of-9 latent encodes a temporal chunk instead.
+//
+// THAT REASONING IS WRONG, and it is recorded here rather than deleted so nobody
+// spends the GPU time again. A/B at 1280x704, seed 9001, echo-e50, two
+// render-resolution references, `tass_phase_scale: 0`: BOTH arms open on the empty
+// scene with the subject appearing at frame 1. The clip encode measurably changes
+// the render -- the two arms are different takes -- but it does not touch the
+// artifact, because the artifact is POSITIONAL.
+//
+// So this stays a knob rather than a default: it is upstream's convention and may
+// yet matter for identity fidelity, but it costs 9x the VAE work on a cache miss
+// and has no measured benefit, and turning it on changes the conditioning of every
+// existing project. The count must be 1 modulo 8, the LTX VAE's temporal stride.
+static int ltxav_reference_clip_frames() {
+    static const int frames = []() {
+        const char* configured = getenv("LTX_REF_CLIP_FRAMES");
+        if (configured == nullptr || configured[0] == '\0') {
+            return 1;
+        }
+        const int requested = atoi(configured);
+        if (requested < 1 || requested % 8 != 1) {
+            LOG_WARN("LTX_REF_CLIP_FRAMES=%s is not 1 modulo 8; using 1", configured);
+            return 1;
+        }
+        return requested;
+    }();
+    return frames;
+}
+
+// Encode one reference still the way the checkpoint was trained to read it: as a
+// short clip of that image, keeping only the trailing latent frame. See
+// `ltxav_reference_clip_frames` for why a single-frame encode is the wrong tensor
+// rather than merely a cheaper one.
+static sd::Tensor<float> encode_ltxav_reference_image(sd_ctx_t* sd_ctx,
+                                                      const sd::Tensor<float>& image,
+                                                      const char* name) {
+    const int clip_frames = ltxav_reference_clip_frames();
+    if (clip_frames <= 1) {
+        return encode_ltxav_condition_image(sd_ctx, image, name);
+    }
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || image.empty()) {
+        return {};
+    }
+    // Replicate on the frame axis. The VAE sees a still clip, which is what the
+    // reference implementation hands it -- not a still.
+    auto frame = image.reshape({image.shape()[0], image.shape()[1], 1, image.shape()[2], image.shape()[3]});
+    sd::Tensor<float> clip({image.shape()[0], image.shape()[1], clip_frames, image.shape()[2], image.shape()[3]});
+    for (int f = 0; f < clip_frames; ++f) {
+        sd::ops::slice_assign(&clip, 2, f, f + 1, frame);
+    }
+    auto clip_latent = sd_ctx->sd->encode_first_stage(clip);
+    if (clip_latent.empty() || clip_latent.dim() < 4) {
+        LOG_ERROR("failed to encode LTXAV %s reference clip", name);
+        return {};
+    }
+    const int64_t latent_frames = clip_latent.shape()[2];
+    if (latent_frames <= 1) {
+        // A VAE with no temporal compression collapses the clip back to a seed
+        // latent; nothing is gained and nothing is lost by saying so out loud.
+        LOG_WARN("LTXAV %s reference clip encoded to %lld latent frame(s); keeping it as-is",
+                 name,
+                 (long long)latent_frames);
+        return clip_latent;
+    }
+    return sd::ops::slice(clip_latent, 2, latent_frames - 1, latent_frames);
+}
+
+// ── content-addressed cache for encoded reference latents ────────────────────
+//
+// A character reference is an IDENTITY, not a shot: the same pixels, encoded to
+// the same latent, for every segment of a chain and for every chain that names
+// that character. Today it is re-encoded per segment, inside the GPU mutex, so a
+// ten-shot chain pays the VAE ten times for one unchanging face -- and pays it
+// again on the next render of the same project. The clip encode above makes that
+// worse, since it now feeds the VAE nine frames rather than one.
+//
+// Both problems have the same answer: key the latent on its input and keep it.
+//
+// The key is taken over the DECODED, ALREADY-RESIZED pixel tensor -- the exact
+// thing handed to the VAE -- so resolution and channel layout are part of the key
+// by construction rather than by remembering to include them. Two independent
+// 64-bit FNV-1a passes give a 128-bit key; a collision would silently swap one
+// person's face for another's, which is worth eight extra bytes to make absurd.
+//
+// Empty cache dir disables the whole thing and restores the encode-every-time
+// behaviour exactly. `LTX_REF_LATENT_CACHE_TAG` joins the key so a deliberate VAE
+// change can invalidate every entry without finding them.
+static std::string ltxav_reference_cache_dir() {
+    static const std::string dir = []() {
+        const char* configured = getenv("LTX_REF_LATENT_CACHE_DIR");
+        return configured != nullptr ? std::string(configured) : std::string();
+    }();
+    return dir;
+}
+
+static std::string ltxav_reference_cache_key(const sd::Tensor<float>& input, const char* kind, int variant) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(input.data());
+    const size_t size = static_cast<size_t>(input.numel()) * sizeof(float);
+    uint64_t h1 = 1469598103934665603ull;   // FNV-1a 64
+    uint64_t h2 = 0x9e3779b97f4a7c15ull;    // a second basis, so the pair is 128 bits
+    for (size_t i = 0; i < size; ++i) {
+        h1 = (h1 ^ bytes[i]) * 1099511628211ull;
+        h2 = (h2 ^ bytes[i]) * 0x100000001b3ull;
+        h2 ^= h2 >> 29;
+    }
+    // SHAPE goes in the key explicitly. "Resolution is in the key by construction because it is in
+    // the bytes" is FALSE for a transposed pair: a uniform-content reference at [W,H] and [H,W] has
+    // the same bytes, the same numel and the same rank, so it would collide and hand back a latent
+    // on the wrong spatial grid.
+    std::string dims;
+    for (int64_t axis = 0; axis < input.dim(); ++axis) {
+        dims += (axis ? "x" : "") + std::to_string(input.shape()[axis]);
+    }
+    char key[256];
+    const char* tag = getenv("LTX_REF_LATENT_CACHE_TAG");
+    snprintf(key, sizeof(key), "%s-%016llx%016llx-v%d-s%s-%s",
+             kind,
+             (unsigned long long)h1,
+             (unsigned long long)h2,
+             variant,
+             dims.c_str(),
+             tag != nullptr && tag[0] != '\0' ? tag : "v1");
+    return key;
+}
+
+// Run `encode` on `input`, reusing a previously written latent when these exact
+// bytes have been through here before. Falls back to encoding on ANY cache
+// trouble: a cache is an optimisation, and a render must never fail because of one.
+template <typename Encoder>
+static sd::Tensor<float> ltxav_encode_with_reference_cache(const sd::Tensor<float>& input,
+                                                           const char* kind,
+                                                           int variant,
+                                                           const char* name,
+                                                           Encoder&& encode) {
+    const std::string dir = ltxav_reference_cache_dir();
+    if (dir.empty() || input.empty()) {
+        return encode();
+    }
+    std::string path;
+    try {
+        std::error_code error;
+        std::filesystem::create_directories(dir, error);
+        if (error) {
+            LOG_WARN("LTXAV reference latent cache dir %s is unusable: %s", dir.c_str(), error.message().c_str());
+            return encode();
+        }
+        path = (std::filesystem::path(dir) / (ltxav_reference_cache_key(input, kind, variant) + ".bin")).string();
+        if (std::filesystem::is_regular_file(path, error)) {
+            auto cached = sd::load_tensor_from_file_as_tensor<float>(path);
+            if (!cached.empty() && cached.dim() >= 4) {
+                LOG_INFO("LTXAV %s reference: cache HIT %lldx%lldx%lld latent (no VAE pass)",
+                         name,
+                         (long long)cached.shape()[0],
+                         (long long)cached.shape()[1],
+                         (long long)cached.shape()[2]);
+                return cached;
+            }
+            LOG_WARN("LTXAV reference latent cache entry %s is unusable; re-encoding", path.c_str());
+        }
+    } catch (const std::exception& exception) {
+        LOG_WARN("LTXAV reference latent cache read failed (%s); re-encoding", exception.what());
+        return encode();
+    }
+
+    auto encoded = encode();
+    if (encoded.empty() || path.empty()) {
+        return encoded;
+    }
+    // Write to a unique temporary and rename. Two workers can encode the same
+    // reference concurrently; rename is atomic, so the loser overwrites the winner
+    // with byte-identical content instead of a reader seeing a half-written latent.
+    try {
+        // A stack address is NOT unique across threads -- two workers at the same call depth share
+        // it. Use the thread id plus a monotonic counter so concurrent encodes cannot collide on
+        // the temporary and truncate each other's write.
+        static std::atomic<uint64_t> temp_seq{0};
+        std::ostringstream temp_name;
+        temp_name << path << ".tmp" << std::hash<std::thread::id>{}(std::this_thread::get_id())
+                  << "-" << temp_seq.fetch_add(1);
+        const std::string temporary = temp_name.str();
+        sd::save_tensor_to_file(temporary, encoded, "ltxav_reference_latent");
+        std::error_code error;
+        std::filesystem::rename(temporary, path, error);
+        if (error) {
+            std::filesystem::remove(temporary, error);
+        }
+    } catch (const std::exception& exception) {
+        LOG_WARN("LTXAV reference latent cache write failed (%s); the render is unaffected", exception.what());
+    }
+    return encoded;
+}
+
+static sd::Tensor<float> encode_ltxav_reference_image_cached(sd_ctx_t* sd_ctx,
+                                                             const sd::Tensor<float>& image,
+                                                             const char* name) {
+    const int clip_frames = ltxav_reference_clip_frames();
+    return ltxav_encode_with_reference_cache(image, "ref", clip_frames, name, [&]() {
+        return encode_ltxav_reference_image(sd_ctx, image, name);
+    });
 }
 
 // Fit one image onto a `width` x `height` canvas.
@@ -8184,7 +8572,13 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             if (strip.empty()) {
                 return std::nullopt;
             }
-            auto strip_latent = sd_ctx->sd->encode_first_stage(strip);
+            // The strip is recomposited from the same images for every shot it is
+            // scoped to, so it is the single biggest beneficiary of the cache: one
+            // VAE pass over a 17-to-65-frame video, once, instead of once per shot.
+            auto strip_latent =
+                ltxav_encode_with_reference_cache(strip, "msr", sd_vid_gen_params->msr_frames, "MSR strip", [&]() {
+                    return sd_ctx->sd->encode_first_stage(strip);
+                });
             if (strip_latent.empty() || strip_latent.dim() < 4) {
                 LOG_ERROR("failed to encode the LTXAV MSR reference strip");
                 return std::nullopt;
@@ -8222,7 +8616,7 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             const int ref_width  = std::max<int>(scale, static_cast<int>((ref_image.width + scale / 2) / scale) * scale);
             const int ref_height = std::max<int>(scale, static_cast<int>((ref_image.height + scale / 2) / scale) * scale);
             auto image           = sd_image_to_tensor(ref_image, ref_width, ref_height);
-            auto ref_latent      = encode_ltxav_condition_image(sd_ctx, image, "character reference");
+            auto ref_latent      = encode_ltxav_reference_image_cached(sd_ctx, image, "character");
             if (ref_latent.empty() || ref_latent.dim() < 4) {
                 return std::nullopt;
             }
@@ -8258,7 +8652,7 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                 ref_latent.shape()[1],
                                                 ref_latent.shape()[2],
                                                 static_cast<float>(source_id)});
-            LOG_INFO("LTXAV character reference %d/%d: %ux%u px -> %lldx%lldx%lld latent, source_id=%d",
+            LOG_INFO("LTXAV character reference %d/%d: %ux%u px -> %lldx%lldx%lld latent, source_id=%d, clip=%d%s",
                      i + 1,
                      sd_vid_gen_params->character_refs_size,
                      ref_image.width,
@@ -8266,7 +8660,9 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                      (long long)ref_latent.shape()[0],
                      (long long)ref_latent.shape()[1],
                      (long long)ref_latent.shape()[2],
-                     source_id);
+                     source_id,
+                     ltxav_reference_clip_frames(),
+                     ltxav_reference_clip_frames() > 1 ? " (last-of-clip)" : " (SEED LATENT)");
             ref_latents.push_back(std::move(ref_latent));
         }
 
@@ -8291,6 +8687,18 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
         // regenerate).
         latents.tass_positions_only = latents.video_positions.empty();
         latents.ref_grids           = ref_grids;
+        // >= 0 is an explicit request; exactly 0 means UNTAGGED (Echo's native layout:
+        // references share the target's RoPE grid with no source-phase tag at all).
+        // An unsupplied phase scale defaults to the Best-Face-ID convention of 1.0,
+        // EXCEPT when an MSR strip is present: MSR was trained through ComfyUI's
+        // IC-LoRA guide, which tags nothing, so tagging it would be off-recipe. A
+        // caller that asks for a scale explicitly still gets exactly what it asked for.
+        //
+        // Resolved BEFORE the positions are built: the placement policy reads it, because the
+        // frame-0 collision only exists in the untagged regime.
+        latents.tass_phase_scale = sd_vid_gen_params->tass_phase_scale >= 0.f
+                                       ? sd_vid_gen_params->tass_phase_scale
+                                       : (has_msr_strip ? 0.f : 1.f);
         latents.video_positions  = build_ltxv_tass_ref_video_positions(latents.video_positions,
                                                                       latents.init_latent.shape()[0],
                                                                       latents.init_latent.shape()[1],
@@ -8300,17 +8708,10 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
                                                                       request->vae_scale_factor,
                                                                       8,
                                                                       &latents.video_source_ids);
-        // >= 0 is an explicit request; exactly 0 means UNTAGGED (Echo's native layout:
-        // references share the target's RoPE grid with no source-phase tag at all).
-        // An unsupplied phase scale defaults to the Best-Face-ID convention of 1.0,
-        // EXCEPT when an MSR strip is present: MSR was trained through ComfyUI's
-        // IC-LoRA guide, which tags nothing, so tagging it would be off-recipe. A
-        // caller that asks for a scale explicitly still gets exactly what it asked for.
-        latents.tass_phase_scale = sd_vid_gen_params->tass_phase_scale >= 0.f
-                                       ? sd_vid_gen_params->tass_phase_scale
-                                       : (has_msr_strip ? 0.f : 1.f);
-        LOG_INFO("LTXAV TASS overlap references: %d sheet(s), %lld reference token(s), phase_scale=%.2f%s",
+        LOG_INFO("LTXAV TASS overlap references: %d sheet(s), %lld reference latent frame(s), "
+                 "%lld reference token(s), phase_scale=%.2f%s",
                  static_cast<int>(ref_grids.size()),
+                 (long long)latents.ref_video_x.shape()[2],
                  (long long)(latents.ref_video_x.shape()[0] * latents.ref_video_x.shape()[1] *
                              latents.ref_video_x.shape()[2]),
                  latents.tass_phase_scale,
@@ -8829,7 +9230,11 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* latent_width_out,
                               int* latent_height_out,
                               int* latent_frames_out,
-                              int* latent_channels_out) {
+                              int* latent_channels_out,
+                              int* reference_head_trim_out) {
+    if (reference_head_trim_out != nullptr) {
+        *reference_head_trim_out = 0;
+    }
     if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
         return false;
     }
@@ -10030,6 +10435,14 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
 
+    // Resolve -- but do NOT apply -- the reference head-frame trim. The cut belongs to whoever
+    // owns the output timeline: generate_video() applies it directly, while generate_video_chain()
+    // folds it into that shot's head drop so the durable bank keeps holding the shot AS RENDERED.
+    if (reference_head_trim_out != nullptr) {
+        *reference_head_trim_out = ltxv_resolve_reference_head_trim(
+            sd_vid_gen_params, latents, sd_version_is_ltxav(sd_ctx->sd->version), *num_frames_out);
+    }
+
     sd_ctx->sd->lora_stat();
 
     int64_t t1 = ggml_time_ms();
@@ -10050,16 +10463,28 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_image_t** frames_out,
                            int* num_frames_out,
                            sd_audio_t** audio_out) {
-    return generate_video_ex(sd_ctx,
-                             sd_vid_gen_params,
-                             frames_out,
-                             num_frames_out,
-                             audio_out,
-                             nullptr,
-                             nullptr,
-                             nullptr,
-                             nullptr,
-                             nullptr);
+    int reference_head_trim = 0;
+    if (!generate_video_ex(sd_ctx,
+                           sd_vid_gen_params,
+                           frames_out,
+                           num_frames_out,
+                           audio_out,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           nullptr,
+                           &reference_head_trim)) {
+        return false;
+    }
+    // Single-shot render: this call owns the whole output timeline, so the trim lands here on both
+    // the frames and the audio at once.
+    ltxv_apply_reference_head_trim(frames_out,
+                                   num_frames_out,
+                                   audio_out != nullptr ? *audio_out : nullptr,
+                                   reference_head_trim,
+                                   sd_vid_gen_params != nullptr ? sd_vid_gen_params->fps : 0);
+    return true;
 }
 
 static sd_image_t copy_video_frame(const sd_image_t& source) {
@@ -10887,7 +11312,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     std::vector<int> tass_scope_offsets;
     if (base_params->character_refs != nullptr && base_params->character_refs_size > 0) {
         tass_source_ids.reserve(base_params->character_refs_size);
-        int next_source_id = 2;
+        // The encode path numbers the MSR strip FIRST and takes 2 for it, so a chain that carries
+        // both a strip and character references must resume at 3 or reference 0 collides with the
+        // strip. Inert while the phase scale is zero -- the tag multiplies by zero -- but a
+        // landmine the moment anyone sets it positive.
+        int next_source_id = base_params->msr_frames > 0 ? 3 : 2;
         for (int i = 0; i < base_params->character_refs_size; ++i) {
             int source_id = next_source_id;
             if (base_params->character_ref_source_ids != nullptr && base_params->character_ref_source_ids[i] > 1) {
@@ -10999,6 +11428,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
         if (chain_params->segment_cfg != nullptr && chain_params->segment_cfg[segment] >= 0.f) {
             params.sample_params.guidance.txt_cfg = chain_params->segment_cfg[segment];
+        }
+        // A supplied per-shot array is authoritative for every entry, zero included -- otherwise
+        // "off for this one shot" would be unexpressible in a project that has the trim on.
+        if (chain_params->segment_reference_head_trim != nullptr) {
+            params.reference_head_trim = chain_params->segment_reference_head_trim[segment];
         }
         // A supplied per-shot array is authoritative, including when a shot's
         // count is zero. Only a chain that carries no beat array at all falls
@@ -11214,6 +11648,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         int height = 0;
         int frames = 0;
         int channels = 0;
+        int reference_head_trim = 0;
         if (!generate_video_ex(sd_ctx,
                                &params,
                                &segment_frames,
@@ -11223,7 +11658,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                &width,
                                &height,
                                &frames,
-                               &channels) ||
+                               &channels,
+                               &reference_head_trim) ||
             segment_frames == nullptr || segment_count <= 0 || latent == nullptr) {
             free_sd_audio(segment_audio);
             free(segment_frames);
@@ -11253,11 +11689,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             return fail();
         }
         if (chain_params->on_segment != nullptr) {
-            // Frames AND audio are both still untrimmed here -- adopt_frames() applies the seam
-            // drop below, and append_audio() applies the matching audio_drop. So the preview is the
-            // shot exactly AS RENDERED, overlap head included, and its picture and sound stay in
-            // sync with each other. The trim belongs to the stitched timeline, not to a preview of
-            // one shot.
+            // Frames AND audio are both still untrimmed here -- adopt_frames() applies the head
+            // drop below (the seam overlap PLUS any reference head trim), and append_audio()
+            // applies the matching audio_drop. So the preview is the shot exactly AS RENDERED,
+            // overlap head and contaminated reference frame included, and its picture and sound
+            // stay in sync with each other. Trimming belongs to the stitched timeline, not to a
+            // preview of one shot.
             chain_params->on_segment(segment,
                                      segment_frames,
                                      segment_count,
@@ -11309,7 +11746,28 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             last_measured_seam_drop = measured;
             seam_trims.emplace_back(seam_drop, measured);
         }
-        const int audio_drop = std::min(effective_seam_drop, segment_count);
+        // The REFERENCE HEAD TRIM rides on the same output-side head drop as the seam trim: the
+        // frames and this shot's own audio are cut by the same amount, and nothing before the
+        // render moves. In practice the two never coexist -- the trim self-gates off continuation
+        // shots, which are the only ones with a seam drop -- but summing is the honest expression
+        // of "drop this many frames off the head", and both cuts are pure output bookkeeping.
+        //
+        // Doing it HERE rather than inside generate_video_ex is what keeps the durable bank
+        // consistent: seg_<n>.bin holds the shot AS RENDERED (untrimmed), seg_<n>.audio holds its
+        // untrimmed audio, and seg_<n>.len records what the timeline kept. A resume or a retake
+        // re-derives the drop as `count - banked_kept` and applies it to BOTH, which reproduces
+        // this cut exactly. Banking an already-trimmed audio sidecar next to an untrimmed latent
+        // would silently trim the audio twice on every restore.
+        if (reference_head_trim > 0) {
+            LOG_INFO("generate_video_chain: window %d drops %d reference head frame(s)%s",
+                     segment + 1,
+                     reference_head_trim,
+                     effective_seam_drop > 0 ? " on top of its seam drop" : "");
+        }
+        // With the trim OFF this is the historical `min(effective_seam_drop, segment_count)` to
+        // the byte; the leave-one-frame floor only comes into force once a trim is in play.
+        const int head_drop_limit = reference_head_trim > 0 ? std::max(0, segment_count - 1) : segment_count;
+        const int audio_drop      = std::min(effective_seam_drop + reference_head_trim, head_drop_limit);
         if (chain_params->segment_audio_track != nullptr) {
             if (!append_shot_track(chain_params->segment_audio_track[segment], segment_count - audio_drop)) {
                 free_sd_audio(segment_audio);
@@ -11359,11 +11817,29 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             const int declared_drop = chain_params->segment_seam_drop_frames != nullptr
                                           ? chain_params->segment_seam_drop_frames[segment]
                                           : -1;
-            const int drop = std::min(segment_count,
-                                      declared_drop >= 0 ? declared_drop
-                                                         : (chain_params->cont_seam_drop_frames > 0
-                                                                ? chain_params->cont_seam_drop_frames
-                                                                : seam_drop_default));
+            int drop = std::min(segment_count,
+                                declared_drop >= 0 ? declared_drop
+                                                   : (chain_params->cont_seam_drop_frames > 0
+                                                          ? chain_params->cont_seam_drop_frames
+                                                          : seam_drop_default));
+            // LENGTH PIN -- the same one the RESUME path applies above, and for the same reason.
+            // A suffix segment's kept length is whatever it banked, which is NOT re-derivable from
+            // the seam policy alone: an auto-trim search lands where it lands, and a reference
+            // head trim adds to it. Re-deriving here reproduces a DIFFERENT prefix length and
+            // slides every downstream shot (and its audio) along the timeline. The resume path had
+            // this pin; the retake suffix never got it, so a retake on a project with references
+            // was the one path that could still drift.
+            const int banked_kept = read_seg_len(std::string(chain_params->bank_dir) + "/seg_" +
+                                                 std::to_string(segment) + ".len");
+            if (banked_kept >= 0 && banked_kept <= segment_count) {
+                const int pinned_drop = segment_count - banked_kept;
+                if (pinned_drop != drop) {
+                    LOG_INFO("generate_video_chain: retake suffix %d restored to its banked length "
+                             "(kept %d, drop %d, would have re-derived %d)",
+                             segment + 1, banked_kept, pinned_drop, drop);
+                }
+                drop = pinned_drop;
+            }
             if (chain_params->segment_audio_track != nullptr &&
                 chain_params->segment_audio_track[segment] != nullptr &&
                 chain_params->segment_audio_track[segment][0] != '\0' &&
@@ -11679,7 +12155,10 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
                                                  &out_width,
                                                  &out_height,
                                                  &out_frames,
-                                                 &out_channels);
+                                                 &out_channels,
+                                                 // Wan VACE has no TASS references; the trim
+                                                 // resolves to zero here by construction.
+                                                 nullptr);
         free_sd_audio(segment_audio);
         if (!generated || segment_frames == nullptr || segment_count <= 0 ||
             exported_latent == nullptr) {

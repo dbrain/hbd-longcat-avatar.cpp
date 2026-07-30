@@ -498,6 +498,37 @@ typedef struct {
     // leaves shot 1 bit-identical to a request that never mentioned MSR.
     int* msr_segments;
     int msr_segments_size;
+    // REFERENCE HEAD-FRAME TRIM.
+    //
+    // A TASS reference sits at the target's latent-frame-0 RoPE address, and on some
+    // checkpoints the decoder hands that address straight back: the opening pixel frame
+    // of a bare t2v shot renders the reference VERBATIM. With a location plate in the
+    // set frame 0 is the empty plate (which reads as "the subject is missing"); with only
+    // a character sheet it is that sheet's own source photo, background and all.
+    //
+    // The contaminated run is measured in PIXEL frames and is 1 + 8*(K-1), where K is the
+    // largest reference's LATENT frame count. Reference COUNT does not change it (verified
+    // at 1, 2 and 4 references): every reference is given the same latent-frame origin, and
+    // latent frame 0 is the only latent frame that decodes to a single pixel frame, because
+    // ltxv_latent_corner_to_pixel_frame() is max(0, 8t-7). For stills (K == 1) that is
+    // exactly ONE pixel frame.
+    //
+    //   0  -- OFF. The default, and byte-identical to a build that never had this field.
+    //   -1 -- AUTO. The ENGINE derives 1 + 8*(K-1) from the references it actually encoded,
+    //         so no caller ever hard-codes the formula.
+    //   >0 -- trim exactly that many pixel frames.
+    //
+    // Caller-controlled rather than automatic because it is CHECKPOINT-specific: echo-e50
+    // leaks, msr-v2 and echo-full do not. It additionally SELF-GATES to a no-op on any shot
+    // that already pins frame 0 -- an i2v init image, a keyframe at index 0, or a
+    // continuation tail -- and on any shot carrying no references at all; i2v and
+    // continuation shots were measured clean. Each gate logs.
+    //
+    // The shot is TRIMMED, not re-rendered: it returns (N - trim) frames. Rendering the
+    // frames back would cost a whole latent frame (LTX requires frames % 8 == 1, so the
+    // smallest legal increase is 8 pixel frames) and that VRAM is not available. A matching
+    // trim/fps seconds is taken off the HEAD of the OUTPUT audio so A/V stays exact.
+    int reference_head_trim;
     sd_image_t* control_frames;
     int control_frames_size;
     int width;
@@ -712,6 +743,13 @@ typedef struct {
     const float* segment_cfg;
     // Negative prompts: null or empty entries inherit the base negative prompt.
     const char* const* segment_negative_prompts;
+    // Optional per-shot reference_head_trim, same encoding as the base field
+    // (0 = off, -1 = auto, >0 = an explicit pixel-frame count). A NULL array
+    // applies base_params->reference_head_trim to every shot; a SUPPLIED array is
+    // authoritative for every entry, INCLUDING a zero -- the same rule the beat
+    // arrays follow, so a caller can switch the trim off for one shot of a project
+    // that has it on.
+    const int* segment_reference_head_trim;
 } sd_vid_chain_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;
@@ -828,7 +866,16 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               int* latent_width_out,
                               int* latent_height_out,
                               int* latent_frames_out,
-                              int* latent_channels_out);
+                              int* latent_channels_out,
+                              // Reports the reference head-frame trim this render RESOLVED (after
+                              // AUTO derivation, self-gating and clamping) WITHOUT applying it, so
+                              // the caller can decide where the cut lands. generate_video() applies
+                              // it to the frames and audio it returns; generate_video_chain() folds
+                              // it into that shot's output-side head drop, which keeps the durable
+                              // seg_<n>.bin / .len / .audio bank internally consistent (the bank
+                              // holds the shot AS RENDERED and .len records what the timeline kept).
+                              // Null when the caller does not care.
+                              int* reference_head_trim_out);
 
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,
