@@ -8,6 +8,50 @@
 
 #define LORA_GRAPH_BASE_SIZE 10240
 
+// ---- runtime-LoRA accumulate direction (see forward_with_lora) -------------------------------
+// SD_LORA_ACC_BASE=1        emit the delta ADD as add_inplace(delta, base) instead of
+//                           add_inplace(base, delta), so the BASE gemm is the one the CUDA
+//                           MUL_MAT+ADD fusion folds into. OFF by default: this changes float
+//                           accumulation order and which kernel is fused, so it is opt-in until
+//                           measured per model.
+// SD_LORA_ACC_BASE_SKIP=a,b comma-separated substrings matched against the patched Linear's
+//                           prefix; a match keeps that module on the forward ordering. Exists
+//                           because the reversal only pays where the base gemm has spare
+//                           bandwidth (e.g. "mlp.down" measured at 96% of DRAM peak).
+__STATIC_INLINE__ bool sd_lora_acc_base_enabled() {
+    static const bool enabled = [] {
+        const char* e = getenv("SD_LORA_ACC_BASE");
+        return e != nullptr && e[0] != '\0' && std::atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+__STATIC_INLINE__ const std::vector<std::string>& sd_lora_acc_base_skip() {
+    static const std::vector<std::string> pats = [] {
+        std::vector<std::string> out;
+        const char* e = getenv("SD_LORA_ACC_BASE_SKIP");
+        if (e == nullptr) {
+            return out;
+        }
+        std::string s(e), cur;
+        for (char c : s) {
+            if (c == ',') {
+                if (!cur.empty()) {
+                    out.push_back(cur);
+                }
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+        if (!cur.empty()) {
+            out.push_back(cur);
+        }
+        return out;
+    }();
+    return pats;
+}
+
 struct LoraModel : public GGMLRunner {
     std::string lora_id;
     float multiplier = 1.0f;
@@ -1026,12 +1070,91 @@ public:
         if (base_output_scale != nullptr) {
             out = ggml_mul(ctx, out, base_output_scale);
         }
+        // ---- delta accumulation, and WHICH GEMM pays for it --------------------------------
+        //
+        // Both orderings compute out + delta and move exactly the same bytes; what differs is
+        // which kernel does the read-modify-write, because ggml_cuda_try_fuse_mul_mat_acc()
+        // folds an in-place ADD into whichever MUL_MAT is its immediate graph predecessor.
+        //
+        //   FORWARD (default)   add_inplace(out, delta)
+        //       cgraph order: base_gemm, lora_down, lora_up, ADD.  The fusable MUL_MAT is
+        //       lora_up, so lora_up runs beta=1 and reads `out` back.
+        //
+        //   REVERSED            add_inplace(delta, out)
+        //       cgraph order: lora_down, lora_up, base_gemm, ADD.  The fusable MUL_MAT is the
+        //       BASE gemm, so lora_up writes its own [O x L] delta at beta=0 and the base gemm
+        //       reads it back at beta=1.
+        //
+        // (The order above is not a hope: ggml_build_forward_expand does a left-to-right DFS
+        // over src[], so src[0]'s subtree is emitted first and the node itself last. Swapping
+        // the ADD's operands is therefore the whole reordering -- the base Linear is still
+        // *constructed* first, it is just *visited* second.)
+        //
+        // WHY REVERSED CAN WIN. ncu on the krea2 edit shape: the LoRA `up` GEMM is at 78-85%
+        // of DRAM peak and 13-17% of tensor peak -- bandwidth-bound at the roofline, and half
+        // its traffic is the beta=1 read-back. The base Linear it pairs with is compute-bound
+        // (SM 84-87%, DRAM 22-29%) and has bandwidth to spare, so it can absorb the same
+        // read-modify-write behind its own math.
+        //
+        // Two extra effects, both in the same direction:
+        //   * with a NON-NVFP4 adapter (the shipping Q8_0 one) the up GEMM cannot fuse at all
+        //     -- Route A needs an NVFP4 src0 and Route B is off -- so today the delta ADD runs
+        //     as a separate full-width binbcast. Reversed, the fusable node is the base gemm,
+        //     whose weight IS NVFP4, so the ADD disappears outright: 5 full-width passes
+        //     (W out, W diff, R+R+W add) become 3 (W diff, R+W base).
+        //   * a delta chain that ends in a CONCAT or a SCALE (multi-tensor modules, non-unit
+        //     strength) is not a MUL_MAT and never fused forward; reversed it is only the
+        //     addend, so those modules become fusable too.
+        //
+        // Not free everywhere: where the BASE gemm is itself bandwidth-bound (mlp.down measured
+        // at DRAM 96%) there is no slack to hide the read-back in and this is a wash. Hence the
+        // name filter.
+        //
+        // SD_LORA_ACC_BASE=1        reverse every module      (opt-in; default is unchanged)
+        // SD_LORA_ACC_BASE_SKIP=a,b substring blacklist on the Linear's prefix, so a module
+        //                           type whose base partner has no bandwidth to spare can be
+        //                           held on the forward ordering.
+        // Reversal preconditions, each of which would otherwise turn a win into a loss or a
+        // wrong answer:
+        //   * base_output_scale makes `out` a MUL node, not a MUL_MAT -> nothing to fuse into,
+        //     and we would give up the forward fusion for nothing;
+        //   * the ADD must not be a broadcast. Forward needs the delta repeatable into `out`;
+        //     reversed needs `out` repeatable into the delta. Only equal shapes satisfy both,
+        //     and a broadcasting delta would silently change the result. Re-checked per module
+        //     below, since get_out_diff() is what decides the shape.
+        bool reverse = sd_lora_acc_base_enabled() && base_output_scale == nullptr;
+        if (reverse) {
+            for (const std::string& pat : sd_lora_acc_base_skip()) {
+                if (!pat.empty() && prefix.find(pat) != std::string::npos) {
+                    reverse = false;
+                    break;
+                }
+            }
+        }
+
+        // `delta` is only used by the reversed path. The forward path is left EXACTLY as it
+        // was -- one in-place ADD per lora_model, in load order -- so with the flag off this
+        // whole block is bit-identical to the pre-change engine for any number of adapters.
+        ggml_tensor* delta = nullptr;
         for (auto& lora_model : lora_models) {
             ggml_tensor* out_diff = lora_model->get_out_diff(ctx, backend, x, forward_params, prefix + "weight");
             if (out_diff == nullptr) {
                 continue;
             }
-            out = ggml_add_inplace(ctx, out, out_diff);
+            if (!reverse || !ggml_are_same_shape(out, out_diff)) {
+                // Fold anything already accumulated into `delta` back onto `out` first, so a
+                // module that declines reversal mid-list cannot drop a delta.
+                if (delta != nullptr) {
+                    out   = ggml_add_inplace(ctx, out, delta);
+                    delta = nullptr;
+                }
+                out = ggml_add_inplace(ctx, out, out_diff);
+                continue;
+            }
+            delta = delta == nullptr ? out_diff : ggml_add_inplace(ctx, delta, out_diff);
+        }
+        if (delta != nullptr) {
+            out = ggml_add_inplace(ctx, delta, out);
         }
         return out;
     }
