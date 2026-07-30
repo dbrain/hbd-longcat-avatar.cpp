@@ -10497,14 +10497,24 @@ static sd_image_t copy_video_frame(const sd_image_t& source) {
     return copy;
 }
 
-// CONTENT-ADAPTIVE SEAM TRIM. The fixed 8*K pin is only ever an ESTIMATE of how much of a
-// continuation shot repeats the prior one -- the true settling length varies per clip, and pinning
-// it too long throws away newly rendered frames, which reads as the picture JUMPING FORWARD at the
-// join. Instead, search a band around the 8*K centre for the frame whose downsampled luma best
+// CONTENT-ADAPTIVE SEAM TRIM. A derived trim is only ever an ESTIMATE of how much of a continuation
+// shot repeats the prior one -- the true settling length varies per clip, and trimming too long
+// throws away newly rendered frames, which reads as the picture JUMPING FORWARD at the join.
+// Instead, search a band around the predicted centre for the frame whose downsampled luma best
 // matches the prior segment's last kept frame: that frame is the smoothest continuation.
 //
-// Centred on 8*K deliberately. Centring on overlap_px let the band rail-clip as K shrank, which is
-// what produced the wild per-segment trims (measured 22/17/8) at K=2.
+// READ THE ERROR, NOT JUST THE ARGMIN -- see the confidence gate below. An argmin always exists; a
+// MATCH does not, and on a seam where the shot genuinely CHANGES SCENE none of the candidates match
+// at all. Measured 2026-07-30 on an alley->beach crane the whole band sat at MAE 41.3..45.1 out of
+// 255, a 9% spread with no minimum, and the argmin was a two-way tie. That noise used to be applied
+// as a trim (24 here; 10 on the same recipe without drive audio), which is where the wandering came
+// from. Below the gate the answer stands; above it the caller's centre is returned unchanged.
+// LTXAV_TRIM_DEBUG=1 prints the whole curve, the band median, and the verdict.
+//
+// The centre is whatever the caller predicted for this seam, and the band is only [-8, +10] around
+// it, so the answer is NOT independent of the prediction -- a prediction that is off by more than
+// the band rails the search at an edge. (Historically the centre was 8*K; centring on overlap_px
+// let the band rail-clip as K shrank, which produced the wild per-segment trims 22/17/8 at K=2.)
 //
 // Cheap by construction: a 32x18 luma grid per candidate, ~19 candidates, no full-res compare.
 static int ltxav_auto_trim_drop(const sd_image_t& prev_last,
@@ -10538,8 +10548,18 @@ static int ltxav_auto_trim_drop(const sd_image_t& prev_last,
     };
     std::vector<float> reference, candidate;
     grid(prev_last, reference);
+    std::vector<float> errors;
+    errors.reserve(static_cast<size_t>(hi - lo + 1));
     int best_frame = centre;
     float best_error = 1e30f;
+    // LTXAV_TRIM_DEBUG=1 dumps the whole match curve. Worth having permanently: the single number
+    // this function returns cannot tell you whether it found a real minimum or just rail-clipped
+    // at the edge of the band, and those two want opposite fixes.
+    static const bool trim_debug = [] {
+        const char* raw = getenv("LTXAV_TRIM_DEBUG");
+        return raw != nullptr && *raw == '1';
+    }();
+    std::string curve;
     for (int frame = lo; frame <= hi; ++frame) {
         if (frames[frame].data == nullptr) {
             continue;
@@ -10550,10 +10570,55 @@ static int ltxav_auto_trim_drop(const sd_image_t& prev_last,
             mae += std::fabs(reference[i] - candidate[i]);
         }
         mae /= static_cast<float>(reference.size());
+        if (trim_debug) {
+            char cell[32];
+            snprintf(cell, sizeof(cell), " %d:%.2f", frame, mae);
+            curve += cell;
+        }
+        errors.push_back(mae);
         if (mae < best_error) {
             best_error = mae;
             best_frame = frame;
         }
+    }
+    // CONFIDENCE GATE -- refuse to answer when nothing in the band actually matches.
+    //
+    // An argmin always exists; a MATCH does not. Measured 2026-07-30, three seams, same clip
+    // family, LTXAV_TRIM_DEBUG=1:
+    //   continuous walk, seam 1  best 5.62 @16, band median 21.65  -> real minimum, ratio 0.26
+    //   continuous walk, seam 2  best 3.89 @16, band median 29.52  -> real minimum, ratio 0.13
+    //   alley -> beach crane     best 41.28,    band median 41.94  -> NO minimum,   ratio 0.98
+    // The third is a scene change: the previous shot's last frame is nowhere in the continuation,
+    // the whole band is flat noise, and the argmin was a two-way tie decided by float ordering.
+    // That is exactly the number that used to be applied as a trim (24 here, 10 on the same recipe
+    // without drive audio), and on an audio chain it also got carried into the NEXT seam's
+    // prediction, over-trimming a seam whose own search had a clean answer at 17.
+    //
+    // So: below the threshold the measurement stands; at or above it, fall back to the caller's
+    // centre, which is a deliberate estimate rather than the argmin of noise. On a genuinely
+    // static shot every candidate matches, the ratio goes to 1, and falling back is also correct --
+    // every trim looks the same, so there is nothing to gain by moving the cut.
+    constexpr float CONFIDENT_RATIO = 0.6f;
+    float band_median = 0.f;
+    if (!errors.empty()) {
+        std::vector<float> sorted = errors;
+        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+        band_median = sorted[sorted.size() / 2];
+    }
+    const bool confident = band_median > 0.f && best_error <= CONFIDENT_RATIO * band_median;
+    if (trim_debug) {
+        LOG_INFO("LTXAV auto-trim curve (centre %d, band %d..%d, best %d @ %.2f, band median %.2f, "
+                 "ratio %.2f -> %s):%s",
+                 centre, lo, hi, best_frame, best_error, band_median,
+                 band_median > 0.f ? best_error / band_median : 0.f,
+                 confident ? "CONFIDENT" : "no match, using the centre", curve.c_str());
+    }
+    if (!confident) {
+        LOG_INFO("LTXAV auto-trim: no frame in %d..%d reproduces the previous shot's last frame "
+                 "(best MAE %.1f vs band median %.1f) -- this seam is a scene change, not a "
+                 "continuation; keeping the predicted %d-frame trim instead of the argmin of noise",
+                 lo, hi, best_error, band_median, centre);
+        return std::min(centre, std::max(0, n_frames - 1));
     }
     // best_frame is the frame that most closely REPRODUCES the prior segment's last frame -- i.e.
     // the duplicate of a moment the viewer has already seen. Keeping it freezes the action for one
@@ -10850,17 +10915,24 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         sd_ctx->sd->avatar_chain_text_cache_active = true;
     }
 
-    // Last seam the adaptive trim actually measured, fed forward as the next segment's a-priori
-    // estimate. The drive-audio window has to be cut BEFORE a segment renders, but the trim can
-    // only be measured AFTER, so any gap between the two lands as a within-segment A/V offset.
-    // Seams in one clip sit close together (8 and 8, or 8 and 14, on measured chains), so the
-    // previous measurement is a far better predictor than a fixed 8*K -- and it self-corrects
-    // instead of being wrong the same way at every join. -1 = nothing measured yet.
+    // Last seam the trim search actually measured, fed forward as the next segment's a-priori
+    // estimate -- and, on an audio chain, as the next segment's APPLIED trim, since the two are
+    // pinned together there. The drive-audio window has to be cut BEFORE a segment renders but the
+    // trim can only be measured AFTER, so the two can only agree if the applied value is the
+    // predicted one; carrying the previous seam's measurement forward is how the predicted value
+    // still tracks the content. Seams in one clip sit close together (8 and 8, or 8 and 14, on
+    // measured chains). -1 = nothing measured yet.
     int last_measured_seam_drop = -1;
-    // Per-seam (predicted, applied) log so a long chain reports its trim behaviour in ONE
-    // line at the end, instead of the operator having to spot a mid-render WARN. A chain
-    // whose trims all agree is the normal case; any wandering shows up as a spread.
-    std::vector<std::pair<int, int>> seam_trims;
+    // Per-seam trim log so a long chain reports its behaviour in ONE line at the end, instead of
+    // the operator having to spot a mid-render WARN. `applied` == `predicted` is the normal case
+    // (that is the pin); `measured` is what the advisory search wanted, and a wide
+    // measured-vs-applied spread is the honest signal that the prediction models this clip badly.
+    struct SeamTrim {
+        int predicted;
+        int applied;
+        int measured;
+    };
+    std::vector<SeamTrim> seam_trims;
     int carried_frames = std::max(1, chain_params->cont_latent_frames);
     const int overlap_frames = 1 + (carried_frames - 1) * (ltx_chain ? 8 : 4);
     // Seam trim fallback when the caller supplies no pin.
@@ -10946,9 +11018,10 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // Therefore: PIN the trim whenever the engine owns the audio -- i.e. whenever there is anything
     // to desync -- and let the adaptive search run only when a miss cannot cost anything (a
     // picture-only chain). Seam smoothness on the pinned path is the job of frame-count-PRESERVING
-    // polish, not of moving the cut. Caller pin wins; cont_seam_drop_frames == 0 derives 8*K; a
-    // NEGATIVE cont_seam_drop_frames forces the adaptive search back on even with audio (a
-    // diagnostic escape hatch -- it will desync, and the tripwire below says so).
+    // polish, not of moving the cut. Caller pin wins; cont_seam_drop_frames == 0 uses the derived
+    // prediction (overlap_px, then the previous seam's measurement); a NEGATIVE
+    // cont_seam_drop_frames forces the adaptive search back on even with audio (a diagnostic
+    // escape hatch -- it will desync, and the tripwire below says so).
     const bool has_shot_audio    = chain_params->segment_audio_full != nullptr ||
                                    chain_params->segment_audio_track != nullptr;
     const bool has_windowed_audio_dir = chain_params->chain_audio_dir != nullptr &&
@@ -10956,21 +11029,39 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     const bool engine_owns_audio = drive_audio.loaded() || track_audio.loaded() || has_shot_audio ||
                                    has_windowed_audio_dir;
     const bool force_adaptive_seam = chain_params->cont_seam_drop_frames < 0;
-    // ADAPT BY DEFAULT. A derived pin was tried and is wrong for this engine: auto-trim exists
-    // BECAUSE the fixed derived value (8*K) does not hold — the real trim moves per clip, and
-    // assuming it was constant is what made audio skip in the first place. Pinning "fixes" A/V by
-    // forcing the picture to a cut the content did not ask for.
+    // PIN TO THE PREDICTION WHENEVER THE ENGINE OWNS THE AUDIO.
     //
-    // Instead, the PREDICTION adapts: `last_measured_seam_drop` feeds the previous seam's measured
-    // trim forward into the next window's drive-audio cut (seams within one clip sit close
-    // together), and `seam_drop_default` = overlap_px is the first-seam guess, which is what the
-    // search empirically returns. Residual error is therefore bounded to the first seam of a chain
-    // rather than systematic at every join, and the tripwire warning reports any remainder.
+    // The previous revision left the adaptive search APPLIED over audio on the argument that
+    // "the auto-trim search independently lands on overlap_px (measured: 9 at K=2, 17 at K=3), so
+    // predicting overlap_px makes prediction and application agree". MEASURED 2026-07-30, that is
+    // false: on a 2-shot i2v+continuation chain at K=3 with a supplied drive song, the estimate
+    // was 17 and the search applied 24; the SAME recipe and seed with no drive audio applied 10.
+    // The search is a content match — it moves with the content, and the content moves with the
+    // audio conditioning, so no a-priori value can track it.
     //
-    // LTXAV_PIN_SEAM=1 restores the pinned behaviour for diagnosis.
+    // The damage is measurable, not theoretical. Envelope cross-correlation of the delivered
+    // Opus track against the drive song (envelopes, not samples — the audio VAE round-trips the
+    // waveform) put shot 1 at +0.022 s and shot 2 at +0.315 s: the song SKIPS FORWARD by
+    // applied-minus-predicted = 7 frames = 292 ms across the seam, and the shot itself is
+    // rendered 292 ms off the song. Picture and its own generated audio stay together (both take
+    // the same head drop), so the audible defect on this path is a jump in the music; on any path
+    // where the caller re-muxes the SOURCE song against the final timeline it is 292 ms of true
+    // lip-sync error, baked into the pixels.
+    //
+    // So the applied trim is the ESTIMATE, always, whenever there is audio to desync. Note what
+    // that estimate is: NOT the old 8*K, which the 2026-07-28 eye test showed visibly jumping on a
+    // locked-off walk. It is overlap_px at the first seam (the cut that eye test found clean) and
+    // the PREVIOUS seam's measured trim at every seam after it. From the second seam on the
+    // applied trim is therefore content-adaptive AND frame-exact against the audio; only the first
+    // seam of a chain pays for the fact that a trim cannot be measured before the render it has to
+    // precede. The search still runs on this path as an ADVISORY: it reports the gap and feeds the
+    // next seam's estimate, it just no longer moves this shot.
+    //
+    // LTXAV_PIN_SEAM=0 restores apply-the-measurement for A/B (it will desync, and the tripwire
+    // below says so), as does a NEGATIVE cont_seam_drop_frames.
     static const bool pin_seam_env = [] {
         const char* raw = getenv("LTXAV_PIN_SEAM");
-        return raw != nullptr && *raw == '1';
+        return raw == nullptr || *raw != '0';
     }();
     const bool pin_derived_seam = pin_seam_env && engine_owns_audio && !force_adaptive_seam &&
                                   chain_params->cont_seam_drop_frames == 0;
@@ -10981,10 +11072,11 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                      chain_params->cont_seam_drop_frames,
                      chain_params->segment_seam_drop_frames != nullptr ? " (per-shot entries supersede)" : "");
         } else if (pin_derived_seam) {
-            LOG_INFO("generate_video_chain: seam trim PINNED to the derived %d frames (K=%d -> 8*K; guide "
-                     "overlap_px=%d) because the engine owns the audio -> picture and sound are "
-                     "frame-exact at every seam",
-                     seam_drop_default, carried_frames, overlap_frames);
+            LOG_INFO("generate_video_chain: seam trim PINNED to this seam's PREDICTION (first seam %d = "
+                     "guide overlap_px, K=%d; later seams inherit the previous seam's measured trim) "
+                     "because the engine owns the audio -> the drive-audio window and the applied trim "
+                     "agree at every seam. The auto-trim search still runs as an advisory.",
+                     seam_drop_default, carried_frames);
         } else {
             LOG_INFO("generate_video_chain: seam trim CONTENT-ADAPTIVE (search centred on %d, guide "
                      "overlap_px=%d)%s",
@@ -11561,15 +11653,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const int declared_drop = chain_params->segment_seam_drop_frames != nullptr
                                       ? chain_params->segment_seam_drop_frames[segment]
                                       : -1;
-        // A-priori estimate: it cuts this segment's drive-audio window, so the closer it is to the
-        // trim we will actually apply, the tighter A/V stays. This now runs for AUDIO chains too:
-        // pinning is off by default (see pin_derived_seam), so the prediction is what adapts.
-        // Seams within one clip sit close together, so the previous seam's MEASURED trim predicts
-        // the next far better than any fixed derivation -- and it self-corrects instead of being
-        // wrong the same way at every join. Only the first seam of a chain falls back to
-        // seam_drop_default (= overlap_px, what the search empirically returns).
+        // A-priori estimate. On an audio chain this is not merely the estimate, it IS the trim
+        // (pin_derived_seam), because it is also what cut this segment's drive-audio window and
+        // only equality keeps the shot on the song. So it has to be as close to the content's
+        // preference as something knowable-before-the-render can be:
+        //
+        //   first seam of a chain -> seam_drop_default = overlap_px, the guide's decoded length
+        //                            and the cut the 2026-07-28 eye test found clean;
+        //   every seam after it   -> last_measured_seam_drop, what the advisory search actually
+        //                            measured at the previous seam of THIS clip.
+        //
+        // Seams within one clip sit close together, so the carry-forward makes the applied trim
+        // content-adaptive from the second seam on without ever letting it disagree with the audio
+        // window. It applies on the pinned path too -- that is the whole point of measuring a trim
+        // we are not going to apply here.
         const int seam_drop_estimate =
-            (declared_drop < 0 && chain_params->cont_seam_drop_frames <= 0 && !pin_derived_seam &&
+            (declared_drop < 0 && chain_params->cont_seam_drop_frames <= 0 &&
              last_measured_seam_drop >= 0)
                 ? last_measured_seam_drop
                 : seam_drop_default;
@@ -11702,49 +11801,71 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                      chain_params->on_segment_user);
         }
         free(latent);
-        // The trim: an explicit pin from the caller is authoritative (koblem sends 8*K), and the
-        // derived 8*K is itself a pin whenever the engine owns the audio -- because the drive slice
-        // was cut a priori against exactly this number, and only equality makes A/V exact. The
+        // The trim: an explicit pin from the caller is authoritative, and the PREDICTION is itself
+        // a pin whenever the engine owns the audio -- because the drive slice was cut a priori
+        // against exactly this number, and only equality keeps the shot on the song. The
         // content-adaptive search, which aligns the cut to the smoothest continuation rather than
-        // trusting 8*K, therefore runs ONLY on a picture-only chain (or when a caller forces it),
+        // to the prediction, is APPLIED only on a picture-only chain (or when a caller forces it),
         // where a miss costs nothing but a slightly different join.
         //
-        // Using the measured drop for BOTH the video trim and this segment's audio head-drop keeps
-        // those two aligned within the segment, and the next segment re-anchors its drive window to
-        // the true accumulated timeline, so an adaptive miss cannot accumulate across seams. It
-        // still cannot undo the fact that the shot was RENDERED against a mispositioned drive
-        // window -- which is why the pin exists.
+        // It still RUNS on the pinned path, because a measurement we do not apply here is exactly
+        // what makes the NEXT seam of this clip both adaptive and exact: it becomes that seam's
+        // prediction, and therefore also cuts that seam's drive-audio window.
+        //
+        // Using one drop for BOTH the video trim and this segment's audio head-drop keeps those two
+        // aligned within the segment, and the next segment re-anchors its drive window to the true
+        // accumulated timeline, so a miss cannot accumulate across seams. It still cannot undo the
+        // fact that the shot was RENDERED against a mispositioned drive window -- which is why the
+        // pin exists.
         int effective_seam_drop = seam_drop;
         // Beats pin the trim for exactly the reason audio does. This shot's beat
         // frames were already shifted by `seam_drop` (the a-priori estimate) so
         // that a beat authored at visible t=0 lands on the first frame the viewer
         // keeps. If the adaptive search then applies a different trim, every beat
         // in the shot is off by the difference -- baked into the pixels, and not
-        // knowable at shift time because the search runs after the render. One
-        // seam joined at 8*K instead of the smoothest cut is the cheaper error.
-        const bool seam_drop_pinned = declared_drop >= 0 || chain_params->cont_seam_drop_frames > 0 ||
-                                      pin_derived_seam || params.beat_count > 0;
-        if (seam_drop > 0 && !seam_drop_pinned && !stitched.empty() && segment_count > 2) {
+        // knowable at shift time because the search runs after the render.
+        const bool caller_pinned_seam = declared_drop >= 0 || chain_params->cont_seam_drop_frames > 0;
+        const bool seam_drop_pinned = caller_pinned_seam || pin_derived_seam || params.beat_count > 0;
+        if (seam_drop > 0 && !stitched.empty() && segment_count > 2) {
             const int measured = ltxav_auto_trim_drop(stitched.back(), segment_frames, segment_count, seam_drop);
-            // TRIPWIRE. The drive window for THIS segment was already cut against seam_drop, so a
-            // measured trim that differs by delta offsets this segment's A/V by delta -- baked into
-            // the pixels, not fixable by re-muxing. With the pin above this branch is unreachable
-            // whenever there is any audio at all, so the warning should NEVER fire; if it does,
-            // either a caller forced the adaptive search on over audio or the pin has regressed.
-            if (measured != seam_drop) {
-                const int delta = std::abs(measured - seam_drop);
-                LOG_INFO("generate_video_chain: window %d seam auto-trim -> drop %d (estimate was %d)",
-                         segment + 1, measured, seam_drop);
-                if (engine_owns_audio) {
-                    LOG_WARN("generate_video_chain: window %d drive audio was cut for a %d-frame trim "
-                             "but %d was applied — this shot's A/V is offset by %d frame(s); the next "
-                             "shot re-anchors to the true timeline so it cannot accumulate",
-                             segment + 1, seam_drop, measured, delta);
+            if (!seam_drop_pinned) {
+                // TRIPWIRE. The drive window for THIS segment was already cut against seam_drop, so
+                // a measured trim that differs by delta offsets this segment against the song by
+                // delta -- baked into the pixels, not fixable by re-muxing. With the pin above,
+                // this branch is unreachable whenever there is any audio at all, so the warning
+                // should never fire; if it does, a caller forced the adaptive search on over audio
+                // (LTXAV_PIN_SEAM=0 or a negative cont_seam_drop_frames) or the pin has regressed.
+                if (measured != seam_drop) {
+                    const int delta = std::abs(measured - seam_drop);
+                    LOG_INFO("generate_video_chain: window %d seam auto-trim -> drop %d (estimate was %d)",
+                             segment + 1, measured, seam_drop);
+                    if (engine_owns_audio) {
+                        LOG_WARN("generate_video_chain: window %d drive audio was cut for a %d-frame trim "
+                                 "but %d was applied — this shot sits %d frame(s) off the song; the next "
+                                 "shot re-anchors to the true timeline so it cannot accumulate",
+                                 segment + 1, seam_drop, measured, delta);
+                    }
                 }
+                effective_seam_drop = measured;
+            } else if (measured != seam_drop) {
+                // ADVISORY ONLY. Applying this would move the picture off the audio window that
+                // was already cut for `seam_drop`, which is the desync this pin exists to prevent.
+                // It is still worth measuring and worth saying out loud: a large or wandering gap
+                // means the prediction is a poor model of this clip's content, which is a real
+                // (picture-side) finding even though nothing here acts on it.
+                LOG_INFO("generate_video_chain: window %d seam auto-trim ADVISORY -> would have dropped "
+                         "%d, applied the predicted %d (delta %d)%s",
+                         segment + 1, measured, seam_drop, std::abs(measured - seam_drop),
+                         caller_pinned_seam ? " — caller pin, not carried forward"
+                                            : " — carried forward as the next seam's prediction");
             }
-            effective_seam_drop = measured;
-            last_measured_seam_drop = measured;
-            seam_trims.emplace_back(seam_drop, measured);
+            // Feed the measurement forward unless the caller dictated this seam's trim: at the next
+            // seam it becomes both the applied trim and the drive-audio cut, so the chain converges
+            // on the content's preference without ever letting the two disagree.
+            if (!caller_pinned_seam) {
+                last_measured_seam_drop = measured;
+            }
+            seam_trims.push_back({seam_drop, effective_seam_drop, measured});
         }
         // The REFERENCE HEAD TRIM rides on the same output-side head drop as the seam trim: the
         // frames and this shot's own audio are cut by the same amount, and nothing before the
@@ -11871,17 +11992,24 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         if (!seam_trims.empty()) {
             std::string detail;
             int worst = 0;
-            for (const auto& [predicted, applied] : seam_trims) {
-                detail += " " + std::to_string(applied);
-                if (predicted != applied) {
-                    detail += "(pred " + std::to_string(predicted) + ")";
+            int widest_advice = 0;
+            for (const auto& trim : seam_trims) {
+                detail += " " + std::to_string(trim.applied);
+                if (trim.predicted != trim.applied) {
+                    detail += "(pred " + std::to_string(trim.predicted) + ")";
                 }
-                worst = std::max(worst, std::abs(applied - predicted));
+                if (trim.measured != trim.applied) {
+                    detail += "[search wanted " + std::to_string(trim.measured) + "]";
+                }
+                worst = std::max(worst, std::abs(trim.applied - trim.predicted));
+                widest_advice = std::max(widest_advice, std::abs(trim.measured - trim.applied));
             }
             LOG_INFO("generate_video_chain: seam trims applied:%s | worst predicted-vs-applied gap %d "
-                     "frame(s)%s",
+                     "frame(s)%s | widest unapplied search advice %d frame(s)",
                      detail.c_str(), worst,
-                     worst == 0 ? " — A/V exact at every seam" : " (that shot's mouths sit that far off)");
+                     worst == 0 ? " — every shot sits exactly where its drive-audio window put it"
+                                : " (that shot sits that far off the song)",
+                     widest_advice);
         }
         *frames_out = nullptr;
         *num_frames_out = static_cast<int>(final_frame_count);
