@@ -11142,6 +11142,25 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     auto timeline_frames = [&]() -> long long {
         return flushed_total + static_cast<long long>(stitched.size());
     };
+    // ── DRIVE-AUDIO TIMELINE SKEW ───────────────────────────────────────────────────────────────
+    // Frames of the DRIVE timeline that were rendered and then discarded, and whose audio no other
+    // shot covers. Output timeline frame t is driven by drive frame `t + drive_head_trimmed`, and
+    // everything that reads the drive or deliverable timeline has to add it.
+    //
+    // Only the REFERENCE HEAD TRIM contributes. A seam drop discards frames too, but those are the
+    // continuation overlap -- the previous shot already showed that stretch of the song, so the
+    // timeline does not advance past it. A reference head trim discards frames nothing else covers,
+    // so the song genuinely runs on underneath them.
+    //
+    // Measured 2026-07-30 on a bare t2v opener with two character references (AUTO -> 1 frame):
+    // envelope lag against the drive song was +0.022 s with the trim off and +0.062 s with it on,
+    // a clean +0.040 s = 0.96 frames, while both deliverable-track paths handed back the source at
+    // NCC 0.9977 lag 0.00. One frame of lip desync, 41.7 ms, in every shipped clip that trims.
+    //
+    // Unlike the seam trim this is repairable output-side: shot 0 ESTABLISHES the timeline instead
+    // of having to match one, so nothing has to be predicted before the render -- the trim is
+    // reported back after it and every consumer of the offset runs later.
+    int64_t drive_head_trimmed = 0;
     auto fail = [&]() {
         release_stitched();
         // Reclaim GPU memory on a failed/aborted job too, so a persistent worker
@@ -11176,7 +11195,14 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         const size_t end = static_cast<size_t>(start + count) * audio->channels;
         chain_audio_samples.insert(chain_audio_samples.end(), audio->data + begin, audio->data + end);
     };
-    auto append_shot_track = [&](const char* path, int kept_frames) -> bool {
+    // A per-shot deliverable track is on the SAME clock as that shot's per-shot drive WAV, which
+    // is the shot AS RENDERED -- frame 0 of the track is frame 0 of the render, seam overlap and
+    // contaminated reference head included. So it takes the same head drop the picture and the
+    // generated audio take (see append_audio, which has always done this). Reading it from t=0
+    // instead shipped the shot's picture `drop` frames ahead of its own deliverable: measured
+    // 2026-07-30, one frame (41.7 ms) on a head-trimmed t2v opener, and it would be the whole
+    // seam drop -- 17 frames, 708 ms -- on any continuation shot carrying per-shot audio.
+    auto append_shot_track = [&](const char* path, int drop_frames, int kept_frames) -> bool {
         if (path == nullptr || path[0] == '\0') {
             return true;
         }
@@ -11196,11 +11222,17 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                       sample_rate, channels, chain_audio_rate, chain_audio_channels);
             return false;
         }
-        const size_t wanted = static_cast<size_t>(std::llround(
-            static_cast<double>(std::max(0, kept_frames)) * sample_rate / std::max(1, base_params->fps)));
+        const int fps = std::max(1, base_params->fps);
         const size_t available = samples.size() / channels;
-        const size_t copy = std::min(wanted, available);
-        chain_audio_samples.insert(chain_audio_samples.end(), samples.begin(), samples.begin() + copy * channels);
+        const size_t start = std::min<size_t>(available,
+                                              static_cast<size_t>(std::llround(
+                                                  static_cast<double>(std::max(0, drop_frames)) * sample_rate / fps)));
+        const size_t wanted = static_cast<size_t>(std::llround(
+            static_cast<double>(std::max(0, kept_frames)) * sample_rate / fps));
+        const size_t copy = std::min(wanted, available - start);
+        chain_audio_samples.insert(chain_audio_samples.end(),
+                                   samples.begin() + start * channels,
+                                   samples.begin() + (start + copy) * channels);
         chain_audio_samples.insert(chain_audio_samples.end(), (wanted - copy) * channels, 0.f);
         return true;
     };
@@ -11353,6 +11385,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // LENGTH PIN: if this segment banked its kept count, honour it verbatim. Re-deriving the
         // drop here would let a retake reproduce a DIFFERENT prefix length and slide every
         // downstream segment (and its audio) along the timeline.
+        const int seam_policy_drop = drop;
         const int banked_kept = read_seg_len(std::string(chain_params->bank_dir) + "/seg_" +
                                              std::to_string(segment) + ".len");
         if (banked_kept >= 0 && banked_kept <= count) {
@@ -11364,10 +11397,29 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             }
             drop = pinned_drop;
         }
+        // A banked drop on a shot the seam policy says to drop NOTHING from is a reference head
+        // trim this prefix shot took when it was first rendered. It skewed the drive clock then
+        // and it has to skew it again now, or the shots this resume actually re-renders get their
+        // drive windows cut against a clock the restored prefix does not share.
+        //
+        // Gated on seam_policy_drop == 0 and not just on the difference: only an opener-shaped
+        // shot can carry a head trim (it self-gates off i2v, keyframe-at-0 and continuation, all
+        // of which also force this drop to 0), so on a continuation shot a banked-vs-policy
+        // difference means the CALLER changed the seam policy between renders, which is not a
+        // trim and must not move the clock.
+        const int restored_head_trim = seam_policy_drop == 0 ? std::max(0, drop) : 0;
+        if (restored_head_trim > 0) {
+            drive_head_trimmed += restored_head_trim;
+            LOG_INFO("generate_video_chain: restored window %d carried a %d-frame reference head "
+                     "trim -> drive clock now %lld frame(s) ahead of the output timeline",
+                     segment + 1, restored_head_trim, (long long)drive_head_trimmed);
+        }
         if (!track_audio.loaded() && chain_params->segment_audio_track != nullptr &&
             chain_params->segment_audio_track[segment] != nullptr &&
             chain_params->segment_audio_track[segment][0] != '\0' &&
-            !append_shot_track(chain_params->segment_audio_track[segment], count - std::min(drop, count))) {
+            !append_shot_track(chain_params->segment_audio_track[segment],
+                               std::min(drop, count),
+                               count - std::min(drop, count))) {
             for (int frame = 0; frame < count; ++frame) free(banked_frames[frame].data);
             free(banked_frames);
             return fail();
@@ -11716,7 +11768,12 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             params.drive_audio_path = drive_audio_path.c_str();
         } else if (drive_audio.loaded()) {
             const int drop = seam_drop;
-            const int64_t timeline_start = static_cast<int64_t>(timeline_frames()) - drop;
+            // + drive_head_trimmed: an earlier shot discarded that many rendered frames off its
+            // head, so the song is that far ahead of the output timeline from there on. Without
+            // it every shot after a head-trimmed one would be re-cut against a stale clock and the
+            // fix for shot 0 would break shot 1.
+            const int64_t timeline_start =
+                static_cast<int64_t>(timeline_frames()) - drop + drive_head_trimmed;
             const auto slice = drive_audio.window(timeline_start,
                                                   params.video_frames,
                                                   std::max(1, params.fps),
@@ -11889,8 +11946,13 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // the byte; the leave-one-frame floor only comes into force once a trim is in play.
         const int head_drop_limit = reference_head_trim > 0 ? std::max(0, segment_count - 1) : segment_count;
         const int audio_drop      = std::min(effective_seam_drop + reference_head_trim, head_drop_limit);
+        // Only the part of the head drop that is a REFERENCE trim advances the drive clock -- and
+        // only by as much as actually survived the head_drop_limit clamp. The seam part is overlap
+        // the previous shot already showed.
+        const int drive_skipped = std::max(0, audio_drop - effective_seam_drop);
         if (chain_params->segment_audio_track != nullptr) {
-            if (!append_shot_track(chain_params->segment_audio_track[segment], segment_count - audio_drop)) {
+            if (!append_shot_track(chain_params->segment_audio_track[segment], audio_drop,
+                                   segment_count - audio_drop)) {
                 free_sd_audio(segment_audio);
                 for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
                 free(segment_frames);
@@ -11912,6 +11974,15 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         }
         free_sd_audio(segment_audio);
         adopt_frames(segment_frames, segment_count, audio_drop);
+        // Advance the drive clock AFTER this shot's own windows are cut and its audio appended:
+        // the skew applies to everything downstream of the discarded frames, not to them.
+        if (drive_skipped > 0) {
+            drive_head_trimmed += drive_skipped;
+            LOG_INFO("generate_video_chain: window %d discarded %d rendered frame(s) of drive audio "
+                     "no other shot covers -> the song now runs %lld frame(s) ahead of the output "
+                     "timeline; later drive windows and the deliverable track follow it",
+                     segment + 1, drive_skipped, (long long)drive_head_trimmed);
+        }
         // Everything but the retained suffix is final now; hand it over before the next window
         // allocates, so peak RAM is one segment plus the window rather than the whole clip.
         flush_window(false);
@@ -11964,7 +12035,8 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             if (chain_params->segment_audio_track != nullptr &&
                 chain_params->segment_audio_track[segment] != nullptr &&
                 chain_params->segment_audio_track[segment][0] != '\0' &&
-                !append_shot_track(chain_params->segment_audio_track[segment], segment_count - drop)) {
+                !append_shot_track(chain_params->segment_audio_track[segment], drop,
+                                   segment_count - drop)) {
                 for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
                 free(segment_frames);
                 return fail();
@@ -12024,7 +12096,23 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     }
     if (audio_out != nullptr) {
         if (track_audio.loaded()) {
-            const auto track = track_audio.window(0,
+            // Starts at drive_head_trimmed, not 0: the render consumed that much of the song
+            // driving frames it then discarded, so output timeline 0 IS song frame
+            // drive_head_trimmed. Handing back the song from 0 while the picture sings from
+            // drive_head_trimmed is a straight lip desync, and this is the DELIVERABLE path --
+            // the track is copied verbatim, so the error lands whole rather than smeared by the
+            // audio VAE.
+            //
+            // One contiguous window can only carry ONE offset. Every shot but a bare t2v opener
+            // self-gates the reference trim off, so in practice only shot 0 ever moves this; a
+            // chain where a later shot trims too would need the deliverable accumulated per shot,
+            // and says so rather than shipping a wrong number quietly.
+            if (drive_head_trimmed > 0) {
+                LOG_INFO("generate_video_chain: deliverable track starts %lld frame(s) into the "
+                         "supplied audio, matching the reference head trim the picture took",
+                         (long long)drive_head_trimmed);
+            }
+            const auto track = track_audio.window(drive_head_trimmed,
                                                   final_frame_count,
                                                   std::max(1, base_params->fps),
                                                   audio_offset);
