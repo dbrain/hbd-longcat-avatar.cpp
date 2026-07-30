@@ -425,6 +425,21 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
         error = "model or GPU switch requires the active worker to be idle";
         return false;
     }
+    // Try an IN-PROCESS variant swap before recycling. Saves ~36 s per switch (~40 s recycle
+    // + ~29 GB reload vs ~4 s swap). Preconditions, all of them load-bearing:
+    //   * same GPU -- CUDA_VISIBLE_DEVICES is applied before execv, so a GPU change genuinely
+    //     needs a new process and can never be a swap;
+    //   * a variant map -- a legacy single-model `-m` server has nothing to swap between;
+    //   * child alive, and idle including its QUEUE (the child re-checks and 409s).
+    // Any non-200 falls through to the recycle below, which is required and not merely
+    // preferred: sd_ctx_swap_diffusion_model's late failure paths can leave the DiT
+    // unregistered, so the respawn is the repair.
+    if (inproc_model_switch_enabled() && pid_ > 0 && active_gpu_ == gpu && !variants_.empty() &&
+        variants_.find(model) != variants_.end() && swap_child_model(port_, model)) {
+        active_model_ = model;
+        return true;
+    }
+
     if (!unload_locked()) {
         error = "could not terminate the prior GPU worker";
         return false;
@@ -483,6 +498,26 @@ bool WorkerSupervisor::ensure_worker_locked(const std::string& requested_model,
         return false;
     }
     return true;
+}
+
+// LTX_INPROC_MODEL_SWITCH=1 opts in. Default OFF: the swap replaces a guaranteed-zero
+// allocator watermark with a live-context free/realloc, and whether that fragments the CUDA
+// heap over many switches is empirical.
+bool WorkerSupervisor::inproc_model_switch_enabled() {
+    const char* value = std::getenv("LTX_INPROC_MODEL_SWITCH");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool WorkerSupervisor::swap_child_model(int port, const std::string& model) {
+    if (port <= 0) return false;
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(2, 0);
+    // Registration walks every tensor of the incoming DiT; the weights themselves load
+    // lazily afterwards, but this call is not instant.
+    client.set_read_timeout(180, 0);
+    const auto response = client.Post("/v1/admin/swap_model",
+                                      json({{"model", model}}).dump(), "application/json");
+    return response && response->status == 200;
 }
 
 bool WorkerSupervisor::child_busy_on_port(int port) {

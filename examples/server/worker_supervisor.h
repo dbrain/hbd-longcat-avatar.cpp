@@ -55,6 +55,8 @@ private:
     static std::string request_gpu(const httplib::Request& request);
     bool child_busy();
     static bool child_busy_on_port(int port);
+    static bool inproc_model_switch_enabled();
+    static bool swap_child_model(int port, const std::string& model);
     static std::map<std::string, std::string> build_variants(const std::string& base_model,
                                                               const std::string& edit_model,
                                                               const std::string& variants_spec);
