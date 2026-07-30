@@ -161,7 +161,19 @@ def main():
 
     if a.vs_gguf:
         g2, b2, i2 = read_gguf(a.vs_gguf)
-        get_ref = lambda n: gguf_tensor(g2, b2, i2, n)[0]
+
+        # ★ The reference's OWN `.wglobal` must be applied, exactly as it is for the
+        # primary file below. Omitting it silently rescales the reference by
+        # 1/wglobal (~2.7e3 for LTX), so an IDENTICAL pair projects at ~4e-4 and the
+        # tool reports "the convert is losing the weights" on a perfect file. Both
+        # nvfp4-CLEAN.gguf and every route-B build carry sidecars, so this hit the
+        # exact comparison the docstring recommends.
+        def get_ref(n):
+            r = gguf_tensor(g2, b2, i2, n)[0]
+            if n + ".wglobal" in i2:
+                r = r * gguf_tensor(g2, b2, i2, n + ".wglobal")[0][0]
+            return r
+
         missing = lambda n: n not in i2
         label = a.vs_gguf
     else:

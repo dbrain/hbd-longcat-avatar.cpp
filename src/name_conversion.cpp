@@ -231,7 +231,11 @@ std::string convert_diffusers_unet_to_original_sd1(std::string name) {
     };
 
     static std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
-    if (unet_conversion_map_layer.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool unet_conversion_map_layer_initialized = [&]() {
         for (int i = 0; i < 4; ++i) {
             // down_blocks
             for (int j = 0; j < 2; ++j) {
@@ -277,7 +281,9 @@ std::string convert_diffusers_unet_to_original_sd1(std::string name) {
             std::string sd_mid_res_prefix = "middle_block." + std::to_string(2 * j) + ".";
             unet_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
         }
-    }
+        return true;
+    }();
+    (void)unet_conversion_map_layer_initialized;
 
     std::string result = name;
 
@@ -346,7 +352,11 @@ std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
     };
 
     static std::vector<std::pair<std::string, std::string>> unet_conversion_map_layer;
-    if (unet_conversion_map_layer.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool unet_conversion_map_layer_initialized = [&]() {
         for (int i = 0; i < 3; ++i) {
             // --- down_blocks ---
             for (int j = 0; j < 2; ++j) {
@@ -395,7 +405,9 @@ std::string convert_diffusers_unet_to_original_sdxl(std::string name) {
             std::string sd_mid_res_prefix = "middle_block." + std::to_string(2 * j) + ".";
             unet_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
         }
-    }
+        return true;
+    }();
+    (void)unet_conversion_map_layer_initialized;
 
     std::string result = name;
 
@@ -435,7 +447,11 @@ std::string convert_diffusers_dit_to_original_sd3(std::string name) {
     int num_layers = 38;
     static std::unordered_map<std::string, std::string> sd3_name_map;
 
-    if (sd3_name_map.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool sd3_name_map_initialized = [&]() {
         // --- time_text_embed ---
         sd3_name_map["time_text_embed.timestep_embedder.linear_1.weight"] = "t_embedder.mlp.0.weight";
         sd3_name_map["time_text_embed.timestep_embedder.linear_1.bias"]   = "t_embedder.mlp.0.bias";
@@ -530,7 +546,9 @@ std::string convert_diffusers_dit_to_original_sd3(std::string name) {
         sd3_name_map["proj_out.bias"]          = "final_layer.linear.bias";
         sd3_name_map["norm_out.linear.weight"] = "final_layer.adaLN_modulation.1.weight";
         sd3_name_map["norm_out.linear.bias"]   = "final_layer.adaLN_modulation.1.bias";
-    }
+        return true;
+    }();
+    (void)sd3_name_map_initialized;
 
     replace_with_prefix_map(name, sd3_name_map);
 
@@ -542,7 +560,11 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
     int num_single_layers = 38;
     static std::unordered_map<std::string, std::string> flux_name_map;
 
-    if (flux_name_map.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool flux_name_map_initialized = [&]() {
         // --- time_embed (longcat) ---
         flux_name_map["time_embed.timestep_embedder.linear_1.weight"] = "time_in.in_layer.weight";
         flux_name_map["time_embed.timestep_embedder.linear_1.bias"]   = "time_in.in_layer.bias";
@@ -657,7 +679,9 @@ std::string convert_diffusers_dit_to_original_flux(std::string name) {
         flux_name_map["proj_out.bias"]          = "final_layer.linear.bias";
         flux_name_map["norm_out.linear.weight"] = "final_layer.adaLN_modulation.1.weight";
         flux_name_map["norm_out.linear.bias"]   = "final_layer.adaLN_modulation.1.bias";
-    }
+        return true;
+    }();
+    (void)flux_name_map_initialized;
 
     replace_with_prefix_map(name, flux_name_map);
 
@@ -669,7 +693,11 @@ std::string convert_hunyuan_video_to_original_flux(std::string name) {
     int num_single_layers = 0;
     static std::unordered_map<std::string, std::string> hy_name_map;
 
-    if (hy_name_map.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool hy_name_map_initialized = [&]() {
         // --- double transformer blocks ---
         for (int i = 0; i < num_layers; ++i) {
             std::string block_prefix = "double_blocks." + std::to_string(i) + ".";
@@ -699,7 +727,9 @@ std::string convert_hunyuan_video_to_original_flux(std::string name) {
             hy_name_map[block_prefix + "img_attn_proj"] = dst_prefix + "img_attn.proj";
             hy_name_map[block_prefix + "txt_attn_proj"] = dst_prefix + "txt_attn.proj";
         }
-    }
+        return true;
+    }();
+    (void)hy_name_map_initialized;
 
     hy_name_map["time_in.mlp.0"]     = "time_in.in_layer";
     hy_name_map["time_in.mlp.2"]     = "time_in.out_layer";
@@ -735,7 +765,11 @@ std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
     int num_refiner_layers = 2;
     static std::unordered_map<std::string, std::string> z_image_name_map;
 
-    if (z_image_name_map.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool z_image_name_map_initialized = [&]() {
         z_image_name_map["all_x_embedder.2-1."]  = "x_embedder.";
         z_image_name_map["all_final_layer.2-1."] = "final_layer.";
 
@@ -761,7 +795,9 @@ std::string convert_diffusers_dit_to_original_lumina2(std::string name) {
         add_attention_map("noise_refiner.", num_refiner_layers);
         add_attention_map("context_refiner.", num_refiner_layers);
         add_attention_map("layers.", num_layers);
-    }
+        return true;
+    }();
+    (void)z_image_name_map_initialized;
 
     replace_with_prefix_map(name, z_image_name_map);
 
@@ -893,7 +929,11 @@ std::string convert_diffusers_vae_to_original_sd1(std::string name) {
     };
 
     static std::vector<std::pair<std::string, std::string>> vae_conversion_map_layer;
-    if (vae_conversion_map_layer.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool vae_conversion_map_layer_initialized = [&]() {
         for (int i = 0; i < 4; ++i) {
             // --- encoder down blocks ---
             for (int j = 0; j < 2; ++j) {
@@ -926,7 +966,9 @@ std::string convert_diffusers_vae_to_original_sd1(std::string name) {
             std::string sd_mid_res_prefix = "mid.block_" + std::to_string(i + 1) + ".";
             vae_conversion_map_layer.emplace_back(sd_mid_res_prefix, hf_mid_res_prefix);
         }
-    }
+        return true;
+    }();
+    (void)vae_conversion_map_layer_initialized;
 
     static const std::vector<std::pair<std::string, std::string>> vae_conversion_map_attn = {
         {"norm.", "group_norm."},
@@ -1253,7 +1295,11 @@ bool is_first_stage_model_name(const std::string& name) {
 static std::string convert_esrgan_tensor_name(std::string name) {
     static std::unordered_map<std::string, std::string> esrgan_name_map;
 
-    if (esrgan_name_map.empty()) {
+    // Thread-safe one-time fill: a bare `if (map.empty())` lets several threads
+    // populate the same static concurrently -- that is a heap-corrupting data race
+    // (hit by the 12-thread `-M convert` path). A function-local static's
+    // initialiser is guaranteed by C++11 to run exactly once.
+    static const bool esrgan_name_map_initialized = [&]() {
         esrgan_name_map["model.0."] = "conv_first.";
 
         constexpr int max_num_blocks = 64;
@@ -1279,7 +1325,9 @@ static std::string convert_esrgan_tensor_name(std::string name) {
         esrgan_name_map["model.7."]  = "conv_last.";
         esrgan_name_map["model.8."]  = "conv_hr.";
         esrgan_name_map["model.10."] = "conv_last.";
-    }
+        return true;
+    }();
+    (void)esrgan_name_map_initialized;
 
     replace_with_prefix_map(name, esrgan_name_map);
     return name;
