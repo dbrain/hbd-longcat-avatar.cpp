@@ -145,9 +145,22 @@ def adapter_stems(h):
     return out
 
 
+def _as_f32(u, dt):
+    """safetensors raw bytes -> f32. F16 is NOT hypothetical: ai-toolkit writes the
+    krea2_edit adapters in F16, and view(float32) on those halves the tensor and reads
+    pairs of halves as garbage floats — a silently wrong merge, not a crash."""
+    if dt == "BF16":
+        return bf16_to_f32(u)
+    if dt in ("F16", "FP16"):
+        return u.view(np.float16).astype(np.float32)
+    if dt in ("F32", "FP32"):
+        return u.view(np.float32)
+    raise SystemExit(f"unsupported safetensors dtype {dt}")
+
+
 def _st_f32(f, base, h, key):
     u, dt, sh = st_raw(f, base, h, key)
-    x = bf16_to_f32(u) if dt == "BF16" else u.view(np.float32)
+    x = _as_f32(u, dt)
     return x.reshape(sh).astype(np.float64) if sh else x.astype(np.float64)
 
 
@@ -301,7 +314,7 @@ def main():
     for i, (n, d, t) in enumerate(plan):
         oname = base_pfx + n
         u, dt, sh = st_raw(fb, bb, hb, oname)
-        x = bf16_to_f32(u) if dt == "BF16" else u.view(np.float32)
+        x = _as_f32(u, dt)
         x = x.reshape(sh).astype(np.float64)
         stem = lora_pfx + n[:-len(".weight")] if n.endswith(".weight") else None
         hit = False

@@ -37,6 +37,12 @@ def main():
     ap.add_argument("--mult", type=float, required=True)
     ap.add_argument("--tensors", type=int, default=10)
     ap.add_argument("--min-projection", type=float, default=0.85)
+    # See the B3 comment: a one-sided floor cannot catch a reader/units bug.
+    ap.add_argument("--max-projection", type=float, default=1.15)
+    # Deliberately loose. Requantising the base perturbs it by 1.2-3.6x the delta for a
+    # small LoRA, so an HONEST route-B fold measures cosine ~0.3-0.8, not ~1.0. This is
+    # only here to catch a transpose / wrong-tensor read, which lands near 0.
+    ap.add_argument("--min-cosine", type=float, default=0.15)
     # ★ B2's floor is CONVENTION-DEPENDENT, so it defaults to None and is resolved below.
     # UNFOLDED builds recompute a per-tensor wglobal from the MERGED weights, which shifts the
     # effective scale of every block a hair -> ~94% of elements "move" no matter how small the
@@ -146,8 +152,18 @@ def main():
         print(f"  B2 CHANGED   : PASS (>= {a.min_changed}%)")
     print(f"  B3 DIRECTION : projection {mp_:.4f}  cosine {mc:.4f}")
     print(f"       route A (frozen grid) measures ~0.36 here; route B should be ~1.0.")
-    if mp_ < a.min_projection:
-        fails.append(f"B3 DIRECTION: projection {mp_:.4f} < {a.min_projection}")
+    # BRACKET it, do not just floor it. This gate was one-sided and passed a projection of
+    # 1.2e26 on the krea2 snofs+idedit build -- a units bug in the reader printed as SUCCESS,
+    # which is worse than a failure because nobody looks twice at a PASS. A correct route-B
+    # fold lands ~1.0; anything far above is as broken as anything far below. Cosine is
+    # scale-invariant, so it is checked too: it is the only number a units bug cannot fake.
+    if mp_ < a.min_projection or mp_ > a.max_projection:
+        fails.append(f"B3 DIRECTION: projection {mp_:.4f} outside "
+                     f"[{a.min_projection}, {a.max_projection}]")
+        print("  B3 DIRECTION : FAIL")
+    elif mc < a.min_cosine:
+        fails.append(f"B3 DIRECTION: cosine {mc:.4f} < {a.min_cosine} "
+                     f"(direction is wrong even though the magnitude looks plausible)")
         print("  B3 DIRECTION : FAIL")
     else:
         print(f"  B3 DIRECTION : PASS (>= {a.min_projection})")
