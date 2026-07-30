@@ -1887,6 +1887,19 @@ struct WeightAdapter {
                                            ForwardParams forward_params,
                                            ggml_tensor* base_output_scale = nullptr)                                                = 0;
     virtual size_t get_extra_graph_size()                                                                                             = 0;
+
+    // May the caller feed this adapter an F16 activation?
+    //
+    // forward_with_lora() runs `x @ A^T @ B^T` against the adapter's own tensors, so an F16
+    // residual stream turns every adapter tensor into a src0 with an F16 src1. On CUDA that
+    // combination is only served for an NVFP4 weight (ggml_backend_cuda_device_supports_op:
+    // `b->type == F16 && a->type != F16` is REJECTED unless the cuBLASLt FP4/FP8 GEMM serves the
+    // node). A rejected Linear is not slow — ggml_backend_sched silently drops it to the CPU
+    // backend — so a wrong `true` here destroys the render rather than merely costing time.
+    //
+    // Hence: default FALSE. Every adapter type keeps today's behaviour until it opts in, and the
+    // caller must still AND this with its own device probe.
+    virtual bool supports_f16_activation() const { return false; }
 };
 
 struct GGMLRunnerContext {

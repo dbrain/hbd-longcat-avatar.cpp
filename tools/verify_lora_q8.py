@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""VERIFY a Q8_0 LoRA gguf against the BF16 safetensors it came from.
+"""VERIFY a quantised LoRA gguf (Q8_0, F16 or NVFP4) against the safetensors it came from.
+
+Reads whatever type the gguf declares, so it covers convert_lora_q8.py AND
+convert_lora_nvfp4.py. The DEFAULT THRESHOLDS ARE Q8_0 THRESHOLDS (relerr <= 0.02,
+projection >= 0.97). A 4-bit NVFP4 adapter will not meet them and is not supposed to —
+pass explicit --max-relerr/--min-projection and, above all, remember that weight-space
+projection has repeatedly failed to predict whether an adapter still does its job. The
+number this prints is an input to a behavioural assay, not a substitute for one.
 
 The lesson from the 2026-07 inert-fold family: coverage counts and byte-diffs prove nothing.
 So this checks the only thing that matters — that the DELTA THE ENGINE WILL APPLY, B@A, is
@@ -23,7 +30,11 @@ import numpy as np
 
 GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
+GGML_TYPE_NVFP4 = 40
 QK8_0 = 32
+QK_NVFP4 = 64
+QK_NVFP4_SUB = 16
+TYPE_NAME = {0: 'F32', GGML_TYPE_F16: 'F16', GGML_TYPE_Q8_0: 'Q8_0', GGML_TYPE_NVFP4: 'NVFP4'}
 
 
 def st_open(p):
@@ -72,6 +83,43 @@ def dequant_q8(raw, ne):
     return (q * d).reshape(rows, k)
 
 
+_E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def _ue4m3_dec(u8):
+    """UE4M3 (unsigned e4m3 block scale) byte -> float. Mirrors ggml_cuda_ue4m3_to_fp32 and
+    build_folded_nvfp4.py:e4m3_dec_byte, minus the sign bit that a scale never sets."""
+    u = u8.astype(np.int32); e = (u >> 3) & 0xF; m = u & 0x7
+    v = np.where(e == 0, np.ldexp(m.astype(np.float64), -9), np.ldexp(1.0 + m / 8.0, e - 7))
+    return np.where((u & 0x7F) == 0, 0.0, v)
+
+
+def dequant_nvfp4(raw, ne):
+    """raw block_nvfp4 bytes -> [rows, k] float64 (k = ne[0]).
+
+    FLAT convention: no per-tensor `.wglobal`, so an absent registration reads back as 1.0
+    (nvfp4-cublaslt.cu:243-247) and the block scale is already absolute. Layout per 64-element
+    block (ggml-common.h:223-226): 4 ue4m3 sub-block scale bytes, then 32 nibble bytes where
+    byte j of sub-block s holds element s*16+j in the LOW nibble and element s*16+8+j in the
+    HIGH one — the exact packing build_folded_nvfp4.py writes. Unpacking it the other way round
+    still produces plausible-looking magnitudes, so this is checked by the round-trip, not by
+    eye: a wrong reading shows up as a collapsed projection.
+    """
+    k = ne[0]; rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+    nblk = k // QK_NVFP4
+    b = np.frombuffer(raw, dtype=np.uint8).reshape(rows * nblk, 4 + QK_NVFP4 // 2)
+    sc = _ue4m3_dec(b[:, 0:4])                      # [rows*nblk, 4]
+    qs = b[:, 4:]                                   # [rows*nblk, 32]
+    out = np.empty((rows * nblk, QK_NVFP4), dtype=np.float64)
+    for s in range(4):
+        byte = qs[:, s * 8:s * 8 + 8]
+        for half, nib in ((0, byte & 0xF), (8, byte >> 4)):
+            sign = np.where((nib & 0x8) != 0, -1.0, 1.0)
+            out[:, s * 16 + half:s * 16 + half + 8] = sign * _E2M1[nib & 0x7]
+        out[:, s * 16:s * 16 + 16] *= sc[:, s:s + 1]
+    return out.reshape(rows, k)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--src', required=True)
@@ -104,6 +152,22 @@ def main():
             print(f"  L1 STRUCTURE: FAIL (dim order, {len(bad_dims)} tensors)")
         else:
             print(f"  L1 STRUCTURE: PASS ({len(h)} tensors, dims reversed correctly)")
+    tcount = {}
+    for _, tt, _ in infos.values():
+        tcount[TYPE_NAME.get(tt, f"type{tt}")] = tcount.get(TYPE_NAME.get(tt, f"type{tt}"), 0) + 1
+    # A MIXED adapter is legal but must never be discovered by accident: NVFP4 tensors take the
+    # cuBLASLt FP4 GEMM, everything else falls to MMQ, so a stray Q8_0 is a silent slow path.
+    print(f"  L1 TYPES    : " + ", ".join(f"{v} {k}" for k, v in sorted(tcount.items()))
+          + ("   <-- MIXED" if len(tcount) > 1 else ""))
+    if GGML_TYPE_NVFP4 in {tt for _, tt, _ in infos.values()}:
+        bad_k = [n for n, (ne, tt, _) in infos.items()
+                 if tt == GGML_TYPE_NVFP4 and ne[0] % QK_NVFP4]
+        print(f"  L1 FP4 K%64 : {len(infos) - len(bad_k)}/{len(infos)} tensors have "
+              f"ne[0] % 64 == 0" + (f"  !!! {len(bad_k)} FAIL: {bad_k[:3]}" if bad_k else ""))
+        if bad_k:
+            fails.append(f"L1 FP4 K%64: {len(bad_k)} NVFP4 tensor(s) with ne[0] %% 64 != 0 — "
+                         f"the cuBLASLt FP4 GEMM refuses these and they fall back to a slower "
+                         f"path than the Q8_0 adapter they replaced")
 
     stems = sorted({k[:-len('.lora_A.weight')] for k in h if k.endswith('.lora_A.weight')})
     stems = [s for s in stems if s + '.lora_B.weight' in h]
@@ -116,9 +180,19 @@ def main():
 
     def load_q8(name):
         ne, tt, off = infos[name]
-        assert tt in (GGML_TYPE_Q8_0, GGML_TYPE_F16), f"{name}: type {tt} not Q8_0/F16"
+        assert tt in (GGML_TYPE_Q8_0, GGML_TYPE_F16, GGML_TYPE_NVFP4), \
+            f"{name}: type {tt} not Q8_0/F16/NVFP4"
         n = int(np.prod(ne))
-        if tt == GGML_TYPE_F16:
+        if tt == GGML_TYPE_NVFP4:
+            # 36 bytes per 64 elements. ne[0] % 64 != 0 cannot even be laid out, and would
+            # ALSO be refused by the cuBLASLt FP4 GEMM at run time — fail loudly here rather
+            # than dequantise something the engine would silently route elsewhere.
+            assert ne[0] % QK_NVFP4 == 0, \
+                f"{name}: ne[0]={ne[0]} not a multiple of {QK_NVFP4} — the FP4 GEMM refuses this"
+            nb = n // QK_NVFP4 * (4 + QK_NVFP4 // 2)
+            fg.seek(dstart + off)
+            w = dequant_nvfp4(fg.read(nb), ne)
+        elif tt == GGML_TYPE_F16:
             fg.seek(dstart + off)
             w = np.frombuffer(fg.read(n * 2), dtype=np.float16).astype(np.float64)
             w = w.reshape(ne[1], ne[0]) if len(ne) > 1 else w

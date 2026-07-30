@@ -61,14 +61,26 @@ namespace Krea2 {
     // well-tested F32 stream runs unchanged — there is no F16-Q path there, and an ungated
     // LTX_DIT_F16 is exactly what crashed a 3060 once already.
     //
-    // Also refused with a runtime weight adapter attached: LoRA takes
-    // WeightAdapter::forward_with_lora(), whose delta chain runs `x @ A^T @ B^T` against
-    // adapter tensors of unknown type. An F32 adapter weight against an F16 x is precisely the
-    // supports_op rejection above, so the F16 stream would move Linears to the CPU. The
-    // shipping checkpoint (krea2-bf16hold-snofs.gguf) has its LoKr already folded in, so this
-    // only costs the runtime `lora` request field.
+    // A runtime weight adapter used to refuse the F16 stream UNCONDITIONALLY: LoRA takes
+    // WeightAdapter::forward_with_lora(), whose delta chain runs `x @ A^T @ B^T` against adapter
+    // tensors of unknown type, and an F32 adapter weight against an F16 x is precisely the
+    // supports_op rejection above — the Linear would be dropped to the CPU, not merely slowed.
+    //
+    // That blanket refusal is now narrowed to what it was actually protecting against. An NVFP4
+    // adapter is the one case where the premise is FALSE: supports_op explicitly serves NVFP4
+    // src0 against an F16 src1 (the cuBLASLt FP4 GEMM quantises the activation to E2M1 itself),
+    // and both LoRA GEMMs go through ggml_ext_linear(), so its F16-dst gate fires for them too
+    // and the whole delta chain stays half-width. WeightAdapter::supports_f16_activation()
+    // answers this per adapter and defaults to false, so every other adapter type — F32, F16,
+    // Q8_0, mixed, or an NVFP4 one whose rank is not a multiple of 64 — keeps today's behaviour.
+    //
+    // Both halves are required: the adapter must be F16-safe AND the device must serve an F16
+    // NVFP4 destination at all.
     __STATIC_INLINE__ bool krea2_dit_f16_device_ok(GGMLRunnerContext* ctx) {
-        if (ctx == nullptr || ctx->weight_adapter != nullptr) {
+        if (ctx == nullptr) {
+            return false;
+        }
+        if (ctx->weight_adapter != nullptr && !ctx->weight_adapter->supports_f16_activation()) {
             return false;
         }
         return ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
