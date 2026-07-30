@@ -1904,6 +1904,11 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("cache_mode", cache_mode);
     load_if_exists("cache_option", cache_option);
     load_if_exists("scm_mask", scm_mask);
+    // Per-request reference-image handling (key=value list, same grammar as
+    // --ref-image-args). One server serves both t2i and edit, and the edit recipe
+    // is a property of the LoRA in the request, not of the process — so the preset
+    // has to be selectable per job, e.g. "preset=krea2_identity_edit".
+    load_if_exists("ref_image_args", ref_image_args);
 
     load_if_exists("clip_skip", clip_skip);
     load_if_exists("width", width);

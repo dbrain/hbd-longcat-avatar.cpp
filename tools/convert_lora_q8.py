@@ -140,7 +140,18 @@ def main():
         m = h[name]; a0, b0 = m['data_offsets']
         fs_.seek(base + a0)
         raw = np.frombuffer(fs_.read(b0 - a0), dtype=np.uint8)
-        x = bf16_to_f32(raw) if m['dtype'] == 'BF16' else raw.view(np.float32)
+        # BF16 / F16 / F32 sources. F16 is not hypothetical: ai-toolkit writes the
+        # krea2_edit adapters in F16, and view(float32) on those halves the tensor and
+        # reinterprets pairs of halves as garbage floats — a silently wrong adapter.
+        st_dtype = m['dtype']
+        if st_dtype == 'BF16':
+            x = bf16_to_f32(raw)
+        elif st_dtype in ('F16', 'FP16'):
+            x = raw.view(np.float16).astype(np.float32)
+        elif st_dtype in ('F32', 'FP32'):
+            x = raw.view(np.float32)
+        else:
+            raise SystemExit(f"{name}: unsupported safetensors dtype {st_dtype}")
         x = x.reshape(m['shape'])
         if tt == GGML_TYPE_Q8_0:
             data = quantize_q8_0(x)

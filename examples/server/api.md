@@ -527,6 +527,7 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `batch_count` | `integer` |
 | `auto_resize_ref_image` | `boolean` |
 | `increase_ref_index` | `boolean` |
+| `ref_image_args` | `string` |
 | `control_strength` | `number` |
 | `hires` | `object` |
 | `hires.enabled` | `boolean` |
@@ -570,6 +571,7 @@ Fields returned in `features_by_mode.img_gen`:
 - `mask_image`
 - `control_image`
 - `ref_images`
+- `ref_image_args`
 - `lora`
 - `vae_tiling`
 - `hires`
@@ -656,6 +658,8 @@ Example:
   "increase_ref_index": false,
   "control_strength": 0.9,
   "embed_image_metadata": true,
+
+  "ref_image_args": "",
 
   "init_image": null,
   "ref_images": [],
@@ -758,6 +762,7 @@ Top-level scalar fields:
 | `batch_count` | `integer` |
 | `auto_resize_ref_image` | `boolean` |
 | `increase_ref_index` | `boolean` |
+| `ref_image_args` | `string` |
 | `control_strength` | `number` |
 | `embed_image_metadata` | `boolean` |
 
@@ -769,6 +774,29 @@ Image fields:
 | `ref_images` | `array<string>` |
 | `mask_image` | `string \| null` |
 | `control_image` | `string \| null` |
+
+`ref_image_args` is a comma-separated `key=value` list controlling how `ref_images`
+are prepared, overriding the server's `--ref-image-args` default for this job.
+Start with `preset=<name>`; later keys override the preset. Presets:
+`flux_kontext`, `flux2`, `longcat`, `qwen`, `qwen_layered`, `mage_flow`,
+`z_image_omni`, `cosmos_reference`, `krea2_ostris_edit`, `krea2_edit`,
+`krea2_identity_edit`. Keys: `pass_to_vlm`, `pass_to_dit`, `ref_index_mode`
+(`fixed`/`increase`/`decrease`), `force_ref_timestep_zero`, `resize_before_vae`,
+`resize_vae_to_target`, `crop_vae_to_target_ar`, `vae_input_max_pixels`,
+`vlm_resize_mode` (`area`/`longest_side`/`none`), `vlm_min_size`, `vlm_max_size`,
+`vlm_size`, `vlm_picture_labels`.
+
+Krea 2 edit example (conradlocke/krea2-identity-edit + its LoRA):
+
+```json
+{
+  "prompt": "put this person in a night market, same face",
+  "width": 1024, "height": 1024, "steps": 10, "cfg_scale": 1.0,
+  "ref_images": ["<base64 png>"],
+  "ref_image_args": "preset=krea2_identity_edit",
+  "lora": [{"path": "krea2-identity-edit-v1_2", "multiplier": 1.0}]
+}
+```
 
 LoRA fields:
 

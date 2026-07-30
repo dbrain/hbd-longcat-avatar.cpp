@@ -3648,6 +3648,18 @@ public:
                 if (!parse_strict_int(value, params.vlm_min_size)) {
                     LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
                 }
+            } else if (key == "resize_vae_to_target") {
+                if (!parse_strict_bool(value, params.resize_vae_to_target)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "crop_vae_to_target_ar") {
+                if (!parse_strict_bool(value, params.crop_vae_to_target_ar)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "vlm_picture_labels") {
+                if (!parse_strict_bool(value, params.vlm_picture_labels)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
             } else if (key != "preset" && key != "vlm_size") {
                 LOG_WARN("ignoring unknown reference image arg '%s'", key.c_str());
             }
@@ -6921,16 +6933,45 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
             vae_height = round(vae_height / factor) * factor;
             vae_width  = round(vae_width / factor) * factor;
 
-            auto resized_ref_img = sd::ops::interpolate(ref_images[i],
+            // crop_vae_to_target_ar: a plain interpolate to a target of a different
+            // aspect ratio STRETCHES the reference — for an identity-preserving edit
+            // that is a distorted face, not a framing choice. Center-crop to the
+            // target AR first (the krea2_edit trainer's geometry) so the resize is
+            // pure scale. Only meaningful together with resize_vae_to_target.
+            // Deliberately a LOCAL copy: ref_images[] is what the VLM grounds on, and
+            // the reference nodes ground on the UNCROPPED image.
+            const sd::Tensor<float>* vae_ref_src = &ref_images[i];
+            sd::Tensor<float> cropped_ref;
+            if (ref_image_params.crop_vae_to_target_ar && vae_width > 0 && vae_height > 0) {
+                const int64_t src_w = ref_images[i].shape()[0];
+                const int64_t src_h = ref_images[i].shape()[1];
+                const double scale  = std::max(vae_width / static_cast<double>(src_w),
+                                              vae_height / static_cast<double>(src_h));
+                const int64_t crop_w = std::min<int64_t>(src_w, std::llround(vae_width / scale));
+                const int64_t crop_h = std::min<int64_t>(src_h, std::llround(vae_height / scale));
+                if (crop_w > 0 && crop_h > 0 && (crop_w != src_w || crop_h != src_h)) {
+                    const int64_t x0 = (src_w - crop_w) / 2;
+                    const int64_t y0 = (src_h - crop_h) / 2;
+                    LOG_DEBUG("center-crop ref image %d from %" PRId64 "x%" PRId64 " to %" PRId64 "x%" PRId64 " (target AR)",
+                              static_cast<int>(i), src_w, src_h, crop_w, crop_h);
+                    cropped_ref = sd::ops::slice(sd::ops::slice(ref_images[i], 0, x0, x0 + crop_w),
+                                                 1,
+                                                 y0,
+                                                 y0 + crop_h);
+                    vae_ref_src = &cropped_ref;
+                }
+            }
+
+            auto resized_ref_img = sd::ops::interpolate(*vae_ref_src,
                                                         {static_cast<int>(vae_width),
                                                          static_cast<int>(vae_height),
-                                                         ref_images[i].shape()[2],
-                                                         ref_images[i].shape()[3]});
+                                                         vae_ref_src->shape()[2],
+                                                         vae_ref_src->shape()[3]});
 
             LOG_DEBUG("resize vae ref image %d from %" PRId64 "x%" PRId64 " to %" PRId64 "x%" PRId64,
                       static_cast<int>(i),
-                      ref_images[i].shape()[1],
-                      ref_images[i].shape()[0],
+                      vae_ref_src->shape()[1],
+                      vae_ref_src->shape()[0],
                       resized_ref_img.shape()[1],
                       resized_ref_img.shape()[0]);
 

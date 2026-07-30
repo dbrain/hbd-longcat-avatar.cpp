@@ -2435,11 +2435,19 @@ struct LLMEmbedder : public Conditioner {
                     auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true);
                     GGML_ASSERT(!image_embed.empty());
 
-                    std::string image_prefix = prompt + img_prompt + "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
+                    // The "Picture N: " label is part of upstream's Krea2 template, but the
+                    // krea2_edit recipe (lbouaraba nodes / conradlocke weights) trains on a
+                    // bare vision block. Grounding only works if inference matches training,
+                    // so the preset gets to drop it.
+                    const std::string label = conditioner_params.ref_image_params.vlm_picture_labels
+                                                  ? "Picture " + std::to_string(i + 1) + ": "
+                                                  : std::string();
+
+                    std::string image_prefix = prompt + img_prompt + label + "<|vision_start|>";
                     int image_embed_idx      = static_cast<int>(tokenizer->encode(image_prefix, nullptr).size());
                     image_embeds.emplace_back(image_embed_idx, image_embed);
 
-                    img_prompt += "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
+                    img_prompt += label + "<|vision_start|>";
                     int64_t num_image_tokens = image_embed.shape()[1];
                     img_prompt.reserve(img_prompt.size() + static_cast<size_t>(num_image_tokens) * placeholder.size() + 32);
                     for (int j = 0; j < num_image_tokens; j++) {

@@ -34,8 +34,14 @@ def st_open(p):
 def st_get(f, base, h, k):
     m = h[k]; a, b = m['data_offsets']; f.seek(base + a)
     raw = np.frombuffer(f.read(b - a), dtype=np.uint8)
-    x = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32) if m['dtype'] == 'BF16' \
-        else raw.view(np.float32)
+    if m['dtype'] == 'BF16':
+        x = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    elif m['dtype'] in ('F16', 'FP16'):
+        # ai-toolkit writes the krea2_edit adapters in F16; view(float32) here would
+        # silently halve the tensor and read pairs of halves as garbage floats.
+        x = raw.view(np.float16).astype(np.float32)
+    else:
+        x = raw.view(np.float32)
     return x.reshape(m['shape']).astype(np.float64)
 
 

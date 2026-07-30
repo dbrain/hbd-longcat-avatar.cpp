@@ -925,8 +925,20 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
         // cuBLASLt alpha), so the stored nibbles live in a scaled domain and the TRUE-unit
         // delta has to be divided by it before it can be merged. The sidecar was loaded by
         // the pre-pass above; this only reads it.
-        auto wg_it            = tensor_states_by_name_.find(state->name + ".wglobal");
-        TensorState* wg_state = wg_it == tensor_states_by_name_.end() ? nullptr : wg_it->second;
+        auto wg_it = tensor_states_by_name_.find(state->name + ".wglobal");
+        if (wg_it == tensor_states_by_name_.end()) {
+            // FLAT nvfp4 build (krea2 ships one): there is no per-tensor global scale
+            // ANYWHERE in the model, so the stored nibbles are already in true units and
+            // wglobal is exactly 1.0 -- there is nothing for the runtime to multiply by.
+            // Declining here was not conservative, it was fatal: SD_LORA_FOLD=1 forces
+            // apply_lora_immediately, and the graph apply path a decline routes to cannot
+            // convert NVFP4 (GGML_ASSERT(convert_func != nullptr), ggml-cuda.cu). Every
+            // krea2 nvfp4 tensor declined, and the first render killed the worker.
+            // ABSENT is 1.0; only a wglobal that exists-but-is-unloaded is a real decline.
+            work.wglobal = 1.0f;
+            return;
+        }
+        TensorState* wg_state = wg_it->second;
         ggml_tensor* wg       = wg_state != nullptr ? wg_state->tensor : nullptr;
         if (wg == nullptr || wg->data == nullptr) {
             work.no_wglobal = true;
@@ -986,8 +998,15 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
         const float wglobal                            = work.wglobal;
 
         if (work.no_wglobal) {
-            LOG_WARN("lora fold-at-load: no .wglobal for nvfp4 tensor '%s'; leaving it to the runtime path",
-                     state->name.c_str());
+            // NOT a soft fallback: SD_LORA_FOLD=1 already forced apply_lora_immediately, and
+            // the graph apply path a declined NVFP4 tensor lands on has no convert kernel for
+            // it -- the next render aborts the worker on GGML_ASSERT(convert_func != nullptr).
+            // Say so, at ERROR, naming the way out.
+            LOG_ERROR(
+                "lora fold-at-load: nvfp4 tensor '%s' has a .wglobal sidecar that is not loaded; "
+                "it cannot be folded AND cannot go through the graph apply path (no NVFP4 convert "
+                "kernel). Unset SD_LORA_FOLD to use the per-step runtime adapter instead.",
+                state->name.c_str());
         }
         if (work.declined) {
             state->lora_fold_declined = true;
