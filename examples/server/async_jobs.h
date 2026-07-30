@@ -68,6 +68,10 @@ struct LtxCharacterRef {
     std::string image;
     int source_id     = 0;
     bool match_target = false;
+    // Did the caller SAY which resize mode it wanted? Only the route cares: an
+    // unstated mode can be adopted to the MSR strip's grid, an explicitly stated
+    // one must be honoured or refused, never quietly overridden.
+    bool resize_mode_explicit = false;
     // Optional SHOT SCOPE, in rendered-segment index space (the same space as the
     // request's own `segments[]` positions). `scoped == false` means the sheet
     // applies to every segment, which is what an absent key must keep doing.
@@ -167,6 +171,12 @@ struct AsyncGenerationJob {
     std::vector<int64_t> ltx_segment_seeds;
     std::vector<int> ltx_segment_steps;
     std::vector<float> ltx_segment_cfg;
+    // Reference head-frame trim: 0 = off (the default), -1 = auto, >0 = an explicit
+    // pixel-frame count. The per-shot vector is EMPTY when no shot named the field --
+    // a populated vector is authoritative for every shot, so a zero in it means
+    // "explicitly off here", not "inherit".
+    int ltx_reference_head_trim = 0;
+    std::vector<int> ltx_segment_reference_head_trim;
     std::vector<std::string> ltx_segment_negative_prompts;
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;

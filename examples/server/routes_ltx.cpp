@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,21 @@ fs::path ltx_persist_root() {
         return configured;
     }
     return "/var/lib/ltx-video/persist";
+}
+
+// `reference_head_trim` wire encoding: 0 = off, -1 = AUTO (the engine derives 1 + 8*(K-1) from the
+// references it actually encoded), >0 = trim exactly that many pixel frames. The ceiling only has
+// to stop a units mistake reaching the engine -- the real bound is the shot's own length, which
+// only the engine knows, and which it enforces by refusing to leave a shot with no frames.
+constexpr int kMaxReferenceHeadTrim = 512;
+
+bool valid_reference_head_trim(int value) {
+    return value >= -1 && value <= kMaxReferenceHeadTrim;
+}
+
+std::string reference_head_trim_error(const std::string& field) {
+    return R"({"error":")" + field + " must be -1 (auto), 0 (off), or 1.." +
+           std::to_string(kMaxReferenceHeadTrim) + R"( frames"})";
 }
 
 std::vector<fs::path> ltx_bank_roots() {
@@ -258,6 +274,12 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<int> segment_steps;
             std::vector<float> segment_cfg;
             std::vector<std::string> segment_negative_prompts;
+            // Per-shot reference_head_trim, collected with an "absent" sentinel because the
+            // top-level default it inherits from is not parsed until ~500 lines below. Resolved
+            // into the wire encoding (0 off / -1 auto / >0 explicit) once both are known.
+            constexpr int kHeadTrimInherit = std::numeric_limits<int>::min();
+            std::vector<int> segment_reference_head_trim;
+            bool any_segment_head_trim = false;
             bool any_segment_beats     = false;
             bool any_segment_overrides = false;
             // Only needed to turn a beat's `time` (seconds) into a frame index; the authoritative
@@ -293,6 +315,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_steps.push_back(0);
                         segment_cfg.push_back(-1.f);
                         segment_negative_prompts.emplace_back();
+                        segment_reference_head_trim.push_back(kHeadTrimInherit);
                     } else if (segment.is_object()) {
                         prompts.push_back(segment.value("prompt", std::string()));
                         if (segment.contains("model") && !segment["model"].is_string()) {
@@ -506,6 +529,29 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         any_segment_overrides = any_segment_overrides ||
                                                 shot_seed >= 0 || shot_steps > 0 || shot_cfg >= 0.f ||
                                                 !segment_negative_prompts.back().empty();
+
+                        // Per-shot reference head-frame trim. ABSENT inherits the request-level
+                        // value; PRESENT is authoritative for this shot, zero included, so one
+                        // shot of a project that has the trim on can switch it off.
+                        int shot_head_trim = kHeadTrimInherit;
+                        if (segment.contains("reference_head_trim") &&
+                            !segment["reference_head_trim"].is_null()) {
+                            if (!segment["reference_head_trim"].is_number_integer()) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"each LTX segment reference_head_trim must be an integer: 0 off, -1 auto, >0 frames"})",
+                                                "application/json");
+                                return;
+                            }
+                            shot_head_trim = segment["reference_head_trim"].get<int>();
+                            if (!valid_reference_head_trim(shot_head_trim)) {
+                                res.status = 400;
+                                res.set_content(reference_head_trim_error("LTX segment reference_head_trim"),
+                                                "application/json");
+                                return;
+                            }
+                            any_segment_head_trim = true;
+                        }
+                        segment_reference_head_trim.push_back(shot_head_trim);
                     }
                 }
             } else if (body.contains("prompts") && body["prompts"].is_array()) {
@@ -528,6 +574,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_steps.push_back(0);
                         segment_cfg.push_back(-1.f);
                         segment_negative_prompts.emplace_back();
+                        segment_reference_head_trim.push_back(kHeadTrimInherit);
                     }
                 }
             }
@@ -743,6 +790,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                             return;
                         }
                         const std::string mode = entry["resize_mode"].get<std::string>();
+                        reference.resize_mode_explicit = true;
                         if (mode == "match_target") {
                             reference.match_target = true;
                         } else if (mode != "native_resolution") {
@@ -887,11 +935,14 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     }
                     msr_frames = msr["frames"].get<int>();
                 }
-                // 1 modulo 8 is what makes each reference land on a whole latent frame;
-                // the checkpoint's own menu is 17/25/33/41/49/57/65.
+                // 1 modulo 8 is what makes each reference land on a whole latent frame. The
+                // checkpoint's own menu starts at 17, but 9 is a real and useful length -- two
+                // latent slots, one subject plus the background, the cheapest strip that composes
+                // anything -- so it is accepted, and the error says so rather than listing a menu
+                // the validator does not actually enforce.
                 if (msr_frames < 9 || msr_frames > 65 || msr_frames % 8 != 1) {
                     res.status = 400;
-                    res.set_content(R"({"error":"msr frames must be one of 17, 25, 33, 41, 49, 57, 65"})",
+                    res.set_content(R"json({"error":"msr frames must be 1 modulo 8 in [9, 65]: 9, 17, 25, 33, 41, 49, 57 or 65. The checkpoint's own menu starts at 17; 9 is the minimal one-subject strip."})json",
                                     "application/json");
                     return;
                 }
@@ -939,6 +990,36 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 // Forcing 0 here instead would apply it to the whole request and silently flip
                 // the sheets on every shot the strip does not appear in -- the exact opposite of
                 // what scoping promises. An explicit caller-supplied scale is still honoured.
+
+                // A strip and a character sheet in the same shot must share a LATENT GRID: the
+                // engine packs every reference onto the frame axis of one tensor. The strip is
+                // always composited at the render resolution, so a sheet kept at its native size
+                // cannot join it -- and that failure used to happen deep in the encode path, AFTER
+                // the job was queued and the model warm, surfacing as a generic `generation_failed`
+                // with the real reason only in the engine log. It is decidable here, from the
+                // request alone, so decide it here.
+                //
+                // An UNSTATED resize mode is adopted to the strip's grid: `match_target` is already
+                // what the Echo/MSR memory regime asks for, so this is the mode such a caller meant.
+                // An explicitly stated `native_resolution` is refused rather than overridden.
+                for (size_t index = 0; index < character_refs.size(); ++index) {
+                    LtxCharacterRef& reference = character_refs[index];
+                    if (reference.match_target) {
+                        continue;
+                    }
+                    if (!reference.resize_mode_explicit) {
+                        reference.match_target = true;
+                        continue;
+                    }
+                    res.status = 400;
+                    res.set_content(json({{"error", "character_ref " + std::to_string(index + 1) +
+                                                        " uses resize_mode native_resolution, which cannot share a "
+                                                        "latent grid with the msr strip (composited at the render "
+                                                        "resolution); use match_target or drop the msr block"}})
+                                        .dump(),
+                                    "application/json");
+                    return;
+                }
             }
 
             const std::string default_model = body.value("model", std::string("base"));
@@ -1042,6 +1123,32 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 job->ltx_segment_steps = std::move(segment_steps);
                 job->ltx_segment_cfg = std::move(segment_cfg);
                 job->ltx_segment_negative_prompts = std::move(segment_negative_prompts);
+            }
+            // Reference head-frame trim. Request-level value first, then the per-shot overrides
+            // resolved against it -- the array is only carried when a shot actually named the
+            // field, so an ordinary project keeps the single scalar in durable job state.
+            if (body.contains("reference_head_trim") && !body["reference_head_trim"].is_null()) {
+                if (!body["reference_head_trim"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"reference_head_trim must be an integer: 0 off, -1 auto, >0 frames"})",
+                                    "application/json");
+                    return;
+                }
+                job->ltx_reference_head_trim = body["reference_head_trim"].get<int>();
+                if (!valid_reference_head_trim(job->ltx_reference_head_trim)) {
+                    res.status = 400;
+                    res.set_content(reference_head_trim_error("reference_head_trim"), "application/json");
+                    return;
+                }
+            }
+            if (any_segment_head_trim) {
+                segment_reference_head_trim.resize(static_cast<size_t>(requested_segments), kHeadTrimInherit);
+                for (auto& value : segment_reference_head_trim) {
+                    if (value == kHeadTrimInherit) {
+                        value = job->ltx_reference_head_trim;
+                    }
+                }
+                job->ltx_segment_reference_head_trim = std::move(segment_reference_head_trim);
             }
             job->ltx_cont_latent_frames = continuation_frames;
             job->ltx_emit_segments = body.value("emit_segments", false);

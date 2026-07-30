@@ -547,14 +547,21 @@ uint8_t* load_image_common(bool from_memory,
         LOG_ERROR("load image from '%s' failed", image_path);
         return nullptr;
     }
-    if (source_channel_count < expected_channel) {
-        fprintf(stderr,
-                "the number of channels for the input image must be >= %d,"
-                "but got %d channels, image_path = %s",
-                expected_channel,
-                source_channel_count,
-                image_path);
+    // stbi_load was already asked for `expected_channel` channels and honoured it --
+    // grayscale is replicated across RGB and a missing alpha is filled opaque, so the
+    // buffer in hand is always the requested layout regardless of what the file held.
+    // Rejecting a grayscale source here was therefore refusing images we had already
+    // successfully converted; a grayscale character reference or matte is an ordinary
+    // thing to hand in. Only a source that reported NO channels is actually unusable.
+    if (source_channel_count <= 0) {
+        LOG_ERROR("input image reports %d channels, image_path = %s", source_channel_count, image_path);
         return nullptr;
+    }
+    if (source_channel_count < expected_channel) {
+        LOG_DEBUG("input image is %d-channel, expanded to %d, image_path = %s",
+                  source_channel_count,
+                  expected_channel,
+                  image_path);
     }
     if (width <= 0) {
         LOG_ERROR("error: the width of image must be greater than 0, image_path = %s", image_path);
