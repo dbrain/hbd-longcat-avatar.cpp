@@ -346,10 +346,32 @@ std::string SDSvrParams::to_string() const {
 // the whole LoRA directory offline because someone left a trailing comma would be a far worse
 // failure than serving the files undescribed. Keys are matched against the entry's `path` (the
 // name relative to the LoRA dir, extension included — the same string a request must send).
+// `LTX_LORA_MANIFEST` overrides the location. It exists because the natural home —
+// `<lora_dir>/loras.json` — is awkward for a containerised deployment: the LoRA directory is
+// already a bind mount, and mounting a single tracked file INSIDE another bind mount means nesting
+// two mounts, which resolves through any symlink already at that path and silently lands the file
+// somewhere else. A separate path plus this variable is unambiguous. Unset keeps the natural
+// default, which is what a bare-metal run wants.
 static json load_lora_manifest(const fs::path& lora_dir) {
     fs::path manifest = lora_dir / "loras.json";
+    bool explicitly_configured = false;
+    if (const char* override_path = std::getenv("LTX_LORA_MANIFEST")) {
+        if (override_path[0] != '\0') {
+            manifest             = override_path;
+            explicitly_configured = true;
+        }
+    }
     std::error_code ec;
     if (!fs::exists(manifest, ec) || !fs::is_regular_file(manifest, ec)) {
+        // An absent DEFAULT is the ordinary "this directory is undescribed" case and says nothing.
+        // An absent CONFIGURED path is an operator error, and a silent one: every adapter quietly
+        // reverts to the client's neutral 1.0, which for several of them is the wrong strength and
+        // shows up only as a render that under- or over-fires. So it gets said out loud.
+        if (explicitly_configured) {
+            LOG_WARN("LTX_LORA_MANIFEST=%s does not exist; every adapter will be UNDESCRIBED and "
+                     "clients will fall back to a neutral 1.0 strength\n",
+                     manifest.u8string().c_str());
+        }
         return json::object();
     }
     std::ifstream f(manifest, std::ios::binary);
