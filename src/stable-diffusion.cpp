@@ -496,10 +496,12 @@ public:
             ggml_backend_cuda_trim_memory(backend);
         }
 
-        // LTX's cuDNN Conv3D path reorders each temporary staged VAE weight
-        // buffer. The cache is keyed by that temporary device address, so it
-        // cannot be kept safely into the next window and is outside VMM trim.
-        // Do not touch the CUDA runtime for a CPU-only LTX invocation.
+        // LTX's cuDNN Conv3D path holds a reordered copy of each VAE weight, outside
+        // the VMM pool, so a boundary that exists to hand VRAM back frees them here.
+        // This is no longer a CORRECTNESS requirement: the cache is keyed by stable
+        // identity (tensor name + buffer + shape + type + device), not by the temporary
+        // staged address, so keeping it across a window would be safe -- it is kept as a
+        // VRAM reclaim. Do not touch the CUDA runtime for a CPU-only LTX invocation.
         if (!backends.empty()) {
             ggml_backend_cuda_release_cudnn_conv3d_weights();
         }
@@ -9867,9 +9869,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             vae_backend != nullptr && ggml_backend_is_cuda(vae_backend)) {
             ggml_backend_synchronize(vae_backend);
             ggml_backend_cuda_trim_memory(vae_backend);
-            // The staged VAE weights just moved (compute copies freed, home restored); their
-            // device pointers are stale, so the cuDNN Conv3D weight-reorder cache holds orphaned
-            // buffers. Free them now (they re-reorder at decode anyway) or they leak per segment.
+            // The staged VAE weights just moved (compute copies freed, home restored). The
+            // cuDNN Conv3D reorder cache is keyed by stable identity, not by that address, so
+            // it is not stale -- but this phase exists to hand VRAM back and those reorder
+            // buffers are outside the VMM pool. Free them here; they re-reorder at decode.
             ggml_backend_cuda_release_cudnn_conv3d_weights();
         }
         LOG_INFO("LTXAV_VAE_LAZY: released encode-staged video+audio VAE GPU params + trimmed VAE pool "
