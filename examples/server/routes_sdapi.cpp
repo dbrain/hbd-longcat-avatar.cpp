@@ -422,10 +422,8 @@ void register_sdapi_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         {
             std::lock_guard<std::mutex> lock(*runtime->lora_mutex);
             for (const auto& e : *runtime->lora_cache) {
-                json item;
-                item["name"] = e.name;
-                item["path"] = e.path;
-                result.push_back(item);
+                // Shared with the supervisor's copy of this route — see lora_entry_json.
+                result.push_back(lora_entry_json(e));
             }
         }
 

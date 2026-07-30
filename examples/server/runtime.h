@@ -42,10 +42,32 @@ struct SDSvrParams {
     std::string to_string() const;
 };
 
+// One adapter in --lora-model-dir, plus whatever `loras.json` in that same directory says about
+// it. The manifest half exists because a file name cannot carry the two things a CLIENT must know
+// to use the adapter correctly, and getting either wrong is silent — the render succeeds and looks
+// like the adapter did nothing:
+//
+//   * the multiplier it was TRAINED at. None of these adapters ship `.alpha` tensors, so the
+//     engine applies `multiplier` raw; an adapter trained at alpha/r = 2.0 rendered at 1.0 is
+//     simply half an adapter, and nothing on the wire says so.
+//   * the TRIGGER PHRASE some adapters need in the prompt before they do anything at all.
+//
+// It lives NEXT TO THE WEIGHTS on purpose. The directory is bind-mounted, so adding an adapter is
+// "drop the .gguf, add a manifest entry" — no engine rebuild, no client rebuild, and no second
+// hand-maintained list of file names anywhere to drift out of step with the directory.
+// Every field is optional; a directory with no `loras.json` behaves exactly as it did before.
 struct LoraEntry {
     std::string name;
     std::string path;
     std::string fullpath;
+    // ── from loras.json, empty/absent when the manifest says nothing ──
+    std::string label;
+    std::string blurb;
+    // < 0 means "unstated" — NOT 1.0. A client must be able to tell "the manifest says render this
+    // at 1.0" from "the manifest is silent", because only the first is a claim about the adapter.
+    float default_multiplier = -1.0f;
+    std::string trigger;
+    bool trigger_required = false;
 };
 
 struct UpscalerEntry {
@@ -125,6 +147,18 @@ bool assign_output_options(VidGenJobRequest& request,
 std::string video_mime_type(const std::string& output_format);
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode);
 std::string unsupported_generation_mode_error(SDMode mode);
+// Scan a LoRA directory and read its `loras.json`. FILESYSTEM ONLY — no CUDA, no model context —
+// which is what lets the CUDA-free supervisor answer `/sdapi/v1/loras` itself instead of proxying
+// it into the worker. That matters: koblem asks for this list on every video-tab bootstrap, and
+// proxying would cold-start a ~16 GB CUDA child to list a directory. Same reasoning as the
+// supervisor's `DELETE /ltx/v1/job`.
+std::vector<LoraEntry> scan_lora_dir(const std::string& lora_model_dir);
+
+// ONE wire shape for a LoRA entry, shared by the worker's `/sdapi/v1/loras` and the supervisor's.
+// The two answer the same route depending on isolation mode; a client that saw different JSON from
+// each would be debugging a phantom.
+nlohmann::json lora_entry_json(const LoraEntry& entry);
+
 void refresh_lora_cache(ServerRuntime& rt);
 std::string get_lora_full_path(ServerRuntime& rt, const std::string& path);
 void refresh_upscaler_cache(ServerRuntime& rt);

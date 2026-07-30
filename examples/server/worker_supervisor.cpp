@@ -1,6 +1,9 @@
 #include "worker_supervisor.h"
 
 #include "common/log.h"
+// For scan_lora_dir / lora_entry_json — the CUDA-free half of the LoRA listing, so the supervisor
+// can answer /sdapi/v1/loras without waking the worker.
+#include "runtime.h"
 
 #include <algorithm>
 #include <chrono>
@@ -704,7 +707,27 @@ bool worker_isolation_child() {
     return truthy(std::getenv("SD_SERVER_WORKER_CHILD"));
 }
 
-void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervisor& supervisor) {
+void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervisor& supervisor,
+                                          const std::string& lora_model_dir) {
+    // Answered HERE, not proxied. Scanning the LoRA directory (and its `loras.json`) touches only
+    // the filesystem, and the catch-all below would have sent it to the worker — cold-starting a
+    // ~16 GB CUDA child every time koblem bootstraps the video tab, which is where it reads this
+    // list. Exactly the reasoning behind `DELETE /ltx/v1/job` further down.
+    //
+    // Scanned per request rather than cached: the directory is bind-mounted, so dropping in an
+    // adapter or editing the manifest is meant to take effect without a restart, and the cost is a
+    // readdir over a handful of files.
+    if (!lora_model_dir.empty()) {
+        server.Get("/sdapi/v1/loras",
+                   [lora_model_dir](const httplib::Request&, httplib::Response& response) {
+                       json result = json::array();
+                       for (const auto& e : scan_lora_dir(lora_model_dir)) {
+                           result.push_back(lora_entry_json(e));
+                       }
+                       response.set_content(result.dump(), "application/json");
+                   });
+    }
+
     server.Get("/health", [&supervisor](const httplib::Request&, httplib::Response& response) {
         const int in_flight = supervisor.in_flight();
         response.set_content(json({{"status", "ok"}, {"busy", in_flight > 0}, {"in_flight", in_flight},

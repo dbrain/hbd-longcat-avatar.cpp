@@ -108,7 +108,9 @@ int main(int argc, const char** argv) {
         server.set_read_timeout(60 * 60, 0);
         server.set_write_timeout(60 * 60, 0);
         server.set_idle_interval(60, 0);
-        register_worker_supervisor_endpoints(server, supervisor);
+        // The LoRA dir goes in so the supervisor can serve /sdapi/v1/loras itself — filesystem-only
+        // work that must not cold-start the CUDA child. See the declaration for why.
+        register_worker_supervisor_endpoints(server, supervisor, ctx_params.lora_model_dir);
         LOG_INFO("worker isolation enabled: CUDA-free supervisor listening on http://%s:%d\n",
                  svr_params.listen_ip.c_str(), svr_params.listen_port);
         server.listen(svr_params.listen_ip, svr_params.listen_port);

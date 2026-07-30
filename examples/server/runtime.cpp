@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <regex>
 #include <sstream>
@@ -326,11 +327,78 @@ std::string SDSvrParams::to_string() const {
     return oss.str();
 }
 
-void refresh_lora_cache(ServerRuntime& rt) {
+// Read `<lora_dir>/loras.json` — the optional, operator-editable description of the adapters in
+// this directory. See LoraEntry in runtime.h for why it lives here and not in a client.
+//
+// Shape (every key optional; unlisted files are simply undescribed):
+//
+//   {
+//     "ltx2.3-transition.gguf": {
+//       "label": "Transition / morph",
+//       "blurb": "Smooth first-to-last-frame morphs and scene transitions.",
+//       "default_multiplier": 1.0,
+//       "trigger": "zhuanchang",
+//       "trigger_required": true
+//     }
+//   }
+//
+// A malformed manifest is a WARNING, never fatal: the adapters themselves still load, and taking
+// the whole LoRA directory offline because someone left a trailing comma would be a far worse
+// failure than serving the files undescribed. Keys are matched against the entry's `path` (the
+// name relative to the LoRA dir, extension included — the same string a request must send).
+static json load_lora_manifest(const fs::path& lora_dir) {
+    fs::path manifest = lora_dir / "loras.json";
+    std::error_code ec;
+    if (!fs::exists(manifest, ec) || !fs::is_regular_file(manifest, ec)) {
+        return json::object();
+    }
+    std::ifstream f(manifest, std::ios::binary);
+    if (!f) {
+        LOG_WARN("lora manifest %s exists but could not be opened; adapters will be undescribed\n",
+                 manifest.u8string().c_str());
+        return json::object();
+    }
+    json parsed = json::parse(f, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_object()) {
+        LOG_WARN("lora manifest %s is not a JSON object; adapters will be undescribed\n",
+                 manifest.u8string().c_str());
+        return json::object();
+    }
+    return parsed;
+}
+
+json lora_entry_json(const LoraEntry& e) {
+    json item;
+    item["name"] = e.name;
+    item["path"] = e.path;
+    // Manifest fields are OMITTED rather than defaulted when unstated, so a client can tell
+    // "the operator states 1.0" from "nobody has said" — see LoraEntry in runtime.h.
+    if (!e.label.empty()) {
+        item["label"] = e.label;
+    }
+    if (!e.blurb.empty()) {
+        item["blurb"] = e.blurb;
+    }
+    if (e.default_multiplier >= 0.0f) {
+        item["default_multiplier"] = e.default_multiplier;
+    }
+    if (!e.trigger.empty()) {
+        item["trigger"]          = e.trigger;
+        item["trigger_required"] = e.trigger_required;
+    }
+    return item;
+}
+
+std::vector<LoraEntry> scan_lora_dir(const std::string& lora_model_dir) {
     std::vector<LoraEntry> new_cache;
 
-    fs::path lora_dir = rt.ctx_params->lora_model_dir;
+    fs::path lora_dir = lora_model_dir;
     if (fs::exists(lora_dir) && fs::is_directory(lora_dir)) {
+        // Re-read per refresh rather than caching: the directory is bind-mounted, so editing the
+        // manifest is meant to take effect without restarting the engine, exactly as dropping a new
+        // .gguf into the directory already does.
+        json manifest = load_lora_manifest(lora_dir);
+
         for (auto& entry : fs::recursive_directory_iterator(lora_dir, fs::directory_options::skip_permission_denied)) {
             if (!entry.is_regular_file()) {
                 continue;
@@ -347,6 +415,22 @@ void refresh_lora_cache(ServerRuntime& rt) {
             std::replace(rel.begin(), rel.end(), '\\', '/');
             lora_entry.path = rel;
 
+            // Manifest lookup by the wire name first, then by stem, so an entry keyed
+            // "foo.safetensors" still describes the "foo.gguf" it was converted to (the engine
+            // prefers the gguf; losing the trained multiplier on that swap would be silent).
+            auto it = manifest.find(rel);
+            if (it == manifest.end()) {
+                it = manifest.find(lora_entry.name);
+            }
+            if (it != manifest.end() && it->is_object()) {
+                const json& m               = *it;
+                lora_entry.label            = m.value("label", std::string());
+                lora_entry.blurb            = m.value("blurb", std::string());
+                lora_entry.default_multiplier = m.value("default_multiplier", -1.0f);
+                lora_entry.trigger          = m.value("trigger", std::string());
+                lora_entry.trigger_required = m.value("trigger_required", false);
+            }
+
             new_cache.push_back(std::move(lora_entry));
         }
     }
@@ -354,7 +438,11 @@ void refresh_lora_cache(ServerRuntime& rt) {
     std::sort(new_cache.begin(), new_cache.end(), [](const LoraEntry& a, const LoraEntry& b) {
         return a.path < b.path;
     });
+    return new_cache;
+}
 
+void refresh_lora_cache(ServerRuntime& rt) {
+    std::vector<LoraEntry> new_cache = scan_lora_dir(rt.ctx_params->lora_model_dir);
     {
         std::lock_guard<std::mutex> lock(*rt.lora_mutex);
         *rt.lora_cache = std::move(new_cache);

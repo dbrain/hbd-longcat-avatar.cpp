@@ -83,4 +83,10 @@ private:
 
 bool worker_isolation_requested();
 bool worker_isolation_child();
-void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervisor& supervisor);
+// `lora_model_dir` lets the supervisor answer `GET /sdapi/v1/loras` itself. It must, rather than
+// letting the catch-all proxy it: listing a directory is filesystem-only work, and proxying it
+// would COLD-START the ~16 GB CUDA child — which koblem would trigger on every video-tab bootstrap,
+// since that is where it reads the adapter list. Empty disables the route (falls through to the
+// proxy, i.e. the previous behaviour).
+void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervisor& supervisor,
+                                          const std::string& lora_model_dir);
