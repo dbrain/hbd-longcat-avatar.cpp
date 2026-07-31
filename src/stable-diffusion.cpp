@@ -4028,6 +4028,14 @@ public:
                 if (!parse_strict_bool(value, params.vlm_picture_labels)) {
                     LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
                 }
+            } else if (key == "rescale_ref_ids") {
+                if (!parse_strict_bool(value, params.rescale_ref_ids)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "center_ref_ids") {
+                if (!parse_strict_bool(value, params.center_ref_ids)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
             } else if (key != "preset" && key != "vlm_size") {
                 LOG_WARN("ignoring unknown reference image arg '%s'", key.c_str());
             }
@@ -4047,6 +4055,12 @@ public:
         }
         if (params.force_ref_timestep_zero && !sd_version_is_krea2(version)) {
             LOG_WARN("force_ref_timestep_zero is only supported by Krea2 architecture for now");
+        }
+        if ((params.rescale_ref_ids || params.center_ref_ids) && !sd_version_is_krea2(version)) {
+            LOG_WARN("rescale_ref_ids/center_ref_ids are only supported by Krea2 architecture for now");
+        }
+        if (params.rescale_ref_ids && params.center_ref_ids) {
+            LOG_WARN("rescale_ref_ids and center_ref_ids are mutually exclusive; centring wins");
         }
         return params;
     }

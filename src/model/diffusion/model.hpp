@@ -37,6 +37,20 @@ struct RefImageParams {
     // (its template is bare <|vision_start|><|image_pad|>...<|vision_end|>), and the
     // grounding half of that recipe only lands if inference matches training.
     bool vlm_picture_labels = true;
+    // Give the DiT reference tokens the SAME positional span as the target grid rather than
+    // a unit-step sub-rectangle of it (krea2 only, today). Without it a reference that is not
+    // the same latent grid as the target lands in the top-left corner of the positional plane
+    // and the (i,j)<->(i,j) correspondence an edit adapter trains on is lost — which is what
+    // resize_vae_to_target + crop_vae_to_target_ar exist to sidestep by forcing the grids equal.
+    // With it, a reference of ANY aspect ratio or size spans the target, so it can be passed at
+    // its native geometry. Off everywhere by default; deployed presets are unaffected.
+    bool rescale_ref_ids = false;
+    // The other way to put a small reference where the target is: keep the step at exactly 1
+    // (in-distribution) and TRANSLATE the reference to the centre of the target plane instead
+    // of leaving it in the top-left corner. Wins over rescale_ref_ids if both are set. Not in
+    // any preset — reachable only through ref_image_args, because it is a live hypothesis
+    // rather than a shipped behaviour.
+    bool center_ref_ids = false;
 };
 
 const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
@@ -57,6 +71,12 @@ const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
     //   vlm_picture_labels=false  its grounded-encode template has no "Picture N: ".
     //   vlm min/max 768           = the nodes' grounding_px default (trained 384-768).
     {"krea2_identity_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768, true, true, false}},
+    // Same adapter as krea2_identity_edit, different job: RESTAGE, where the reference is an
+    // IDENTITY SOURCE whose aspect ratio has nothing to do with the output's. The reference is
+    // passed at its native geometry (no crop, no resize-to-target) and its RoPE ids are stretched
+    // to span the target plane instead. EXPERIMENTAL — krea2_identity_edit is the deployed preset
+    // and is deliberately left alone.
+    {"krea2_identity_restage", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768, false, false, false, true}},
     {"cosmos_reference", {false, true, Rope::RefIndexMode::INCREASE, false, false, -1, RefImageResizeMode::NONE, -1, -1}},
 };
 

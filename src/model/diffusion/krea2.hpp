@@ -1159,12 +1159,49 @@ namespace Krea2 {
                                                       float theta,
                                                       const std::vector<int>& axes_dim,
                                                       const std::vector<ggml_tensor*>& ref_latents,
-                                                      Rope::RefIndexMode ref_index_mode) {
+                                                      Rope::RefIndexMode ref_index_mode,
+                                                      bool rescale_ref_ids = false,
+                                                      bool center_ref_ids  = false) {
         auto txt_ids = Rope::gen_flux_txt_ids(bs, context_len, 3, {});
         auto img_ids = Rope::gen_flux_img_ids(h, w, patch_size, bs, 3, 0, 0, 0, false);
         auto ids     = Rope::concat_ids(txt_ids, img_ids, bs);
         if (ref_latents.size() > 0) {
-            auto refs_ids = Rope::gen_refs_ids(patch_size, bs, 3, 1, ref_latents, ref_index_mode, 1.0f, false, 0);
+            // rescale_ref_ids: give each reference the SAME positional span as the target
+            // instead of a unit-step sub-rectangle of it. See gen_flux_img_ids' span comment.
+            // Off (the default, and what every deployed preset uses) this is bit-identical to
+            // before: the spans equal the ref's own lens only when the grids already match,
+            // and 0/0 means "unit step" outright.
+            const bool fit         = rescale_ref_ids || center_ref_ids;
+            const int target_h_len = fit ? (h + (patch_size / 2)) / patch_size : 0;
+            const int target_w_len = fit ? (w + (patch_size / 2)) / patch_size : 0;
+            if (fit) {
+                LOG_INFO("krea2: fitting %zu reference id grid(s) onto the %dx%d target plane (%s)",
+                         ref_latents.size(),
+                         target_w_len,
+                         target_h_len,
+                         center_ref_ids ? "centre, unit step" : "span, fractional step");
+                for (const ggml_tensor* ref : ref_latents) {
+                    if (ref == nullptr) {
+                        continue;
+                    }
+                    const int rh = (static_cast<int>(ref->ne[1]) + (patch_size / 2)) / patch_size;
+                    const int rw = (static_cast<int>(ref->ne[0]) + (patch_size / 2)) / patch_size;
+                    if (center_ref_ids) {
+                        LOG_INFO("krea2:   ref grid %dx%d -> offset (%d, %d)",
+                                 rw,
+                                 rh,
+                                 std::max(0, (target_w_len - rw) / 2),
+                                 std::max(0, (target_h_len - rh) / 2));
+                    } else {
+                        LOG_INFO("krea2:   ref grid %dx%d -> row step %.4f, col step %.4f",
+                                 rw,
+                                 rh,
+                                 rh > 1 ? (target_h_len - 1) / static_cast<double>(rh - 1) : 0.0,
+                                 rw > 1 ? (target_w_len - 1) / static_cast<double>(rw - 1) : 0.0);
+                    }
+                }
+            }
+            auto refs_ids = Rope::gen_refs_ids(patch_size, bs, 3, 1, ref_latents, ref_index_mode, 1.0f, false, 0, target_h_len, target_w_len, center_ref_ids);
             ids           = Rope::concat_ids(ids, refs_ids, bs);
         }
         return Rope::embed_nd(ids, bs, theta, axes_dim);
@@ -1188,7 +1225,9 @@ namespace Krea2 {
                                                   float theta,
                                                   const std::vector<int>& axes_dim,
                                                   const std::vector<ggml_tensor*>& ref_latents,
-                                                  Rope::RefIndexMode ref_index_mode) {
+                                                  Rope::RefIndexMode ref_index_mode,
+                                                  bool rescale_ref_ids = false,
+                                                  bool center_ref_ids  = false) {
         uint64_t hh = 1469598103934665603ull;
         hh          = krea2_fnv1a_val(hh, h);
         hh          = krea2_fnv1a_val(hh, w);
@@ -1197,6 +1236,8 @@ namespace Krea2 {
         hh          = krea2_fnv1a_val(hh, context_len);
         hh          = krea2_fnv1a_val(hh, theta);
         hh          = krea2_fnv1a_val(hh, static_cast<int>(ref_index_mode));
+        hh          = krea2_fnv1a_val(hh, static_cast<int>(rescale_ref_ids));
+        hh          = krea2_fnv1a_val(hh, static_cast<int>(center_ref_ids));
         hh          = krea2_fnv1a_val(hh, static_cast<uint64_t>(axes_dim.size()));
         for (int d : axes_dim) {
             hh = krea2_fnv1a_val(hh, d);
@@ -1448,7 +1489,9 @@ namespace Krea2 {
                                                             config.theta,
                                                             config.axes_dim,
                                                             ref_latents,
-                                                            ref_image_params.ref_index_mode);
+                                                            ref_image_params.ref_index_mode,
+                                                            ref_image_params.rescale_ref_ids,
+                                                            ref_image_params.center_ref_ids);
             static const bool pe_cache_enabled = krea2_env_flag("KREA2_PE_CACHE", true);
             static const bool pe_timing        = krea2_env_flag("KREA2_PE_TIMING", false);
             const bool pe_hit                  = pe_cache_enabled && pe_key == want_pe_key && !pe_vec.empty();
@@ -1466,7 +1509,9 @@ namespace Krea2 {
                                                 config.theta,
                                                 config.axes_dim,
                                                 ref_latents,
-                                                ref_image_params.ref_index_mode);
+                                                ref_image_params.ref_index_mode,
+                                                ref_image_params.rescale_ref_ids,
+                                                ref_image_params.center_ref_ids);
                 if (pe_timing) {
                     LOG_INFO("[krea2-pe] built in %" PRId64 " ms (%zu floats, key=%016" PRIx64 ")",
                              ggml_time_ms() - t0,
