@@ -2,9 +2,14 @@
 #define __SD_CONDITIONING_CONDITIONER_HPP__
 
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <list>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
@@ -13,6 +18,129 @@
 #include "model/te/llm.hpp"
 #include "model/te/t5.hpp"
 #include "model_loader.h"
+
+// ── content-addressed, bounded, in-process caches ────────────────────────────
+//
+// Two things in an edit render are pure functions of their input and are
+// recomputed on every request even when the user only changed the seed: the
+// reference image's VAE latent, and the VLM's grounding embedding for that same
+// reference. Both are keyed the way ltx-video keys its reference latents
+// (`ltxav_reference_cache_key` in stable-diffusion.cpp): hash the DECODED,
+// ALREADY-PREPROCESSED pixel tensor -- the exact bytes handed to the encoder --
+// so every geometry decision upstream of the encode (resize target, crop, VLM
+// min/max size, resize mode) is in the key BY CONSTRUCTION rather than by
+// remembering to enumerate it.
+//
+// Everything that is NOT in those bytes -- the weights, the runtime knobs -- is
+// the caller's responsibility and goes in an explicit `env` string. A key that
+// is incomplete does not fail loudly; it returns a wrong tensor that renders
+// into a plausible image. When in doubt, put it in the env.
+//
+// These live in the process that reuses them. The CUDA-owning worker is a
+// forked child (examples/server/worker_supervisor.cpp), so both caches hang off
+// objects owned by that child's sd_ctx and die with it.
+namespace sd_cache {
+
+// Two independent 64-bit FNV-1a passes = a 128-bit content key. A collision
+// would silently swap one person's reference for another's, which is worth the
+// extra eight bytes to make absurd.
+//
+// SHAPE IS IN THE KEY EXPLICITLY, not left to "it is in the bytes": a uniform
+// tensor at [W,H] and at [H,W] has identical bytes, identical numel and
+// identical rank, so shape-by-implication would hand back a result computed on
+// the wrong spatial grid.
+inline std::string tensor_content_key(const sd::Tensor<float>& tensor) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(tensor.data());
+    const size_t size = static_cast<size_t>(tensor.numel()) * sizeof(float);
+    uint64_t h1       = 1469598103934665603ull;  // FNV-1a 64 basis
+    uint64_t h2       = 0x9e3779b97f4a7c15ull;   // a second basis, so the pair is 128 bits
+    for (size_t i = 0; i < size; ++i) {
+        h1 = (h1 ^ bytes[i]) * 1099511628211ull;
+        h2 = (h2 ^ bytes[i]) * 0x100000001b3ull;
+        h2 ^= h2 >> 29;
+    }
+    std::string dims;
+    for (int64_t axis = 0; axis < tensor.dim(); ++axis) {
+        dims += (axis != 0 ? "x" : "") + std::to_string(tensor.shape()[axis]);
+    }
+    char digest[64];
+    snprintf(digest, sizeof(digest), "%016llx%016llx", (unsigned long long)h1, (unsigned long long)h2);
+    return std::string(digest) + "-s" + dims;
+}
+
+// Smallest LRU that does the job. Bounded by construction: a user iterating
+// seeds on one reference hits every time, a user cycling references evicts
+// rather than accumulating. Not thread-safe -- every user of it is inside the
+// engine's single generation path.
+template <typename Value>
+class LruCache {
+public:
+    explicit LruCache(size_t capacity = 4)
+        : capacity_(capacity == 0 ? 1 : capacity) {}
+
+    void set_capacity(size_t capacity) {
+        capacity_ = capacity == 0 ? 1 : capacity;
+        trim();
+    }
+
+    // Returns nullptr on a miss. The pointer is invalidated by the next put().
+    const Value* get(const std::string& key) {
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->first == key) {
+                entries_.splice(entries_.begin(), entries_, it);
+                return &entries_.front().second;
+            }
+        }
+        return nullptr;
+    }
+
+    void put(const std::string& key, Value value) {
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->first == key) {
+                it->second = std::move(value);
+                entries_.splice(entries_.begin(), entries_, it);
+                return;
+            }
+        }
+        entries_.emplace_front(key, std::move(value));
+        trim();
+    }
+
+    void clear() {
+        entries_.clear();
+    }
+
+    size_t size() const {
+        return entries_.size();
+    }
+
+private:
+    void trim() {
+        while (entries_.size() > capacity_) {
+            entries_.pop_back();
+        }
+    }
+
+    size_t capacity_ = 4;
+    std::list<std::pair<std::string, Value>> entries_;  // front = most recently used
+};
+
+// Cache size from the environment, clamped. 0 disables the cache entirely and
+// restores the recompute-every-time behaviour exactly.
+inline size_t entries_from_env(const char* name, size_t fallback, size_t maximum) {
+    const char* value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char* end       = nullptr;
+    const long parsed = strtol(value, &end, 10);
+    if (end == value || parsed < 0) {
+        return fallback;
+    }
+    return static_cast<size_t>(parsed) > maximum ? maximum : static_cast<size_t>(parsed);
+}
+
+}  // namespace sd_cache
 
 struct SDCondition {
     sd::Tensor<float> c_crossattn;
@@ -122,6 +250,14 @@ struct ConditionerParams {
     bool zero_out_masked                             = false;
     const std::vector<sd::Tensor<float>>* ref_images = nullptr;  // for qwen image edit
     RefImageParams ref_image_params;
+    // Identifies the weight adapter currently attached to the cond_stage model,
+    // for the VLM image-embed cache below. A runtime LoRA can target the text
+    // encoder -- including its vision tower -- so the same pixels can encode to
+    // a different embedding under a different adapter set. Empty = no adapter.
+    // Set by the engine (stable-diffusion.cpp) from the resolved LoRA specs; it
+    // is a SUPERSET (it names every adapter in the request, not only the ones
+    // that matched a cond_stage tensor), which can only cost hit rate.
+    std::string weight_adapter_signature;
 };
 
 struct Conditioner {
@@ -1885,6 +2021,7 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_max_graph_vram_bytes(max_vram_bytes);
         }
+        vlm_image_embed_cache.clear();
     }
 
     void set_stream_layers_enabled(bool enabled) override {
@@ -1892,6 +2029,7 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_stream_layers_enabled(enabled);
         }
+        vlm_image_embed_cache.clear();
     }
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends) override {
@@ -1899,6 +2037,7 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_runtime_backends(backends);
         }
+        vlm_image_embed_cache.clear();
     }
 
     void set_graph_cut_layer_split_enabled(bool enabled) override {
@@ -1908,6 +2047,7 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_graph_cut_layer_split_enabled(enabled);
         }
+        vlm_image_embed_cache.clear();
     }
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
@@ -1917,6 +2057,7 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_graph_cut_layer_split_backend_vram_limits(limits);
         }
+        vlm_image_embed_cache.clear();
     }
 
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
@@ -1931,6 +2072,7 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_flash_attention_enabled(enabled);
         }
+        vlm_image_embed_cache.clear();
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
@@ -1940,6 +2082,60 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->set_weight_adapter(adapter);
         }
+        // Deliberately NOT clearing the VLM cache here: clear_lora_adapters()
+        // calls this with nullptr on EVERY request, so clearing would make the
+        // cache dead code. The adapter is carried in the cache KEY instead, via
+        // ConditionerParams::weight_adapter_signature.
+    }
+
+    // ── VLM grounding-embed cache ────────────────────────────────────────────
+    //
+    // The Qwen3-VL vision tower is re-run per request on a reference the user is
+    // not changing -- and with the encoder params on the CPU backend
+    // (KREA2_PARAMS_BACKEND=clip=cpu) that drags ~4.6 GB over PCIe to do it,
+    // inside the 3.30 s of pre-sampling GPU idle. Reruns are pure: the same
+    // preprocessed pixels through the same weights give the same embedding.
+    //
+    // KEY (see encode_image_cached): the content+shape hash of `resized_image`,
+    // which is the output of clip_preprocess() and therefore already carries the
+    // source pixels, vlm_min_size / vlm_max_size, vlm_resize_mode and the
+    // patch/merge-derived w_bar x h_bar grid. Plus, explicitly, everything that
+    // is NOT in those bytes: the model version, whether the vision tower is
+    // enabled at all, n_threads (the CPU backend's thread count can reorder a
+    // reduction), and the attached weight adapter (a LoRA may target the text
+    // encoder). Every other runtime knob that reaches this runner clears the
+    // cache in its setter above rather than joining the key.
+    sd_cache::LruCache<sd::Tensor<float>> vlm_image_embed_cache{
+        sd_cache::entries_from_env("SD_VLM_IMAGE_EMBED_CACHE_ENTRIES", 4, 64)};
+
+    sd::Tensor<float> encode_image_cached(int n_threads,
+                                          const sd::Tensor<float>& resized_image,
+                                          const ConditionerParams& conditioner_params) {
+        if (resized_image.empty()) {
+            return llm->encode_image(n_threads, resized_image, false, true, true);
+        }
+        // Cache disabled: recompute, and do not even hash.
+        if (sd_cache::entries_from_env("SD_VLM_IMAGE_EMBED_CACHE_ENTRIES", 4, 64) == 0) {
+            LOG_INFO("[CACHE] vlm-embed MISS (disabled)");
+            return llm->encode_image(n_threads, resized_image, false, true, true);
+        }
+        const std::string key = sd_cache::tensor_content_key(resized_image) +
+                                "-v" + std::to_string(static_cast<int>(version)) +
+                                "-vis" + (llm->enable_vision ? "1" : "0") +
+                                "-t" + std::to_string(n_threads) +
+                                "-a" + conditioner_params.weight_adapter_signature;
+        if (const sd::Tensor<float>* hit = vlm_image_embed_cache.get(key); hit != nullptr) {
+            LOG_INFO("[CACHE] vlm-embed HIT (%lld tokens, no vision-tower pass)",
+                     hit->dim() >= 2 ? (long long)hit->shape()[1] : 0LL);
+            return *hit;
+        }
+        LOG_INFO("[CACHE] vlm-embed MISS (running vision tower; %zu entries resident)",
+                 vlm_image_embed_cache.size());
+        auto embed = llm->encode_image(n_threads, resized_image, false, true, true);
+        if (!embed.empty()) {
+            vlm_image_embed_cache.put(key, embed);
+        }
+        return embed;
     }
 
     void runner_done() override {
@@ -2432,14 +2628,26 @@ struct LLMEmbedder : public Conditioner {
                     LOG_DEBUG("resize conditioner ref image %d from %dx%d to %dx%d", i, height, width, h_bar, w_bar);
 
                     auto resized_image = clip_preprocess(image, w_bar, h_bar);
-                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true);
+                    // Cached: an edit user re-renders the same reference on every seed.
+                    // Only the krea2 branch takes the cached path -- the other pipelines'
+                    // encode is identical code, but each would need its own audit of what
+                    // else varies per request, and none of them is the measured 3.30 s.
+                    auto image_embed = encode_image_cached(n_threads, resized_image, conditioner_params);
                     GGML_ASSERT(!image_embed.empty());
 
-                    std::string image_prefix = prompt + img_prompt + "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
+                    // The "Picture N: " label is part of upstream's Krea2 template, but the
+                    // krea2_edit recipe (lbouaraba nodes / conradlocke weights) trains on a
+                    // bare vision block. Grounding only works if inference matches training,
+                    // so the preset gets to drop it.
+                    const std::string label = conditioner_params.ref_image_params.vlm_picture_labels
+                                                  ? "Picture " + std::to_string(i + 1) + ": "
+                                                  : std::string();
+
+                    std::string image_prefix = prompt + img_prompt + label + "<|vision_start|>";
                     int image_embed_idx      = static_cast<int>(tokenizer->encode(image_prefix, nullptr).size());
                     image_embeds.emplace_back(image_embed_idx, image_embed);
 
-                    img_prompt += "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
+                    img_prompt += label + "<|vision_start|>";
                     int64_t num_image_tokens = image_embed.shape()[1];
                     img_prompt.reserve(img_prompt.size() + static_cast<size_t>(num_image_tokens) * placeholder.size() + 32);
                     for (int j = 0; j < num_image_tokens; j++) {

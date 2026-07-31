@@ -28,6 +28,15 @@ struct RefImageParams {
     int vlm_min_size                   = -1;
     int vlm_max_size                   = -1;
     bool resize_vae_to_target          = false;
+    // Center-crop the reference to the TARGET aspect ratio before the resize that
+    // resize_vae_to_target performs. Without it a mismatched-AR source is stretched;
+    // the krea2_edit trainer/nodes crop (their "crop (legacy)" geometry) instead.
+    bool crop_vae_to_target_ar = false;
+    // Prefix each VLM vision block with "Picture N: ". Upstream's Krea2 conditioner
+    // always does; the lbouaraba/conradlocke krea2_edit recipe trains WITHOUT it
+    // (its template is bare <|vision_start|><|image_pad|>...<|vision_end|>), and the
+    // grounding half of that recipe only lands if inference matches training.
+    bool vlm_picture_labels = true;
 };
 
 const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
@@ -40,6 +49,14 @@ const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
     {"z_image_omni", {true, true, Rope::RefIndexMode::FIXED, false, true, -1, RefImageResizeMode::AREA, -1, -1}},
     {"krea2_ostris_edit", {true, true, Rope::RefIndexMode::INCREASE, true, true, -1, RefImageResizeMode::AREA, -1, -1}},
     {"krea2_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768}},
+    // conradlocke/krea2-identity-edit (v1.x) + lbouaraba/comfyui-krea2edit nodes.
+    // Differences from "krea2_edit" above, all training-matched to those nodes:
+    //   resize_vae_to_target + crop_vae_to_target_ar  the node fits the SOURCE to the
+    //       target latent grid exactly (center-crop to the target AR, then resize), so
+    //       ref grid == target grid and the anchored ref RoPE ids are the centered ones.
+    //   vlm_picture_labels=false  its grounded-encode template has no "Picture N: ".
+    //   vlm min/max 768           = the nodes' grounding_px default (trained 384-768).
+    {"krea2_identity_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768, true, true, false}},
     {"cosmos_reference", {false, true, Rope::RefIndexMode::INCREASE, false, false, -1, RefImageResizeMode::NONE, -1, -1}},
 };
 

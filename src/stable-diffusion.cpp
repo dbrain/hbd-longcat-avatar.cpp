@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <type_traits>
@@ -284,6 +285,58 @@ public:
     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
     std::vector<std::shared_ptr<LoraModel>> runtime_lora_models;
     bool apply_lora_immediately = false;
+
+    // ── caches that must not outlive the weights they were built against ─────
+    //
+    // Bumped by anything that changes what is registered with `model_manager`
+    // while the sd_ctx lives: a DiT hot-swap (which REUSES the same runner
+    // object, so a runner pointer cannot detect it) and control-net load/unload
+    // (which changes `model_manager->tensor_names()`, the input to
+    // LoraModel::preprocess_lora_tensors). Every cache below joins it into its
+    // key, so a stale entry becomes unreachable rather than silently applied
+    // against different weights.
+    uint64_t base_model_epoch = 0;
+
+    // Canonical description of the LoRA set resolved for the current request:
+    // path, file identity, multiplier, high-noise flag and prefix filter of each
+    // spec, in order, plus the apply mode. Empty string == no adapter. Recomputed
+    // in apply_loras(); read by the runtime-adapter cache and handed to the
+    // conditioner so the VLM embed cache can key on it.
+    std::string current_lora_signature;
+
+    // One request's worth of runtime LoRA state, kept so an unchanged `lora`
+    // array does not re-parse and re-register the adapter gguf on every render
+    // (measured: apply_loras 0.42-0.55 s per img_gen, CPU, outside sampling).
+    //
+    // The models hold ResidencyMode::ParamBackend registrations in their OWN
+    // private ModelManager (~926 MiB for the r256 Q8_0 adapter).
+    //
+    // MEASURED: caching this costs ZERO extra idle VRAM -- 2938 vs 2940 MiB over
+    // three renders, i.e. noise. An earlier draft of this comment claimed the
+    // binding "pins" that memory between renders and was WRONG: it does, but so
+    // does the code without it. apply_loras_at_runtime frees the previous adapter
+    // at the START of the next request, not at the end of the render, so the
+    // adapter is already resident between renders in both arms. The cache changes
+    // nothing about idle residency.
+    //
+    // Still a single binding rather than an LRU: a second adapter set WOULD cost
+    // its full resident size, for a hit rate the edit workflow does not need.
+    // Releasing drops the last shared_ptr, and ~ModelManager -> release_all()
+    // returns the memory.
+    struct RuntimeLoraBinding {
+        std::string key;
+        std::vector<std::shared_ptr<LoraModel>> models;
+        std::shared_ptr<MultiLoraAdapter> cond_stage_adapter;
+        std::shared_ptr<MultiLoraAdapter> diffusion_adapter;
+        std::shared_ptr<MultiLoraAdapter> first_stage_adapter;
+    };
+    std::optional<RuntimeLoraBinding> runtime_lora_binding;
+
+    // Reference-image VAE latents, content-addressed. See
+    // encode_reference_latent_cached().
+    sd_cache::LruCache<sd::Tensor<float>> reference_latent_cache{
+        sd_cache::entries_from_env("SD_REF_LATENT_CACHE_ENTRIES", 4, 64)};
+
     bool animatediff_loaded     = false;
     int animatediff_num_frames  = 0;
 
@@ -423,6 +476,11 @@ public:
         finish_runner(high_noise_diffusion_model);
         finish_runner(first_stage_model);
         finish_runner(audio_vae_model);
+        // The cached runtime adapter set pins its own params (hundreds of MiB for
+        // a rank-256 adapter) in its private ModelManager, and nothing above can
+        // see it. A chain boundary exists to hand VRAM back, so hand this back
+        // too; the next segment reloads it exactly as it does today.
+        release_runtime_lora_binding();
         if (model_manager) {
             model_manager->reclaim_transient_compute_buffers();
         }
@@ -438,17 +496,12 @@ public:
             ggml_backend_cuda_trim_memory(backend);
         }
 
-        // LTX's cuDNN Conv3D path reorders each temporary staged VAE weight buffer, into raw
-        // cudaMalloc'd memory that is outside VMM trim. Freeing it here returns ~1.4 GB per
-        // window.
-        //
-        // ⚠️ The reason has CHANGED (ggml b57bc91b). This used to say the cache "is keyed by that
-        // temporary device address, so it cannot be kept safely into the next window" — that key
-        // was a BUG, not a constraint: it took stale hits and convolved with another tensor's
-        // weights. The cache is now keyed on stable identity (name + buffer + shape + type +
-        // device), so re-staging no longer invalidates it and this call is a pure memory
-        // reclaim that costs a rebuild, not a correctness requirement.
-        // Do not touch the CUDA runtime for a CPU-only LTX invocation.
+        // LTX's cuDNN Conv3D path holds a reordered copy of each VAE weight, outside
+        // the VMM pool, so a boundary that exists to hand VRAM back frees them here.
+        // This is no longer a CORRECTNESS requirement: the cache is keyed by stable
+        // identity (tensor name + buffer + shape + type + device), not by the temporary
+        // staged address, so keeping it across a window would be safe -- it is kept as a
+        // VRAM reclaim. Do not touch the CUDA runtime for a CPU-only LTX invocation.
         if (!backends.empty()) {
             ggml_backend_cuda_release_cudnn_conv3d_weights();
         }
@@ -665,10 +718,19 @@ public:
                                                      params_follow_runtime);
     }
 
+    // Drop everything cached against the currently registered weights or against
+    // `model_manager->tensor_names()`. Cheap; call it on any doubt.
+    void invalidate_weight_dependent_caches() {
+        base_model_epoch++;
+        reference_latent_cache.clear();
+        release_runtime_lora_binding();
+    }
+
     bool unload_control_net() {
         if (control_net == nullptr) {
             return true;
         }
+        invalidate_weight_dependent_caches();
         if (model_manager != nullptr) {
             if (!model_manager->unregister_param_tensors("ControlNet", &control_net_params_mem_size)) {
                 return false;
@@ -816,6 +878,12 @@ public:
             LOG_ERROR("swap_diffusion_model: missing path, diffusion runner, or model manager");
             return false;
         }
+        // Invalidate every weight-dependent cache BEFORE anything is touched, and
+        // unconditionally: the swap reuses the SAME runner object, so nothing
+        // downstream can tell one variant from another by identity, and a failed
+        // swap can still leave the registration mutated. A runtime adapter cached
+        // against the outgoing DiT would be applied to the incoming one.
+        invalidate_weight_dependent_caches();
 
         ModelLoader compatibility_probe;
         if (!compatibility_probe.init_from_file(path, "model.diffusion_model.")) {
@@ -896,6 +964,10 @@ public:
         if (!unload_control_net()) {
             return false;
         }
+        // unload_control_net() short-circuits when nothing was loaded, so bump
+        // again here: this call registers new tensors either way, and
+        // `model_manager->tensor_names()` feeds preprocess_lora_tensors().
+        invalidate_weight_dependent_caches();
 
         ModelLoader& shared_loader = model_manager->loader();
         if (!shared_loader.init_from_file(path)) {
@@ -2359,16 +2431,120 @@ public:
 
         clear_lora_adapters();
         runtime_lora_models.clear();
+        // The immediate path folds into the base weights and never consults the
+        // runtime binding, so a live binding here would be dead VRAM.
+        release_runtime_lora_binding();
 
         model_manager->set_loras(loras, version);
+    }
+
+    // Drop the cached runtime adapter set and, with it, its VRAM. The models are
+    // the last strong references to their private ModelManagers, whose destructor
+    // calls release_all(); release_loaded_tensors() first makes that deterministic
+    // rather than dependent on shared_ptr order, and matches how ModelManager
+    // itself disposes of a fold LoRA (model_manager.cpp:567,1283).
+    void release_runtime_lora_binding() {
+        if (!runtime_lora_binding.has_value()) {
+            return;
+        }
+        RuntimeLoraBinding binding = std::move(*runtime_lora_binding);
+        runtime_lora_binding.reset();
+        for (auto& model : binding.models) {
+            if (model != nullptr) {
+                model->release_loaded_tensors();
+            }
+        }
+    }
+
+    // Everything outside the LoRA specs themselves that decides what
+    // apply_loras_at_runtime() builds. Joined into the binding key.
+    std::string runtime_lora_environment_key() const {
+        std::string key = "v" + std::to_string(static_cast<int>(version)) +
+                          "-t" + std::to_string(n_threads) +
+                          "-e" + std::to_string((unsigned long long)base_model_epoch);
+        // Which module runners exist decides which of the three filtered loads
+        // runs at all, and each load allocates on that module's backend pair.
+        key += cond_stage_model ? "-te1" : "-te0";
+        key += diffusion_model ? "-dit1" : "-dit0";
+        key += high_noise_diffusion_model ? "-hn1" : "-hn0";
+        key += first_stage_model ? "-vae1" : "-vae0";
+        return key;
     }
 
     void apply_loras_at_runtime(const std::vector<ModelManager::LoraSpec>& loras) {
         if (model_manager != nullptr) {
             model_manager->set_loras({}, version);
         }
+
+        // ── cached fast path ─────────────────────────────────────────────────
+        //
+        // The adapter gguf is otherwise re-opened, re-parsed, re-allocated and
+        // re-staged on EVERY img_gen (measured 0.42-0.55 s of CPU, outside
+        // sampling) for a `lora` array the user is not changing while they
+        // iterate on seeds.
+        //
+        // KEY = current_lora_signature (per spec, in order: resolved path, file
+        // size, file mtime, multiplier bit pattern, is_high_noise, tensor-name
+        // prefix filter, required flag) + runtime_lora_environment_key()
+        // (SDVersion, n_threads, base_model_epoch, which module runners exist).
+        // A hit rebuilds NOTHING -- the same LoraModel objects, holding the same
+        // tensors at the same addresses, are re-attached -- so the graph the
+        // adapter contributes is identical by construction.
+        //
+        // Multiplier is in the key even though LoraModel::multiplier is only read
+        // at graph-build time (lora.hpp forward_lora / get_lora_weight_diff), so
+        // assigning it on reuse would also be correct. Keying on it costs one
+        // reload when the strength changes -- exactly today's cost -- and removes
+        // the need for that argument to stay true.
+        //
+        // `current_lora_signature` is set by apply_loras(), the only caller. If a
+        // future caller reaches here without setting it, an empty signature would
+        // make every non-empty set share one key -- so that case declines to
+        // cache rather than guessing.
+        //
+        // Escape hatch: SD_RUNTIME_LORA_CACHE=0 restores the reload-every-request
+        // behaviour exactly, and is the reference arm for any A/B of this change.
+        // It is also the lever if holding the adapter resident between renders
+        // ever costs a co-resident model its headroom.
+        const bool cache_enabled = sd_cache::entries_from_env("SD_RUNTIME_LORA_CACHE", 1, 1) != 0;
+        const bool cacheable     = cache_enabled && !loras.empty() && !current_lora_signature.empty();
+
+        const std::string binding_key = cacheable
+                                            ? current_lora_signature + "|" + runtime_lora_environment_key()
+                                            : std::string();
+        if (cacheable && runtime_lora_binding.has_value() && runtime_lora_binding->key == binding_key) {
+            runtime_lora_models = runtime_lora_binding->models;
+            clear_lora_adapters();
+            if (cond_stage_model && runtime_lora_binding->cond_stage_adapter) {
+                cond_stage_model->set_weight_adapter(runtime_lora_binding->cond_stage_adapter);
+            }
+            if (diffusion_model && runtime_lora_binding->diffusion_adapter) {
+                diffusion_model->set_weight_adapter(runtime_lora_binding->diffusion_adapter);
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->set_weight_adapter(runtime_lora_binding->diffusion_adapter);
+                }
+            }
+            if (first_stage_model && runtime_lora_binding->first_stage_adapter) {
+                first_stage_model->set_weight_adapter(runtime_lora_binding->first_stage_adapter);
+            }
+            LOG_INFO("[CACHE] lora-binding HIT: reusing the loaded adapter set (no re-read)");
+            return;
+        }
+        if (!loras.empty()) {
+            LOG_INFO("[CACHE] lora-binding MISS (%s)",
+                     !cache_enabled ? "disabled"
+                                    : (runtime_lora_binding.has_value() ? "key changed" : "cold"));
+        }
+
         runtime_lora_models.clear();
         clear_lora_adapters();
+        // Release BEFORE loading the replacement, never after: the outgoing
+        // adapter's resident params must be returned before the incoming set is
+        // allocated, or a switch would transiently need both (~926 MiB each for
+        // the r256 Q8_0 adapter). This also covers the switch to NO adapter --
+        // an empty request drops the binding rather than pinning dead VRAM
+        // through a t2i render.
+        release_runtime_lora_binding();
         if (loras.empty()) {
             return;
         }
@@ -2377,6 +2553,9 @@ public:
         if (model_manager != nullptr) {
             model_tensor_names = model_manager->tensor_names();
         }
+
+        RuntimeLoraBinding binding;
+        binding.key = binding_key;
 
         LOG_INFO("apply lora at runtime");
         if (cond_stage_model) {
@@ -2397,6 +2576,7 @@ public:
             if (!cond_stage_lora_models.empty()) {
                 auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(cond_stage_lora_models);
                 cond_stage_model->set_weight_adapter(multi_lora_adapter);
+                binding.cond_stage_adapter = std::move(multi_lora_adapter);
             }
         }
         if (diffusion_model) {
@@ -2417,6 +2597,7 @@ public:
                 if (high_noise_diffusion_model) {
                     high_noise_diffusion_model->set_weight_adapter(multi_lora_adapter);
                 }
+                binding.diffusion_adapter = std::move(multi_lora_adapter);
             }
         }
 
@@ -2435,7 +2616,16 @@ public:
             if (!first_stage_lora_models.empty()) {
                 auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(first_stage_lora_models);
                 first_stage_model->set_weight_adapter(multi_lora_adapter);
+                binding.first_stage_adapter = std::move(multi_lora_adapter);
             }
+        }
+
+        // Only cache a set that actually produced something. A key whose loads
+        // all failed or matched no tensors must be retried, not remembered as
+        // "the adapter is already applied".
+        if (cacheable && !runtime_lora_models.empty()) {
+            binding.models = runtime_lora_models;
+            runtime_lora_binding.emplace(std::move(binding));
         }
     }
 
@@ -2446,6 +2636,61 @@ public:
                 lora_model->stat();
             }
         }
+    }
+
+    // Canonical, order-sensitive description of a resolved LoRA set.
+    //
+    // FILE IDENTITY IS IN IT, not just the path: an adapter is routinely rebuilt
+    // in place under the same name (tools/convert_lora_q8.py writes over the
+    // served gguf), and a cache keyed on the path alone would keep serving the
+    // previous build's weights for the rest of the worker's life. Size + mtime
+    // is the same identity ModelLoader would have re-read anyway; a content hash
+    // would mean reading ~1 GB per request, which is the cost being removed.
+    //
+    // A path that cannot be stat()ed contributes `id=0` with zeroed size/mtime,
+    // which never equals a successful stat of the same file, so an unreadable
+    // file can never produce a hit against a readable one.
+    static std::string lora_set_signature(const std::vector<ModelManager::LoraSpec>& loras,
+                                          bool apply_immediately) {
+        std::string signature = apply_immediately ? "mode=immediate" : "mode=runtime";
+        for (const auto& spec : loras) {
+            uint64_t size_bytes = 0;
+            int64_t mtime_ticks = 0;
+            bool identified     = false;
+            try {
+                std::error_code error;
+                const std::filesystem::path path(spec.path);
+                const auto file_size = std::filesystem::file_size(path, error);
+                if (!error) {
+                    const auto write_time = std::filesystem::last_write_time(path, error);
+                    if (!error) {
+                        size_bytes  = static_cast<uint64_t>(file_size);
+                        mtime_ticks = static_cast<int64_t>(write_time.time_since_epoch().count());
+                        identified  = true;
+                    }
+                }
+            } catch (const std::exception&) {
+                identified = false;
+            }
+            // Compare the multiplier by BIT PATTERN: two floats that print the
+            // same are not necessarily the same float.
+            uint32_t multiplier_bits = 0;
+            static_assert(sizeof(multiplier_bits) == sizeof(spec.multiplier),
+                          "LoraSpec::multiplier must be a 32-bit float to key on its bits");
+            std::memcpy(&multiplier_bits, &spec.multiplier, sizeof(multiplier_bits));
+
+            char scratch[128];
+            snprintf(scratch, sizeof(scratch),
+                     "|sz=%llu|mt=%lld|mul=%08x|hn=%d|req=%d|id=%d|pfx=",
+                     (unsigned long long)size_bytes,
+                     (long long)mtime_ticks,
+                     (unsigned)multiplier_bits,
+                     spec.is_high_noise ? 1 : 0,
+                     spec.required ? 1 : 0,
+                     identified ? 1 : 0);
+            signature += "\n" + spec.path + scratch + spec.tensor_name_prefix_filter;
+        }
+        return signature;
     }
 
     void apply_loras(const sd_lora_t* loras, uint32_t lora_count) {
@@ -2467,6 +2712,11 @@ public:
         for (auto& extension : generation_extensions) {
             extension->collect_loras(all_loras);
         }
+
+        // Computed AFTER collect_loras(), so extension-supplied adapters (PuLID,
+        // PhotoMaker) are in it, and before apply_*, which reads it.
+        current_lora_signature = all_loras.empty() ? std::string()
+                                                   : lora_set_signature(all_loras, apply_lora_immediately);
 
         int64_t t0 = ggml_time_ms();
         if (apply_lora_immediately) {
@@ -3504,6 +3754,110 @@ public:
         return latents;
     }
 
+    // ── reference-image VAE latent, content-addressed ────────────────────────
+    //
+    // A reference is an IDENTITY, not a shot: the same pixels encode to the same
+    // latent for every seed the user tries on one edit. Today it is re-encoded
+    // per request, serialised ahead of sampling inside the measured 3.30 s of
+    // pre-sampling GPU idle, and the encode owns a 2356 MB compute buffer.
+    // ltx-video already keys its reference latents this way
+    // (ltxav_encode_with_reference_cache below); this is the same idea in RAM.
+    //
+    // KEY, part 1: the content+shape hash of `pixels` -- the EXACT tensor handed
+    // to the VAE, after the crop and the resize. Every geometry input is
+    // therefore in the key by construction rather than by enumeration:
+    // resize_before_vae, resize_vae_to_target, crop_vae_to_target_ar,
+    // vae_input_max_pixels, the vae_scale_factor rounding, and the source image
+    // itself. Shape is joined explicitly because a transposed pair of uniform
+    // tensors has identical bytes.
+    //
+    // KEY, part 2 (`env`): everything encode_first_stage() reads that is NOT in
+    // those bytes -- see encode_reference_latent_env().
+    //
+    // GATED TO krea2 ON PURPOSE. AutoencoderKL::vae_output_to_latents() draws
+    // from `rng` to sample the posterior (auto_encoder_kl.hpp:761), so for those
+    // models the encode is neither reproducible nor side-effect-free: serving a
+    // cached latent would both differ from a fresh sample and leave the RNG
+    // stream un-advanced, changing the sampling noise and hence the whole image.
+    // krea2 uses the Wan VAE, whose vae_output_to_latents is `SD_UNUSED(rng);
+    // return vae_output;` (wan_vae.hpp:1318) -- deterministic, no draw. Widening
+    // this needs that check repeated per VAE, not an assumption.
+    //
+    // Both the REQUESTED and the current circular axes are in the env, and the
+    // pair is load-bearing. configure_image_vae_axes() splits one request flag
+    // into two values -- the VAE runner's internal axes (`requested && tile >=
+    // latent`) and the `sd->circular_*` that encode() is passed (`requested &&
+    // tile < latent`) -- and the second does NOT determine the first: with
+    // tiling on and a tile at least as large as the latent, sd->circular_x is
+    // false for a requested value of either true or false, while the runner's
+    // internal axis follows the request. Keying on the post-guard value alone
+    // would collide a circular encode with a non-circular one.
+    std::string encode_reference_latent_env(int target_width,
+                                            int target_height,
+                                            bool requested_circular_x,
+                                            bool requested_circular_y) const {
+        char scratch[512];
+        snprintf(scratch, sizeof(scratch),
+                 "v%d|e%llu|n%d|w%d|h%d|rcx%d|rcy%d|cx%d|cy%d|tile%d,%d,%d,%d,%.9g,%.9g,%.9g|xa=",
+                 static_cast<int>(version),
+                 (unsigned long long)base_model_epoch,
+                 n_threads,
+                 target_width,
+                 target_height,
+                 requested_circular_x ? 1 : 0,
+                 requested_circular_y ? 1 : 0,
+                 circular_x ? 1 : 0,
+                 circular_y ? 1 : 0,
+                 vae_tiling_params.enabled ? 1 : 0,
+                 vae_tiling_params.temporal_tiling ? 1 : 0,
+                 vae_tiling_params.tile_size_x,
+                 vae_tiling_params.tile_size_y,
+                 (double)vae_tiling_params.target_overlap,
+                 (double)vae_tiling_params.rel_size_x,
+                 (double)vae_tiling_params.rel_size_y);
+        std::string env = scratch;
+        env += vae_tiling_params.extra_tiling_args != nullptr ? vae_tiling_params.extra_tiling_args : "";
+        // A runtime LoRA can target the first_stage model, and the immediate path
+        // folds LoRA deltas into the VAE weights outright. This is the whole
+        // request's adapter set, i.e. a superset of the VAE-targeting subset: it
+        // can only cost hit rate, never correctness.
+        env += "|lora=" + current_lora_signature;
+        return env;
+    }
+
+    sd::Tensor<float> encode_reference_latent_cached(const sd::Tensor<float>& pixels,
+                                                     int target_width,
+                                                     int target_height,
+                                                     bool requested_circular_x,
+                                                     bool requested_circular_y,
+                                                     int index) {
+        const size_t entries = sd_cache::entries_from_env("SD_REF_LATENT_CACHE_ENTRIES", 4, 64);
+        if (entries == 0 || pixels.empty() || !sd_version_is_krea2(version)) {
+            if (!pixels.empty() && sd_version_is_krea2(version)) {
+                LOG_INFO("[CACHE] ref-latent %d MISS (disabled)", index);
+            }
+            return encode_first_stage(pixels);
+        }
+        reference_latent_cache.set_capacity(entries);
+
+        const std::string key = sd_cache::tensor_content_key(pixels) + "|" +
+                                encode_reference_latent_env(target_width,
+                                                            target_height,
+                                                            requested_circular_x,
+                                                            requested_circular_y);
+        if (const sd::Tensor<float>* hit = reference_latent_cache.get(key); hit != nullptr) {
+            LOG_INFO("[CACHE] ref-latent %d HIT (no VAE encode pass)", index);
+            return *hit;
+        }
+        LOG_INFO("[CACHE] ref-latent %d MISS (encoding; %zu entries resident)",
+                 index, reference_latent_cache.size());
+        auto latent = encode_first_stage(pixels);
+        if (!latent.empty()) {
+            reference_latent_cache.put(key, latent);
+        }
+        return latent;
+    }
+
     sd::Tensor<float> decode_first_stage(const sd::Tensor<float>& x, bool decode_video = false) {
         if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
@@ -3660,6 +4014,18 @@ public:
                 }
             } else if (key == "vlm_min_size") {
                 if (!parse_strict_int(value, params.vlm_min_size)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "resize_vae_to_target") {
+                if (!parse_strict_bool(value, params.resize_vae_to_target)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "crop_vae_to_target_ar") {
+                if (!parse_strict_bool(value, params.crop_vae_to_target_ar)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
+            } else if (key == "vlm_picture_labels") {
+                if (!parse_strict_bool(value, params.vlm_picture_labels)) {
                     LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
                 }
             } else if (key != "preset" && key != "vlm_size") {
@@ -6935,22 +7301,61 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
             vae_height = round(vae_height / factor) * factor;
             vae_width  = round(vae_width / factor) * factor;
 
-            auto resized_ref_img = sd::ops::interpolate(ref_images[i],
+            // crop_vae_to_target_ar: a plain interpolate to a target of a different
+            // aspect ratio STRETCHES the reference — for an identity-preserving edit
+            // that is a distorted face, not a framing choice. Center-crop to the
+            // target AR first (the krea2_edit trainer's geometry) so the resize is
+            // pure scale. Only meaningful together with resize_vae_to_target.
+            // Deliberately a LOCAL copy: ref_images[] is what the VLM grounds on, and
+            // the reference nodes ground on the UNCROPPED image.
+            const sd::Tensor<float>* vae_ref_src = &ref_images[i];
+            sd::Tensor<float> cropped_ref;
+            if (ref_image_params.crop_vae_to_target_ar && vae_width > 0 && vae_height > 0) {
+                const int64_t src_w = ref_images[i].shape()[0];
+                const int64_t src_h = ref_images[i].shape()[1];
+                const double scale  = std::max(vae_width / static_cast<double>(src_w),
+                                              vae_height / static_cast<double>(src_h));
+                const int64_t crop_w = std::min<int64_t>(src_w, std::llround(vae_width / scale));
+                const int64_t crop_h = std::min<int64_t>(src_h, std::llround(vae_height / scale));
+                if (crop_w > 0 && crop_h > 0 && (crop_w != src_w || crop_h != src_h)) {
+                    const int64_t x0 = (src_w - crop_w) / 2;
+                    const int64_t y0 = (src_h - crop_h) / 2;
+                    LOG_DEBUG("center-crop ref image %d from %" PRId64 "x%" PRId64 " to %" PRId64 "x%" PRId64 " (target AR)",
+                              static_cast<int>(i), src_w, src_h, crop_w, crop_h);
+                    cropped_ref = sd::ops::slice(sd::ops::slice(ref_images[i], 0, x0, x0 + crop_w),
+                                                 1,
+                                                 y0,
+                                                 y0 + crop_h);
+                    vae_ref_src = &cropped_ref;
+                }
+            }
+
+            auto resized_ref_img = sd::ops::interpolate(*vae_ref_src,
                                                         {static_cast<int>(vae_width),
                                                          static_cast<int>(vae_height),
-                                                         ref_images[i].shape()[2],
-                                                         ref_images[i].shape()[3]});
+                                                         vae_ref_src->shape()[2],
+                                                         vae_ref_src->shape()[3]});
 
             LOG_DEBUG("resize vae ref image %d from %" PRId64 "x%" PRId64 " to %" PRId64 "x%" PRId64,
                       static_cast<int>(i),
-                      ref_images[i].shape()[1],
-                      ref_images[i].shape()[0],
+                      vae_ref_src->shape()[1],
+                      vae_ref_src->shape()[0],
                       resized_ref_img.shape()[1],
                       resized_ref_img.shape()[0]);
 
-            ref_latent = sd_ctx->sd->encode_first_stage(resized_ref_img);
+            ref_latent = sd_ctx->sd->encode_reference_latent_cached(resized_ref_img,
+                                                                    request->width,
+                                                                    request->height,
+                                                                    sd_img_gen_params->circular_x,
+                                                                    sd_img_gen_params->circular_y,
+                                                                    static_cast<int>(i));
         } else {
-            ref_latent = sd_ctx->sd->encode_first_stage(ref_images[i]);
+            ref_latent = sd_ctx->sd->encode_reference_latent_cached(ref_images[i],
+                                                                    request->width,
+                                                                    request->height,
+                                                                    sd_img_gen_params->circular_x,
+                                                                    sd_img_gen_params->circular_y,
+                                                                    static_cast<int>(i));
         }
         if (ref_latent.empty()) {
             LOG_ERROR("failed to encode reference image %d", static_cast<int>(i));
@@ -7068,6 +7473,10 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     }
 
     condition_params.ref_image_params = ref_image_params;
+    // Names the adapter set attached to the cond_stage model for this request, so
+    // the VLM image-embed cache cannot serve an embedding computed under a
+    // different (or absent) LoRA. See ConditionerParams::weight_adapter_signature.
+    condition_params.weight_adapter_signature = sd_ctx->sd->current_lora_signature;
 
     sd_ctx->sd->prepare_generation_extensions(request->pm_params,
                                               request->pulid_params,
@@ -8772,6 +9181,11 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     condition_params.text            = request.prompt;
     condition_params.zero_out_masked = true;
     condition_params.ref_images      = &latents.ref_images;
+    // Not reachable today (the VLM image-embed cache is krea2-only and krea2 is
+    // an image model), but set for the same reason the image path does: an empty
+    // signature is a real key value, and leaving it empty here would make an
+    // adapter-attached video encode collide with an adapter-free one.
+    condition_params.weight_adapter_signature = sd_ctx->sd->current_lora_signature;
     if (sd_version_is_lingbot_video(sd_ctx->sd->version)) {
         condition_params.ref_image_params.vlm_resize_mode = RefImageResizeMode::AREA;
     }
@@ -9462,9 +9876,10 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             vae_backend != nullptr && ggml_backend_is_cuda(vae_backend)) {
             ggml_backend_synchronize(vae_backend);
             ggml_backend_cuda_trim_memory(vae_backend);
-            // The staged VAE weights just moved (compute copies freed, home restored); their
-            // device pointers are stale, so the cuDNN Conv3D weight-reorder cache holds orphaned
-            // buffers. Free them now (they re-reorder at decode anyway) or they leak per segment.
+            // The staged VAE weights just moved (compute copies freed, home restored). The
+            // cuDNN Conv3D reorder cache is keyed by stable identity, not by that address, so
+            // it is not stale -- but this phase exists to hand VRAM back and those reorder
+            // buffers are outside the VMM pool. Free them here; they re-reorder at decode.
             ggml_backend_cuda_release_cudnn_conv3d_weights();
         }
         LOG_INFO("LTXAV_VAE_LAZY: released encode-staged video+audio VAE GPU params + trimmed VAE pool "

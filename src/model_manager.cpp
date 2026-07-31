@@ -1026,8 +1026,20 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
         // cuBLASLt alpha), so the stored nibbles live in a scaled domain and the TRUE-unit
         // delta has to be divided by it before it can be merged. The sidecar was loaded by
         // the pre-pass above; this only reads it.
-        auto wg_it            = tensor_states_by_name_.find(state->name + ".wglobal");
-        TensorState* wg_state = wg_it == tensor_states_by_name_.end() ? nullptr : wg_it->second;
+        auto wg_it = tensor_states_by_name_.find(state->name + ".wglobal");
+        if (wg_it == tensor_states_by_name_.end()) {
+            // FLAT nvfp4 build (krea2 ships one): there is no per-tensor global scale
+            // ANYWHERE in the model, so the stored nibbles are already in true units and
+            // wglobal is exactly 1.0 -- there is nothing for the runtime to multiply by.
+            // Declining here was not conservative, it was fatal: SD_LORA_FOLD=1 forces
+            // apply_lora_immediately, and the graph apply path a decline routes to cannot
+            // convert NVFP4 (GGML_ASSERT(convert_func != nullptr), ggml-cuda.cu). Every
+            // krea2 nvfp4 tensor declined, and the first render killed the worker.
+            // ABSENT is 1.0; only a wglobal that exists-but-is-unloaded is a real decline.
+            work.wglobal = 1.0f;
+            return;
+        }
+        TensorState* wg_state = wg_it->second;
         ggml_tensor* wg       = wg_state != nullptr ? wg_state->tensor : nullptr;
         if (wg == nullptr || wg->data == nullptr) {
             work.no_wglobal = true;
@@ -1087,8 +1099,15 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
         const float wglobal                            = work.wglobal;
 
         if (work.no_wglobal) {
-            LOG_WARN("lora fold-at-load: no .wglobal for nvfp4 tensor '%s'; leaving it to the runtime path",
-                     state->name.c_str());
+            // NOT a soft fallback: SD_LORA_FOLD=1 already forced apply_lora_immediately, and
+            // the graph apply path a declined NVFP4 tensor lands on has no convert kernel for
+            // it -- the next render aborts the worker on GGML_ASSERT(convert_func != nullptr).
+            // Say so, at ERROR, naming the way out.
+            LOG_ERROR(
+                "lora fold-at-load: nvfp4 tensor '%s' has a .wglobal sidecar that is not loaded; "
+                "it cannot be folded AND cannot go through the graph apply path (no NVFP4 convert "
+                "kernel). Unset SD_LORA_FOLD to use the per-step runtime adapter instead.",
+                state->name.c_str());
         }
         if (work.declined) {
             state->lora_fold_declined = true;
@@ -1391,11 +1410,33 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
     return true;
 }
 
+void ModelManager::invalidate_cudnn_conv_weight_caches() {
+#ifdef SD_USE_CUDA
+    bool have_cuda = false;
+    for (const auto& state : tensor_states_) {
+        if (state != nullptr && state->compute_backend != nullptr &&
+            ggml_backend_is_cuda(state->compute_backend)) {
+            have_cuda = true;
+            break;
+        }
+    }
+    if (!have_cuda) {
+        return;
+    }
+    // Both wrappers sync the device first; no conv may be in flight.
+    ggml_backend_cuda_release_cudnn_conv3d_weights();
+    ggml_backend_cuda_release_cudnn_conv2d_weights();
+#endif
+}
+
 void ModelManager::reset_lora_applied_params() {
     // FIRST, while tensor->data still points into the mapping: undo any fold. Releasing
     // the params blocks below does NOT do this -- see TensorState::folded_lora_epoch --
     // and free_params_storage_block() nulls the data pointers we need to find the pages.
     unfold_loras_from_params();
+    // The LoRA epoch moved: any conv weight this adapter touches now means something
+    // different under the same tensor name. See invalidate_cudnn_conv_weight_caches().
+    invalidate_cudnn_conv_weight_caches();
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
     for (auto& state : tensor_states_) {
@@ -1711,6 +1752,19 @@ void ModelManager::free_compute_staging_block(ComputeStagingBlock& block) {
                   ggml_backend_buffer_get_size(block.buffer) / (1024.f * 1024.f),
                   block.staged_tensors.size(),
                   block.compute_backend != nullptr ? ggml_backend_name(block.compute_backend) : "unknown");
+        // NOTE: nothing is invalidated here on purpose. Staging swaps managed_tensor->data
+        // to point INTO the buffer we have just freed, so from here on that address range
+        // is free for the pool to hand to a DIFFERENT tensor. That used to corrupt the
+        // cuDNN conv weight-reorder caches, which were keyed by the weight's DEVICE
+        // POINTER: every conv after the first render took a stale hit and convolved with
+        // another tensor's reordered weights.
+        //
+        // Those caches are now keyed by STABLE IDENTITY instead (tensor name + buffer +
+        // shape + type + device — ggml/src/ggml-cuda/cudnn-weight-key.cuh), so a recycled
+        // address cannot alias and the reorder survives the unstage. Releasing here would
+        // be correct but pointlessly slower, and — more to the point — it would leave
+        // correctness depending on every future path that recycles a staged address
+        // remembering to do the same thing. It does not.
         ggml_backend_buffer_free(block.buffer);
         block.buffer = nullptr;
     }
@@ -1772,6 +1826,9 @@ void ModelManager::release_compute_staging_blocks(bool force,
 
 void ModelManager::free_params_storage_block(ParamsStorageBlock& block) {
     if (block.buffer != nullptr) {
+        // The weights behind these names are going away; the next load may bring different
+        // content back under the same names. See invalidate_cudnn_conv_weight_caches().
+        invalidate_cudnn_conv_weight_caches();
         LOG_DEBUG("model manager releasing params backend buffer (%6.2f MB, %zu tensors, %s)",
                   ggml_backend_buffer_get_size(block.buffer) / (1024.f * 1024.f),
                   block.states.size(),

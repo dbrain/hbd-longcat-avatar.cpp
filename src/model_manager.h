@@ -139,6 +139,21 @@ private:
     void erase_params_storage_block(ParamsStorageBlock* block);
     void reset_lora_applied_params();
 
+    // Belt-and-braces invalidation of the cuDNN conv2d/conv3d reordered-weight caches.
+    //
+    // Those caches are keyed by tensor NAME (+ backend buffer, shape, type, device), which
+    // is stable across staging -- that is what makes weight offload correct without
+    // touching them per render, and it is deliberately NOT called from
+    // free_compute_staging_block(). The one thing a name cannot capture is the CONTENT
+    // under that name changing, which happens at exactly two places, both rare and both
+    // central:
+    //   * a LoRA epoch change  -- the delta is merged into the params copy
+    //     (fold_loras_into_params) or the staged copy (apply_loras_to_params);
+    //   * params being unloaded -- the next load may bring a DIFFERENT checkpoint into the
+    //     same registered tensor names.
+    // No-op unless some tensor actually computes on a CUDA backend.
+    void invalidate_cudnn_conv_weight_caches();
+
 public:
     ~ModelManager() override;
 

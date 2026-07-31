@@ -3,9 +3,11 @@
 
 #include <inttypes.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
@@ -61,19 +63,88 @@ namespace Krea2 {
     // well-tested F32 stream runs unchanged — there is no F16-Q path there, and an ungated
     // LTX_DIT_F16 is exactly what crashed a 3060 once already.
     //
-    // Also refused with a runtime weight adapter attached: LoRA takes
-    // WeightAdapter::forward_with_lora(), whose delta chain runs `x @ A^T @ B^T` against
-    // adapter tensors of unknown type. An F32 adapter weight against an F16 x is precisely the
-    // supports_op rejection above, so the F16 stream would move Linears to the CPU. The
-    // shipping checkpoint (krea2-bf16hold-snofs.gguf) has its LoKr already folded in, so this
-    // only costs the runtime `lora` request field.
+    // A runtime weight adapter used to refuse the F16 stream UNCONDITIONALLY: LoRA takes
+    // WeightAdapter::forward_with_lora(), whose delta chain runs `x @ A^T @ B^T` against adapter
+    // tensors of unknown type, and an F32 adapter weight against an F16 x is precisely the
+    // supports_op rejection above — the Linear would be dropped to the CPU, not merely slowed.
+    //
+    // That blanket refusal is now narrowed to what it was actually protecting against. An NVFP4
+    // adapter is the one case where the premise is FALSE: supports_op explicitly serves NVFP4
+    // src0 against an F16 src1 (the cuBLASLt FP4 GEMM quantises the activation to E2M1 itself),
+    // and both LoRA GEMMs go through ggml_ext_linear(), so its F16-dst gate fires for them too
+    // and the whole delta chain stays half-width. WeightAdapter::supports_f16_activation()
+    // answers this per adapter and defaults to false, so every other adapter type — F32, F16,
+    // Q8_0, mixed, or an NVFP4 one whose rank is not a multiple of 64 — keeps today's behaviour.
+    //
+    // Both halves are required: the adapter must be F16-safe AND the device must serve an F16
+    // NVFP4 destination at all.
     __STATIC_INLINE__ bool krea2_dit_f16_device_ok(GGMLRunnerContext* ctx) {
-        if (ctx == nullptr || ctx->weight_adapter != nullptr) {
+        if (ctx == nullptr) {
+            return false;
+        }
+        if (ctx->weight_adapter != nullptr && !ctx->weight_adapter->supports_f16_activation()) {
             return false;
         }
         return ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
     }
     // ---------------------------------------------------------------------------------------
+
+    // Value-honouring env read for the per-render caches below: `=0` must DISABLE, exactly as
+    // for KREA2_DIT_F16. A presence-only test would ignore anyone bisecting with an explicit 0.
+    __STATIC_INLINE__ bool krea2_env_flag(const char* name, bool dflt) {
+        const char* e = getenv(name);
+        if (e == nullptr || e[0] == '\0') {
+            return dflt;
+        }
+        return atoi(e) != 0;
+    }
+
+    // FNV-1a, byte at a time. Fine for the few-hundred-byte scalar keys.
+    __STATIC_INLINE__ uint64_t krea2_fnv1a(uint64_t h, const void* data, size_t bytes) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (size_t i = 0; i < bytes; ++i) {
+            h = (h ^ p[i]) * 1099511628211ull;
+        }
+        return h;
+    }
+
+    template <typename T>
+    __STATIC_INLINE__ uint64_t krea2_fnv1a_val(uint64_t h, const T& v) {
+        return krea2_fnv1a(h, &v, sizeof(T));
+    }
+
+    // Bulk digest for the CONDITIONING, which is ~74 MB ([2560*12, 605] F32). The byte-at-a-time
+    // loop above is a serial multiply chain — ~100 ms on that buffer, i.e. more than the cache it
+    // guards saves. Eight independent lanes over 8-byte words turn it into a memory-bandwidth
+    // walk (~5 ms), which is roughly what the 74 MB H2D upload this change REMOVES was already
+    // costing per step. Still an exact identity check: a hit needs the same byte length and the
+    // same 64-bit digest over every byte.
+    __STATIC_INLINE__ uint64_t krea2_bulk_hash(const void* data, size_t bytes) {
+        constexpr int LANES = 8;
+        uint64_t h[LANES];
+        for (int i = 0; i < LANES; ++i) {
+            h[i] = 1469598103934665603ull + static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull;
+        }
+        const auto* p     = static_cast<const unsigned char*>(data);
+        const size_t words = bytes / 8;
+        size_t i           = 0;
+        for (; i + LANES <= words; i += LANES) {
+            for (int l = 0; l < LANES; ++l) {
+                uint64_t v;
+                std::memcpy(&v, p + (i + static_cast<size_t>(l)) * 8, sizeof(v));
+                h[l] = (h[l] ^ v) * 1099511628211ull;
+            }
+        }
+        uint64_t out = 1469598103934665603ull;
+        out          = krea2_fnv1a_val(out, bytes);
+        for (int l = 0; l < LANES; ++l) {
+            out = krea2_fnv1a_val(out, h[l]);
+        }
+        // Tail: whole words the lane loop could not fill, plus any trailing bytes.
+        out = krea2_fnv1a(out, p + i * 8, bytes - i * 8);
+        // Zero is the "nothing cached yet" sentinel, so never return it.
+        return out == 0 ? 1 : out;
+    }
 
     // Self-attention for the F16 residual stream: RoPE, then attention, with the two type
     // normalizations the CUDA kernels actually require.
@@ -390,10 +461,17 @@ namespace Krea2 {
             blocks["wo"]           = std::make_shared<Linear>(features, features, false);
         }
 
+        // out_lo/out_hi: keep ONLY tokens [out_lo, out_hi) from the point where attention stops
+        // mixing rows. Everything after `attn_out` here — the gate Linear, the sigmoid multiply
+        // and `wo` — is strictly row-wise, so dropping rows there computes exactly the rows the
+        // caller keeps. Used by the LAST DiT block only, where the caller throws the text and
+        // reference rows away immediately afterwards. -1 (the default) means "all tokens".
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* pe   = nullptr,
-                             ggml_tensor* mask = nullptr) {
+                             ggml_tensor* mask = nullptr,
+                             int64_t out_lo    = -1,
+                             int64_t out_hi    = -1) {
             auto wq    = std::dynamic_pointer_cast<Linear>(blocks["wq"]);
             auto wk    = std::dynamic_pointer_cast<Linear>(blocks["wk"]);
             auto wv    = std::dynamic_pointer_cast<Linear>(blocks["wv"]);
@@ -427,6 +505,22 @@ namespace Krea2 {
 
             auto out = pe != nullptr ? krea2_rope_attention(ctx, q, k, v, pe, mask, f16_stream)
                                      : attention_no_rope(ctx, q, k, v, mask);
+
+            // TOKEN TRIM (last block only). Attention is the last op that mixes rows, so this is
+            // the earliest point a row can be dropped without changing any row that survives.
+            //
+            // `x` is sliced TOO, not just `out`. Two reasons, both load-bearing:
+            //   * the gate Linear reads `x`, so leaving it full width would keep a 6144x6144 GEMM
+            //     at the full sequence for an output that is immediately discarded;
+            //   * slicing the SIGMOID's output instead of its input would put a cont node between
+            //     the sigmoid and the multiply, and ggml only fuses at strictly consecutive node
+            //     indices — that would break ggml_cuda_op_unary_mul and cost a full extra pass
+            //     over [features x tokens], which is most of what the trim just saved.
+            if (out_lo >= 0) {
+                GGML_ASSERT(out_hi > out_lo && out_hi <= out->ne[1] && out_hi <= x->ne[1]);
+                out = ggml_ext_slice(ctx->ggml_ctx, out, 1, out_lo, out_hi);
+                x   = ggml_ext_slice(ctx->ggml_ctx, x, 1, out_lo, out_hi);
+            }
 
             // Re-join the stream. `out` is F16 already when GGML_CUDNN_ATTN_F16_OUT is on AND
             // the shape gate fired; it is F32 when that flag is off, or when flash attention
@@ -585,17 +679,68 @@ namespace Krea2 {
             blocks["mlp"]      = std::make_shared<KreaSwiGLU>(config.features, config.mlp_multiplier);
         }
 
+        // out_lo/out_hi — see KreaAttention::forward. Only the LAST block passes them, and only
+        // ever the IMAGE row range, which is why the trimmed path below can use `mods_main`
+        // unconditionally: the image rows sit entirely inside [0, ref_start), i.e. inside the
+        // "main" modulation half, never in the reference half.
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* vec,
                              ggml_tensor* pe,
                              ggml_tensor* vec_refs = nullptr,
-                             int64_t ref_start     = -1) {
+                             int64_t ref_start     = -1,
+                             int64_t out_lo        = -1,
+                             int64_t out_hi        = -1) {
             auto mod      = std::dynamic_pointer_cast<KreaDoubleSharedModulation>(blocks["mod"]);
             auto prenorm  = std::dynamic_pointer_cast<KreaRMSNorm>(blocks["prenorm"]);
             auto postnorm = std::dynamic_pointer_cast<KreaRMSNorm>(blocks["postnorm"]);
             auto attn     = std::dynamic_pointer_cast<KreaAttention>(blocks["attn"]);
             auto mlp      = std::dynamic_pointer_cast<KreaSwiGLU>(blocks["mlp"]);
+
+            if (out_lo >= 0 && ref_start >= 0 && vec_refs) {
+                // TRIMMED + per-reference modulation. The attention input still spans the whole
+                // sequence (references must still be attended to), so the pre-attention half is
+                // unchanged, verbatim, from the untrimmed branch below. Only the post-attention
+                // half collapses: [out_lo, out_hi) is a subrange of [0, ref_start), so every
+                // surviving row takes `mods_main` and the view/concat dance disappears.
+                GGML_ASSERT(out_hi > out_lo && out_hi <= ref_start);
+
+                auto mods_main = mod->forward(ctx, vec);
+                auto mods_refs = mod->forward(ctx, vec_refs);
+
+                int64_t D  = x->ne[0];
+                int64_t N  = x->ne[1];
+                int64_t B  = x->ne[2];
+                size_t nb1 = x->nb[1];
+                size_t nb2 = x->nb[2];
+
+                int64_t len_main = ref_start;
+                int64_t len_refs = N - ref_start;
+
+                auto pre_x = prenorm->forward(ctx, x);
+
+                auto pre_x_main = ggml_view_3d(ctx->ggml_ctx, pre_x, D, len_main, B, nb1, nb2, 0);
+                auto pre_x_refs = ggml_view_3d(ctx->ggml_ctx, pre_x, D, len_refs, B, nb1, nb2, len_main * nb1);
+
+                auto attn_in_main = Flux::modulate(ctx->ggml_ctx, pre_x_main, mods_main[1], mods_main[0], true);
+                auto attn_in_refs = Flux::modulate(ctx->ggml_ctx, pre_x_refs, mods_refs[1], mods_refs[0], true);
+
+                auto attn_input = ggml_concat(ctx->ggml_ctx, attn_in_main, attn_in_refs, 1);
+
+                auto attn_out = attn->forward(ctx, attn_input, pe, nullptr, out_lo, out_hi);
+
+                x = ggml_ext_slice(ctx->ggml_ctx, x, 1, out_lo, out_hi);
+                x = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, mods_main[2]));
+
+                auto mlp_input = Flux::modulate(ctx->ggml_ctx,
+                                                postnorm->forward(ctx, x),
+                                                mods_main[4],
+                                                mods_main[3],
+                                                true);
+                auto mlp_out   = mlp->forward(ctx, mlp_input);
+                x              = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, mlp_out, mods_main[5]));
+                return x;
+            }
 
             if (ref_start >= 0 && vec_refs) {
                 // same as normal, but since vec is different for refs and the rest, needs a lot of views and concats
@@ -659,7 +804,10 @@ namespace Krea2 {
                                                  mods[1],
                                                  mods[0],
                                                  true);
-                auto attn_out   = attn->forward(ctx, attn_input, pe);
+                auto attn_out   = attn->forward(ctx, attn_input, pe, nullptr, out_lo, out_hi);
+                if (out_lo >= 0) {
+                    x = ggml_ext_slice(ctx->ggml_ctx, x, 1, out_lo, out_hi);
+                }
                 x               = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, attn_out, mods[2]));
 
                 auto mlp_input = Flux::modulate(ctx->ggml_ctx,
@@ -810,13 +958,31 @@ namespace Krea2 {
             return true;
         }
 
+        // The TEXT half of the DiT, on its own. txtfusion -> txtmlp is a pure function of
+        // `context`: no timestep, no x, no noise, nothing that varies across a sampling
+        // schedule. Krea2Runner computes it ONCE per conditioning per render and feeds the
+        // result back into forward() as `txt_in`, instead of rebuilding these ~2.5 TFLOP (and
+        // dragging 32 of the LoRA modules through the graph) on every one of the 10 steps.
+        //
+        // Kept as its own method rather than a flag inside forward() so the two paths cannot
+        // drift: the body below is the exact pair of calls forward() used to make inline.
+        ggml_tensor* forward_text(GGMLRunnerContext* ctx, ggml_tensor* context) {
+            auto txtfusion = std::dynamic_pointer_cast<KreaTextFusionTransformer>(blocks["txtfusion"]);
+            auto txtmlp    = std::dynamic_pointer_cast<KreaTextMLP>(blocks["txtmlp"]);
+            GGML_ASSERT(context != nullptr);
+            auto txt = txtfusion->forward(ctx, context);
+            txt      = txtmlp->forward(ctx, txt);
+            return txt;
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* timestep,
                              ggml_tensor* context,
                              ggml_tensor* pe,
                              std::vector<ggml_tensor*> ref_latents = {},
-                             bool zero_timestep_refs               = false) {
+                             bool zero_timestep_refs               = false,
+                             ggml_tensor* txt_in                   = nullptr) {
             int64_t W = x->ne[0];
             int64_t H = x->ne[1];
             int64_t N = x->ne[3];
@@ -895,8 +1061,18 @@ namespace Krea2 {
             //   * `projector` is a Linear(12 -> 1) applied across a permuted layer axis — a
             //     12-element reduction where F16 rounding is proportionally worst, feeding
             //     every downstream token. Bad place to spend precision for no VRAM.
-            auto txt        = txtfusion->forward(ctx, context);
-            txt             = txtmlp->forward(ctx, txt);
+            //
+            // `txt_in` is that same result, already computed by forward_text() in a one-shot
+            // graph and handed back as an F32 input. It is byte-identical to what the two calls
+            // below produce — same ops, same weights, same order, and the D2H/H2D round trip is a
+            // raw copy of F32 — so the only thing that changes is HOW OFTEN it is computed. When
+            // it is absent (cache disabled, or an empty conditioning) the original inline path
+            // runs unchanged.
+            ggml_tensor* txt = txt_in;
+            if (txt == nullptr) {
+                txt = txtfusion->forward(ctx, context);
+                txt = txtmlp->forward(ctx, txt);
+            }
             int64_t txt_len = txt->ne[1];
 
             if (dit_f16) {
@@ -907,13 +1083,60 @@ namespace Krea2 {
             // both halves must have been cast by here.
             auto hidden_states = ggml_concat(ctx->ggml_ctx, txt, img, 1);
             int64_t ref_start  = hidden_states->ne[1] - ref_len;
+
+            // LAST-BLOCK TOKEN TRIM. The slice below keeps only the image rows, so in block 27
+            // `wo`, the gate/sigmoid multiply and the whole SwiGLU were being computed for the
+            // text and reference rows and then thrown away — at 1024^2 with one reference that
+            // is 4701 of 8797 rows, 53% of ~87% of a block.
+            //
+            // The layout is `concat(txt, img, refs)` and `ref_start = ne[1] - ref_len`, so the
+            // image rows are txt_len .. txt_len+img_len == ref_start — the MIDDLE of the
+            // sequence, hence a two-sided range rather than a prefix. Asserted below, because
+            // getting it wrong corrupts the output silently rather than failing.
+            //
+            // ⚠️ NOT BIT-IDENTICAL under GGML_NVFP4_QUANT_TWOLEVEL=1 (which the krea2 service
+            // sets). It is exact in real arithmetic — everything after attention is row-wise —
+            // but the two-level activation quant takes a PER-TENSOR amax over the whole M x K
+            // activation (nvfp4-cublaslt.cu, quant_act_kernel: the block scale is
+            // ue4m3((amax/6)/per_tensor) and per_tensor is also carried in the GEMM alpha), and
+            // dropping rows can lower that amax, which moves the rounding grid for the rows that
+            // remain. The change can only SHRINK the amax, so the survivors are quantised no
+            // worse than before; but the last bits of the output can differ, content-dependently
+            // — if the largest activation happens to live in an image row it is bit-identical,
+            // and that is not knowable in advance.
+            //
+            // DEFAULT OFF for that reason, and only that reason. Optimisations 1-3 in this change
+            // ARE bit-identical, so they validate as a maxdiff-0 assertion against the previous
+            // binary; leaving an output-changing edit switched on in the same build would make any
+            // pixel difference ambiguous between "the trim working as designed" and "one of the
+            // other three subtly wrong". KREA2_LAST_BLOCK_TRIM=1 turns it on as a single-flag A/B
+            // once that first assertion has passed. Flip the default only with its own evidence.
+            static const bool last_block_trim = krea2_env_flag("KREA2_LAST_BLOCK_TRIM", false);
+            const int64_t trim_lo             = last_block_trim ? txt_len : -1;
+            const int64_t trim_hi             = last_block_trim ? txt_len + img_len : -1;
+            if (last_block_trim) {
+                GGML_ASSERT(trim_hi == ref_start);
+                GGML_ASSERT(trim_lo >= 0 && trim_hi > trim_lo && trim_hi <= hidden_states->ne[1]);
+            }
+
             for (int i = 0; i < config.layers; ++i) {
-                auto block    = std::dynamic_pointer_cast<KreaSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
-                hidden_states = block->forward(ctx, hidden_states, tvec, pe, tvec_0, ref_start);
+                auto block          = std::dynamic_pointer_cast<KreaSingleStreamBlock>(blocks["blocks." + std::to_string(i)]);
+                const bool is_last  = (i == config.layers - 1);
+                hidden_states       = block->forward(ctx,
+                                                     hidden_states,
+                                                     tvec,
+                                                     pe,
+                                                     tvec_0,
+                                                     ref_start,
+                                                     is_last ? trim_lo : -1,
+                                                     is_last ? trim_hi : -1);
                 sd::ggml_graph_cut::mark_graph_cut(hidden_states, "krea2.blocks." + std::to_string(i), "hidden_states");
             }
 
-            hidden_states = ggml_ext_slice(ctx->ggml_ctx, hidden_states, 1, txt_len, txt_len + img_len);
+            if (!last_block_trim) {
+                hidden_states = ggml_ext_slice(ctx->ggml_ctx, hidden_states, 1, txt_len, txt_len + img_len);
+            }
+            GGML_ASSERT(hidden_states->ne[1] == img_len);
             // Leave the F16 stream before the head. Cast AFTER the slice, so only the image
             // tokens pay for it, and the text and ref tokens are dropped while still half
             // width. KreaLastLayer is F32 throughout: last.norm is an RMSNorm whose output
@@ -947,10 +1170,83 @@ namespace Krea2 {
         return Rope::embed_nd(ids, bs, theta, axes_dim);
     }
 
+    // Key for the RoPE table cache below: FNV-1a over EVERY argument gen_krea2_pe() reads.
+    // That is what makes the cache exact by construction rather than by argument — a hit means
+    // the inputs were identical, a miss just rebuilds.
+    //
+    // The reference latents contribute their SHAPES, not their contents, because that is all
+    // Rope::gen_refs_ids() looks at (`ref->ne[1]` and `ref->ne[0]` feed gen_flux_img_ids, and
+    // the running h/w offsets are derived from the same two). All four ne are mixed in anyway:
+    // free, and it means a future gen_refs_ids that starts reading ne[2]/ne[3] cannot silently
+    // alias. The reference COUNT is implicit in the per-ref mixing but is mixed explicitly too,
+    // so [A] and [A, A] cannot collide with each other's ordering.
+    __STATIC_INLINE__ uint64_t krea2_pe_cache_key(int h,
+                                                  int w,
+                                                  int patch_size,
+                                                  int bs,
+                                                  int context_len,
+                                                  float theta,
+                                                  const std::vector<int>& axes_dim,
+                                                  const std::vector<ggml_tensor*>& ref_latents,
+                                                  Rope::RefIndexMode ref_index_mode) {
+        uint64_t hh = 1469598103934665603ull;
+        hh          = krea2_fnv1a_val(hh, h);
+        hh          = krea2_fnv1a_val(hh, w);
+        hh          = krea2_fnv1a_val(hh, patch_size);
+        hh          = krea2_fnv1a_val(hh, bs);
+        hh          = krea2_fnv1a_val(hh, context_len);
+        hh          = krea2_fnv1a_val(hh, theta);
+        hh          = krea2_fnv1a_val(hh, static_cast<int>(ref_index_mode));
+        hh          = krea2_fnv1a_val(hh, static_cast<uint64_t>(axes_dim.size()));
+        for (int d : axes_dim) {
+            hh = krea2_fnv1a_val(hh, d);
+        }
+        hh = krea2_fnv1a_val(hh, static_cast<uint64_t>(ref_latents.size()));
+        for (const ggml_tensor* ref : ref_latents) {
+            const uint64_t null_marker = 0;
+            if (ref == nullptr) {
+                hh = krea2_fnv1a_val(hh, null_marker);
+                continue;
+            }
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                hh = krea2_fnv1a_val(hh, ref->ne[d]);
+            }
+        }
+        // Zero is the "nothing cached yet" sentinel, so never return it.
+        return hh == 0 ? 1 : hh;
+    }
+
     struct Krea2Runner : public DiffusionModelRunner {
         Krea2Config config;
         Krea2Model model;
         std::vector<float> pe_vec;
+
+        // ROPE TABLE CACHE. gen_krea2_pe() ran inside build_graph, i.e. ONCE PER SAMPLING STEP.
+        // At 1024^2 with one reference that is an 8797x3 transpose, three rope() passes
+        // (~1.1M sin + 1.1M cos), an `emb` built out of 8797 separate std::vector<float>(256)
+        // rows and a flatten() — order 45k heap allocations — all single-threaded and all on the
+        // critical path AHEAD of any GPU work, followed by a ~9 MB H2D upload. Ten times a render.
+        //
+        // The positions do not change within a render, so the whole thing is pure. This is the
+        // same fix (and the same keying pattern) as b6c0bc2 for LTX, which measured 310 ms and
+        // 157 ms per call at 12k tokens; krea2 was simply missed. Keyed on every input the build
+        // reads (see krea2_pe_cache_key), so a resolution change, a reference-count change or a
+        // new request invalidates it and a hit is byte-identical to a rebuild by construction.
+        //
+        // KREA2_PE_CACHE=0 disables it; KREA2_PE_TIMING=1 logs the per-call cost. Run the two
+        // together to get the raw uncached number for every step.
+        uint64_t pe_key = 0;
+
+        // TEXT-BRANCH CACHE — see Krea2Model::forward_text. N-way, because CFG evaluates two
+        // conditionings per step and a batch evaluates more; a single slot would thrash and
+        // recompute on every call, which is the bug this replaces, not a fix for it.
+        struct TxtCacheEntry {
+            uint64_t key = 0;
+            sd::Tensor<float> txt;
+        };
+        static constexpr size_t KREA2_TXT_CACHE_SLOTS = 4;
+        std::array<TxtCacheEntry, KREA2_TXT_CACHE_SLOTS> txt_cache;
+        size_t txt_cache_next = 0;
 
         Krea2Runner(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
@@ -966,21 +1262,172 @@ namespace Krea2 {
             return "krea2";
         }
 
+        // THE OTHER WAY THE TEXT CACHE CAN GO STALE. `cache_identity()` covers the adapter, but
+        // the txtfusion/txtmlp WEIGHTS can change under a live runner too:
+        // sd_ctx_swap_diffusion_model (stable-diffusion.cpp:807) switches the DiT variant IN
+        // PROCESS — it keeps this same Krea2Runner and reloads its params, calling
+        // `diffusion_model->runner_done()` on the way through. So runner_done is exactly the
+        // "your parameters are no longer what you computed against" signal, and dropping the
+        // cache here makes a variant switch safe by construction rather than by remembering.
+        //
+        // Cheap: krea2's own compute() passes auto_free=false, so this is NOT called per render
+        // or per sampling step (measured: one `text branch computed` per render, not ten). It
+        // fires on swap and on unload, which is precisely when the entries are worthless.
+        void runner_done() override {
+            for (auto& entry : txt_cache) {
+                entry.key = 0;
+                entry.txt = {};
+            }
+            txt_cache_next = 0;
+            pe_key         = 0;
+            pe_vec.clear();
+            GGMLRunner::runner_done();
+        }
+
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
             model.get_param_tensors(tensors, prefix);
+        }
+
+        // GALLOCR RE-RESERVE PROBE. The text pass and the DiT graph share one gallocr
+        // (free_compute_buffer=false on both), so a tiny text graph is followed by the big DiT
+        // graph and ggml_gallocr_alloc_graph has to grow the buffer -- once per render, not once
+        // per step, because after step 0 the text branch is a cache hit and never builds a graph.
+        //
+        // ggml's own evidence for that is unusable here: BOTH "reallocating buffers
+        // automatically" (ggml-alloc.c:1070) and "reallocating <buft> buffer from size X to Y"
+        // (ggml-alloc.c:944) sit inside `#ifndef NDEBUG`, and CMakeLists.txt forces Release, so
+        // neither is compiled in. Hence this: KREA2_BUF_DIAG=1 prints the gallocr's actual buffer
+        // size at each phase, which is the number those lines would have reported.
+        void log_compute_buffer(const char* phase) {
+            static const bool diag = krea2_env_flag("KREA2_BUF_DIAG", false);
+            if (!diag || compute_allocr == nullptr) {
+                return;
+            }
+            LOG_INFO("[krea2-buf] %s: compute buffer %.2f MiB",
+                     phase,
+                     ggml_gallocr_get_buffer_size(compute_allocr, 0) / (1024.0 * 1024.0));
+        }
+
+        // One-shot graph for the text branch. Deliberately builds NOTHING else: the point is that
+        // its result depends on `context` alone, so it must not pick up a timestep or an x.
+        ggml_cgraph* build_text_graph(const sd::Tensor<float>& context_tensor) {
+            ggml_cgraph* gf      = new_graph_custom(KREA2_GRAPH_SIZE);
+            ggml_tensor* context = make_input(context_tensor);
+            auto runner_ctx      = get_context();
+            ggml_tensor* out     = model.forward_text(&runner_ctx, context);
+            ggml_build_forward_expand(gf, out);
+            return gf;
+        }
+
+        // Returns the cached txtfusion->txtmlp result for this conditioning, computing it on a
+        // miss. nullptr means "not available — run the original inline path", which is the only
+        // behaviour change when KREA2_TXT_CACHE=0 or the one-shot compute fails.
+        //
+        // Keyed on the conditioning BYTES, not on its address: the sampler holds one
+        // SDCondition per branch for the whole render, but an address alone would let a later
+        // render inherit a previous one's text through a recycled allocation. Hashing ~74 MB
+        // costs a few ms (see krea2_bulk_hash) against a text branch worth ~2.5 TFLOP, and it
+        // replaces a 74 MB context upload per step with a ~15 MB one.
+        //
+        // MUST be called BEFORE the outer GGMLRunner::compute — it runs a compute of its own,
+        // and compute() resets the shared compute ctx.
+        //
+        // NULL/EMPTY CONDITIONING: a null `diffusion_params.context` arrives here as
+        // tensor_or_empty()'s shared default-constructed tensor, so `empty()` is true and we bail
+        // BEFORE touching data()/numel() — no hash of a null pointer, no zero-length digest. That
+        // path then hits build_graph's pre-existing `GGML_ASSERT(!context_tensor.empty())`,
+        // exactly as it did before this change; the DiT cannot run without conditioning either
+        // way, so this adds no new failure mode. Note that an empty negative PROMPT is not an
+        // empty conditioning TENSOR — the encoder still emits a full-length embedding of the
+        // empty string — so the common t2i case takes the normal cached path, and at cfg 1.0
+        // there is one conditioning, hence one text pass and nine hits per 10-step render.
+        //
+        // ⚠️⚠️ THE ADAPTER IS PART OF THE KEY, AND MUST STAY PART OF THE KEY. The text branch is
+        // pure in the CONDITIONING, but it is NOT pure in the model: 32 of a 256-module
+        // identity-edit LoRA are inside txtfusion (e.g.
+        // `...txtfusion.refiner_blocks.0.attn.wq.weight.lora_up`). Keyed on the conditioning
+        // alone, a worker that renders `no-lora` first and `restage` second serves the
+        // NO-ADAPTER text into the adapter render — the adapter is silently partly disabled and
+        // the image still looks plausible. That is exactly what shipped in cee21b4 and what this
+        // key fixes. Any future cache in this file whose value can be touched by a patched
+        // weight must key on WeightAdapter::cache_identity() the same way.
+        //
+        // An adapter that cannot identify itself returns 0 and we DO NOT CACHE AT ALL — losing
+        // the optimisation is the correct failure, not serving a stale entry.
+        const sd::Tensor<float>* get_or_build_txt(int n_threads, const sd::Tensor<float>& context_tensor) {
+            static const bool enabled = krea2_env_flag("KREA2_TXT_CACHE", true);
+            if (!enabled || context_tensor.empty()) {
+                return nullptr;
+            }
+            // "No adapter" needs its own constant: it must differ from every real adapter AND
+            // from the 0 that means "unidentifiable", so absence can be cached but unknown
+            // cannot.
+            constexpr uint64_t KREA2_TXT_NO_ADAPTER = 0x6b7265613274786eull;  // "krea2txn"
+            uint64_t adapter_id                     = KREA2_TXT_NO_ADAPTER;
+            if (weight_adapter != nullptr) {
+                adapter_id = weight_adapter->cache_identity();
+                if (adapter_id == 0) {
+                    LOG_DEBUG("krea2: adapter has no cache identity; text branch stays in-graph");
+                    return nullptr;
+                }
+            }
+
+            uint64_t key = krea2_bulk_hash(context_tensor.data(),
+                                           static_cast<size_t>(context_tensor.numel()) * sizeof(float));
+            key          = krea2_fnv1a_val(key, static_cast<uint64_t>(context_tensor.dim()));
+            for (int64_t d : context_tensor.shape()) {
+                key = krea2_fnv1a_val(key, d);
+            }
+            key = krea2_fnv1a_val(key, adapter_id);
+            if (key == 0) {
+                key = 1;
+            }
+
+            for (auto& entry : txt_cache) {
+                if (entry.key == key && !entry.txt.empty()) {
+                    return &entry.txt;
+                }
+            }
+
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_text_graph(context_tensor);
+            };
+            auto out = GGMLRunner::compute<float>(get_graph, n_threads, false, false, false);
+            log_compute_buffer("after-text-pass");
+            if (!out.has_value() || out->empty()) {
+                LOG_WARN("krea2: text-branch precompute failed; falling back to the in-graph path");
+                return nullptr;
+            }
+
+            // Round-robin eviction. With CFG the two conditionings settle into two slots on the
+            // first step and every later step is a hit, so replacement policy barely matters —
+            // round robin just avoids one branch permanently evicting the other at 2 slots.
+            const size_t slot_index = txt_cache_next;
+            txt_cache_next          = (txt_cache_next + 1) % KREA2_TXT_CACHE_SLOTS;
+            TxtCacheEntry& slot     = txt_cache[slot_index];
+            slot.txt                = std::move(*out);
+            slot.key                = key;
+            LOG_DEBUG("krea2: text branch computed (%" PRId64 " tokens), cached in slot %zu",
+                      slot.txt.dim() >= 2 ? slot.txt.shape()[1] : static_cast<int64_t>(0),
+                      slot_index);
+            return &slot.txt;
         }
 
         ggml_cgraph* build_graph(const sd::Tensor<float>& x_tensor,
                                  const sd::Tensor<float>& timesteps_tensor,
                                  const sd::Tensor<float>& context_tensor,
                                  const std::vector<sd::Tensor<float>>& ref_latents_tensor = {},
-                                 const RefImageParams& ref_image_params                   = REF_IMAGE_PRESETS.at("krea2_ostris_edit")) {
+                                 const RefImageParams& ref_image_params                   = REF_IMAGE_PRESETS.at("krea2_ostris_edit"),
+                                 const sd::Tensor<float>* txt_tensor                      = nullptr) {
             ggml_cgraph* gf        = new_graph_custom(KREA2_GRAPH_SIZE);
             ggml_tensor* x         = make_input(x_tensor);
             ggml_tensor* timesteps = make_input(timesteps_tensor);
             GGML_ASSERT(x->ne[3] == 1);
             GGML_ASSERT(!context_tensor.empty());
-            ggml_tensor* context = make_input(context_tensor);
+            // With the text branch hoisted, the raw conditioning is no longer part of this graph
+            // at all -- neither the ops nor the ~74 MB upload. `txt` (~15 MB) takes its place.
+            ggml_tensor* context = txt_tensor != nullptr ? nullptr : make_input(context_tensor);
+            ggml_tensor* txt     = txt_tensor != nullptr ? make_input(*txt_tensor) : nullptr;
 
             std::vector<ggml_tensor*> ref_latents;
             ref_latents.reserve(ref_latents_tensor.size());
@@ -988,21 +1435,52 @@ namespace Krea2 {
                 ref_latents.push_back(make_input(ref_latent_tensor));
             }
 
-            pe_vec      = gen_krea2_pe(static_cast<int>(x->ne[1]),
-                                       static_cast<int>(x->ne[0]),
-                                       config.patch_size,
-                                       static_cast<int>(x->ne[3]),
-                                       static_cast<int>(context->ne[1]),
-                                       config.theta,
-                                       config.axes_dim,
-                                       ref_latents,
-                                       ref_image_params.ref_index_mode);
+            // Text token count for the RoPE ids. txtfusion and txtmlp both preserve the token
+            // axis (ne[1]), so the hoisted txt carries exactly the conditioning's token count --
+            // this is the same number either way, not an approximation of it.
+            const int64_t context_len = txt != nullptr ? txt->ne[1] : context->ne[1];
+
+            const uint64_t want_pe_key = krea2_pe_cache_key(static_cast<int>(x->ne[1]),
+                                                            static_cast<int>(x->ne[0]),
+                                                            config.patch_size,
+                                                            static_cast<int>(x->ne[3]),
+                                                            static_cast<int>(context_len),
+                                                            config.theta,
+                                                            config.axes_dim,
+                                                            ref_latents,
+                                                            ref_image_params.ref_index_mode);
+            static const bool pe_cache_enabled = krea2_env_flag("KREA2_PE_CACHE", true);
+            static const bool pe_timing        = krea2_env_flag("KREA2_PE_TIMING", false);
+            const bool pe_hit                  = pe_cache_enabled && pe_key == want_pe_key && !pe_vec.empty();
+            if (pe_hit) {
+                if (pe_timing) {
+                    LOG_INFO("[krea2-pe] reused (key=%016" PRIx64 ")", want_pe_key);
+                }
+            } else {
+                const int64_t t0 = pe_timing ? ggml_time_ms() : 0;
+                pe_vec           = gen_krea2_pe(static_cast<int>(x->ne[1]),
+                                                static_cast<int>(x->ne[0]),
+                                                config.patch_size,
+                                                static_cast<int>(x->ne[3]),
+                                                static_cast<int>(context_len),
+                                                config.theta,
+                                                config.axes_dim,
+                                                ref_latents,
+                                                ref_image_params.ref_index_mode);
+                if (pe_timing) {
+                    LOG_INFO("[krea2-pe] built in %" PRId64 " ms (%zu floats, key=%016" PRIx64 ")",
+                             ggml_time_ms() - t0,
+                             pe_vec.size(),
+                             want_pe_key);
+                }
+            }
+            pe_key      = want_pe_key;
             int pos_len = static_cast<int>(pe_vec.size() / config.axes_dim_sum / 2);
             auto pe     = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, config.axes_dim_sum / 2, pos_len);
             set_backend_tensor_data(pe, pe_vec.data());
 
             auto runner_ctx  = get_context();
-            ggml_tensor* out = model.forward(&runner_ctx, x, timesteps, context, pe, ref_latents, ref_image_params.force_ref_timestep_zero);
+            ggml_tensor* out = model.forward(&runner_ctx, x, timesteps, context, pe, ref_latents, ref_image_params.force_ref_timestep_zero, txt);
             ggml_build_forward_expand(gf, out);
             return gf;
         }
@@ -1013,10 +1491,15 @@ namespace Krea2 {
                                   const sd::Tensor<float>& context,
                                   const std::vector<sd::Tensor<float>>& ref_latents = {},
                                   const RefImageParams& ref_image_params            = REF_IMAGE_PRESETS.at("krea2_ostris_edit")) {
-            auto get_graph = [&]() -> ggml_cgraph* {
-                return build_graph(x, timesteps, context, ref_latents, ref_image_params);
+            // Resolved here, OUTSIDE get_graph: on a miss it runs a compute of its own, and
+            // compute() resets the shared compute ctx, so it cannot happen during graph build.
+            const sd::Tensor<float>* txt = get_or_build_txt(n_threads, context);
+            auto get_graph               = [&]() -> ggml_cgraph* {
+                return build_graph(x, timesteps, context, ref_latents, ref_image_params, txt);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), x.dim());
+            log_compute_buffer("after-dit-step");
+            return result;
         }
 
         sd::Tensor<float> compute(int n_threads,

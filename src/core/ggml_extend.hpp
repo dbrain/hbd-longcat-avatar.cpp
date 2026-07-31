@@ -1890,17 +1890,35 @@ struct WeightAdapter {
 
     // May the caller feed this adapter an F16 activation?
     //
-    // forward_with_lora() runs `x @ A^T @ B^T` against the adapter's OWN tensors, so an F16
+    // forward_with_lora() runs `x @ A^T @ B^T` against the adapter's own tensors, so an F16
     // residual stream turns every adapter tensor into a src0 with an F16 src1. On CUDA that
-    // combination is only served for an NVFP4 (or FP8-FFN) weight —
-    // ggml_backend_cuda_device_supports_op() rejects `b->type == F16 && a->type != F16` unless
-    // the cuBLASLt GEMM serves the node. A rejected Linear is not slow: ggml_backend_sched
-    // silently drops it to the CPU backend. So a wrong `true` here destroys the render rather
-    // than merely costing time.
+    // combination is only served for an NVFP4 weight (ggml_backend_cuda_device_supports_op:
+    // `b->type == F16 && a->type != F16` is REJECTED unless the cuBLASLt FP4/FP8 GEMM serves the
+    // node). A rejected Linear is not slow — ggml_backend_sched silently drops it to the CPU
+    // backend — so a wrong `true` here destroys the render rather than merely costing time.
     //
     // Hence: default FALSE. Every adapter type keeps today's behaviour until it opts in, and the
     // caller must still AND this with its own device probe.
     virtual bool supports_f16_activation() const { return false; }
+
+    // Identity of everything this adapter contributes to a graph, for callers that CACHE a
+    // subgraph result ACROSS RENDERS.
+    //
+    // WHY THIS EXISTS. An adapter patches weights anywhere in the model, including inside
+    // subgraphs a caller may have decided are "pure" in its own inputs. Krea2's text branch is
+    // the worked example: txtfusion + txtmlp depend only on the conditioning, so their result is
+    // cacheable — except that 32 of a 256-module identity-edit LoRA live inside txtfusion, so the
+    // result also depends on the ADAPTER. A cache keyed on the conditioning alone will serve a
+    // no-adapter text result into an adapter render, silently disabling part of the adapter while
+    // the render still looks plausible. That shipped once; this method is how it cannot again.
+    //
+    // ⚠️ ZERO MEANS "I CANNOT IDENTIFY MYSELF — DO NOT CACHE ANYTHING THAT DEPENDS ON ME", and it
+    // is the DEFAULT deliberately. A new adapter type that forgets to override this loses the
+    // optimisation; it does not ship a wrong render. Fail closed, not open.
+    //
+    // Callers must also give "no adapter attached" its own distinct non-zero constant, so that
+    // absence keys differently from every adapter AND from this "unknown" sentinel.
+    virtual uint64_t cache_identity() const { return 0; }
 };
 
 struct GGMLRunnerContext {
