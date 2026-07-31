@@ -301,6 +301,43 @@ bool MmapWrapper::copy_data(void* buf, size_t n, size_t offset) const {
     return true;
 }
 
+bool MmapWrapper::supports_discard_private_writes() {
+#ifdef __linux__
+    return true;
+#else
+    // MADV_DONTNEED on a MAP_PRIVATE file mapping is the documented Linux behaviour
+    // ("repopulating the memory contents from the up-to-date contents of the underlying
+    // mapped file"). There is no portable equivalent -- notably NOT on the BSDs, where
+    // MADV_DONTNEED is only a hint and may leave the private copy in place, and not for
+    // a Windows FILE_MAP_COPY view. Anywhere else, say so and let the caller fail closed.
+    return false;
+#endif
+}
+
+bool MmapWrapper::discard_private_writes(size_t offset, size_t bytes) {
+    if (data_ == nullptr || bytes == 0 || offset >= size_ || bytes > size_ - offset) {
+        return false;
+    }
+#ifdef __linux__
+    const size_t page = (size_t)std::max(1L, sysconf(_SC_PAGESIZE));
+    // Round OUTWARD: inward rounding would leave the mutated bytes in the partial
+    // head/tail pages behind, which is exactly the bug this exists to fix.
+    const size_t beg = (offset / page) * page;
+    size_t end       = ((offset + bytes + page - 1) / page) * page;
+    if (end > size_) {
+        end = size_;
+    }
+    if (end <= beg) {
+        return false;
+    }
+    return madvise(static_cast<uint8_t*>(data_) + beg, end - beg, MADV_DONTNEED) == 0;
+#else
+    (void)offset;
+    (void)bytes;
+    return false;
+#endif
+}
+
 // get_num_physical_cores is copy from
 // https://github.com/ggerganov/llama.cpp/blob/master/examples/common.cpp
 // LICENSE: https://github.com/ggerganov/llama.cpp/blob/master/LICENSE

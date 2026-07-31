@@ -20,6 +20,9 @@ struct ModelFileData {
     std::shared_ptr<MmapWrapper> mmapped;
     std::shared_ptr<struct ggml_backend_buffer> mmbuffer;
     bool is_zip;
+    // Mapped PROT_WRITE, i.e. anything may have written through it in place. Only such a
+    // mapping needs (or can be) restored -- see ModelLoader::restore_mmapped_bytes.
+    bool writable_mmap = false;
 };
 
 struct MmapTensorStore {
@@ -71,6 +74,23 @@ public:
     std::vector<MmapTensorStore> mmap_tensors(std::map<std::string, ggml_tensor*>& tensors,
                                               std::set<std::string> ignore_tensors = {},
                                               bool writable                        = true);
+
+    // Restore [ptr, ptr + bytes) to the on-disk bytes, when ptr points into one of the
+    // writable MAP_PRIVATE model mappings this loader owns. Returns false if the range
+    // is not in any mapping, or the platform cannot discard private pages.
+    //
+    // 🔴 This exists because RELEASING A PARAMS STORAGE BLOCK DOES NOT UNDO AN IN-PLACE
+    // WRITE. The mapping is created once by process_model_files() (latched on
+    // model_files_processed) and owned by `file_data` for the loader's whole life;
+    // MmapTensorStore holds only shared_ptr COPIES of it, so
+    // ModelManager::free_params_storage_block()'s `mmap_tensor_stores.clear()` drops the
+    // refcount 2 -> 1 and never munmaps. The next mmap_tensors() then re-points
+    // tensor->data at the SAME copy-on-write pages, mutations and all.
+    bool restore_mmapped_bytes(const void* ptr, size_t bytes);
+
+    // True if this loader has at least one writable mapping whose in-place writes could
+    // survive a params-storage release. The LoRA fold checks this and fails closed.
+    bool has_writable_mmap() const;
     bool load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                       bool use_mmap                                    = false,
                       const std::set<std::string>* target_tensor_names = nullptr,

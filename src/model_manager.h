@@ -53,8 +53,17 @@ private:
         // Set once the LoRA delta has been merged into the PARAMS-backend copy of this
         // tensor. Distinct from applied_lora_epoch, which tracks the compute-staged copy
         // and is therefore reset every time a staging block is freed -- a fold survives
-        // re-staging and is only invalidated when the params storage itself is released
-        // (which re-reads the pristine weights from the model file).
+        // re-staging.
+        //
+        // 🔴 CLEARING THIS DOES NOT UNDO THE MERGE, and for a long time the comment here
+        // claimed it did ("the next load re-reads pristine weights from the model file").
+        // That is true only for a params block that owns its bytes -- an alloc'd buffer,
+        // freed and refilled by load_tensors(). It is FALSE for the mmap path, which is
+        // the one prod runs and the only one the fold is even allowed on: those bytes are
+        // copy-on-write pages of a mapping the ModelLoader owns for its whole life, so
+        // releasing the block just re-points tensor->data at the same mutated pages.
+        // ModelManager::unfold_loras_from_params() is what actually restores them, and it
+        // needs this flag, so it must run BEFORE the flag is cleared.
         uint64_t folded_lora_epoch = UINT64_MAX;
         // A LoRA target this fold cannot handle (non-2D, or a row length that is not a
         // whole number of NVFP4 blocks). Left to the graph-based apply path.
@@ -109,6 +118,7 @@ private:
     bool load_tensors_to_params_backend(const std::vector<TensorState*>& states);
     bool apply_loras_to_params(const std::vector<TensorState*>& states);
     bool fold_loras_into_params(const std::vector<TensorState*>& states);
+    void unfold_loras_from_params();
     void release_fold_loras();
     bool mmap_params(const std::vector<TensorState*>& states,
                      std::vector<ParamsStorageBlock*>& created_storage_blocks);

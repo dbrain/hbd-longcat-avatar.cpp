@@ -561,6 +561,46 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
     return true;
 }
 
+// Undo fold_loras_into_params(). Not by subtracting the delta back out -- that is not
+// bit-exact in the target dtype and would drift with every adapter change -- but by
+// throwing away the process-private copy-on-write pages the fold wrote, so the weights
+// re-read from the model file on next touch. MAP_PRIVATE means the file was never
+// written, so it is still the pristine checkpoint.
+//
+// Tensors whose params block OWNS its bytes (alloc'd buffer, not mmap) need nothing here:
+// release_params_storage_blocks() frees the buffer and the next load_tensors() genuinely
+// re-reads them. restore_mmapped_bytes() returns false for those and they are not counted.
+void ModelManager::unfold_loras_from_params() {
+    size_t restored = 0, failed = 0;
+    const int64_t t0 = ggml_time_ms();
+    for (auto& state : tensor_states_) {
+        if (state == nullptr || state->folded_lora_epoch == UINT64_MAX) {
+            continue;
+        }
+        ggml_tensor* tensor = state->tensor;
+        if (tensor == nullptr || tensor->data == nullptr) {
+            // Already released without being restored -- the mutated pages are still live
+            // in the mapping and we can no longer locate them. Only reachable if some
+            // other path force-released the block first; loud, because the next render
+            // would silently inherit the merge.
+            LOG_ERROR("lora unfold: '%s' was folded but its params copy is already released",
+                      state->name.c_str());
+            failed++;
+            continue;
+        }
+        if (tensor->buffer != nullptr && !ggml_backend_buffer_is_host(tensor->buffer)) {
+            continue;  // device memory: freeing the buffer really does discard it
+        }
+        if (model_loader_.restore_mmapped_bytes(tensor->data, ggml_nbytes(tensor))) {
+            restored++;
+        }
+    }
+    if (restored > 0 || failed > 0) {
+        LOG_INFO("lora unfold: restored %zu tensor(s) from the model file in %.2fs (%zu failed)",
+                 restored, (ggml_time_ms() - t0) / 1000.0, failed);
+    }
+}
+
 void ModelManager::release_fold_loras() {
     for (auto& lora : fold_loras_) {
         if (lora != nullptr) {
@@ -662,6 +702,14 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
 
     if (enable_mmap_ && !writable_mmap_) {
         LOG_ERROR("lora fold-at-load needs a writable mmap; refusing to fold read-only weights");
+        fold_loras_failed_ = true;
+        return false;
+    }
+    // Fail closed: an unfoldable fold is worse than no fold. Without page discard, the
+    // merge survives set_loras({}) and every later render on this worker silently
+    // inherits it -- and STACKS, adapter on adapter. That was live for two days.
+    if (enable_mmap_ && !MmapWrapper::supports_discard_private_writes()) {
+        LOG_ERROR("lora fold-at-load cannot be undone on this platform (no private-page discard); refusing to fold");
         fold_loras_failed_ = true;
         return false;
     }
@@ -1274,6 +1322,10 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
 }
 
 void ModelManager::reset_lora_applied_params() {
+    // FIRST, while tensor->data still points into the mapping: undo any fold. Releasing
+    // the params blocks below does NOT do this -- see TensorState::folded_lora_epoch --
+    // and free_params_storage_block() nulls the data pointers we need to find the pages.
+    unfold_loras_from_params();
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
     for (auto& state : tensor_states_) {
@@ -1669,8 +1721,12 @@ void ModelManager::free_params_storage_block(ParamsStorageBlock& block) {
 
         state->loaded_to_params_backend = false;
         state->applied_lora_epoch       = UINT64_MAX;
-        // The next load re-reads pristine weights from the model file, so any merged
-        // LoRA delta is gone with them.
+        // 🔴 Clearing this does NOT undo a merge. For an alloc'd buffer it is accurate --
+        // the buffer is gone and the next load_tensors() re-reads the file. For an mmap
+        // block it is not: the mapping outlives this block (ModelLoader owns it) and the
+        // next mmap_tensors() hands back the same copy-on-write pages. Callers that force
+        // a release across a LoRA epoch must run unfold_loras_from_params() FIRST;
+        // reset_lora_applied_params() does.
         state->folded_lora_epoch  = UINT64_MAX;
         state->lora_fold_declined = false;
     }

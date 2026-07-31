@@ -57,6 +57,22 @@ public:
     size_t size() const { return size_; }
     bool copy_data(void* buf, size_t n, size_t offset) const;
 
+    // True if discard_private_writes() is implemented on this platform. The LoRA fold
+    // refuses to run without it: a fold it cannot undo is silent cross-request corruption.
+    static bool supports_discard_private_writes();
+
+    // Throw away this process's private (copy-on-write) copies of the pages covering
+    // [offset, offset + bytes), so the next access re-reads the ON-DISK bytes. This is
+    // the ONLY way to undo an in-place write to a MAP_PRIVATE file mapping short of
+    // unmapping it, and it is what makes the LoRA fold reversible.
+    //
+    // The range is rounded OUTWARD to whole pages, which is required for correctness (a
+    // partial head/tail page rounded inward would keep its mutated bytes) and harmless:
+    // every neighbouring byte in those pages either belongs to another folded tensor,
+    // which is being restored too, or is unmodified and therefore already equal to the
+    // file. MAP_PRIVATE means nothing was ever written back, so "the file" is pristine.
+    bool discard_private_writes(size_t offset, size_t bytes);
+
 protected:
     MmapWrapper(void* data, size_t size)
         : data_(data), size_(size) {}

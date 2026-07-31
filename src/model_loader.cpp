@@ -873,7 +873,8 @@ void ModelLoader::process_model_files(bool enable_mmap, bool writable_mmap) {
                 } else {
                     LOG_WARN("mmap: failed to create backend buffer for file %s", fdata.path.c_str());
                 }
-                fdata.mmapped = std::shared_ptr<MmapWrapper>(std::move(mmapped));
+                fdata.mmapped       = std::shared_ptr<MmapWrapper>(std::move(mmapped));
+                fdata.writable_mmap = writable_mmap;
             } else {
                 LOG_WARN("failed to memory-map '%s' (falling back to read())", file_path.c_str());
             }
@@ -974,6 +975,38 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
              duration_ms / 1000.0);
 
     return result;
+}
+
+bool ModelLoader::has_writable_mmap() const {
+    for (const auto& fdata : file_data) {
+        if (fdata.mmapped && fdata.writable_mmap) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ModelLoader::restore_mmapped_bytes(const void* ptr, size_t bytes) {
+    if (ptr == nullptr || bytes == 0) {
+        return false;
+    }
+    const uint8_t* p = static_cast<const uint8_t*>(ptr);
+    for (auto& fdata : file_data) {
+        if (!fdata.mmapped || !fdata.writable_mmap) {
+            continue;
+        }
+        const uint8_t* base = fdata.mmapped->data();
+        const size_t size   = fdata.mmapped->size();
+        if (p < base || p >= base + size) {
+            continue;
+        }
+        const size_t offset = (size_t)(p - base);
+        if (bytes > size - offset) {
+            return false;
+        }
+        return fdata.mmapped->discard_private_writes(offset, bytes);
+    }
+    return false;
 }
 
 bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
