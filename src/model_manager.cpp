@@ -22,6 +22,48 @@
 #include "ggml-cuda.h"
 #endif
 
+// ---------------------------------------------------------------------------
+// WEIGHT-CONTENT EPOCH — what the CUDA backend's byte-derived caches key on.
+//
+// The backend caches things computed FROM a weight's bytes (the per-tensor e4m3 scale, an
+// amax) under the weight's NAME. A name is the right identity across an address change --
+// staging moves a weight every graph without changing what it is -- but it says nothing about
+// the bytes, and this file rewrites those bytes in place under an unchanged name: the LoRA
+// fold merges the delta into the params copy, and the unfold restores the pristine file bytes
+// with MADV_DONTNEED. Neither is visible to ggml (the unfold is a madvise() on a mapping; it
+// makes no ggml call at all), so ggml is told, once, how to ASK.
+//
+// Process-global rather than per-ModelManager on purpose: the caches it guards are themselves
+// process-global, and the provider is registered from a static initialiser, so there is no
+// lifetime to get wrong and nothing to unregister when a context goes away. Two managers
+// folding at once merely invalidate each other's cached scalars, which costs a recompute and
+// never correctness.
+//
+// Bumped at exactly the three places this file can change what a weight's bytes ARE. The GPU
+// fold ALSO self-invalidates inside ggml (ggml_cuda_lora_fold_* calls
+// ggml_cuda_weight_content_bump), so the fold bump here is what covers SD_LORA_FOLD_CPU=1.
+namespace {
+std::atomic<uint64_t> g_weight_content_epoch{0};
+
+void bump_weight_content_epoch(const char* why) {
+    const uint64_t e = g_weight_content_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    LOG_DEBUG("weight-content epoch -> %llu (%s)", (unsigned long long)e, why);
+}
+
+#ifdef SD_USE_CUDA
+uint64_t weight_content_epoch_provider(void*) {
+    return g_weight_content_epoch.load(std::memory_order_acquire);
+}
+
+struct WeightContentEpochRegistrar {
+    WeightContentEpochRegistrar() {
+        ggml_cuda_set_weight_content_epoch_provider(weight_content_epoch_provider, nullptr);
+    }
+};
+const WeightContentEpochRegistrar g_weight_content_epoch_registrar;
+#endif
+}  // namespace
+
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
     GGML_ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
     size_t align = (alignment - ((reinterpret_cast<uintptr_t>(buffer) + offset) % alignment)) % alignment;
@@ -138,6 +180,11 @@ void ModelManager::set_loras(std::vector<LoraSpec> loras, SDVersion version) {
     loras_        = std::move(loras);
     lora_version_ = version;
     current_lora_epoch_++;
+    // The adapter set changed, so every weight a fold/apply touches is about to mean something
+    // different -- including the case where it means PRISTINE again (an empty set after a
+    // folded render). Bumped here, before any fold runs, so nothing cached under the outgoing
+    // set can be served under the incoming one.
+    bump_weight_content_epoch("lora set changed");
     reset_lora_applied_params();
 }
 
@@ -598,6 +645,12 @@ void ModelManager::unfold_loras_from_params() {
     if (restored > 0 || failed > 0) {
         LOG_INFO("lora unfold: restored %zu tensor(s) from the model file in %.2fs (%zu failed)",
                  restored, (ggml_time_ms() - t0) / 1000.0, failed);
+    }
+    if (restored > 0) {
+        // madvise() is invisible to ggml: the pages now hold the pristine checkpoint under the
+        // same names and addresses the folded bytes had. Nothing downstream can notice unless
+        // it is told.
+        bump_weight_content_epoch("lora unfold");
     }
 }
 
@@ -1198,6 +1251,12 @@ bool ModelManager::fold_loras_into_params(const std::vector<TensorState*>& state
         ggml_cuda_lora_fold_release();
     }
 #endif
+    if (folded > 0) {
+        // Covers the CPU fold, and the deferred case: a tensor that was staged when the epoch
+        // opened is folded on a LATER prepare_params, still under the SAME lora epoch, so the
+        // set_loras() bump alone would not have invalidated anything cached in between.
+        bump_weight_content_epoch("lora fold");
+    }
     if (folded > 0 || declined > 0) {
         LOG_INFO("lora fold-at-load: merged %zu tensor(s) (%zu on GPU), declined %zu, taking %.2fs",
                  folded, gpu_folded, declined, (ggml_time_ms() - t0) * 1.0f / 1000);
@@ -1318,6 +1377,17 @@ bool ModelManager::apply_loras_to_params(const std::vector<TensorState*>& states
             }
         }
     }
+    // NO weight-content bump here, deliberately. This path DOES rewrite tensors in place under
+    // unchanged names, but it rewrites them to the SAME bytes every time: free_compute_staging_block()
+    // resets applied_lora_epoch, so under weight offload the apply re-runs on every staging cycle,
+    // always from freshly staged pristine bytes with the same adapter at the same multiplier. The
+    // post-apply bytes are therefore invariant for the whole lora epoch, and set_loras() already
+    // bumps at the only transition that changes them.
+    //
+    // Bumping here anyway would be the expensive kind of wrong: staging cycles run ~23 times for a
+    // single 25-frame render, so it would invalidate every byte-derived cache ~23 times per render
+    // for no correctness gain — perfectly correct and perfectly useless, which is the failure mode
+    // this whole family of fixes has to avoid.
     return true;
 }
 
