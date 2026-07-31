@@ -804,7 +804,19 @@ struct LoraModel : public GGMLRunner {
                 // were previously bit-identical, so that is the shape to validate on, and the CLI
                 // cannot reach it (VAE decode OOMs without the server's tiling). Needs a server
                 // build. Do not claim neutrality — in either direction — until that A/B is run.
-                lx = ggml_ext_scale(ctx, lx, scale_value, true);
+                //
+                // And when scale_value is EXACTLY 1.0 the node is a pure identity -- a
+                // [rank x tokens] read plus a [rank x tokens] write, per module per step, for
+                // nothing. That is the common case here: none of ltx-video's adapters ship an
+                // `.alpha`/`.scale` tensor, so scale_value IS the request multiplier, and the
+                // manifest's stated multiplier is 1.0 for five of the ten. Skipping the emission
+                // is a graph change only -- the surviving arithmetic is untouched, so a non-unit
+                // multiplier still gets the node in the SAME rank-wide position as before.
+                // `lx` comes straight out of a matmul, so the ggml_cont() inside
+                // ggml_ext_scale() was never doing anything here either.
+                if (scale_value != 1.0f) {
+                    lx = ggml_ext_scale(ctx, lx, scale_value, true);
+                }
                 scale_folded = true;
                 lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
             } else {  // OP_CONV2D
@@ -971,6 +983,38 @@ protected:
 public:
     explicit MultiLoraAdapter(const std::vector<std::shared_ptr<LoraModel>>& lora_models)
         : lora_models(lora_models) {
+    }
+
+    // Every tensor this adapter owns must be an NVFP4 matrix whose contraction dimension is a
+    // whole number of 64-element FP4 blocks. That is exactly the precondition
+    // ggml_cuda_nvfp4_cublaslt_shapes_ok() enforces (`a->ne[0] % 64 != 0` bails), and it is what
+    // makes ggml_backend_cuda_device_supports_op() accept an F16 src1 against this src0.
+    //
+    // For a LoRA, ne[0] is the CONTRACTION dim of each factor: lora_down is [in_features, rank]
+    // so ne[0] = in_features, lora_up is [rank, out_features] so ne[0] = RANK. Rank 256, 128 and
+    // 64 pass; RANK 32 CAN NEVER PASS, which is why four of ltx-video's ten adapters
+    // (transition, pixar-toon, vbvr, omninft) stay Q8_0 and keep the F32 stream.
+    //
+    // Deliberately strict: a stray F32 `.alpha`/`.scale` scalar makes the whole adapter decline.
+    // Those are read host-side at graph-build time and are never GEMM operands, so this is
+    // stricter than strictly necessary — but the failure mode of a wrong `true` is nodes on the
+    // CPU, and the cost of a wrong `false` is only that the F32 stream runs. Strict wins.
+    bool supports_f16_activation() const override {
+        bool saw_any = false;
+        for (const auto& lora_model : lora_models) {
+            for (const auto& kv : lora_model->lora_tensors) {
+                const ggml_tensor* t = kv.second;
+                if (t == nullptr) {
+                    return false;
+                }
+                if (t->type != GGML_TYPE_NVFP4 || t->ne[0] % 64 != 0) {
+                    return false;
+                }
+                saw_any = true;
+            }
+        }
+        // An adapter that has not loaded its tensors yet must not be waved through.
+        return saw_any;
     }
 
     ggml_tensor* patch_weight(ggml_context* ctx, ggml_backend_t backend, ggml_tensor* weight, const std::string& weight_name, bool with_lora_and_lokr) {

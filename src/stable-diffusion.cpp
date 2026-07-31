@@ -438,9 +438,16 @@ public:
             ggml_backend_cuda_trim_memory(backend);
         }
 
-        // LTX's cuDNN Conv3D path reorders each temporary staged VAE weight
-        // buffer. The cache is keyed by that temporary device address, so it
-        // cannot be kept safely into the next window and is outside VMM trim.
+        // LTX's cuDNN Conv3D path reorders each temporary staged VAE weight buffer, into raw
+        // cudaMalloc'd memory that is outside VMM trim. Freeing it here returns ~1.4 GB per
+        // window.
+        //
+        // ⚠️ The reason has CHANGED (ggml b57bc91b). This used to say the cache "is keyed by that
+        // temporary device address, so it cannot be kept safely into the next window" — that key
+        // was a BUG, not a constraint: it took stale hits and convolved with another tensor's
+        // weights. The cache is now keyed on stable identity (name + buffer + shape + type +
+        // device), so re-staging no longer invalidates it and this call is a pure memory
+        // reclaim that costs a rebuild, not a correctness requirement.
         // Do not touch the CUDA runtime for a CPU-only LTX invocation.
         if (!backends.empty()) {
             ggml_backend_cuda_release_cudnn_conv3d_weights();
@@ -1842,7 +1849,14 @@ public:
             // At 1920x1088 that im2col arena asks for a single ~9.9 GB compute buffer and
             // OOMs; conv-direct + the cuDNN interceptor (conv2d-cudnn.cu) is both smaller
             // and faster. Measured: 1024^2 11210 -> 8070 MiB, 1920x1088 OOM -> 10288 MiB.
-            if (sd_ctx_params->vae_conv_direct || getenv("GGML_CUDNN_CONV")) {
+            // Value-honouring: `GGML_CUDNN_CONV=0` must DISABLE this. The presence test that used
+            // to be here meant an explicit 0 turned conv2d-direct ON, so anyone bisecting cuDNN
+            // conv measured it enabled in both arms. Same class of bug as the two gates inside
+            // ggml-cuda (conv2d-cudnn.cu / conv3d-cudnn.cu), fixed there too.
+            const char* cudnn_conv2d_env = getenv("GGML_CUDNN_CONV");
+            const bool cudnn_conv2d_on   = cudnn_conv2d_env != nullptr && cudnn_conv2d_env[0] != '\0' &&
+                                         atoi(cudnn_conv2d_env) != 0;
+            if (sd_ctx_params->vae_conv_direct || cudnn_conv2d_on) {
                 LOG_INFO("Using Conv2d direct in the vae model");
                 first_stage_model->set_conv2d_direct_enabled(true);
                 if (preview_vae) {
@@ -10484,6 +10498,20 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                    audio_out != nullptr ? *audio_out : nullptr,
                                    reference_head_trim,
                                    sd_vid_gen_params != nullptr ? sd_vid_gen_params->fps : 0);
+    // Reclaim this job's GPU working set, exactly as generate_video_chain() does at its end
+    // (see the note there). The two are alternative branches of the SAME server route
+    // (routes_longcat.cpp: `segment_count == 1 ? generate_video : generate_video_chain`), so
+    // without this a one-segment render leaves the last window's committed VMM high-water and
+    // the cuDNN conv3d reorder cache resident into the next job on a persistent worker — the
+    // exact starvation the chain path added its own end-of-job reclaim to prevent.
+    //
+    // ⚠️ SCOPED TO LTX ON PURPOSE. generate_video() is also the entry point for wan-vace and
+    // longcat-avatar, and this reclaim is the prime suspect in a reproducible mid-chain cuBLAS
+    // failure (see reclaim_ltx_chain_window_gpu_memory()'s header). Widening it to every video
+    // model would be trading a latent leak for a live crash class in services that never had it.
+    if (sd_ctx != nullptr && sd_ctx->sd != nullptr && sd_version_is_ltxav(sd_ctx->sd->version)) {
+        sd_ctx->sd->reclaim_ltx_chain_window_gpu_memory();
+    }
     return true;
 }
 

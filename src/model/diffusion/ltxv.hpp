@@ -56,11 +56,46 @@ namespace LTXV {
     // GGML_NVFP4_CUBLASLT=1). On an sm86 box (e.g. the 3060 the same image is deployed to)
     // this is false and the well-tested F32 stream runs unchanged — which also keeps the
     // cross-attentions off the F16-Q path that only the Blackwell cuDNN SDPA accepts.
+    // Escape hatch for the adapter gate below: LTX_DIT_F16_WITH_ADAPTER=1 restores the old
+    // behaviour (F16 stream even under an adapter that cannot consume F16), so the two can be
+    // A/B'd on one binary. Do not ship it on without a measurement.
+    __STATIC_INLINE__ bool ltx_dit_f16_with_adapter_env() {
+        static int v = -1;
+        if (v < 0) {
+            const char* e = getenv("LTX_DIT_F16_WITH_ADAPTER");
+            v             = (e != nullptr && atoi(e) != 0) ? 1 : 0;
+        }
+        return v == 1;
+    }
+
     __STATIC_INLINE__ bool ltx_dit_f16_enabled(GGMLRunnerContext* ctx) {
         if (!ltx_dit_f16_env()) {
             return false;
         }
-        return ctx != nullptr && ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
+        if (ctx == nullptr) {
+            return false;
+        }
+        // 🔴 A RUNTIME LoRA MUST BE ABLE TO EAT THE STREAM IT IS HANDED.
+        //
+        // This cast is what puts the whole transformer body in F16, and forward_with_lora()
+        // then feeds that same activation to the ADAPTER's own tensors as src1. On CUDA an F16
+        // src1 against a non-F16, non-cuBLASLt-served src0 is REJECTED by
+        // ggml_backend_cuda_device_supports_op(), so a Q8_0 adapter's down-GEMM is not merely
+        // slower in the F16 stream — it is a node the CUDA backend says it cannot run.
+        //
+        // krea2 has had the equivalent gate since bring-up (krea2.hpp: any adapter => F32
+        // stream) and measured 3.05 s of what looked like "adapter cost" to be the base DiT
+        // losing F16. LTX never had one: the ONLY adapter-aware F16 gate on this model was
+        // ltx_attn_f16_out_enabled() below, which covers one tensor per attention.
+        //
+        // Asking the adapter, rather than blanket-rejecting, is what lets an all-NVFP4
+        // rank%64==0 adapter KEEP the F16 stream — which is the entire reason to convert an
+        // adapter to NVFP4 in the first place.
+        if (ctx->weight_adapter != nullptr && !ctx->weight_adapter->supports_f16_activation() &&
+            !ltx_dit_f16_with_adapter_env()) {
+            return false;
+        }
+        return ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
     }
 
     // GGML_CUDNN_ATTN_F16_OUT -- let the DiT attention hand its output to `to_out.0` as F16
@@ -92,13 +127,22 @@ namespace LTXV {
     //   * the to_out weight must actually be NVFP4, so ggml_ext_linear's mm_dst gate is
     //     guaranteed to fire and emit the F16 dst rather than asking for an F32 dst from an
     //     F16 activation.
-    //   * no LoRA/weight-adapter: forward_with_lora() builds its own delta chain and an F16
-    //     activation through it is unproven.
+    //   * a weight-adapter must SAY it can take an F16 activation. forward_with_lora() builds
+    //     its own delta chain out of the adapter's tensors, and an F16 src1 against a non-NVFP4
+    //     src0 is not merely unproven, it is REJECTED by supports_op and dropped to the CPU
+    //     backend. WeightAdapter::supports_f16_activation() answers that per adapter (an
+    //     all-NVFP4, rank%64==0 adapter says yes; a Q8_0 or rank-32 one says no), which is what
+    //     lets an NVFP4 adapter keep the F16 attention output that a Q8_0 one has to give up.
+    //     Blanket-rejecting any adapter — as this used to — cost the F16 output on EVERY
+    //     adaptered render, including the ones that could have kept it.
     __STATIC_INLINE__ bool ltx_attn_f16_out_enabled(GGMLRunnerContext* ctx, const ggml_tensor* to_out_weight) {
         if (!ltx_attn_f16_out_env()) {
             return false;
         }
-        if (ctx == nullptr || ctx->weight_adapter != nullptr) {
+        if (ctx == nullptr) {
+            return false;
+        }
+        if (ctx->weight_adapter != nullptr && !ctx->weight_adapter->supports_f16_activation()) {
             return false;
         }
         if (to_out_weight == nullptr || to_out_weight->type != GGML_TYPE_NVFP4) {
