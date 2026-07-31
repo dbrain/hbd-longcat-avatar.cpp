@@ -2117,9 +2117,33 @@ bool SDGenerationParams::from_json_str(
         LOG_ERROR("invalid end_image");
         return false;
     }
-    if (!parse_image_array_json_field(j, "ref_images", 3, width, height, ref_images)) {
+    // ⚠️ REFERENCE IMAGES ARE CROPPED HERE, NOT BY THE PRESET. Passing the request's
+    // width/height as `expected_*` makes load_image_common() centre-crop the decoded image
+    // to the TARGET aspect ratio and then rescale it to the exact target resolution
+    // (media_io.cpp:574-...). So by the time stable-diffusion.cpp reads ref_image_params,
+    // every reference is already at the target geometry and `crop_vae_to_target_ar` /
+    // `resize_vae_to_target` have nothing left to do -- a square 1024^2 reference sent to a
+    // 1920x1088 render arrives as 1024x580 upscaled, with the top of the head thrown away,
+    // and nothing in the preset can get it back.
+    //
+    // That is correct for IN-PLACE EDIT, where the reference IS the canvas. It is wrong for
+    // RESTAGE, where the reference is an identity source whose aspect ratio has nothing to do
+    // with the output's. SD_REF_IMAGES_NATIVE=1 decodes references at their own geometry and
+    // leaves all downstream fitting to the preset, which is where it is describable.
+    // Off by default: this changes what every ref-image model receives.
+    static const bool ref_images_native = []() {
+        const char* v = getenv("SD_REF_IMAGES_NATIVE");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    const int ref_expect_w = ref_images_native ? 0 : width;
+    const int ref_expect_h = ref_images_native ? 0 : height;
+    if (!parse_image_array_json_field(j, "ref_images", 3, ref_expect_w, ref_expect_h, ref_images)) {
         LOG_ERROR("invalid ref_images");
         return false;
+    }
+    if (ref_images_native && !ref_images.empty()) {
+        LOG_INFO("SD_REF_IMAGES_NATIVE: decoded %zu reference image(s) at native geometry (no target-AR crop)",
+                 ref_images.size());
     }
     if (!parse_image_array_json_field(j, "control_frames", 3, width, height, control_frames)) {
         LOG_ERROR("invalid control_frames");

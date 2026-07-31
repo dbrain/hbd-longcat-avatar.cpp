@@ -135,7 +135,9 @@ namespace Rope {
                                                                        int index       = 0,
                                                                        int h_offset    = 0,
                                                                        int w_offset    = 0,
-                                                                       bool scale_rope = false) {
+                                                                       bool scale_rope = false,
+                                                                       int h_span      = 0,
+                                                                       int w_span      = 0) {
         int h_len = (h + (patch_size / 2)) / patch_size;
         int w_len = (w + (patch_size / 2)) / patch_size;
         std::vector<std::vector<float>> img_ids(h_len * w_len, std::vector<float>(axes_dim_num, 0.0));
@@ -148,8 +150,21 @@ namespace Rope {
             w_start -= w_len / 2;
         }
 
-        std::vector<float> row_ids = linspace<float>(1.f * h_start, 1.f * h_start + h_len - 1, h_len);
-        std::vector<float> col_ids = linspace<float>(1.f * w_start, 1.f * w_start + w_len - 1, w_len);
+        // POSITIONAL SPAN. Normally the ids advance in UNIT steps, so a grid of h_len rows
+        // occupies rows [h_start, h_start + h_len - 1] of the positional plane. A reference
+        // that is smaller than the target therefore lands in a SUB-RECTANGLE of the plane
+        // rather than spanning it, and the (i,j)<->(i,j) correspondence an edit adapter was
+        // trained on is gone.
+        //
+        // With h_span/w_span > 0 the same h_len ids are spread across [start, start + span - 1]
+        // instead — same span, FRACTIONAL step. Nothing downstream objects: ids are float and
+        // embed_nd() computes cos/sin(pos * theta), continuous in pos, with no integer indexing.
+        // span == len reproduces the unit-step behaviour exactly.
+        const float h_end = h_span > 0 ? 1.f * h_start + h_span - 1 : 1.f * h_start + h_len - 1;
+        const float w_end = w_span > 0 ? 1.f * w_start + w_span - 1 : 1.f * w_start + w_len - 1;
+
+        std::vector<float> row_ids = linspace<float>(1.f * h_start, h_end, h_len);
+        std::vector<float> col_ids = linspace<float>(1.f * w_start, w_end, w_len);
         for (int i = 0; i < h_len; ++i) {
             for (int j = 0; j < w_len; ++j) {
                 img_ids[i * w_len + j][0] = 1.f * index;
@@ -355,7 +370,10 @@ namespace Rope {
                                                                    RefIndexMode ref_index_mode,
                                                                    float ref_index_scale,
                                                                    bool scale_rope,
-                                                                   int base_offset = 0) {
+                                                                   int base_offset  = 0,
+                                                                   int target_h_len = 0,
+                                                                   int target_w_len = 0,
+                                                                   bool center_refs = false) {
         std::vector<std::vector<float>> ids;
         int curr_h_offset = 0;
         int curr_w_offset = 0;
@@ -374,15 +392,32 @@ namespace Rope {
                 index--;
             }
 
+            // CENTER_REFS is the OTHER way to put a smaller reference where the target is,
+            // and the two are different hypotheses about what the model is sensitive to.
+            // Spanning (target_*_len) keeps the reference covering the whole plane but at a
+            // FRACTIONAL step the model has never seen. Centring keeps the step at exactly 1 --
+            // in-distribution -- and only TRANSLATES the reference to the middle of the plane.
+            // Mutually exclusive; centring wins if both are set.
+            int centre_h = 0;
+            int centre_w = 0;
+            if (center_refs) {
+                const int ref_h_len = (static_cast<int>(ref->ne[1]) + (patch_size / 2)) / patch_size;
+                const int ref_w_len = (static_cast<int>(ref->ne[0]) + (patch_size / 2)) / patch_size;
+                centre_h            = std::max(0, (target_h_len - ref_h_len) / 2);
+                centre_w            = std::max(0, (target_w_len - ref_w_len) / 2);
+            }
+
             auto ref_ids = gen_flux_img_ids(static_cast<int>(ref->ne[1]),
                                             static_cast<int>(ref->ne[0]),
                                             patch_size,
                                             bs,
                                             axes_dim_num,
                                             static_cast<int>(index * ref_index_scale),
-                                            h_offset + base_offset,
-                                            w_offset + base_offset,
-                                            scale_rope);
+                                            h_offset + base_offset + centre_h,
+                                            w_offset + base_offset + centre_w,
+                                            scale_rope,
+                                            center_refs ? 0 : target_h_len,
+                                            center_refs ? 0 : target_w_len);
             ids          = concat_ids(ids, ref_ids, bs);
 
             if (ref_index_mode == RefIndexMode::INCREASE) {
