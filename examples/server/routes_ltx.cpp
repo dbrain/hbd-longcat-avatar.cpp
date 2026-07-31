@@ -95,6 +95,127 @@ bool resolve_ltx_bank_dir(const std::string& requested_id,
     return false;
 }
 
+// Is a resumed/retaken job allowed to FORK its own bank instead of writing into
+// the one it resumed? LTX_BANK_FORK=0 restores the old shared-bank behaviour on
+// the same binary. Reads the VALUE, not merely the presence.
+bool ltx_bank_fork_enabled() {
+    if (const char* env = std::getenv("LTX_BANK_FORK"); env != nullptr && env[0] != '\0') {
+        return !(env[0] == '0' && env[1] == '\0');
+    }
+    return true;
+}
+
+// Give a resumed job its OWN bank, sharing every unchanged shot with the bank it
+// resumed by HARD LINK.
+//
+// ★ WHY THIS EXISTS — measured, not theorised. Before this, a retake resolved
+// `bank_dir` to the RESUMED job's directory and re-rendered shot i straight over
+// `seg_<i>.bin` there, while `write_ltx_bank_reference` made the new job id a
+// mere pointer back to the same bank. So a retake DESTROYED the take it
+// replaced: rendering a 2-shot chain and retaking shot 0 leaves seg_0.bin and
+// seg_0.audio with new contents and nowhere holding the old ones. Every take's
+// `latent_job_id` resolved to one directory, so a UI that records which take a
+// shot used was recording a distinction that did not exist on disk.
+//
+// Copying is not an option: a production 42-shot 1920x1088 bank is 929 MB and
+// the store is ext4 (no reflinks), so an overnight critic run at two retakes a
+// shot would write ~78 GB. Hard links make the fork cost one directory entry per
+// file and zero data blocks — the shots this job will NOT re-render are
+// genuinely the same bytes, which is exactly what a hard link says.
+//
+// The re-rendered shots' links are then REMOVED, so when the render opens
+// `seg_<i>.bin` for writing it creates a fresh inode and the resumed bank's copy
+// is left untouched. Unlinking first is the whole trick — writing in place
+// through a shared inode would corrupt the other take rather than fork from it.
+bool fork_ltx_bank(const fs::path& resume_bank,
+                   const fs::path& destination,
+                   const std::vector<std::string>& segment_bank_dirs,
+                   int n_segments,
+                   const std::vector<int>& rerendered_segments,
+                   std::string& why_not) {
+    std::error_code error;
+    fs::create_directories(destination, error);
+    if (error) {
+        why_not = "could not create the forked bank directory: " + error.message();
+        return false;
+    }
+
+    auto link_or_copy = [&](const fs::path& from, const fs::path& to) -> bool {
+        std::error_code remove_error;
+        fs::remove(to, remove_error);
+        std::error_code link_error;
+        fs::create_hard_link(from, to, link_error);
+        if (!link_error) return true;
+        // Cross-device, or a filesystem without links: a real copy is still
+        // correct, just expensive. Only the fallback pays for the bytes.
+        std::error_code copy_error;
+        fs::copy_file(from, to, fs::copy_options::overwrite_existing, copy_error);
+        if (copy_error) {
+            why_not = "could not link or copy '" + from.filename().string() + "': " + copy_error.message();
+            return false;
+        }
+        return true;
+    };
+
+    // Everything that is NOT a per-shot artefact — the staged drive/track WAVs,
+    // audio_offset_frames, the legacy audio/ slice directory — comes from the
+    // resumed job wholesale. `bank_id` is deliberately NOT carried over: this is a
+    // real bank now, and copying the pointer would make it resolve elsewhere.
+    for (const auto& entry : fs::recursive_directory_iterator(resume_bank, error)) {
+        if (error) break;
+        const fs::path relative = entry.path().lexically_relative(resume_bank);
+        const std::string top = relative.begin()->string();
+        if (top == "bank_id" || top.rfind("seg_", 0) == 0) continue;
+        if (entry.is_directory(error)) {
+            std::error_code dir_error;
+            fs::create_directories(destination / relative, dir_error);
+            continue;
+        }
+        if (!entry.is_regular_file(error)) continue;
+        if (!link_or_copy(entry.path(), destination / relative)) return false;
+    }
+    if (error) {
+        why_not = "could not read the source bank: " + error.message();
+        return false;
+    }
+
+    // ★ Per-shot artefacts come from THE BANK THAT SHOT IS RESTORED FROM, not
+    // blanket from the resumed job.
+    //
+    // This is what makes the forked bank a faithful record of what was actually
+    // rendered. A mixture render — shot 0 out of take A, shot 1 out of take C —
+    // restores each shot from its own bank; if the fork copied both from the
+    // resumed job instead, the finished bank would describe a DIFFERENT mixture
+    // than the video it accompanies, and the next resume of this job would
+    // silently render a combination the user never picked. The output would look
+    // right and the bank would lie.
+    //
+    // Shots this job RE-RENDERS are skipped entirely: no link is made, so the
+    // render's own write creates a fresh inode and no other take is touched.
+    for (int segment = 0; segment < n_segments; ++segment) {
+        if (std::find(rerendered_segments.begin(), rerendered_segments.end(), segment) !=
+            rerendered_segments.end()) {
+            continue;
+        }
+        fs::path source = resume_bank;
+        if (segment < static_cast<int>(segment_bank_dirs.size()) && !segment_bank_dirs[segment].empty()) {
+            source = segment_bank_dirs[segment];
+        }
+        // The trailing '.' is load-bearing: without it "seg_1" would also match
+        // "seg_10.bin" and a ten-shot chain would fork the wrong artefacts.
+        const std::string stem = "seg_" + std::to_string(segment) + ".";
+        std::error_code scan_error;
+        for (const auto& entry : fs::directory_iterator(source, scan_error)) {
+            if (scan_error) break;
+            if (!entry.is_regular_file(scan_error)) continue;
+            const std::string name = entry.path().filename().string();
+            if (name.rfind(stem, 0) != 0) continue;
+            if (!link_or_copy(entry.path(), destination / name)) return false;
+        }
+    }
+    return true;
+}
+
 bool write_ltx_bank_reference(const fs::path& root, const std::string& job_id, const std::string& bank_id) {
     if (job_id == bank_id) {
         return true;
@@ -269,6 +390,10 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<int> segment_v2v_modes;
             std::vector<float> segment_v2v_strengths;
             std::vector<std::string> segment_v2v_guide_latent_paths;
+            // Per-shot "restore THIS shot from THAT job's bank" — the take the caller picked for
+            // this shot. Collected as raw job ids and resolved to directories once, below, so the
+            // core is only ever handed resolved paths.
+            std::vector<std::string> segment_bank_job_ids;
             std::vector<std::vector<LtxSegmentBeat>> segment_beats;
             std::vector<int64_t> segment_seeds;
             std::vector<int> segment_steps;
@@ -310,6 +435,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
                         segment_v2v_guide_latent_paths.emplace_back();
+                        segment_bank_job_ids.emplace_back();
                         segment_beats.emplace_back();
                         segment_seeds.push_back(-1);
                         segment_steps.push_back(0);
@@ -465,6 +591,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_modes.push_back(v2v_mode);
                         segment_v2v_strengths.push_back(v2v_strength);
                         segment_v2v_guide_latent_paths.push_back(std::move(guide_latent_path));
+                        // Which TAKE this shot is restored from. `bank_job_id` names the job whose
+                        // bank holds the take the caller selected for this shot; absent means "the
+                        // resumed job's own bank", i.e. exactly today's behaviour. Only meaningful
+                        // for shots this render RESTORES rather than re-renders.
+                        segment_bank_job_ids.push_back(segment.value("bank_job_id", std::string()));
 
                         // Prompt Relay beats. The shot's own `prompt` stays the
                         // global setting; each beat is a short clause pinned to a
@@ -569,6 +700,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
                         segment_v2v_guide_latent_paths.emplace_back();
+                        segment_bank_job_ids.emplace_back();
                         segment_beats.emplace_back();
                         segment_seeds.push_back(-1);
                         segment_steps.push_back(0);
@@ -1111,6 +1243,34 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
+            // Resolve each shot's chosen take to a DIRECTORY here, once, so the core never learns
+            // the bank_id indirection or the persist/transient root search — same split as
+            // v2v_guide_latent_paths, which also crosses this boundary already resolved.
+            //
+            // An unresolvable id is a hard 400 rather than a silent fall back to the resumed
+            // bank: falling back would render a DIFFERENT take from the one the user picked and
+            // look completely successful, which is the exact failure this whole feature exists to
+            // stop. Better to refuse than to quietly disagree with the UI.
+            if (std::any_of(segment_bank_job_ids.begin(), segment_bank_job_ids.end(),
+                            [](const std::string& id) { return !id.empty(); })) {
+                std::vector<std::string> resolved(segment_bank_job_ids.size());
+                for (size_t segment = 0; segment < segment_bank_job_ids.size(); ++segment) {
+                    if (segment_bank_job_ids[segment].empty()) continue;
+                    fs::path segment_bank_dir;
+                    std::string segment_bank_id;
+                    if (!resolve_ltx_bank_dir(segment_bank_job_ids[segment], segment_bank_dir, segment_bank_id)) {
+                        res.status = 400;
+                        res.set_content(json({{"error", "invalid bank_job_id"},
+                                              {"segment", static_cast<int>(segment)},
+                                              {"bank_job_id", segment_bank_job_ids[segment]}})
+                                            .dump(),
+                                        "application/json");
+                        return;
+                    }
+                    resolved[segment] = segment_bank_dir.string();
+                }
+                job->ltx_segment_bank_dirs = std::move(resolved);
+            }
             // Only carry the per-shot arrays when a shot actually asked for
             // something: an all-inert array would make the chain treat every
             // shot as "explicitly no beats", which is the same result but costs
@@ -1196,6 +1356,20 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             }
             const bool has_audio_offset_frames = body.contains("audio_offset_frames");
             const int audio_offset_frames = body.value("audio_offset_frames", 0);
+            // AUDIO GAP-FILL. Generate the SILENT stretches of the supplied drive clip while
+            // holding the rest, instead of holding the whole clip. Default off: a supplied drive
+            // clip normally means "condition on all of this".
+            if (body.contains("audio_fill_gaps") && !body["audio_fill_gaps"].is_boolean() &&
+                !body["audio_fill_gaps"].is_number_integer()) {
+                res.status = 400;
+                res.set_content(R"({"error":"audio_fill_gaps must be a boolean"})", "application/json");
+                return;
+            }
+            const bool audio_fill_gaps = body.contains("audio_fill_gaps")
+                                             ? (body["audio_fill_gaps"].is_boolean()
+                                                    ? body["audio_fill_gaps"].get<bool>()
+                                                    : body["audio_fill_gaps"].get<int>() != 0)
+                                             : false;
             if (audio_offset_frames < 0) {
                 res.status = 400;
                 res.set_content(R"({"error":"audio_offset_frames must not be negative"})", "application/json");
@@ -1251,6 +1425,46 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                     bank_root = persist_bank ? ltx_persist_root() : ltx_bank_root();
                     bank_dir = bank_root / job->id;
                     bank_id = job->id;
+                }
+                // FORK the resumed bank rather than writing back into it, so this
+                // job's take is added to the project instead of replacing the one
+                // it resumed. See fork_ltx_bank for why hard links and not a copy.
+                //
+                // Every shot this job does NOT re-render is still restored from
+                // this bank, byte-identical, because the link IS the same file.
+                // Failing to fork is not fatal: it degrades to the previous
+                // shared-bank behaviour, which is destructive but is also exactly
+                // what every render before this change did. Loud, not fatal.
+                if (!resume_job_id.empty() && ltx_bank_fork_enabled()) {
+                    // The resume branch above never allocated one — it used to have no
+                    // need, since the job wrote into the bank it resumed. It needs an id
+                    // now because the fork is named after it.
+                    if (job->id.empty()) job->id = make_async_job_id(manager);
+                    const fs::path source_bank = bank_dir;
+                    const fs::path forked = bank_root / job->id;
+                    std::vector<int> rerendered;
+                    if (retake_segment >= 0) {
+                        rerendered.push_back(retake_segment);
+                    } else {
+                        for (int segment = resume_from;
+                             segment < static_cast<int>(job->ltx_prompts.size()); ++segment) {
+                            rerendered.push_back(segment);
+                        }
+                    }
+                    std::string why_not;
+                    if (forked != source_bank &&
+                        fork_ltx_bank(source_bank, forked, job->ltx_segment_bank_dirs,
+                                      static_cast<int>(job->ltx_prompts.size()), rerendered, why_not)) {
+                        bank_dir = forked;
+                        bank_id = job->id;   // a real bank now, not a pointer
+                        printf("[ltx] forked bank %s -> %s (re-rendering %zu shot(s); every other shot "
+                               "is hard-linked, so the resumed take is preserved)\n",
+                               source_bank.filename().string().c_str(), job->id.c_str(), rerendered.size());
+                    } else if (forked != source_bank) {
+                        printf("[ltx] WARNING: could not fork bank %s (%s) — falling back to writing "
+                               "into the resumed bank, which OVERWRITES the take being resumed\n",
+                               source_bank.filename().string().c_str(), why_not.c_str());
+                    }
                 }
                 std::error_code error;
                 fs::create_directories(bank_dir, error);
@@ -1382,6 +1596,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 job->ltx_segment_seam_drop_frames = std::move(segment_seam_drop_frames);
                 if (job->ltx_chain_audio_offset_frames == 0) {
                     job->ltx_chain_audio_offset_frames = audio_offset_frames;
+                    job->ltx_audio_fill_gaps = audio_fill_gaps;
                 }
                 manager.jobs[job->id] = job;
                 manager.queue.push_back(job->id);

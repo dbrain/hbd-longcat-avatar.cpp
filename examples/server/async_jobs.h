@@ -143,6 +143,11 @@ struct AsyncGenerationJob {
     std::vector<int> ltx_segment_v2v_modes;
     std::vector<float> ltx_segment_v2v_strengths;
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;
+    // Per-shot RESOLVED bank directory to restore that shot from, sized with the
+    // prompts when any segment names one. Empty entries fall back to ltx_bank_dir.
+    // Resolution (job id -> directory, via resolve_ltx_bank_dir) happens in the
+    // route so the core never learns the bank_id indirection.
+    std::vector<std::string> ltx_segment_bank_dirs;
     // Owned stage parameter views for the optional LTX hires chain.  The
     // generation objects retain model-path and sigma backing storage until the
     // worker has completed the request.
@@ -157,6 +162,8 @@ struct AsyncGenerationJob {
     std::string ltx_chain_audio_full;
     std::string ltx_chain_audio_track;
     int ltx_chain_audio_offset_frames = 0;
+    // Generate the silent stretches of the drive clip rather than holding it entire.
+    bool ltx_audio_fill_gaps = false;
     // Retake/seam/audio policy is durable job state rather than an endpoint-only
     // concern: a queued job must retain precisely the contract that was staged.
     int ltx_retake_segment = -1;

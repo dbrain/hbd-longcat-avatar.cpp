@@ -580,6 +580,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                          int& output_fps,
                          std::string& error_message) {
     sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
+    params.audio_fill_gaps = job.ltx_audio_fill_gaps ? 1 : 0;
     // The production LipDub client sends its source frames at the top level,
     // with v2v_mode omitted (therefore mode 0).  Keep the selection in durable
     // job state so queued requests cannot inherit a previous worker setting.
@@ -622,6 +623,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     std::vector<sd_image_t*> ltx_v2v_image_windows;
     std::vector<int> ltx_v2v_frame_counts;
     std::vector<const char*> ltx_v2v_guide_latent_paths;
+    std::vector<const char*> ltx_segment_bank_dirs;
     if (!job.ltx_prompts.empty()) {
         ltx_scene_image_owners.resize(job.ltx_prompts.size());
         ltx_scene_images.resize(job.ltx_prompts.size(), nullptr);
@@ -677,6 +679,16 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         for (size_t segment = 0; segment < job.ltx_segment_v2v_guide_latent_paths.size(); ++segment) {
             if (!job.ltx_segment_v2v_guide_latent_paths[segment].empty()) {
                 ltx_v2v_guide_latent_paths[segment] = job.ltx_segment_v2v_guide_latent_paths[segment].c_str();
+            }
+        }
+        if (!job.ltx_segment_bank_dirs.empty()) {
+            ltx_segment_bank_dirs.resize(job.ltx_prompts.size(), nullptr);
+            for (size_t segment = 0;
+                 segment < job.ltx_segment_bank_dirs.size() && segment < ltx_segment_bank_dirs.size();
+                 ++segment) {
+                if (!job.ltx_segment_bank_dirs[segment].empty()) {
+                    ltx_segment_bank_dirs[segment] = job.ltx_segment_bank_dirs[segment].c_str();
+                }
             }
         }
         for (size_t segment = 0; segment < job.ltx_segment_control_frames.size(); ++segment) {
@@ -874,6 +886,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;
             chain.bank_dir = job.ltx_bank_dir.empty() ? nullptr : job.ltx_bank_dir.c_str();
+            chain.segment_bank_dirs = ltx_segment_bank_dirs.empty() ? nullptr : ltx_segment_bank_dirs.data();
             chain.chain_audio_full = job.ltx_chain_audio_full.empty() ? nullptr : job.ltx_chain_audio_full.c_str();
             chain.chain_audio_track = job.ltx_chain_audio_track.empty() ? nullptr : job.ltx_chain_audio_track.c_str();
             chain.chain_audio_offset_frames = job.ltx_chain_audio_offset_frames;

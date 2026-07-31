@@ -240,6 +240,9 @@ struct SDGenerationParams {
     bool fps_explicit                    = false;
     float vace_strength                  = 1.f;
     int audio_frame_offset                = 0;
+    // Generate the SILENT stretches of the drive clip instead of holding the whole
+    // thing (audio gap-fill / inpainting stage 1). See sd_vid_gen_params_t.
+    int audio_fill_gaps                   = 0;
     // LTXAV LipDub modality guidance. Defaults are intentionally inert.
     float a2v_guidance                    = 1.f;
     float a2v_ramp_end                    = 1.f;

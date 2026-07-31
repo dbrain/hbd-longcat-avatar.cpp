@@ -9,11 +9,19 @@
 #include <string>
 #include <vector>
 
+#include "audio_resample.hpp"
+
 namespace sd::audio {
 
 // Decode the PCM/float WAV formats used by the model audio encoders, mix to mono,
-// and linearly resample to 16 kHz. Kept independent from a particular model so the
+// and resample to 16 kHz. Kept independent from a particular model so the
 // LongCat, S2V, and InfiniteTalk front ends share identical drive-audio semantics.
+//
+// Mono is right here: every consumer of this loader is a whisper/wav2vec2 front
+// end, which is a mono model. The rate conversion is the shared anti-aliased one
+// — it used to be two-tap linear interpolation with no filter, identical to the
+// bug fixed in LONGCAT_AUDIO::load_wav_16k, and these front ends were folding
+// 8-24 kHz down into the encoder's band exactly the same way.
 inline bool load_wav_16k_mono(const std::string& path, std::vector<float>& out) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
@@ -99,17 +107,8 @@ inline bool load_wav_16k_mono(const std::string& path, std::vector<float>& out) 
         out = std::move(mono);
         return true;
     }
-    const double ratio = 16000.0 / sample_rate;
-    const size_t output_size = static_cast<size_t>(mono.size() * ratio);
-    out.resize(output_size);
-    for (size_t i = 0; i < output_size; ++i) {
-        const double source = i / ratio;
-        const size_t left = static_cast<size_t>(source);
-        const size_t right = std::min(left + 1, mono.size() - 1);
-        const float fraction = static_cast<float>(source - left);
-        out[i] = mono[left] * (1.0f - fraction) + mono[right] * fraction;
-    }
-    return true;
+    sd_audio_resample::resample(mono, sample_rate, 16000, out);
+    return !out.empty();
 }
 
 }  // namespace sd::audio

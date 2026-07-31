@@ -1064,6 +1064,11 @@ ArgOptions SDGenerationParams::get_options() {
          "LongCat Avatar driving-audio offset in the model's 25 fps timeline (default: 0)",
          &audio_frame_offset},
         {"",
+         "--audio-fill-gaps",
+         "LTX: generate the SILENT stretches of the drive audio and hold the rest, instead of "
+         "holding the whole clip (1 = on, default: 0)",
+         &audio_fill_gaps},
+        {"",
          "--fps",
          "fps (default: 24)",
          &fps},
@@ -1951,6 +1956,7 @@ bool SDGenerationParams::from_json_str(
     load_if_exists("vace_strength", vace_strength);
     load_if_exists("audio_path", audio_path);
     load_if_exists("audio_frame_offset", audio_frame_offset);
+    load_if_exists("audio_fill_gaps", audio_fill_gaps);
     load_if_exists("a2v_guidance", a2v_guidance);
     load_if_exists("a2v_ramp_end", a2v_ramp_end);
     load_if_exists("relip_ref_tstride", relip_ref_tstride);
@@ -2705,6 +2711,7 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.vace_strength             = vace_strength;
     params.audio_path                = audio_path.empty() ? nullptr : audio_path.c_str();
     params.audio_frame_offset        = audio_frame_offset;
+    params.audio_fill_gaps           = audio_fill_gaps;
     params.vae_tiling_params         = vae_tiling_params;
     params.cache                     = cache_params;
     params.hires.enabled             = hires_enabled;
@@ -2833,6 +2840,7 @@ std::string SDGenerationParams::to_string() const {
         << "  fps: " << fps << ",\n"
         << "  vace_strength: " << vace_strength << ",\n"
         << "  audio_frame_offset: " << audio_frame_offset << ",\n"
+        << "  audio_fill_gaps: " << audio_fill_gaps << ",\n"
         << "  strength: " << strength << ",\n"
         << "  control_strength: " << control_strength << ",\n"
         << "  seed: " << seed << ",\n"
@@ -2979,6 +2987,7 @@ std::string build_sdcpp_image_metadata_json(const SDContextParams& ctx_params,
             root["audio_path"] = gen_params.audio_path;
         }
         root["audio_frame_offset"] = gen_params.audio_frame_offset;
+        root["audio_fill_gaps"]    = gen_params.audio_fill_gaps;
         root["high_noise_sampling"] = build_sampling_metadata_json(gen_params.high_noise_sample_params,
                                                                    gen_params.high_noise_skip_layers);
     }

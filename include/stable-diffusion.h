@@ -598,6 +598,16 @@ typedef struct {
     // motion follows the supplied speech. This is distinct from audio_path,
     // which remains the LongCat Avatar Whisper input.
     const char* drive_audio_path;
+    // AUDIO GAP-FILL (inpainting, stage 1). Non-zero generates the regions of
+    // drive_audio_path that are SILENT while holding the regions that carry real
+    // signal, instead of holding the whole clip. Zero (default) is the ordinary
+    // behaviour: a supplied drive clip conditions the render and is held entire.
+    //
+    // The deliverable still wants the SOURCE re-substituted over the held regions
+    // at mux time — a round trip through the audio VAE is measurably lossy, so
+    // what this buys is generated content in the gaps, not a transparent copy of
+    // what was supplied.
+    int audio_fill_gaps;
     // Start position in the driving-audio timeline, measured at the Avatar
     // model's fixed 25 fps.  Zero is the normal single-clip case.
     int audio_frame_offset;
@@ -659,6 +669,23 @@ typedef struct {
     int cont_latent_frames;
     int start_segment;
     const char* bank_dir;
+    // Optional PER-SHOT override for the bank a RESTORED shot is read from.
+    // Null, or a null/empty entry, keeps `bank_dir` — i.e. today's behaviour.
+    //
+    // What this buys: a resume or a retake can restore a MIXTURE — shot 0 out of
+    // one job's bank, shot 1 out of another's — which is what "render again from
+    // the takes I picked" needs. `bank_dir` alone can only ever name one bank,
+    // so a retake of a later shot continued from whatever the single bank last
+    // held rather than from the take the user actually selected.
+    //
+    // Entries are RESOLVED DIRECTORIES, not job ids: id->dir policy (the bank_id
+    // indirection, the persist/transient root search) lives in the server layer
+    // next to resolve_ltx_bank_dir, exactly as segment_v2v_guide_latent_paths
+    // carries a resolved path rather than a reference.
+    //
+    // WRITES ignore this and always go to `bank_dir`. Restoring is a read of a
+    // shot's chosen past; banking is what this job produces.
+    const char* const* segment_bank_dirs;
     // Optional full-timeline WAV inputs for LTX chains. The core slices
     // chain_audio_full per generated window and holds each slice fixed as the
     // drive signal; bank_dir is required so those durable slices survive the

@@ -3074,6 +3074,50 @@ public:
         *controls = std::move(*control_result);
     }
 
+    // Does the packed denoise mask ask for ANY audio element to be generated?
+    //
+    // Used instead of a separate "gap fill" flag so a flag and a mask can never disagree: the mask
+    // IS the instruction, and the timestep schedule simply follows it. With audio held (the
+    // ordinary supplied-drive case) the audio block is uniformly 0 and this returns false, giving
+    // the one-element {0.f} timestep exactly as before — byte-identical. With gap-fill it returns
+    // true, so the audio runs the FULL schedule and the re-injection blend keeps the supplied
+    // regions pinned while the gaps actually denoise. A scalar timestep of 0 tells the model all
+    // audio is already clean, which is why the gaps would otherwise never be generated.
+    //
+    // The audio occupies the LAST `extra_ch` channels of the packed mask, where extra_ch is the
+    // number of [W,H,F] planes the audio latent rounds up to — derived here from the mask's own
+    // shape so it cannot drift from what the packer did.
+    static bool ltxav_audio_mask_has_free_elements(const sd::Tensor<float>& denoise_mask, int audio_length) {
+        constexpr int64_t kFrequencyBins = 16;
+        constexpr int64_t kAudioChannels = 8;
+        if (denoise_mask.empty() || denoise_mask.dim() < 4 || audio_length <= 0) {
+            return false;
+        }
+        const int64_t width  = denoise_mask.shape()[0];
+        const int64_t height = denoise_mask.shape()[1];
+        const int64_t frames = denoise_mask.shape()[2];
+        const int64_t total_ch = denoise_mask.shape()[3];
+        const int64_t spatial  = width * height * frames;
+        if (spatial <= 0) {
+            return false;
+        }
+        const int64_t audio_values = kFrequencyBins * static_cast<int64_t>(audio_length) * kAudioChannels;
+        const int64_t extra_ch     = (audio_values + spatial - 1) / spatial;
+        if (extra_ch <= 0 || extra_ch > total_ch) {
+            return false;
+        }
+        const float* data = denoise_mask.data();
+        // Only the REAL audio elements are consulted; the rounding padding beyond them carries
+        // whatever the uniform fill left there and says nothing about the caller's intent.
+        const int64_t first = (total_ch - extra_ch) * spatial;
+        for (int64_t i = 0; i < audio_values; ++i) {
+            if (data[first + i] > 0.5f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     sd::Tensor<float> sample(const std::shared_ptr<DiffusionModelRunner>& work_diffusion_model,
                              bool inverse_noise_scaling,
                              const sd::Tensor<float>& init_latent,
@@ -3316,9 +3360,14 @@ public:
             if (sd_version_is_ltxav(version) && !denoise_mask.empty()) {
                 timesteps_vec          = process_ltxav_video_timesteps(base_timesteps_vec, init_latent, denoise_mask,
                                                                        ref_video_token_count);
-                const std::vector<float> audio_timesteps = ltxav_audio_fixed
-                                                               ? std::vector<float>{0.f}
-                                                               : base_timesteps_vec;
+                // Follow the MASK, not the flag: audio held everywhere -> the historical
+                // one-element {0.f}; any element left free (gap-fill) -> the full schedule, so
+                // the gaps denoise while the blend re-pins the supplied regions each step.
+                const bool audio_needs_denoise =
+                    !ltxav_audio_fixed || ltxav_audio_mask_has_free_elements(denoise_mask, audio_length);
+                const std::vector<float> audio_timesteps = audio_needs_denoise
+                                                               ? base_timesteps_vec
+                                                               : std::vector<float>{0.f};
                 audio_timesteps_tensor = sd::Tensor<float>({static_cast<int64_t>(audio_timesteps.size())}, audio_timesteps);
             } else {
                 timesteps_vec = process_timesteps(timesteps_vec, init_latent, denoise_mask, step);
@@ -5536,6 +5585,9 @@ struct ImageGenerationLatents {
     int64_t video_target_frame_count       = 0;
     int audio_length                       = 0;
     bool audio_fixed                        = false;
+    // Per-element audio denoise mask for gap-fill inpainting. Empty = the ordinary uniform
+    // behaviour (all held when audio_fixed, all generated otherwise).
+    std::vector<float> audio_gap_mask;
     bool v2v_sdedit                        = false;
     bool relip_twostage                    = false;
 };
@@ -6313,10 +6365,21 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_latents(const sd::Tensor<flo
     return packed;
 }
 
+// `audio_mask_elements`, when non-null and non-empty, replaces the uniform audio mask with a
+// PER-ELEMENT one — 0 holds that audio latent element at the supplied value, 1 lets the model
+// generate it. This is what makes gap-fill inpainting possible: the existing re-injection blend
+// (noised = noised*mask + init*(1-mask)) already reads the full packed mask including the audio
+// channels, so a per-element block is all the mechanism needs. Entry k corresponds to audio latent
+// element k, which the packer lays down at flat offset video_latent.numel() + k.
+//
+// Elements past the end of the supplied vector (the padding that rounds the audio up to whole
+// [W,H,F] channels) keep `audio_mask_value`: they are not real audio and must behave exactly as
+// they did before.
 static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tensor<float>& video_mask,
                                                                  const sd::Tensor<float>& video_latent,
                                                                  const sd::Tensor<float>& audio_latent,
-                                                                 float audio_mask_value = 1.f) {
+                                                                 float audio_mask_value = 1.f,
+                                                                 const std::vector<float>* audio_mask_elements = nullptr) {
     if (video_mask.empty() || audio_latent.empty()) {
         return video_mask;
     }
@@ -6360,6 +6423,11 @@ static sd::Tensor<float> pack_ltxav_audio_and_video_denoise_mask(const sd::Tenso
     std::vector<int64_t> audio_mask_shape = video_latent.shape();
     audio_mask_shape[3]                   = extra_ch;
     auto audio_mask                       = sd::full<float>(audio_mask_shape, audio_mask_value);
+    if (audio_mask_elements != nullptr && !audio_mask_elements->empty()) {
+        const int64_t n = std::min<int64_t>(static_cast<int64_t>(audio_mask_elements->size()),
+                                            audio_mask.numel());
+        std::copy_n(audio_mask_elements->data(), n, audio_mask.data());
+    }
     return sd::ops::concat(video_mask_full, audio_mask, 3);
 }
 
@@ -6962,6 +7030,90 @@ static sd::Tensor<float> unpack_ltxav_audio_latent(const sd::Tensor<float>& pack
     return audio_latent;
 }
 
+// AUDIO GAP-FILL (inpainting, stage 1).
+//
+// Build a per-element denoise mask for the audio latent from the supplied clip's own coverage:
+// 0 where the clip actually has signal (HOLD — the existing re-injection blend puts the supplied
+// audio back every step), 1 where it is silent or absent (GENERATE). Handing that to
+// pack_ltxav_audio_and_video_denoise_mask is the whole mechanism; no graph change is involved.
+//
+// ★ The threshold is in dB, deliberately. A linear "is it zero" test calls quiet room tone a gap
+// and the model then invents over the top of real material. Only near-digital-silence should read
+// as absent, which is what a low dBFS floor expresses.
+//
+// ★ Layout. The audio latent is [frequency=16, time=audio_length, channel=8, 1] with
+//   flat = channel*16*audio_length + time*16 + frequency
+// so a decision made per TIME step has to be written across every frequency AND every channel of
+// that step. Getting this wrong does not crash — it masks a diagonal smear through the spectrum
+// and sounds like a broken codec rather than like a mis-built mask.
+//
+// Returns an empty vector when every step is covered (nothing to generate), which the caller
+// treats as "no gap-fill", so a fully-supplied clip stays byte-identical to the old path.
+static std::vector<float> build_ltxav_audio_gap_mask(const std::vector<float>& wav,
+                                                     uint32_t wav_channels,
+                                                     int64_t source_tokens,
+                                                     int audio_length,
+                                                     float silence_db) {
+    constexpr int kFrequencyBins = 16;
+    constexpr int kChannels      = 8;
+    if (wav.empty() || wav_channels == 0 || source_tokens <= 0 || audio_length <= 0) {
+        return {};
+    }
+    const int64_t frames = static_cast<int64_t>(wav.size() / wav_channels);
+    if (frames <= 0) {
+        return {};
+    }
+    const double silence_amplitude = std::pow(10.0, silence_db / 20.0);
+
+    // One decision per latent time step, measured over the samples that step covers.
+    std::vector<float> per_time(static_cast<size_t>(audio_length), 1.f);   // default: generate
+    int64_t covered = 0;
+    const int64_t usable = std::min<int64_t>(source_tokens, audio_length);
+    for (int64_t t = 0; t < usable; ++t) {
+        const int64_t first = frames * t / source_tokens;
+        const int64_t last  = std::min<int64_t>(frames, frames * (t + 1) / source_tokens);
+        double acc = 0.0;
+        int64_t n  = 0;
+        for (int64_t f = first; f < last; ++f) {
+            for (uint32_t c = 0; c < wav_channels; ++c) {
+                const double v = wav[static_cast<size_t>(f) * wav_channels + c];
+                acc += v * v;
+                ++n;
+            }
+        }
+        const double rms = n > 0 ? std::sqrt(acc / static_cast<double>(n)) : 0.0;
+        if (rms > silence_amplitude) {
+            per_time[static_cast<size_t>(t)] = 0.f;   // hold: the clip has real signal here
+            ++covered;
+        }
+    }
+    if (covered == 0) {
+        LOG_WARN("LTX audio gap-fill: the supplied clip is silent everywhere above %.1f dBFS; "
+                 "nothing would be held, so gap-fill is skipped",
+                 silence_db);
+        return {};
+    }
+    if (covered == audio_length) {
+        // Fully covered: there is no gap to fill, so leave the ordinary fixed-audio path alone.
+        return {};
+    }
+
+    std::vector<float> mask(static_cast<size_t>(kFrequencyBins) * audio_length * kChannels, 1.f);
+    for (int64_t channel = 0; channel < kChannels; ++channel) {
+        for (int64_t t = 0; t < audio_length; ++t) {
+            const float value = per_time[static_cast<size_t>(t)];
+            const int64_t base = channel * kFrequencyBins * audio_length + t * kFrequencyBins;
+            for (int64_t frequency = 0; frequency < kFrequencyBins; ++frequency) {
+                mask[static_cast<size_t>(base + frequency)] = value;
+            }
+        }
+    }
+    LOG_INFO("LTX audio gap-fill: holding %lld of %d audio latent steps from the supplied clip, "
+             "generating the other %lld (silence floor %.1f dBFS)",
+             (long long)covered, audio_length, (long long)(audio_length - covered), silence_db);
+    return mask;
+}
+
 static sd::Tensor<float> make_ltxav_empty_audio_latent(int audio_length) {
     if (audio_length <= 0) {
         return {};
@@ -6974,9 +7126,60 @@ static sd::Tensor<float> make_ltxav_empty_audio_latent(int audio_length) {
 // Load a 16 kHz drive WAV, encode it with the optional LTX audio-VAE encoder,
 // then lay it out in the joint AV latent's [frequency, time, channel, batch]
 // format. The caller holds this latent fixed during video denoising.
+// How many channels of the drive WAV reach the LTX audio VAE.
+//
+// The VAE is a 2-channel model (ltx_audio_vae.hpp asserts audio_channels == 2)
+// and its encode() has always accepted a stereo waveform, duplicating channel 0
+// when handed mono. The drive loader was the only thing forcing mono, which is
+// why delivered LTX audio measured L/R NCC 0.993 — effectively mono — against
+// source material at 0.43-0.50.
+//
+// LTX_DRIVE_AUDIO_CHANNELS=1 restores the old mono downmix on the same binary,
+// which is what makes this A/B-able. Reads the VALUE, not merely the presence:
+// a presence test would make "=1" enable the very thing it asks to disable, and
+// that exact bug has bitten four gates in this tree already.
+static int ltx_drive_audio_channels() {
+    if (const char* env = std::getenv("LTX_DRIVE_AUDIO_CHANNELS"); env != nullptr && env[0] != '\0') {
+        const int want = atoi(env);
+        if (want >= 1 && want <= 2) {
+            return want;
+        }
+        LOG_WARN("LTX_DRIVE_AUDIO_CHANNELS='%s' is not 1 or 2; using 2", env);
+    }
+    return 2;
+}
+
+// Gap-fill knobs. LTX_AUDIO_GAP_FILL=1 turns on stage-1 audio inpainting: regions of the supplied
+// drive clip that are silent are GENERATED while the rest is held. Off by default — a supplied
+// drive clip means "condition on this", and generating over its quiet parts is a different request.
+// LTX_AUDIO_GAP_SILENCE_DB moves the floor that decides what counts as absent (default -60 dBFS,
+// low enough that genuine room tone reads as signal rather than as a gap).
+static bool ltx_audio_gap_fill_enabled() {
+    if (const char* env = std::getenv("LTX_AUDIO_GAP_FILL"); env != nullptr && env[0] != '\0') {
+        return !(env[0] == '0' && env[1] == '\0');
+    }
+    return false;
+}
+
+static float ltx_audio_gap_silence_db() {
+    if (const char* env = std::getenv("LTX_AUDIO_GAP_SILENCE_DB"); env != nullptr && env[0] != '\0') {
+        const float value = static_cast<float>(atof(env));
+        if (value < 0.f && value > -120.f) {
+            return value;
+        }
+        LOG_WARN("LTX_AUDIO_GAP_SILENCE_DB='%s' is not a sane negative dBFS floor; using -60", env);
+    }
+    return -60.f;
+}
+
+// `gap_mask_out`, when non-null, receives the per-element audio denoise mask described by
+// build_ltxav_audio_gap_mask. Empty means "no gaps" and the caller keeps the ordinary held-audio
+// behaviour.
 static sd::Tensor<float> encode_ltxav_drive_audio(sd_ctx_t* sd_ctx,
                                                   const char* wav_path,
-                                                  int audio_length) {
+                                                  int audio_length,
+                                                  std::vector<float>* gap_mask_out = nullptr,
+                                                  bool request_gap_fill = false) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || wav_path == nullptr || wav_path[0] == '\0' || audio_length <= 0) {
         return {};
     }
@@ -6987,11 +7190,24 @@ static sd::Tensor<float> encode_ltxav_drive_audio(sd_ctx_t* sd_ctx,
     }
 
     std::vector<float> wav;
-    if (!LONGCAT_AUDIO::load_wav_16k_mono(wav_path, wav) || wav.empty()) {
+    uint32_t           wav_channels = 0;
+    if (!LONGCAT_AUDIO::load_wav_16k(wav_path, wav, wav_channels, ltx_drive_audio_channels()) || wav.empty()) {
         LOG_ERROR("failed to load LTX drive audio WAV: %s", wav_path);
         return {};
     }
-    sd::Tensor<float> waveform({static_cast<int64_t>(wav.size()), 1}, wav);
+    // encode() reads its waveform PLANAR (channel c starts at c*samples), while
+    // every WAV buffer in this file is interleaved. De-interleave here rather
+    // than teaching the loader a second layout — the interleaved convention is
+    // load-bearing elsewhere (see load_wav_full's comment about the historical
+    // planar-read bug).
+    const int64_t      wav_frames = static_cast<int64_t>(wav.size() / wav_channels);
+    std::vector<float> planar(wav.size());
+    for (uint32_t c = 0; c < wav_channels; ++c) {
+        for (int64_t f = 0; f < wav_frames; ++f) {
+            planar[static_cast<size_t>(c) * wav_frames + f] = wav[static_cast<size_t>(f) * wav_channels + c];
+        }
+    }
+    sd::Tensor<float> waveform({wav_frames, static_cast<int64_t>(wav_channels)}, planar);
     const auto encoded = audio_vae->encode(sd_ctx->sd->n_threads, waveform);
     constexpr int kFrequencyBins = 16;
     constexpr int kChannels      = 8;
@@ -7013,9 +7229,14 @@ static sd::Tensor<float> encode_ltxav_drive_audio(sd_ctx_t* sd_ctx,
             }
         }
     }
-    LOG_INFO("LTX drive audio encoded: %s (%zu samples, %lld source tokens -> %d target tokens)",
+    if (gap_mask_out != nullptr && (request_gap_fill || ltx_audio_gap_fill_enabled())) {
+        *gap_mask_out = build_ltxav_audio_gap_mask(wav, wav_channels, source_time, audio_length,
+                                                   ltx_audio_gap_silence_db());
+    }
+    LOG_INFO("LTX drive audio encoded: %s (%lld samples x%u ch, %lld source tokens -> %d target tokens)",
              wav_path,
-             wav.size(),
+             static_cast<long long>(wav_frames),
+             wav_channels,
              source_time,
              audio_length);
     return output;
@@ -8207,7 +8428,9 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             latents.audio_length = get_ltxav_num_audio_latents(request->frames, request->fps);
             const char* drive_audio_path = sd_vid_gen_params->drive_audio_path;
             if (drive_audio_path != nullptr && drive_audio_path[0] != '\0') {
-                latents.audio_latent = encode_ltxav_drive_audio(sd_ctx, drive_audio_path, latents.audio_length);
+                latents.audio_latent = encode_ltxav_drive_audio(sd_ctx, drive_audio_path, latents.audio_length,
+                                                                &latents.audio_gap_mask,
+                                                                sd_vid_gen_params->audio_fill_gaps != 0);
                 if (latents.audio_latent.empty()) {
                     LOG_ERROR("LTX drive audio was requested but could not be encoded");
                     return std::nullopt;
@@ -9221,7 +9444,10 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
             latents.denoise_mask = pack_ltxav_audio_and_video_denoise_mask(latents.denoise_mask,
                                                                            latents.init_latent,
                                                                            latents.audio_latent,
-                                                                           latents.audio_fixed ? 0.f : 1.f);
+                                                                           latents.audio_fixed ? 0.f : 1.f,
+                                                                           latents.audio_gap_mask.empty()
+                                                                               ? nullptr
+                                                                               : &latents.audio_gap_mask);
         }
         latents.init_latent = pack_ltxav_audio_and_video_latents(latents.init_latent, latents.audio_latent);
     }
@@ -11140,13 +11366,38 @@ static int ltxav_auto_trim_drop(const sd_image_t& prev_last,
 // the picture of an already-rendered prefix but not its sound or its exact length. Two files fix
 // that, and both are best-effort: a chain whose bank predates them just behaves as before.
 //
-//   seg_<i>.audio  the segment's DECODED audio (header + planar [channel][sample] floats, the
-//                  sd_audio_t layout). Without it, a chain resumed at segment N replays its whole
-//                  prefix SILENTLY whenever the audio was model-generated rather than supplied.
+//   seg_<i>.audio  the segment's DECODED audio: a header (rate u32, channels u32, samples u64)
+//                  followed by INTERLEAVED float32 — the sd_audio_t layout. ★ INTERLEAVED, not
+//                  planar: this comment said "planar" for a long time and it is wrong, which is
+//                  the same trap load_wav_full warns about ("the planar reading of that buffer was
+//                  a real historical bug"). Reading it planar does not fail loudly; it silently
+//                  shifts every time offset by the channel count, so a measurement lands on the
+//                  wrong part of the clip and quietly reports the wrong answer.
+//                  Without this file, a chain resumed at segment N replays its whole prefix
+//                  SILENTLY whenever the audio was model-generated rather than supplied.
 //   seg_<i>.len    the KEPT frame count after the seam trim. Without it the restore path
 //                  re-derives a drop from its own fresh-vs-continuation classification, which is
 //                  exactly the disagreement the pinned trim exists to defeat -- so a retake
 //                  reproduces a different prefix length and slides the whole timeline.
+//
+// ★ THE THREE MOVE TOGETHER, PER SHOT. Every RESTORE must take .bin, .len and .audio for a given
+// shot from the SAME directory. Resolving the .bin out of one bank while .len still looks in
+// another finds no .len, silently re-derives the drop, and slides every downstream segment and its
+// audio along the timeline -- a fault that sounds and looks nothing like "wrong take" and would be
+// blamed on anything but the bank. `bank_stem_for` below is the ONLY way a restore should build
+// these paths, so the three cannot disagree by construction.
+static std::string bank_stem_for(const sd_vid_chain_params_t* chain_params, int segment) {
+    const char* dir = nullptr;
+    if (chain_params->segment_bank_dirs != nullptr && segment >= 0 && segment < chain_params->n_segments &&
+        chain_params->segment_bank_dirs[segment] != nullptr &&
+        chain_params->segment_bank_dirs[segment][0] != '\0') {
+        dir = chain_params->segment_bank_dirs[segment];
+    } else {
+        dir = chain_params->bank_dir;
+    }
+    return std::string(dir != nullptr ? dir : "") + "/seg_" + std::to_string(segment);
+}
+
 static bool write_seg_audio(const std::string& path, const sd_audio_t* audio) {
     if (audio == nullptr || audio->data == nullptr || audio->sample_count == 0) {
         return false;
@@ -11282,9 +11533,16 @@ static bool save_banked_video_latent(const std::string& path, const sd::Tensor<f
     return output.good();
 }
 
+// Stage one window of drive audio into the job bank as a 16 kHz WAV, which the
+// per-window render then re-reads through encode_ltxav_drive_audio.
+//
+// `samples` is INTERLEAVED with `n_channels` channels. This used to hardcode
+// mono, which silently collapsed a stereo drive track at the one point between
+// the loader and the VAE where nothing else would have noticed.
 static bool write_ltx_drive_audio_wav(const std::string& path,
-                                      const std::vector<float>& samples) {
-    if (samples.empty()) {
+                                      const std::vector<float>& samples,
+                                      uint32_t n_channels = 1) {
+    if (samples.empty() || n_channels == 0 || samples.size() % n_channels != 0) {
         return false;
     }
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -11293,7 +11551,7 @@ static bool write_ltx_drive_audio_wav(const std::string& path,
         return false;
     }
     const uint32_t sample_rate = 16000;
-    const uint16_t channels = 1;
+    const uint16_t channels = static_cast<uint16_t>(n_channels);
     const uint16_t bits = 16;
     const uint32_t data_length = static_cast<uint32_t>(samples.size() * sizeof(int16_t));
     const uint32_t riff_length = 36 + data_length;
@@ -11487,14 +11745,18 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                      : 0;
     LTXChainAudio drive_audio;
     if (chain_params->chain_audio_full != nullptr && chain_params->chain_audio_full[0] != '\0') {
+        uint32_t drive_channels = 0;
         if (chain_params->bank_dir == nullptr || chain_params->bank_dir[0] == '\0' ||
-            !LONGCAT_AUDIO::load_wav_16k_mono(chain_params->chain_audio_full, drive_audio.samples) ||
+            !LONGCAT_AUDIO::load_wav_16k(chain_params->chain_audio_full,
+                                         drive_audio.samples,
+                                         drive_channels,
+                                         ltx_drive_audio_channels()) ||
             drive_audio.samples.empty()) {
             LOG_ERROR("generate_video_chain: drive audio requires a readable WAV and durable bank directory");
             return false;
         }
         drive_audio.sample_rate = 16000;
-        drive_audio.channels = 1;
+        drive_audio.channels = drive_channels;
     }
     LTXChainAudio track_audio;
     if (chain_params->chain_audio_track != nullptr && chain_params->chain_audio_track[0] != '\0') {
@@ -11823,7 +12085,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // Rebuild a durable prefix exactly as the original chain stitched it, and
     // recover the final bank's latent tail for the next sampled window.
     for (int segment = 0; segment < sample_start; ++segment) {
-        const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
+        const std::string path = bank_stem_for(chain_params, segment) + ".bin";
         int count = 0;
         sd_image_t* banked_frames = decode_banked_video_latent(sd_ctx, path, &count);
         if (banked_frames == nullptr || count <= 0) {
@@ -11889,8 +12151,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // drop here would let a retake reproduce a DIFFERENT prefix length and slide every
         // downstream segment (and its audio) along the timeline.
         const int seam_policy_drop = drop;
-        const int banked_kept = read_seg_len(std::string(chain_params->bank_dir) + "/seg_" +
-                                             std::to_string(segment) + ".len");
+        const int banked_kept = read_seg_len(bank_stem_for(chain_params, segment) + ".len");
         if (banked_kept >= 0 && banked_kept <= count) {
             const int pinned_drop = count - banked_kept;
             if (pinned_drop != drop) {
@@ -11933,8 +12194,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             (chain_params->segment_audio_track == nullptr ||
              chain_params->segment_audio_track[segment] == nullptr ||
              chain_params->segment_audio_track[segment][0] == '\0')) {
-            const std::string audio_path = std::string(chain_params->bank_dir) + "/seg_" +
-                                           std::to_string(segment) + ".audio";
+            const std::string audio_path = bank_stem_for(chain_params, segment) + ".audio";
             if (sd_audio_t* banked_audio = read_seg_audio(audio_path); banked_audio != nullptr) {
                 append_audio(banked_audio, drop, count - std::min(drop, count));
                 free_sd_audio(banked_audio);
@@ -12183,8 +12443,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
         // decoded and spliced after this window has completed.
         std::vector<float> next_head;
         if (retake_active && segment + 1 < chain_params->n_segments) {
-            const std::string next_path = std::string(chain_params->bank_dir) + "/seg_" +
-                                          std::to_string(segment + 1) + ".bin";
+            const std::string next_path = bank_stem_for(chain_params, segment + 1) + ".bin";
             try {
                 auto next = sd::load_tensor_from_file_as_tensor<float>(next_path);
                 if (next.empty() || next.dim() < 4 ||
@@ -12257,14 +12516,18 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 return fail();
             }
             std::vector<float> shot_drive;
-            if (!LONGCAT_AUDIO::load_wav_16k_mono(chain_params->segment_audio_full[segment], shot_drive) ||
+            uint32_t           shot_drive_channels = 0;
+            if (!LONGCAT_AUDIO::load_wav_16k(chain_params->segment_audio_full[segment],
+                                             shot_drive,
+                                             shot_drive_channels,
+                                             ltx_drive_audio_channels()) ||
                 shot_drive.empty()) {
                 LOG_ERROR("generate_video_chain: per-shot drive audio is not a readable WAV: %s",
                           chain_params->segment_audio_full[segment]);
                 return fail();
             }
             drive_audio_path = std::string(chain_params->bank_dir) + "/aud_shot_" + std::to_string(segment) + ".wav";
-            if (!write_ltx_drive_audio_wav(drive_audio_path, shot_drive)) {
+            if (!write_ltx_drive_audio_wav(drive_audio_path, shot_drive, shot_drive_channels)) {
                 LOG_ERROR("generate_video_chain: could not stage per-shot drive audio for window %d", segment + 1);
                 return fail();
             }
@@ -12282,7 +12545,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                                   std::max(1, params.fps),
                                                   audio_offset);
             drive_audio_path = std::string(chain_params->bank_dir) + "/aud_" + std::to_string(segment) + ".wav";
-            if (!write_ltx_drive_audio_wav(drive_audio_path, slice)) {
+            if (!write_ltx_drive_audio_wav(drive_audio_path, slice, drive_audio.channels)) {
                 LOG_ERROR("generate_video_chain: could not stage drive audio for window %d", segment + 1);
                 return fail();
             }
@@ -12501,7 +12764,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
     // chain.  This avoids re-sampling an entire timeline for a one-shot edit.
     if (retake_active) {
         for (int segment = sample_end + 1; segment < chain_params->n_segments; ++segment) {
-            const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
+            const std::string path = bank_stem_for(chain_params, segment) + ".bin";
             int segment_count = 0;
             sd_image_t* segment_frames = decode_banked_video_latent(sd_ctx, path, &segment_count);
             if (segment_frames == nullptr || segment_count <= 0) {
@@ -12524,8 +12787,7 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
             // slides every downstream shot (and its audio) along the timeline. The resume path had
             // this pin; the retake suffix never got it, so a retake on a project with references
             // was the one path that could still drift.
-            const int banked_kept = read_seg_len(std::string(chain_params->bank_dir) + "/seg_" +
-                                                 std::to_string(segment) + ".len");
+            const int banked_kept = read_seg_len(bank_stem_for(chain_params, segment) + ".len");
             if (banked_kept >= 0 && banked_kept <= segment_count) {
                 const int pinned_drop = segment_count - banked_kept;
                 if (pinned_drop != drop) {
@@ -12543,6 +12805,22 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 for (int frame = 0; frame < segment_count; ++frame) free(segment_frames[frame].data);
                 free(segment_frames);
                 return fail();
+            }
+            // Restore this SUFFIX segment's own audio, exactly as the prefix path above does and
+            // for the same reason: a retake on a project whose audio is MODEL-GENERATED rather
+            // than a supplied track otherwise plays everything after the retaken shot silent.
+            // The prefix path grew this restore; the retake suffix never did, so the picture came
+            // back and the sound did not -- and a retake is precisely when that bites, since
+            // retaking shot i is the only way to reach this loop.
+            if (!track_audio.loaded() &&
+                (chain_params->segment_audio_track == nullptr ||
+                 chain_params->segment_audio_track[segment] == nullptr ||
+                 chain_params->segment_audio_track[segment][0] == '\0')) {
+                const std::string audio_path = bank_stem_for(chain_params, segment) + ".audio";
+                if (sd_audio_t* banked_audio = read_seg_audio(audio_path); banked_audio != nullptr) {
+                    append_audio(banked_audio, drop, segment_count - drop);
+                    free_sd_audio(banked_audio);
+                }
             }
             adopt_frames(segment_frames, segment_count, drop);
             flush_window(false);
@@ -12749,6 +13027,9 @@ SD_API bool generate_wan_vace_chain(sd_ctx_t*                         sd_ctx,
             prior_latent.assign(chain_params->resume_latent, chain_params->resume_latent + count);
         } else if (chain_params->bank_dir != nullptr && chain_params->bank_dir[0] != '\0') {
             for (int segment = 0; segment < chain_params->start_segment; ++segment) {
+                // NOT bank_stem_for: Wan-VACE chains carry sd_wan_vace_chain_params_t, a
+                // different struct with no per-shot bank overrides. Take selection is an LTX
+                // Director feature and Wan-VACE has no take model, so this stays single-bank.
                 const std::string path = std::string(chain_params->bank_dir) + "/seg_" + std::to_string(segment) + ".bin";
                 int count = 0;
                 sd_image_t* frames = decode_banked_video_latent(sd_ctx, path, &count);

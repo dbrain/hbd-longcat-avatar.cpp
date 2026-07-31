@@ -7,6 +7,7 @@
 #include <fstream>
 #include <vector>
 
+#include "audio_resample.hpp"
 #include "core/ggml_extend.hpp"
 #include "model.h"
 
@@ -44,18 +45,23 @@ namespace LONGCAT_AUDIO {
     // layout (see ChainAudioAcc::append_window in stable-diffusion.cpp — the planar
     // reading of that buffer was a real historical bug; do not "fix" this to planar).
     //
-    // Distinct from load_wav_16k_mono below, which is the LIP-SYNC DRIVE loader and
-    // deliberately destroys rate/channels to feed the audio encoder. This one is the
-    // DELIVERABLE-TRACK loader: whatever the user uploaded reaches the muxer intact,
-    // so the Opus encode is the only generation loss.
+    // Distinct from load_wav_16k below, which is the LIP-SYNC DRIVE loader and
+    // resamples to the audio encoder's rate. This one is the DELIVERABLE-TRACK
+    // loader: whatever the user uploaded reaches the muxer intact, so the Opus
+    // encode is the only generation loss.
     //
     // out_sample_rate/out_channels receive the file's native values. Returns false and
     // leaves outputs untouched on any parse failure.
+    //
+    // log_summary=false is for callers that parse and then convert (the drive
+    // loader), which would otherwise log a "loaded verbatim" line describing a
+    // buffer no one ever sees.
     // ---------------------------------------------------------------------
     inline bool load_wav_full(const std::string& path,
                              std::vector<float>& out,
                              uint32_t&           out_sample_rate,
-                             uint32_t&           out_channels) {
+                             uint32_t&           out_channels,
+                             bool                log_summary = true) {
         std::ifstream f(path, std::ios::binary);
         if (!f.is_open()) {
             LOG_ERROR("audio: cannot open wav '%s'", path.c_str());
@@ -125,124 +131,99 @@ namespace LONGCAT_AUDIO {
         out              = std::move(inter);
         out_sample_rate  = sample_rate;
         out_channels     = channels;
-        LOG_INFO("audio: loaded '%s' verbatim (%u Hz x%u, %zu frames)",
-                 path.c_str(), sample_rate, channels, out.size() / channels);
+        if (log_summary) {
+            LOG_INFO("audio: loaded '%s' verbatim (%u Hz x%u, %zu frames)",
+                     path.c_str(), sample_rate, channels, out.size() / channels);
+        }
         return true;
     }
 
     // ---------------------------------------------------------------------
-    // Minimal WAV reader: PCM16 / PCM32 / IEEE float, mono or multi-channel
-    // (averaged to mono). Linear-resamples to 16 kHz if needed. The test input
-    // is already 16 kHz mono PCM16, so the common path is a straight read.
-    // Returns the mono float waveform in [-1, 1].
+    // The LIP-SYNC DRIVE loader. Reads any of the WAV formats above and returns
+    // 16 kHz INTERLEAVED float in [-1, 1] — the rate every audio encoder in this
+    // tree wants (whisper for the avatar paths, the LTX audio VAE for LTX).
+    //
+    // max_channels caps the result. 1 is the historical behaviour and is CORRECT
+    // for whisper, which is mono by construction. The LTX audio VAE is a
+    // 2-channel model (ltx_audio_vae.hpp: audio_channels == 2) and its encode()
+    // already accepts a 2-channel waveform — it was only ever handed mono
+    // because this loader averaged the channels away unconditionally, which is
+    // why delivered LTX audio measured L/R NCC 0.993 (effectively mono) against
+    // a source at 0.43-0.50.
+    //
+    // out_channels reports what you actually got: min(file channels, max_channels).
+    //
+    // RESAMPLING is anti-aliased (sd_audio_resample). It used to be a two-tap
+    // linear interpolation with no filter at all, which folded 8-24 kHz back
+    // down into the band the encoder reads — see the header comment in
+    // audio_resample.hpp for the measurements. Note the ordering: the downmix
+    // happens BEFORE the rate convert (both are linear, so this is exact, and it
+    // is a third of the filtering work), while the LONGCAT_AUDIO_LOWPASS knob
+    // stays AFTER it, since that one is a deliberate voicing choice on the
+    // already-correct signal rather than an anti-alias filter.
     // ---------------------------------------------------------------------
-    inline bool load_wav_16k_mono(const std::string& path, std::vector<float>& out) {
-        std::ifstream f(path, std::ios::binary);
-        if (!f.is_open()) {
-            LOG_ERROR("audio: cannot open wav '%s'", path.c_str());
+    inline bool load_wav_16k(const std::string&  path,
+                            std::vector<float>& out,
+                            uint32_t&           out_channels,
+                            int                 max_channels = 1) {
+        std::vector<float> raw;
+        uint32_t           sample_rate = 0;
+        uint32_t           channels    = 0;
+        if (!load_wav_full(path, raw, sample_rate, channels, /*log_summary=*/false)) {
             return false;
         }
-        std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        if (buf.size() < 44 || std::memcmp(buf.data(), "RIFF", 4) != 0 || std::memcmp(buf.data() + 8, "WAVE", 4) != 0) {
-            LOG_ERROR("audio: '%s' is not a RIFF/WAVE file", path.c_str());
+        if (raw.empty() || channels == 0 || sample_rate == 0) {
+            LOG_ERROR("audio: '%s' decoded to nothing", path.c_str());
             return false;
         }
-        auto rd_u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, buf.data() + o, 4); return v; };
-        auto rd_u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, buf.data() + o, 2); return v; };
 
-        uint16_t audio_format = 1, channels = 1, bits = 16;
-        uint32_t sample_rate = 16000;
-        size_t data_off = 0, data_len = 0;
-        size_t p = 12;
-        while (p + 8 <= buf.size()) {
-            uint32_t cksz = rd_u32(p + 4);
-            if (std::memcmp(buf.data() + p, "fmt ", 4) == 0) {
-                audio_format = rd_u16(p + 8);
-                channels     = rd_u16(p + 10);
-                sample_rate  = rd_u32(p + 12);
-                bits         = rd_u16(p + 22);
-            } else if (std::memcmp(buf.data() + p, "data", 4) == 0) {
-                data_off = p + 8;
-                data_len = cksz;
-                break;
-            }
-            p += 8 + cksz + (cksz & 1);
-        }
-        if (data_off == 0 || channels == 0) {
-            LOG_ERROR("audio: no data chunk in '%s'", path.c_str());
-            return false;
-        }
-        data_len = std::min(data_len, buf.size() - data_off);
+        const uint32_t want = std::max(1u, std::min<uint32_t>(channels, (uint32_t)std::max(1, max_channels)));
+        const size_t   frames = raw.size() / channels;
 
-        std::vector<float> mono;
-        const char* d = buf.data() + data_off;
-        if (audio_format == 1 && bits == 16) {
-            size_t n = data_len / 2;
-            size_t frames = n / channels;
-            mono.resize(frames);
-            for (size_t i = 0; i < frames; i++) {
+        // Channel reduction. Down to 1 is an average of everything (a real
+        // downmix); down to N>1 keeps the first N, because averaging groups of
+        // an unknown channel layout guesses at a mapping we do not have.
+        std::vector<float> mixed;
+        if (want == channels) {
+            mixed = std::move(raw);
+        } else if (want == 1) {
+            mixed.resize(frames);
+            for (size_t f = 0; f < frames; f++) {
                 float acc = 0.f;
-                for (int c = 0; c < channels; c++) {
-                    int16_t s;
-                    std::memcpy(&s, d + (i * channels + c) * 2, 2);
-                    acc += s / 32768.0f;
+                for (uint32_t c = 0; c < channels; c++) {
+                    acc += raw[f * channels + c];
                 }
-                mono[i] = acc / channels;
-            }
-        } else if (audio_format == 3 && bits == 32) {
-            size_t n = data_len / 4;
-            size_t frames = n / channels;
-            mono.resize(frames);
-            for (size_t i = 0; i < frames; i++) {
-                float acc = 0.f;
-                for (int c = 0; c < channels; c++) {
-                    float s;
-                    std::memcpy(&s, d + (i * channels + c) * 4, 4);
-                    acc += s;
-                }
-                mono[i] = acc / channels;
-            }
-        } else if (audio_format == 1 && bits == 32) {
-            size_t n = data_len / 4;
-            size_t frames = n / channels;
-            mono.resize(frames);
-            for (size_t i = 0; i < frames; i++) {
-                float acc = 0.f;
-                for (int c = 0; c < channels; c++) {
-                    int32_t s;
-                    std::memcpy(&s, d + (i * channels + c) * 4, 4);
-                    acc += s / 2147483648.0f;
-                }
-                mono[i] = acc / channels;
+                mixed[f] = acc / (float)channels;
             }
         } else {
-            LOG_ERROR("audio: unsupported wav format=%u bits=%u in '%s'", audio_format, bits, path.c_str());
-            return false;
+            mixed.resize(frames * want);
+            for (size_t f = 0; f < frames; f++) {
+                for (uint32_t c = 0; c < want; c++) {
+                    mixed[f * want + c] = raw[f * channels + c];
+                }
+            }
         }
 
         if (sample_rate == 16000) {
-            out = std::move(mono);
+            out = std::move(mixed);
         } else {
-            // linear resample to 16 kHz
-            double ratio = 16000.0 / (double)sample_rate;
-            size_t out_n = (size_t)(mono.size() * ratio);
-            out.resize(out_n);
-            for (size_t i = 0; i < out_n; i++) {
-                double src = i / ratio;
-                size_t i0  = (size_t)src;
-                size_t i1  = std::min(i0 + 1, mono.size() - 1);
-                float w    = (float)(src - i0);
-                out[i]     = mono[i0] * (1 - w) + mono[i1] * w;
-            }
-            LOG_INFO("audio: resampled %u Hz -> 16000 Hz (%zu samples)", sample_rate, out_n);
+            sd_audio_resample::resample_interleaved(mixed, want, sample_rate, 16000, out);
+            LOG_INFO("audio: resampled %u Hz -> 16000 Hz x%u, anti-aliased (%zu frames)",
+                     sample_rate, want, out.size() / want);
+        }
+        out_channels = want;
+        if (out.empty()) {
+            LOG_ERROR("audio: '%s' produced no samples after conversion", path.c_str());
+            return false;
         }
 
         // RUNTIME mouth-softening knob: optional 2nd-order Butterworth low-pass on the
-        // 16 kHz mono signal (re-introduces the v1.0 wav2vec2 path's _smooth_transients,
+        // 16 kHz signal (re-introduces the v1.0 wav2vec2 path's _smooth_transients,
         // which the v1.5 Whisper path dropped — it softens the plosive/sibilant
         // transients that spike visemes). Cutoff Hz from LONGCAT_AUDIO_LOWPASS; 0/unset =
         // off (default, signal unchanged). Forward biquad (causal; the slight group delay
-        // is negligible vs the 50fps audio window).
+        // is negligible vs the 50fps audio window), run INDEPENDENTLY PER CHANNEL so a
+        // stereo drive track does not have its image smeared by shared filter state.
         if (const char* lpe = getenv("LONGCAT_AUDIO_LOWPASS")) {
             float fc = (float)atof(lpe);
             if (fc > 0.0f && fc < 8000.0f && !out.empty()) {
@@ -256,18 +237,27 @@ namespace LONGCAT_AUDIO {
                 const double b2    = b0;
                 const double a1    = 2.0 * (wc2 - 1.0) * norm;
                 const double a2    = (1.0 - k + wc2) * norm;
-                double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
-                for (size_t i = 0; i < out.size(); i++) {
-                    double x0 = out[i];
-                    double y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-                    x2 = x1; x1 = x0;
-                    y2 = y1; y1 = y0;
-                    out[i] = (float)y0;
+                for (uint32_t c = 0; c < want; c++) {
+                    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+                    for (size_t i = c; i < out.size(); i += want) {
+                        double x0 = out[i];
+                        double y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                        x2 = x1; x1 = x0;
+                        y2 = y1; y1 = y0;
+                        out[i] = (float)y0;
+                    }
                 }
                 LOG_INFO("audio: applied %.0f Hz Butterworth low-pass (mouth-softening)", fc);
             }
         }
         return true;
+    }
+
+    // Mono convenience wrapper. Whisper (LongCat avatar / S2V / InfiniteTalk) is
+    // a mono model, so those call sites want exactly this and nothing more.
+    inline bool load_wav_16k_mono(const std::string& path, std::vector<float>& out) {
+        uint32_t channels = 0;
+        return load_wav_16k(path, out, channels, /*max_channels=*/1);
     }
 
     // ---------------------------------------------------------------------
