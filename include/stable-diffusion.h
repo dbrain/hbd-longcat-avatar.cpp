@@ -791,6 +791,19 @@ SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);
 SD_API bool sd_ctx_unload_control_net(sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_has_control_net(const sd_ctx_t* sd_ctx);
 
+// Does this reference-image args string ask for references to be decoded at their NATIVE
+// geometry, rather than centre-cropped to the request's aspect ratio and rescaled to the
+// request's resolution?
+//
+// This exists because that crop happens in the CALLER, at HTTP decode time (load_image_common,
+// driven by the request's width/height), long before an sd_ctx_t sees a RefImageParams. The
+// front end therefore has to be able to ask the question before it has decoded anything, and it
+// must get the same answer the library would — so both go through the same preset table here.
+//
+// Returns true if `preset=` names a preset with native geometry (krea2_identity_restage), or if
+// an explicit `native_ref=1` overrides it either way. Safe on NULL/empty.
+SD_API bool sd_ref_image_args_want_native_geometry(const char* ref_image_args);
+
 SD_API const char* sd_type_name(enum sd_type_t type);
 SD_API enum sd_type_t str_to_sd_type(const char* str);
 SD_API const char* sd_rng_type_name(enum rng_type_t rng_type);

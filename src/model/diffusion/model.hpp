@@ -47,10 +47,29 @@ struct RefImageParams {
     bool rescale_ref_ids = false;
     // The other way to put a small reference where the target is: keep the step at exactly 1
     // (in-distribution) and TRANSLATE the reference to the centre of the target plane instead
-    // of leaving it in the top-left corner. Wins over rescale_ref_ids if both are set. Not in
-    // any preset — reachable only through ref_image_args, because it is a live hypothesis
-    // rather than a shipped behaviour.
+    // of leaving it in the top-left corner. Wins over rescale_ref_ids if both are set.
+    //
+    // MEASURED, 1920x1088 target, n=3 seeds x 2 subjects x 2 reference shapes: centring beats
+    // spanning on the identity marker (square ref 3/3 vs 2/3; PORTRAIT ref 3/3 vs 0/3) and ties
+    // it at 0/6 composition failures. Spanning has to apply a fractional, anisotropic step
+    // (0.798 rows x 2.532 cols on the portrait case) that the adapter — trained at ref grid ==
+    // target grid, i.e. step exactly 1.0 — has never seen. Centring is only a translation, so
+    // it never leaves the training distribution. This is the one the restage preset carries.
     bool center_ref_ids = false;
+    // Decode reference images at their OWN geometry instead of centre-cropping them to the
+    // request's aspect ratio and rescaling them to the request's resolution.
+    //
+    // ⚠️ THIS IS RESOLVED BEFORE THE DECODE, not here — see sd_ref_image_args_want_native_geometry()
+    // and the call site in SDGenerationParams::from_json_str(). By the time anything reads this
+    // struct the reference bytes already exist, so flipping it here would be far too late. It is
+    // carried on RefImageParams only so that the preset table is the single place the two halves
+    // agree, and so `native_ref` is not rejected as an unknown arg.
+    //
+    // Off by default: for an IN-PLACE EDIT the crop is correct, because the reference IS the
+    // canvas. It is wrong for RESTAGE, where the reference is an identity source and the crop is
+    // silent data loss — a 768x1344 portrait into a 16:9 render keeps a 32% middle band, which
+    // does not contain the head.
+    bool native_ref_geometry = false;
 };
 
 const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
@@ -72,11 +91,21 @@ const std::unordered_map<std::string, RefImageParams> REF_IMAGE_PRESETS = {
     //   vlm min/max 768           = the nodes' grounding_px default (trained 384-768).
     {"krea2_identity_edit", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768, true, true, false}},
     // Same adapter as krea2_identity_edit, different job: RESTAGE, where the reference is an
-    // IDENTITY SOURCE whose aspect ratio has nothing to do with the output's. The reference is
-    // passed at its native geometry (no crop, no resize-to-target) and its RoPE ids are stretched
-    // to span the target plane instead. EXPERIMENTAL — krea2_identity_edit is the deployed preset
-    // and is deliberately left alone.
-    {"krea2_identity_restage", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768, false, false, false, true}},
+    // IDENTITY SOURCE whose aspect ratio has nothing to do with the output's. Three things have
+    // to be true together, and it is worth being explicit about which does what, because they
+    // were confused for each other for a long time:
+    //   native_ref_geometry=true      the reference is decoded at its own size, so the identifying
+    //       features are still IN THE INPUT. This is the one that saves the markers.
+    //   resize_vae_to_target=false    ... and the preset does not then re-impose the target
+    //   crop_vae_to_target_ar=false       geometry that native_ref_geometry just avoided.
+    //   center_ref_ids=true           the reference is translated to the MIDDLE of the positional
+    //       plane. Without it a native-size reference sits in the top-left corner, the model reads
+    //       it as "a picture hanging here" rather than "this is the subject", and pastes it — 4/6
+    //       cells came back as a diptych or a duplicated subject.
+    // NOT rescale_ref_ids: spanning is the losing arm, see the comment on the field.
+    // Also 30% cheaper than the edit preset at 1920x1088 (4,096 reference tokens, not 8,160),
+    // because the reference is not upscaled to the target first.
+    {"krea2_identity_restage", {true, true, Rope::RefIndexMode::INCREASE, false, true, -1, RefImageResizeMode::LONGEST_SIDE, 768, 768, false, false, false, /*rescale_ref_ids=*/false, /*center_ref_ids=*/true, /*native_ref_geometry=*/true}},
     {"cosmos_reference", {false, true, Rope::RefIndexMode::INCREASE, false, false, -1, RefImageResizeMode::NONE, -1, -1}},
 };
 

@@ -588,7 +588,24 @@ uint8_t* load_image_common(bool from_memory,
         }
 
         if (crop_x != 0 || crop_y != 0) {
-            LOG_INFO("crop input image from %dx%d to %dx%d, image_path = %s", width, height, crop_w, crop_h, image_path);
+            // Say how much is being THROWN AWAY, not just the new size. This crop is silent data
+            // loss dressed as a resize: nothing errors, the render succeeds, and the output is a
+            // competent photograph of whatever happened to be inside the band. It is correct when
+            // the image is a canvas (init_image, or an in-place edit's reference) and badly wrong
+            // when it is an identity source -- a 768x1344 portrait reference into a 1920x1088
+            // render keeps 32% of its height, centred, which does not include the head.
+            // See sd_ref_image_args_want_native_geometry() for the way out (`native_ref=1`).
+            const double keep_frac = crop_x != 0
+                                         ? static_cast<double>(crop_w) / width
+                                         : static_cast<double>(crop_h) / height;
+            const char* const detail =
+                keep_frac < 0.85 ? " -- if this is an identity reference rather than the canvas, that is data loss" : "";
+            LOG_WARN("crop input image from %dx%d to %dx%d, keeping %.0f%% of its %s%s, image_path = %s",
+                     width, height, crop_w, crop_h,
+                     keep_frac * 100.0,
+                     crop_x != 0 ? "width" : "height",
+                     detail,
+                     image_path);
             FreeUniquePtr<uint8_t> cropped_image_buffer((uint8_t*)malloc(crop_w * crop_h * expected_channel));
             if (cropped_image_buffer == nullptr) {
                 LOG_ERROR("error: allocate memory for crop\n");

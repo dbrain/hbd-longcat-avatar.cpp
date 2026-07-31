@@ -2128,23 +2128,27 @@ bool SDGenerationParams::from_json_str(
     //
     // That is correct for IN-PLACE EDIT, where the reference IS the canvas. It is wrong for
     // RESTAGE, where the reference is an identity source whose aspect ratio has nothing to do
-    // with the output's. SD_REF_IMAGES_NATIVE=1 decodes references at their own geometry and
-    // leaves all downstream fitting to the preset, which is where it is describable.
-    // Off by default: this changes what every ref-image model receives.
-    static const bool ref_images_native = []() {
-        const char* v = getenv("SD_REF_IMAGES_NATIVE");
-        return v != nullptr && v[0] == '1' && v[1] == '\0';
-    }();
-    const int ref_expect_w = ref_images_native ? 0 : width;
-    const int ref_expect_h = ref_images_native ? 0 : height;
+    // with the output's.
+    //
+    // So it is a PER-REQUEST decision, not a server one: one krea2 instance serves both modes,
+    // and the mode is a property of the job. It rides on `ref_image_args` (parsed above, ~200
+    // lines earlier — which is the only reason this is possible here) via the preset table, so
+    // `preset=krea2_identity_restage` implies it and `native_ref=0|1` overrides it. The library
+    // answers the question rather than this file, so the two cannot drift apart.
+    const bool ref_images_native = sd_ref_image_args_want_native_geometry(ref_image_args.c_str());
+    const int ref_expect_w       = ref_images_native ? 0 : width;
+    const int ref_expect_h       = ref_images_native ? 0 : height;
     if (!parse_image_array_json_field(j, "ref_images", 3, ref_expect_w, ref_expect_h, ref_images)) {
         LOG_ERROR("invalid ref_images");
         return false;
     }
     if (ref_images_native && !ref_images.empty()) {
-        LOG_INFO("SD_REF_IMAGES_NATIVE: decoded %zu reference image(s) at native geometry (no target-AR crop)",
+        LOG_INFO("ref_images: decoded %zu reference image(s) at NATIVE geometry (no target-AR crop)",
                  ref_images.size());
     }
+    // NOTE: the lossy case cannot be detected from here -- by this point every reference has
+    // already BEEN cropped, so its aspect ratio trivially equals the target's. The warning for it
+    // lives in load_image_common(), which is the only place that still knows the source geometry.
     if (!parse_image_array_json_field(j, "control_frames", 3, width, height, control_frames)) {
         LOG_ERROR("invalid control_frames");
         return false;

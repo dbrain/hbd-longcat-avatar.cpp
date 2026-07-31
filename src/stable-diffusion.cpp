@@ -4036,6 +4036,14 @@ public:
                 if (!parse_strict_bool(value, params.center_ref_ids)) {
                     LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
                 }
+            } else if (key == "native_ref") {
+                // Parsed here only so it is not reported as unknown, and so the resolved value is
+                // visible for the sanity check below. It has ALREADY been acted on, by
+                // sd_ref_image_args_want_native_geometry() at HTTP decode time; setting it at this
+                // point changes nothing, because the reference bytes exist by now.
+                if (!parse_strict_bool(value, params.native_ref_geometry)) {
+                    LOG_WARN("ignoring invalid reference image arg '%s=%s'", key.c_str(), value.c_str());
+                }
             } else if (key != "preset" && key != "vlm_size") {
                 LOG_WARN("ignoring unknown reference image arg '%s'", key.c_str());
             }
@@ -4062,6 +4070,13 @@ public:
         if (params.rescale_ref_ids && params.center_ref_ids) {
             LOG_WARN("rescale_ref_ids and center_ref_ids are mutually exclusive; centring wins");
         }
+        if (params.native_ref_geometry && (params.resize_vae_to_target || params.crop_vae_to_target_ar)) {
+            // Both halves of the restage recipe have to agree. Decoding the reference natively and
+            // then resizing/cropping it to the target here just re-imposes the geometry the native
+            // decode existed to avoid — the markers are thrown away either way, and the only
+            // symptom is a quietly wrong picture.
+            LOG_WARN("native_ref is set but resize_vae_to_target/crop_vae_to_target_ar will re-impose the target geometry");
+        }
         return params;
     }
 };
@@ -4069,6 +4084,37 @@ public:
 /*================================================= SD API ==================================================*/
 
 #define NONE_STR "NONE"
+
+bool sd_ref_image_args_want_native_geometry(const char* ref_image_args) {
+    // Deliberately NOT resolve_ref_image_params(): that is a method on the context, needs the
+    // loaded model's version to pick a default preset, and runs long after the reference bytes
+    // have been decoded. The caller has to decide this before it decodes anything, so it needs a
+    // free function — but it must still read the SAME preset table, or the two halves of one
+    // request could disagree about whether the reference was cropped.
+    //
+    // No version is needed here because every version-default preset leaves this off; only an
+    // explicit preset or an explicit native_ref= can turn it on.
+    bool native = false;
+    for (const auto& [key, value] : parse_key_value_args(ref_image_args, "reference image args")) {
+        if (key == "preset") {
+            auto it = REF_IMAGE_PRESETS.find(value);
+            if (it != REF_IMAGE_PRESETS.end()) {
+                native = it->second.native_ref_geometry;
+            }
+            break;
+        }
+    }
+    // An explicit native_ref= wins over the preset, in both directions: it is how you restage
+    // with the edit preset, or ask the restage preset for a reference already at target geometry.
+    for (const auto& [key, value] : parse_key_value_args(ref_image_args, "reference image args")) {
+        if (key == "native_ref") {
+            if (!parse_strict_bool(value, native)) {
+                LOG_WARN("ignoring invalid reference image arg 'native_ref=%s'", value.c_str());
+            }
+        }
+    }
+    return native;
+}
 
 const char* sd_type_name(enum sd_type_t type) {
     if ((int)type < std::min<int>(SD_TYPE_COUNT, GGML_TYPE_COUNT)) {
