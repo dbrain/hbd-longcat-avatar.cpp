@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <string>
 
 #include "core/ggml_extend.hpp"
@@ -357,6 +358,19 @@ public:
             ffn_tile = atoll(e);
         }
         const int64_t n_tok = x->ne[1];
+        if (ffn_tile > 0) {
+            // One-shot shape report: the tile guard is shape-sensitive and a silent
+            // fall-through is indistinguishable from "the flag did nothing".
+            static std::set<std::string> reported;
+            char shape[96];
+            snprintf(shape, sizeof(shape), "%lld,%lld,%lld,%lld",
+                     (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3]);
+            if (reported.insert(shape).second) {
+                LOG_INFO("SD_FFN_TILE_TOKENS=%lld: FFN input ne=[%s] -> %s",
+                         (long long)ffn_tile, shape,
+                         (n_tok > ffn_tile && x->ne[2] == 1 && x->ne[3] == 1) ? "TILED" : "NOT TILED");
+            }
+        }
         if (ffn_tile > 0 && n_tok > ffn_tile && x->ne[2] == 1 && x->ne[3] == 1) {
             // Tagged off the net.2 weight NAME, which get_param_tensors() has already set to the
             // full dotted prefix at load -- the same identity nvfp4_weight_global_for() keys on.
