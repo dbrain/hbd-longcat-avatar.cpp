@@ -748,6 +748,40 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 body["video_frames"] = body["frames"];
             }
 
+            // SEGMENT 0 HAS NO PER-SEGMENT SCENE IMAGE -- its opener is the request's TOP-LEVEL
+            // `init_image`. That is deliberate on both sides: segment 0 is always a fresh scene, so
+            // `generate_video_chain` gates the per-segment image behind `segment > 0`
+            // (stable-diffusion.cpp, `fresh_scene`) and the job staging below only decodes indices
+            // >= 1. Do NOT relax either gate; two fields fighting over the same opener with no
+            // defined precedence is worse than one field.
+            //
+            // The trap is that `segments[0].init_image` still PARSES. It lands in
+            // segment_init_images[0], is never read, and the render succeeds looking plausible
+            // while the reference never conditioned anything -- measured at 10.42 dB on frame 0
+            // against the source image, where a working i2v scores 28-39 dB. A caller cannot tell
+            // that apart from success, so answer it here rather than let it ship a silent t2v.
+            //
+            // Fold when the opener slot is free (the caller's intent is unambiguous); refuse when
+            // both are set, because picking a winner would be guessing at which image the caller
+            // meant to open on.
+            if (body.contains("segments") && body["segments"].is_array() && !body["segments"].empty() &&
+                body["segments"][0].is_object() && body["segments"][0].contains("init_image") &&
+                body["segments"][0]["init_image"].is_string() &&
+                !body["segments"][0]["init_image"].get<std::string>().empty()) {
+                const bool has_top_level = body.contains("init_image") && body["init_image"].is_string() &&
+                                           !body["init_image"].get<std::string>().empty();
+                if (has_top_level) {
+                    res.status = 400;
+                    res.set_content(
+                        R"({"error":"segments[0].init_image conflicts with the top-level init_image; segment 0's opener is the top-level field, so send exactly one of them"})",
+                        "application/json");
+                    return;
+                }
+                body["init_image"] = body["segments"][0]["init_image"];
+                LOG_INFO("LTX: folded segments[0].init_image up to the top-level opener "
+                         "(segment 0 has no per-segment scene image; send it at the request root)");
+            }
+
             // Koblem's LipDub contract asks for the production two-stage
             // recipe with `two_stage: true`; it does not need to redundantly
             // expose the worker's configured latent-upscaler model. Enable
