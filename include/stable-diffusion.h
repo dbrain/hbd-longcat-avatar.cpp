@@ -664,6 +664,17 @@ typedef struct {
     // Negative entries retain base_params->strength; non-negative entries are
     // the SDEdit denoising strength for their corresponding V2V window.
     const float* segment_v2v_strengths;
+    // Optional PER-WINDOW image-pin hold strength (init image / keyframes / end image).
+    // Same encoding as segment_v2v_strengths: negative retains base_params->strength,
+    // non-negative overrides it for that window alone. 1.0 pins the image exactly (the
+    // conditioned latent frames get denoise mask 0); lower lets the pin flex toward the
+    // generated motion.
+    //
+    // Without this a chain has ONE strength for every pinned image in it, so softening one
+    // shot's pin softened every other shot's too -- the caller could not express "hold shot 0
+    // exactly, let shot 3 breathe". A V2V window ignores this: strength there means SDEdit
+    // denoising, and segment_v2v_strengths already owns it.
+    const float* segment_pin_strengths;
     // Optional trusted saved-video-latent source for a mode-2 V2V window.
     const char* const* segment_v2v_guide_latent_paths;
     int cont_latent_frames;

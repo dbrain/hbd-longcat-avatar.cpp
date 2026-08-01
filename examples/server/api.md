@@ -1280,6 +1280,34 @@ for a prompt-only fresh shot, or `init_image` for a fresh image-pinned shot. Fre
 are stitched without trimming the preceding continuation overlap. It returns the same
 asynchronous job and media URLs as `/sdcpp/v1/vid_gen`.
 
+**`init_image` on segment 0 is not a thing.** Segment 0 is always a fresh scene, so its
+opener is the request's **top-level** `init_image`; the per-segment field is only read for
+segments `>= 1`. Sending `segments[0].init_image` with no top-level `init_image` folds it up
+to the opener (logged once); sending both is a `400`, because there is no defined precedence
+between them.
+
+#### Per-shot image-pin strength
+
+A segment object may supply `pin_strength` (`0..1`) to say how hard **that shot** holds its
+pinned images — its `init_image`, its `keyframes`, an `end_image`. `1.0` pins exactly (the
+conditioned latent frames are held at denoise mask `0`); lower lets the pin flex toward the
+generated motion. `0` is legal and means the pin is fully re-denoised.
+
+Omitted, the shot inherits the request's top-level `strength`, which is also what every shot
+gets when no segment mentions `pin_strength` at all — such a request takes the identical code
+path it did before this field existed, so `pin_strength` absent and `pin_strength` present at
+the chain default are the same render, not merely similar ones.
+
+A V2V shot ignores `pin_strength`: on a V2V window `strength` is the SDEdit denoising
+schedule, and `v2v_guide_strength` already owns it.
+
+```json
+"segments": [
+  { "prompt": "she turns to the window", "pin_strength": 1.0 },
+  { "prompt": "the room breathes",       "init_image": "<base64>", "pin_strength": 0.6 }
+]
+```
+
 An object may request `v2v_mode: 1` with `control_frames`, a base64 image array
 containing exactly one frame for every requested output frame. This is SDEdit V2V: the
 source is VAE-encoded, treated as a fresh shot, and denoised according to optional

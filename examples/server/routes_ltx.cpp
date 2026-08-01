@@ -389,6 +389,11 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             std::vector<std::vector<std::string>> segment_control_frames;
             std::vector<int> segment_v2v_modes;
             std::vector<float> segment_v2v_strengths;
+            // Per-shot image-pin hold strength (init image / keyframes / end image), -1 = inherit
+            // the request's top-level `strength`. Only staged onto the job if some shot actually
+            // names one, so a request that never mentions pin_strength reaches the core with a
+            // null pointer -- byte-identical to before this existed.
+            std::vector<float> segment_pin_strengths;
             std::vector<std::string> segment_v2v_guide_latent_paths;
             // Per-shot "restore THIS shot from THAT job's bank" — the take the caller picked for
             // this shot. Collected as raw job ids and resolved to directories once, below, so the
@@ -434,6 +439,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_control_frames.emplace_back();
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
+                        segment_pin_strengths.push_back(-1.f);
                         segment_v2v_guide_latent_paths.emplace_back();
                         segment_bank_job_ids.emplace_back();
                         segment_beats.emplace_back();
@@ -511,6 +517,30 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         }
                         segment_keyframes.push_back(std::move(keyframes));
                         segment_keyframe_indices.push_back(std::move(keyframe_indices));
+                        // How hard THIS shot holds its pinned image(s) -- the init image just
+                        // parsed, the keyframes above, an end image. Absent (and only absent)
+                        // inherits the request's top-level `strength`; the -1 sentinel is the
+                        // same one `v2v_guide_strength` uses two blocks down, deliberately, so
+                        // there is one convention for "this shot did not say".
+                        //
+                        // 0 is a LEGAL value and means something (the pin is fully re-denoised),
+                        // which is why the sentinel is negative rather than zero and why the
+                        // range check rejects anything below it instead of clamping.
+                        float pin_strength = -1.f;
+                        if (segment.contains("pin_strength") && !segment["pin_strength"].is_null()) {
+                            if (!segment["pin_strength"].is_number()) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"each LTX segment pin_strength must be a number between 0 and 1"})", "application/json");
+                                return;
+                            }
+                            pin_strength = segment["pin_strength"].get<float>();
+                            if (pin_strength < 0.f || pin_strength > 1.f) {
+                                res.status = 400;
+                                res.set_content(R"({"error":"LTX segment pin_strength must be between 0 and 1"})", "application/json");
+                                return;
+                            }
+                        }
+                        segment_pin_strengths.push_back(pin_strength);
                         const int v2v_mode = segment.value("v2v_mode", 0);
                         if (v2v_mode != 0 && v2v_mode != 1 && v2v_mode != 2) {
                             res.status = 400;
@@ -699,6 +729,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                         segment_control_frames.emplace_back();
                         segment_v2v_modes.push_back(0);
                         segment_v2v_strengths.push_back(-1.f);
+                        segment_pin_strengths.push_back(-1.f);
                         segment_v2v_guide_latent_paths.emplace_back();
                         segment_bank_job_ids.emplace_back();
                         segment_beats.emplace_back();
@@ -1276,6 +1307,15 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->ltx_msr_segments     = std::move(msr_segments);
             job->ltx_segment_v2v_modes = std::move(segment_v2v_modes);
             job->ltx_segment_v2v_strengths = std::move(segment_v2v_strengths);
+            // Only carry the pin-strength array when a shot actually names one. An all-inherit
+            // array would reach the core as a non-null pointer of -1s -- harmless, but then
+            // "pin_strength absent" and "pin_strength present at the chain default" would take
+            // different code paths, and the no-op claim would rest on the sentinel check rather
+            // than on there being nothing to check. Same reason ltx_segment_loras is gated.
+            if (std::any_of(segment_pin_strengths.begin(), segment_pin_strengths.end(),
+                            [](float strength) { return strength >= 0.f; })) {
+                job->ltx_segment_pin_strengths = std::move(segment_pin_strengths);
+            }
             job->ltx_segment_v2v_guide_latent_paths = std::move(segment_v2v_guide_latent_paths);
             // Resolve each shot's chosen take to a DIRECTORY here, once, so the core never learns
             // the bank_id indirection or the persist/transient root search — same split as

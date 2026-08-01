@@ -12429,6 +12429,21 @@ SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                 params.v2v_guide_strength = chain_params->segment_v2v_strengths[segment];
             }
         }
+        // Per-window image-pin hold strength. Same shape and sentinel as segment_v2v_strengths
+        // above (negative = inherit base_params->strength), and deliberately AFTER it but gated
+        // on !has_v2v_source: `strength` means two different things depending on the window, and
+        // on a V2V window it is the SDEdit schedule that segment_v2v_strengths just set. A window
+        // is either V2V or image-pinned, never both, so this only ever fills in the other case --
+        // but stating the exclusion is what stops a future caller that sets both from silently
+        // losing its guide strength.
+        if (!has_v2v_source && chain_params->segment_pin_strengths != nullptr &&
+            chain_params->segment_pin_strengths[segment] >= 0.f) {
+            params.strength = chain_params->segment_pin_strengths[segment];
+            LOG_INFO("LTX window %d: image-pin strength %.2f (chain default %.2f)",
+                     segment + 1,
+                     params.strength,
+                     base_params->strength);
+        }
         if (segment > 0 && !fresh_scene) {
             if (previous_tail.empty()) {
                 LOG_ERROR("generate_video_chain: continuation segment %d has no prior latent tail", segment);

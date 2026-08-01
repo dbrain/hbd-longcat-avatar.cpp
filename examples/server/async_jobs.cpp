@@ -882,6 +882,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             chain.segment_control_frame_counts = ltx_v2v_frame_counts.empty() ? nullptr : ltx_v2v_frame_counts.data();
             chain.segment_v2v_modes = job.ltx_segment_v2v_modes.empty() ? nullptr : job.ltx_segment_v2v_modes.data();
             chain.segment_v2v_strengths = job.ltx_segment_v2v_strengths.empty() ? nullptr : job.ltx_segment_v2v_strengths.data();
+            chain.segment_pin_strengths = job.ltx_segment_pin_strengths.empty() ? nullptr : job.ltx_segment_pin_strengths.data();
             chain.segment_v2v_guide_latent_paths = ltx_v2v_guide_latent_paths.empty() ? nullptr : ltx_v2v_guide_latent_paths.data();
             chain.cont_latent_frames = job.ltx_cont_latent_frames;
             chain.start_segment = job.ltx_resume_from;

@@ -142,6 +142,11 @@ struct AsyncGenerationJob {
     std::vector<int> ltx_msr_segments;
     std::vector<int> ltx_segment_v2v_modes;
     std::vector<float> ltx_segment_v2v_strengths;
+    // Per-shot image-pin hold strength, -1 = inherit the request's top-level `strength`.
+    // Sized with the prompts whenever ANY shot names one, empty otherwise -- an all-inherit
+    // array and no array at all must reach the core identically, or "absent" stops being a
+    // provable no-op.
+    std::vector<float> ltx_segment_pin_strengths;
     std::vector<std::string> ltx_segment_v2v_guide_latent_paths;
     // Per-shot RESOLVED bank directory to restore that shot from, sized with the
     // prompts when any segment names one. Empty entries fall back to ltx_bank_dir.
