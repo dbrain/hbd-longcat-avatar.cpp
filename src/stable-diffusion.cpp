@@ -3240,7 +3240,17 @@ public:
         // today's (whatever static GGML_LTX_SA3 the caller set, untouched).
         const char* sa3_policy_env = std::getenv("GGML_LTX_SA3_POLICY");
         const std::string sa3_policy = sa3_policy_env != nullptr ? sa3_policy_env : "";
-        const bool sa3_step_policy = sd_version_is_ltxav(version) &&
+        // Krea-2 is admitted alongside LTX now that SA3 serves GQA shapes. The env names keep
+        // their GGML_LTX_SA3_* spelling (compose + binary compatibility) even though the LTX_
+        // prefix is a misnomer for an image model.
+        //
+        // ⚠️ The right POLICY differs by modality. Video dilutes FP4 attention error across ~50
+        // steps x 121 frames; a distilled image model has 8-10 steps and one frame, so there is
+        // far less to average it away. "first" protects the step that fixes composition; for
+        // images "middle" (cuDNN on the FIRST and LAST step, SA3 between) is the candidate,
+        // because the last step writes final detail straight to the output with nothing after it
+        // to smooth FP4 stipple in flat regions. A/B both before picking a default.
+        const bool sa3_step_policy = (sd_version_is_ltxav(version) || sd_version_is_krea2(version)) &&
                                      (sa3_policy == "first" || sa3_policy == "last" || sa3_policy == "middle");
         // The precise cuDNN step needs two full-length F16 buffers (converted Q
         // and output).  Tile only that step's independent query rows; the SA3
