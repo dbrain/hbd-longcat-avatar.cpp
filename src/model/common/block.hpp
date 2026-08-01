@@ -1,6 +1,11 @@
 #ifndef __SD_MODEL_COMMON_BLOCK_HPP__
 #define __SD_MODEL_COMMON_BLOCK_HPP__
 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "core/ggml_extend.hpp"
 #include "core/util.h"
 #include "ggml-backend.h"
@@ -288,6 +293,30 @@ public:
         blocks["net.2"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, dim_out, true, false, force_prec_f32, scale));
     }
 
+private:
+    // Stable per-FFN activation tag for ggml's NVFP4 shared-global path
+    // (GGML_NVFP4_ACT_GLOBAL_SHARE, ggml/src/ggml-cuda/nvfp4-cublaslt.cu). Every tile of one
+    // FFN gets the SAME name, which is exactly what makes them share one quantisation global.
+    //
+    // Hashed rather than spelled out: ggml_set_name TRUNCATES at GGML_MAX_NAME and truncation
+    // would silently ALIAS two layers onto one global (LTX runs to
+    // "transformer_blocks.47.audio_ff.net.2.weight"). "actshare." + 16 hex is 25 chars, so it
+    // can never truncate, and the "actshare." prefix is what the backend matches on -- an
+    // untagged tensor is never touched by the shared-global path.
+    static std::string act_share_tag(const char* base, char which) {
+        uint64_t h = 1469598103934665603ull;  // FNV-1a 64
+        for (const char* p = base; p != nullptr && *p != '\0'; ++p) {
+            h ^= (uint64_t)(unsigned char)*p;
+            h *= 1099511628211ull;
+        }
+        h ^= (uint64_t)(unsigned char)which;
+        h *= 1099511628211ull;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "actshare.%016llx", (unsigned long long)h);
+        return std::string(buf);
+    }
+
+public:
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
         // x: [ne3, ne2, ne1, dim]
         // return: [ne3, ne2, ne1, dim_out]
@@ -296,6 +325,67 @@ public:
         auto net_2 = std::dynamic_pointer_cast<Linear>(blocks["net.2"]);
         if (sd_backend_is(ctx->backend, "Vulkan") || sd_backend_is(ctx->backend, "ROCm")) {
             net_2->set_force_prec_f32(true);
+        }
+
+        // ── Token-tiled FFN ──────────────────────────────────────────────────────────────
+        // SD_FFN_TILE_TOKENS=N (N>0) processes tokens in chunks of N. The FFN is position-wise
+        // (independent per token) so this is the same math concatenated: no extra FLOPs, only
+        // a few more kernel launches, and the [inner_dim, tokens] intermediate -- the dominant
+        // DiT activation at video lengths -- is capped at [inner_dim, N].
+        //
+        // 🔴 THIS IS A KNOWN ARTIFACT GENERATOR ON THE NVFP4 PATH, AND THAT IS DELIBERATE.
+        // Each tile is a separate mul_mat, so on the FP4 two-level path each tile takes its
+        // OWN per-tensor activation global over its OWN slice of tokens. Patches are spatial,
+        // so the quantisation grid moves as the subject moves and the render "worms"
+        // (root-caused 2026-06-26). This code was carried on master as LONGCAT_FFN_TILE_TOKENS
+        // from 1f9079b until the 2026-07-25 upstream rebuild dropped it; it is restored here
+        // under a NEW name -- the old one is still set to 8192 in kobbler's docker-compose.yml
+        // for ltx-video, and reusing it would silently re-enable tiling in prod on the next
+        // rebuild. Nothing turns this on by accident.
+        //
+        // Two reasons to keep it:
+        //   1. It is the only NEGATIVE CONTROL for the worm. An A/B of a fix needs an arm that
+        //      visibly reproduces the defect, or a clean result proves nothing.
+        //   2. Paired with GGML_NVFP4_ACT_GLOBAL_SHARE=1 it is the recorded "option 2" fix:
+        //      the tiles are tagged with one shared name, the backend hands them ONE global,
+        //      and the tiling stops being visible to the quantiser.
+        //
+        // Off by default (N<=0 / unset), value-gated, and only the simple 2D single-batch case
+        // is tiled -- everything else falls through to the original path byte-identically.
+        int64_t ffn_tile = 0;
+        if (const char* e = getenv("SD_FFN_TILE_TOKENS")) {
+            ffn_tile = atoll(e);
+        }
+        const int64_t n_tok = x->ne[1];
+        if (ffn_tile > 0 && n_tok > ffn_tile && x->ne[2] == 1 && x->ne[3] == 1) {
+            // Tagged off the net.2 weight NAME, which get_param_tensors() has already set to the
+            // full dotted prefix at load -- the same identity nvfp4_weight_global_for() keys on.
+            // An unnamed weight would hash every FFN in the model to ONE tag and quietly merge
+            // their globals, so leave the tiles untagged in that case: the backend then falls
+            // through to per-tile globals, which is the pre-fix behaviour, not a wrong render.
+            const char*       wname    = net_2->get_weight()->name;
+            const bool        tag_ok   = wname != nullptr && wname[0] != '\0';
+            const std::string tag_up   = tag_ok ? act_share_tag(wname, 'u') : std::string();
+            const std::string tag_down = tag_ok ? act_share_tag(wname, 'd') : std::string();
+            ggml_tensor*      out      = nullptr;
+            for (int64_t c = 0; c < n_tok; c += ffn_tile) {
+                const int64_t len = (n_tok - c < ffn_tile) ? (n_tok - c) : ffn_tile;
+                ggml_tensor*  xc  = ggml_view_2d(ctx->ggml_ctx, x, x->ne[0], len, x->nb[1], (size_t)c * x->nb[1]);
+                xc                = ggml_cont(ctx->ggml_ctx, xc);
+                // src1 of net.0's projection. ggml_ext_linear passes the activation straight to
+                // ggml_mul_mat_ext at scale 1.0, so this name is what the backend sees.
+                if (tag_ok) {
+                    ggml_set_name(xc, tag_up.c_str());
+                }
+                xc = net_0->forward(ctx, xc);  // [inner_dim, len]
+                // src1 of net.2 -- the down-proj input, the tensor the worm is about.
+                if (tag_ok) {
+                    ggml_set_name(xc, tag_down.c_str());
+                }
+                xc  = net_2->forward(ctx, xc);  // [dim_out, len]
+                out = (out == nullptr) ? xc : ggml_concat(ctx->ggml_ctx, out, xc, 1);
+            }
+            return out;
         }
 
         x = net_0->forward(ctx, x);  // [ne3, ne2, ne1, inner_dim]
