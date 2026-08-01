@@ -424,6 +424,100 @@ namespace LTXVAE {
         }
     };
 
+    // Channel-projection ResNet (diffusers LTX2VideoResnetBlock3d with in != out).
+    //
+    // Stock LTX-2.3 never changes width inside a decoder block: every up-block resnet is
+    // square and the pixel-shuffle upsampler owns the whole reduction. Pruned decoders
+    // (PrunaAI/PrunaVAED) keep the *skip* between blocks wider than the resnets inside
+    // them and absorb the odd ratio (e.g. 512 -> 384) in a projection resnet placed at the
+    // head of the block — diffusers calls it `up_blocks.<i>.conv_in`. Without it the
+    // upsampler ratios stop being integers and infer_decoder_config_from_weights() silently
+    // truncates the decoder.
+    //
+    // Layout matches LTX2VideoResnetBlock3d exactly:
+    //   main: PerChannelRMSNorm -> silu -> conv1(in->out) -> PerChannelRMSNorm -> silu -> conv2(out->out)
+    //   skip: LayerNorm over channels (affine + bias) -> 1x1x1 conv(in->out)
+    // then main + skip. The skip conv is a plain nn.Conv3d upstream (not causal), so it
+    // needs no temporal-context cache in the chunked path.
+    //
+    // Weight keys are `<block>.conv1.conv.*`, `.conv2.conv.*`, `.norm3.*`, `.skip_conv.*`.
+    // `skip_conv` (not `conv_shortcut`) is deliberate: convert_diffusers_vae_to_original_sd1()
+    // rewrites any "conv_shortcut" substring in a `vae.*` key to "nin_shortcut".
+    struct ResnetProjBlock3D : public GGMLBlock {
+        int64_t in_channels;
+        int64_t out_channels;
+
+        ResnetProjBlock3D(int64_t in_channels,
+                          int64_t out_channels,
+                          float eps = 1e-6f)
+            : in_channels(in_channels), out_channels(out_channels) {
+            blocks["norm1"]     = std::make_shared<PixelNorm3D>(eps);
+            blocks["conv1"]     = std::make_shared<CausalConv3d>(in_channels, out_channels, 3);
+            blocks["norm2"]     = std::make_shared<PixelNorm3D>(eps);
+            blocks["conv2"]     = std::make_shared<CausalConv3d>(out_channels, out_channels, 3);
+            blocks["norm3"]     = std::make_shared<LayerNorm>(in_channels, eps, true, true);
+            blocks["skip_conv"] = std::make_shared<Conv3d>(in_channels,
+                                                           out_channels,
+                                                           std::tuple<int, int, int>{1, 1, 1});
+        }
+
+        // x: [W, H, T, C] — channels last, as everywhere else in this decoder.
+        ggml_tensor* skip(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto norm3     = std::dynamic_pointer_cast<LayerNorm>(blocks["norm3"]);
+            auto skip_conv = std::dynamic_pointer_cast<Conv3d>(blocks["skip_conv"]);
+            // LayerNorm normalises over ne[0]; rotate channels into ne[0] and back
+            // (same trick as PixelNorm3D).
+            auto s = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, x, 3, 0, 1, 2));
+            s      = norm3->forward(ctx, s);
+            s      = ggml_ext_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, s, 1, 2, 3, 0));
+            return skip_conv->forward(ctx, s);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             bool causal = false) {
+            auto norm1 = std::dynamic_pointer_cast<PixelNorm3D>(blocks["norm1"]);
+            auto conv1 = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+            auto norm2 = std::dynamic_pointer_cast<PixelNorm3D>(blocks["norm2"]);
+            auto conv2 = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
+
+            auto h = norm1->forward(ctx, x);
+            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
+            h      = conv1->forward(ctx, h, causal);
+            h      = norm2->forward(ctx, h);
+            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
+            h      = conv2->forward(ctx, h, causal);
+
+            return ggml_add(ctx->ggml_ctx, h, skip(ctx, x));
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             bool causal,
+                             std::vector<ggml_tensor*>& feat_map,
+                             int& feat_idx,
+                             int chunk_idx,
+                             int temporal_pad = 0) {
+            auto norm1 = std::dynamic_pointer_cast<PixelNorm3D>(blocks["norm1"]);
+            auto conv1 = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv1"]);
+            auto norm2 = std::dynamic_pointer_cast<PixelNorm3D>(blocks["norm2"]);
+            auto conv2 = std::dynamic_pointer_cast<CausalConv3d>(blocks["conv2"]);
+
+            // Take the skip before conv1 consumes feat_map slots, so the slot order is
+            // identical between the two forwards.
+            auto s = skip(ctx, x);
+
+            auto h = norm1->forward(ctx, x);
+            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
+            h      = conv1->forward(ctx, h, feat_map, feat_idx, chunk_idx, causal, temporal_pad);
+            h      = norm2->forward(ctx, h);
+            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
+            h      = conv2->forward(ctx, h, feat_map, feat_idx, chunk_idx, causal, temporal_pad);
+
+            return ggml_add(ctx->ggml_ctx, h, s);
+        }
+    };
+
     struct DepthToSpaceUpsample : public GGMLBlock {
         int64_t in_channels;
         int factor_t;
@@ -587,6 +681,9 @@ namespace LTXVAE {
             std::string type;
             int num_layers = 0;
             int multiplier = 1;
+            // "res_proj" only: the width this projection resnet outputs. The ratio
+            // in:out need not be integral, which is the whole point of the block.
+            int64_t out_channels = 0;
         };
 
         std::vector<Block> blocks;
@@ -630,6 +727,9 @@ namespace LTXVAE {
             const std::string block_prefix = decoder_prefix + std::to_string(block_idx);
             const std::string res0_bias    = block_prefix + ".res_blocks.0.conv1.conv.bias";
             const std::string conv_bias    = block_prefix + ".conv.conv.bias";
+            // A projection resnet has conv1 directly under the block (no ".res_blocks.N.")
+            // plus a 1x1x1 skip conv; see ResnetProjBlock3D.
+            const std::string proj_bias = block_prefix + ".conv1.conv.bias";
 
             if (has_tensor(tensor_storage_map, res0_bias)) {
                 int num_layers = 0;
@@ -642,6 +742,13 @@ namespace LTXVAE {
                 continue;
             }
 
+            if (has_tensor(tensor_storage_map, proj_bias)) {
+                const int64_t proj_out = get_tensor_ne0(tensor_storage_map, proj_bias, current_channels);
+                cfg.blocks.push_back({"res_proj", 0, 1, proj_out});
+                current_channels = proj_out;
+                continue;
+            }
+
             if (!has_tensor(tensor_storage_map, conv_bias)) {
                 break;
             }
@@ -649,9 +756,14 @@ namespace LTXVAE {
             int64_t next_channels = 0;
             for (int next_idx = block_idx + 1;; ++next_idx) {
                 const std::string next_res0_bias = decoder_prefix + std::to_string(next_idx) + ".res_blocks.0.conv1.conv.bias";
+                const std::string next_proj_bias = decoder_prefix + std::to_string(next_idx) + ".conv1.conv.bias";
                 const std::string next_conv_bias = decoder_prefix + std::to_string(next_idx) + ".conv.conv.bias";
                 if (has_tensor(tensor_storage_map, next_res0_bias)) {
                     next_channels = get_tensor_ne0(tensor_storage_map, next_res0_bias);
+                    break;
+                }
+                if (has_tensor(tensor_storage_map, next_proj_bias)) {
+                    next_channels = get_tensor_ne0(tensor_storage_map, next_proj_bias);
                     break;
                 }
                 if (!has_tensor(tensor_storage_map, next_conv_bias)) {
@@ -960,6 +1072,12 @@ namespace LTXVAE {
                     blocks["up_blocks." + std::to_string(block_idx)] = std::make_shared<UNetMidBlock3D>(channels,
                                                                                                         block.num_layers,
                                                                                                         timestep_conditioning);
+                } else if (block.type == "res_proj") {
+                    // Pruned decoders (PrunaVAED) narrow the tensor here rather than in the
+                    // upsampler, which is what keeps every upsampler ratio integral.
+                    blocks["up_blocks." + std::to_string(block_idx)] = std::make_shared<ResnetProjBlock3D>(channels,
+                                                                                                           block.out_channels);
+                    channels = block.out_channels;
                 } else if (block.type == "compress_all") {
                     blocks["up_blocks." + std::to_string(block_idx)] = std::make_shared<DepthToSpaceUpsample>(channels,
                                                                                                               2,
@@ -1033,8 +1151,11 @@ namespace LTXVAE {
             int block_idx = 0;
             while (blocks.find("up_blocks." + std::to_string(block_idx)) != blocks.end()) {
                 auto mid_block = std::dynamic_pointer_cast<UNetMidBlock3D>(blocks["up_blocks." + std::to_string(block_idx)]);
+                auto proj      = std::dynamic_pointer_cast<ResnetProjBlock3D>(blocks["up_blocks." + std::to_string(block_idx)]);
                 if (mid_block) {
                     x = mid_block->forward(ctx, x, scaled_timestep, causal_decoder);
+                } else if (proj) {
+                    x = proj->forward(ctx, x, causal_decoder);
                 } else {
                     auto upsample = std::dynamic_pointer_cast<DepthToSpaceUpsample>(blocks["up_blocks." + std::to_string(block_idx)]);
                     x             = upsample->forward(ctx, x, causal_decoder);
@@ -1100,9 +1221,13 @@ namespace LTXVAE {
             int block_idx = 0;
             while (blocks.find("up_blocks." + std::to_string(block_idx)) != blocks.end()) {
                 auto mid_block = std::dynamic_pointer_cast<UNetMidBlock3D>(blocks["up_blocks." + std::to_string(block_idx)]);
+                auto proj      = std::dynamic_pointer_cast<ResnetProjBlock3D>(blocks["up_blocks." + std::to_string(block_idx)]);
                 if (mid_block) {
                     x = mid_block->forward(ctx, x, scaled_timestep, causal_decoder,
                                            feat_map, feat_idx, chunk_idx, temporal_pad);
+                } else if (proj) {
+                    x = proj->forward(ctx, x, causal_decoder,
+                                      feat_map, feat_idx, chunk_idx, temporal_pad);
                 } else {
                     auto upsample = std::dynamic_pointer_cast<DepthToSpaceUpsample>(
                         blocks["up_blocks." + std::to_string(block_idx)]);
