@@ -186,6 +186,13 @@ struct MiniT2IDiffusionExtra {
     const sd::Tensor<float>* mask = nullptr;
 };
 
+struct MiniMaxH3DiffusionExtra {
+    // Per-row AdaLN modality tag over the TEXT span (0 video, 1 text, 2 audio), as produced by
+    // the H3 conditioner on SDCondition::c_token_types. Null means "the whole text span is
+    // text", which is right for t2va and wrong for any presentation carrying vision pads.
+    const sd::Tensor<int32_t>* text_token_tags = nullptr;
+};
+
 struct HunyuanVideoDiffusionExtra {
     const sd::Tensor<float>* guidance   = nullptr;
     const sd::Tensor<float>* byt5       = nullptr;
@@ -203,6 +210,7 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           LTXAVDiffusionExtra,
                                           LongCatAvatarDiffusionExtra,
                                           MiniT2IDiffusionExtra,
+                                          MiniMaxH3DiffusionExtra,
                                           HunyuanVideoDiffusionExtra>;
 
 struct DiffusionParams {

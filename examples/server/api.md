@@ -1435,6 +1435,306 @@ Set `persist:true` on a new LTX request to store its bank under `$LTX_PERSIST_DI
 and V2V job references search both roots. `DELETE /ltx/v1/job?id=<engine-job-id>`
 removes an inactive bank (including the requested resume alias) and is idempotent.
 
+### MiniMax-H3 generation
+
+`POST /h3/v1/generate` takes a **`segments` list** and renders the shots back to back inside
+one job, returning the same asynchronous job, media and per-shot partial URLs as
+`/ltx/v1/generate` — poll `/sdcpp/v1/jobs/{id}`, fetch `/sdcpp/v1/jobs/{id}/media`, collect
+progressive shots from `/sdcpp/v1/jobs/{id}/segments/{n}`, cancel with
+`/sdcpp/v1/jobs/{id}/cancel`.
+
+The shape is LTX's **on purpose, as a specification rather than a resemblance**: the goal is
+that the existing LTX Director can drive H3 with the smallest possible client diff, so field
+names and types are taken from LTX and not improved on. What differs is documented field by
+field below.
+
+Two model facts shape everything else, and neither is negotiable:
+
+* **One packed sequence per DENOISE.** H3 renders video and its synchronised stereo audio in a
+  single pass over one token sequence. Shots therefore share no latent state at all.
+* **Guidance-distilled.** Exactly one forward per step, no unconditional branch.
+
+One prompt per HTTP *request* was never a model fact — the entry point is ours — which is why
+the segment list exists. Batching matters concretely: the Qwen3-VL text encoder at NVFP4 is
+~14.5 GB resident and the DiT is ~11 GB against a 15,888 MiB card, so the two cannot be
+co-resident and the swap between them is unavoidable. The only question is whether it happens
+once or once per shot, so a job runs **one residency per stage**:
+
+1. encode **every** shot's prompt, in one text-encoder residency;
+2. reclaim the text encoder — staged params back to their params-backend home, cache
+   context/buffer dropped, the text-encoder backend's CUDA pool trimmed;
+3. load the DiT once and render every shot, each taking its conditioning back out of the staging
+   cache.
+
+The job also holds `sd_ctx` for its whole run, so nothing else can evict a model between shots,
+and the reference pixels are decoded once rather than once per shot.
+
+**There is no continuity machinery, and that is a feature.** No latent bank, no
+`resume_job_id`, no banked `seg_<n>.bin`, no prefix reload, no retake splice, no
+`cont_latent_frames` overlap. H3 has nothing to resume *from* — its seam is an `fl2va` RGB
+frame the **caller** supplies — so a retake costs exactly one shot instead of a re-render of
+everything downstream.
+
+#### Field-by-field mapping from `/ltx/v1/generate`
+
+Every LTX Director field is in exactly one of four states. **N/A, refused** is a hard `400`.
+**N/A, ignored** is accepted and discarded — and every ignored field this request actually
+carried is **named back to the caller in the `202`'s `ignored` array**, so a setting that did
+nothing is visible in the response rather than discovered an hour later.
+
+The dividing line for the two N/A states: a field is **refused** when honouring it would change
+the render, and **ignored** when it is structurally inert here *and* an LTX Director sends it as
+a routine default (refusing those would 400 every otherwise-valid request).
+
+##### Request root
+
+| LTX field | H3 | status |
+| --- | --- | --- |
+| `segments` (array of strings or objects) | same | **identical** |
+| `prompts` (string array alias) | same | **identical** |
+| `n_segments` | same, cross-checked against `segments.length` | **identical** |
+| `prompt` (no list) | one segment | **identical** |
+| `width`, `height` | same, request-level | **reshaped** — must be a multiple of 32 with `w*h <= 1032192`; off-grid is a `400` naming the model's own canvas, or send `adapt_canvas: true` |
+| `frames` / `video_frames` | same name, per-request default for shots that omit their own | **reshaped** — snapped **up** to `17n+5` (LTX is `8k+1`); both numbers are reported |
+| `fps` | — | **N/A, refused** unless `24` — the frame grid, the 4× temporal VAE and the 40 Hz audio latent rate are all *defined* at 24 fps |
+| `seed`, `steps` | same | **identical** |
+| `sample_method`, `scheduler` | same | **identical** — honoured by the shared sampler; H3 additionally walks a second audio-only sigma schedule |
+| `sample_params.flow_shift` | same | **identical** — and it wins over `sigma_shift_video` when set explicitly |
+| `negative_prompt` | — | **N/A, refused** when non-empty; an empty string is ignored |
+| `cfg` / `cfg_scale` / `guidance_scale` | — | **N/A, refused** unless `1.0`. `1.0` is H3's only legal value and is genuinely honoured, so a Director carrying the default is not refused |
+| `batch_count` | — | **N/A, refused** unless `1` |
+| `strength` | — | **N/A, ignored** — the LTX image-pin hold; an H3 `fl2va` keyframe is anchored outright |
+| `clip_skip` | — | **N/A, ignored** — the H3 conditioner reads a fixed hidden layer |
+| `output_format`, `output_compression` | same | **identical** |
+| `emit_segments` | same | **identical** — one `seg_<n>.webm` per shot, same file name, same URL, same poll-side `partials` list |
+| `persist` | same | **identical** — selects `$MINIMAX_H3_PERSIST_DIR` over `$MINIMAX_H3_JOB_DIR` |
+| `init_image` / `end_image` | aliases `first_frame` / `last_frame` | **identical** — seeds **segment 0**, exactly as LTX's opener does |
+| `model` | — | **N/A, refused** unless `""` or `"base"` (ignored at those values) — H3 ships one DiT |
+| `lora` | — | **N/A, refused** when non-empty (`[]` ignored) — no runtime-LoRA path |
+| `hires_chain`, `hires`, `two_stage` | — | **N/A, refused** when non-empty/true (`[]`/`false` ignored) — no latent-upscale refine chain |
+| `emit_stages` | — | **N/A, refused** when true (`false` ignored) — a shot renders in one pass, so there are no intermediate stages |
+| `resume_job_id` | — | **N/A, refused** — no latent bank. Accepting it would re-render the whole timeline and bill it as a resume |
+| `retake_segment` / `retake_from` | — | **N/A, refused** when `>= 0` — nothing to splice into. Submit the one shot; that is what a retake costs here |
+| `cont_latent_frames` | — | **N/A, ignored** — shots do not overlap at all |
+| `cont_seam_drop_frames`, `segment_seam_drop_frames` | — | **N/A, ignored** — there is no seam to trim |
+| `character_refs` | `references[]` with `kind: "image"` | **N/A, refused** when non-empty — different mechanism (VLM-routed omni references, not rotary-tagged latent overlap), so it cannot be translated silently |
+| `tass_phase_scale` | — | **N/A, refused** — controls the LTX rotary source tag |
+| `msr` | `references[]` with `kind: "image"` | **N/A, refused** |
+| `v2v_mode` | — | **N/A, refused** unless `0` |
+| `control_frames` | `references[]` with `kind: "video"` | **N/A, refused** when non-empty |
+| `relip_ref_tstride` | — | **N/A, refused** unless `1` |
+| `audio_full`, `audio_track`, `audio_<n>`, `audio_full_<n>`, `audio_track_<n>` (multipart) | — | **N/A, refused** — H3 *generates* its soundtrack in the same denoise as the picture. A reference soundtrack rides a `references[]` entry as `ref_audio_<i>` |
+| `audio_offset_frames`, `audio_fill_gaps` | — | **N/A, refused** when non-zero/true (`0`/`false` ignored) |
+| `reference_head_trim` | — | **N/A, refused** when non-zero — an LTX reference-leak workaround at latent frame 0 |
+
+##### Per-segment object
+
+| LTX `segments[i]` field | H3 | status |
+| --- | --- | --- |
+| `prompt` | same | **identical** |
+| `frames` | same name, per-shot length | **reshaped** — `17n+5` instead of `8k+1`, snapped up |
+| `seed` (`<0` inherits) | same | **identical** |
+| `steps` (`0` inherits) | same | **identical** |
+| `init_image` | same, plus alias `first_frame` | **reshaped** — H3 shots are independent, so **every** shot may pin its own opener, including shot 0. It is folded up to the request root exactly as LTX folds it, and sending both spellings for shot 0 is a `400` |
+| — | `end_image` / `last_frame` | **H3 addition** — the `fl2va` closing anchor, per shot |
+| `scene_cut` | — | **N/A, ignored** — every H3 shot *is* a cut; shots share no state |
+| `negative_prompt` | — | **N/A, refused** when non-empty |
+| `cfg` | — | **N/A, refused** unless `1.0` or the `-1` inherit sentinel |
+| `model` | — | **N/A, refused** unless `""`/`"base"` |
+| `lora` | — | **N/A, refused** when non-empty |
+| `pin_strength` | — | **N/A, refused** — a deliberate per-shot intent that would silently do nothing (contrast the request-root `strength`, which is ignored because it is a routine default) |
+| `keyframes` | — | **N/A, refused** — H3 pins only the first and last frame of a shot; mid-shot keyframes do not exist |
+| `beats` | — | **N/A, refused** — Prompt Relay is an LTX conditioning layout |
+| `v2v_mode`, `control_frames`, `v2v_source_latent_path`, `v2v_source_job_id`, `v2v_source_segment`, `v2v_guide_strength` | — | **N/A, refused** |
+| `bank_job_id` | — | **N/A, refused** — selects a banked LTX take |
+| `reference_head_trim` | — | **N/A, refused** when non-zero |
+
+##### H3-only, all optional and additive
+
+An LTX-shaped request that omits every one of these still renders, as `t2va`.
+
+| field | meaning |
+| --- | --- |
+| `references[]` | `{"kind": "image"\|"video"\|"audio", ...}`, with an optional per-entry `segments` scope array — same placement and same scoping convention as LTX's `character_refs` |
+| `sigma_shift_video` (default `12.0`) | the schedule the sampler walks; folded into `sample_params.flow_shift` unless the caller set that directly |
+| `sigma_shift_audio` (default `3.0`) | the audio stream's own flow shift |
+| `adapt_canvas` | opt in to the model's own canvas instead of a `400` on an off-grid size |
+| `task` (root and per segment) | `t2va` / `fl2va` / `ref2va`, **checked against** the conditioning actually supplied rather than trusted |
+| `first_frame` / `last_frame` | aliases for `init_image` / `end_image`, at the root and per segment |
+
+#### The `202`
+
+Everything LTX returns, plus H3's own geometry. `resume_from`, `retake_segment` and
+`resume_job_id` are present and **constant** (`0`, `-1`, `null`) purely so a client's LTX
+response parser does not need a branch — H3 keeps no bank, so a job always starts at shot 0.
+
+```json
+{
+  "id": "job_...", "kind": "minimax_h3", "status": "queued", "created": 1754,
+  "poll_url": "/sdcpp/v1/jobs/job_...",
+  "media_url": "/sdcpp/v1/jobs/job_.../media",
+  "cancel_url": "/sdcpp/v1/jobs/job_.../cancel",
+  "segments": 3, "resume_from": 0, "retake_segment": -1, "resume_job_id": null,
+  "task": "t2va", "width": 1344, "height": 768, "fps": 24,
+  "frames": 372, "duration_seconds": 15.5,
+  "segment_plans": [
+    {"index": 0, "task": "t2va", "requested_frames": 121, "frames": 124,
+     "duration_seconds": 5.17, "latent_frames": 37, "audio_latent_frames": 207}
+  ],
+  "references": {"images": 0, "videos": 0, "audios": 0},
+  "ignored": ["negative_prompt", "hires_chain", "cont_latent_frames"]
+}
+```
+
+`task` is `"mixed"` when the shots derive different tasks; `segment_plans[i].task` is always the
+per-shot truth. The poll response also carries `task` and `segments`, so a client that reattached
+after a restart still learns what the job it is watching is.
+
+#### What the model will not do, and therefore what the route refuses
+
+| sent | response |
+| --- | --- |
+| `negative_prompt` (non-empty) | `400` — guidance-distilled, there is no unconditional branch |
+| `cfg` / `cfg_scale` / `guidance_scale` != `1.0` | `400` — one forward per step, no CFG |
+| `batch_count` != `1` | `400` — one request is one sequence |
+| `fps` != `24` | `400` — the frame grid and the audio latent rate are both *defined* at 24 fps |
+
+These are refusals rather than silent drops on purpose: a caller who believes it sent a
+negative prompt and receives a plausible clip has no way to discover otherwise.
+
+#### Geometry
+
+`frames` (alias `video_frames`) snaps **up** to the model's `17n+5` grid, floored at `5`, per
+shot. `segment_plans` reports both `requested_frames` and the snapped `frames`, plus
+`latent_frames` (`2` at `<= 5`, else `((frames - 5) / 17) * 5 + 2`), `audio_latent_frames`
+(`round(frames / 24 * 40)`) and `duration_seconds`. A shot that omits `frames` inherits the
+request-level value, which itself falls back to the worker's `--video-frames`.
+
+`width` and `height` are request-level and must be multiples of `32` with
+`width * height <= 1032192` (`768 * 1344`). An off-grid size is a `400` naming the canvas the
+model's own rule would pick; send `adapt_canvas: true` to accept that canvas instead. Adoption
+is opt-in because rendering a size other than the one requested and reporting success is
+indistinguishable from working.
+
+`GET /h3/v1/capabilities` returns this whole contract as JSON, and with
+`?width=&height=&frames=` also returns the exact `plan` a request with those values would render
+at — so a UI can show the snapped duration without submitting anything, and without a CUDA
+worker being started to answer (see *Worker-isolation lifecycle*). The plan's
+`width`/`height`/`latent_width`/`latent_height` describe what `POST /h3/v1/generate` would
+actually render, so on a legal canvas they equal the requested one;
+`adapted_width`/`adapted_height` always carry the model's own canvas.
+
+#### Tasks
+
+`task` is optional and is **derived per shot from the conditioning actually supplied**; an
+explicit value — at the root or on the shot — is checked against that derivation rather than
+trusted, so a request naming `ref2va` with no references in scope is a `400` instead of a silent
+`t2va`.
+
+| task | conditioning |
+| --- | --- |
+| `t2va` | prompt only |
+| `fl2va` | `first_frame` and/or `last_frame` (aliases: `init_image` / `end_image`), anchored at frames `0` and `frames - 1` |
+| `ref2va` | at least one `references` entry in scope for that shot |
+
+`ref2va` and `fl2va` are different tasks; a shot carrying both forms is a `400`.
+
+```json
+{
+  "segments": [
+    { "prompt": "the camera pushes in as she starts to speak", "frames": 124, "seed": 42 },
+    { "prompt": "she turns to the window", "frames": 124,
+      "first_frame": "<base64 png/jpg or absolute path>" }
+  ],
+  "width": 1344,
+  "height": 768,
+  "steps": 30,
+  "emit_segments": true,
+  "references": [
+    { "kind": "image", "image": "<base64 png/jpg or absolute path>", "segments": [0] },
+    { "kind": "video", "frames": ["<base64>", "..."], "audio": "<base64 WAV>" },
+    { "kind": "audio", "audio": "<base64 WAV or absolute path>" }
+  ]
+}
+```
+
+#### References
+
+A reference is an object with `kind` of `image`, `video` or `audio`. Limits are `9` images, `3`
+videos and `3` audio references. A `video` reference carries its clip at **24 fps, one array
+entry per frame**; it is truncated to the longest shot in the job and then trimmed **down** to
+the same `17n+5` grid (it is VAE-encoded whole), and needs at least `5` frames (~0.2 s). A
+soundtrack may ride on the `video` entry as `audio`, in which case it is labelled `<Audio j>`
+before its own `<Video k>`. Audio may also be uploaded as a multipart file named
+`ref_audio_<i>`, where `<i>` is the reference's **index in the array** — sending both forms for
+one reference is a `400`.
+
+References are **top-level**, like LTX's `character_refs`, because a reference is a cast member
+or a location rather than a shot. An optional per-entry `"segments": [0, 2]` scopes it, in
+rendered-segment index space; **absent** means every shot and an explicit **empty array** means
+no shot, so the two are never confused. A shot with no references in scope reaches the engine in
+exactly the state a request with no references arrives in.
+
+⚠️ **Order is semantic.** A reference's position assigns its `<Picture i>` / `<Video k>` /
+`<Audio j>` ordinal and advances the shared rotary clock, so the same references in a different
+order are a different request. Scoping narrows the list for a shot but never reorders it. Each
+reference's pixels are decoded **once for the whole job**, so an N-shot chain pays one decode.
+
+**The 2 fps conditioner sampling is resolved by the route, not the caller.** Qwen3-VL sees a
+reference video at 2 fps (every 12th frame, deduplicated by the rounded cursor) and merges the
+sampled frames in pairs, and the conditioner asserts that the frame count and the per-block
+timestamps agree. Both are derived here from one number, so that agreement is structural rather
+than a convention two layers have to remember. Callers send the clip; they never send timestamps.
+
+Reference audio is staged under `$MINIMAX_H3_JOB_DIR/<id>` (default `/var/lib/minimax-h3/jobs`,
+or `$MINIMAX_H3_PERSIST_DIR` with `persist: true`), alongside the `seg_<n>.webm` partials.
+Nothing else is written there — there is no latent bank — and a request that carries neither
+reference audio nor `emit_segments` creates no directory at all.
+`DELETE /h3/v1/job?id=<engine-job-id>` removes it and is idempotent.
+
+#### Progressive delivery
+
+With `emit_segments: true`, each shot is published as `seg_<n>.webm` in the job bank as it
+completes and listed in the poll response's `partials` array, fetchable from
+`/sdcpp/v1/jobs/{id}/segments/{n}` — the same file name, the same URL and the same list shape
+LTX uses, so a client's progressive-delivery path needs no fork. The partial carries that shot's
+own generated soundtrack. There are no `?stage=` variants: an H3 shot renders in one pass.
+
+When the output format is `webm` the finished timeline is streamed out shot by shot, so peak
+frame memory stays at one shot rather than the whole timeline.
+
+#### Schedules
+
+Video and audio denoise on two differently-shifted flow schedules inside the same transformer
+call. `sigma_shift_video` (default `12.0`) is the schedule the sampler walks and is folded into
+`sample_params.flow_shift` unless the caller set that field directly. `sigma_shift_audio`
+(default `3.0`) rides `sd_vid_gen_params_t::minimax_h3_sigma_shift_audio`. Both are request-level.
+
+Muxing is done for you: the delivered media is a container holding every shot's frames and the
+stitched stereo track together, exactly as for LTX.
+
+#### Current limits
+
+**Staged text encoding is unverified against real weights.** A job encodes every shot's prompt in
+one text-encoder residency, reclaims the text encoder (params home, cache buffer, CUDA pool), and
+then renders every shot against a DiT that is loaded once. `MINIMAX_H3_STAGED_TE=0` disables the
+pre-pass, at which point each shot encodes its own prompt and pays a text-encoder/DiT swap — same
+output, more wall clock. The fallback is also automatic: if any shot fails to stage, the cache is
+dropped and every shot encodes in place.
+
+A mid-chain failure fails the **whole job**. Completed shots remain fetchable as partials when
+`emit_segments` is on, but the job does not deliver a truncated timeline as if it were finished.
+
+A reference list the engine cannot honour **fails the job with an explicit message** rather than
+rendering a reference-free clip that looks like a success. The refusals are: a reference video
+whose frame count is off the `17n+5` grid, an image reference carrying a soundtrack (only a video
+reference may), a reference kind or frame-count array that was not supplied, and a
+conditioner-frame or block-timestamp list that does not agree with the frames it describes.
+
+**Unverified against weights.** None of the H3 render path has run against a real checkpoint yet,
+so the conditioning-row packing, the reference canvas sizing and the joint-audio decode are
+correct by construction and by the layout regression only.
+
 ### Worker-isolation lifecycle
 
 When `SD_SERVER_WORKER_ISOLATION` (or a service-specific isolation flag) is enabled,
@@ -1449,6 +1749,19 @@ generation lazily starts a new child. A child is also killed when its supervisor
 dies, so stopping the public service cannot leave a CUDA worker orphaned. The
 filesystem-only `DELETE /ltx/v1/job` cleanup call is handled by the supervisor
 without spawning a child, so Director-bank cleanup remains safe after unload.
+
+The service-specific flags are `SD_IMAGE_ISOLATION`, `LTX_VIDEO_ISOLATION`,
+`WAN_VIDEO_ISOLATION`, `LONGCAT_AVATAR_WORKER_ISOLATION` and `MINIMAX_H3_ISOLATION`;
+any one of them enables the supervisor.
+
+Three endpoints are answered by the **supervisor itself** and never reach the child,
+because each touches only the filesystem or is pure arithmetic and the child would have
+to become resident to answer: `GET /sdapi/v1/loras`, `DELETE /ltx/v1/job` and — for
+MiniMax-H3 — `GET /h3/v1/capabilities` and `DELETE /h3/v1/job`. The capability document
+in particular is read while a client is *building* a request, i.e. before it wants a GPU
+at all, and H3's resident set is a ~20 GB DiT plus a ~25B text encoder. The supervisor
+and the child produce that document from the same shared code, so the two answers cannot
+drift.
 
 ### LongCat Avatar compatibility endpoint
 

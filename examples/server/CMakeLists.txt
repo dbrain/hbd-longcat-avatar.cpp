@@ -74,6 +74,7 @@ add_executable(${TARGET}
     routes_sdapi.cpp
     routes_sdcpp.cpp
     routes_ltx.cpp
+    routes_h3.cpp
     routes_longcat.cpp
     routes_wan.cpp
     routes_gpu_sharing.cpp

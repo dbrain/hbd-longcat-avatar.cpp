@@ -1,4 +1,6 @@
+#include <inttypes.h>
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -12,14 +14,23 @@
 #include <vector>
 
 #include "core/util.h"
+#include "model/diffusion/minimax_h3_qk_permute.hpp"
 #include "model_io/gguf_io.h"
 #include "model_io/safetensors_io.h"
 #include "model_io/streaming_writer.h"
 #include "model_loader.h"
 
+// How a tensor's head-channel axis is rewritten on the way out.  See the H3 section below.
+enum class QKPermuteMode {
+    None,
+    QKVRows,   // 2-D [in, 3*inner]: permute channels within each head of the q and k thirds
+    NormElems  // 1-D [head_dim]: permute the channels themselves
+};
+
 struct TensorExportInfo {
     TensorStorage storage;
     ggml_type type;
+    QKPermuteMode qk_permute = QKPermuteMode::None;
 };
 
 struct TensorExportJob {
@@ -52,17 +63,212 @@ static ggml_type get_export_tensor_type(ModelLoader& model_loader,
     return tensor_type;
 }
 
+/*======================================= MiniMax-H3 q/k RoPE permutation ==============================*/
+
+// Rewrite the head-channel axis of the H3 DiT's q/k projections so the runtime can rope the full
+// head in one call instead of slicing, roping and concatenating.  The maths, the proof that it is an
+// exact identity, and the numeric verification live in model/diffusion/minimax_h3_qk_permute.hpp.
+//
+// Scope: `<prefix>blocks.<N>.attn.{qkv_proj,q_norm,k_norm}.weight` only.  `token_refiner.blocks.*`
+// is deliberately excluded -- the refiner has no rotary embedding at all, so permuting it would be
+// churn that buys nothing.  Nothing else in this file or any other model is touched.
+struct H3QKPermutePlan {
+    bool active = false;
+    std::string prefix;  // includes the trailing '.', e.g. "model.diffusion_model."
+    int64_t head_dim = 0;
+    int64_t rot_dim  = 0;
+    std::vector<int64_t> perm;  // out[i] = in[perm[i]]
+};
+
+static bool h3_block_attn_leaf(const std::string& name, const std::string& prefix, const char* leaf) {
+    // <prefix>blocks.<digits>.attn.<leaf>, and NOT <prefix>token_refiner.blocks...
+    const std::string head = prefix + "blocks.";
+    if (!starts_with(name, head)) {
+        return false;
+    }
+    size_t i = head.size();
+    if (i >= name.size() || !isdigit(static_cast<unsigned char>(name[i]))) {
+        return false;
+    }
+    while (i < name.size() && isdigit(static_cast<unsigned char>(name[i]))) {
+        i++;
+    }
+    return name.compare(i, std::string::npos, std::string(".attn.") + leaf) == 0;
+}
+
+static H3QKPermutePlan h3_plan_qk_permutation(const ModelLoader& model_loader) {
+    H3QKPermutePlan plan;
+    const String2TensorStorage& map = model_loader.get_tensor_storage_map();
+
+    const std::string marker = MiniMaxH3::qk_permuted_marker_name();
+    const std::string anchor = "video_patch_proj.weight";
+    std::string prefix;
+    for (const auto& [name, _] : map) {
+        if (name.size() > anchor.size() && ends_with(name, anchor)) {
+            const std::string candidate = name.substr(0, name.size() - anchor.size());
+            if (map.count(candidate + "audio_patch_proj.weight") != 0) {
+                prefix = candidate;
+                break;
+            }
+        }
+    }
+    if (prefix.empty()) {
+        return plan;
+    }
+    if (map.count(prefix + marker) != 0) {
+        LOG_INFO("minimax-h3: q/k head channels are already permuted, passing them through");
+        return plan;
+    }
+
+    auto find = [&](const std::string& n) -> const TensorStorage* {
+        auto it = map.find(prefix + n);
+        return it == map.end() ? nullptr : &it->second;
+    };
+    const TensorStorage* q_norm = find("blocks.0.attn.q_norm.weight");
+    const TensorStorage* qkv    = find("blocks.0.attn.qkv_proj.weight");
+    if (q_norm == nullptr || q_norm->n_dims != 1 || qkv == nullptr || qkv->n_dims != 2) {
+        LOG_WARN("minimax-h3: no blocks.0.attn q/k weights found, skipping the RoPE permutation");
+        return plan;
+    }
+    plan.head_dim = q_norm->ne[0];
+    // rope.inv_freq is a persistent buffer in the reference spelling; diffusers computes it instead,
+    // so fall back to the reference's 16 rather than refusing.
+    const TensorStorage* inv = find("rope.inv_freq");
+    plan.rot_dim             = 2 * 3 * ((inv != nullptr && inv->n_dims == 1) ? inv->ne[0] : 16);
+
+    if (!MiniMaxH3::qk_permutation_is_applicable(plan.head_dim, plan.rot_dim)) {
+        LOG_WARN("minimax-h3: head_dim %" PRId64 " / rot_dim %" PRId64 " admits no q/k permutation, skipping",
+                 plan.head_dim,
+                 plan.rot_dim);
+        return plan;
+    }
+    if (plan.rot_dim == plan.head_dim) {
+        // Split-half over the whole head is already H3's own pairing; there is nothing to rewrite
+        // and no slice/concat to remove.
+        return plan;
+    }
+    if (qkv->ne[1] % (3 * plan.head_dim) != 0) {
+        LOG_WARN("minimax-h3: qkv_proj out dim %" PRId64 " is not 3 * heads * %" PRId64 ", skipping the permutation",
+                 qkv->ne[1],
+                 plan.head_dim);
+        return plan;
+    }
+
+    plan.perm   = MiniMaxH3::build_qk_head_permutation(plan.head_dim, plan.rot_dim);
+    plan.prefix = prefix;
+    plan.active = true;
+    LOG_INFO("minimax-h3: permuting q/k head channels for full-width split-half RoPE (head_dim=%" PRId64
+             ", rot_dim=%" PRId64 ")",
+             plan.head_dim,
+             plan.rot_dim);
+    return plan;
+}
+
+// Add the marker the runtime keys off.  Written through the tensor storage map rather than appended
+// to the export list so that load_tensor() -- which resolves by name against the map -- can find it.
+static void h3_add_permuted_marker(ModelLoader& model_loader, const H3QKPermutePlan& plan) {
+    String2TensorStorage& map     = model_loader.get_tensor_storage_map();
+    const std::string anchor      = plan.prefix + "video_patch_proj.weight";
+    const int64_t ne[SD_MAX_DIMS] = {1, 1, 1, 1, 1};
+
+    TensorStorage marker(plan.prefix + MiniMaxH3::qk_permuted_marker_name(),
+                         GGML_TYPE_F32,
+                         ne,
+                         1,
+                         map.at(anchor).file_index,
+                         0);
+    marker.is_inline_f32 = true;
+    marker.inline_f32    = 1.0f;
+    map[marker.name]     = marker;
+}
+
+static QKPermuteMode h3_permute_mode(const std::string& name, const H3QKPermutePlan& plan) {
+    if (!plan.active) {
+        return QKPermuteMode::None;
+    }
+    if (h3_block_attn_leaf(name, plan.prefix, "qkv_proj.weight")) {
+        return QKPermuteMode::QKVRows;
+    }
+    if (h3_block_attn_leaf(name, plan.prefix, "q_norm.weight") ||
+        h3_block_attn_leaf(name, plan.prefix, "k_norm.weight")) {
+        return QKPermuteMode::NormElems;
+    }
+    return QKPermuteMode::None;
+}
+
+// Apply the permutation to already-typed export bytes.
+//
+// QKVRows is a pure row shuffle along the OUTPUT axis, so it is exact for every type including a
+// quantised one: a row is `ne[0]` elements, which is a whole number of quant blocks, and the
+// quantiser works per row -- quantise-then-permute and permute-then-quantise are the same bytes.
+// NormElems moves individual elements, which is only meaningful when a "block" is one element;
+// collect_tensors_for_export keeps those two tiny 1-D tensors at their source type for exactly that
+// reason (and because 4-bit-quantising a per-channel RMSNorm gain was never a good idea).
+static bool h3_apply_permute(const TensorExportInfo& info, const H3QKPermutePlan& plan, std::vector<uint8_t>& data) {
+    if (info.qk_permute == QKPermuteMode::None) {
+        return true;
+    }
+    const int64_t head_dim           = plan.head_dim;
+    const std::vector<int64_t>& perm = plan.perm;
+
+    std::vector<uint8_t> scratch;
+
+    if (info.qk_permute == QKPermuteMode::NormElems) {
+        const size_t esz = ggml_type_size(info.type);
+        if (ggml_blck_size(info.type) != 1 || info.storage.ne[0] != head_dim ||
+            data.size() != static_cast<size_t>(head_dim) * esz) {
+            LOG_ERROR("minimax-h3: cannot permute '%s' as %s", info.storage.name.c_str(), ggml_type_name(info.type));
+            return false;
+        }
+        // One "row" is one element here, so the same helper does the job.
+        MiniMaxH3::permute_head_rows(data.data(), esz, 1, perm, scratch);
+        return true;
+    }
+
+    const size_t row_bytes = ggml_row_size(info.type, info.storage.ne[0]);
+    const int64_t rows     = info.storage.nelements() / info.storage.ne[0];
+    const int64_t inner    = rows / 3;
+    if (row_bytes == 0 || rows % 3 != 0 || inner % head_dim != 0 ||
+        data.size() != static_cast<size_t>(rows) * row_bytes) {
+        LOG_ERROR("minimax-h3: cannot permute '%s' (%" PRId64 " rows of %zu bytes)",
+                  info.storage.name.c_str(),
+                  rows,
+                  row_bytes);
+        return false;
+    }
+
+    // q and k only; v keeps its channel order because out_proj consumes it.
+    for (int64_t third = 0; third < 2; third++) {
+        MiniMaxH3::permute_head_rows(data.data() + static_cast<size_t>(third * inner) * row_bytes,
+                                     row_bytes,
+                                     inner / head_dim,
+                                     perm,
+                                     scratch);
+    }
+    return true;
+}
+
+/*=====================================================================================================*/
+
 static bool collect_tensors_for_export(ModelLoader& model_loader,
                                        ggml_type type,
                                        const TensorTypeRules& tensor_type_rules,
+                                       const H3QKPermutePlan& h3_plan,
                                        std::vector<TensorExportInfo>& tensors) {
     tensors.clear();
     tensors.reserve(model_loader.get_tensor_storage_map().size());
+    const std::string h3_marker = h3_plan.active ? h3_plan.prefix + MiniMaxH3::qk_permuted_marker_name() : "";
     for (const auto& kv : model_loader.get_tensor_storage_map()) {
         const TensorStorage& tensor_storage = kv.second;
         TensorExportInfo info;
-        info.storage = tensor_storage;
-        info.type    = get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules);
+        info.storage    = tensor_storage;
+        info.type       = get_export_tensor_type(model_loader, tensor_storage, type, tensor_type_rules);
+        info.qk_permute = h3_permute_mode(tensor_storage.name, h3_plan);
+        if (info.qk_permute == QKPermuteMode::NormElems || tensor_storage.name == h3_marker) {
+            // Both are per-element, not per-row: a quantised destination would make the permutation
+            // meaningless for the norms and the 4-byte marker unreadable.
+            info.type = tensor_storage.type;
+        }
         tensors.push_back(std::move(info));
     }
     LOG_INFO("collected %zu tensors for export", tensors.size());
@@ -122,7 +328,7 @@ static bool preallocate_output_file(const std::string& output_path, uint64_t fil
     return true;
 }
 
-static bool load_tensor_for_export(ModelLoader& model_loader, TensorExportJob& job) {
+static bool load_tensor_for_export(ModelLoader& model_loader, const H3QKPermutePlan& h3_plan, TensorExportJob& job) {
     size_t mem_size = 1 * 1024 * 1024;
     mem_size += ggml_tensor_overhead();
     TensorStorage output_storage = job.info.storage;
@@ -155,6 +361,11 @@ static bool load_tensor_for_export(ModelLoader& model_loader, TensorExportJob& j
         memcpy(job.data.data(), tensor->data, tensor_nbytes);
     }
     ggml_free(ggml_ctx);
+
+    if (!h3_apply_permute(job.info, h3_plan, job.data)) {
+        job.error = "failed to permute q/k head channels for '" + job.info.storage.name + "'";
+        return false;
+    }
     return true;
 }
 
@@ -162,6 +373,7 @@ static bool stream_tensor_data(ModelLoader& model_loader,
                                const std::string& output_path,
                                const std::vector<TensorExportInfo>& tensors,
                                const StreamingModelWriter& writer,
+                               const H3QKPermutePlan& h3_plan,
                                int n_threads,
                                std::string* error) {
     n_threads = n_threads > 0 ? n_threads : sd_get_num_physical_cores();
@@ -241,7 +453,7 @@ static bool stream_tensor_data(ModelLoader& model_loader,
                 TensorExportJob job;
                 job.info = tensors[tensor_index];
                 try {
-                    job.success = load_tensor_for_export(model_loader, job);
+                    job.success = load_tensor_for_export(model_loader, h3_plan, job);
                 } catch (const std::exception& e) {
                     job.error   = e.what();
                     job.success = false;
@@ -297,6 +509,7 @@ static bool write_model_file_streaming(ModelLoader& model_loader,
                                        const std::string& output_path,
                                        const std::vector<TensorExportInfo>& tensors,
                                        StreamingModelWriter& writer,
+                                       const H3QKPermutePlan& h3_plan,
                                        int n_threads,
                                        std::string* error) {
     std::vector<TensorWritePlan> plans = tensor_write_plans_from_export_infos(tensors);
@@ -307,7 +520,7 @@ static bool write_model_file_streaming(ModelLoader& model_loader,
         return false;
     }
     model_loader.process_model_files(false, false);
-    return stream_tensor_data(model_loader, output_path, tensors, writer, n_threads, error);
+    return stream_tensor_data(model_loader, output_path, tensors, writer, h3_plan, n_threads, error);
 }
 
 static bool init_convert_path(ModelLoader& model_loader, const char* path, const char* prefix, bool& loaded_any) {
@@ -331,8 +544,15 @@ static bool export_loaded_model(ModelLoader& model_loader,
     bool output_is_safetensors = ends_with(output_path, ".safetensors");
     TensorTypeRules type_rules = parse_tensor_type_rules(tensor_type_rules);
 
+    // MiniMax-H3 only, and only when the input is not already permuted; every other model gets an
+    // inactive plan and an untouched export path.
+    H3QKPermutePlan h3_plan = h3_plan_qk_permutation(model_loader);
+    if (h3_plan.active) {
+        h3_add_permuted_marker(model_loader, h3_plan);
+    }
+
     std::vector<TensorExportInfo> tensors;
-    bool success = collect_tensors_for_export(model_loader, type, type_rules, tensors);
+    bool success = collect_tensors_for_export(model_loader, type, type_rules, h3_plan, tensors);
     std::string error;
     if (success) {
         std::unique_ptr<StreamingModelWriter> writer;
@@ -341,7 +561,7 @@ static bool export_loaded_model(ModelLoader& model_loader,
         } else {
             writer = std::make_unique<GGUFStreamingWriter>();
         }
-        success = write_model_file_streaming(model_loader, output_path, tensors, *writer, n_threads, &error);
+        success = write_model_file_streaming(model_loader, output_path, tensors, *writer, h3_plan, n_threads, &error);
     }
 
     if (!success && !error.empty()) {

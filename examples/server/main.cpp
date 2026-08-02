@@ -178,6 +178,7 @@ int main(int argc, const char** argv) {
             req.method == "POST" &&
             (req.path == "/sdcpp/v1/img_gen" || req.path == "/sdcpp/v1/vid_gen" ||
              req.path == "/wan/v1/generate" || req.path == "/ltx/v1/generate" ||
+             req.path == "/h3/v1/generate" ||
              req.path == "/sdapi/v1/txt2img" || req.path == "/sdapi/v1/img2img" ||
              req.path == "/v1/images/generations" || req.path == "/v1/images/edits");
         if (is_generation_request && runtime_is_draining(runtime)) {
@@ -200,6 +201,7 @@ int main(int argc, const char** argv) {
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
     register_ltx_video_endpoints(svr, runtime);
+    register_minimax_h3_endpoints(svr, runtime);
     register_longcat_avatar_endpoints(svr, runtime);
     register_wan_video_endpoints(svr, runtime);
     register_gpu_sharing_endpoints(svr, runtime);

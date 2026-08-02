@@ -3,6 +3,7 @@
 #include "async_jobs.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -438,6 +439,35 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
         result["error"]  = nullptr;
     }
 
+    // The derived task ("t2va" / "fl2va" / "ref2va", or "mixed" when the shots differ) is echoed on
+    // every poll, not only in the 202, so a client that reattached after a restart still learns what
+    // the job it is watching actually is.
+    if (!job.h3_task.empty()) {
+        result["task"]     = job.h3_task;
+        result["segments"] = static_cast<int>(job.h3_prompts.size());
+    }
+
+    // MiniMax-H3 publishes the SAME artefact under the SAME URL as LTX -- one seg_<n>.webm per
+    // shot, listed here as it lands -- so koblem's progressive-delivery machinery needs no fork.
+    // The bank holds nothing else: there is no latent to resume from and no stage previews,
+    // because an H3 shot renders in a single pass.
+    if (job.h3_emit_segments && !job.h3_bank_dir.empty() &&
+        (job.status == AsyncJobStatus::Generating || job.status == AsyncJobStatus::Completed)) {
+        json partials = json::array();
+        for (size_t segment = 0; segment < job.h3_prompts.size(); ++segment) {
+            std::error_code error;
+            const fs::path path = fs::path(job.h3_bank_dir) / ("seg_" + std::to_string(segment) + ".webm");
+            if (fs::is_regular_file(path, error)) {
+                partials.push_back({
+                    {"segment_index", static_cast<int>(segment)},
+                    {"stage", 4},
+                    {"url", "/sdcpp/v1/jobs/" + job.id + "/segments/" + std::to_string(segment)},
+                });
+            }
+        }
+        if (!partials.empty()) result["partials"] = std::move(partials);
+    }
+
     // Koblem polls this optional list and fetches the URLs best-effort.  The
     // files are atomically published by SegmentPreviewWriter, so a listed
     // segment is always a complete, playable WebM rather than a partial write.
@@ -848,17 +878,121 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         }
     }
 
+    // MiniMax-H3 `ref2va` references. The route has already validated these, resolved the 2 fps
+    // conditioner frame subset and computed the block timestamps; this decodes each reference's
+    // pixels ONCE for the whole job and records where they landed, so a chain of N shots pays one
+    // decode rather than N.
+    //
+    // ⚠️ ORDER IS SEMANTIC and is preserved exactly: a reference's position assigns its
+    // `<Picture i>` / `<Video k>` / `<Audio j>` ordinal AND advances the shared rotary clock, so
+    // grouping by kind here would silently render a different request than the one submitted.
+    // Filtering a shot's references out narrows the list but never reorders it.
+    struct H3StagedReference {
+        int kind         = 0;
+        int frame_count  = 0;
+        size_t frame_offset = 0;  // into h3_frames
+        std::vector<float> block_timestamps;
+        const MiniMaxH3JobReference* source = nullptr;
+    };
+    std::vector<SDImageOwner> h3_frame_owners;
+    std::vector<sd_image_t> h3_frames;
+    std::vector<H3StagedReference> h3_staged_refs;
+    if (!job.h3_references.empty()) {
+        size_t total_frames = 0;
+        for (const MiniMaxH3JobReference& reference : job.h3_references) {
+            total_frames += reference.frames.size() + (reference.image.empty() ? 0 : 1);
+        }
+        h3_frame_owners.resize(total_frames);
+        h3_frames.reserve(total_frames);
+        h3_staged_refs.reserve(job.h3_references.size());
+
+        size_t owner_cursor = 0;
+        auto decode_frame = [&](const std::string& source, const std::string& what) {
+            if (ltx_source_is_path(source)) {
+                sd_image_t loaded = {};
+                if (!load_sd_image_from_file(&loaded, source.c_str(), 0, 0, 3)) {
+                    error_message = "failed to load MiniMax-H3 " + what;
+                    return false;
+                }
+                h3_frame_owners[owner_cursor].reset(loaded);
+            } else if (!decode_base64_image(source, 3, 0, 0, h3_frame_owners[owner_cursor])) {
+                error_message = "failed to decode MiniMax-H3 " + what;
+                return false;
+            }
+            h3_frames.push_back(h3_frame_owners[owner_cursor].get());
+            owner_cursor++;
+            return true;
+        };
+
+        for (size_t index = 0; index < job.h3_references.size(); ++index) {
+            const MiniMaxH3JobReference& reference = job.h3_references[index];
+            const std::string label                = "reference " + std::to_string(index + 1);
+            H3StagedReference staged;
+            staged.source       = &reference;
+            staged.frame_offset = h3_frames.size();
+            switch (reference.kind) {
+                case MiniMaxH3JobReference::Kind::Image: {
+                    if (!decode_frame(reference.image, label)) {
+                        return false;
+                    }
+                    staged.kind        = 0;
+                    staged.frame_count = 1;
+                    break;
+                }
+                case MiniMaxH3JobReference::Kind::Video: {
+                    for (size_t frame = 0; frame < reference.frames.size(); ++frame) {
+                        if (!decode_frame(reference.frames[frame], label + " frame " + std::to_string(frame + 1))) {
+                            return false;
+                        }
+                    }
+                    staged.kind        = 1;
+                    staged.frame_count = static_cast<int>(reference.frames.size());
+                    break;
+                }
+                case MiniMaxH3JobReference::Kind::Audio: {
+                    // No pixels at all. A count of ZERO here means exactly that -- it is never a
+                    // synonym for "all", which is the same distinction character_ref_segment_counts
+                    // documents on the LTX side.
+                    staged.kind        = 2;
+                    staged.frame_count = 0;
+                    break;
+                }
+            }
+            staged.block_timestamps.reserve(reference.block_timestamps.size());
+            for (double timestamp : reference.block_timestamps) {
+                staged.block_timestamps.push_back(static_cast<float>(timestamp));
+            }
+            h3_staged_refs.push_back(std::move(staged));
+        }
+    }
+    if (!job.h3_prompts.empty()) {
+        // The VIDEO shift is already folded into sample_params.flow_shift by the route -- that is
+        // the schedule the sampler walks. Only the audio shift needs its own field.
+        params.minimax_h3_sigma_shift_audio = job.h3_sigma_shift_audio;
+    }
+
     SegmentPreviewWriter segment_writer;
-    const bool write_segment_previews = !job.ltx_prompts.empty() && (job.ltx_emit_segments || job.ltx_emit_stages) &&
-                                        !job.ltx_bank_dir.empty();
+    const bool write_h3_segment_previews =
+        !job.h3_prompts.empty() && job.h3_emit_segments && !job.h3_bank_dir.empty();
+    const bool write_segment_previews = (!job.ltx_prompts.empty() && (job.ltx_emit_segments || job.ltx_emit_stages) &&
+                                         !job.ltx_bank_dir.empty()) ||
+                                        write_h3_segment_previews;
     if (write_segment_previews) {
-        segment_writer.directory = job.ltx_bank_dir;
+        segment_writer.directory = write_h3_segment_previews ? job.h3_bank_dir : job.ltx_bank_dir;
         segment_writer.fps = params.fps;
         segment_writer.quality = job.vid_gen.output_compression;
         segment_writer.start();
     }
 
     IncrementalWebmEncoder stream_encoder;
+    // The MiniMax-H3 chain accumulates its own output (it drives N generate_video calls rather
+    // than one), so the shared `results.adopt()` below must not run and clear it.
+    bool results_already_owned = false;
+    // ...and because it accumulates, a mid-chain failure leaves REAL frames behind. The generic
+    // tail below infers success from `num_results > 0`, which for every other path is zero after a
+    // failure precisely because `adopt(nullptr, 0)` cleared it. Without this flag a 12-shot job
+    // that died on shot 7 would be delivered as a complete 6-shot video.
+    bool h3_incomplete = false;
     {
         std::lock_guard<std::mutex> lock(*runtime.sd_ctx_mutex);
         sd_image_t* raw_results = nullptr;
@@ -1039,16 +1173,322 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                                                  &raw_results,
                                                  &num_results,
                                                  &generated_audio);
+        } else if (!job.h3_prompts.empty()) {
+            // ── MiniMax-H3: LTX's job shape over H3's one-sequence-per-denoise model ──────────
+            //
+            // ONE PACKED SEQUENCE PER DENOISE IS FIXED; ONE PROMPT PER REQUEST WAS NOT. So this is
+            // a loop of independent renders rather than a chain: no latent is carried across the
+            // seam, no bank is written, and nothing here can resume. A shot's `first_frame` /
+            // `last_frame` are its fl2va anchors -- the reference implementation pins those two
+            // keyframes at resolved indices 0 and frame_count-1 and nowhere else -- and they are
+            // supplied by the CALLER, which is what replaces LTX's `cont_latent_frames` overlap.
+            //
+            // ★ ONE RESIDENCY PER STAGE FOR THE WHOLE JOB, which is the reason the segment list
+            // exists at all. The Qwen3-VL text encoder is ~14.5 GB resident at NVFP4 and the DiT
+            // is ~11 GB, against a 15,888 MiB card: they cannot be co-resident, so the swap is
+            // unavoidable and the only question is whether it happens once or N times. So:
+            //
+            //   PHASE 1  encode EVERY shot's prompt, in one text-encoder residency
+            //   PHASE 2  reclaim the text encoder -- params home, cache buffer and CUDA pool
+            //   PHASE 3  render every shot; the DiT is loaded once and each shot's conditioning
+            //            comes back out of the staging cache instead of off the TE
+            //
+            // Everything else is amortised by the loop simply living here: it holds `sd_ctx_mutex`
+            // for the whole run so nothing can interleave, the reference pixels above are decoded
+            // once, and nothing between shots calls reclaim_ltx_chain_window_gpu_memory() --
+            // generate_video() scopes that to LTX -- so the params-backend homes stay warm.
+            //
+            // Staging is an OPTIMISATION, never a correctness dependency: if any shot fails to
+            // stage, the cache is dropped and every shot encodes in place exactly as it would
+            // have, one swap each. `MINIMAX_H3_STAGED_TE=0` takes that path deliberately, which is
+            // the runtime rollback for a path that has never met real weights.
+            const size_t segment_count = job.h3_prompts.size();
+            std::vector<float> h3_audio_samples;
+            uint32_t h3_audio_rate     = 0;
+            uint32_t h3_audio_channels = 0;
+            const bool h3_stream = job.vid_gen.output_format == "webm" &&
+                                   stream_encoder.begin(params.width, params.height, params.fps);
+
+            // Every shot's fully-resolved request, built BEFORE either phase runs because phase 1
+            // needs the same `sd_vid_gen_params_t` phase 3 will render from -- the conditioner's
+            // presentation depends on the references in scope for that shot, so staging a shot
+            // from anything other than its own params would encode a different request.
+            //
+            // ⚠️ `plans` is sized ONCE and never grows. Each plan's params holds raw pointers into
+            // that plan's own vectors, so a reallocation would dangle every one of them.
+            struct H3SegmentPlan {
+                SDImageOwner init_owner;
+                SDImageOwner end_owner;
+                std::vector<sd_image_t> ref_frames;
+                std::vector<int> ref_kinds;
+                std::vector<int> ref_frame_counts;
+                std::vector<int> ref_conditioner_frames;
+                std::vector<int> ref_conditioner_frame_counts;
+                std::vector<float> ref_block_timestamps;
+                std::vector<int> ref_block_timestamp_counts;
+                std::vector<const char*> ref_audio_paths;
+                sd_vid_gen_params_t params = {};
+            };
+            std::vector<H3SegmentPlan> plans(segment_count);
+
+            generated = true;
+            for (size_t segment = 0; segment < segment_count && generated; ++segment) {
+                H3SegmentPlan& plan = plans[segment];
+                plan.params         = params;
+                plan.params.prompt  = job.h3_prompts[segment].c_str();
+                plan.params.video_frames = job.h3_segment_frames[segment];
+                // LTX's sentinels exactly: a negative seed and a zero step count inherit the
+                // request-level value rather than meaning "seed 0" / "zero steps".
+                if (job.h3_segment_seeds[segment] >= 0) {
+                    plan.params.seed = job.h3_segment_seeds[segment];
+                }
+                if (job.h3_segment_steps[segment] > 0) {
+                    plan.params.sample_params.sample_steps = job.h3_segment_steps[segment];
+                }
+
+                // fl2va anchors, decoded to the render canvas. Segment 0 takes exactly this path
+                // too -- the route folded the request's top-level init_image/end_image into
+                // h3_segment_*_images[0] and erased them from the body -- so no shot is special.
+                const auto decode_anchor = [&](const std::string& source,
+                                               SDImageOwner& owner,
+                                               const char* what) {
+                    if (source.empty()) {
+                        return true;
+                    }
+                    if (ltx_source_is_path(source)) {
+                        sd_image_t loaded = {};
+                        if (!load_sd_image_from_file(&loaded, source.c_str(), params.width, params.height, 3)) {
+                            error_message = std::string("failed to load MiniMax-H3 ") + what + " for segment " +
+                                            std::to_string(segment);
+                            return false;
+                        }
+                        owner.reset(loaded);
+                        return true;
+                    }
+                    if (!decode_base64_image(source, 3, params.width, params.height, owner)) {
+                        error_message = std::string("failed to decode MiniMax-H3 ") + what + " for segment " +
+                                        std::to_string(segment);
+                        return false;
+                    }
+                    return true;
+                };
+                if (!decode_anchor(job.h3_segment_init_images[segment], plan.init_owner, "first_frame") ||
+                    !decode_anchor(job.h3_segment_end_images[segment], plan.end_owner, "last_frame")) {
+                    generated = false;
+                    break;
+                }
+                plan.params.init_image = plan.init_owner.get();
+                plan.params.end_image  = plan.end_owner.get();
+
+                // References in scope for THIS shot, in request order. The flat arrays are rebuilt
+                // per shot because the C API has no "applies everywhere" encoding, and because a
+                // shot that scopes every reference out must reach the engine in exactly the state
+                // a request with no references arrives in -- null pointers and a zero count --
+                // rather than in a special empty-array state nothing else ever produces.
+                for (const H3StagedReference& staged : h3_staged_refs) {
+                    const MiniMaxH3JobReference& reference = *staged.source;
+                    if (reference.scoped &&
+                        std::find(reference.segments.begin(), reference.segments.end(),
+                                  static_cast<int>(segment)) == reference.segments.end()) {
+                        continue;
+                    }
+                    plan.ref_kinds.push_back(staged.kind);
+                    plan.ref_frame_counts.push_back(staged.frame_count);
+                    for (int frame = 0; frame < staged.frame_count; ++frame) {
+                        plan.ref_frames.push_back(h3_frames[staged.frame_offset + static_cast<size_t>(frame)]);
+                    }
+                    // The counts arrays are per REFERENCE, not per video reference: an image or
+                    // audio entry contributes a zero so index i always means reference i.
+                    plan.ref_conditioner_frame_counts.push_back(
+                        static_cast<int>(reference.conditioner_frame_indices.size()));
+                    plan.ref_conditioner_frames.insert(plan.ref_conditioner_frames.end(),
+                                                       reference.conditioner_frame_indices.begin(),
+                                                       reference.conditioner_frame_indices.end());
+                    plan.ref_block_timestamp_counts.push_back(static_cast<int>(staged.block_timestamps.size()));
+                    plan.ref_block_timestamps.insert(plan.ref_block_timestamps.end(),
+                                                     staged.block_timestamps.begin(),
+                                                     staged.block_timestamps.end());
+                    plan.ref_audio_paths.push_back(reference.audio_path.empty() ? nullptr
+                                                                                : reference.audio_path.c_str());
+                }
+                if (!plan.ref_kinds.empty()) {
+                    plan.params.minimax_h3_ref_kinds  = plan.ref_kinds.data();
+                    plan.params.minimax_h3_ref_frames = plan.ref_frames.empty() ? nullptr
+                                                                                : plan.ref_frames.data();
+                    plan.params.minimax_h3_ref_frame_counts = plan.ref_frame_counts.data();
+                    plan.params.minimax_h3_ref_conditioner_frames =
+                        plan.ref_conditioner_frames.empty() ? nullptr : plan.ref_conditioner_frames.data();
+                    plan.params.minimax_h3_ref_conditioner_frame_counts =
+                        plan.ref_conditioner_frame_counts.data();
+                    plan.params.minimax_h3_ref_block_timestamps =
+                        plan.ref_block_timestamps.empty() ? nullptr : plan.ref_block_timestamps.data();
+                    plan.params.minimax_h3_ref_block_timestamp_counts =
+                        plan.ref_block_timestamp_counts.data();
+                    plan.params.minimax_h3_ref_audio_paths = plan.ref_audio_paths.data();
+                    plan.params.minimax_h3_refs_size       = static_cast<int>(plan.ref_kinds.size());
+                }
+            }
+
+            // ── PHASE 1: every prompt, one text-encoder residency ────────────────────────────
+            static const bool h3_staged_te_enabled = [] {
+                const char* value = getenv("MINIMAX_H3_STAGED_TE");
+                return value == nullptr || value[0] != '0';
+            }();
+            bool h3_staged_te = false;
+            if (generated && h3_staged_te_enabled) {
+                const auto staging_started = std::chrono::steady_clock::now();
+                h3_staged_te                     = true;
+                sd_ctx_minimax_h3_clear_staged_conditioning(runtime.sd_ctx);
+                for (size_t segment = 0; segment < segment_count; ++segment) {
+                    if (!sd_ctx_minimax_h3_stage_conditioning(runtime.sd_ctx, &plans[segment].params,
+                                                              static_cast<int>(segment))) {
+                        h3_staged_te = false;
+                        break;
+                    }
+                }
+                // ── PHASE 2: hand the card to the DiT ────────────────────────────────────────
+                //
+                // UNCONDITIONAL, including on the failure path. The staging pass pins the text
+                // encoder resident (that is what makes it one residency instead of N), so skipping
+                // this after a partial pass would carry ~14.5 GB into the DiT phase on a card that
+                // cannot hold both.
+                sd_ctx_minimax_h3_reclaim_text_encoder(runtime.sd_ctx);
+                if (h3_staged_te) {
+                    const double staging_seconds =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - staging_started).count();
+                    LOG_INFO("MiniMax-H3: encoded %zu shot prompt(s) in one text-encoder residency (%.2fs)",
+                             segment_count, staging_seconds);
+                } else {
+                    // Never fatal. Dropping the cache makes every lookup miss, which is exactly
+                    // the un-staged behaviour -- one swap per shot, same output.
+                    sd_ctx_minimax_h3_clear_staged_conditioning(runtime.sd_ctx);
+                    LOG_WARN("MiniMax-H3: could not stage the shot prompts up front; each shot will "
+                             "encode its own, costing a text-encoder/DiT swap per shot");
+                }
+            }
+
+            // ── PHASE 3: render every shot against the resident DiT ──────────────────────────
+            for (size_t segment = 0; segment < segment_count && generated; ++segment) {
+                if (job.cancel_requested) {
+                    error_message = "job cancelled by client";
+                    generated     = false;
+                    break;
+                }
+                // -1 disables the lookup outright, so an un-staged run cannot half-hit.
+                sd_ctx_minimax_h3_use_staged_conditioning(runtime.sd_ctx,
+                                                          h3_staged_te ? static_cast<int>(segment) : -1);
+
+                sd_image_t* segment_frames = nullptr;
+                int segment_frame_count    = 0;
+                sd_audio_t* segment_audio  = nullptr;
+                const bool segment_ok = generate_video(runtime.sd_ctx, &plans[segment].params, &segment_frames,
+                                                       &segment_frame_count, &segment_audio);
+                SDImageVec segment_results;
+                if (!segment_ok) {
+                    segment_frames = nullptr;
+                }
+                segment_results.adopt(segment_frames, segment_frame_count);
+                if (!segment_ok || segment_results.empty()) {
+                    free_sd_audio(segment_audio);
+                    if (error_message.empty()) {
+                        error_message = "MiniMax-H3 shot " + std::to_string(segment + 1) + " of " +
+                                        std::to_string(segment_count) + " returned no results";
+                    }
+                    generated = false;
+                    break;
+                }
+                if (runtime.gpu_sharing != nullptr) {
+                    runtime.gpu_sharing->diffusion_loaded.store(true);
+                }
+
+                // One partial per shot, published under the same file name and the same URL LTX
+                // uses, so koblem's progressive delivery needs no fork.
+                if (write_h3_segment_previews) {
+                    segment_writer.enqueue(static_cast<int>(segment), 4, segment_results.data(),
+                                           segment_results.count(), segment_audio);
+                }
+
+                if (segment_audio != nullptr && segment_audio->data != nullptr &&
+                    segment_audio->channels > 0 && segment_audio->sample_count > 0) {
+                    if (h3_audio_channels == 0) {
+                        h3_audio_rate     = segment_audio->sample_rate;
+                        h3_audio_channels = segment_audio->channels;
+                    }
+                    if (segment_audio->sample_rate == h3_audio_rate &&
+                        segment_audio->channels == h3_audio_channels) {
+                        const size_t total = static_cast<size_t>(segment_audio->sample_count) *
+                                             segment_audio->channels;
+                        h3_audio_samples.insert(h3_audio_samples.end(), segment_audio->data,
+                                                segment_audio->data + total);
+                    } else {
+                        // Every shot runs the same audio VAE at the same rate, so this cannot
+                        // happen without a real bug. Say so rather than splicing mismatched PCM
+                        // into the deliverable, which would desync everything after it.
+                        LOG_WARN("MiniMax-H3 shot %zu returned %u Hz x%u audio, expected %u Hz x%u; dropping it",
+                                 segment + 1, segment_audio->sample_rate, segment_audio->channels,
+                                 h3_audio_rate, h3_audio_channels);
+                    }
+                }
+                free_sd_audio(segment_audio);
+
+                if (h3_stream) {
+                    // Hand each frame to the encoder and free it immediately: peak frame memory
+                    // stays at one shot rather than the whole timeline, which is what makes a
+                    // 35-shot Director run survivable.
+                    for (int frame = 0; frame < segment_results.count(); ++frame) {
+                        stream_encoder.append(segment_results[frame]);
+                    }
+                } else {
+                    for (int frame = 0; frame < segment_results.count(); ++frame) {
+                        results.push_back(segment_results[frame]);
+                        segment_results[frame].data = nullptr;  // ownership moved to `results`
+                    }
+                }
+            }
+            // The cache is CONTEXT state, not job state: leaving it behind would condition the
+            // next job's shot i on this job's shot i, and the render would look completely normal.
+            sd_ctx_minimax_h3_clear_staged_conditioning(runtime.sd_ctx);
+
+            results_already_owned = true;
+            h3_incomplete         = !generated;
+            if (generated && !h3_audio_samples.empty() && h3_audio_channels > 0) {
+                auto* stitched = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
+                float* pcm     = static_cast<float*>(malloc(h3_audio_samples.size() * sizeof(float)));
+                if (stitched != nullptr && pcm != nullptr) {
+                    memcpy(pcm, h3_audio_samples.data(), h3_audio_samples.size() * sizeof(float));
+                    stitched->sample_rate  = h3_audio_rate;
+                    stitched->channels     = h3_audio_channels;
+                    stitched->sample_count = h3_audio_samples.size() / h3_audio_channels;
+                    stitched->data         = pcm;
+                    generated_audio        = stitched;
+                } else {
+                    free(pcm);
+                    free(stitched);
+                    LOG_WARN("MiniMax-H3: could not allocate the stitched soundtrack");
+                }
+            }
         }
         if (!generated) {
             raw_results = nullptr;
         } else if (runtime.gpu_sharing != nullptr) {
             runtime.gpu_sharing->diffusion_loaded.store(true);
         }
-        results.adopt(raw_results, num_results);
+        if (!results_already_owned) {
+            results.adopt(raw_results, num_results);
+        } else {
+            free(raw_results);
+        }
     }
     if (write_segment_previews) {
         segment_writer.finish();
+    }
+
+    if (h3_incomplete) {
+        free_sd_audio(generated_audio);
+        if (error_message.empty()) {
+            error_message = "MiniMax-H3 chain did not complete";
+        }
+        return false;
     }
 
     // When the chain streamed, the frames were encoded and freed as they arrived, so `results`
@@ -1057,7 +1497,13 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
     num_results = streamed ? stream_encoder.frames() : results.count();
     if (num_results <= 0) {
         free_sd_audio(generated_audio);
-        error_message = "generate_video returned no results";
+        // Only when nothing more specific was recorded. A render that failed for a KNOWN reason
+        // (a LoRA lease that could not be restored, an unsupported H3 conditioning shape) already
+        // set error_message; overwriting it with the generic line replaced a diagnosis with a
+        // symptom, and the diagnosis is the only part the caller cannot re-derive.
+        if (error_message.empty()) {
+            error_message = "generate_video returned no results";
+        }
         return false;
     }
 

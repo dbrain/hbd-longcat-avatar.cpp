@@ -81,6 +81,41 @@ struct LtxCharacterRef {
     std::vector<int> segments;
 };
 
+// One MiniMax-H3 `ref2va` reference as it arrived on the wire, in packed (request) order.
+//
+// `frames` is the reference video at its FULL 24 fps rate, already trimmed to the 17n+5 grid --
+// that is what the video VAE encodes. `conditioner_frame_indices` selects the 2 fps subset the
+// Qwen3-VL presentation is shown, and `block_timestamps` labels the pairs those sampled frames
+// merge into. The route computes the last two TOGETHER (minimax_h3_wire.h) because the conditioner
+// GGML_ASSERTs that their counts agree: one entry per merged 2-frame block, with the trailing frame
+// repeated when the sampled count is odd. Two callers deriving them separately is exactly how they
+// drift, and a drifted timestamp silently relabels every later block.
+struct MiniMaxH3JobReference {
+    enum class Kind {
+        Image,
+        Video,
+        Audio,
+    };
+
+    Kind kind = Kind::Image;
+    // Image: a base64 payload or a trusted absolute path (see ltx_source_is_path -- the `ltx_`
+    // prefix is historical, the predicate is generic).
+    std::string image;
+    std::vector<std::string> frames;
+    std::vector<int> conditioner_frame_indices;
+    std::vector<double> block_timestamps;
+    // Staged WAV inside the job bank. Set for Kind::Audio, and for a Kind::Video that carries a
+    // soundtrack -- in which case the reference is labelled "<Audio j>: " BEFORE its "<Video k>: ".
+    std::string audio_path;
+    // Optional SHOT SCOPE, in rendered-segment index space -- the exact convention
+    // LtxCharacterRef uses, and for the same reason: a reference is a cast member, not a shot.
+    // `scoped == false` means every segment, which is what an absent key must keep doing.
+    // `scoped == true` with an EMPTY list applies to no segment, so an empty array is never
+    // confused with "all".
+    bool scoped = false;
+    std::vector<int> segments;
+};
+
 struct AsyncGenerationJob {
     std::string id;
     AsyncJobKind kind     = AsyncJobKind::ImgGen;
@@ -193,6 +228,56 @@ struct AsyncGenerationJob {
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;
     bool ltx_emit_segments = false;
+    // Non-empty only for /h3/v1/generate. `h3_prompts` doubles as the "this is an H3 job" flag,
+    // mirroring how ltx_prompts / wan_vace_prompts select their branches.
+    //
+    // MiniMax-H3 renders ONE packed sequence per DENOISE -- video and its synchronised stereo
+    // audio in a single pass. That is a MODEL property and it is unchanged. One prompt per HTTP
+    // REQUEST was never a model property, it was our API choice, so this mirrors LTX: a segment
+    // list arrives in one request and the shots render back to back inside one job, which is what
+    // amortises the TE/DiT stage swap (they cannot be co-resident on a 16 GB card) over the whole
+    // timeline instead of paying it per shot.
+    //
+    // What deliberately does NOT come with the shape: there is no latent bank, no `resume_job_id`,
+    // no banked seg_<n>.bin, no prefix reload, no retake splice and no `cont_latent_frames`
+    // overlap. H3 has nothing to resume FROM -- its seam is an fl2va RGB frame the caller supplies
+    // -- so a retake costs exactly one shot, which is a genuine H3 advantage worth keeping. The
+    // bank directory holds staged reference audio and the progressive seg_<n>.webm partials, and
+    // nothing else.
+    std::vector<std::string> h3_prompts;
+    // Per-shot task, derived from the conditioning that shot actually carries ("t2va" / "fl2va" /
+    // "ref2va"). Sized with h3_prompts.
+    std::vector<std::string> h3_segment_tasks;
+    // Geometry the route resolved and the caller was told about in the 202, per shot. Durable job
+    // state rather than something recomputed at render time: a queued request must render the clip
+    // it was quoted, even if the snapping rule is later relaxed.
+    std::vector<int> h3_segment_frames;
+    std::vector<int> h3_segment_latent_frames;
+    std::vector<int> h3_segment_audio_latent_frames;
+    // Per-shot sampling overrides, LTX's sentinels exactly: a negative seed and a zero step count
+    // inherit the request-level value.
+    std::vector<int64_t> h3_segment_seeds;
+    std::vector<int> h3_segment_steps;
+    // fl2va anchors. Unlike LTX, segment 0 is NOT special here -- H3 shots are independent, so
+    // every shot may pin its own opening and closing frame. The request's top-level init_image /
+    // end_image seed shot 0, which is what keeps an LTX-shaped request working unchanged.
+    std::vector<std::string> h3_segment_init_images;
+    std::vector<std::string> h3_segment_end_images;
+    // Top-level reference list in REQUEST ORDER (order is semantic: it assigns the
+    // `<Picture i>` / `<Video k>` / `<Audio j>` ordinals and advances the shared rotary clock).
+    // Per-shot scope rides on the entry itself, exactly as ltx_character_refs does.
+    std::vector<MiniMaxH3JobReference> h3_references;
+    // Job-level summary of h3_segment_tasks, for the 202 and the logs.
+    std::string h3_task;
+    std::string h3_bank_dir;
+    // Publish one seg_<n>.webm per shot as it completes, so koblem gets progressive delivery.
+    // Same field, same file names and same poll-side `partials` list as LTX.
+    bool h3_emit_segments = false;
+    // Dual flow schedules. The VIDEO shift is also folded into sample_params.flow_shift by the
+    // route (that is the schedule the sampler itself walks); the AUDIO shift rides
+    // sd_vid_gen_params_t::minimax_h3_sigma_shift_audio.
+    float h3_sigma_shift_video = 12.f;
+    float h3_sigma_shift_audio = 3.f;
     std::vector<std::string> result_images_b64;
     std::string result_media_b64;
     std::string result_media_mime_type;

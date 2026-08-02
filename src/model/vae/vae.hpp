@@ -76,6 +76,12 @@ public:
             scale_factor = 32;
         } else if (version == VERSION_WAN2_2_TI2V || sd_version_is_hunyuan_video(version) || sd_version_is_mage_flow(version)) {
             scale_factor = 16;
+        } else if (sd_version_is_minimax_h3(version)) {
+            // 16x spatial (4x temporal, which this accessor does not model). Note this is NOT
+            // only about the generic tiler: get_vae_scale_factor() drives pixel<->latent sizing
+            // for the whole pipeline, so the default 8 would size every H3 latent 2x too large.
+            // The generic --vae-tiling path is separately forced off (this VAE tiles itself).
+            scale_factor = 16;
         } else if (sd_version_uses_flux2_vae(version)) {
             scale_factor = 16;
         } else if (version == VERSION_CHROMA_RADIANCE || version == VERSION_HIDREAM_O1 || sd_version_is_minit2i(version)) {

@@ -12,4 +12,5 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt);
+void register_minimax_h3_endpoints(httplib::Server& svr, ServerRuntime& rt);
 void register_gpu_sharing_endpoints(httplib::Server& svr, ServerRuntime& rt);

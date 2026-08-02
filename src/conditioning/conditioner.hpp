@@ -13,6 +13,7 @@
 
 #include "core/tensor_ggml.hpp"
 #include "core/util.h"
+#include "model/diffusion/minimax_h3_layout.hpp"
 #include "model/diffusion/model.hpp"
 #include "model/te/clip.hpp"
 #include "model/te/llm.hpp"
@@ -150,6 +151,10 @@ struct SDCondition {
     sd::Tensor<float> c_t5_weights;
     sd::Tensor<int32_t> c_input_ids;
     sd::Tensor<int32_t> c_position_ids;
+    // Per-row token class of c_crossattn. HiDream-O1 uses it for its text/image
+    // split; MiniMax-H3 uses it for the AdaLN modality tag the DiT indexes its
+    // per-(timestep, modality) table with (0 video, 1 text) -- comfy returns the
+    // same vector as "minimax_token_tags".
     sd::Tensor<int32_t> c_token_types;
     sd::Tensor<int32_t> c_vinput_mask;
     std::vector<std::pair<int, sd::Tensor<float>>> c_image_embeds;
@@ -235,6 +240,34 @@ static inline sd::Tensor<float> apply_token_weights(sd::Tensor<float> hidden_sta
     return hidden_states;
 }
 
+// One MiniMax-H3 `ref2va` reference, in packed (request) order. Ordinals are
+// numbered PER MODALITY, and a reference that carries sound is labelled
+// "<Audio j>: " BEFORE its own "<Picture i>: " / "<Video k>: ", mirroring the
+// order its rows are packed in.
+struct MiniMaxH3Reference {
+    enum class Kind {
+        IMAGE,
+        VIDEO,
+        AUDIO,
+    };
+
+    Kind kind = Kind::IMAGE;
+    // AUDIO always; VIDEO when the clip carries a soundtrack. A waveform never
+    // reaches the conditioner -- only its label does.
+    bool has_audio = false;
+    // IMAGE: the source pixels, [W, H, 3, 1].
+    const sd::Tensor<float>* image = nullptr;
+    // VIDEO: the frames the conditioner sees, each [W, H, 3, 1] and all of the
+    // same source size -- every 12th frame of the 24 fps reference, i.e. 2 fps,
+    // deduplicated. Qwen3-VL merges them in pairs into temporal patches; an odd
+    // count is repeat-padded with its last frame, as both references do.
+    const std::vector<sd::Tensor<float>>* frames = nullptr;
+    // VIDEO: one timestamp in seconds per merged 2-frame vision block, i.e. the
+    // mean of the pair's two 2 fps timestamps. Must agree with `frames` after
+    // that repeat-padding -- one entry per pair.
+    std::vector<double> block_timestamps;
+};
+
 struct ConditionerParams {
     std::string text;
     // Prompt Relay. When non-empty, `text` is ignored by the LTX-AV embedder in
@@ -249,6 +282,11 @@ struct ConditionerParams {
     int height                                       = -1;
     bool zero_out_masked                             = false;
     const std::vector<sd::Tensor<float>>* ref_images = nullptr;  // for qwen image edit
+    // MiniMax-H3 `ref2va` only. When non-empty it REPLACES ref_images as the
+    // conditioner's reference list, because ref2va numbers its labels per
+    // modality and interleaves audio-only entries that carry no pixels at all.
+    // Empty (the default) is `t2va` / `fl2va`, which read ref_images.
+    const std::vector<MiniMaxH3Reference>* minimax_h3_references = nullptr;
     RefImageParams ref_image_params;
     // Identifies the weight adapter currently attached to the cond_stage model,
     // for the VLM image-embed cache below. A runtime LoRA can target the text
@@ -277,6 +315,18 @@ public:
     virtual void set_flash_attention_enabled(bool enabled) = 0;
     virtual void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {}
     virtual void runner_done() {}
+    // Drop the runner's CACHE context and buffer (rope tables, reusable graph scratch), which
+    // `runner_done()` deliberately keeps because the next encode normally reuses them.
+    //
+    // Only worth calling when the text encoder is about to be evicted for a WHOLE JOB rather than
+    // between two encodes -- which is exactly the MiniMax-H3 case, where the ~14.5 GB resident TE
+    // and the ~11 GB DiT cannot share a 15,888 MiB card, so a job encodes every shot's prompt and
+    // then hands the card over. This pairs with GGMLRunner::free_cache_ctx_and_buffer() the way
+    // reclaim_ltx_chain_window_gpu_memory() already pairs them for the DiT and the VAEs.
+    //
+    // The default is a NO-OP on purpose: only the conditioner H3 actually uses overrides it, so no
+    // other model's residency can change even if a future caller reaches this through the base.
+    virtual void free_cache_ctx_and_buffer() {}
 };
 
 // ldm.modules.encoders.modules.FrozenCLIPEmbedder
@@ -1952,6 +2002,44 @@ struct AnimaConditioner : public Conditioner {
     }
 };
 
+// ── MiniMax-H3 request presentation ──────────────────────────────────────────
+//
+// H3 is NOT chat-templated. The conditioner sees raw label and prompt text with
+// vision blocks spliced in, and the DiT wants a per-row modality tag alongside
+// the embeddings. References:
+//   comfy      comfy/text_encoders/minimax.py       (MiniMaxH3Tokenizer)
+//   diffusers  modular_pipelines/minimax_h3/encoders.py, packing_ref2va.py
+namespace minimax_h3 {
+
+// The AdaLN modality tag of a conditioning row, from the DiT's own enum so the
+// two cannot drift. A vision block is VIDEO, not text, and the flanking
+// <|vision_start|>/<|vision_end|> are INSIDE the tagged span: comfy widens the
+// span by one on each side, diffusers tags the whole emitted block. Audio never
+// reaches the text stream, so Modality::Audio never appears here -- the DiT
+// tags its own audio rows.
+constexpr int32_t TAG_VIDEO = static_cast<int32_t>(MiniMaxH3::Modality::Video);
+constexpr int32_t TAG_TEXT  = static_cast<int32_t>(MiniMaxH3::Modality::Text);
+
+// The conditioning is the hidden state after decoder layer 50, UNNORMALIZED.
+// llm.hpp's stop_layers guard SILENTLY IGNORES an out_layer greater than the
+// layer count detected from the weights, so this has to match MiniMax's
+// pre-truncated 50-layer checkpoint exactly; asking for the stock 64 would fall
+// through and hand back the final layer instead. On a checkpoint that does keep
+// a final norm this still reads the pre-norm state, because forward_embeds()
+// only appends the normed tensor when num_layers + 1 is requested.
+constexpr int TEXT_ENCODER_LAYER = 50;
+
+// Python renders "<%.1f seconds>" with round-half-to-even, and snprintf rounds
+// the same binary value under the default FE_TONEAREST, so the mean of a 2 fps
+// pair prints "<0.2 seconds>" in both rather than "<0.3 seconds>".
+inline std::string block_timestamp_label(double seconds) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "<%.1f seconds>", seconds);
+    return std::string(buf);
+}
+
+}  // namespace minimax_h3
+
 struct LLMEmbedder : public Conditioner {
     SDVersion version;
     std::shared_ptr<BPETokenizer> tokenizer;
@@ -1979,7 +2067,10 @@ struct LLMEmbedder : public Conditioner {
                    sd_version_is_boogu_image(version) ||
                    sd_version_is_sefi_image(version) ||
                    sd_version_is_krea2(version) ||
-                   sd_version_is_mage_flow(version)) {
+                   sd_version_is_mage_flow(version) ||
+                   sd_version_is_minimax_h3(version)) {
+            // MiniMax-H3 is the first Qwen3-VL-32B here; every other consumer is
+            // the 4B. num_heads/num_kv_heads are detected from the weights.
             arch = LLM::LLMArch::QWEN3_VL;
         } else if (sd_version_is_z_image(version) || version == VERSION_OVIS_IMAGE || version == VERSION_FLUX2_KLEIN) {
             arch = LLM::LLMArch::QWEN3;
@@ -2114,35 +2205,63 @@ struct LLMEmbedder : public Conditioner {
     // reduction), and the attached weight adapter (a LoRA may target the text
     // encoder). Every other runtime knob that reaches this runner clears the
     // cache in its setter above rather than joining the key.
-    sd_cache::LruCache<sd::Tensor<float>> vlm_image_embed_cache{
+    // ⚠️ THE DEEPSTACK FEATURES ARE PART OF THE CACHED VALUE, never a separate lookup.
+    //
+    // A Qwen3-VL vision tower emits, alongside the merged embedding, one feature slab per
+    // deepstack merger; LLMRunner::vision_deepstack carries them into the decoder, which adds
+    // slab k into the hidden state at the visual rows after decoder layer k. A cache HIT skips
+    // the tower entirely, so an entry holding only the embedding would leave build_graph() with
+    // a vision block and no features -- which it LOG_WARNs about and then conditions WITHOUT.
+    // That is a different (and wrong) hidden state on a hit than on a miss, from the same
+    // request, discoverable only by reading a warning. Store them together or not at all.
+    struct VlmImageEmbed {
+        sd::Tensor<float> embed;
+        std::vector<sd::Tensor<float>> deepstack;
+    };
+
+    sd_cache::LruCache<VlmImageEmbed> vlm_image_embed_cache{
         sd_cache::entries_from_env("SD_VLM_IMAGE_EMBED_CACHE_ENTRIES", 4, 64)};
 
     sd::Tensor<float> encode_image_cached(int n_threads,
                                           const sd::Tensor<float>& resized_image,
-                                          const ConditionerParams& conditioner_params) {
+                                          const ConditionerParams& conditioner_params,
+                                          std::vector<sd::Tensor<float>>* out_deepstack) {
         if (resized_image.empty()) {
-            return llm->encode_image(n_threads, resized_image, false, true, true);
+            return llm->encode_image(n_threads, resized_image, false, true, true, nullptr, out_deepstack);
         }
         // Cache disabled: recompute, and do not even hash.
         if (sd_cache::entries_from_env("SD_VLM_IMAGE_EMBED_CACHE_ENTRIES", 4, 64) == 0) {
             LOG_INFO("[CACHE] vlm-embed MISS (disabled)");
-            return llm->encode_image(n_threads, resized_image, false, true, true);
+            return llm->encode_image(n_threads, resized_image, false, true, true, nullptr, out_deepstack);
         }
         const std::string key = sd_cache::tensor_content_key(resized_image) +
                                 "-v" + std::to_string(static_cast<int>(version)) +
                                 "-vis" + (llm->enable_vision ? "1" : "0") +
                                 "-t" + std::to_string(n_threads) +
                                 "-a" + conditioner_params.weight_adapter_signature;
-        if (const sd::Tensor<float>* hit = vlm_image_embed_cache.get(key); hit != nullptr) {
-            LOG_INFO("[CACHE] vlm-embed HIT (%lld tokens, no vision-tower pass)",
-                     hit->dim() >= 2 ? (long long)hit->shape()[1] : 0LL);
-            return *hit;
+        if (const VlmImageEmbed* hit = vlm_image_embed_cache.get(key); hit != nullptr) {
+            LOG_INFO("[CACHE] vlm-embed HIT (%lld tokens, %zu deepstack slab(s), no vision-tower pass)",
+                     hit->embed.dim() >= 2 ? (long long)hit->embed.shape()[1] : 0LL,
+                     hit->deepstack.size());
+            if (out_deepstack != nullptr) {
+                *out_deepstack = hit->deepstack;
+            }
+            return hit->embed;
         }
         LOG_INFO("[CACHE] vlm-embed MISS (running vision tower; %zu entries resident)",
                  vlm_image_embed_cache.size());
-        auto embed = llm->encode_image(n_threads, resized_image, false, true, true);
+        // The features are requested UNCONDITIONALLY, not only when this caller wants them:
+        // the entry outlives the call, and an entry stored without them would starve every
+        // later hit. encode_image() returns none when the checkpoint has no mergers, which is
+        // exactly the pre-deepstack behaviour.
+        VlmImageEmbed entry;
+        entry.embed = llm->encode_image(n_threads, resized_image, false, true, true, nullptr, &entry.deepstack);
+        if (out_deepstack != nullptr) {
+            *out_deepstack = entry.deepstack;
+        }
+        auto embed = entry.embed;
         if (!embed.empty()) {
-            vlm_image_embed_cache.put(key, embed);
+            vlm_image_embed_cache.put(key, std::move(entry));
         }
         return embed;
     }
@@ -2153,6 +2272,15 @@ struct LLMEmbedder : public Conditioner {
         }
         if (byt5) {
             byt5->runner_done();
+        }
+    }
+
+    void free_cache_ctx_and_buffer() override {
+        if (llm) {
+            llm->free_cache_ctx_and_buffer();
+        }
+        if (byt5) {
+            byt5->free_cache_ctx_and_buffer();
         }
     }
 
@@ -2221,8 +2349,9 @@ struct LLMEmbedder : public Conditioner {
                                     const std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds,
                                     const std::set<int>& out_layers,
                                     int prompt_template_encode_start_idx,
-                                    bool spell_quotes = false,
-                                    int max_length    = 100000000) {
+                                    bool spell_quotes                                        = false,
+                                    int max_length                                           = 100000000,
+                                    std::vector<std::vector<sd::Tensor<float>>>* vision_deepstack = nullptr) {
         auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, spell_quotes);
         auto& tokens             = std::get<0>(tokens_weights_mask);
         auto& weights            = std::get<1>(tokens_weights_mask);
@@ -2247,6 +2376,16 @@ struct LLMEmbedder : public Conditioner {
             }
         }
 
+        // Qwen3-VL DeepStack. Set IMMEDIATELY before the compute it belongs to and moved from,
+        // exactly like vision_block_grids: build_graph() consumes and clears it, so a second
+        // encode_prompt() in the same request (hunyuan's byt5 quoted-text pass, the negative
+        // prompt) cannot inherit the positive pass's features. Order is the ONLY thing binding a
+        // slab set to its block -- build_graph() zips it against image_embeds by index.
+        if (vision_deepstack != nullptr && !vision_deepstack->empty()) {
+            GGML_ASSERT(vision_deepstack->size() == image_embeds.size());
+            llm->vision_deepstack = std::move(*vision_deepstack);
+            vision_deepstack->clear();
+        }
         auto hidden_states = llm->compute(n_threads,
                                           input_ids,
                                           attention_mask,
@@ -2330,6 +2469,321 @@ struct LLMEmbedder : public Conditioner {
         }
     }
 
+    // MiniMax-H3's presentation, accumulated segment by segment.
+    //
+    // Every text segment is tokenized ON ITS OWN, as both references do. It
+    // matters: in `ref2va` a "<Video 1>: " label is immediately followed by a
+    // "<0.2 seconds>" label with no special token between them, so tokenizing
+    // the joined string would let BPE merge across the boundary and shift every
+    // tag after it by a token.
+    struct MiniMaxH3Presentation {
+        std::vector<int> token_ids;
+        std::vector<float> weights;
+        std::vector<int32_t> tags;
+        std::vector<std::pair<int, sd::Tensor<float>>> image_embeds;
+        // Parallel to image_embeds, which is how LLMRunner::fill_mrope_positions
+        // zips the two. add_vision() is the ONLY writer of either, so the two
+        // cannot be permuted relative to each other -- see the handover comment
+        // in encode_minimax_h3(), because nothing downstream can detect it.
+        std::vector<LLM::VisionBlockGrid> vision_grids;
+        // Also parallel to image_embeds, for the same reason and with the same
+        // single writer: build_graph() zips vision_deepstack against image_embeds
+        // by index. An entry may be EMPTY (a checkpoint with no deepstack mergers
+        // produces none); the outer vector still gets one slot per block so the
+        // zip stays aligned.
+        std::vector<std::vector<sd::Tensor<float>>> vision_deepstack;
+
+        void add_text(const std::vector<int>& ids, const std::vector<float>* text_weights = nullptr) {
+            GGML_ASSERT(text_weights == nullptr || text_weights->size() == ids.size());
+            for (size_t i = 0; i < ids.size(); i++) {
+                token_ids.push_back(ids[i]);
+                weights.push_back(text_weights != nullptr ? (*text_weights)[i] : 1.0f);
+                tags.push_back(minimax_h3::TAG_TEXT);
+            }
+        }
+
+        void add_vision(int start_id,
+                        int pad_id,
+                        int end_id,
+                        sd::Tensor<float> embed,
+                        const LLM::VisionBlockGrid& grid,
+                        std::vector<sd::Tensor<float>> deepstack = {}) {
+            const int64_t num_vision_tokens = embed.shape()[1];
+            GGML_ASSERT(static_cast<int64_t>(grid.llm_grid_h) * grid.llm_grid_w == num_vision_tokens);
+
+            // splice_image_embeds() replaces exactly [index, index + rows) of the
+            // id sequence with the embed's rows, so the index is the position of
+            // the FIRST pad token -- one past the <|vision_start|> just pushed.
+            token_ids.push_back(start_id);
+            weights.push_back(1.0f);
+            tags.push_back(minimax_h3::TAG_VIDEO);
+
+            image_embeds.emplace_back(static_cast<int>(token_ids.size()), std::move(embed));
+            vision_grids.push_back(grid);
+            vision_deepstack.push_back(std::move(deepstack));
+
+            for (int64_t i = 0; i < num_vision_tokens; i++) {
+                token_ids.push_back(pad_id);
+                weights.push_back(1.0f);
+                tags.push_back(minimax_h3::TAG_VIDEO);
+            }
+
+            token_ids.push_back(end_id);
+            weights.push_back(1.0f);
+            tags.push_back(minimax_h3::TAG_VIDEO);
+        }
+    };
+
+    // A vocabulary that does not carry H3's vision tokens is the wrong
+    // tokenizer, and would otherwise degrade into plausible-looking text tokens.
+    int minimax_h3_special_id(const std::string& token) {
+        auto ids = tokenizer->encode(token, nullptr);
+        GGML_ASSERT(ids.size() == 1);
+        return ids[0];
+    }
+
+    // Qwen3-VL's smart_resize: snap to the patch*merge grid, then clamp by area.
+    // One policy covers both block kinds -- comfy's process_video_block reuses
+    // process_qwen2vl_images' bounds verbatim.
+    void minimax_h3_vision_canvas(const sd::Tensor<float>& image,
+                                  const ConditionerParams& conditioner_params,
+                                  int& w_bar,
+                                  int& h_bar) {
+        const RefImageResizeMode resize_mode = conditioner_params.ref_image_params.vlm_resize_mode;
+        const int factor                     = llm->config.vision.patch_size * llm->config.vision.spatial_merge_size;
+        const int height                     = static_cast<int>(image.shape()[1]);
+        const int width                      = static_cast<int>(image.shape()[0]);
+
+        // Qwen3-VL's image-processor defaults, 56 and 3584 px a side. UNVERIFIED:
+        // diffusers reads them from the released checkpoint's
+        // preprocessor_config.json, which is not public yet.
+        int min_pixels = conditioner_params.ref_image_params.vlm_min_size;
+        if (min_pixels <= 0) {
+            min_pixels = 56;
+            if (resize_mode == RefImageResizeMode::AREA) {
+                min_pixels *= min_pixels;
+            }
+        }
+        int max_pixels = conditioner_params.ref_image_params.vlm_max_size;
+        if (max_pixels <= 0) {
+            max_pixels = 3584;
+            if (resize_mode == RefImageResizeMode::AREA) {
+                max_pixels *= max_pixels;
+            }
+        }
+
+        h_bar = std::max(factor, static_cast<int>(std::round(static_cast<double>(height) / factor)) * factor);
+        w_bar = std::max(factor, static_cast<int>(std::round(static_cast<double>(width) / factor)) * factor);
+        resize_image_dims(height, width, h_bar, w_bar, factor, min_pixels, max_pixels, resize_mode);
+
+        LOG_DEBUG("resize MiniMax-H3 vision block from %dx%d to %dx%d", width, height, w_bar, h_bar);
+    }
+
+    // An IMAGE vision block: one frame, repeated across the temporal patch.
+    sd::Tensor<float> encode_minimax_h3_image(int n_threads,
+                                              const sd::Tensor<float>& image,
+                                              const ConditionerParams& conditioner_params,
+                                              LLM::VisionBlockGrid* out_grid,
+                                              std::vector<sd::Tensor<float>>* out_deepstack) {
+        int w_bar = 0;
+        int h_bar = 0;
+        minimax_h3_vision_canvas(image, conditioner_params, w_bar, h_bar);
+
+        // Not routed through encode_image_cached(): that cache's key was audited
+        // for the krea2 path only. It would apply here unchanged -- an fl2va user
+        // re-renders the same keyframes on every seed -- but H3 cannot be
+        // measured yet, so this stays on the majority path.
+        auto image_embed =
+            llm->encode_image(n_threads, clip_preprocess(image, w_bar, h_bar), false, true, true, out_grid, out_deepstack);
+        GGML_ASSERT(!image_embed.empty());
+        return image_embed;
+    }
+
+    // A VIDEO vision block: `temporal_patch_size` DISTINCT frames. Taken by
+    // pointer so a repeated pad frame costs nothing -- the only copy is the
+    // preprocessed one this makes anyway.
+    sd::Tensor<float> encode_minimax_h3_frames(int n_threads,
+                                               const std::vector<const sd::Tensor<float>*>& frames,
+                                               const ConditionerParams& conditioner_params,
+                                               LLM::VisionBlockGrid* out_grid,
+                                               std::vector<sd::Tensor<float>>* out_deepstack) {
+        GGML_ASSERT(!frames.empty() && frames[0] != nullptr);
+
+        // The block's canvas comes from its FIRST frame and every frame of the
+        // block is put on it: encode_frames() asserts the frames match but does
+        // not resize, and comfy's process_video_block interpolates the pair
+        // together off one (height, width). Sizing each frame on its own would
+        // trip that assert the moment a source has a variable frame size.
+        int w_bar = 0;
+        int h_bar = 0;
+        minimax_h3_vision_canvas(*frames[0], conditioner_params, w_bar, h_bar);
+
+        std::vector<sd::Tensor<float>> block_frames;
+        block_frames.reserve(frames.size());
+        for (const auto* frame : frames) {
+            GGML_ASSERT(frame != nullptr);
+            block_frames.push_back(clip_preprocess(*frame, w_bar, h_bar));
+        }
+
+        auto frames_embed = llm->encode_frames(n_threads, block_frames, false, true, true, out_grid, out_deepstack);
+        GGML_ASSERT(!frames_embed.empty());
+        return frames_embed;
+    }
+
+    // MiniMax-H3: t2va / fl2va / ref2va, all three presentations.
+    //
+    //   t2va    <prompt>
+    //   fl2va   "<Picture i>: " <vision block> ... <prompt>
+    //   ref2va  per reference in packed order, ordinals per modality:
+    //             audio   "<Audio j>: "                      (label only)
+    //             image   "<Picture i>: " <vision block>
+    //             video   "<Video k>: " then per 2-frame block
+    //                     "<T.T seconds>" <vision block>
+    //           then <prompt>
+    //
+    // No chat template, no special tokens, no negative prompt -- the checkpoint
+    // is guidance-distilled and has no unconditional branch.
+    SDCondition encode_minimax_h3(int n_threads, const ConditionerParams& conditioner_params) {
+        const int vision_start_id = minimax_h3_special_id("<|vision_start|>");
+        const int vision_end_id   = minimax_h3_special_id("<|vision_end|>");
+        const int image_pad_id    = minimax_h3_special_id("<|image_pad|>");
+        const int video_pad_id    = minimax_h3_special_id("<|video_pad|>");
+
+        MiniMaxH3Presentation presentation;
+        auto add_label = [&](const std::string& label) {
+            presentation.add_text(tokenizer->encode(label, nullptr));
+        };
+
+        const auto* references = conditioner_params.minimax_h3_references;
+        if (references != nullptr && !references->empty()) {
+            LOG_INFO("MiniMaxH3Ref2VAPipeline (%zu references)", references->size());
+
+            int image_ordinal = 0;
+            int video_ordinal = 0;
+            int audio_ordinal = 0;
+            for (const auto& reference : *references) {
+                if (reference.has_audio) {
+                    add_label("<Audio " + std::to_string(++audio_ordinal) + ">: ");
+                }
+                if (reference.kind == MiniMaxH3Reference::Kind::IMAGE) {
+                    GGML_ASSERT(llm->enable_vision && reference.image != nullptr);
+                    add_label("<Picture " + std::to_string(++image_ordinal) + ">: ");
+                    LLM::VisionBlockGrid grid;
+                    std::vector<sd::Tensor<float>> deepstack;
+                    auto embed = encode_minimax_h3_image(n_threads, *reference.image, conditioner_params, &grid, &deepstack);
+                    presentation.add_vision(vision_start_id, image_pad_id, vision_end_id, std::move(embed), grid, std::move(deepstack));
+                } else if (reference.kind == MiniMaxH3Reference::Kind::VIDEO) {
+                    GGML_ASSERT(llm->enable_vision && reference.frames != nullptr && !reference.frames->empty());
+                    const auto& frames          = *reference.frames;
+                    const size_t temporal_patch = static_cast<size_t>(llm->config.vision.temporal_patch_size);
+
+                    // Repeat-pad to a whole number of temporal patches by clamping
+                    // the frame index, exactly as comfy's trailing-frame repeat
+                    // does. The caller's block_timestamps must already count the
+                    // padded blocks -- diffusers' sample_reference_video_frames
+                    // pads its timestamps the same way, so a caller that follows it
+                    // agrees and one that does not trips here rather than sliding
+                    // every later label onto the wrong block.
+                    const size_t num_blocks = (frames.size() + temporal_patch - 1) / temporal_patch;
+                    GGML_ASSERT(reference.block_timestamps.size() == num_blocks);
+
+                    add_label("<Video " + std::to_string(++video_ordinal) + ">: ");
+                    for (size_t block = 0; block < num_blocks; block++) {
+                        add_label(minimax_h3::block_timestamp_label(reference.block_timestamps[block]));
+
+                        std::vector<const sd::Tensor<float>*> pair;
+                        pair.reserve(temporal_patch);
+                        for (size_t f = 0; f < temporal_patch; f++) {
+                            pair.push_back(&frames[std::min(block * temporal_patch + f, frames.size() - 1)]);
+                        }
+
+                        LLM::VisionBlockGrid grid;
+                        std::vector<sd::Tensor<float>> deepstack;
+                        auto embed = encode_minimax_h3_frames(n_threads, pair, conditioner_params, &grid, &deepstack);
+                        // <|video_pad|>, per diffusers; comfy routes video blocks
+                        // through its image path instead. The two are
+                        // interchangeable here -- the pad row is overwritten by the
+                        // spliced embed, and this engine derives mrope positions
+                        // from vision_block_grids rather than from the pad ids.
+                        presentation.add_vision(vision_start_id, video_pad_id, vision_end_id, std::move(embed), grid, std::move(deepstack));
+                    }
+                }
+            }
+        } else if (llm->enable_vision && conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
+            LOG_INFO("MiniMaxH3Fl2VAPipeline (%zu keyframes)", conditioner_params.ref_images->size());
+            for (size_t i = 0; i < conditioner_params.ref_images->size(); i++) {
+                add_label("<Picture " + std::to_string(i + 1) + ">: ");
+                LLM::VisionBlockGrid grid;
+                std::vector<sd::Tensor<float>> deepstack;
+                auto embed =
+                    encode_minimax_h3_image(n_threads, (*conditioner_params.ref_images)[i], conditioner_params, &grid, &deepstack);
+                presentation.add_vision(vision_start_id, image_pad_id, vision_end_id, std::move(embed), grid, std::move(deepstack));
+            }
+        }
+
+        // The prompt, verbatim. Prompt-attention weighting is this engine's
+        // convention rather than H3's -- with no (word:1.2) in the prompt every
+        // weight is 1.0 and apply_token_weights() is a no-op.
+        auto tokens_weights_mask = tokenize(conditioner_params.text,
+                                            {0, static_cast<int>(conditioner_params.text.size())});
+        presentation.add_text(std::get<0>(tokens_weights_mask), &std::get<1>(tokens_weights_mask));
+
+        if (presentation.token_ids.empty()) {
+            // An empty request still has to be a sequence; comfy pads to one token.
+            presentation.add_text({tokenizer->PAD_TOKEN_ID});
+        }
+
+        sd::Tensor<int32_t> input_ids({static_cast<int64_t>(presentation.token_ids.size())},
+                                      presentation.token_ids);
+
+        // ORDERING INVARIANT: fill_mrope_positions() zips vision_block_grids
+        // against image_embeds BY INDEX, so grid b must describe block b of this
+        // presentation. add_vision() appending to both in one place is the only
+        // thing holding that -- a permutation does not assert, it silently
+        // rotates every vision row and every text row after it against the wrong
+        // grid.
+        //
+        // Non-empty is also the switch that turns the modality-aware path on at
+        // all: leave it empty and the runner keeps its flat (i, i, i) positions,
+        // which is exactly right for t2va and WRONG the moment a block exists,
+        // with no error either way. build_graph() consumes and clears it, so
+        // this must be set immediately before the compute it belongs to.
+        GGML_ASSERT(presentation.vision_grids.size() == presentation.image_embeds.size());
+        llm->vision_block_grids = std::move(presentation.vision_grids);
+
+        // Same handover, same invariant, same one-shot consumption as the grids above: slab set
+        // b belongs to block b of image_embeds. Left empty, build_graph() warns and conditions
+        // WITHOUT the deepstack features -- a plausible but wrong hidden state, exactly the
+        // silent failure mode the grids have.
+        GGML_ASSERT(presentation.vision_deepstack.size() == presentation.image_embeds.size());
+        llm->vision_deepstack = std::move(presentation.vision_deepstack);
+
+        // No attention mask: build_graph() then builds the plain causal mask,
+        // which is what the reference's all-ones mask decays to on a decoder.
+        auto hidden_states = llm->compute(n_threads,
+                                          input_ids,
+                                          sd::Tensor<float>(),
+                                          presentation.image_embeds,
+                                          {minimax_h3::TEXT_ENCODER_LAYER},
+                                          false,
+                                          false,
+                                          true,
+                                          true);
+        GGML_ASSERT(!hidden_states.empty());
+        hidden_states = apply_token_weights(std::move(hidden_states), presentation.weights);
+
+        // The spliced embeds replace their pad rows one for one, so the row count
+        // never moves off the tag vector. If it ever does, the DiT would index
+        // its AdaLN table with a shifted modality per row and still render.
+        std::vector<int64_t> tag_shape{static_cast<int64_t>(presentation.tags.size())};
+        GGML_ASSERT(hidden_states.shape()[1] == tag_shape[0]);
+
+        SDCondition result;
+        result.c_crossattn   = std::move(hidden_states);
+        result.c_token_types = sd::Tensor<int32_t>(std::move(tag_shape), std::move(presentation.tags));
+        return result;
+    }
+
     SDCondition get_learned_condition(int n_threads,
                                       const ConditionerParams& conditioner_params) override {
         std::string prompt;
@@ -2337,6 +2791,14 @@ struct LLMEmbedder : public Conditioner {
         std::vector<std::string> extra_prompts;
         std::vector<std::pair<int, int>> extra_prompts_attn_range;
         std::vector<std::pair<int, sd::Tensor<float>>> image_embeds;
+        // Qwen3-VL DeepStack features, ONE SLOT PER VISION BLOCK and in the same order as
+        // image_embeds -- build_graph() zips the two by index and cannot detect a permutation.
+        // Every branch below that pushes an image_embeds entry pushes exactly one slot here,
+        // immediately before its encode, which is what keeps the two aligned by construction.
+        //
+        // A checkpoint with no deepstack mergers fills the slots with EMPTY feature lists, so
+        // the whole thing is a no-op for every non-Qwen3-VL consumer without a version check.
+        std::vector<std::vector<sd::Tensor<float>>> vision_deepstack;
         int prompt_template_encode_start_idx = 34;
         int min_length                       = 0;  // pad tokens
         int max_length                       = 100000000;
@@ -2346,6 +2808,14 @@ struct LLMEmbedder : public Conditioner {
 
         int64_t t0                     = ggml_time_ms();
         RefImageResizeMode resize_mode = conditioner_params.ref_image_params.vlm_resize_mode;
+
+        if (sd_version_is_minimax_h3(version)) {
+            // H3 builds token ids and their modality tags directly rather than a
+            // template string, so it never reaches the shared encode_prompt().
+            auto result = encode_minimax_h3(n_threads, conditioner_params);
+            LOG_DEBUG("computing condition graph completed, taking %" PRId64 " ms", ggml_time_ms() - t0);
+            return result;
+        }
 
         if (sd_version_is_hunyuan_video(version)) {
             prompt_template_encode_start_idx = 98;
@@ -2427,7 +2897,9 @@ struct LLMEmbedder : public Conditioner {
 
                     LOG_DEBUG("resize LingBotVideo ref image %d from %dx%d to %dx%d", i, height, width, h_bar, w_bar);
                     auto resized_image = clip_preprocess(image, w_bar, h_bar);
-                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true);
+                    vision_deepstack.emplace_back();
+                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true,
+                                                           nullptr, &vision_deepstack.back());
                     GGML_ASSERT(!image_embed.empty());
 
                     std::string image_prefix = prompt + img_prompt + "<|vision_start|>";
@@ -2486,7 +2958,9 @@ struct LLMEmbedder : public Conditioner {
 
                     auto resized_image = clip_preprocess(image, w_bar, h_bar);
 
-                    auto image_embed = llm->encode_image(n_threads, resized_image, false, true, true);
+                    vision_deepstack.emplace_back();
+                    auto image_embed = llm->encode_image(n_threads, resized_image, false, true, true,
+                                                         nullptr, &vision_deepstack.back());
                     GGML_ASSERT(!image_embed.empty());
                     image_embeds.emplace_back(image_embed_idx, image_embed);
                     image_embed_idx += 1 + static_cast<int>(image_embed.shape()[1]) + 6;
@@ -2569,7 +3043,9 @@ struct LLMEmbedder : public Conditioner {
                     LOG_DEBUG("resize conditioner ref image %d from %dx%d to %dx%d", i, height, width, h_bar, w_bar);
 
                     auto resized_image = clip_preprocess(image, w_bar, h_bar);
-                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true);
+                    vision_deepstack.emplace_back();
+                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true,
+                                                           nullptr, &vision_deepstack.back());
                     GGML_ASSERT(!image_embed.empty());
 
                     std::string image_prefix = prompt_prefix + img_prompt + "<|vision_start|>";
@@ -2641,7 +3117,9 @@ struct LLMEmbedder : public Conditioner {
                     // Only the krea2 branch takes the cached path -- the other pipelines'
                     // encode is identical code, but each would need its own audit of what
                     // else varies per request, and none of them is the measured 3.30 s.
-                    auto image_embed = encode_image_cached(n_threads, resized_image, conditioner_params);
+                    vision_deepstack.emplace_back();
+                    auto image_embed = encode_image_cached(n_threads, resized_image, conditioner_params,
+                                                          &vision_deepstack.back());
                     GGML_ASSERT(!image_embed.empty());
 
                     // The "Picture N: " label is part of upstream's Krea2 template, but the
@@ -2712,7 +3190,9 @@ struct LLMEmbedder : public Conditioner {
                     LOG_DEBUG("resize conditioner ref image %d from %dx%d to %dx%d", i, height, width, h_bar, w_bar);
 
                     auto resized_image = clip_preprocess(image, w_bar, h_bar);
-                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true);
+                    vision_deepstack.emplace_back();
+                    auto image_embed   = llm->encode_image(n_threads, resized_image, false, true, true,
+                                                           nullptr, &vision_deepstack.back());
                     GGML_ASSERT(!image_embed.empty());
                     image_embeds.emplace_back(image_embed_idx, image_embed);
                     image_embed_idx += 1 + static_cast<int>(image_embed.shape()[1]) + 6;
@@ -2876,7 +3356,8 @@ struct LLMEmbedder : public Conditioner {
                                                out_layers,
                                                0,
                                                false,
-                                               max_length);
+                                               max_length,
+                                               &vision_deepstack);
             GGML_ASSERT(!hidden_states.empty());
 
             if (hidden_states.shape()[1] > pixeldit_max_length) {
@@ -2907,7 +3388,8 @@ struct LLMEmbedder : public Conditioner {
                                            out_layers,
                                            prompt_template_encode_start_idx,
                                            spell_quotes,
-                                           max_length);
+                                           max_length,
+                                           &vision_deepstack);
         std::vector<sd::Tensor<float>> extra_hidden_states_vec;
         if (sd_version_is_hunyuan_video(version) && byt5) {
             std::vector<std::string> quoted_texts;

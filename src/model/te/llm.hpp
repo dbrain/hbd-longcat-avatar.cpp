@@ -80,6 +80,49 @@ namespace LLM {
         int num_position_embeddings         = 0;
         std::set<int> fullatt_block_indexes = {7, 15, 23, 31};
         bool split_patch_embed              = false;
+        // Qwen3-VL DeepStack (https://arxiv.org/abs/2406.04334): a few vision blocks
+        // additionally feed a post-shuffle patch merger whose output is added into the LM's
+        // hidden states at the visual token positions. `first` is the merger's block name as
+        // the checkpoint spells it, `second` is the VISION block whose output it reads.
+        // Ascending by vision block; EMPTY disables the feature, which is what every arch
+        // other than Qwen3-VL -- and any Qwen3-VL checkpoint whose deepstack weights are
+        // absent or whose layer mapping cannot be resolved -- gets.
+        std::vector<std::pair<std::string, int>> deepstack_mergers;
+    };
+
+    // transformers `vision_config.deepstack_visual_indexes`. HF-format checkpoints name a
+    // deepstack merger by its POSITION in `deepstack_merger_list`, not by the vision block it
+    // reads, so that mapping has to come from the published configs. llama.cpp mmproj GGUFs
+    // put the block index straight into the tensor name (`v.deepstack.<block>.`) and never
+    // need this table.
+    //
+    // depth 24 -> {5, 11, 17}: Qwen3-VL-4B-Instruct config.json (verified against the
+    //                          checkout at HEAD of this work).
+    // depth 27 -> {8, 16, 24}: Qwen3-VL-32B-Instruct config.json, and the MiniMax-H3
+    //                          50-layer thin checkpoint derived from it.
+    static const std::vector<int>* qwen3_vl_deepstack_indexes(int64_t vision_layers, size_t count) {
+        static const std::vector<int> depth_24{5, 11, 17};
+        static const std::vector<int> depth_27{8, 16, 24};
+        const std::vector<int>* indexes = nullptr;
+        if (vision_layers == 24) {
+            indexes = &depth_24;
+        } else if (vision_layers == 27) {
+            indexes = &depth_27;
+        }
+        if (indexes == nullptr || indexes->size() != count) {
+            return nullptr;
+        }
+        return indexes;
+    }
+
+    // The post-spatial-merge grid of one vision block, i.e. Qwen's
+    // `image_grid_thw[1:] // spatial_merge_size`, in LLM rows. `llm_grid_t` is
+    // deliberately absent: Qwen3-VL always encodes a block with grid_t == 1 and
+    // separates video frames with timestamp text instead, so the temporal mrope
+    // axis of a vision row is always 0. See LLMRunner::vision_block_grids.
+    struct VisionBlockGrid {
+        int llm_grid_h = 0;
+        int llm_grid_w = 0;
     };
 
     struct LLMConfig {
@@ -106,7 +149,12 @@ namespace LLM {
         int64_t num_experts_per_tok = 0;
         LLMVisionConfig vision;
         bool have_vision_weight = false;
-        bool llama_cpp_style    = false;
+        // Conditioning-only checkpoints can ship the transformer stack truncated, with the
+        // final norm (and lm_head) stripped, because the consumer reads a mid-stack hidden
+        // state. Declaring a weight the file does not carry is a fatal load error, so the
+        // final norm is only built when the tensor map actually has it.
+        bool have_final_norm = true;
+        bool llama_cpp_style = false;
 
         static LLMConfig detect_from_weights(const String2TensorStorage& tensor_storage_map,
                                              const std::string& prefix,
@@ -182,6 +230,10 @@ namespace LLM {
 
             config.num_layers          = 0;
             int detected_vision_layers = 0;
+            // Keyed by the trailing integer of the merger's block name, which means the vision
+            // block for the llama.cpp spelling and the list position for the HF one.
+            std::map<int, std::string> deepstack_by_layer;
+            std::map<int, std::string> deepstack_by_position;
             for (const auto& [name, tensor_storage] : tensor_storage_map) {
                 if (!starts_with(name, prefix)) {
                     continue;
@@ -228,6 +280,24 @@ namespace LLM {
                         contains(name, "visual.merger.mlp.2.weight")) {
                         config.vision.out_hidden_size = tensor_storage.ne[1];
                     }
+                    // One hit per deepstack merger: the norm weight is the only tensor both
+                    // the llama.cpp (`visual.deepstack.<block>.`) and the HF
+                    // (`visual.deepstack_merger_list.<position>.`) spellings agree on.
+                    if (ends_with(name, ".norm.weight")) {
+                        const std::string rel = name.substr(pos + sizeof("visual.") - 1);
+                        if (starts_with(rel, "deepstack")) {
+                            const std::string key = rel.substr(0, rel.size() - (sizeof(".norm.weight") - 1));
+                            const size_t dot      = key.rfind('.');
+                            if (dot != std::string::npos) {
+                                const int index = atoi(key.c_str() + dot + 1);
+                                if (starts_with(key, "deepstack_merger_list.")) {
+                                    deepstack_by_position[index] = key;
+                                } else {
+                                    deepstack_by_layer[index] = key;
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 pos = name.find("layers.");
@@ -254,17 +324,69 @@ namespace LLM {
                     config.intermediate_size = tensor_storage.ne[1];
                 }
             }
-            if ((arch == LLMArch::QWEN3 || arch == LLMArch::QWEN3_VL) && config.num_layers == 28) {
-                config.num_heads = 16;
+            std::string base = prefix;
+            if (!base.empty() && base.back() != '.') {
+                base += '.';
             }
+            auto detect_heads = [&](const std::string& proj_name) -> int {
+                auto it = tensor_storage_map.find(base + "model.layers.0.self_attn." + proj_name + ".weight");
+                if (it == tensor_storage_map.end() || config.head_dim <= 0) {
+                    return 0;
+                }
+                const int64_t out_features = it->second.ne[1];
+                if (out_features <= 0 || out_features % config.head_dim != 0) {
+                    return 0;
+                }
+                return static_cast<int>(out_features / config.head_dim);
+            };
+            if (int detected = detect_heads("q_proj"); detected > 0) {
+                config.num_heads = detected;
+            }
+            if (int detected = detect_heads("k_proj"); detected > 0) {
+                config.num_kv_heads = detected;
+            }
+            config.have_final_norm = tensor_storage_map.find(base + "model.norm.weight") != tensor_storage_map.end();
             if (detected_vision_layers > 0) {
                 config.vision.num_layers = detected_vision_layers;
             }
-            LOG_DEBUG("llm: num_layers = %" PRId64 ", vocab_size = %" PRId64 ", hidden_size = %" PRId64 ", intermediate_size = %" PRId64,
+            if (!deepstack_by_layer.empty()) {
+                for (const auto& [layer, key] : deepstack_by_layer) {
+                    config.vision.deepstack_mergers.emplace_back(key, layer);
+                }
+            } else if (!deepstack_by_position.empty()) {
+                const size_t count              = deepstack_by_position.size();
+                const bool contiguous           = deepstack_by_position.begin()->first == 0 &&
+                                        deepstack_by_position.rbegin()->first == static_cast<int>(count) - 1;
+                const std::vector<int>* indexes = contiguous ? qwen3_vl_deepstack_indexes(config.vision.num_layers, count) : nullptr;
+                if (indexes == nullptr) {
+                    // Guessing the mapping would silently condition on the wrong vision depth,
+                    // so fall back to the pre-deepstack behaviour instead.
+                    LOG_WARN("llm: %zu deepstack mergers present but their vision blocks are unknown for a "
+                             "%d-layer tower; deepstack disabled",
+                             count,
+                             static_cast<int>(config.vision.num_layers));
+                } else {
+                    size_t i = 0;
+                    for (const auto& entry : deepstack_by_position) {
+                        config.vision.deepstack_mergers.emplace_back(entry.second, (*indexes)[i]);
+                        ++i;
+                    }
+                }
+            }
+            for (size_t i = 0; i < config.vision.deepstack_mergers.size(); ++i) {
+                LOG_DEBUG("llm: deepstack merger %zu = '%s' reads vision block %d",
+                          i,
+                          config.vision.deepstack_mergers[i].first.c_str(),
+                          config.vision.deepstack_mergers[i].second);
+            }
+            LOG_DEBUG("llm: num_layers = %" PRId64 ", vocab_size = %" PRId64 ", hidden_size = %" PRId64 ", intermediate_size = %" PRId64 ", num_heads = %d, num_kv_heads = %d, final_norm = %d",
                       config.num_layers,
                       config.vocab_size,
                       config.hidden_size,
-                      config.intermediate_size);
+                      config.intermediate_size,
+                      config.num_heads,
+                      config.num_kv_heads,
+                      config.have_final_norm ? 1 : 0);
             return config;
         }
     };
@@ -677,19 +799,28 @@ namespace LLM {
     protected:
         LLMVisionArch arch_;
         int64_t hidden_size;
+        // transformers Qwen3VLVisionPatchMerger.use_postshuffle_norm: the deepstack mergers
+        // normalise the FUSED spatial-merge vector, the final merger normalises the per-patch
+        // one. The affine is sized accordingly, so this is not a reorder that washes out --
+        // reusing the final merger's recipe costs ~20% relative L2 on the merger output
+        // (measured against transformers 4.57.3 on Qwen3-VL-4B).
+        bool post_shuffle_norm_;
 
     public:
         VisionPatchMerger(LLMVisionArch arch,
                           int64_t dim,
                           int64_t context_dim,
-                          int64_t spatial_merge_size)
+                          int64_t spatial_merge_size,
+                          bool post_shuffle_norm = false)
             : arch_(arch),
-              hidden_size(context_dim * spatial_merge_size * spatial_merge_size) {
+              hidden_size(context_dim * spatial_merge_size * spatial_merge_size),
+              post_shuffle_norm_(post_shuffle_norm) {
             if (arch_ == LLMVisionArch::QWEN3_VL) {
-                blocks["norm"]       = std::make_shared<LayerNorm>(context_dim, 1e-6f);
+                blocks["norm"]       = std::make_shared<LayerNorm>(post_shuffle_norm_ ? hidden_size : context_dim, 1e-6f);
                 blocks["linear_fc1"] = std::make_shared<Linear>(hidden_size, hidden_size, true);
                 blocks["linear_fc2"] = std::make_shared<Linear>(hidden_size, dim, true);
             } else {
+                GGML_ASSERT(!post_shuffle_norm_);
                 blocks["ln_q"]  = std::make_shared<RMSNorm>(context_dim, 1e-6f);
                 blocks["mlp.0"] = std::make_shared<Linear>(hidden_size, hidden_size);
                 blocks["mlp.2"] = std::make_shared<Linear>(hidden_size, dim);
@@ -702,8 +833,13 @@ namespace LLM {
                 auto linear_fc1 = std::dynamic_pointer_cast<Linear>(blocks["linear_fc1"]);
                 auto linear_fc2 = std::dynamic_pointer_cast<Linear>(blocks["linear_fc2"]);
 
-                x = norm->forward(ctx, x);
-                x = ggml_reshape_2d(ctx->ggml_ctx, x, hidden_size, ggml_nelements(x) / hidden_size);
+                if (post_shuffle_norm_) {
+                    x = ggml_reshape_2d(ctx->ggml_ctx, x, hidden_size, ggml_nelements(x) / hidden_size);
+                    x = norm->forward(ctx, x);
+                } else {
+                    x = norm->forward(ctx, x);
+                    x = ggml_reshape_2d(ctx->ggml_ctx, x, hidden_size, ggml_nelements(x) / hidden_size);
+                }
                 x = linear_fc1->forward(ctx, x);
                 x = ggml_gelu_erf(ctx->ggml_ctx, x);
                 x = linear_fc2->forward(ctx, x);
@@ -844,6 +980,7 @@ namespace LLM {
         int spatial_merge_size;
         int num_grid_per_side;
         std::set<int> fullatt_block_indexes;
+        std::vector<std::pair<std::string, int>> deepstack_mergers_;
 
     public:
         VisionModel(bool llama_cpp_style,
@@ -853,7 +990,8 @@ namespace LLM {
               num_layers(vision_params.num_layers),
               spatial_merge_size(vision_params.spatial_merge_size),
               num_grid_per_side(vision_params.num_position_embeddings > 0 ? static_cast<int>(std::sqrt(vision_params.num_position_embeddings)) : 0),
-              fullatt_block_indexes(vision_params.fullatt_block_indexes) {
+              fullatt_block_indexes(vision_params.fullatt_block_indexes),
+              deepstack_mergers_(vision_params.deepstack_mergers) {
             blocks["patch_embed"] = std::shared_ptr<GGMLBlock>(new VisionPatchEmbed(vision_params.split_patch_embed,
                                                                                     arch_,
                                                                                     vision_params.patch_size,
@@ -875,6 +1013,18 @@ namespace LLM {
                                                                                 vision_params.out_hidden_size,
                                                                                 vision_params.hidden_size,
                                                                                 spatial_merge_size));
+            for (const auto& [name, layer] : deepstack_mergers_) {
+                GGML_ASSERT(layer >= 0 && layer < num_layers);
+                blocks[name] = std::shared_ptr<GGMLBlock>(new VisionPatchMerger(arch_,
+                                                                                vision_params.out_hidden_size,
+                                                                                vision_params.hidden_size,
+                                                                                spatial_merge_size,
+                                                                                true));
+            }
+        }
+
+        size_t num_deepstack_mergers() const {
+            return deepstack_mergers_.size();
         }
 
         std::shared_ptr<Embedding> pos_embedder() {
@@ -899,7 +1049,8 @@ namespace LLM {
                              ggml_tensor* window_index,
                              ggml_tensor* window_inverse_index,
                              ggml_tensor* window_mask,
-                             ggml_tensor* pos_embeds = nullptr) {
+                             ggml_tensor* pos_embeds                     = nullptr,
+                             std::vector<ggml_tensor*>* deepstack_out    = nullptr) {
             // pixel_values: [grid_t*(H/mh/ph)*(W/mw/pw)*mh*mw, C*pt*ph*pw]
             // window_index: [grid_t*(H/mh/ph)*(W/mw/pw)]
             // window_inverse_index: [grid_t*(H/mh/ph)*(W/mw/pw)]
@@ -930,6 +1081,15 @@ namespace LLM {
                 if (i == 0) {
                 }
                 sd::ggml_graph_cut::mark_graph_cut(x, "llm.vision.blocks." + std::to_string(i), "x");
+                if (deepstack_out != nullptr) {
+                    for (const auto& [name, layer] : deepstack_mergers_) {
+                        if (layer != i) {
+                            continue;
+                        }
+                        auto deepstack_merger = std::dynamic_pointer_cast<VisionPatchMerger>(blocks[name]);
+                        deepstack_out->push_back(deepstack_merger->forward(ctx, x));
+                    }
+                }
             }
 
             x = merger->forward(ctx, x);
@@ -1263,7 +1423,9 @@ namespace LLM {
             for (int i = 0; i < num_layers; i++) {
                 blocks["layers." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new TransformerBlock(config, i));
             }
-            blocks["norm"] = std::shared_ptr<GGMLBlock>(new LLMRMSNorm(config.hidden_size, config.rms_norm_eps, config.rms_norm_add));
+            if (config.have_final_norm) {
+                blocks["norm"] = std::shared_ptr<GGMLBlock>(new LLMRMSNorm(config.hidden_size, config.rms_norm_eps, config.rms_norm_add));
+            }
         }
 
         ggml_tensor* embed(GGMLRunnerContext* ctx,
@@ -1273,14 +1435,46 @@ namespace LLM {
             return x;
         }
 
+        // transformers Qwen3VLTextModel.forward: `deepstack_visual_embeds[k]` is added into the
+        // hidden states at the visual token positions AFTER decoder layer k, for the first
+        // len(deepstack_visual_embeds) layers -- so merger k of the vision tower feeds decoder
+        // layer k, not the vision block it was read from. Verified against transformers 4.57.3
+        // on Qwen3-VL-4B: disabling deepstack changes hidden_states[1] at visual positions by
+        // exactly ||deepstack[0]|| / ||hidden|| (0.71400 vs 0.71400) and leaves every text
+        // position bit-identical.
+        //
+        // `deepstack` is (token index of the vision block's first row, one feature tensor per
+        // decoder layer), i.e. the same (index, embed) pairing splice_image_embeds() uses.
+        static ggml_tensor* apply_deepstack(GGMLRunnerContext* ctx,
+                                            ggml_tensor* x,
+                                            const std::vector<std::pair<int, std::vector<ggml_tensor*>>>& deepstack,
+                                            int layer_index) {
+            for (const auto& [token_start, features] : deepstack) {
+                if (layer_index >= static_cast<int>(features.size())) {
+                    continue;
+                }
+                ggml_tensor* feature = features[layer_index];
+                GGML_ASSERT(x->ne[2] == 1);
+                GGML_ASSERT(x->type == GGML_TYPE_F32 && feature->type == GGML_TYPE_F32);
+                GGML_ASSERT(feature->ne[0] == x->ne[0] && feature->ne[2] == 1 && feature->ne[3] == 1);
+                GGML_ASSERT(token_start >= 0 && token_start + feature->ne[1] <= x->ne[1]);
+                x = ggml_acc(ctx->ggml_ctx, x, feature, x->nb[1], x->nb[2], x->nb[3], token_start * x->nb[1]);
+            }
+            return x;
+        }
+
         ggml_tensor* forward_embeds(GGMLRunnerContext* ctx,
                                     ggml_tensor* x,
                                     ggml_tensor* input_pos,
                                     ggml_tensor* attention_mask,
                                     std::set<int> out_layers,
-                                    ggml_tensor* sliding_attention_mask = nullptr,
-                                    bool return_all_hidden_states       = false) {
-            auto norm = std::dynamic_pointer_cast<LLMRMSNorm>(blocks["norm"]);
+                                    ggml_tensor* sliding_attention_mask                                       = nullptr,
+                                    bool return_all_hidden_states                                             = false,
+                                    const std::vector<std::pair<int, std::vector<ggml_tensor*>>>* deepstack   = nullptr) {
+            std::shared_ptr<LLMRMSNorm> norm;
+            if (config.have_final_norm) {
+                norm = std::dynamic_pointer_cast<LLMRMSNorm>(blocks["norm"]);
+            }
             std::vector<ggml_tensor*> intermediate_outputs;
 
             if (config.normalize_input) {
@@ -1305,6 +1499,9 @@ namespace LLM {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["layers." + std::to_string(i)]);
 
                 x = block->forward(ctx, x, input_pos, attention_mask, sliding_attention_mask);
+                if (deepstack != nullptr) {
+                    x = apply_deepstack(ctx, x, *deepstack, i);
+                }
                 if (return_all_hidden_states || out_layers.size() > 1) {
                     x = ggml_cont(ctx->ggml_ctx, x);
                 }
@@ -1318,7 +1515,7 @@ namespace LLM {
                 }
             }
 
-            auto normed_x = norm->forward(ctx, x);
+            auto normed_x = norm != nullptr ? norm->forward(ctx, x) : x;
             if (return_all_hidden_states) {
                 intermediate_outputs.push_back(normed_x);
                 x = intermediate_outputs[0];
@@ -1347,7 +1544,8 @@ namespace LLM {
                              ggml_tensor* sliding_attention_mask,
                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
                              std::set<int> out_layers,
-                             bool return_all_hidden_states = false) {
+                             bool return_all_hidden_states                                             = false,
+                             const std::vector<std::pair<int, std::vector<ggml_tensor*>>>* deepstack   = nullptr) {
             // input_ids: [N, n_token]
             // return: [N, n_token, hidden_size]
             auto x = embed(ctx, input_ids);
@@ -1358,7 +1556,8 @@ namespace LLM {
                                   attention_mask,
                                   std::move(out_layers),
                                   sliding_attention_mask,
-                                  return_all_hidden_states);
+                                  return_all_hidden_states,
+                                  deepstack);
         }
     };
 
@@ -1383,7 +1582,8 @@ namespace LLM {
                              ggml_tensor* sliding_attention_mask,
                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
                              std::set<int> out_layers,
-                             bool return_all_hidden_states = false) {
+                             bool return_all_hidden_states                                             = false,
+                             const std::vector<std::pair<int, std::vector<ggml_tensor*>>>* deepstack   = nullptr) {
             // input_ids: [N, n_token]
             auto model = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
 
@@ -1394,7 +1594,8 @@ namespace LLM {
                                     sliding_attention_mask,
                                     image_embeds,
                                     out_layers,
-                                    return_all_hidden_states);
+                                    return_all_hidden_states,
+                                    deepstack);
             return x;
         }
 
@@ -1409,9 +1610,10 @@ namespace LLM {
                                     ggml_tensor* window_index,
                                     ggml_tensor* window_inverse_index,
                                     ggml_tensor* window_mask,
-                                    ggml_tensor* pos_embeds = nullptr) {
+                                    ggml_tensor* pos_embeds                  = nullptr,
+                                    std::vector<ggml_tensor*>* deepstack_out = nullptr) {
             GGML_ASSERT(enable_vision);
-            return vision_model()->forward(ctx, pixel_values, pe, window_index, window_inverse_index, window_mask, pos_embeds);
+            return vision_model()->forward(ctx, pixel_values, pe, window_index, window_inverse_index, window_mask, pos_embeds, deepstack_out);
         }
     };
 
@@ -1430,33 +1632,101 @@ namespace LLM {
         std::array<std::vector<int32_t>, 4> pos_embed_idx_data_;
         std::array<std::vector<float>, 4> pos_embed_weight_data_;
 
-        static ggml_tensor* process_image_common(ggml_context* ctx,
-                                                 ggml_tensor* image,
-                                                 const LLMVisionConfig& vision_params) {
+        // The merged grid of each vision block the NEXT compute() will splice in,
+        // in the order the blocks appear in its `image_embeds`. build_graph()
+        // consumes it and clears it.
+        //
+        // Qwen3-VL does not give a vision row the flat token index on all three
+        // mrope axes: a block's rows carry (0, h, w) over its own merged grid, and
+        // the text after it resumes from max(previous positions) + 1 rather than
+        // from the raw token index (transformers Qwen3VLModel.get_rope_index).
+        // EMPTY -- the default, and what every consumer other than MiniMax-H3
+        // does -- keeps the flat (i, i, i) positions this runner has always
+        // emitted, so their conditioning is untouched. Flat is exactly right for a
+        // text-only prompt and only diverges once a vision block is present.
+        std::vector<VisionBlockGrid> vision_block_grids;
+
+        // Qwen3-VL DeepStack features of each vision block the NEXT compute() will splice in,
+        // in the order the blocks appear in its `image_embeds`; the inner vector is one
+        // [out_hidden_size, rows] slab per deepstack merger, i.e. per LM decoder layer.
+        // Produced by encode_image()/encode_frames() when asked for them, consumed and cleared
+        // by build_graph(), exactly like vision_block_grids.
+        //
+        // EMPTY -- the default -- reproduces the pre-deepstack conditioning bit for bit.
+        // A caller that CACHES encode_image()'s embedding must cache these alongside it: a
+        // cache hit that skips the vision tower has no features to supply, and build_graph()
+        // warns rather than silently conditioning without them.
+        std::vector<std::vector<sd::Tensor<float>>> vision_deepstack;
+
+        // One frame's spatial patchification, stopping just short of the temporal
+        // patch so the caller can fill it from one frame or from several.
+        static ggml_tensor* patchify_frame_common(ggml_context* ctx,
+                                                  ggml_tensor* image,
+                                                  const LLMVisionConfig& vision_params) {
             // image: [C, H, W]
-            // return: [grid_t*(H/mh/ph)*(W/mw/pw)*mh*mw, C*pt*ph*pw], grid_t == 1
+            // return: [(H/mh/ph)*mh*mw, C, (W/mw/pw), ph*pw]
             int64_t C  = image->ne[2];
             int64_t H  = image->ne[1];
             int64_t W  = image->ne[0];
             int64_t mh = vision_params.spatial_merge_size;
             int64_t mw = vision_params.spatial_merge_size;
-            int64_t pt = vision_params.temporal_patch_size;
             int64_t ph = vision_params.patch_size;
             int64_t pw = vision_params.patch_size;
 
-            image = ggml_reshape_4d(ctx, image, pw, mw, (W / mw / pw), H * C);                               // [C*H, (W/mw/pw), mw, pw]
-            image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 3, 1));                          // [mw, C*H, (W/mw/pw), pw]
-            image = ggml_reshape_4d(ctx, image, pw * (W / mw / pw), H, C, mw);                               // [mw, C, H, (W/mw/pw)*pw]
-            image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 3, 1));                          // [H, mw, C, (W/mw/pw)*pw]
-            image = ggml_reshape_4d(ctx, image, pw, (W / mw / pw) * C * mw, ph, mh * (H / mh / ph));         // [(H/mh/ph)*mh, ph, mw*C*(W/mw/pw), pw]
-            image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 1, 3));                          // [(H/mh/ph)*mh, mw*C*(W/mw/pw), ph, pw]
-            image = ggml_reshape_4d(ctx, image, pw * ph, (W / mw / pw), C, mw * mh * (H / mh / ph));         // [(H/mh/ph)*mh*mw, C, (W/mw/pw), ph*pw]
-            image = ggml_concat(ctx, image, image, 0);                                                       // [(H/mh/ph)*mh*mw, C, (W/mw/pw), pt*ph*pw]
+            image = ggml_reshape_4d(ctx, image, pw, mw, (W / mw / pw), H * C);                        // [C*H, (W/mw/pw), mw, pw]
+            image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 3, 1));                   // [mw, C*H, (W/mw/pw), pw]
+            image = ggml_reshape_4d(ctx, image, pw * (W / mw / pw), H, C, mw);                        // [mw, C, H, (W/mw/pw)*pw]
+            image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 3, 1));                   // [H, mw, C, (W/mw/pw)*pw]
+            image = ggml_reshape_4d(ctx, image, pw, (W / mw / pw) * C * mw, ph, mh * (H / mh / ph));  // [(H/mh/ph)*mh, ph, mw*C*(W/mw/pw), pw]
+            image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 1, 3));                   // [(H/mh/ph)*mh, mw*C*(W/mw/pw), ph, pw]
+            image = ggml_reshape_4d(ctx, image, pw * ph, (W / mw / pw), C, mw * mh * (H / mh / ph));  // [(H/mh/ph)*mh*mw, C, (W/mw/pw), ph*pw]
+            return image;
+        }
+
+        // frames: `temporal_patch_size` frames of [C, H, W], slowest-varying axis
+        // of the packed feature vector after the channel. An IMAGE block repeats
+        // one frame; a VIDEO block passes distinct frames. Repeated pointers share
+        // one patchify subgraph, so the single-image case builds exactly the graph
+        // it always did.
+        static ggml_tensor* process_frames_common(ggml_context* ctx,
+                                                  const std::vector<ggml_tensor*>& frames,
+                                                  const LLMVisionConfig& vision_params) {
+            // return: [grid_t*(H/mh/ph)*(W/mw/pw)*mh*mw, C*pt*ph*pw], grid_t == 1
+            int64_t pt = vision_params.temporal_patch_size;
+            GGML_ASSERT(static_cast<int64_t>(frames.size()) == pt);
+
+            int64_t C  = frames[0]->ne[2];
+            int64_t H  = frames[0]->ne[1];
+            int64_t W  = frames[0]->ne[0];
+            int64_t mh = vision_params.spatial_merge_size;
+            int64_t mw = vision_params.spatial_merge_size;
+            int64_t ph = vision_params.patch_size;
+            int64_t pw = vision_params.patch_size;
+
+            ggml_tensor* image      = nullptr;
+            ggml_tensor* prev_frame = nullptr;
+            ggml_tensor* prev_part  = nullptr;
+            for (ggml_tensor* frame : frames) {
+                GGML_ASSERT(frame->ne[0] == W && frame->ne[1] == H && frame->ne[2] == C);
+                ggml_tensor* part = frame == prev_frame ? prev_part : patchify_frame_common(ctx, frame, vision_params);
+                prev_frame        = frame;
+                prev_part         = part;
+                // [(H/mh/ph)*mh*mw, C, (W/mw/pw), t*ph*pw]
+                image = image == nullptr ? part : ggml_concat(ctx, image, part, 0);
+            }
+
             image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 1, 3));                          // [(H/mh/ph)*mh*mw, (W/mw/pw), C, pt*ph*pw]
             image = ggml_reshape_4d(ctx, image, pw * ph * pt * C, (W / mw / pw), mw * mh, (H / mh / ph));    // [(H/mh/ph), mh*mw, (W/mw/pw), C*pt*ph*pw]
             image = ggml_cont(ctx, ggml_ext_torch_permute(ctx, image, 0, 2, 1, 3));                          // [(H/mh/ph), (W/mw/pw), mh*mw, C*pt*ph*pw]
             image = ggml_reshape_2d(ctx, image, pw * ph * pt * C, mw * mh * (W / mw / pw) * (H / mh / ph));  // [(H/mh/ph)*(W/mw/pw)*mh*mw, C*pt*ph*pw]
             return image;
+        }
+
+        static ggml_tensor* process_image_common(ggml_context* ctx,
+                                                 ggml_tensor* image,
+                                                 const LLMVisionConfig& vision_params) {
+            std::vector<ggml_tensor*> frames(static_cast<size_t>(vision_params.temporal_patch_size), image);
+            return process_frames_common(ctx, frames, vision_params);
         }
 
         static ggml_tensor* build_patch_pos_embeds_common(GGMLRunner* runner,
@@ -1523,25 +1793,34 @@ namespace LLM {
             return patch_pos_embeds;
         }
 
-        static ggml_tensor* encode_image_common(GGMLRunner* runner,
-                                                ggml_context* compute_ctx,
-                                                GGMLRunnerContext* runner_ctx,
-                                                ggml_tensor* image,
-                                                const LLMVisionConfig& vision_params,
-                                                std::shared_ptr<VisionModel> vision_model,
-                                                std::vector<int>& window_index_vec,
-                                                std::vector<int>& window_inverse_index_vec,
-                                                std::vector<float>& window_mask_vec,
-                                                std::vector<float>& pe_vec,
-                                                std::array<std::vector<int32_t>, 4>& pos_embed_idx_data,
-                                                std::array<std::vector<float>, 4>& pos_embed_weight_data) {
+        static ggml_tensor* encode_frames_common(GGMLRunner* runner,
+                                                 ggml_context* compute_ctx,
+                                                 GGMLRunnerContext* runner_ctx,
+                                                 const std::vector<ggml_tensor*>& frames,
+                                                 const LLMVisionConfig& vision_params,
+                                                 std::shared_ptr<VisionModel> vision_model,
+                                                 std::vector<int>& window_index_vec,
+                                                 std::vector<int>& window_inverse_index_vec,
+                                                 std::vector<float>& window_mask_vec,
+                                                 std::vector<float>& pe_vec,
+                                                 std::array<std::vector<int32_t>, 4>& pos_embed_idx_data,
+                                                 std::array<std::vector<float>, 4>& pos_embed_weight_data,
+                                                 VisionBlockGrid* out_grid                = nullptr,
+                                                 std::vector<ggml_tensor*>* deepstack_out = nullptr) {
+            GGML_ASSERT(!frames.empty());
+            ggml_tensor* image = frames[0];
             GGML_ASSERT(image->ne[1] % (vision_params.patch_size * vision_params.spatial_merge_size) == 0);
             GGML_ASSERT(image->ne[0] % (vision_params.patch_size * vision_params.spatial_merge_size) == 0);
 
             int grid_h = static_cast<int>(image->ne[1]) / vision_params.patch_size;
             int grid_w = static_cast<int>(image->ne[0]) / vision_params.patch_size;
 
-            auto pixel_values = process_image_common(compute_ctx, image, vision_params);
+            if (out_grid != nullptr) {
+                out_grid->llm_grid_h = grid_h / vision_params.spatial_merge_size;
+                out_grid->llm_grid_w = grid_w / vision_params.spatial_merge_size;
+            }
+
+            auto pixel_values = process_frames_common(compute_ctx, frames, vision_params);
             int head_dim      = static_cast<int>(vision_params.hidden_size / vision_params.num_heads);
 
             if (vision_params.arch == LLMVisionArch::QWEN3_VL) {
@@ -1566,8 +1845,11 @@ namespace LLM {
                 int pos_len = static_cast<int>(pe_vec.size() / head_dim / 2);
                 auto pe     = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, head_dim / 2, pos_len);
                 runner->set_backend_tensor_data(pe, pe_vec.data());
-                return vision_model->forward(runner_ctx, pixel_values, pe, nullptr, nullptr, nullptr, pos_embeds);
+                return vision_model->forward(runner_ctx, pixel_values, pe, nullptr, nullptr, nullptr, pos_embeds, deepstack_out);
             }
+
+            // Only Qwen3-VL has deepstack mergers, and only it takes the branch above.
+            GGML_ASSERT(deepstack_out == nullptr);
 
             int llm_grid_h             = grid_h / vision_params.spatial_merge_size;
             int llm_grid_w             = grid_w / vision_params.spatial_merge_size;
@@ -1635,6 +1917,37 @@ namespace LLM {
             return vision_model->forward(runner_ctx, pixel_values, pe, window_index, window_inverse_index, window_mask);
         }
 
+        static ggml_tensor* encode_image_common(GGMLRunner* runner,
+                                                ggml_context* compute_ctx,
+                                                GGMLRunnerContext* runner_ctx,
+                                                ggml_tensor* image,
+                                                const LLMVisionConfig& vision_params,
+                                                std::shared_ptr<VisionModel> vision_model,
+                                                std::vector<int>& window_index_vec,
+                                                std::vector<int>& window_inverse_index_vec,
+                                                std::vector<float>& window_mask_vec,
+                                                std::vector<float>& pe_vec,
+                                                std::array<std::vector<int32_t>, 4>& pos_embed_idx_data,
+                                                std::array<std::vector<float>, 4>& pos_embed_weight_data,
+                                                VisionBlockGrid* out_grid                = nullptr,
+                                                std::vector<ggml_tensor*>* deepstack_out = nullptr) {
+            std::vector<ggml_tensor*> frames(static_cast<size_t>(vision_params.temporal_patch_size), image);
+            return encode_frames_common(runner,
+                                        compute_ctx,
+                                        runner_ctx,
+                                        frames,
+                                        vision_params,
+                                        vision_model,
+                                        window_index_vec,
+                                        window_inverse_index_vec,
+                                        window_mask_vec,
+                                        pe_vec,
+                                        pos_embed_idx_data,
+                                        pos_embed_weight_data,
+                                        out_grid,
+                                        deepstack_out);
+        }
+
     public:
         LLMRunner(LLMArch arch,
                   ggml_backend_t backend,
@@ -1678,7 +1991,8 @@ namespace LLM {
                              ggml_tensor* sliding_attention_mask,
                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
                              std::set<int> out_layers,
-                             bool return_all_hidden_states = false) {
+                             bool return_all_hidden_states                                             = false,
+                             const std::vector<std::pair<int, std::vector<ggml_tensor*>>>* deepstack   = nullptr) {
             auto hidden_states = model.forward(ctx,
                                                input_ids,
                                                input_pos,
@@ -1686,7 +2000,8 @@ namespace LLM {
                                                sliding_attention_mask,
                                                image_embeds,
                                                out_layers,
-                                               return_all_hidden_states);  // [N, n_token, hidden_size]
+                                               return_all_hidden_states,
+                                               deepstack);  // [N, n_token, hidden_size]
             return hidden_states;
         }
 
@@ -1699,6 +2014,63 @@ namespace LLM {
                                     ggml_tensor* pos_embeds = nullptr) {
             auto hidden_states = model.vision_forward(ctx, pixel_values, input_pos, window_index, window_inverse_index, window_mask, pos_embeds);
             return hidden_states;
+        }
+
+        // Qwen3-VL's per-modality 3D rotary layout, transcribed from transformers
+        // `Qwen3VLModel.get_rope_index` (v4.57.3) for the single-sequence,
+        // all-ones-attention-mask case this runner builds.
+        //
+        // A run of text takes consecutive positions on all three axes. A vision
+        // block's rows take (0, h, w) over its own merged grid -- the temporal
+        // axis is 0 because Qwen3-VL always encodes a block with grid_t == 1, and
+        // separates video frames with timestamp text instead. The running counter
+        // then advances by max(llm_grid_h, llm_grid_w), i.e. one past the block's
+        // largest position and NOT by its row count, so the text AFTER a vision
+        // block is rotated differently than its raw token index would suggest.
+        //
+        // Qwen2.5-VL shares this layout for images: its extra
+        // second_per_grid_t * tokens_per_second scaling only reaches the temporal
+        // axis of a block with grid_t > 1, which neither arch produces here.
+        //
+        // The <|vision_start|> / <|vision_end|> that flank a block are text here,
+        // matching the reference, which only ever grids the pad rows.
+        void fill_mrope_positions(int64_t n_tokens,
+                                  const std::vector<std::pair<int, ggml_tensor*>>& image_embeds) {
+            GGML_ASSERT(vision_block_grids.size() == image_embeds.size());
+
+            int64_t next   = 0;  // next unused position, get_rope_index's st_idx
+            int64_t cursor = 0;  // next token to place
+
+            auto place_text = [&](int64_t end) {
+                for (int64_t i = cursor; i < end; ++i) {
+                    int pos                         = static_cast<int>(next + (i - cursor));
+                    input_pos_vec[i]                = pos;
+                    input_pos_vec[n_tokens + i]     = pos;
+                    input_pos_vec[2 * n_tokens + i] = pos;
+                }
+                next += end - cursor;
+                cursor = end;
+            };
+
+            for (size_t b = 0; b < image_embeds.size(); ++b) {
+                const int64_t start  = image_embeds[b].first;
+                const int64_t rows   = image_embeds[b].second->ne[1];
+                const int64_t grid_h = vision_block_grids[b].llm_grid_h;
+                const int64_t grid_w = vision_block_grids[b].llm_grid_w;
+                GGML_ASSERT(grid_h > 0 && grid_w > 0);
+                GGML_ASSERT(grid_h * grid_w == rows);
+                GGML_ASSERT(start >= cursor && start + rows <= n_tokens);
+
+                place_text(start);
+                for (int64_t r = 0; r < rows; ++r) {
+                    input_pos_vec[start + r]                = static_cast<int>(next);
+                    input_pos_vec[n_tokens + start + r]     = static_cast<int>(next + r / grid_w);
+                    input_pos_vec[2 * n_tokens + start + r] = static_cast<int>(next + r % grid_w);
+                }
+                next += std::max(grid_h, grid_w);
+                cursor = start + rows;
+            }
+            place_text(n_tokens);
         }
 
         ggml_cgraph* build_graph(const sd::Tensor<int32_t>& input_ids_tensor,
@@ -1714,6 +2086,27 @@ namespace LLM {
                 ggml_tensor* embed = make_input(embed_tensor);
                 image_embeds.emplace_back(idx, embed);
             }
+
+            std::vector<std::pair<int, std::vector<ggml_tensor*>>> deepstack;
+            if (!vision_deepstack.empty()) {
+                GGML_ASSERT(vision_deepstack.size() == image_embeds.size());
+                deepstack.reserve(vision_deepstack.size());
+                for (size_t b = 0; b < vision_deepstack.size(); ++b) {
+                    std::vector<ggml_tensor*> features;
+                    features.reserve(vision_deepstack[b].size());
+                    for (const auto& feature_tensor : vision_deepstack[b]) {
+                        features.push_back(make_input(feature_tensor));
+                    }
+                    deepstack.emplace_back(image_embeds[b].first, std::move(features));
+                }
+            } else if (!image_embeds.empty() && num_deepstack_mergers() > 0) {
+                // Loud rather than silent: this checkpoint HAS deepstack mergers, so a vision
+                // block spliced in without their features is conditioning the DiT on a hidden
+                // state the reference implementation would never produce.
+                LOG_WARN("llm: %zu vision block(s) spliced in without deepstack features; conditioning omits them",
+                         image_embeds.size());
+            }
+            vision_deepstack.clear();
 
             int64_t n_tokens = input_ids->ne[0];
             if (config.arch == LLMArch::MISTRAL_SMALL_3_2 ||
@@ -1734,7 +2127,15 @@ namespace LLM {
                     input_pos_vec[2 * n_tokens + i] = i;
                     input_pos_vec[3 * n_tokens + i] = 0;
                 }
+                if (!vision_block_grids.empty()) {
+                    fill_mrope_positions(n_tokens, image_embeds);
+                }
             }
+            // Consumed. INVARIANT: GGMLRunner::compute() calls its get_graph
+            // callback exactly once (prepare_compute_graph -> get_compute_graph),
+            // so clearing here cannot drop the grids of a graph still to be built.
+            // If that ever changes, this silently reverts to flat positions.
+            vision_block_grids.clear();
 
             auto input_pos = ggml_new_tensor_1d(compute_ctx,
                                                 GGML_TYPE_I32,
@@ -1792,7 +2193,8 @@ namespace LLM {
                                                  sliding_attention_mask,
                                                  image_embeds,
                                                  out_layers,
-                                                 return_all_hidden_states);
+                                                 return_all_hidden_states,
+                                                 deepstack.empty() ? nullptr : &deepstack);
 
             ggml_build_forward_expand(gf, hidden_states);
 
@@ -1846,30 +2248,108 @@ namespace LLM {
                                                  pos_embed_weight_data_);
         }
 
-        ggml_tensor* encode_image(GGMLRunnerContext* runner_ctx, ggml_tensor* image) {
-            return encode_image_common(this,
-                                       compute_ctx,
-                                       runner_ctx,
-                                       image,
-                                       config.vision,
-                                       model.vision_model(),
-                                       window_index_vec,
-                                       window_inverse_index_vec,
-                                       window_mask_vec,
-                                       pe_vec,
-                                       pos_embed_idx_data_,
-                                       pos_embed_weight_data_);
+        ggml_tensor* encode_frames(GGMLRunnerContext* runner_ctx,
+                                   const std::vector<ggml_tensor*>& frames,
+                                   VisionBlockGrid* out_grid                = nullptr,
+                                   std::vector<ggml_tensor*>* deepstack_out = nullptr) {
+            return encode_frames_common(this,
+                                        compute_ctx,
+                                        runner_ctx,
+                                        frames,
+                                        config.vision,
+                                        model.vision_model(),
+                                        window_index_vec,
+                                        window_inverse_index_vec,
+                                        window_mask_vec,
+                                        pe_vec,
+                                        pos_embed_idx_data_,
+                                        pos_embed_weight_data_,
+                                        out_grid,
+                                        deepstack_out);
         }
 
-        ggml_cgraph* build_encode_image_graph(const sd::Tensor<float>& image_tensor) {
+        ggml_tensor* encode_image(GGMLRunnerContext* runner_ctx,
+                                  ggml_tensor* image,
+                                  VisionBlockGrid* out_grid                = nullptr,
+                                  std::vector<ggml_tensor*>* deepstack_out = nullptr) {
+            std::vector<ggml_tensor*> frames(static_cast<size_t>(config.vision.temporal_patch_size), image);
+            return encode_frames(runner_ctx, frames, out_grid, deepstack_out);
+        }
+
+        size_t num_deepstack_mergers() const {
+            return enable_vision ? config.vision.deepstack_mergers.size() : 0;
+        }
+
+        // GGMLRunner::compute() hands back a single tensor, so the deepstack features ride out
+        // stacked behind the merged embedding on the highest dimension -- they share its
+        // [out_hidden_size, rows] shape exactly -- and split_vision_output() peels them off
+        // again before any caller sees a 3-D embedding.
+        ggml_tensor* stack_deepstack(ggml_tensor* hidden_states, const std::vector<ggml_tensor*>& deepstack) {
+            for (ggml_tensor* feature : deepstack) {
+                GGML_ASSERT(feature->ne[0] == hidden_states->ne[0] && feature->ne[1] == hidden_states->ne[1]);
+                hidden_states = ggml_concat(compute_ctx, hidden_states, feature, 2);
+            }
+            return hidden_states;
+        }
+
+        sd::Tensor<float> split_vision_output(sd::Tensor<float> stacked,
+                                              std::vector<sd::Tensor<float>>* out_deepstack) {
+            if (out_deepstack == nullptr || stacked.empty() || stacked.dim() < 3) {
+                return stacked;
+            }
+            const int64_t width  = stacked.shape()[0];
+            const int64_t rows   = stacked.shape()[1];
+            const int64_t slabs  = stacked.shape()[2];
+            const int64_t stride = width * rows;
+            const auto& values   = stacked.values();
+            out_deepstack->clear();
+            out_deepstack->reserve(static_cast<size_t>(slabs - 1));
+            for (int64_t s = 1; s < slabs; ++s) {
+                out_deepstack->emplace_back(std::vector<int64_t>{width, rows},
+                                            std::vector<float>(values.begin() + static_cast<size_t>(s * stride),
+                                                               values.begin() + static_cast<size_t>((s + 1) * stride)));
+            }
+            return sd::Tensor<float>({width, rows},
+                                     std::vector<float>(values.begin(), values.begin() + static_cast<size_t>(stride)));
+        }
+
+        ggml_cgraph* build_encode_frames_graph(const std::vector<sd::Tensor<float>>& frame_tensors,
+                                               VisionBlockGrid* out_grid = nullptr,
+                                               bool want_deepstack       = false) {
+            GGML_ASSERT(!frame_tensors.empty());
+            ggml_cgraph* gf = new_graph_custom(LLM_GRAPH_SIZE);
+
+            std::vector<ggml_tensor*> frames;
+            frames.reserve(frame_tensors.size());
+            for (const auto& frame_tensor : frame_tensors) {
+                ggml_tensor* frame = make_input(frame_tensor);
+                GGML_ASSERT(frame->ne[1] % (config.vision.patch_size * config.vision.spatial_merge_size) == 0);
+                GGML_ASSERT(frame->ne[0] % (config.vision.patch_size * config.vision.spatial_merge_size) == 0);
+                frames.push_back(frame);
+            }
+
+            auto runnter_ctx = get_context();
+            std::vector<ggml_tensor*> deepstack;
+            ggml_tensor* hidden_states = encode_frames(&runnter_ctx, frames, out_grid, want_deepstack ? &deepstack : nullptr);
+            hidden_states              = stack_deepstack(hidden_states, deepstack);
+            ggml_build_forward_expand(gf, hidden_states);
+
+            return gf;
+        }
+
+        ggml_cgraph* build_encode_image_graph(const sd::Tensor<float>& image_tensor,
+                                              VisionBlockGrid* out_grid = nullptr,
+                                              bool want_deepstack       = false) {
             ggml_cgraph* gf    = new_graph_custom(LLM_GRAPH_SIZE);
             ggml_tensor* image = make_input(image_tensor);
 
             GGML_ASSERT(image->ne[1] % (config.vision.patch_size * config.vision.spatial_merge_size) == 0);
             GGML_ASSERT(image->ne[0] % (config.vision.patch_size * config.vision.spatial_merge_size) == 0);
 
-            auto runnter_ctx           = get_context();
-            ggml_tensor* hidden_states = encode_image(&runnter_ctx, image);
+            auto runnter_ctx = get_context();
+            std::vector<ggml_tensor*> deepstack;
+            ggml_tensor* hidden_states = encode_image(&runnter_ctx, image, out_grid, want_deepstack ? &deepstack : nullptr);
+            hidden_states              = stack_deepstack(hidden_states, deepstack);
             ggml_build_forward_expand(gf, hidden_states);
 
             return gf;
@@ -1877,13 +2357,43 @@ namespace LLM {
 
         sd::Tensor<float> encode_image(const int n_threads,
                                        const sd::Tensor<float>& image,
-                                       bool auto_free           = false,
-                                       bool free_compute_buffer = false,
-                                       bool free_compute_params = false) {
-            auto get_graph = [&]() -> ggml_cgraph* {
-                return build_encode_image_graph(image);
+                                       bool auto_free                                 = false,
+                                       bool free_compute_buffer                       = false,
+                                       bool free_compute_params                       = false,
+                                       VisionBlockGrid* out_grid                      = nullptr,
+                                       std::vector<sd::Tensor<float>>* out_deepstack  = nullptr) {
+            const bool want_deepstack = out_deepstack != nullptr && num_deepstack_mergers() > 0;
+            auto get_graph            = [&]() -> ggml_cgraph* {
+                return build_encode_image_graph(image, out_grid, want_deepstack);
             };
-            return take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params));
+            auto stacked = take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params));
+            if (out_deepstack != nullptr) {
+                out_deepstack->clear();
+            }
+            return split_vision_output(std::move(stacked), want_deepstack ? out_deepstack : nullptr);
+        }
+
+        // A VIDEO vision block: `temporal_patch_size` DISTINCT frames of equal
+        // size filling the temporal patch, where encode_image() repeats one. All
+        // frames must already be resized to the block's canvas -- Qwen derives the
+        // block's grid from the first frame and asserts the rest match.
+        sd::Tensor<float> encode_frames(const int n_threads,
+                                        const std::vector<sd::Tensor<float>>& frames,
+                                        bool auto_free                                = false,
+                                        bool free_compute_buffer                      = false,
+                                        bool free_compute_params                      = false,
+                                        VisionBlockGrid* out_grid                     = nullptr,
+                                        std::vector<sd::Tensor<float>>* out_deepstack = nullptr) {
+            GGML_ASSERT(static_cast<int>(frames.size()) == config.vision.temporal_patch_size);
+            const bool want_deepstack = out_deepstack != nullptr && num_deepstack_mergers() > 0;
+            auto get_graph            = [&]() -> ggml_cgraph* {
+                return build_encode_frames_graph(frames, out_grid, want_deepstack);
+            };
+            auto stacked = take_or_empty(GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params));
+            if (out_deepstack != nullptr) {
+                out_deepstack->clear();
+            }
+            return split_vision_output(std::move(stacked), want_deepstack ? out_deepstack : nullptr);
         }
     };
 
