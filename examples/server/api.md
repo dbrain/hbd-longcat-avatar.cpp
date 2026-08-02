@@ -529,6 +529,7 @@ Shared default fields used by both `img_gen` and `vid_gen`:
 | `increase_ref_index` | `boolean` |
 | `ref_image_args` | `string` |
 | `control_strength` | `number` |
+| `ip_adapter_strength` | `number` |
 | `hires` | `object` |
 | `hires.enabled` | `boolean` |
 | `hires.upscaler` | `string` |
@@ -570,6 +571,7 @@ Fields returned in `features_by_mode.img_gen`:
 - `init_image`
 - `mask_image`
 - `control_image`
+- `ip_adapter_image`
 - `ref_images`
 - `ref_image_args`
 - `lora`
@@ -657,6 +659,7 @@ Example:
   "auto_resize_ref_image": true,
   "increase_ref_index": false,
   "control_strength": 0.9,
+  "ip_adapter_strength": 1.0,
   "embed_image_metadata": true,
 
   "ref_image_args": "",
@@ -665,6 +668,7 @@ Example:
   "ref_images": [],
   "mask_image": null,
   "control_image": null,
+  "ip_adapter_image": null,
 
   "sample_params": {
     "scheduler": "discrete",
@@ -739,6 +743,7 @@ Channel expectations:
 - `init_image`: 3 channels
 - `ref_images[]`: 3 channels
 - `control_image`: 3 channels
+- `ip_adapter_image`: 3 channels
 - `mask_image`: 1 channel
 
 If omitted or null:
@@ -764,6 +769,7 @@ Top-level scalar fields:
 | `increase_ref_index` | `boolean` |
 | `ref_image_args` | `string` |
 | `control_strength` | `number` |
+| `ip_adapter_strength` | `number` |
 | `embed_image_metadata` | `boolean` |
 
 Image fields:
@@ -774,6 +780,7 @@ Image fields:
 | `ref_images` | `array<string>` |
 | `mask_image` | `string \| null` |
 | `control_image` | `string \| null` |
+| `ip_adapter_image` | `string \| null` |
 
 `ref_image_args` is a comma-separated `key=value` list controlling how `ref_images`
 are prepared, overriding the server's `--ref-image-args` default for this job.
@@ -988,7 +995,7 @@ Response fields:
 Compared with `img_gen`, the `vid_gen` request body:
 
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
-- `ref_images`, `mask_image`, `control_image`, `control_strength`, and `embed_image_metadata` are not part of the request schema
+- `ref_images`, `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, `vace_strength`, and LongCat Avatar's `audio_path` / `audio_frame_offset`
 
 Example:

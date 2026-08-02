@@ -267,6 +267,7 @@ public:
     virtual SDCondition get_learned_condition(int n_threads,
                                               const ConditionerParams& conditioner_params) = 0;
     virtual void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors)           = 0;
+    virtual void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) {}
     virtual void set_max_graph_vram_bytes(size_t max_vram_bytes) {}
     virtual void set_stream_layers_enabled(bool enabled) {}
     virtual void set_runtime_backends(const std::vector<ggml_backend_t>& backends) {}
@@ -1833,6 +1834,10 @@ struct AnimaConditioner : public Conditioner {
         llm->get_param_tensors(tensors, "text_encoders.llm");
     }
 
+    void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) override {
+        llm->get_param_tensor_ops(tensor_ops);
+    }
+
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
         llm->set_max_graph_vram_bytes(max_vram_bytes);
     }
@@ -2014,6 +2019,10 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->get_param_tensors(tensors, "text_encoders.t5xxl.transformer");
         }
+    }
+
+    void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) override {
+        llm->get_param_tensor_ops(tensor_ops);
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
@@ -3067,6 +3076,10 @@ struct LTXAVEmbedder : public Conditioner {
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         llm->get_param_tensors(tensors, "text_encoders.llm");
         projector->get_param_tensors(tensors, "text_embedding_projection");
+    }
+
+    void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) override {
+        llm->get_param_tensor_ops(tensor_ops);
     }
 
     void set_flash_attention_enabled(bool enabled) override {
