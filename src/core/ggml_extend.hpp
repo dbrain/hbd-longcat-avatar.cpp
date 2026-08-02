@@ -2527,6 +2527,8 @@ protected:
         return !extra_runtime_backends.empty();
     }
 
+    // Retained from upstream #1828 but INTENTIONALLY UNUSED -- see the long note in
+    // alloc_compute_buffer(). Kept so the next upstream merge does not conflict here.
     bool graph_requires_backend_fallback(ggml_cgraph* gf) const {
         if (gf == nullptr || sd_backend_is_cpu(runtime_backend)) {
             return false;
@@ -2542,7 +2544,35 @@ protected:
     }
 
     bool alloc_compute_buffer(ggml_cgraph* gf) {
-        if (sched != nullptr || is_multi_device() || graph_requires_backend_fallback(gf)) {
+        // ⚠️ graph_requires_backend_fallback() is DELIBERATELY NOT CONSULTED HERE.
+        //
+        // Upstream #1828 added it so that a node the runtime backend rejects can fall back
+        // to the CPU backend instead of failing. That is a good idea and it is safe
+        // UPSTREAM, because upstream's supports_op is truthful. This fork's is not, in
+        // several places on purpose: it declines shapes the CUDA backend can in fact
+        // execute, because declining was FREE as long as a single-device run built no
+        // ggml_backend_sched and therefore never asked. Switching the fallback on makes
+        // every one of those conservative rejects load-bearing, and they immediately fail:
+        //
+        //   LTX 2.3 (nvfp4-CLEAN, 1920x1088x97)
+        //       ggml_backend_sched_split_graph: GGML_ASSERT(*cur_backend_id != -1)
+        //       -- MUL_MAT of a BF16 holdout against the F16 residual stream, declined by
+        //       CUDA and unsupported on CPU. That particular lie is now fixed in
+        //       ggml-cuda.cu, but it was only the first one to fire.
+        //   LTX-2B
+        //       ggml-cuda.cu: GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(...))
+        //       -- the sched placed a node off-CUDA while this runner stages its own params
+        //       straight to CUDA, so the buffer types disagree.
+        //
+        // Auditing every supports_op path across six model families for truthfulness is
+        // unbounded work; single-device-without-a-scheduler is the behaviour all six
+        // services are actually validated against, and it is what shipped before this
+        // merge. Restoring it is the smaller and safer claim.
+        //
+        // If CPU fallback is ever genuinely wanted here, the PREREQUISITE is a truthful
+        // supports_op -- not re-enabling this call. The helper is left in place (unused)
+        // so the next upstream merge does not read as a conflict.
+        if (sched != nullptr || is_multi_device()) {
             // The sched replaces the gallocr. Do NOT ggml_backend_sched_reserve
             // the graph here: reserve runs split_graph, which rewires the
             // graph's src pointers to sched-internal copy tensors, and the
