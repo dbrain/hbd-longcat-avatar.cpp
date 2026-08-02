@@ -1491,11 +1491,32 @@ static sd::Tensor<float> sample_euler_ancestral(denoise_cb_t model,
                                                 std::shared_ptr<RNG> rng = nullptr,
                                                 bool is_flow_denoiser    = false,
                                                 float eta                = 0.f) {
+    // LTX_TIMESHIFT (default 1.0 = OFF, value-gated): Time-Shift Sampler / exposure-bias probe
+    // (Li et al., ICLR 2024). Exposure bias is a train/test mismatch in the denoiser's INPUT
+    // distribution: accumulated error makes the actual noise level of x_i higher than the
+    // schedule claims, so the network is queried off-distribution. The training-free fix is to
+    // tell the model a SHIFTED (larger) sigma while the update arithmetic keeps the true one.
+    // It injects no noise, which is why it survives the eta=0 result that killed the whole
+    // ancestral family. At exactly 1.0 no multiply happens and the render is byte-identical.
+    //
+    // NOTE this is the only reachable route: --extra-sample-args is CLI-only (never referenced
+    // in examples/server/), so LTX2Scheduler's max_shift/base_shift/stretch/terminal cannot be
+    // set in server mode at all -- and at 22000 tokens `stretch` renormalises max_shift/
+    // base_shift away regardless (schedules differ only in the 4th decimal).
+    static float s_timeshift = -1.f;
+    if (s_timeshift < 0.f) {
+        const char* e = getenv("LTX_TIMESHIFT");
+        s_timeshift   = (e != nullptr && e[0] != '\0') ? (float)atof(e) : 1.0f;
+        if (!(s_timeshift > 0.f)) s_timeshift = 1.0f;
+        if (s_timeshift != 1.0f) LOG_INFO("LTX_TIMESHIFT=%.4f: querying the model at a shifted sigma", s_timeshift);
+    }
     int steps = static_cast<int>(sigmas.size()) - 1;
     for (int i = 0; i < steps; i++) {
         float sigma       = sigmas[i];
         float sigma_to    = sigmas[i + 1];
-        auto denoised_opt = model(x, sigma, i + 1);
+        // Shift only the sigma the MODEL SEES; every step-size term below still uses `sigma`.
+        const float sigma_q = (s_timeshift == 1.0f) ? sigma : std::min(sigma * s_timeshift, 1.0f);
+        auto denoised_opt = model(x, sigma_q, i + 1);
         if (denoised_opt.pred.empty()) {
             return {};
         }
