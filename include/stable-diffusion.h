@@ -229,7 +229,14 @@ typedef struct {
     bool force_sdxl_vae_conv_scale;
     enum sd_vae_format_t vae_format;
     const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
-    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
+    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram). DIFFUSION MODULE ONLY.
+    // Per-module opt-in for the CONDITIONER/text encoder, in GiB. 0 (default) leaves the text
+    // encoder exactly as it behaves today; > 0 enables the same residency+prefetch streaming the
+    // diffusion module gets under `stream_layers` AND overrides the conditioner's graph-cut VRAM
+    // budget to this value (the text encoder and the DiT share one backend, so they cannot share
+    // one `max_vram` number); < 0 enables streaming and keeps the `max_vram` budget.
+    // Requires the conditioner's params backend to be cpu and its runtime backend to be a device.
+    float stream_layers_te;
     bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
     const char* backend;
     const char* params_backend;
@@ -862,6 +869,12 @@ SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
 SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
+// True when the loaded checkpoint is MiniMax-H3. The version is derived from the TENSOR NAMES, so
+// this is only answerable after new_sd_ctx() has read the weights. A front end needs it because
+// H3's request shape is fixed by the model rather than chosen by the caller (24 fps, the 17n+5
+// frame grid, cfg 1.0 with no unconditional branch, video and audio from one pass), and applying
+// those to a non-H3 model would be wrong.
+SD_API bool sd_ctx_is_minimax_h3(const sd_ctx_t* sd_ctx);
 // Replace the registered diffusion-model weights while preserving the
 // architecture-compatible runner and the other model components. The caller
 // must serialize this with generation; the outgoing DiT residency is released
@@ -1016,6 +1029,23 @@ SD_API void sd_ctx_minimax_h3_clear_staged_conditioning(sd_ctx_t* sd_ctx);
 // next encode re-stages from the params backend -- but only worth it when the card is about to be
 // handed to the DiT for a whole job rather than for one shot.
 SD_API void sd_ctx_minimax_h3_reclaim_text_encoder(sd_ctx_t* sd_ctx);
+
+// Diagnostic: encode a known-good 32 kHz waveform with the MiniMax-H3 audio VAE and decode it
+// straight back, with the DiT and the packed sequence out of the loop. Loads ONLY the audio VAE
+// (~600 MB), so it needs no sd_ctx and runs on CPU while the GPU is busy.
+//
+// Writes, next to `output_prefix`:
+//   <prefix>.input.wav      the exact planar buffer that was encoded (32-bit float WAV)
+//   <prefix>.latent.npy     the encoded latent, numpy shape (S, C, T)
+//   <prefix>.roundtrip.wav  the decoded result -- LISTEN TO THIS
+// and logs per-latent-channel mean/std plus a best-lag correlation against the input.
+//
+// `input_wav_path` must be a WAV (demux an mp4 with ffmpeg first). Mono is duplicated to stereo
+// and any sample rate is resampled to the VAE's 32 kHz. n_threads <= 0 means "hardware default".
+SD_API bool sd_minimax_h3_audio_roundtrip(const char* audio_vae_path,
+                                          const char* input_wav_path,
+                                          const char* output_prefix,
+                                          int n_threads);
 
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,

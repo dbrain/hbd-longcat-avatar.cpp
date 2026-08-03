@@ -316,6 +316,17 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
 bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const std::string& prefix) {
     LOG_DEBUG("init from '%s', prefix = '%s'", file_path.c_str(), prefix.c_str());
 
+    // >>> ComfyUI `comfy_quant` probe (src/model_io/nvfp4_import.h) — must run BEFORE
+    // read_safetensors_file: an int8_tensorwise checkpoint stores I8 weights, which that
+    // reader rejects with a bare "unsupported dtype 'I8'" that explains nothing.
+    std::string comfy_detail;
+    const ComfyQuantScan comfy = comfy_quant_scan_safetensors(file_path, &comfy_detail);
+    if (comfy == ComfyQuantScan::Unsupported || comfy == ComfyQuantScan::Malformed) {
+        LOG_ERROR("%s", comfy_detail.c_str());
+        return false;
+    }
+    // <<<
+
     std::vector<TensorStorage> tensor_storages;
     std::string error;
     if (!read_safetensors_file(file_path, tensor_storages, &error, &metadata_)) {
@@ -324,7 +335,7 @@ bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const
     }
 
     // >>> external NVFP4 checkpoint import (src/model_io/nvfp4_import.h) — no-op otherwise
-    if (!nvfp4_import_rewrite_safetensors(file_path, tensor_storages)) {
+    if (!nvfp4_import_rewrite_safetensors(file_path, tensor_storages, comfy)) {
         return false;
     }
     // <<<

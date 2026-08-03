@@ -16,6 +16,7 @@
 #include "core/ggml_graph_cut.h"
 #include "model/common/rope.hpp"
 #include "model/diffusion/dit.hpp"
+#include "model/diffusion/minimax_h3_diag_graph.hpp"
 #include "model/diffusion/minimax_h3_layout.hpp"
 #include "model/diffusion/minimax_h3_qk_permute.hpp"
 #include "model/diffusion/minimax_h3_sched.hpp"
@@ -203,6 +204,13 @@ namespace MiniMaxH3 {
         // its shape or its statistics, so this can never be guessed.
         bool qk_rope_permuted = false;
 
+        // True when the converter de-interleaved the fused qkv rows into [q_all; k_all; v_all].
+        // The graph does NOT branch on this -- split_qkv only knows the contiguous layout and there
+        // is nothing else it could do.  It exists so the loader has a home for the marker tensor and
+        // so the log records the file's provenance, which is the only trace of a decision that is
+        // otherwise invisible in the weights.  Absence means "unknown", not "interleaved".
+        bool qkv_deinterleaved = false;
+
         int64_t inner_dim() const { return num_attention_heads * attention_head_dim; }
         int64_t video_patch_dim() const { return latents_dim * patch_t * patch_h * patch_w; }
         int64_t patch_volume() const { return patch_t * patch_h * patch_w; }
@@ -299,6 +307,16 @@ namespace MiniMaxH3 {
                     config.adaln_curve_grid = table->ne[1];  // torch [grid, k] -> ggml [k, grid]
                     config.time_embed_dim   = table->ne[0];
                 }
+                // INFO, not DEBUG, and for the same reason the qkv/RoPE markers are: this single
+                // tensor's presence swaps the modulation for the WHOLE model onto a different
+                // path, and both paths run happily on the other one's file -- a curve checkpoint
+                // read as a full one would try to load a [k, N] weight into a [t_dim, N] Linear,
+                // but a mis-sized TABLE would just produce wrong modulation, quietly.  Say which
+                // form was chosen so the log, not a render, is the record of it.
+                LOG_INFO("minimax_h3: AdaLN = PRUNED curve table (rank k=%" PRId64 ", grid=%" PRId64
+                         "); the time embedder is replaced by a lerp of two table rows",
+                         config.time_embed_dim,
+                         config.adaln_curve_grid);
             } else {
                 if (const TensorStorage* pin = find("time_embedder.proj_in.weight")) {
                     if (pin->n_dims == 2) {
@@ -311,6 +329,11 @@ namespace MiniMaxH3 {
                         config.time_embed_dim = pout->ne[1];
                     }
                 }
+                LOG_INFO("minimax_h3: AdaLN = full time-embedder form (t_dim=%" PRId64
+                         "). This file carries the UNFACTORISED modulation projection "
+                         "(~13.0B params, 39%% of the DiT); tools/h3_prune_adaln.py rewrites it "
+                         "to the rank-8 curve table.",
+                         config.time_embed_dim);
             }
             if (const TensorStorage* inv = find("rope.inv_freq")) {
                 if (inv->n_dims == 1) {
@@ -341,6 +364,21 @@ namespace MiniMaxH3 {
                     "[%" PRId64 " x seq x %" PRId64 "] copy of q AND k per block per step.",
                     config.attention_head_dim,
                     config.num_attention_heads);
+            }
+
+            config.qkv_deinterleaved = find(qkv_deinterleaved_marker_name()) != nullptr;
+            if (config.qkv_deinterleaved) {
+                LOG_INFO("minimax_h3: fused qkv rows were de-interleaved at conversion time");
+            } else {
+                // Not an error: a checkpoint that was never interleaved carries no marker either.
+                // But a RAW MiniMax shard is interleaved, and split_qkv on one is silently garbage,
+                // so say so rather than leaving the operator with nothing to check.
+                LOG_INFO(
+                    "minimax_h3: no '%s' marker -- the fused qkv rows are assumed to be "
+                    "[q_all; k_all; v_all] already. If this came from a RAW MiniMax checkpoint it is "
+                    "per-head interleaved and the attention is WRONG; re-convert with "
+                    "MINIMAX_H3_QKV_DEINTERLEAVE=1.",
+                    qkv_deinterleaved_marker_name());
             }
 
             LOG_DEBUG("minimax_h3: layers=%" PRId64 " refiner=%" PRId64 " hidden=%" PRId64 " heads=%" PRId64
@@ -554,10 +592,18 @@ namespace MiniMaxH3 {
             const int64_t N = x->ne[2];
             GGML_ASSERT(N == 1 && "minimax-h3 is batch-size-1 only");
 
-            // The fused weight ships as [q_all; k_all; v_all] along the output axis -- comfy splits
-            // with `.split(heads*head_dim, dim=-1)`.  (Raw MiniMax shards are per-head interleaved;
-            // the diffusers converter normalises them with reorder_interleaved_qkv BEFORE the key
-            // plan, so anything carrying the reference spelling is already un-interleaved.)
+            // This consumes [q_all; k_all; v_all] along the output axis -- comfy splits with
+            // `.split(heads*head_dim, dim=-1)`, contiguously.
+            //
+            // ⚠️ That is NOT the on-disk layout of a raw MiniMax-H3 shard, and an earlier version of
+            // this comment got it wrong.  Raw shards are per-head INTERLEAVED
+            // (`[h0: q k v, h1: q k v, ...]`); the reference un-interleaves at LOAD time
+            // (`_reorder_grouped_qkv_to_qkv`) and the diffusers converter does it on the way in
+            // (`reorder_interleaved_qkv`).  So `[q_all; k_all; v_all]` is an in-memory layout only,
+            // and reference SPELLING does not imply it -- the raw file has reference spelling AND
+            // raw interleave.  The GGUF converter is what normalises it
+            // (MINIMAX_H3_QKV_DEINTERLEAVE, stamping `attn.qkv_deinterleaved`); fed an interleaved
+            // file this split produces garbage with no error anywhere.
             ggml_tensor* qkv = qkv_proj->forward(ctx, x);  // [3*inner, L, N]
             auto split       = split_qkv(ctx->ggml_ctx, qkv);
             ggml_tensor* q   = ggml_reshape_4d(ctx->ggml_ctx, split[0], head_dim, heads, L, N);
@@ -859,7 +905,17 @@ namespace MiniMaxH3 {
                              ggml_tensor* x,
                              ggml_tensor* t_emb,
                              const std::vector<ModSegment>& mod_segments,
-                             ggml_tensor* pe) {
+                             ggml_tensor* pe,
+                             // Diagnostics only.  When non-null, receives the six AdaLN chunks
+                             // this block just produced so the caller can mark them as graph
+                             // outputs.  Observation only: the tensors are the ones the block
+                             // already uses, not copies, so nothing about the numerics changes
+                             // and nothing extra is computed.
+                             std::vector<ggml_tensor*>* out_mods = nullptr,
+                             // Diagnostics only.  Receives {attention output, MLP output} BEFORE
+                             // the gate, which is what separates "attention lost this modality"
+                             // from "the MLP did" without a second render.
+                             std::vector<ggml_tensor*>* out_branch = nullptr) {
             auto norm1      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
             auto norm2      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
             auto attn       = std::dynamic_pointer_cast<H3Attention>(blocks["attn"]);
@@ -870,12 +926,21 @@ namespace MiniMaxH3 {
             // which is the order the checkpoint's fused projection stores them in.
             auto mods = adaln_proj->forward(ctx, t_emb);
             GGML_ASSERT(mods.size() == 6);
+            if (out_mods != nullptr) {
+                *out_mods = mods;
+            }
 
-            ggml_tensor* h = h3_mod_scale_shift(ctx->ggml_ctx, norm1->forward(ctx, x), mods[0], mods[1], mod_segments);
-            x              = h3_mod_gate(ctx->ggml_ctx, x, attn->forward(ctx, h, pe), mods[2], mod_segments);
+            ggml_tensor* h        = h3_mod_scale_shift(ctx->ggml_ctx, norm1->forward(ctx, x), mods[0], mods[1], mod_segments);
+            ggml_tensor* attn_out = attn->forward(ctx, h, pe);
+            x                     = h3_mod_gate(ctx->ggml_ctx, x, attn_out, mods[2], mod_segments);
 
-            h = h3_mod_scale_shift(ctx->ggml_ctx, norm2->forward(ctx, x), mods[3], mods[4], mod_segments);
-            x = h3_mod_gate(ctx->ggml_ctx, x, mlp->forward(ctx, h), mods[5], mod_segments);
+            h                    = h3_mod_scale_shift(ctx->ggml_ctx, norm2->forward(ctx, x), mods[3], mods[4], mod_segments);
+            ggml_tensor* mlp_out = mlp->forward(ctx, h);
+            x                    = h3_mod_gate(ctx->ggml_ctx, x, mlp_out, mods[5], mod_segments);
+            if (out_branch != nullptr) {
+                out_branch->push_back(attn_out);
+                out_branch->push_back(mlp_out);
+            }
             return x;
         }
 
@@ -1011,6 +1076,9 @@ namespace MiniMaxH3 {
             if (config.qk_rope_permuted) {
                 params[qk_permuted_marker_name()] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
             }
+            if (config.qkv_deinterleaved) {
+                params[qkv_deinterleaved_marker_name()] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            }
         }
 
     public:
@@ -1127,7 +1195,12 @@ namespace MiniMaxH3 {
                                                       ggml_tensor* pe,
                                                       const PackedLayout& layout,
                                                       const TimestepPlan& plan,
-                                                      bool dit_f16) {
+                                                      bool dit_f16,
+                                                      // Diagnostics only (MINIMAX_H3_DIAG_GRAPH=1).
+                                                      // Non-null enables the per-block AdaLN /
+                                                      // residual capture, which needs the graph to
+                                                      // expand its extra output nodes onto.
+                                                      ggml_cgraph* diag_gf = nullptr) {
             auto video_patch_proj = std::dynamic_pointer_cast<Linear>(blocks["video_patch_proj"]);
             auto audio_patch_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patch_proj"]);
             auto final_layer      = std::dynamic_pointer_cast<H3FinalLayer>(blocks["final_layer"]);
@@ -1183,10 +1256,70 @@ namespace MiniMaxH3 {
             }
             ggml_tensor* h = h3_concat_seq(ctx->ggml_ctx, parts);
             GGML_ASSERT(h->ne[1] == layout.seq_len);
+            if (MiniMaxH3Diag::on()) {
+                auto tensor_layout_json = [](const ggml_tensor* t) {
+                    if (t == nullptr) {
+                        return std::string("null");
+                    }
+                    return std::string("{\"type\":") + MiniMaxH3Diag::jstr(ggml_type_name(t->type)) +
+                           ",\"ne\":[" + MiniMaxH3Diag::jint(t->ne[0]) + "," +
+                           MiniMaxH3Diag::jint(t->ne[1]) + "," + MiniMaxH3Diag::jint(t->ne[2]) + "," +
+                           MiniMaxH3Diag::jint(t->ne[3]) + "]" +
+                           ",\"nb\":[" + MiniMaxH3Diag::jint(static_cast<int64_t>(t->nb[0])) + "," +
+                           MiniMaxH3Diag::jint(static_cast<int64_t>(t->nb[1])) + "," +
+                           MiniMaxH3Diag::jint(static_cast<int64_t>(t->nb[2])) + "," +
+                           MiniMaxH3Diag::jint(static_cast<int64_t>(t->nb[3])) + "]" +
+                           ",\"contiguous\":" + MiniMaxH3Diag::jbool(ggml_is_contiguous(t)) + "}";
+                };
+                const int64_t audio_byte_start =
+                    plan.audio.present ? static_cast<int64_t>(static_cast<size_t>(plan.audio.start) * h->nb[1]) : -1;
+                const int64_t audio_byte_stop =
+                    plan.audio.present ? static_cast<int64_t>(static_cast<size_t>(plan.audio.stop) * h->nb[1]) : -1;
+                MiniMaxH3Diag::rec().set_section(
+                    "forward_tensor_layout",
+                    "{\"packed\":" + tensor_layout_json(h) +
+                        ",\"video_embed\":" + tensor_layout_json(video_embed) +
+                        ",\"audio_embed\":" + tensor_layout_json(audio_embed) +
+                        ",\"rope\":" + tensor_layout_json(pe) +
+                        ",\"audio_byte_start\":" + MiniMaxH3Diag::jint(audio_byte_start) +
+                        ",\"audio_byte_stop\":" + MiniMaxH3Diag::jint(audio_byte_stop) +
+                        ",\"audio_view_fits_packed_bytes\":" +
+                        MiniMaxH3Diag::jbool(!plan.audio.present ||
+                                             (audio_byte_start >= 0 && audio_byte_stop >= audio_byte_start &&
+                                              static_cast<uint64_t>(audio_byte_stop) <=
+                                                  static_cast<uint64_t>(ggml_nbytes(h)))) +
+                        "}");
+            }
 
+            const bool diag_capture        = diag_gf != nullptr && MiniMaxH3Diag::graph_on();
+            const bool diag_branch_capture = diag_capture && MiniMaxH3Diag::rec().graph_branch();
+            std::vector<ggml_tensor*> diag_mods;
+            std::vector<ggml_tensor*> diag_branch;
             for (int64_t i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<H3DiTBlock>(blocks["blocks." + std::to_string(i)]);
-                h          = block->forward(ctx, h, t_emb, plan.mod_segments, pe);
+                diag_mods.clear();
+                diag_branch.clear();
+                h = block->forward(ctx,
+                                   h,
+                                   t_emb,
+                                   plan.mod_segments,
+                                   pe,
+                                   diag_capture ? &diag_mods : nullptr,
+                                   diag_branch_capture ? &diag_branch : nullptr);
+                if (diag_capture) {
+                    // BEFORE the cut below, deliberately: every capture node then sits inside this
+                    // block's own node range in graph order, so marking them into this block's cut
+                    // group does not straddle a segment boundary.
+                    MiniMaxH3Diag::capture_block(ctx->ggml_ctx,
+                                                 diag_gf,
+                                                 i,
+                                                 h,
+                                                 diag_mods,
+                                                 diag_branch,
+                                                 plan.video,
+                                                 plan.audio,
+                                                 MiniMaxH3Diag::rec().graph_rows());
+                }
                 // Per-block cut point.  Mandatory rather than nice-to-have at this size: the
                 // activation working set of a single block is multiple gigabytes at production
                 // length, so the graph has to be executable in block-sized pieces.
@@ -1292,6 +1425,12 @@ namespace MiniMaxH3 {
         float sigma_shift_video = -1.f;
         float sigma_shift_audio = -1.f;
 
+        // The NEXT step's video sigma, in the same [0, 1] units as `timesteps / timestep_scale`.
+        // Set per step by the sampler (see MiniMaxH3DiffusionExtra::sigma_next); < 0 means "the
+        // sampler did not say", which forces the instantaneous-slope behaviour regardless of
+        // MINIMAX_H3_AUDIO_SECANT.  Only the AUDIO velocity scale reads it.
+        float sigma_v_next = -1.f;
+
         // The engine's DiscreteFlowDenoiser hands the DiT `sigma * 1000` (sigma_to_t), which is the
         // same convention comfy's model_base uses.  Kept as a named constant so a future scheduler
         // that passes raw sigma has one place to say so.
@@ -1325,6 +1464,10 @@ namespace MiniMaxH3 {
         // WITHOUT changing that tuple, so a ref2va request following a t2va request of the same
         // shape would silently reuse the wrong row ordering.  Hash them separately.
         uint64_t layout_extra_key = 0;
+
+        // MINIMAX_H3_DIAG_GRAPH=1 only.  Collects the per-block AdaLN / residual captures out of
+        // the (possibly segmented) graph after compute; inert and allocation-free when off.
+        MiniMaxH3Diag::GraphReadback diag_readback;
 
         MiniMaxH3Runner(ggml_backend_t backend,
                         const String2TensorStorage& tensor_storage_map      = {},
@@ -1457,13 +1600,49 @@ namespace MiniMaxH3 {
             const float shift_v = request.sigma_shift_video > 0.f ? request.sigma_shift_video : config.sigma_shift_video;
             const float shift_a = request.sigma_shift_audio > 0.f ? request.sigma_shift_audio : config.sigma_shift_audio;
             const float sigma_v = timesteps_tensor.data()[0] / request.timestep_scale;
-            plan                = build_timestep_plan(layout,
-                                                      sigma_v,
-                                                      shift_v,
-                                                      shift_a,
-                                                      request.visual_cond_noise_aug,
-                                                      request.audio_cond_noise_aug,
-                                                      request.text_token_tags.empty() ? nullptr : &request.text_token_tags);
+            // MINIMAX_H3_AUDIO_SECANT=1 -- scale the audio velocity by the DISCRETE
+            // (sigma_a - sigma_a_next)/(sigma_v - sigma_v_next) instead of comfy's instantaneous
+            // d(sigma_a)/d(sigma_v).  That makes one Euler step on the VIDEO schedule advance the
+            // audio stream by exactly the step diffusers' second (audio) scheduler would take.
+            // Default OFF: this changes every audio latent, so it is an A/B, not a silent repair.
+            static const bool audio_secant = h3_env_flag("MINIMAX_H3_AUDIO_SECANT", false);
+            plan                           = build_timestep_plan(layout,
+                                                                 sigma_v,
+                                                                 shift_v,
+                                                                 shift_a,
+                                                                 request.visual_cond_noise_aug,
+                                                                 request.audio_cond_noise_aug,
+                                                                 request.text_token_tags.empty() ? nullptr : &request.text_token_tags,
+                                                                 request.sigma_v_next,
+                                                                 audio_secant);
+            {
+                // One line per step, not once per run: the whole point of the A/B is watching the
+                // two candidates diverge as sigma falls, and a run-once log hides exactly that.
+                static bool logged_mode = false;
+                if (!logged_mode) {
+                    logged_mode = true;
+                    LOG_INFO("minimax_h3: audio velocity scale = %s",
+                             audio_secant ? "SECANT, discrete d(sigma_a)/d(sigma_v) (MINIMAX_H3_AUDIO_SECANT=1)"
+                                          : "INSTANTANEOUS slope (comfy default; set MINIMAX_H3_AUDIO_SECANT=1 to A/B)");
+                }
+                LOG_DEBUG("minimax_h3: sigma_v %.6f -> %.6f  sigma_a %.6f -> %.6f  slope inst %.4f  secant %.4f%s  using %.4f",
+                          plan.sigma_v,
+                          plan.sigma_v_next,
+                          plan.sigma_a,
+                          plan.sigma_a_next,
+                          plan.slope_a_instant,
+                          plan.slope_a_secant,
+                          plan.secant_valid ? "" : " (INVALID: sampler gave no next sigma)",
+                          plan.slope_a);
+                if (audio_secant && !plan.secant_valid) {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        LOG_WARN("minimax_h3: MINIMAX_H3_AUDIO_SECANT=1 but no next sigma reached the DiT; "
+                                 "falling back to the instantaneous slope (the A/B is a NO-OP).");
+                    }
+                }
+            }
 
             // ---- rotary table ----------------------------------------------------------------
             uint64_t want_pe_key               = h3_bulk_hash(layout.position_ids.data(),
@@ -1540,11 +1719,55 @@ namespace MiniMaxH3 {
                 }
             }
 
+            // ---- diagnostics -----------------------------------------------------------------
+            // Written EVERY step (the layout is stable within a render, but the plan is not, and a
+            // bundle that only describes step 1 cannot be diffed against itself).  Pure host
+            // arithmetic over structures that already exist -- see minimax_h3_diag.hpp.
+            if (MiniMaxH3Diag::on()) {
+                MiniMaxH3Diag::GeometryFacts g;
+                g.hidden_size       = config.hidden_size;
+                g.num_layers        = config.num_layers;
+                g.video_patch_dim   = config.video_patch_dim();
+                g.audio_latents_dim = config.audio_latents_dim;
+                g.latents_dim       = config.latents_dim;
+                g.attention_inner_dim = config.inner_dim();
+                g.ffn_hidden_size     = config.ffn_hidden_size;
+                g.patch_t           = config.patch_t;
+                g.patch_h           = config.patch_h;
+                g.patch_w           = config.patch_w;
+                g.adaln_curve_form  = config.use_adaln_curves();
+                g.time_embed_dim    = config.time_embed_dim;
+                g.dit_f16           = dit_f16;
+                g.orig_latent_w     = orig_w;
+                g.orig_latent_h     = orig_h;
+                g.latent_w          = lat_w;
+                g.latent_h          = lat_h;
+                g.latent_t          = t_len;
+                g.audio_t           = layout_request.audio_t;
+                g.text_len          = layout_request.text_len;
+                g.mlp_chunk_rows    = h3_mlp_chunk_rows();
+                g.graph_capacity    = MINIMAX_H3_GRAPH_SIZE;
+                MiniMaxH3Diag::emit_geometry(layout, g);
+                MiniMaxH3Diag::rec().append(
+                    "timestep_plan",
+                    "{\"step\":" + MiniMaxH3Diag::jint(MiniMaxH3Diag::rec().step()) +
+                        ",\"plan\":" + MiniMaxH3Diag::timestep_plan_json(plan) + "}");
+            }
+
             // ---- forward ---------------------------------------------------------------------
             ggml_tensor* text_embed = model.forward_text(&runner_ctx, context);
             ggml_tensor* t_emb      = model.forward_time(&runner_ctx, t_freq, curve_i0, curve_i1, curve_frac);
 
-            auto out = model.forward(&runner_ctx, video_rows, audio_rows, text_embed, t_emb, pe, layout, plan, dit_f16);
+            auto out = model.forward(&runner_ctx,
+                                     video_rows,
+                                     audio_rows,
+                                     text_embed,
+                                     t_emb,
+                                     pe,
+                                     layout,
+                                     plan,
+                                     dit_f16,
+                                     MiniMaxH3Diag::graph_on() ? gf : nullptr);
 
             // ---- back to latent shape --------------------------------------------------------
             GGML_ASSERT(out.first != nullptr && "minimax-h3: the packed layout has no target video segment");
@@ -1574,7 +1797,10 @@ namespace MiniMaxH3 {
             // DiscreteFlowDenoiser has exactly that scaling (c_skip = 1, c_out = -sigma), so the
             // negation belongs here and the audio slope with it: scaling the audio velocity by
             // d(sigma_a)/d(sigma_v) is what makes the flat ODE the sampler integrates on the VIDEO
-            // schedule equal the audio stream's true ODE on its own.
+            // schedule equal the audio stream's true ODE on its own.  `plan.slope_a` is that
+            // factor; whether it holds comfy's instantaneous derivative or diffusers' per-step
+            // secant is decided above by MINIMAX_H3_AUDIO_SECANT.  The VIDEO branch is untouched
+            // by that switch -- it is on the schedule the sampler is already integrating.
             video_out = ggml_scale(compute_ctx, video_out, -1.0f);
 
             ggml_tensor* audio_out = nullptr;
@@ -1585,6 +1811,18 @@ namespace MiniMaxH3 {
 
             ggml_tensor* merged = merge_av(compute_ctx, video_out, audio_out);
             ggml_build_forward_expand(gf, merged);
+            if (MiniMaxH3Diag::on()) {
+                const int64_t nodes = ggml_graph_n_nodes(gf);
+                const int64_t leafs = sd::ggml_graph_cut::leaf_count(gf);
+                MiniMaxH3Diag::rec().append(
+                    "graph_build",
+                    "{\"step\":" + MiniMaxH3Diag::jint(MiniMaxH3Diag::rec().step()) +
+                        ",\"nodes\":" + MiniMaxH3Diag::jint(nodes) +
+                        ",\"leafs\":" + MiniMaxH3Diag::jint(leafs) +
+                        ",\"capacity\":" + MiniMaxH3Diag::jint(MINIMAX_H3_GRAPH_SIZE) +
+                        ",\"capacity_headroom\":" + MiniMaxH3Diag::jint(MINIMAX_H3_GRAPH_SIZE - nodes) +
+                        ",\"within_capacity\":" + MiniMaxH3Diag::jbool(nodes <= MINIMAX_H3_GRAPH_SIZE) + "}");
+            }
             return gf;
         }
 
@@ -1595,8 +1833,138 @@ namespace MiniMaxH3 {
             auto get_graph = [&]() -> ggml_cgraph* {
                 return build_graph(x, timesteps, context);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false),
-                                                   x.dim());
+            // MINIMAX_H3_DIAG_GRAPH=1.  The hook fires once per graph-cut segment on the segmented
+            // path and once on the plain one; a block's captures are only visible in the call that
+            // computed them, so scan() picks each one up as it appears and emit() runs after the
+            // whole graph is done.
+            const bool diag_graph = MiniMaxH3Diag::graph_on();
+            const bool diag_on    = MiniMaxH3Diag::on();
+            int64_t previous_segment_nodes = -1;
+            int64_t previous_segment_leafs = -1;
+            uint64_t previous_segment_signature = 0;
+            if (diag_on) {
+                graph_cut_plan_hook_ = [](const GraphCutPlan& graph_plan) {
+                    std::vector<std::string> segments;
+                    segments.reserve(graph_plan.segments.size());
+                    for (const GraphCutSegment& seg : graph_plan.segments) {
+                        segments.push_back(
+                            "{\"name\":" + MiniMaxH3Diag::jstr(seg.group_name) +
+                            ",\"nodes\":" +
+                            MiniMaxH3Diag::jint(static_cast<int64_t>(seg.internal_node_indices.size())) +
+                            ",\"outputs\":" +
+                            MiniMaxH3Diag::jint(static_cast<int64_t>(seg.output_node_indices.size())) +
+                            ",\"compute_bytes\":" +
+                            MiniMaxH3Diag::jint(static_cast<int64_t>(seg.compute_buffer_size)) +
+                            ",\"previous_cut_bytes\":" +
+                            MiniMaxH3Diag::jint(static_cast<int64_t>(seg.input_previous_cut_bytes)) +
+                            ",\"external_bytes\":" +
+                            MiniMaxH3Diag::jint(static_cast<int64_t>(seg.input_external_bytes)) +
+                            ",\"param_bytes\":" +
+                            MiniMaxH3Diag::jint(static_cast<int64_t>(seg.input_param_bytes)) + "}");
+                    }
+                    MiniMaxH3Diag::rec().append(
+                        "graph_cut_plan",
+                        "{\"step\":" + MiniMaxH3Diag::jint(MiniMaxH3Diag::rec().step()) +
+                            ",\"valid\":" + MiniMaxH3Diag::jbool(graph_plan.valid) +
+                            ",\"has_cuts\":" + MiniMaxH3Diag::jbool(graph_plan.has_cuts) +
+                            ",\"nodes\":" + MiniMaxH3Diag::jint(graph_plan.n_nodes) +
+                            ",\"leafs\":" + MiniMaxH3Diag::jint(graph_plan.n_leafs) +
+                            ",\"segments\":" + MiniMaxH3Diag::jarray(segments) + "}");
+                };
+            }
+            if (diag_on) {
+                diag_readback.reset();
+                segment_readback_hook_ = [this,
+                                          diag_graph,
+                                          &previous_segment_nodes,
+                                          &previous_segment_leafs,
+                                          &previous_segment_signature](ggml_cgraph* g) {
+                    if (diag_graph) {
+                        diag_readback.scan(g);
+                    }
+
+                    // The shared gallocr may reuse a prior segment's positional address plan when
+                    // node/leaf counts and allocation sizes happen to match
+                    // (ggml_extend.hpp:2590; ggml-alloc.c:1023).  Hash the structure that check does
+                    // NOT compare: op/type/shape and source positions.  A count match with a hash
+                    // mismatch is a concrete allocator-reuse CANDIDATE, not an audio symptom.
+                    // It is not proof: ggml_gallocr_needs_realloc() can still re-plan because a
+                    // positional tensor grew beyond the prior allocation.
+                    uint64_t signature = 1469598103934665603ull;
+                    auto mix = [&signature](uint64_t value) {
+                        for (int i = 0; i < 8; ++i) {
+                            signature ^= static_cast<unsigned char>(value >> (i * 8));
+                            signature *= 1099511628211ull;
+                        }
+                    };
+                    const int64_t nodes = ggml_graph_n_nodes(g);
+                    const int64_t leafs = sd::ggml_graph_cut::leaf_count(g);
+                    for (int64_t i = 0; i < nodes; ++i) {
+                        const ggml_tensor* node = ggml_graph_node(g, static_cast<int>(i));
+                        mix(static_cast<uint64_t>(node->op));
+                        mix(static_cast<uint64_t>(node->type));
+                        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                            mix(static_cast<uint64_t>(node->ne[d]));
+                            mix(static_cast<uint64_t>(node->nb[d]));
+                        }
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            int64_t source_index = -1;
+                            if (node->src[s] != nullptr) {
+                                for (int64_t j = 0; j < nodes; ++j) {
+                                    if (ggml_graph_node(g, static_cast<int>(j)) == node->src[s]) {
+                                        source_index = j;
+                                        break;
+                                    }
+                                }
+                            }
+                            mix(static_cast<uint64_t>(source_index));
+                        }
+                    }
+                    const bool same_counts = nodes == previous_segment_nodes && leafs == previous_segment_leafs;
+                    const bool reuse_candidate =
+                        same_counts && previous_segment_signature != 0 && signature != previous_segment_signature;
+                    MiniMaxH3Diag::rec().append(
+                        "graph_segment_execution",
+                        "{\"step\":" + MiniMaxH3Diag::jint(MiniMaxH3Diag::rec().step()) +
+                            ",\"nodes\":" + MiniMaxH3Diag::jint(nodes) +
+                            ",\"leafs\":" + MiniMaxH3Diag::jint(leafs) +
+                            ",\"structure_hash\":" + MiniMaxH3Diag::jstr(std::to_string(signature)) +
+                            ",\"same_counts_as_previous\":" + MiniMaxH3Diag::jbool(same_counts) +
+                            ",\"allocator_reuse_candidate\":" + MiniMaxH3Diag::jbool(reuse_candidate) + "}");
+                    if (reuse_candidate) {
+                        MiniMaxH3Diag::rec().warn(
+                            "graph-cut consecutive segments have equal node/leaf counts but different "
+                            "op/shape/source topology; shared gallocr positional-plan reuse is a candidate "
+                            "(not proof: a size increase can force replanning; try "
+                            "SD_GRAPH_CUT_RESERVE_PER_SEGMENT=1)");
+                    }
+                    previous_segment_nodes     = nodes;
+                    previous_segment_leafs     = leafs;
+                    previous_segment_signature = signature;
+                };
+            }
+            auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false),
+                                                          x.dim());
+            if (diag_on) {
+                segment_readback_hook_ = nullptr;
+            }
+            if (diag_graph) {
+                if (diag_readback.empty()) {
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        MiniMaxH3Diag::rec().warn(
+                            "MINIMAX_H3_DIAG_GRAPH=1 captured NOTHING -- the per-block AdaLN / residual "
+                            "tensors were not materialised by this execution path");
+                    }
+                }
+                diag_readback.emit(MiniMaxH3Diag::rec().step(), plan);
+                MiniMaxH3Diag::rec().flush();
+            }
+            if (diag_on) {
+                graph_cut_plan_hook_ = nullptr;
+            }
+            return result;
         }
 
         // The modality tags arrive per call on MiniMaxH3DiffusionExtra; the remaining H3-specific
@@ -1612,6 +1980,13 @@ namespace MiniMaxH3 {
                 if (extra->text_token_tags != nullptr && !extra->text_token_tags->empty()) {
                     const std::vector<int32_t>& tags = extra->text_token_tags->values();
                     request.text_token_tags.assign(tags.begin(), tags.end());
+                }
+                // Reset on EVERY call carrying the extra, exactly as the tags are: a stale next
+                // sigma would silently scale one step's audio velocity by the previous step's
+                // secant, which is a much harder thing to see than an outright missing value.
+                request.sigma_v_next = -1.f;
+                if (extra->sigma_next != nullptr && !extra->sigma_next->empty()) {
+                    request.sigma_v_next = extra->sigma_next->data()[0];
                 }
             }
             return compute(n_threads,

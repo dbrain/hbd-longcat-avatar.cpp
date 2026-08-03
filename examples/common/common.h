@@ -154,6 +154,9 @@ struct SDContextParams {
     bool offload_params_to_cpu  = false;
     std::string max_vram        = "0";
     bool stream_layers          = false;
+    // GiB budget for streaming the TEXT ENCODER's layers. 0 = off (unchanged behaviour).
+    // Separate from `stream_layers`, which stays diffusion-only. See --stream-layers-te.
+    float stream_layers_te      = 0.f;
     bool eager_load             = false;
     std::string backend;
     std::string params_backend;
@@ -259,6 +262,11 @@ struct SDGenerationParams {
     float relay_eps                        = 0.f;
     float relay_audio_eps                  = 0.f;
     float relay_steps_frac                 = 0.f;
+    // MiniMax-H3 AUDIO sigma shift. The VIDEO shift is `sample_params.flow_shift` -- that is the
+    // schedule the sampler actually walks, and the DiT re-derives the audio schedule from it --
+    // so only the audio side needs a field of its own. <= 0 keeps the checkpoint's own 3.0, which
+    // is why the default is inert rather than 3.f.
+    float minimax_h3_sigma_shift_audio     = 0.f;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
 

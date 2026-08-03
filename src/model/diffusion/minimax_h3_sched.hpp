@@ -25,6 +25,9 @@
 //     flat ODE dX/dsigma_v; multiplying the audio branch by the slope is what makes that integral
 //     equal the audio stream's true ODE on ITS schedule.  Drop it and the audio simply denoises at
 //     the wrong rate -- no crash, no NaN, just mush.
+//     comfy uses the INSTANTANEOUS derivative here; diffusers PR #14355 runs a second audio
+//     scheduler, which is equivalent to the SECANT over the step.  Both live on TimestepPlan;
+//     which one the graph uses is chosen by the caller (MINIMAX_H3_AUDIO_SECANT).
 //   * the distinct timesteps are known ANALYTICALLY (there are at most four), so the AdaLN table is
 //     a handful of rows and every packed segment is uniform in (timestep, modality).  That is what
 //     lets the DiT modulate by contiguous slices instead of a per-row gather.
@@ -80,8 +83,21 @@ namespace MiniMaxH3 {
         float sigma_v = 0.f;
         float sigma_a = 0.f;
         // The factor the AUDIO velocity must be multiplied by before it is handed back to a sampler
-        // integrating on the VIDEO schedule.
+        // integrating on the VIDEO schedule.  This is the value the graph actually uses; the two
+        // candidates it can hold are kept alongside so a caller can log which one won.
         float slope_a = 1.f;
+
+        // d(sigma_a)/d(sigma_v) at this point -- comfy's `time_shift_slope`, the CONTINUOUS form.
+        float slope_a_instant = 1.f;
+        // (sigma_a - sigma_a_next) / (sigma_v - sigma_v_next) -- the DISCRETE form, which is what
+        // makes one Euler step of size dsigma_v move the audio stream by exactly dsigma_a.  Equal
+        // to `slope_a_instant` only in the limit of infinitely many steps.  Valid (and used) only
+        // when the sampler supplied sigma_v_next; NaN-free by construction, see build().
+        float slope_a_secant = 1.f;
+        bool secant_valid    = false;
+        // The next step's sigmas, as supplied / derived.  < 0 means "the sampler did not say".
+        float sigma_v_next = -1.f;
+        float sigma_a_next = -1.f;
 
         // Ascending, deduplicated -- Python's `sorted(set(...))`.  At most four entries:
         // {t_video, t_audio} plus the visual and audio conditioning pins when those rows exist.
@@ -130,14 +146,47 @@ namespace MiniMaxH3 {
                                             float shift_a,
                                             float visual_cond_noise_aug,
                                             float audio_cond_noise_aug,
-                                            const std::vector<int>* text_token_tags) {
+                                            const std::vector<int>* text_token_tags,
+                                            float sigma_v_next = -1.f,
+                                            bool use_secant    = false) {
         TimestepPlan plan;
         plan.seq_len = layout.seq_len;
 
         // comfy/ldm/minimax/model.py:529 -- clamped away from zero before anything divides by it.
-        plan.sigma_v = std::max(sigma_v, 1e-6f);
-        plan.sigma_a = time_shift_sigma(plan.sigma_v, shift_v, shift_a);
-        plan.slope_a = time_shift_slope(plan.sigma_v, shift_v, shift_a);
+        plan.sigma_v         = std::max(sigma_v, 1e-6f);
+        plan.sigma_a         = time_shift_sigma(plan.sigma_v, shift_v, shift_a);
+        plan.slope_a_instant = time_shift_slope(plan.sigma_v, shift_v, shift_a);
+        plan.slope_a         = plan.slope_a_instant;
+
+        // ---- discrete (secant) audio slope ---------------------------------------------------
+        //
+        // The sampler steps EVERYTHING by dsigma_v = sigma_v_next - sigma_v.  comfy scales the
+        // audio velocity by the instantaneous d(sigma_a)/d(sigma_v), which is only exact as the
+        // step size goes to zero; diffusers PR #14355 (`MiniMaxH3LoopSchedulerStep`, denoise.py)
+        // instead runs a SECOND scheduler for audio and steps it by sigma_a - sigma_a_next.  The
+        // two agree iff the audio velocity is multiplied by the SECANT
+        //
+        //     (sigma_a - sigma_a_next) / (sigma_v - sigma_v_next)
+        //
+        // because then  secant * dsigma_v == sigma_a_next - sigma_a == dsigma_a  exactly.
+        //
+        // sigma_v_next == 0 on the final step is fine and needs no special case: time_shift_sigma
+        // maps 0 -> 0 in closed form (base = 0 / (shift_v + 0) = 0, then shift_a * 0 / 1 = 0), so
+        // the secant stays finite.  What IS guarded is a degenerate/backwards schedule entry --
+        // sigma_v_next >= sigma_v would divide by ~0 -- in which case the instantaneous slope is
+        // kept and `secant_valid` stays false so the caller can say so.
+        if (sigma_v_next >= 0.f) {
+            plan.sigma_v_next = sigma_v_next;
+            plan.sigma_a_next = time_shift_sigma(sigma_v_next, shift_v, shift_a);
+            const float dv    = plan.sigma_v - sigma_v_next;
+            if (dv > 1e-9f) {
+                plan.slope_a_secant = (plan.sigma_a - plan.sigma_a_next) / dv;
+                plan.secant_valid   = std::isfinite(plan.slope_a_secant);
+            }
+        }
+        if (use_secant && plan.secant_valid) {
+            plan.slope_a = plan.slope_a_secant;
+        }
 
         const float t_v = 1.0f - plan.sigma_v;
         const float t_a = 1.0f - plan.sigma_a;

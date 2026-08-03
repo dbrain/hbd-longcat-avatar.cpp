@@ -45,7 +45,7 @@ void Qwen2Tokenizer::load_from_merges(const std::string& merges_utf8_str) {
     bpe_len = rank;
 }
 
-Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str) {
+Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str, SpecialTail special_tail) {
     UNK_TOKEN = "<|endoftext|>";
     EOS_TOKEN = "<|endoftext|>";
     PAD_TOKEN = "<|endoftext|>";
@@ -81,12 +81,47 @@ Qwen2Tokenizer::Qwen2Tokenizer(const std::string& merges_utf8_str) {
         "</tool_response>",
         "<think>",
         "</think>",
-        "<|boi_token|>",
-        "<|bor_token|>",
-        "<|eor_token|>",
-        "<|bot_token|>",
-        "<|tms_token|>",
     };
+    // Everything above is 151643-151668 and is IDENTICAL in every Qwen2/3 vocabulary
+    // this engine loads, MiniMax-H3's included (verified token-by-token against the
+    // shipped FL2VA/tokenizer/ with transformers 4.57.3). Only the tail differs, and
+    // because load_from_merges() assigns ids by POSITION, the tail cannot be a union
+    // of both sets -- appending one would shift the other's ids off the trained
+    // embeddings. Select it instead.
+    switch (special_tail) {
+        case SpecialTail::MINIMAX_H3:
+            // 151669-151675, in this exact order, from MiniMax-H3's
+            // FL2VA/tokenizer/tokenizer_config.json `additional_special_tokens`.
+            // These are absent from vocab.json, so HF appends them at load time and
+            // they land here; vocab_size 151936 means the embeddings are trained.
+            // <d> ... </d> is the wrapper H3 keys ALL spoken and sung content on --
+            // without it a dialogue line byte-BPEs to ordinary tokens and the trained
+            // id is never emitted (README.md:119, and MiniMax's own ref2va request).
+            special_tokens.insert(special_tokens.end(),
+                                  {
+                                      "<d>",
+                                      "</d>",
+                                      "<|cutoff|>",
+                                      "<|lyrics_start|>",
+                                      "<|lyrics_end|>",
+                                      "<|caption_start|>",
+                                      "<|caption_end|>",
+                                  });
+            break;
+        case SpecialTail::DEFAULT:
+        default:
+            // 151669-151673. HiDream-O1 encodes <|boi_token|><|tms_token|> as literal
+            // prompt text, so these must keep their ids for every non-H3 consumer.
+            special_tokens.insert(special_tokens.end(),
+                                  {
+                                      "<|boi_token|>",
+                                      "<|bor_token|>",
+                                      "<|eor_token|>",
+                                      "<|bot_token|>",
+                                      "<|tms_token|>",
+                                  });
+            break;
+    }
 
     if (merges_utf8_str.size() > 0) {
         load_from_merges(merges_utf8_str);

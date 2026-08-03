@@ -45,10 +45,28 @@ constexpr int kMiniMaxH3AudioSampleRate = 32000;
 // Qwen3-VL reads a reference video at 2 fps and merges the sampled frames in pairs.
 constexpr int kMiniMaxH3QwenSampleFps     = 2;
 constexpr int kMiniMaxH3QwenTemporalPatch = 2;
-// Canvas: 32-pixel multiples, 768 short edge, 768*1344 area cap.
+// Canvas: 32-pixel multiples (16x VAE * 2x2 patch), 768 short edge for the default canvas.
 constexpr int kMiniMaxH3CanvasMultiple = 32;
 constexpr int kMiniMaxH3BaseShortEdge  = 768;
-constexpr int kMiniMaxH3MaxPixels      = 768 * 1344;
+
+// ⚠️ AREA CAP — 768*1344 is the reference's DEFAULT CANVAS, not a limit. Do not re-tighten it.
+//
+// This constant started at 768*1344 = 1,032,192 px, read out of the reference PRs, and enforcing
+// it as validation REFUSED 1920x1088 (2,088,960 px) -- a resolution we actively intend to test.
+// That was a bug: it turned a default into a limit.
+//
+// The reference's own node declares no cap at all:
+//     io.Int.Input("width",  default=1344, min=32, max=nodes.MAX_RESOLUTION, step=32)
+//     io.Int.Input("height", default=768,  min=32, max=nodes.MAX_RESOLUTION, step=32)
+// `MAX_PIXELS` appears ONLY inside `adapt_canvas()`, a helper that derives a canvas from an aspect
+// ratio (and is applied to REFERENCE VIDEO canvases), never to the target canvas.
+// Corroborating, though weaker because it is a commercial host's own copy: fal.ai documents every
+// H3 endpoint as 2K -- 1440 short edge, ~3.7 MP at 21:9 (2976x1248).
+//
+// So the number below is a sanity bound, not a model constraint: it keeps a fat-fingered request
+// from allocating absurdly while letting VRAM be the real limit, which is self-evidently
+// diagnosable in a way a 400 is not.
+constexpr int kMiniMaxH3MaxPixels = 2976 * 1248;  // 3,714,048 — fal's documented 2K maximum
 // Reference-image sizing: "max" keeps a 2048 short edge for identity fidelity.
 constexpr int kMiniMaxH3RefImageShortEdge = 2048;
 // Reference counts the trained node exposes. Not architectural limits -- refusing at the

@@ -67,12 +67,103 @@
 // the H3 port has never shipped, so no such build exists outside this tree.  If a permuted GGUF is
 // ever published, the marker has to become something an old build REFUSES rather than ignores.
 
+// =================================================================================================
+// SECOND, INDEPENDENT REWRITE IN THIS FILE: the fused-QKV DE-INTERLEAVE
+//
+// The RAW MiniMax-H3 checkpoint does NOT store `qkv_proj.weight` as [q_all; k_all; v_all].  It
+// stores it PER-HEAD INTERLEAVED:
+//
+//     [head0: q(head_dim) k(head_dim) v(head_dim), head1: q k v, ...]
+//
+// The reference implementation un-interleaves at LOAD time (`_reorder_grouped_qkv_to_qkv`), and the
+// official diffusers converter does the same on the way in (`reorder_interleaved_qkv`,
+// scripts/convert_minimax_h3_to_diffusers.py:110, applied by the shard streamer at :765 to EVERY
+// key ending `.attn.qkv_proj.weight` -- token_refiner blocks included).  So [q_all; k_all; v_all] is
+// an IN-MEMORY layout that no file on disk ever holds, and reference SPELLING says nothing about
+// which of the two a given file carries.
+//
+// The engine's `split_qkv` assumes contiguous.  Fed a raw shard it produces garbage silently: every
+// shape matches, nothing errors, the attention is just wrong.
+//
+// ORDERING, and it is not negotiable: DE-INTERLEAVE FIRST, then the q/k RoPE head-channel
+// permutation above.  That permutation is defined on [q_all; k_all; v_all] -- it walks the first two
+// thirds of the row axis and treats each as `heads` consecutive head blocks.  Applied to an
+// interleaved tensor it would rewrite head0's q/k/v as if they were the q of heads 0/1/2, so both
+// transforms would then be wrong TOGETHER, which is exactly the failure that is hardest to see.
+//
+// Like the RoPE permutation this moves whole rows and never reaches inside one, so it is exact for
+// every ggml type, quantised included.
+//
+// `q_norm.weight` / `k_norm.weight` are NOT touched, and that is a claim about the reference, not an
+// assumption: `reorder_interleaved_qkv` reshapes to (heads, 3, head_dim, ...) and only ever moves
+// whole (head, third) blocks, so the channel order INSIDE a block is untouched -- a per-head-dim
+// gain vector is invariant under it.  Proven against the reference function itself in
+// tests/minimax_h3_qkv_deinterleave_test.cpp (case `q_norm_invariance`).
+
 namespace MiniMaxH3 {
 
     // Presence of this tensor (under the diffusion-model prefix) means the q/k head channels of
     // every `blocks.N.attn` are already permuted for full-width split-half RoPE.  Value unused.
     inline const char* qk_permuted_marker_name() {
         return "rope.qk_permuted";
+    }
+
+    // Presence of this tensor means this converter has already de-interleaved every fused
+    // `attn.qkv_proj.weight` in the file, so the rows are [q_all; k_all; v_all].  Value unused.
+    //
+    // Presence-only, exactly like the RoPE marker and for the same reason: absence does NOT mean
+    // "interleaved", it means "unknown" -- a file could have been de-interleaved by some other tool.
+    // Which is why the converter refuses to guess; see src/convert.cpp.
+    inline const char* qkv_deinterleaved_marker_name() {
+        return "attn.qkv_deinterleaved";
+    }
+
+    // Source row-BLOCK index for each destination row-block, at head_dim-row granularity.
+    // Destination block `t * heads + h` (the [q_all; k_all; v_all] order) comes from source block
+    // `3 * h + t` (the per-head-interleaved order).  This is a block transpose of an
+    // (heads x 3) grid into a (3 x heads) one.
+    inline int64_t deinterleave_source_block(int64_t dst_block, int64_t heads) {
+        const int64_t t = dst_block / heads;
+        const int64_t h = dst_block % heads;
+        return 3 * h + t;
+    }
+
+    // In-place de-interleave of `3 * heads` blocks of `head_dim` rows each, `row_bytes` wide.
+    //
+    // Cycle-following rather than gather-into-a-copy: the scratch buffer is ONE block
+    // (head_dim * row_bytes) instead of the whole tensor, which at the shipping geometry is 4.5 MB
+    // instead of 231 MB per concurrent converter thread.
+    inline void deinterleave_qkv_rows(uint8_t* data,
+                                      size_t row_bytes,
+                                      int64_t heads,
+                                      int64_t head_dim,
+                                      std::vector<uint8_t>& scratch,
+                                      std::vector<uint8_t>& visited) {
+        const int64_t n_blocks   = 3 * heads;
+        const size_t block_bytes = static_cast<size_t>(head_dim) * row_bytes;
+        scratch.resize(block_bytes);
+        visited.assign(static_cast<size_t>(n_blocks), 0);
+
+        auto block = [&](int64_t i) { return data + static_cast<size_t>(i) * block_bytes; };
+
+        for (int64_t start = 0; start < n_blocks; start++) {
+            if (visited[static_cast<size_t>(start)]) {
+                continue;
+            }
+            // out[i] = in[src(i)].  Walk the cycle, holding the one block the cycle overwrites last.
+            std::memcpy(scratch.data(), block(start), block_bytes);
+            int64_t i = start;
+            while (true) {
+                visited[static_cast<size_t>(i)] = 1;
+                const int64_t j                 = deinterleave_source_block(i, heads);
+                if (j == start) {
+                    std::memcpy(block(i), scratch.data(), block_bytes);
+                    break;
+                }
+                std::memcpy(block(i), block(j), block_bytes);
+                i = j;
+            }
+        }
     }
 
     inline bool qk_permutation_is_applicable(int64_t head_dim, int64_t rot_dim) {

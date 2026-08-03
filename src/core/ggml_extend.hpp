@@ -20,6 +20,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1988,6 +1989,30 @@ struct GGMLRunnerContext {
     }
 };
 
+// ------------------------------------------------------------------------------------------
+// VRAM PROBE HOOK.  Null unless something installs one; nothing in this tree installs one except
+// the MiniMax-H3 diagnostic bundle under MINIMAX_H3_DIAG_VRAM=1.
+//
+// It exists here rather than in the H3 headers because the only place the numbers are all
+// simultaneously true is INSIDE execute_graph, immediately after the kernels have run: the
+// segment's weights are staged, the compute buffer is allocated, and the CUDA pool has grown to
+// whatever the kernels asked for.  Sampling anywhere else measures a moment that is not the peak.
+//
+// ★ Cost when unused: one null pointer test per graph.  ltx-video, ltx-2b, flux2, flux2-4b,
+// wan-vace and longcat-avatar are otherwise untouched -- no allocation, no device call, no log.
+// ------------------------------------------------------------------------------------------
+using SDVramProbeFn = void (*)(const char* runner_desc,
+                               ggml_backend_t backend,
+                               int segment,
+                               int segments_total,
+                               size_t compute_buffer_bytes,
+                               size_t cache_buffer_bytes);
+
+inline SDVramProbeFn& sd_vram_probe_hook() {
+    static SDVramProbeFn fn = nullptr;
+    return fn;
+}
+
 struct GGMLRunner {
 protected:
     typedef std::function<ggml_cgraph*()> get_graph_cb_t;
@@ -2005,6 +2030,10 @@ protected:
     ggml_gallocr* compute_allocr = nullptr;
 
     size_t max_graph_vram_bytes           = 0;
+    // Where the segment loop is, so a probe fired from inside execute_graph can say which cut it
+    // is looking at.  -1 outside a segmented compute.
+    int current_graph_cut_segment_        = -1;
+    int current_graph_cut_segments_total_ = -1;
     bool stream_layers_enabled            = false;
     size_t observed_max_effective_budget_ = 0;
     bool graph_cut_layer_split_enabled    = false;
@@ -2065,6 +2094,9 @@ protected:
     // upstream owns planning, residency, and parameter lifecycle; the callback only
     // observes a successfully computed graph before its transient buffer is released.
     std::function<void(ggml_cgraph*)> segment_readback_hook_ = nullptr;
+    // Optional runner-owned diagnostic observer for the resolved plan.  Like the readback hook,
+    // this is observation-only and is null in normal execution.
+    std::function<void(const GraphCutPlan&)> graph_cut_plan_hook_ = nullptr;
 
     bool flash_attn_enabled    = false;
     bool conv2d_direct_enabled = false;
@@ -3459,7 +3491,8 @@ protected:
                                                bool preserve_backend_tensor_data_map,
                                                bool no_return                                          = false,
                                                const std::unordered_set<std::string>* cache_keep_names = nullptr,
-                                               const char* vram_diag_label                            = nullptr) {
+                                               const char* vram_diag_label                            = nullptr,
+                                               const std::vector<ggml_tensor*>* stage_prefetch_params  = nullptr) {
         const char* vram_diag_env = std::getenv("GGML_LTX_VRAM_DIAG");
         const bool vram_diag = get_desc() == "ltxav" && vram_diag_env != nullptr &&
                                vram_diag_env[0] != '\0' && vram_diag_env[0] != '0';
@@ -3552,6 +3585,45 @@ protected:
             sd_backend_cpu_set_n_threads(cpu_fallback_backend, n_threads);
         }
 
+        // COPY/COMPUTE OVERLAP. Everything this segment needs is already staged (that happened
+        // at the top of this function), the compute buffer is allocated and the graph is
+        // allocated -- so the device allocation the prefetch wants is the last one before the
+        // kernels go in, and it happens with nothing in flight. The worker then runs its
+        // host->device copies on its own thread-local CUDA stream for the whole time the main
+        // thread is parked in the compute's cudaStreamSynchronize.
+        //
+        // Declared AFTER GraphWeightDoneGuard and ComputeBufferGuard so it destructs BEFORE
+        // them: the worker must be joined and the prefetch settled before anything releases
+        // this segment's staged weights or frees the compute buffer.
+        struct StagePrefetchGuard {
+            std::thread worker;
+            std::shared_ptr<RunnerWeightManager> manager;
+
+            void settle() {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+                if (manager != nullptr) {
+                    manager->finish_stage_prefetch();
+                    manager.reset();
+                }
+            }
+
+            ~StagePrefetchGuard() { settle(); }
+
+            StagePrefetchGuard()                                     = default;
+            StagePrefetchGuard(const StagePrefetchGuard&)            = delete;
+            StagePrefetchGuard& operator=(const StagePrefetchGuard&) = delete;
+        };
+        StagePrefetchGuard stage_prefetch_guard;
+        if (stage_prefetch_params != nullptr && !stage_prefetch_params->empty()) {
+            if (auto manager = weight_manager.lock();
+                manager != nullptr && manager->begin_stage_prefetch(*stage_prefetch_params)) {
+                stage_prefetch_guard.manager = manager;
+                stage_prefetch_guard.worker  = std::thread([manager]() { manager->run_stage_prefetch(); });
+            }
+        }
+
         ggml_status status;
         if (sched != nullptr) {
             if (sd_get_backend_eval_callback() != nullptr && !multi_device_eval_callback_warned) {
@@ -3570,11 +3642,33 @@ protected:
                                                                  sd_get_backend_eval_callback(),
                                                                  sd_get_backend_eval_callback_data());
         }
+        // Join before the readback/cache work below, not at scope exit: from here on the main
+        // thread issues its own transfers and allocations, and the point of the worker was to
+        // own the window where the main thread had nothing to do.
+        stage_prefetch_guard.settle();
+
         if (status != GGML_STATUS_SUCCESS) {
             LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
             return std::nullopt;
         }
         log_vram("post-compute");
+
+        // ★ THE ONE MOMENT EVERYTHING IS TRUE AT ONCE.  Staged weights live, compute buffer
+        // allocated, CUDA pool grown to whatever the kernels wanted, nothing released yet.
+        if (SDVramProbeFn probe = sd_vram_probe_hook(); probe != nullptr) {
+            size_t compute_buffer_bytes = 0;
+            if (compute_allocr != nullptr) {
+                compute_buffer_bytes = ggml_gallocr_get_buffer_size(compute_allocr, 0);
+            } else if (sched != nullptr) {
+                compute_buffer_bytes = ggml_backend_sched_get_buffer_size(sched, runtime_backend);
+            }
+            probe(get_desc().c_str(),
+                  runtime_backend,
+                  current_graph_cut_segment_,
+                  current_graph_cut_segments_total_,
+                  compute_buffer_bytes,
+                  cache_buffer != nullptr ? ggml_backend_buffer_get_size(cache_buffer) : 0);
+        }
 
         if (!debug_tensors.empty()) {
             std::unordered_set<const ggml_tensor*> debug_graph_tensor_set;
@@ -3729,13 +3823,38 @@ protected:
                      plan.segments.size());
         }
 
+        // MINIMAX_H3_STAGE_PREFETCH=1 overlaps segment N+1's weight stream with segment N's
+        // compute. Default OFF: with the variable unset this resolves to false and every
+        // service on this binary keeps today's serialised stage-then-compute path unchanged.
+        //
+        // Restricted to the single-backend path on purpose. With ggml_backend_sched in play
+        // (multi-GPU / CPU fallback) a graph's params can land on more than one device and the
+        // "which stream is this copy on" argument that makes the overlap safe stops holding.
+        static const bool stage_prefetch_env = [] {
+            const char* v = std::getenv("MINIMAX_H3_STAGE_PREFETCH");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        const bool stage_prefetch = stage_prefetch_env && sched == nullptr;
+
         std::optional<sd::Tensor<T>> output = sd::Tensor<T>();
         const char* segment_profile_env = std::getenv("GGML_LTX_SEGMENT_PROFILE");
         const bool segment_profile = get_desc() == "ltxav" && segment_profile_env != nullptr &&
                                      segment_profile_env[0] != '\0' && segment_profile_env[0] != '0';
+        // Restored on every exit path from the loop, including the early returns below, so a
+        // later unsegmented graph cannot inherit a stale segment index in its probe.
+        struct SegmentIndexGuard {
+            GGMLRunner* runner;
+            ~SegmentIndexGuard() {
+                runner->current_graph_cut_segment_        = -1;
+                runner->current_graph_cut_segments_total_ = -1;
+            }
+        } segment_index_guard{this};
+        current_graph_cut_segments_total_ = static_cast<int>(plan.segments.size());
+
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); ++seg_idx) {
             const auto& segment   = plan.segments[seg_idx];
             const bool is_last    = seg_idx + 1 == plan.segments.size();
+            current_graph_cut_segment_ = static_cast<int>(seg_idx);
             auto future_cut_names = sd::ggml_graph_cut::collect_future_input_names(gf, plan, seg_idx);
             if (log_residency) {
                 LOG_DEBUG("%s graph cut executing segment %zu/%zu: %s (residency=%s)",
@@ -3809,6 +3928,22 @@ protected:
                 const char* v = std::getenv("SD_GRAPH_CUT_FREE_BUF_PER_SEGMENT");
                 return v != nullptr && v[0] != '\0' && v[0] != '0';
             }();
+            // Weights the NEXT segment will ask for, read straight off the plan (param_tensors()
+            // only reads gf; build_segment_graph() would set OUTPUT flags on nodes this segment
+            // has not run yet, so it is deliberately not used here). Anything already staged --
+            // shared with this segment, retained, or kept -- is filtered out by the manager, so
+            // what reaches the worker is disjoint from what this segment's graph can name.
+            std::vector<ggml_tensor*> next_segment_params;
+            if (stage_prefetch && !is_last) {
+                rebuild_params_tensor_set();
+                std::unordered_set<ggml_tensor*> seen_next_params;
+                for (ggml_tensor* leaf : sd::ggml_graph_cut::param_tensors(gf, plan.segments[seg_idx + 1])) {
+                    ggml_tensor* param = canonical_param_tensor(leaf);
+                    if (param != nullptr && seen_next_params.insert(param).second) {
+                        next_segment_params.push_back(param);
+                    }
+                }
+            }
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
                                                    // Reuse the compute allocator through the complete
@@ -3820,7 +3955,8 @@ protected:
                                                    true,
                                                    !is_last || no_return,
                                                    &future_cut_names,
-                                                   segment.group_name.c_str());
+                                                   segment.group_name.c_str(),
+                                                   next_segment_params.empty() ? nullptr : &next_segment_params);
             if (segment_profile) {
                 LOG_INFO("[LTX_SEGMENT] %zu/%zu %s: nodes=%d leafs=%d wall=%lld ms",
                          seg_idx + 1,
@@ -4093,6 +4229,9 @@ public:
             if (!resolve_graph_cut_plan(gf, &plan)) {
                 free_compute_ctx();
                 return std::nullopt;
+            }
+            if (graph_cut_plan_hook_) {
+                graph_cut_plan_hook_(plan);
             }
             if (should_use_graph_cut_segmented_compute(plan)) {
                 return compute_graph_cut_segments<T>(gf,

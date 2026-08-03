@@ -52,6 +52,9 @@
 #include "longcat_avatar.hpp"
 #include "model/diffusion/mage_flow.hpp"
 #include "model/diffusion/minimax_h3.hpp"
+#include "model/diffusion/minimax_h3_cache.hpp"
+#include "model/diffusion/minimax_h3_diag_vram.hpp"
+#include "model/diffusion/minimax_h3_golden.hpp"
 #include "model/diffusion/minimax_h3_host_layout.hpp"
 #include "model/diffusion/minit2i.hpp"
 #include "model/diffusion/mmdit.hpp"
@@ -370,7 +373,12 @@ public:
     bool enable_mmap                     = false;
     sd::ggml_graph_cut::MaxVramAssignment max_vram_assignment;
     bool stream_layers = false;
-    bool eager_load    = false;
+    // Conditioner/text-encoder streaming, opt-in and independent of `stream_layers` (which stays
+    // diffusion-only so that LTX/krea2/flux2/wan keep their measured behaviour untouched).
+    // `stream_layers_te_gib` is the raw request; `stream_layers_te` is what survived the gate.
+    bool stream_layers_te      = false;
+    float stream_layers_te_gib = 0.f;
+    bool eager_load            = false;
     std::string backend_spec;
     std::string params_backend_spec;
     std::string split_mode_spec;
@@ -472,6 +480,158 @@ public:
         }
         LOG_INFO("MiniMax-H3: released the text encoder's staged params, cache buffer and CUDA pool "
                  "pages before the DiT phase (%.3fs)",
+                 (ggml_time_ms() - started_ms) * 1.0f / 1000);
+    }
+
+    // =========================================================================================
+    // MiniMax-H3 PHASE-RESOLVED VRAM ACCOUNTING
+    // =========================================================================================
+
+    // The phase the render is in, so a probe fired from deep inside GGMLRunner -- which has no
+    // idea whether it is encoding a keyframe or denoising -- can label what it sees.
+    std::string h3_vram_phase = "start";
+    int h3_vram_step          = -1;
+
+    // ★ H3-SCOPED, not just env-scoped. The env var is H3-named, but the call sites sit on the
+    // generic video path that ltx-video, ltx-2b and wan-vace also walk -- so the version test is
+    // what actually guarantees those services cannot be sampled even if someone exports the
+    // variable service-wide.
+    bool h3_vram_active() const {
+        return MiniMaxH3Diag::vram_on() && sd_version_is_minimax_h3(version);
+    }
+
+    void h3_vram_set_phase(const char* phase) {
+        if (h3_vram_active()) {
+            h3_vram_phase = phase;
+        }
+    }
+
+    void h3_vram_set_step(int step) {
+        if (h3_vram_active()) {
+            h3_vram_step = step;
+        }
+    }
+
+    // One observation.  `backend` decides which device's counters are read; when it is null the
+    // VAE backend is used, which on every H3 deployment is the same CUDA device as the DiT's.
+    void h3_vram_sample(const char* phase,
+                        const std::string& label,
+                        int segment                 = -1,
+                        int segments_total          = -1,
+                        ggml_backend_t backend      = nullptr,
+                        size_t compute_buffer_bytes = 0,
+                        size_t cache_buffer_bytes   = 0) {
+        if (!h3_vram_active()) {
+            return;
+        }
+        if (phase != nullptr) {
+            h3_vram_phase = phase;
+        }
+        ggml_backend_t probe_backend = backend != nullptr ? backend : backend_for(SDBackendModule::VAE);
+        MiniMaxH3Diag::VramSample sample;
+        if (!MiniMaxH3Diag::query_device_memory(probe_backend, &sample.dev_free, &sample.dev_total)) {
+            return;
+        }
+        sample.phase          = h3_vram_phase;
+        sample.label          = label;
+        sample.step           = h3_vram_step;
+        sample.segment        = segment;
+        sample.segments_total = segments_total;
+        sample.compute_buffer = static_cast<int64_t>(compute_buffer_bytes);
+        sample.cache_buffer   = static_cast<int64_t>(cache_buffer_bytes);
+        if (model_manager) {
+            const ModelManager::ParamsResidency residency = model_manager->params_residency();
+            sample.res.params_vram   = static_cast<int64_t>(residency.params_vram);
+            sample.res.params_ram    = static_cast<int64_t>(residency.params_ram);
+            sample.res.staged_vram   = static_cast<int64_t>(residency.staged_vram);
+            sample.res.prefetch_vram = static_cast<int64_t>(residency.prefetch_vram);
+            sample.res.params_blocks = static_cast<int64_t>(residency.params_blocks);
+            sample.res.staged_blocks = static_cast<int64_t>(residency.staged_blocks);
+            sample.res.modules.reserve(residency.modules.size());
+            for (const ModelManager::ParamsResidency::Module& m : residency.modules) {
+                MiniMaxH3Diag::ModuleResidency mod;
+                mod.desc           = m.desc;
+                mod.params_vram    = static_cast<int64_t>(m.params_vram);
+                mod.params_ram     = static_cast<int64_t>(m.params_ram);
+                mod.staged_vram    = static_cast<int64_t>(m.staged_vram);
+                mod.params_tensors = static_cast<int64_t>(m.params_tensors);
+                mod.staged_tensors = static_cast<int64_t>(m.staged_tensors);
+                sample.res.modules.push_back(std::move(mod));
+            }
+        }
+        MiniMaxH3Diag::vram().record(std::move(sample));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // EVICT THE VAEs ACROSS A PHASE BOUNDARY.  MINIMAX_H3_EVICT_VAE=1, default OFF.
+    //
+    // WHAT IS BEING RECLAIMED, and why it is not already reclaimed. The VAEs' params backend IS
+    // the compute backend (nothing on the command line ever moves it), so their weights are
+    // allocated straight into VRAM as a ParamsStorageBlock and are never staged. `runner_done()`
+    // does call release_params_backend_params(), but release_params_storage_blocks() only frees a
+    // block whose residency is ResidencyMode::Disk -- and the VAEs' is ParamBackend. So once a
+    // decode has faulted the video decoder in, its 4.85 GB (f16) sits on the card until the
+    // process exits, including through every subsequent render's DiT sampling.
+    //
+    // ★ THIS IS A MULTI-SEGMENT PROBLEM, WHICH IS WHY SINGLE-RENDER PROBES NEVER SAW IT. A fresh
+    // worker's FIRST render loads the video decoder only at decode time, i.e. after sampling has
+    // already peaked -- so the frontier table is honest for segment 1 and wrong for segments 2..N,
+    // which are exactly what a continuation chain is made of.
+    //
+    // NUMERICALLY INERT. Freeing a params block sets tensor->data to null and clears
+    // loaded_to_params_backend; the next prepare_params() re-reads the same bytes out of the same
+    // model file into a fresh buffer. The cuDNN conv weight-reorder caches are invalidated by
+    // free_params_storage_block() because the content behind a name may change -- here it does
+    // not, so that is belt-and-braces rather than a correctness dependency. The only thing that
+    // changes is timing: one re-read per render.
+    //
+    // WITH THE VARIABLE UNSET this function is never called, and ltx-video, ltx-2b, flux2,
+    // flux2-4b, wan-vace and longcat-avatar keep byte-identical behaviour -- they do not even
+    // reach the call sites, which are all inside `sd_version_is_minimax_h3` blocks.
+    // -----------------------------------------------------------------------------------------
+    static bool h3_evict_vae_enabled() {
+        static const bool enabled = [] {
+            const char* v = getenv("MINIMAX_H3_EVICT_VAE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return enabled;
+    }
+
+    void reclaim_vae_gpu_memory(const char* reason) {
+        if (!h3_evict_vae_enabled() || !sd_version_is_minimax_h3(version)) {
+            return;
+        }
+        const int64_t started_ms = ggml_time_ms();
+        auto finish_runner       = [](auto& runner) {
+            if (!runner) {
+                return;
+            }
+            runner->runner_done();
+            runner->free_cache_ctx_and_buffer();
+        };
+        finish_runner(first_stage_model);
+        finish_runner(h3_audio_vae_model);
+
+        size_t freed = 0;
+        if (model_manager) {
+            // ★ Deliberately NOT reclaim_transient_compute_buffers(): that force-releases EVERY
+            // module's staging blocks, and a phase boundary has no business touching the DiT's or
+            // the text encoder's. release_module_params() drops only the named modules' staging,
+            // and only when those tensors are idle.
+            //
+            // The descs are the literals register_runner_params() was called with; a typo here
+            // frees nothing and says so (freed == 0), rather than freeing the wrong module.
+            freed = model_manager->release_module_params({"VAE", "preview VAE", "MiniMax-H3 audio VAE"});
+        }
+
+        if (ggml_backend_t vae_backend = backend_for(SDBackendModule::VAE);
+            vae_backend != nullptr && ggml_backend_is_cuda(vae_backend)) {
+            ggml_backend_synchronize(vae_backend);
+            ggml_backend_cuda_trim_memory(vae_backend);
+        }
+        LOG_INFO("MiniMax-H3: evicted %.2f MiB of VAE weights from the device (%s), %.3fs",
+                 freed / (1024.0 * 1024.0),
+                 reason,
                  (ggml_time_ms() - started_ms) * 1.0f / 1000);
     }
 
@@ -1216,8 +1376,10 @@ public:
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads           = sd_ctx_params->n_threads;
         enable_mmap         = sd_ctx_params->enable_mmap;
-        stream_layers       = sd_ctx_params->stream_layers;
-        eager_load          = sd_ctx_params->eager_load;
+        stream_layers        = sd_ctx_params->stream_layers;
+        stream_layers_te_gib = sd_ctx_params->stream_layers_te;
+        stream_layers_te     = std::isfinite(stream_layers_te_gib) && stream_layers_te_gib != 0.f;
+        eager_load           = sd_ctx_params->eager_load;
         backend_spec        = SAFE_STR(sd_ctx_params->backend);
         params_backend_spec = SAFE_STR(sd_ctx_params->params_backend);
         split_mode_spec     = SAFE_STR(sd_ctx_params->split_mode);
@@ -1330,6 +1492,10 @@ public:
             }
         }
 
+        // sd_ctx_params is not retained, so the MiniMax-H3 conditioning cache is
+        // handed the text-encoder identity here. Disables itself if it is empty.
+        minimax_h3_cache::note_text_encoder(sd_ctx_params->llm_path, sd_ctx_params->llm_vision_path);
+
         if (strlen(SAFE_STR(sd_ctx_params->vae_path)) > 0) {
             LOG_INFO("loading vae from '%s'", sd_ctx_params->vae_path);
             if (!model_loader.init_from_file(sd_ctx_params->vae_path, "vae.")) {
@@ -1429,6 +1595,29 @@ public:
         if (stream_layers && !backend_manager.params_backend_is_cpu(SDBackendModule::DIFFUSION)) {
             LOG_WARN("--stream-layers has no effect unless diffusion params backend is cpu; ignoring");
             stream_layers = false;
+        }
+        // --stream-layers-te is the CONDITIONER's own switch. It is deliberately NOT folded into
+        // --stream-layers: that flag is measured and pinned for LTX/krea2/flux2/wan, and several of
+        // them already run the text encoder on the GPU with its params in RAM (krea2 ships
+        // `--params-backend clip=cpu`). Coupling the two would silently change the text-encoder
+        // residency of every one of those services the moment someone turned --stream-layers on.
+        // The two preconditions below are the same ones the graph-cut streaming path itself
+        // requires, checked here so a mistake is a startup WARN and not a mysterious no-op:
+        //   * params backend cpu   -> the weights live in host RAM and are staged per segment.
+        //                             If the params backend IS the device, the whole store is
+        //                             allocated up front and no amount of segmenting helps.
+        //   * runtime backend != cpu -> can_attempt_graph_cut_segmented_compute() bails on a CPU
+        //                             runtime backend, so `--clip-on-cpu` + this flag is a no-op.
+        if (stream_layers_te) {
+            if (!backend_manager.params_backend_is_cpu(SDBackendModule::TE)) {
+                LOG_WARN("--stream-layers-te has no effect unless the text encoder params backend is cpu "
+                         "(e.g. --params-backend te=cpu, or --offload-to-cpu); ignoring");
+                stream_layers_te = false;
+            } else if (backend_manager.runtime_backend_is_cpu(SDBackendModule::TE)) {
+                LOG_WARN("--stream-layers-te has no effect while the text encoder runs on the cpu "
+                         "(--clip-on-cpu / --backend te=cpu); ignoring");
+                stream_layers_te = false;
+            }
         }
         if (eager_load && graph_cut_layer_split_active()) {
             LOG_WARN("--eager-load is not supported with graph-cut layer split; weights will be prepared lazily");
@@ -1875,7 +2064,25 @@ public:
                 }
             }
 
-            cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::TE));
+            size_t te_max_graph_vram_bytes = max_graph_vram_bytes_for_module(SDBackendModule::TE);
+            if (stream_layers_te && stream_layers_te_gib > 0.f) {
+                // --max-vram is keyed by BACKEND, and on a single-GPU box the DiT and the text
+                // encoder are the same backend -- so there is no way to give a 25B text encoder a
+                // small streaming window and the DiT a large one through it. This is that knob,
+                // and it applies to the conditioner runner only.
+                te_max_graph_vram_bytes = sd::ggml_graph_cut::max_vram_gib_to_bytes(stream_layers_te_gib);
+            }
+            cond_stage_model->set_max_graph_vram_bytes(te_max_graph_vram_bytes);
+            if (stream_layers_te && te_max_graph_vram_bytes == 0) {
+                LOG_WARN("--stream-layers-te has no effect without a graph-cut budget; pass a positive "
+                         "--stream-layers-te <GiB> or set --max-vram for the text encoder's backend; ignoring");
+                stream_layers_te = false;
+            }
+            if (stream_layers_te) {
+                LOG_INFO("streaming the text encoder's layers (budget %.2f MB)",
+                         te_max_graph_vram_bytes / (1024.0 * 1024.0));
+                cond_stage_model->set_stream_layers_enabled(true);
+            }
             if (!register_runner_params("Conditioner model",
                                         cond_stage_model,
                                         SDBackendModule::TE,
@@ -3641,6 +3848,40 @@ public:
             if (sd_version_is_hunyuan_video(version) && step + 1 < sigmas.size()) {
                 hunyuan_timestep_r_tensor = sd::Tensor<float>::from_vector({sigmas[step + 1]});
             }
+            // MiniMax-H3 needs the FAR END of the step, not just its start: the audio stream lives
+            // on a different flow shift, and converting its velocity onto the video schedule the
+            // sampler integrates is a per-step SECANT, not a point derivative. Same plumbing as
+            // hunyuan_timestep_r_tensor above -- raw sigma units, one element.
+            //
+            // `step` is 1-based (the samplers call `model(x, sigmas[i], i + 1)`) and its sign is a
+            // flag for the uncond pass, so index on abs(step): this step's sigma is sigmas[|step|-1]
+            // and the NEXT one is therefore sigmas[|step|]. The schedule's last entry is 0, and
+            // sigma_a(0) == 0 in closed form, so the final step's secant is finite and needs no
+            // special case. When |step| runs off the end the tensor stays empty and the DiT keeps
+            // the instantaneous slope.
+            sd::Tensor<float> minimax_h3_sigma_next_tensor;
+            if (sd_version_is_minimax_h3(version)) {
+                const size_t si = static_cast<size_t>(std::abs(step));
+                if (si < sigmas.size()) {
+                    minimax_h3_sigma_next_tensor = sd::Tensor<float>::from_vector({sigmas[si]});
+                }
+            }
+            // MINIMAX_H3_GOLDEN_FORCE_X -- teacher-force this step's x from a ComfyUI capture.
+            //
+            // ★ This is what makes a per-step comparison a FORWARD-PASS comparison. Unforced,
+            // step k starts from OUR step k-1 output, so a step-1 divergence contaminates every
+            // later step and "we differ at step 7" says nothing about step 7. Forced, each step
+            // evaluates the same function at the same point, independently.
+            //
+            // Written through `x` rather than through `noised_input` on purpose: `denoised` is
+            // built as `pred * c_out + x * c_skip` further down, so forcing only the DiT's input
+            // would leave the x0 estimate mixing a golden velocity with our own x.
+            if (sd_version_is_minimax_h3(version)) {
+                minimax_h3_golden::force_x(const_cast<sd::Tensor<float>&>(x),
+                                           step,
+                                           minimax_h3_audio_t,
+                                           get_latent_channel());
+            }
             sd::Tensor<float> noised_input = x * c_in;
             // MiniMax-H3 hands the DiT the VIDEO half of the packed latent and the audio half on
             // the runner's request; this owns the sliced video view for the duration of the step.
@@ -3789,6 +4030,13 @@ public:
                     // the checkpoint and the quantisation as the first suspects. Abort instead.
                     auto* h3_runner = dynamic_cast<MiniMaxH3::MiniMaxH3Runner*>(diffusion_model.get());
                     GGML_ASSERT(h3_runner != nullptr && "MiniMax-H3 version without a MiniMaxH3Runner");
+                    // The DiT is never told which sampler step it is on; the diagnostic bundle
+                    // needs that to label everything it captures inside the graph.
+                    MiniMaxH3Diag::rec().set_step(step);
+                    // ★ Peak VRAM is reached inside step 1, so every per-segment probe HAS to be
+                    // able to say which step it belongs to -- otherwise the ceiling and the steady
+                    // state read as the same number.
+                    h3_vram_set_step(step < 0 ? -step : step);
                     GGML_ASSERT(minimax_h3_request_staged &&
                                 "MiniMax-H3 reached the DiT without a staged request; the packed "
                                 "layout would describe a different sequence than the VAEs produced");
@@ -3800,6 +4048,106 @@ public:
                     h3_runner->request.audio_x =
                         minimax_h3_unpack_audio_latent(noised_input, minimax_h3_audio_t, get_latent_channel(), 32);
                     GGML_ASSERT(minimax_h3_audio_t <= 0 || !h3_runner->request.audio_x.empty());
+
+                    // MINIMAX_H3_AUDIO_X_SCALE=<k> -- ON-DISTRIBUTION LINEARITY PROBE, and the only
+                    // magnitude test the impulse probe below CANNOT give you.
+                    //
+                    // Multiplies THIS STEP's real audio latent by k instead of replacing it. That
+                    // distinction is the whole point. `norm1` is an RMSNorm
+                    // (model/diffusion/minimax_h3.hpp:876, applied at :904 -- and
+                    // comfy/ldm/minimax/model.py:269 does the same), so an impulse measured against
+                    // an all-ZERO baseline hands the first norm a row equal to
+                    // `A * audio_patch_proj.W[:, c] + b`, whose NORMALISED direction stops moving
+                    // once |A*W| dominates |b|. Two impulse amplitudes then produce near-identical
+                    // velocities BY CONSTRUCTION, in any transformer, and that is not evidence that
+                    // the audio latent is being rescaled on the way in. Scaling the real latent
+                    // keeps the row distribution the model was trained on, so the response really is
+                    // proportional to k whenever the branch is magnitude-sensitive.
+                    //
+                    // Run k = 1.0 (control), 1.1 and 2.0 at one step with the same seed and dump the
+                    // velocities: if |v(2.0) - v(1.0)| is ~10x |v(1.1) - v(1.0)| the branch SEES the
+                    // magnitude, and "the noise magnitude is destroyed before the DiT" is refuted.
+                    // Applied FIRST so the two negative controls below still win when they are set.
+                    if (const char* scale_env = getenv("MINIMAX_H3_AUDIO_X_SCALE");
+                        scale_env != nullptr && !h3_runner->request.audio_x.empty()) {
+                        const float k   = static_cast<float>(std::atof(scale_env));
+                        const int64_t n = h3_runner->request.audio_x.numel();
+                        for (int64_t i = 0; i < n; i++) {
+                            h3_runner->request.audio_x.data()[i] *= k;
+                        }
+                        static bool logged = false;
+                        if (!logged) {
+                            logged = true;
+                            LOG_WARN("MINIMAX_H3_AUDIO_X_SCALE=%.4f: the DiT's audio latent is scaled "
+                                     "every step. This is a probe, not a render mode.",
+                                     static_cast<double>(k));
+                        }
+                    }
+
+                    // MINIMAX_H3_AUDIO_X_ZERO=1 -- NEGATIVE CONTROL, not a feature. Hands the DiT an
+                    // all-zero target audio latent while leaving everything else identical.
+                    //
+                    // The audio stream's failure mode ("the latent leaves sampling at its noise
+                    // initialisation") has two families and no end-to-end render can tell them
+                    // apart: either the audio branch never sees `audio_x` at all -- a dead
+                    // `audio_patch_proj`, an input that does not reach the device, a row layout the
+                    // model cannot read -- or it sees it and the velocity is mis-applied downstream.
+                    // Run one render with this set and one without, and compare the GENERATED
+                    // per-channel statistics that MINIMAX_H3_AUDIO_LATENT_DUMP prints. If the two
+                    // agree, the branch is provably INPUT-BLIND and everything downstream of
+                    // `audio_patch_proj` is exonerated in one A/B. If they differ, the input does
+                    // reach the model and the defect is in the schedule, the scale or the merge.
+                    if (getenv("MINIMAX_H3_AUDIO_X_ZERO") != nullptr && !h3_runner->request.audio_x.empty()) {
+                        std::fill_n(h3_runner->request.audio_x.data(),
+                                    h3_runner->request.audio_x.numel(),
+                                    0.f);
+                        static bool logged = false;
+                        if (!logged) {
+                            logged = true;
+                            LOG_WARN("MINIMAX_H3_AUDIO_X_ZERO=1: the DiT is being handed a ZERO audio "
+                                     "latent every step. This is a negative control, not a render mode.");
+                        }
+                    }
+
+                    // MINIMAX_H3_AUDIO_X_IMPULSE=<flat_index>[:<amplitude>] -- ROW-MAP PROBE, and the
+                    // only measurement that separates "the audio rows never receive audio_x" from
+                    // "they receive it but the head reads a different row".
+                    //
+                    // Zeroes the audio latent handed to the DiT except for ONE element, at the flat
+                    // index of `request.audio_x` ({T, 2, 32} with T fastest, i.e.
+                    // idx = c*(2*T) + s*T + t). Run this against MINIMAX_H3_AUDIO_X_ZERO=1 with the
+                    // same seed and step count, dump both velocities with
+                    // MINIMAX_H3_AUDIO_VELOCITY_DUMP, and subtract: the difference IS the impulse
+                    // response of the audio branch to that one input element.
+                    //   * peak of |v_impulse - v_zero| at the SAME flat index  => the row/channel map
+                    //     is correct and the defect is a scale / modulation / passthrough problem;
+                    //   * peak anywhere else => the map is wrong, and the peak's index names the
+                    //     permutation (a shift of k rows, a T<->C transpose, a stereo swap...).
+                    // A DiT is not row-local through attention, but the RESIDUAL stream is, so a
+                    // correct wiring must peak on its own row by a wide margin.
+                    if (const char* impulse_env = getenv("MINIMAX_H3_AUDIO_X_IMPULSE");
+                        impulse_env != nullptr && !h3_runner->request.audio_x.empty()) {
+                        const int64_t n   = h3_runner->request.audio_x.numel();
+                        char* rest        = nullptr;
+                        int64_t idx       = static_cast<int64_t>(std::strtoll(impulse_env, &rest, 10));
+                        float amplitude   = 10.f;
+                        if (rest != nullptr && *rest == ':') {
+                            amplitude = static_cast<float>(std::atof(rest + 1));
+                        }
+                        idx = std::max<int64_t>(0, std::min<int64_t>(idx, n - 1));
+                        std::fill_n(h3_runner->request.audio_x.data(), n, 0.f);
+                        h3_runner->request.audio_x.data()[idx] = amplitude;
+                        static bool logged                     = false;
+                        if (!logged) {
+                            logged = true;
+                            LOG_WARN("MINIMAX_H3_AUDIO_X_IMPULSE: audio_x is zero except element %lld = %.3f "
+                                     "(of %lld). This is a probe, not a render mode.",
+                                     (long long)idx,
+                                     amplitude,
+                                     (long long)n);
+                        }
+                    }
+
                     minimax_h3_video_input = noised_input.shape()[3] > get_latent_channel()
                                                  ? sd::ops::slice(noised_input, 3, 0, get_latent_channel())
                                                  : noised_input;
@@ -3808,7 +4156,8 @@ public:
                     // Per-row AdaLN modality tags over the text span. The H3 conditioner derives
                     // them from MiniMaxH3::Modality, so they cannot drift from the layout header.
                     diffusion_params.extra = MiniMaxH3DiffusionExtra{
-                        condition.c_token_types.empty() ? nullptr : &condition.c_token_types};
+                        condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
+                        minimax_h3_sigma_next_tensor.empty() ? nullptr : &minimax_h3_sigma_next_tensor};
                 } else if (sd_version_is_longcat_avatar(version)) {
                     diffusion_params.extra = LongCatAvatarDiffusionExtra{step};
                 } else if (sd_version_is_minit2i(version)) {
@@ -3935,6 +4284,245 @@ public:
             }
 
             denoised = guided.pred * c_out + x * c_skip;
+
+            // MINIMAX_H3_GOLDEN_DUMP -- the three tensors a forward-parity comparison needs, for
+            // BOTH modalities, in ComfyUI's own array shapes.
+            //
+            // `guided.pred` is the DiT's raw packed output (its audio half already multiplied by
+            // slope_a), which is exactly what comfy's `_forward` returns; and `denoised` is
+            // `x - v*sigma_v`, which is exactly comfy's CONST.calculate_denoised applied to the
+            // whole pack. So both sides' files hold the same quantity and the comparison tool
+            // never has to know which engine wrote one.
+            //
+            // The pre-existing MINIMAX_H3_DIAG_NPY writes the AUDIO half only -- which is how a
+            // whole day of audio measurements went by with no video control.
+            if (sd_version_is_minimax_h3(version)) {
+                minimax_h3_golden::dump_packed("x", x, step, minimax_h3_audio_t, get_latent_channel());
+                minimax_h3_golden::dump_packed("velocity", guided.pred, step, minimax_h3_audio_t, get_latent_channel());
+                minimax_h3_golden::dump_packed("x0", denoised, step, minimax_h3_audio_t, get_latent_channel());
+            }
+
+            // MINIMAX_H3_AUDIO_VELOCITY_PROBE=1 -- per-channel statistics of the AUDIO half of the
+            // DiT's raw output, and of the x0 estimate the sampler derives from it, at every step.
+            //
+            // This is the measurement that separates the two families of "the audio never
+            // denoises". Read the VELOCITY row first:
+            //   * per-channel std ~0 (all 2*audio_t rows equal, only the per-channel means differ)
+            //     => the audio head is emitting a BIAS. The audio rows reach `audio_out` with a
+            //     hidden state that does not depend on `request.audio_x`, so the ODE never contracts
+            //     and Euler leaves the initial noise with a per-channel DC added -- which is exactly
+            //     the signature the generated latent shows (flat ~1.0 std, varied non-zero means).
+            //   * per-channel std O(1) and varying across channels => the audio branch works, and
+            //     the defect is downstream: the sigma_a / slope_a schedule, the merge, or the unpack.
+            // Then read X0: with a working branch its per-channel std must FALL over the run toward
+            // the encoder's distribution. If x0 tracks ~1.0 flat all the way to the last step, the
+            // velocity is not moving the latent at all regardless of what the velocity row says.
+            //
+            // MINIMAX_H3_DIAG=<prefix> subsumes this: it runs the same measurements and writes them
+            // into the bundle instead of (only) the log, and it adds the VIDEO control and the
+            // CORRECTED audio x0 -- see the trajectory block below.
+            if (sd_version_is_minimax_h3(version) && minimax_h3_audio_t > 0 &&
+                (getenv("MINIMAX_H3_AUDIO_VELOCITY_PROBE") != nullptr || MiniMaxH3Diag::on())) {
+                // MINIMAX_H3_AUDIO_VELOCITY_DUMP=<prefix> writes the raw arrays behind the summary
+                // rows, so a candidate fix can be scored offline (and two runs can be SUBTRACTED --
+                // see MINIMAX_H3_AUDIO_X_IMPULSE). Files are <prefix>.s<step>.<what>.npy, numpy
+                // shape (S, C, T), the same convention as MINIMAX_H3_AUDIO_LATENT_DUMP.
+                const char* audio_dump_prefix = getenv("MINIMAX_H3_AUDIO_VELOCITY_DUMP");
+                auto probe                    = [&](const char* what, const sd::Tensor<float>& packed) {
+                    auto slice = minimax_h3_unpack_audio_latent(packed,
+                                                                minimax_h3_audio_t,
+                                                                get_latent_channel(),
+                                                                32);
+                    if (slice.empty()) {
+                        return;
+                    }
+                    char tag[128];
+                    snprintf(tag, sizeof(tag), "MiniMax-H3 AUDIO %s step %d sigma %.5f", what, step, sigma);
+                    // {T, S, C} -> {T, C, S}, the layout log_latent_stats reads.
+                    auto vae_layout = minimax_h3_swap_audio_axes(slice);
+                    MiniMaxH3Audio::MiniMaxH3AudioVAERunner::log_latent_stats(tag, vae_layout);
+                    if (audio_dump_prefix != nullptr) {
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s.s%d.%s.npy", audio_dump_prefix, std::abs(step), what);
+                        MiniMaxH3Audio::MiniMaxH3AudioVAERunner::write_npy_f32(path,
+                                                                              vae_layout.data(),
+                                                                              vae_layout.shape());
+                    }
+                };
+                // The three log lines belong to the ORIGINAL probe. MINIMAX_H3_DIAG alone must not
+                // turn on per-step log spam -- it writes the same numbers, and more, to the bundle.
+                if (getenv("MINIMAX_H3_AUDIO_VELOCITY_PROBE") != nullptr) {
+                    probe("X", x);
+                    probe("VELOCITY", guided.pred);
+                    probe("X0", denoised);
+                }
+
+                // ★ rho -- THE single number this defect is tracked by. For a correct rectified flow
+                // the returned velocity is `eps - E[x0|cond]`, so the eps term passes through verbatim
+                // and rho(velocity, x) must be ~ +1 at sigma = 1. Measured ~0 means the audio branch
+                // is emitting a field that is statistically independent of the noise it must remove.
+                // Printed every step so a candidate fix is one probe render away from a verdict.
+                //
+                // ★★ The VIDEO row is the CONTROL, and it is the more important of the two. Both
+                // streams share the patch-proj -> packed sequence -> 50 blocks -> final-layer path
+                // and differ only in their AdaLN modality row, their rope coordinates and their two
+                // 1-D projections. So:
+                //   * video rho ~ +1, audio rho ~ 0  => the defect really is audio-specific, and the
+                //     hunt belongs on audio_patch_proj / the audio rows' rope / final_layer.audio_out;
+                //   * BOTH ~ 0                       => the defect is GLOBAL and the audio branch is
+                //     merely the stream with no slack, which would also explain the unexplained
+                //     "video is soft/pixelly" defect as the SAME bug rather than a second one.
+                // Measuring only the audio half cannot tell those apart, and every audio measurement
+                // so far has measured only the audio half.
+                auto rho_of = [](const sd::Tensor<float>& a, const sd::Tensor<float>& b) -> double {
+                    const int64_t n = a.numel();
+                    if (n <= 1 || b.numel() != n) {
+                        return 0.0;
+                    }
+                    double sx = 0, sv = 0, sxx = 0, svv = 0, sxv = 0;
+                    for (int64_t i = 0; i < n; i++) {
+                        const double p = a.data()[i];
+                        const double q = b.data()[i];
+                        sx += p;
+                        sv += q;
+                        sxx += p * p;
+                        svv += q * q;
+                        sxv += p * q;
+                    }
+                    const double dn  = static_cast<double>(n);
+                    const double cov = sxv / dn - (sx / dn) * (sv / dn);
+                    const double vx  = std::max(0.0, sxx / dn - (sx / dn) * (sx / dn));
+                    const double vv  = std::max(0.0, svv / dn - (sv / dn) * (sv / dn));
+                    return (vx > 0.0 && vv > 0.0) ? cov / std::sqrt(vx * vv) : 0.0;
+                };
+                {
+                    const int vc = get_latent_channel();
+                    auto ax      = minimax_h3_unpack_audio_latent(x, minimax_h3_audio_t, vc, 32);
+                    auto av      = minimax_h3_unpack_audio_latent(guided.pred, minimax_h3_audio_t, vc, 32);
+                    const double audio_rho = (!ax.empty() && !av.empty()) ? rho_of(ax, av) : 0.0;
+
+                    auto vx_t = x.shape()[3] > vc ? sd::ops::slice(x, 3, 0, vc) : x;
+                    auto vv_t = guided.pred.shape()[3] > vc ? sd::ops::slice(guided.pred, 3, 0, vc) : guided.pred;
+                    const double video_rho = rho_of(vx_t, vv_t);
+
+                    LOG_INFO("MiniMax-H3 RHO step %d sigma %.5f  audio %+.4f  video %+.4f  "
+                             "(a correct rectified flow at sigma=1 requires BOTH ~ +1.0)",
+                             step,
+                             sigma,
+                             audio_rho,
+                             video_rho);
+
+                    // ---- MINIMAX_H3_DIAG trajectory row -------------------------------------
+                    if (MiniMaxH3Diag::on()) {
+                        using namespace MiniMaxH3Diag;
+                        auto* h3d = dynamic_cast<MiniMaxH3::MiniMaxH3Runner*>(diffusion_model.get());
+                        const float sigma_a = h3d != nullptr ? h3d->plan.sigma_a : 0.f;
+                        const float slope_a = h3d != nullptr ? h3d->plan.slope_a : 1.f;
+
+                        auto ad = minimax_h3_unpack_audio_latent(denoised, minimax_h3_audio_t, vc, 32);
+                        auto vd_t = denoised.shape()[3] > vc ? sd::ops::slice(denoised, 3, 0, vc) : denoised;
+
+                        // ★ THE CORRECTED AUDIO x0. The sampler's `denoised` applies c_out = -sigma_v
+                        // to a velocity that has ALREADY been multiplied by slope_a, so its audio
+                        // half is off by slope_a * sigma_v / sigma_a -- roughly 4x at the first step.
+                        // It is not interpretable and has misled at least one reading of this run.
+                        // The audio stream's own x0 is x_a - sigma_a * pred_a / slope_a, derived
+                        // straight from the pieces rather than from c_out/c_skip, so it stays right
+                        // if the denoiser's scalings ever change.
+                        sd::Tensor<float> a_x0_corr;
+                        if (!ax.empty() && !av.empty() && std::fabs(slope_a) > 1e-12f) {
+                            a_x0_corr       = ax;
+                            const int64_t n = a_x0_corr.numel();
+                            for (int64_t i = 0; i < n; i++) {
+                                a_x0_corr.data()[i] = ax.data()[i] - sigma_a * av.data()[i] / slope_a;
+                            }
+                        }
+
+                        // Per-latent-channel std of the audio half. Request layout is {T, stereo, C},
+                        // so channel c is the contiguous run [c * 2T, (c + 1) * 2T).
+                        auto per_channel_std = [&](const sd::Tensor<float>& t) -> std::string {
+                            std::vector<std::string> out;
+                            if (t.empty()) {
+                                return jarray(out);
+                            }
+                            const int64_t rows = static_cast<int64_t>(minimax_h3_audio_t) * 2;
+                            const int64_t ch   = rows > 0 ? t.numel() / rows : 0;
+                            for (int64_t c = 0; c < ch; c++) {
+                                out.push_back(jnum(stats_of(t.data() + c * rows, rows).std, 4));
+                            }
+                            return jarray(out);
+                        };
+
+                        auto side = [&](const sd::Tensor<float>& xs,
+                                        const sd::Tensor<float>& vs,
+                                        const sd::Tensor<float>& d0,
+                                        double rho) {
+                            return "{\"rho_velocity_vs_x\":" + jnum(rho) +
+                                   ",\"x\":" + jstats(stats_of(xs.data(), xs.numel())) +
+                                   ",\"velocity\":" + jstats(stats_of(vs.data(), vs.numel())) +
+                                   ",\"x0\":" + jstats(stats_of(d0.data(), d0.numel())) + "}";
+                        };
+
+                        std::string js = "{\"step\":" + jint(step) + ",\"sigma_v\":" + jnum(sigma) +
+                                         ",\"sigma_a\":" + jnum(sigma_a) + ",\"slope_a\":" + jnum(slope_a) +
+                                         ",\"c_out\":" + jnum(c_out) + ",\"c_skip\":" + jnum(c_skip) +
+                                         ",\"video\":" + side(vx_t, vv_t, vd_t, video_rho) +
+                                         ",\"audio\":" + side(ax, av, ad, audio_rho);
+                        if (!a_x0_corr.empty()) {
+                            js += ",\"audio_x0_corrected\":" + jstats(stats_of(a_x0_corr.data(), a_x0_corr.numel())) +
+                                  ",\"audio_x0_correction_factor\":" +
+                                  jnum(sigma > 0.f ? sigma_a / (sigma * slope_a) : NAN);
+                        }
+                        js += ",\"audio_per_channel_std\":{\"x\":" + per_channel_std(ax) +
+                              ",\"velocity\":" + per_channel_std(av) +
+                              ",\"x0_corrected\":" + per_channel_std(a_x0_corr) + "}}";
+                        rec().append("trajectory", js);
+
+                        // ---- automatic flags ------------------------------------------------
+                        const Thresholds& th = thresholds();
+                        if (sigma >= th.high_sigma) {
+                            if (std::fabs(audio_rho) < th.rho_min_at_high_sigma) {
+                                rec().warn("AUDIO rho = " + jnum(audio_rho, 3) + " at sigma " + jnum(sigma, 3) +
+                                           " -- the audio velocity is uncorrelated with the noise it must remove "
+                                           "(a correct rectified flow needs ~ +1.0)");
+                            }
+                            if (std::fabs(video_rho) < th.rho_min_at_high_sigma) {
+                                rec().warn("VIDEO rho = " + jnum(video_rho, 3) + " at sigma " + jnum(sigma, 3) +
+                                           " -- the defect is GLOBAL, not audio-specific");
+                            }
+                        }
+                        auto finite_check = [&](const char* what, const sd::Tensor<float>& t) {
+                            const Stats s = stats_of(t.data(), t.numel());
+                            if (s.nonfinite > 0) {
+                                rec().warn(std::string("NON-FINITE values in ") + what + " at step " +
+                                           std::to_string(step) + " (" + std::to_string(s.nonfinite) + ")");
+                            }
+                        };
+                        finite_check("the video velocity", vv_t);
+                        finite_check("the audio velocity", av);
+                        finite_check("the video x0", vd_t);
+                        finite_check("the audio x0", ad);
+
+                        // MINIMAX_H3_DIAG_NPY -- the only knob here that writes full tensors.
+                        if (rec().npy() && !av.empty()) {
+                            const std::string base = rec().npy_prefix() + ".s" + std::to_string(std::abs(step));
+                            auto write = [&](const char* what, const sd::Tensor<float>& t) {
+                                if (t.empty()) {
+                                    return;
+                                }
+                                auto vae_layout = minimax_h3_swap_audio_axes(t);
+                                MiniMaxH3Audio::MiniMaxH3AudioVAERunner::write_npy_f32(
+                                    base + "." + what + ".npy", vae_layout.data(), vae_layout.shape());
+                            };
+                            write("audio_x", ax);
+                            write("audio_velocity", av);
+                            write("audio_x0_corrected", a_x0_corr);
+                        }
+                        rec().flush();
+                    }
+                }
+            }
+
             sd::guidance::GuiderOutput output;
             output.pred = denoised;
             if (needs_uncond_denoised) {
@@ -3956,6 +4544,56 @@ public:
             output.pred = denoised;
             return output;
         };
+
+        // MINIMAX_H3_DIAG=<prefix> -- open the diagnostic bundle for this render and write the
+        // SCHEDULE section before a single step runs.
+        //
+        // ★ The full sigma table, both streams, is the cheapest thing in the whole bundle and was
+        // the most expensive thing to reconstruct: the instantaneous-slope-vs-secant bug was found
+        // by hand-deriving these numbers off a log. They are now emitted for every render, whether
+        // or not anyone is looking, and a crashed render still leaves them on disk.
+        if (sd_version_is_minimax_h3(version) && MiniMaxH3Diag::on()) {
+            MiniMaxH3Diag::rec().begin_render();
+            auto* h3_runner = dynamic_cast<MiniMaxH3::MiniMaxH3Runner*>(diffusion_model.get());
+            if (h3_runner != nullptr) {
+                const float shift_v = h3_runner->request.sigma_shift_video > 0.f
+                                          ? h3_runner->request.sigma_shift_video
+                                          : h3_runner->config.sigma_shift_video;
+                const float shift_a = h3_runner->request.sigma_shift_audio > 0.f
+                                          ? h3_runner->request.sigma_shift_audio
+                                          : h3_runner->config.sigma_shift_audio;
+                const char* secant  = getenv("MINIMAX_H3_AUDIO_SECANT");
+                MiniMaxH3Diag::emit_schedule(sigmas,
+                                             shift_v,
+                                             shift_a,
+                                             secant != nullptr && secant[0] != '\0' && secant[0] != '0',
+                                             h3_runner->request.visual_cond_noise_aug,
+                                             h3_runner->request.audio_cond_noise_aug);
+                // The one conditioning invariant that is cheap to state and expensive to notice:
+                // the DiT splits the text span into modality runs by index, so a tag vector that
+                // is not exactly as long as the presentation silently mis-tags rows from the first
+                // mismatch onward. GGML_ASSERTs on it inside build_timestep_plan, but by then the
+                // render is already minutes in.
+                std::string cond_js =
+                    "{\"c_crossattn_tokens\":" +
+                    MiniMaxH3Diag::jint(cond.c_crossattn.empty() ? 0 : cond.c_crossattn.shape()[1]) +
+                    ",\"c_token_types\":" + MiniMaxH3Diag::jint(cond.c_token_types.numel()) +
+                    ",\"text_token_tags\":" +
+                    MiniMaxH3Diag::jint(static_cast<int64_t>(h3_runner->request.text_token_tags.size())) +
+                    ",\"steps\":" + MiniMaxH3Diag::jint(steps) +
+                    ",\"cfg_scale\":" + MiniMaxH3Diag::jnum(guidance.txt_cfg) +
+                    ",\"audio_t\":" + MiniMaxH3Diag::jint(minimax_h3_audio_t) + "}";
+                MiniMaxH3Diag::rec().set_section("conditioning", cond_js);
+                if (!cond.c_token_types.empty() && !cond.c_crossattn.empty() &&
+                    cond.c_crossattn.shape()[1] != cond.c_token_types.numel()) {
+                    MiniMaxH3Diag::rec().warn(
+                        "conditioning invariant FAILED: c_crossattn has " +
+                        std::to_string(cond.c_crossattn.shape()[1]) + " tokens but c_token_types has " +
+                        std::to_string(cond.c_token_types.numel()));
+                }
+            }
+            MiniMaxH3Diag::rec().flush();
+        }
 
         auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args, denoiser);
         if (x0_opt.empty()) {
@@ -4850,6 +5488,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->lora_apply_mode      = LORA_APPLY_AUTO;
     sd_ctx_params->max_vram             = nullptr;
     sd_ctx_params->stream_layers        = false;
+    sd_ctx_params->stream_layers_te     = 0.f;
     sd_ctx_params->eager_load           = false;
     sd_ctx_params->enable_mmap          = false;
     sd_ctx_params->diffusion_flash_attn = false;
@@ -4895,6 +5534,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "prediction: %s\n"
              "max_vram: %s\n"
              "stream_layers: %s\n"
+             "stream_layers_te: %.2f\n"
              "eager_load: %s\n"
              "backend: %s\n"
              "params_backend: %s\n"
@@ -4929,6 +5569,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              sd_prediction_name(sd_ctx_params->prediction),
              SAFE_STR(sd_ctx_params->max_vram),
              BOOL_STR(sd_ctx_params->stream_layers),
+             sd_ctx_params->stream_layers_te,
              BOOL_STR(sd_ctx_params->eager_load),
              SAFE_STR(sd_ctx_params->backend),
              SAFE_STR(sd_ctx_params->params_backend),
@@ -5343,6 +5984,19 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx) {
         return true;
     }
     return sd_version_supports_video_generation(sd_ctx->sd->version);
+}
+
+// MiniMax-H3 is the one model whose REQUEST SHAPE is not negotiable: fixed 24 fps, the 17n+5
+// frame grid, no CFG (guidance-distilled), no negative prompt, and video+audio out of a single
+// pass. A generic front end cannot apply those defaults without knowing it is holding an H3
+// checkpoint, and it can only know that after the weights are read -- the version is derived from
+// the tensor names, not from the file name. `sd-server` learns it from its own route; this is how
+// `sd-cli` learns it.
+SD_API bool sd_ctx_is_minimax_h3(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    return sd_version_is_minimax_h3(sd_ctx->sd->version);
 }
 
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path) {
@@ -5862,6 +6516,20 @@ struct SamplePlan {
                                                       sample_params->extra_sample_args);
         }
 
+        // MINIMAX_H3_GOLDEN_SIGMAS -- take ComfyUI's schedule verbatim instead of rebuilding it.
+        // Ours has been measured "within 1% of comfy at every step", which is a 1% velocity
+        // difference donated to the comparison before the DiT has done anything. The server API
+        // exposes custom_sigmas for the hires pass only, so this is the base pass's route in.
+        if (sd_version_is_minimax_h3(sd_ctx->sd->version) &&
+            sample_params->custom_sigmas_count <= 0 &&
+            minimax_h3_golden::override_sigmas(sigmas)) {
+            const int loaded = static_cast<int>(sigmas.size()) - 1;
+            if (loaded > 0 && loaded != total_steps && getenv("MINIMAX_H3_GOLDEN_SIGMAS") != nullptr) {
+                total_steps  = loaded;
+                sample_steps = loaded;
+            }
+        }
+
         if (sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
             sample_params->custom_sigmas_count <= 0) {
             const int dmd_steps = (sample_steps > 0 && sample_steps < 8) ? sample_steps : 8;
@@ -6060,6 +6728,119 @@ static sd::Tensor<float> encode_minimax_h3_reference_audio(sd_ctx_t* sd_ctx, con
     }
     // {T, C, S} out of the VAE -> {T, S, C} for MiniMaxH3Request. See the layout warning above.
     return minimax_h3_swap_audio_axes(latent);
+}
+
+// ---------------------------------------------------------------------------------------------
+// STANDALONE audio-VAE round trip: encode(known-good waveform) -> decode -> playable file.
+//
+// Loads NOTHING but the ~600 MB audio VAE -- no DiT, no text encoder, no video VAE -- so it runs
+// in seconds, fits on the CPU backend, and can be run while the GPU is busy with a render. That
+// is the entire point: every H3 audio result so far is end-to-end, and end-to-end cannot tell
+// "the VAE is wrong" apart from "the latents handed to it are wrong".
+//
+// The input is read with the DELIVERABLE loader (verbatim, no downmix), resampled to the VAE's
+// 32 kHz if needed, and duplicated to stereo if mono -- exactly what
+// encode_minimax_h3_reference_audio() does for a real ref2va reference, so this exercises the
+// shipping path and not a retyped copy of it.
+//
+// Env knobs (all optional):
+//   MINIMAX_H3_AUDIO_ROUNDTRIP_BACKEND=cpu|gpu   default cpu (a render usually owns the card)
+//   MINIMAX_H3_AUDIO_ROUNDTRIP_SECONDS=<float>   trim the input; 0/unset = whole file
+//   MINIMAX_H3_AUDIO_LATENT_STATS=0              disable the latents_mean/std de-normalization
+SD_API bool sd_minimax_h3_audio_roundtrip(const char* audio_vae_path,
+                                          const char* input_wav_path,
+                                          const char* output_prefix,
+                                          int n_threads) {
+    if (audio_vae_path == nullptr || input_wav_path == nullptr || output_prefix == nullptr) {
+        LOG_ERROR("MiniMax-H3 audio round trip: audio_vae_path, input_wav_path and output_prefix are required");
+        return false;
+    }
+    if (n_threads <= 0) {
+        n_threads = std::max(1u, std::thread::hardware_concurrency());
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_t backend      = nullptr;
+    const char* backend_env     = getenv("MINIMAX_H3_AUDIO_ROUNDTRIP_BACKEND");
+    const bool want_gpu         = backend_env != nullptr &&
+                          (strcmp(backend_env, "gpu") == 0 || strcmp(backend_env, "cuda") == 0);
+    if (want_gpu) {
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        if (backend == nullptr) {
+            LOG_WARN("MiniMax-H3 audio round trip: no GPU backend available, falling back to CPU");
+        }
+    }
+    if (backend == nullptr) {
+        backend = sd_backend_cpu_init();
+        sd_backend_cpu_set_n_threads(backend, n_threads);
+    }
+    LOG_INFO("MiniMax-H3 audio round trip: backend %s, %d threads", ggml_backend_name(backend), n_threads);
+
+    auto model_manager        = std::make_shared<ModelManager>();
+    ModelLoader& model_loader = model_manager->loader();
+    if (!model_loader.init_from_file(audio_vae_path)) {
+        LOG_ERROR("MiniMax-H3 audio round trip: cannot load '%s'", audio_vae_path);
+        return false;
+    }
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+    auto audio_vae           = std::make_shared<MiniMaxH3Audio::MiniMaxH3AudioVAERunner>(backend,
+                                                                                         tensor_storage_map,
+                                                                                         "",
+                                                                                         model_manager);
+    if (!model_manager->register_runner_params("MiniMax-H3 audio VAE round trip",
+                                               *audio_vae,
+                                               ModelManager::ResidencyMode::ParamBackend,
+                                               backend,
+                                               backend) ||
+        !model_manager->validate_registered_tensors()) {
+        LOG_ERROR("MiniMax-H3 audio round trip: registering the audio VAE tensors failed");
+        return false;
+    }
+
+    std::vector<float> interleaved;
+    uint32_t sample_rate = 0;
+    uint32_t channels    = 0;
+    if (!LONGCAT_AUDIO::load_wav_full(input_wav_path, interleaved, sample_rate, channels, true) ||
+        interleaved.empty() || channels == 0 || sample_rate == 0) {
+        LOG_ERROR("MiniMax-H3 audio round trip: cannot read '%s' (WAV only -- demux an mp4 with "
+                  "ffmpeg first)",
+                  input_wav_path);
+        return false;
+    }
+    const uint32_t want_rate = static_cast<uint32_t>(audio_vae->config.output_sample_rate());
+    if (sample_rate != want_rate) {
+        std::vector<float> resampled;
+        sd_audio_resample::resample_interleaved(interleaved, channels, sample_rate, want_rate, resampled);
+        interleaved = std::move(resampled);
+        LOG_INFO("MiniMax-H3 audio round trip: resampled %u Hz -> %u Hz", sample_rate, want_rate);
+    }
+    int64_t frames = static_cast<int64_t>(interleaved.size() / channels);
+    if (const char* seconds_env = getenv("MINIMAX_H3_AUDIO_ROUNDTRIP_SECONDS")) {
+        const double seconds = atof(seconds_env);
+        if (seconds > 0.0) {
+            const int64_t want = static_cast<int64_t>(seconds * want_rate);
+            frames             = std::min(frames, want);
+            LOG_INFO("MiniMax-H3 audio round trip: trimmed to %.2f s (%lld frames)",
+                     seconds, (long long)frames);
+        }
+    }
+    if (frames <= 0) {
+        LOG_ERROR("MiniMax-H3 audio round trip: '%s' has no samples", input_wav_path);
+        return false;
+    }
+    // Planar, always stereo -- the model is mono and carries stereo as two batch items, so a
+    // mono source is duplicated rather than left with an empty second channel.
+    sd::Tensor<float> planar({frames, 2});
+    for (int64_t channel = 0; channel < 2; ++channel) {
+        const uint32_t source = channels > 1 ? static_cast<uint32_t>(channel) : 0;
+        for (int64_t frame = 0; frame < frames; ++frame) {
+            planar.data()[channel * frames + frame] =
+                interleaved[static_cast<size_t>(frame) * channels + source];
+        }
+    }
+    const bool ok = audio_vae->roundtrip(n_threads, planar, output_prefix);
+    audio_vae->free_compute_buffer();
+    return ok;
 }
 
 // Decode the `ref2va` transport off sd_vid_gen_params_t into (a) the conditioner's reference list
@@ -9053,6 +9834,24 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
         return false;
     }
 
+    // ★ REFUSE A VIDEO-ONLY MODEL HERE, not 3,000 lines deeper.
+    //
+    // generate_image() shares its sampler with generate_video(), but NOT its latent preparation:
+    // only prepare_video_generation_latents() stages the per-model video request. For MiniMax-H3
+    // that request IS the packed [text | audio | video] sequence, so an image-mode call used to
+    // walk all the way to the DiT and die on
+    //   GGML_ASSERT(minimax_h3_request_staged) [stable-diffusion.cpp]  -> SIGABRT, exit 134
+    // with no hint that the caller simply picked the wrong entry point. `sd-cli` defaults to
+    // `-M img_gen`, so that abort was the FIRST thing anyone driving H3 from the CLI hit, and it
+    // cost two nsys captures that came back with zero CUDA data because the process never
+    // reached a kernel. Say what to do instead.
+    if (!sd_version_supports_image_generation(sd_ctx->sd->version)) {
+        LOG_ERROR("this is a video model (%s); generate_image() cannot render it -- use "
+                  "generate_video() (sd-cli: -M vid_gen)",
+                  model_version_to_str[sd_ctx->sd->version]);
+        return false;
+    }
+
     sd_ctx->sd->reset_cancel_flag();
 
     int64_t t0                    = ggml_time_ms();
@@ -10471,6 +11270,29 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     return latents;
 }
 
+// MINIMAX_H3_GOLDEN_CONTEXT -- substitute ComfyUI's text conditioning for ours, on every path out
+// of prepare_video_generation_embeds (including the disk-cache hit, which returns early).
+//
+// Our Qwen3-VL-32B is an nvfp4 GGUF, comfy's is nvfp4_awq safetensors, and they do NOT produce the
+// same hidden states. Without this substitution the two DiTs are being handed different prompts,
+// so every per-block divergence has a text-encoder explanation that says nothing about the DiT.
+// Injecting comfy's PRE-REFINED embeds (width 5376) additionally takes condition_proj and the
+// token refiner out of the comparison: MiniMaxH3Model::forward_text passes a hidden-width context
+// straight through, exactly as upstream hoists those two out of the step loop.
+//
+// A refusal ABORTS. Continuing with our own conditioning would produce a parity number that looks
+// like a measurement and is not one -- and this whole file exists because that class of mistake is
+// expensive to notice.
+static void minimax_h3_golden_apply_context(sd_ctx_t* sd_ctx, ImageGenerationEmbeds& embeds) {
+    if (!sd_version_is_minimax_h3(sd_ctx->sd->version)) {
+        return;
+    }
+    if (!minimax_h3_golden::inject_context(embeds.cond.c_crossattn)) {
+        GGML_ABORT("[H3-GOLDEN] MINIMAX_H3_GOLDEN_CONTEXT could not be applied; refusing to render "
+                   "with our own conditioning under a golden-parity run");
+    }
+}
+
 static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
                                                              const sd_vid_gen_params_t* sd_vid_gen_params,
                                                              const GenerationRequest& request,
@@ -10546,6 +11368,30 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
                  sd_ctx->sd->h3_chain_cond_index);
     }
 
+    // MiniMax-H3 ON-DISK conditioning cache. Same idea as h3_chain_cond_cache above, with the
+    // lifetime that makes it useful for an A/B: it survives the process. Content-addressed over
+    // every input encode_minimax_h3() reads, so a rerun that changes only a sampler flag, the
+    // resolution or the seed HITS and skips the ~55-65 s CPU text encode. Off unless
+    // MINIMAX_H3_COND_CACHE_DIR is set. See src/model/diffusion/minimax_h3_cache.hpp for the key
+    // and for what happens if the key is ever incomplete.
+    std::string h3_cond_disk_key;
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version) && !request.use_uncond &&
+        minimax_h3_cache::cond_cache_enabled()) {
+        h3_cond_disk_key = minimax_h3_cache::cond_key(condition_params.text,
+                                                      latents.ref_images,
+                                                      latents.minimax_h3_references,
+                                                      condition_params.ref_image_params,
+                                                      condition_params.weight_adapter_signature,
+                                                      condition_params.clip_skip,
+                                                      minimax_h3::TEXT_ENCODER_LAYER);
+        if (minimax_h3_cache::load_condition(h3_cond_disk_key, embeds.cond)) {
+            embeds.cond.c_concat = latents.concat_latent;
+            embeds.cond.c_vector = latents.clip_vision_output;
+            minimax_h3_golden_apply_context(sd_ctx, embeds);
+            return embeds;
+        }
+    }
+
     int64_t prepare_start_ms = ggml_time_ms();
     const bool use_avatar_chain_cache =
         sd_version_is_longcat_avatar(sd_ctx->sd->version) &&
@@ -10583,6 +11429,12 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
             sd_ctx->sd->avatar_chain_text_cache.emplace(cache_key, std::move(cached));
         }
     }
+    // Stored BEFORE c_concat/c_vector are attached: those are per-request latents, not
+    // conditioning, and an entry carrying them would be refused by the store-everything-or-refuse
+    // guard anyway.
+    if (!h3_cond_disk_key.empty()) {
+        minimax_h3_cache::store_condition(h3_cond_disk_key, embeds.cond);
+    }
     embeds.cond.c_concat = latents.concat_latent;
     embeds.cond.c_vector = latents.clip_vision_output;
     if (request.use_uncond) {
@@ -10593,6 +11445,7 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
+    minimax_h3_golden_apply_context(sd_ctx, embeds);
     return embeds;
 }
 
@@ -10643,9 +11496,11 @@ static sd_image_t* decode_video_outputs(sd_ctx_t* sd_ctx,
         }
     }
     int64_t t4            = ggml_time_ms();
+    sd_ctx->sd->h3_vram_sample("video_decode", "video decode begin");
     sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(video_latent, true);
     int64_t t5            = ggml_time_ms();
     LOG_INFO("decode_first_stage completed, taking %.2fs", (t5 - t4) * 1.0f / 1000);
+    sd_ctx->sd->h3_vram_sample("video_decode", "video decode end");
     if (vid.empty()) {
         LOG_ERROR("decode_first_stage failed for video");
         return nullptr;
@@ -10990,6 +11845,65 @@ static bool generate_animatediff_video(sd_ctx_t* sd_ctx,
     return ok;
 }
 
+// ---------------------------------------------------------------------------------------------
+// MiniMax-H3 VRAM PROBE PLUMBING.
+//
+// GGMLRunner fires sd_vram_probe_hook() from inside execute_graph, where it can see the compute
+// buffer and the staged weights but knows nothing about the render.  This trampoline is what
+// turns that into a labelled sample.  The pointer is installed by an RAII guard for the duration
+// of ONE H3 render and cleared on every exit path, so a probe can never outlive its context and
+// no other model's render is ever hooked.
+// ---------------------------------------------------------------------------------------------
+static StableDiffusionGGML* g_h3_vram_probe_ctx = nullptr;
+
+static void h3_vram_probe_trampoline(const char* runner_desc,
+                                     ggml_backend_t backend,
+                                     int segment,
+                                     int segments_total,
+                                     size_t compute_buffer_bytes,
+                                     size_t cache_buffer_bytes) {
+    StableDiffusionGGML* sd = g_h3_vram_probe_ctx;
+    if (sd == nullptr) {
+        return;
+    }
+    std::string label = runner_desc != nullptr ? runner_desc : "graph";
+    if (segment >= 0 && segments_total > 0) {
+        label += " seg " + std::to_string(segment + 1) + "/" + std::to_string(segments_total);
+    }
+    sd->h3_vram_sample(nullptr, label, segment, segments_total, backend, compute_buffer_bytes, cache_buffer_bytes);
+}
+
+namespace {
+    struct H3VramProbeInstall {
+        bool installed = false;
+
+        explicit H3VramProbeInstall(StableDiffusionGGML* sd) {
+            if (sd == nullptr || !MiniMaxH3Diag::vram_on() || !sd_version_is_minimax_h3(sd->version)) {
+                return;
+            }
+            g_h3_vram_probe_ctx = sd;
+            // The per-segment probe is where the real ceiling is visible; the phase-boundary
+            // samples alone would report the gaps between peaks.
+            if (MiniMaxH3Diag::vram_segments_on()) {
+                sd_vram_probe_hook() = &h3_vram_probe_trampoline;
+            }
+            installed = true;
+            MiniMaxH3Diag::vram().begin_render();
+        }
+
+        ~H3VramProbeInstall() {
+            if (!installed) {
+                return;
+            }
+            sd_vram_probe_hook() = nullptr;
+            g_h3_vram_probe_ctx  = nullptr;
+        }
+
+        H3VramProbeInstall(const H3VramProbeInstall&)            = delete;
+        H3VramProbeInstall& operator=(const H3VramProbeInstall&) = delete;
+    };
+}  // namespace
+
 SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               const sd_vid_gen_params_t* sd_vid_gen_params,
                               sd_image_t** frames_out,
@@ -11115,8 +12029,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     sd_ctx->sd->apply_loras(sd_vid_gen_params->loras, sd_vid_gen_params->lora_count);
     sd_ctx->sd->reset_generation_extensions();
 
+    // Hooked for this render only; a no-op unless MINIMAX_H3_DIAG_VRAM=1 and this is an H3 ctx.
+    H3VramProbeInstall h3_vram_probe_install(sd_ctx->sd);
+    sd_ctx->sd->h3_vram_sample("start", "render begin");
+
     SamplePlan plan(sd_ctx, sd_vid_gen_params, request);
     request.reconcile_cfg_pp_sampler(&plan.sample_method);
+    sd_ctx->sd->h3_vram_set_phase("vae_encode");
     auto latent_inputs_opt = prepare_video_generation_latents(sd_ctx, sd_vid_gen_params, &request);
     if (!latent_inputs_opt.has_value()) {
         return false;
@@ -11156,7 +12075,16 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (sd_ctx->sd->first_stage_model) {
         sd_ctx->sd->first_stage_model->free_compute_buffer();
     }
+    sd_ctx->sd->h3_vram_sample("vae_encode", "encode done, compute buffer freed");
 
+    // ★ The VAE ENCODER's weights are now dead for the rest of the render -- the next thing that
+    // touches this module is the DECODER, minutes later, and it needs a disjoint set of tensors.
+    // On t2va nothing was loaded here and this frees nothing; on fl2va/ref2va it frees the ~361
+    // MiB of encoder that a keyframe or reference encode faulted in, which would otherwise sit on
+    // the card through every sampling step.
+    sd_ctx->sd->reclaim_vae_gpu_memory("VAE encode -> text encode boundary");
+
+    sd_ctx->sd->h3_vram_set_phase("text_encode");
     ImageGenerationEmbeds embeds = prepare_video_generation_embeds(sd_ctx,
                                                                    sd_vid_gen_params,
                                                                    request,
@@ -11236,6 +12164,15 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 
     sd::Tensor<float> x_t   = latents.init_latent;
     sd::Tensor<float> noise = sd::Tensor<float>::randn_like(x_t, sd_ctx->sd->rng);
+    // MINIMAX_H3_GOLDEN_NOISE -- replace the draw with ComfyUI's, captured for the same seed.
+    // Same seed does NOT mean same numbers across two RNGs, and until this is pinned no
+    // downstream comparison between the two engines means anything at all.
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version) &&
+        !minimax_h3_golden::inject_initial_noise(noise,
+                                                 latents.minimax_h3_audio_t,
+                                                 static_cast<int>(sd_ctx->sd->get_latent_channel()))) {
+        return false;
+    }
     std::vector<float> avatar_input_wav;
 
     // LongCat Avatar's speech pathway is intentionally outside DiffusionParams:
@@ -11379,6 +12316,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     }
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
     int64_t sampling_start = ggml_time_ms();
+    sd_ctx->sd->h3_vram_sample("sampling", "sampling begin");
 
     // Prompt Relay. Built once per shot from the caller's beats and the
     // positive encode's token->piece map; the per-window query-time tables are
@@ -11554,7 +12492,17 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         (base_window_fixed_audio || base_window_plain_t2v || base_window_guide) &&
         latents.vace_context.empty() && (x_t.dim() == 4 || (x_t.dim() == 5 && x_t.shape()[4] == 1)) &&
         x_t.shape()[2] > 1;
-    if (!base_temporal_windowing) {
+    // MINIMAX_H3_LOAD_LATENT: replay a previously sampled latent and skip the DiT entirely, so a
+    // VAE-side investigation costs seconds instead of a full render. A refusal (wrong shape,
+    // wrong audio_t, wrong channel count) FAILS the render on purpose -- replay is only ever
+    // asked for explicitly, so silently sampling instead would burn five minutes and hide the
+    // mistake.
+    if (minimax_h3_cache::replay_requested()) {
+        if (!minimax_h3_cache::load_sampled_latent(final_latent, x_t, latents.minimax_h3_audio_t,
+                                                   static_cast<int>(sd_ctx->sd->get_latent_channel()))) {
+            return false;
+        }
+    } else if (!base_temporal_windowing) {
         final_latent = sample_base_window(x_t,
                                           std::move(noise),
                                           latents.denoise_mask,
@@ -11812,6 +12760,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         return false;
     }
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+    sd_ctx->sd->h3_vram_sample("sampling", "sampling end");
     // CHAINING ACROSS A REFINE. The next segment seeds and samples at BASE resolution, so its
     // continuation tail must be the base latent -- captured here, before the hires block replaces
     // final_latent with the upscaled one. Exporting the upscaled latent instead makes segment 2 of
@@ -12092,6 +13041,31 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     int64_t latent_end = ggml_time_ms();
     LOG_INFO("generating latent video completed, taking %.2fs", (latent_end - latent_start) * 1.0f / 1000);
 
+    // MINIMAX_H3_SAVE_LATENT / MINIMAX_H3_INJECT_AUDIO_LATENT. Placed here, on the packed latent,
+    // BEFORE anything unpacks the audio or slices the video: what lands on disk is exactly the
+    // tensor both decoders read, and an injected audio latent reaches both of them.
+    minimax_h3_cache::save_sampled_latent(final_latent,
+                                          latents.minimax_h3_audio_t,
+                                          static_cast<int>(sd_ctx->sd->get_latent_channel()),
+                                          request.prompt);
+    // MINIMAX_H3_GOLDEN_DUMP -- the same tensor again, but in comfy's .npy shapes, so a golden
+    // run and any later production run are diffable by one tool with no special case. The
+    // geometry line is what the compare tool checks before it scores anything: two dumps whose
+    // W/H/T/audio_t disagree are not comparable, and saying so is cheaper than a plausible number.
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version)) {
+        minimax_h3_golden::log_geometry(final_latent,
+                                        latents.minimax_h3_audio_t,
+                                        static_cast<int>(sd_ctx->sd->get_latent_channel()));
+        minimax_h3_golden::dump_final(final_latent,
+                                      latents.minimax_h3_audio_t,
+                                      static_cast<int>(sd_ctx->sd->get_latent_channel()));
+    }
+    if (!minimax_h3_cache::inject_audio_latent(final_latent,
+                                               latents.minimax_h3_audio_t,
+                                               static_cast<int>(sd_ctx->sd->get_latent_channel()))) {
+        return false;
+    }
+
     sd_audio_t* generated_audio = nullptr;
     if (sd_version_is_ltxav(sd_ctx->sd->version) &&
         latents.audio_length > 0 &&
@@ -12121,6 +13095,11 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         int64_t audio_latent_decode_end = ggml_time_ms();
         LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_latent_decode_end - audio_latent_decode_start) * 1.0f / 1000);
     }
+    // MINIMAX_H3_DIAG: the tail of the bundle -- what actually came out. Filled in below and
+    // emitted after the decode so the artifact is self-contained: a reader never has to go find
+    // the wav to know whether it was 70x too loud.
+    std::string h3_diag_audio_latent_js = "null";
+    std::string h3_diag_audio_pcm_js    = "null";
     if (sd_version_is_minimax_h3(sd_ctx->sd->version) &&
         latents.minimax_h3_audio_t > 0 &&
         sd_ctx->sd->h3_audio_vae_model != nullptr) {
@@ -12129,6 +13108,7 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
             return false;
         }
         const int64_t audio_decode_start = ggml_time_ms();
+        sd_ctx->sd->h3_vram_sample("audio_decode", "audio decode begin");
         auto audio_latent                = minimax_h3_unpack_audio_latent(final_latent,
                                                                           latents.minimax_h3_audio_t,
                                                                           sd_ctx->sd->get_latent_channel(),
@@ -12138,7 +13118,45 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         } else {
             // Back to the VAE's own {T, C, S} layout. Handing it the request layout would not
             // error -- it would smear the stereo field across the latent channels.
-            auto waveform = sd_ctx->sd->decode_minimax_h3_audio_latent(minimax_h3_swap_audio_axes(audio_latent));
+            auto vae_layout_latent = minimax_h3_swap_audio_axes(audio_latent);
+            // MINIMAX_H3_AUDIO_LATENT_DUMP=<prefix> writes the DiT's OWN generated audio latent,
+            // pre-decode, next to the per-channel statistics the round-trip probe prints for the
+            // encoder's. The two must agree in scale: a DiT latent whose per-channel std is far
+            // from the encoder's means the sampler never left its initial noise (or the layout is
+            // wrong), and no amount of listening to the muxed webm can tell you which.
+            if (const char* dump_prefix = getenv("MINIMAX_H3_AUDIO_LATENT_DUMP")) {
+                const std::string p = std::string(dump_prefix) + ".dit_audio_latent.npy";
+                MiniMaxH3Audio::MiniMaxH3AudioVAERunner::log_latent_stats("MiniMax-H3 GENERATED",
+                                                                          vae_layout_latent);
+                if (MiniMaxH3Audio::MiniMaxH3AudioVAERunner::write_npy_f32(p,
+                                                                           vae_layout_latent.data(),
+                                                                           vae_layout_latent.shape())) {
+                    LOG_INFO("MiniMax-H3 wrote %s (numpy shape (S, C, T))", p.c_str());
+                }
+            }
+            if (MiniMaxH3Diag::on()) {
+                using namespace MiniMaxH3Diag;
+                // {T, C, S}: channel c of stereo side s is the contiguous run of T values at
+                // (s * C + c) * T -- the same addressing log_latent_stats uses.
+                const int64_t t_len  = vae_layout_latent.shape()[0];
+                const int64_t ch     = vae_layout_latent.shape()[1];
+                const int64_t stereo = vae_layout_latent.dim() > 2 ? vae_layout_latent.shape()[2] : 1;
+                std::vector<std::string> per_ch;
+                for (int64_t c = 0; c < ch; c++) {
+                    Stats acc;
+                    std::vector<std::string> sides;
+                    for (int64_t s = 0; s < stereo; s++) {
+                        acc = stats_of(vae_layout_latent.data() + (s * ch + c) * t_len, t_len);
+                        sides.push_back("{\"mean\":" + jnum(acc.mean, 4) + ",\"std\":" + jnum(acc.std, 4) + "}");
+                    }
+                    per_ch.push_back(jarray(sides));
+                }
+                h3_diag_audio_latent_js = "{\"layout\":\"{T,C,S}\",\"t\":" + jint(t_len) +
+                                          ",\"channels\":" + jint(ch) + ",\"stereo\":" + jint(stereo) +
+                                          ",\"all\":" + jstats(stats_of(vae_layout_latent.data(), vae_layout_latent.numel())) +
+                                          ",\"per_channel_per_side\":" + jarray(per_ch) + "}";
+            }
+            auto waveform = sd_ctx->sd->decode_minimax_h3_audio_latent(vae_layout_latent);
             if (waveform.empty()) {
                 LOG_WARN("MiniMax-H3 audio latent decode failed; continuing with silent video output");
             } else {
@@ -12146,6 +13164,55 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                 // which is null on an H3 context and would publish 0 Hz.
                 const int64_t samples  = waveform.shape()[0];
                 const int64_t channels = waveform.shape().size() > 1 ? waveform.shape()[1] : 1;
+                // ★ THE THREE NUMBERS THAT SAY "the audio is broken" WITHOUT LISTENING.
+                // The reference clip measures std 0.0085, peak 0.0486, L/R +0.607. A run that
+                // reads std 0.60 / peak 1.62 / L-R 0.05 is ~70x too loud, clipped past full scale
+                // and effectively mono -- and every one of those is visible here, at zero cost,
+                // on every render.
+                if (MiniMaxH3Diag::on()) {
+                    using namespace MiniMaxH3Diag;
+                    const Thresholds& th = thresholds();
+                    // Planar: channel c is the contiguous run [c * samples, (c + 1) * samples).
+                    const Stats all = stats_of(waveform.data(), waveform.numel());
+                    std::vector<std::string> per_ch;
+                    for (int64_t c = 0; c < channels; c++) {
+                        per_ch.push_back(jstats(stats_of(waveform.data() + c * samples, samples)));
+                    }
+                    const double lr = channels >= 2
+                                          ? corr_of(waveform.data(), waveform.data() + samples, samples)
+                                          : NAN;
+                    h3_diag_audio_pcm_js =
+                        "{\"samples\":" + jint(samples) + ",\"channels\":" + jint(channels) +
+                        ",\"sample_rate\":" +
+                        jint(static_cast<int64_t>(sd_ctx->sd->h3_audio_vae_model->config.output_sample_rate())) +
+                        ",\"all\":" + jstats(all) +
+                        ",\"per_channel\":" + jarray(per_ch) +
+                        ",\"lr_correlation\":" + jnum(lr) +
+                        ",\"reference\":{\"std\":" + jnum(th.pcm_std_ref) +
+                        ",\"peak\":" + jnum(th.pcm_peak_ref) +
+                        ",\"lr_correlation\":" + jnum(th.pcm_lr_corr_ref) + "}" +
+                        ",\"std_over_reference\":" + jnum(all.std / th.pcm_std_ref) +
+                        ",\"peak_over_reference\":" + jnum(all.absmax / th.pcm_peak_ref) + "}";
+                    if (all.absmax > th.pcm_peak_clip) {
+                        rec().warn("decoded PCM peaks at " + jnum(all.absmax, 4) +
+                                   " -- PAST FULL SCALE, the muxed audio is clipped");
+                    }
+                    if (all.std > th.pcm_std_ref * th.pcm_std_ratio_warn) {
+                        rec().warn("decoded PCM std is " + jnum(all.std / th.pcm_std_ref, 3) +
+                                   "x the reference (" + jnum(all.std, 4) + " vs " + jnum(th.pcm_std_ref, 4) + ")");
+                    } else if (all.std * th.pcm_std_ratio_warn < th.pcm_std_ref) {
+                        rec().warn("decoded PCM std is " + jnum(all.std / th.pcm_std_ref, 3) +
+                                   "x the reference -- near silence");
+                    }
+                    if (channels >= 2 && std::isfinite(lr) && lr < th.pcm_lr_corr_min) {
+                        rec().warn("decoded PCM L/R correlation is " + jnum(lr, 3) + " (reference " +
+                                   jnum(th.pcm_lr_corr_ref, 3) + ") -- the two channels are unrelated, "
+                                   "which is what a destroyed stereo field looks like");
+                    }
+                    if (all.nonfinite > 0) {
+                        rec().warn("decoded PCM contains " + std::to_string(all.nonfinite) + " non-finite samples");
+                    }
+                }
                 auto* audio            = static_cast<sd_audio_t*>(calloc(1, sizeof(sd_audio_t)));
                 if (audio != nullptr) {
                     audio->sample_rate  = static_cast<uint32_t>(sd_ctx->sd->h3_audio_vae_model->config.output_sample_rate());
@@ -12166,6 +13233,37 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
         }
         LOG_INFO("decoding MiniMax-H3 audio latent completed, taking %.2fs",
                  (ggml_time_ms() - audio_decode_start) * 1.0f / 1000);
+        sd_ctx->sd->h3_vram_sample("audio_decode", "audio decode end");
+    }
+    // MINIMAX_H3_DIAG: close the bundle. Runs whether or not there was audio, so a video-only
+    // failure still lands a complete artifact.
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version) && MiniMaxH3Diag::on()) {
+        using namespace MiniMaxH3Diag;
+        const int vc = sd_ctx->sd->get_latent_channel();
+        std::vector<std::string> video_ch;
+        std::string video_all = "null";
+        if (!final_latent.empty() && final_latent.dim() >= 4) {
+            const int64_t plane = final_latent.shape()[0] * final_latent.shape()[1] * final_latent.shape()[2];
+            const int64_t have  = std::min<int64_t>(vc, final_latent.shape()[3]);
+            for (int64_t c = 0; c < have; c++) {
+                const Stats s = stats_of(final_latent.data() + c * plane, plane);
+                video_ch.push_back("{\"mean\":" + jnum(s.mean, 4) + ",\"std\":" + jnum(s.std, 4) +
+                                   ",\"absmax\":" + jnum(s.absmax, 4) + ",\"nonfinite\":" + jint(s.nonfinite) + "}");
+            }
+            video_all = jstats(stats_of(final_latent.data(), plane * have));
+        }
+        std::string js = "{\"thresholds\":" + thresholds_json();
+        js += ",\"video_latent\":{\"channels\":" + jint(static_cast<int64_t>(video_ch.size())) +
+              ",\"all\":" + video_all + ",\"per_channel\":" + jarray(video_ch) + "}";
+        js += ",\"audio_latent\":" + h3_diag_audio_latent_js;
+        js += ",\"audio_pcm\":" + h3_diag_audio_pcm_js;
+        js += "}";
+        rec().set_section("outputs", js);
+        // Land the ledger as it stands now too, so a render that dies in the video decode -- the
+        // stage most likely to OOM -- still leaves everything up to that point on disk.
+        vram().emit();
+        rec().mark_complete();
+        LOG_INFO("MiniMax-H3 diagnostic bundle written: %s", rec().path().c_str());
     }
     if (sd_version_is_longcat_avatar(sd_ctx->sd->version) && !avatar_input_wav.empty()) {
         constexpr uint32_t sample_rate = 16000;
@@ -12249,6 +13347,21 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
     if (result == nullptr) {
         free_sd_audio(generated_audio);
         return false;
+    }
+
+    // ★ THE SEGMENT BOUNDARY THAT MATTERS. Both VAEs are done for this render, and the next thing
+    // that runs is either nothing or the NEXT shot's sampling -- which under the server's chained
+    // multi-shot loop happens in this same process, with this same ModelManager. Without this the
+    // video decoder's ~4.85 GiB and the audio VAE's ~0.59 GiB stay on the card for every
+    // subsequent segment, so segment 2 samples with ~5.4 GiB less headroom than segment 1 and the
+    // measured frontier stops describing it.
+    sd_ctx->sd->reclaim_vae_gpu_memory("end of render");
+    sd_ctx->sd->h3_vram_sample("end", "render end");
+    // Re-emit with the decode phases included and re-flush: the bundle was closed before the video
+    // decode ran, so a ledger written only there would stop at the audio decode.
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version) && MiniMaxH3Diag::vram_on()) {
+        MiniMaxH3Diag::vram().emit();
+        MiniMaxH3Diag::rec().flush();
     }
 
     // Resolve -- but do NOT apply -- the reference head-frame trim. The cut belongs to whoever

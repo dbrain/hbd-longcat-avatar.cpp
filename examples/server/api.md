@@ -1494,7 +1494,7 @@ a routine default (refusing those would 400 every otherwise-valid request).
 | `prompts` (string array alias) | same | **identical** |
 | `n_segments` | same, cross-checked against `segments.length` | **identical** |
 | `prompt` (no list) | one segment | **identical** |
-| `width`, `height` | same, request-level | **reshaped** — must be a multiple of 32 with `w*h <= 1032192`; off-grid is a `400` naming the model's own canvas, or send `adapt_canvas: true` |
+| `width`, `height` | same, request-level | **reshaped** — must be a multiple of 32 with `w*h <= 3714048`; off-grid is a `400` naming the model's own canvas, or send `adapt_canvas: true` |
 | `frames` / `video_frames` | same name, per-request default for shots that omit their own | **reshaped** — snapped **up** to `17n+5` (LTX is `8k+1`); both numbers are reported |
 | `fps` | — | **N/A, refused** unless `24` — the frame grid, the 4× temporal VAE and the 40 Hz audio latent rate are all *defined* at 24 fps |
 | `seed`, `steps` | same | **identical** |
@@ -1611,7 +1611,7 @@ shot. `segment_plans` reports both `requested_frames` and the snapped `frames`, 
 request-level value, which itself falls back to the worker's `--video-frames`.
 
 `width` and `height` are request-level and must be multiples of `32` with
-`width * height <= 1032192` (`768 * 1344`). An off-grid size is a `400` naming the canvas the
+`width * height <= 3714048` (`2976 * 1248`, fal's documented 2K maximum). An off-grid size is a `400` naming the canvas the
 model's own rule would pick; send `adapt_canvas: true` to accept that canvas instead. Adoption
 is opt-in because rendering a size other than the one requested and reporting success is
 indistinguishable from working.

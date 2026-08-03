@@ -94,7 +94,7 @@ def sparkline_svg(series, budget=None, w=360, h=48):
         by = h - 2 - ((budget - lo) / rng) * (h - 4)
         budget_line = (f'<line x1="0" y1="{by:.1f}" x2="{w}" y2="{by:.1f}" '
                        f'stroke="#e55" stroke-dasharray="4 3" stroke-width="1"/>')
-    return (f'<svg class="spark" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+    return (f'<svg class="spark" viewBox="0 0 {w} {h}" preserveAspectRatio="none">'
             f'<polyline fill="none" stroke="#4af" stroke-width="1.5" points="{poly}"/>'
             f'{budget_line}</svg>')
 
@@ -138,6 +138,14 @@ def render_card(run):
     else:
         video = '<div class="noclip">no clip — failed or pending</div>'
 
+    # The owner judges timing and seams on a filmstrip, not by scrubbing, so show it inline
+    # under the clip whenever the render harness wrote one.
+    strip = m.get("filmstrip") or "filmstrip.png"
+    if os.path.isfile(os.path.join(run["dir"], strip)):
+        ssrc = "/clip/" + urllib.parse.quote(name) + "/" + urllib.parse.quote(strip)
+        video += (f'<a href="{html.escape(ssrc)}" target="_blank">'
+                  f'<img class="strip" src="{html.escape(ssrc)}" loading="lazy"></a>')
+
     rows = [
         ("status", status),
         ("phase", fmt(m.get("phase"))),
@@ -179,7 +187,7 @@ def render_card(run):
 
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<title>NAVA cpp eye-test</title>
+<title>MiniMax-H3 eye-test</title>
 <style>
  body{{background:#111;color:#ddd;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:16px}}
  h1{{font-size:18px;margin:0 0 4px}}
@@ -188,17 +196,19 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(440px,1fr));gap:16px;margin-top:16px}}
  .card{{background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:12px}}
  .card h3{{margin:0 0 8px;font-size:14px;color:#fff}}
- .body{{display:flex;gap:12px}}
+ .body{{display:flex;gap:12px;align-items:flex-start;min-width:0}}
  .vid{{flex:0 0 280px}}
+ .metacol{{flex:1;min-width:0;overflow:hidden}}
  video{{width:280px;border-radius:4px;background:#000}}
  .noclip{{width:280px;height:160px;display:flex;align-items:center;justify-content:center;color:#888;background:#000;border-radius:4px}}
- table.meta{{flex:1;border-collapse:collapse;font-size:12px}}
+ img.strip{{width:280px;margin-top:6px;border-radius:4px;background:#000;display:block}}
+ table.meta{{flex:1;min-width:0;border-collapse:collapse;font-size:12px;table-layout:fixed;width:100%}}
  table.meta td{{padding:1px 6px;border-bottom:1px solid #262626;vertical-align:top}}
  table.meta td:first-child{{color:#999;white-space:nowrap}}
  table.meta td:last-child{{color:#eee;text-align:right;font-variant-numeric:tabular-nums}}
- .sparkbox{{margin-top:8px;font-size:10px;color:#888}}
+ .sparkbox{{margin-top:8px;font-size:10px;color:#888;max-width:100%;overflow:hidden}}
  .sparkbox span{{display:block}}
- svg.spark{{background:#0d0d0d;border-radius:3px;margin-top:2px}}
+ svg.spark{{background:#0d0d0d;border-radius:3px;margin-top:2px;width:100%;height:48px;display:block}}
  .notes{{margin-top:8px;color:#bbb;font-size:12px;white-space:pre-wrap}}
  .notes.err{{color:#e88}}
  details{{margin-top:6px}} summary{{cursor:pointer;color:#888;font-size:11px}}
@@ -263,7 +273,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_file(self, fp):
-        ctype = "video/webm" if fp.endswith(".webm") else "video/mp4"
+        ctype = ("video/webm" if fp.endswith(".webm") else
+                 "image/png" if fp.endswith(".png") else
+                 "image/jpeg" if fp.endswith((".jpg", ".jpeg")) else "video/mp4")
         sz = os.path.getsize(fp)
         # minimal range support so <video> seeking works
         rng = self.headers.get("Range")

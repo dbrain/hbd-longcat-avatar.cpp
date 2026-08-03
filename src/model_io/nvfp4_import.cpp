@@ -26,6 +26,37 @@ constexpr size_t NVFP4_BLOCK_SIZE = NVFP4_SUBS + NVFP4_BLCK / 2;
 
 constexpr size_t ST_HEADER_SIZE_LEN = 8;
 
+// cuBLAS block-scaling-factor tiling, as emitted by comfy-kitchen's to_blocked() /
+// scale_factor_swizzled_offset(): a (rows, cols) scale plane is zero-padded to
+// (roundup(rows, 128), roundup(cols, 4)) and then reordered so a tensor-core MMA can read
+// its scales contiguously.  128-row base blocks, 4-group columns, (32, 4, 4) inner order.
+constexpr int64_t SWZ_ROWS_PER_BASE_BLOCK = 128;
+constexpr int64_t SWZ_ROWS_PER_COL        = 32;
+constexpr int64_t SWZ_COLS_PER_COL        = 4;
+
+inline int64_t roundup_div(int64_t a, int64_t b) {
+    return (a + b - 1) / b;
+}
+
+// Byte offset of the scale for output row `o`, 16-group `g`, in a plane whose padded group
+// count is `n_col_blocks` * 4.  Verbatim port of comfy-kitchen's C++/CUDA helper.
+inline size_t swizzled_scale_offset(int64_t o, int64_t g, int64_t n_col_blocks) {
+    const int64_t rb  = o / SWZ_ROWS_PER_BASE_BLOCK;
+    const int64_t rem = o % SWZ_ROWS_PER_BASE_BLOCK;
+    const int64_t d4  = rem / SWZ_ROWS_PER_COL;
+    const int64_t d3  = rem % SWZ_ROWS_PER_COL;
+    const int64_t cbg = g / SWZ_COLS_PER_COL;
+    const int64_t d5  = g % SWZ_COLS_PER_COL;
+    return (size_t)(((rb * n_col_blocks + cbg) * SWZ_ROWS_PER_COL + d3) * 16 + d4 * SWZ_COLS_PER_COL + d5);
+}
+
+// Total bytes of a ComfyUI scale plane for an [out, in] weight.
+inline size_t comfy_scale_plane_bytes(int64_t in_features, int64_t out_features) {
+    const int64_t padded_rows = roundup_div(out_features, SWZ_ROWS_PER_BASE_BLOCK) * SWZ_ROWS_PER_BASE_BLOCK;
+    const int64_t padded_cols = roundup_div(in_features / NVFP4_SUB, SWZ_COLS_PER_COL) * SWZ_COLS_PER_COL;
+    return (size_t)padded_rows * (size_t)padded_cols;
+}
+
 struct RawEntry {
     std::string dtype;
     std::vector<int64_t> shape;
@@ -105,17 +136,25 @@ bool strip_suffix(const std::string& name, const char* suffix, std::string* base
 
 }  // namespace
 
-void nvfp4_import_assemble_blocks(const uint8_t* packed,
-                                  const uint8_t* scales,
-                                  uint8_t* dst,
-                                  int64_t in_features,
-                                  int64_t out_features) {
-    const int64_t nsub = in_features / NVFP4_SUB;
-    const int64_t nblk = in_features / NVFP4_BLCK;
+namespace {
+
+// `src_hi_first`  : element 2j is in the HIGH nibble of each source byte (ComfyUI) rather
+//                   than the LOW one (ModelOpt / llm-compressor).
+// `src_swizzled`  : `scales` is a cuBLAS blocked plane rather than [out, in/16] row-major.
+void assemble_blocks_impl(const uint8_t* packed,
+                          const uint8_t* scales,
+                          uint8_t* dst,
+                          int64_t in_features,
+                          int64_t out_features,
+                          bool src_hi_first,
+                          bool src_swizzled) {
+    const int64_t nsub         = in_features / NVFP4_SUB;
+    const int64_t nblk         = in_features / NVFP4_BLCK;
+    const int64_t n_col_blocks = roundup_div(nsub, SWZ_COLS_PER_COL);
 
     for (int64_t r = 0; r < out_features; ++r) {
         const uint8_t* prow = packed + (size_t)r * (size_t)(in_features / 2);
-        const uint8_t* srow = scales + (size_t)r * (size_t)nsub;
+        const uint8_t* srow = scales + (size_t)r * (size_t)nsub;  // row-major only
         uint8_t* drow       = dst + (size_t)r * (size_t)nblk * NVFP4_BLOCK_SIZE;
 
         for (int64_t b = 0; b < nblk; ++b) {
@@ -123,23 +162,44 @@ void nvfp4_import_assemble_blocks(const uint8_t* packed,
             uint8_t* qs  = blk + NVFP4_SUBS;
             for (int64_t s = 0; s < NVFP4_SUBS; ++s) {
                 const int64_t ss = b * NVFP4_SUBS + s;
-                blk[s]           = srow[ss];  // FP8 E4M3 group scale, verbatim
+                // FP8 E4M3 group scale, verbatim -- only its ADDRESS differs by convention.
+                blk[s] = src_swizzled ? scales[swizzled_scale_offset(r, ss, n_col_blocks)] : srow[ss];
 
-                // Source: 8 bytes holding elements 0..15 of this group as (2j low, 2j+1
-                // high).  Destination: 8 bytes holding (j low, j+8 high).  Elements j and
-                // j+8 always share a parity, so both come from the same nibble half.
+                // Source: 8 bytes holding elements 0..15 of this group, as (2j low, 2j+1
+                // high) or, when src_hi_first, (2j high, 2j+1 low).  Destination: 8 bytes
+                // holding (j low, j+8 high).  Elements j and j+8 always share a parity, so
+                // both come from the same nibble half.
                 const uint8_t* od = prow + (size_t)ss * (NVFP4_SUB / 2);
                 uint8_t* qsub     = qs + s * (NVFP4_SUB / 2);
                 for (int j = 0; j < NVFP4_SUB / 2; ++j) {
                     const uint8_t lo_byte = od[j >> 1];
                     const uint8_t hi_byte = od[(j >> 1) + 4];
-                    const uint8_t n0      = (j & 1) ? (uint8_t)(lo_byte >> 4) : (uint8_t)(lo_byte & 0x0F);
-                    const uint8_t n1      = (j & 1) ? (uint8_t)(hi_byte >> 4) : (uint8_t)(hi_byte & 0x0F);
+                    const bool take_high  = ((j & 1) != 0) != src_hi_first;
+                    const uint8_t n0      = take_high ? (uint8_t)(lo_byte >> 4) : (uint8_t)(lo_byte & 0x0F);
+                    const uint8_t n1      = take_high ? (uint8_t)(hi_byte >> 4) : (uint8_t)(hi_byte & 0x0F);
                     qsub[j]               = (uint8_t)(n0 | (n1 << 4));
                 }
             }
         }
     }
+}
+
+}  // namespace
+
+void nvfp4_import_assemble_blocks(const uint8_t* packed,
+                                  const uint8_t* scales,
+                                  uint8_t* dst,
+                                  int64_t in_features,
+                                  int64_t out_features) {
+    assemble_blocks_impl(packed, scales, dst, in_features, out_features, /*src_hi_first=*/false, /*src_swizzled=*/false);
+}
+
+void nvfp4_import_assemble_blocks_comfy(const uint8_t* packed,
+                                        const uint8_t* scales,
+                                        uint8_t* dst,
+                                        int64_t in_features,
+                                        int64_t out_features) {
+    assemble_blocks_impl(packed, scales, dst, in_features, out_features, /*src_hi_first=*/true, /*src_swizzled=*/true);
 }
 
 bool nvfp4_import_materialize(const TensorStorage& tensor_storage,
@@ -162,7 +222,9 @@ bool nvfp4_import_materialize(const TensorStorage& tensor_storage,
     const int64_t in_features  = tensor_storage.ne[0];
     const int64_t out_features = tensor_storage.ne[1];
     const size_t packed_bytes  = (size_t)(in_features / 2) * (size_t)out_features;
-    const size_t scale_bytes   = (size_t)(in_features / NVFP4_SUB) * (size_t)out_features;
+    const size_t scale_bytes   = tensor_storage.nvfp4_comfy_layout
+                                     ? comfy_scale_plane_bytes(in_features, out_features)
+                                     : (size_t)(in_features / NVFP4_SUB) * (size_t)out_features;
     const size_t block_bytes   = (size_t)(in_features / NVFP4_BLCK) * (size_t)out_features * NVFP4_BLOCK_SIZE;
 
     if (dst_nbytes != block_bytes) {
@@ -182,12 +244,299 @@ bool nvfp4_import_materialize(const TensorStorage& tensor_storage,
     }
 
     out.resize(block_bytes);
-    nvfp4_import_assemble_blocks(scratch.data(), scratch.data() + packed_bytes, out.data(), in_features, out_features);
+    if (tensor_storage.nvfp4_comfy_layout) {
+        nvfp4_import_assemble_blocks_comfy(scratch.data(),
+                                           scratch.data() + packed_bytes,
+                                           out.data(),
+                                           in_features,
+                                           out_features);
+    } else {
+        nvfp4_import_assemble_blocks(scratch.data(),
+                                     scratch.data() + packed_bytes,
+                                     out.data(),
+                                     in_features,
+                                     out_features);
+    }
     return true;
 }
 
+namespace {
+
+constexpr const char* COMFY_QUANT_SUFFIX = ".comfy_quant";
+
+// Replace / delete entries in `tensor_storages` according to an import's decisions.
+void splice_tensor_storages(std::vector<TensorStorage>& tensor_storages,
+                            const std::map<std::string, TensorStorage>& imported,
+                            const std::vector<std::string>& drop) {
+    std::set<std::string> drop_set(drop.begin(), drop.end());
+    std::vector<TensorStorage> result;
+    result.reserve(tensor_storages.size() + imported.size());
+    for (TensorStorage& ts : tensor_storages) {
+        if (drop_set.count(ts.name) != 0) {
+            continue;
+        }
+        if (imported.find(ts.name) != imported.end()) {
+            continue;  // replaced below
+        }
+        result.push_back(std::move(ts));
+    }
+    for (const auto& [name, ts] : imported) {
+        result.push_back(ts);
+    }
+    tensor_storages = std::move(result);
+}
+
+// Materialise the shared block-layout guard once for both branches.
+bool ggml_nvfp4_layout_ok() {
+    if (ggml_blck_size(GGML_TYPE_NVFP4) != NVFP4_BLCK || ggml_type_size(GGML_TYPE_NVFP4) != NVFP4_BLOCK_SIZE) {
+        LOG_ERROR("nvfp4 import: ggml block_nvfp4 layout changed (blck=%d size=%zu); refusing to import",
+                  ggml_blck_size(GGML_TYPE_NVFP4),
+                  ggml_type_size(GGML_TYPE_NVFP4));
+        return false;
+    }
+    return true;
+}
+
+// Import every `{"format": "nvfp4"}` linear of a ComfyUI checkpoint.  The caller has
+// already proven, via comfy_quant_scan_safetensors(), that no OTHER format appears.
+bool rewrite_comfy_nvfp4(const std::string& file_path, std::vector<TensorStorage>& tensor_storages) {
+    if (!ggml_nvfp4_layout_ok()) {
+        return false;
+    }
+
+    std::map<std::string, RawEntry> raw;
+    if (!read_raw_header(file_path, raw)) {
+        LOG_ERROR("comfy_quant import: failed to re-read safetensors header of '%s'", file_path.c_str());
+        return false;
+    }
+
+    std::vector<std::string> bases;
+    for (const auto& [name, entry] : raw) {
+        std::string base;
+        if (strip_suffix(name, COMFY_QUANT_SUFFIX, &base)) {
+            bases.push_back(base);
+        }
+    }
+    if (bases.empty()) {
+        return true;
+    }
+
+    std::map<std::string, TensorStorage> imported;
+    std::vector<std::string> drop;
+
+    for (const std::string& base : bases) {
+        const std::string packed_name = base + ".weight";
+        const std::string scale_name  = base + ".weight_scale";
+        const std::string global_name = base + ".weight_scale_2";
+
+        auto packed_it = raw.find(packed_name);
+        auto scale_it  = raw.find(scale_name);
+        auto global_it = raw.find(global_name);
+        if (packed_it == raw.end() || scale_it == raw.end() || global_it == raw.end()) {
+            LOG_ERROR("comfy_quant import: '%s' says format nvfp4 but is missing one of {%s, %s, %s}",
+                      base.c_str(),
+                      packed_name.c_str(),
+                      scale_name.c_str(),
+                      global_name.c_str());
+            return false;
+        }
+
+        const RawEntry& packed = packed_it->second;
+        const RawEntry& scale  = scale_it->second;
+        const RawEntry& global = global_it->second;
+
+        if (packed.dtype != "U8" || packed.shape.size() != 2) {
+            LOG_ERROR("comfy_quant import: '%s' is %s rank-%zu, expected U8 rank-2",
+                      packed_name.c_str(),
+                      packed.dtype.c_str(),
+                      packed.shape.size());
+            return false;
+        }
+        if (scale.dtype != "F8_E4M3" || scale.shape.size() != 2) {
+            LOG_ERROR("comfy_quant import: '%s' is %s rank-%zu, expected F8_E4M3 rank-2",
+                      scale_name.c_str(),
+                      scale.dtype.c_str(),
+                      scale.shape.size());
+            return false;
+        }
+        if (global.dtype != "F32" || global.nbytes != sizeof(float)) {
+            LOG_ERROR("comfy_quant import: '%s' is not an F32 scalar", global_name.c_str());
+            return false;
+        }
+
+        const int64_t out_features = packed.shape[0];
+        const int64_t in_features  = packed.shape[1] * 2;
+
+        if (in_features % NVFP4_BLCK != 0) {
+            // comfy-kitchen pads to a multiple of 16 and does NOT record the pre-pad shape,
+            // so a 16-but-not-64 row cannot be re-blocked or un-padded.  See the ModelOpt
+            // branch for the same reasoning.
+            LOG_ERROR("comfy_quant import: '%s' has in_features=%" PRId64 ", not a multiple of %" PRId64,
+                      packed_name.c_str(),
+                      in_features,
+                      NVFP4_BLCK);
+            return false;
+        }
+        if (packed.nbytes != (uint64_t)(in_features / 2) * (uint64_t)out_features) {
+            LOG_ERROR("comfy_quant import: byte count does not match the declared shape for '%s'",
+                      packed_name.c_str());
+            return false;
+        }
+
+        // 🔴 The scale plane is the cuBLAS blocked swizzle, so its shape is the PADDED one:
+        // [roundup(out, 128), roundup(in/16, 4)].  A ModelOpt export of the same weight
+        // would be [out, in/16] row-major and, for the shapes typical of a DiT, the two are
+        // the same size -- which is exactly why this must be checked, not inferred.
+        const int64_t padded_rows = roundup_div(out_features, SWZ_ROWS_PER_BASE_BLOCK) * SWZ_ROWS_PER_BASE_BLOCK;
+        const int64_t padded_cols = roundup_div(in_features / NVFP4_SUB, SWZ_COLS_PER_COL) * SWZ_COLS_PER_COL;
+        if (scale.shape[0] != padded_rows || scale.shape[1] != padded_cols) {
+            LOG_ERROR("comfy_quant import: '%s' is [%" PRId64 ", %" PRId64 "], expected the blocked-swizzle shape [%" PRId64
+                      ", %" PRId64 "] for a [%" PRId64 ", %" PRId64 "] weight",
+                      scale_name.c_str(),
+                      scale.shape[0],
+                      scale.shape[1],
+                      padded_rows,
+                      padded_cols,
+                      out_features,
+                      in_features);
+            return false;
+        }
+        if (scale.nbytes != (uint64_t)padded_rows * (uint64_t)padded_cols) {
+            LOG_ERROR("comfy_quant import: byte count does not match the declared shape for '%s'", scale_name.c_str());
+            return false;
+        }
+
+        float wglobal = 0.0f;
+        if (!read_f32_at(file_path, global.offset, &wglobal)) {
+            LOG_ERROR("comfy_quant import: failed to read '%s'", global_name.c_str());
+            return false;
+        }
+        if (!(wglobal > 0.0f) || !std::isfinite(wglobal)) {
+            LOG_ERROR("comfy_quant import: '%s' = %g is not a usable positive scale", global_name.c_str(), wglobal);
+            return false;
+        }
+
+        const int64_t ne[SD_MAX_DIMS] = {in_features, out_features, 1, 1, 1};
+        TensorStorage w(packed_name, GGML_TYPE_NVFP4, ne, 2, 0, packed.offset);
+        w.is_nvfp4_import    = true;
+        w.nvfp4_comfy_layout = true;
+        w.nvfp4_scale_offset = scale.offset;
+        imported[w.name]     = w;
+
+        const int64_t ne1[SD_MAX_DIMS] = {1, 1, 1, 1, 1};
+        TensorStorage g(base + ".weight.wglobal", GGML_TYPE_F32, ne1, 1, 0, 0);
+        g.is_inline_f32  = true;
+        g.inline_f32     = wglobal;
+        imported[g.name] = g;
+
+        // Consumed above.  weight_scale must not survive: it collides by name with Linear's
+        // unrelated per-output-channel F32 `weight_scale` parameter (ggml_extend.hpp).
+        // comfy_quant is U8 and the shared safetensors reader already skips it, but drop it
+        // explicitly so this does not depend on that.
+        drop.push_back(scale_name);
+        drop.push_back(global_name);
+        drop.push_back(base + COMFY_QUANT_SUFFIX);
+    }
+
+    splice_tensor_storages(tensor_storages, imported, drop);
+    LOG_INFO("comfy_quant import: %zu ComfyUI-quantised NVFP4 linears in '%s'", bases.size(), file_path.c_str());
+    return true;
+}
+
+}  // namespace
+
+ComfyQuantScan comfy_quant_scan_safetensors(const std::string& file_path, std::string* detail) {
+    const auto fail = [detail](ComfyQuantScan r, const std::string& msg) {
+        if (detail != nullptr) {
+            *detail = msg;
+        }
+        return r;
+    };
+
+    std::map<std::string, RawEntry> raw;
+    if (!read_raw_header(file_path, raw)) {
+        // Not necessarily a comfy file at all -- let the ordinary reader report on it.
+        return ComfyQuantScan::None;
+    }
+
+    std::vector<std::pair<std::string, RawEntry>> blobs;
+    for (const auto& [name, entry] : raw) {
+        std::string base;
+        if (strip_suffix(name, COMFY_QUANT_SUFFIX, &base)) {
+            blobs.emplace_back(name, entry);
+        }
+    }
+    if (blobs.empty()) {
+        return ComfyQuantScan::None;
+    }
+
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file.is_open()) {
+        return fail(ComfyQuantScan::Malformed, "comfy_quant: failed to open '" + file_path + "'");
+    }
+
+    for (const auto& [name, entry] : blobs) {
+        if (entry.dtype != "U8" || entry.nbytes == 0 || entry.nbytes > 4096) {
+            return fail(ComfyQuantScan::Malformed,
+                        "comfy_quant: '" + name + "' is " + entry.dtype + " of " + std::to_string(entry.nbytes) +
+                            " bytes; expected a small U8 JSON blob");
+        }
+        std::string blob((size_t)entry.nbytes, '\0');
+        file.seekg((std::streamoff)entry.offset);
+        file.read(&blob[0], (std::streamsize)entry.nbytes);
+        if (!file) {
+            return fail(ComfyQuantScan::Malformed, "comfy_quant: failed to read '" + name + "'");
+        }
+
+        nlohmann::json cfg;
+        try {
+            cfg = nlohmann::json::parse(blob);
+        } catch (const std::exception&) {
+            return fail(ComfyQuantScan::Malformed, "comfy_quant: '" + name + "' is not JSON: " + blob);
+        }
+        if (!cfg.is_object() || !cfg.contains("format") || !cfg["format"].is_string()) {
+            return fail(ComfyQuantScan::Malformed, "comfy_quant: '" + name + "' has no string `format`: " + blob);
+        }
+
+        const std::string format = cfg["format"].get<std::string>();
+        if (format != "nvfp4") {
+            // int8_tensorwise+convrot is the common one.  Its weights are quantised AFTER a
+            // Hadamard-style rotation of the input dim, so importing it is not a re-layout:
+            // the rotation has to be undone (or applied to the activations), and nothing in
+            // this engine does either.  REFUSE -- there is no safe fallback path.
+            return fail(ComfyQuantScan::Unsupported,
+                        "comfy_quant: '" + name + "' declares format '" + format +
+                            "', which this engine cannot load: " + blob +
+                            "  (only {\"format\": \"nvfp4\"} is supported)");
+        }
+        // An unrecognised MODIFIER on an nvfp4 layer (e.g. a rotation, an activation
+        // pre-scale) would change the maths while leaving every shape and dtype intact.
+        for (const auto& item : cfg.items()) {
+            if (item.key() != "format") {
+                return fail(ComfyQuantScan::Unsupported,
+                            "comfy_quant: '" + name + "' carries the unrecognised key '" + item.key() +
+                                "' on an nvfp4 layer, which would silently change the dequantisation: " + blob);
+            }
+        }
+    }
+
+    return ComfyQuantScan::Nvfp4;
+}
+
 bool nvfp4_import_rewrite_safetensors(const std::string& file_path,
-                                      std::vector<TensorStorage>& tensor_storages) {
+                                      std::vector<TensorStorage>& tensor_storages,
+                                      ComfyQuantScan comfy) {
+    // 🔴 A ComfyUI nvfp4 export uses ModelOpt's EXACT tensor names with a different byte
+    // order (see the header).  Dispatch on comfy_quant first, or the branch below matches
+    // it on names and silently imports a wrong model.
+    if (comfy == ComfyQuantScan::Nvfp4) {
+        return rewrite_comfy_nvfp4(file_path, tensor_storages);
+    }
+    if (comfy != ComfyQuantScan::None) {
+        LOG_ERROR("nvfp4 import: refusing '%s' -- its comfy_quant blobs were not accepted", file_path.c_str());
+        return false;
+    }
+
     // Cheap bail: the per-tensor global is F32, so the shared reader has already surfaced
     // it if this is an external NVFP4 export.
     bool maybe_external = false;
@@ -342,23 +691,7 @@ bool nvfp4_import_rewrite_safetensors(const std::string& file_path,
         drop.push_back(base + ".input_scale");
     }
 
-    std::set<std::string> drop_set(drop.begin(), drop.end());
-    std::vector<TensorStorage> result;
-    result.reserve(tensor_storages.size() + imported.size());
-    for (TensorStorage& ts : tensor_storages) {
-        if (drop_set.count(ts.name) != 0) {
-            continue;
-        }
-        auto it = imported.find(ts.name);
-        if (it != imported.end()) {
-            continue;  // replaced below
-        }
-        result.push_back(std::move(ts));
-    }
-    for (auto& [name, ts] : imported) {
-        result.push_back(ts);
-    }
-    tensor_storages = std::move(result);
+    splice_tensor_storages(tensor_storages, imported, drop);
 
     LOG_INFO("nvfp4 import: %zu externally-quantised NVFP4 linears in '%s'", linears.size(), file_path.c_str());
     return true;

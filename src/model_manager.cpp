@@ -154,6 +154,30 @@ static bool model_manager_profile_enabled() {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+// Copy/compute overlap for the weight stream. OFF unless MINIMAX_H3_STAGE_PREFETCH is set to
+// something other than "0"/"" -- every other service sharing this binary (ltx-video, krea2,
+// flux2, wan-vace, longcat-avatar) therefore keeps today's enqueue-then-hard-sync staging,
+// byte for byte and instruction for instruction.
+static bool stage_prefetch_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MINIMAX_H3_STAGE_PREFETCH");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+// VRAM the prefetch must leave free AFTER its own buffer is allocated, or it declines. The
+// prefetch costs one extra segment of staged weights at peak; this is the knob that stops
+// that trade from eating the long-sequence headroom.
+static size_t stage_prefetch_headroom_bytes() {
+    static const size_t bytes = [] {
+        const char* value = std::getenv("MINIMAX_H3_STAGE_PREFETCH_HEADROOM_MB");
+        const double mb    = value != nullptr && value[0] != '\0' ? std::atof(value) : 1024.0;
+        return static_cast<size_t>(std::max(0.0, mb) * 1024.0 * 1024.0);
+    }();
+    return bytes;
+}
+
 static size_t model_manager_resident_headroom_bytes() {
     const char* value = std::getenv("LONGCAT_SHARED_RESIDENT_HEADROOM_MB");
     const double mb = value != nullptr && value[0] != '\0' ? std::atof(value) : 512.0;
@@ -460,6 +484,7 @@ void ModelManager::reclaim_transient_compute_buffers() {
     // every participating runner has completed.  Force-release avoids a stale
     // bookkeeping reference pinning a temporary GPU staging block across the
     // next video window; host/mmap parameter storage is intentionally kept.
+    discard_stage_prefetch();
     release_compute_staging_blocks(true);
 }
 
@@ -655,6 +680,323 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// STAGE PREFETCH -- overlapping the next segment's weight stream with this segment's compute.
+//
+// The measurement that motivates it: on a streamed render the GPU is busy 54% of the wall and
+// the classification of every cudaStreamSynchronize by what it overlapped had a "kernel+H2D"
+// row of EXACTLY ZERO. Compute and staged transfers never once ran at the same time, because
+// staging is issued from prepare_params() at the TOP of a segment, before that segment's graph
+// is enqueued, and the segment before it has already been synchronised.
+//
+// The fix is to move the copies into the window where the main thread is parked in
+// cudaStreamSynchronize waiting on segment N's kernels. It is split across three calls because
+// the two halves have to run on different threads and only one of them may touch bookkeeping:
+//
+//   begin_stage_prefetch()  MAIN thread. Allocates the device buffer and builds the staging
+//                           tensors. Runs BEFORE the graph is enqueued precisely because
+//                           cudaMalloc can serialise against in-flight work -- doing it from
+//                           the worker would trade one stall for another.
+//   run_stage_prefetch()    WORKER thread, concurrent with segment N's kernels. Calls exactly
+//                           the same ggml_backend_tensor_copy() the synchronous path calls,
+//                           on exactly the same bytes. Nothing else.
+//   finish_stage_prefetch() MAIN thread, after the worker has been joined. Does the
+//                           buffer/data/extra swap and publishes the ComputeStagingBlock.
+//
+// WHY THE WORKER CANNOT RACE THE RUNNING GRAPH. The CUDA backend launches each node's kernel
+// by reading src->data at launch time, on the main thread, while the worker runs. So the
+// worker must never write ->data of a tensor segment N's graph can name. It cannot:
+// begin_stage_prefetch() skips every state with staged_to_compute_backend set, and by the time
+// it is called every tensor segment N uses is staged (prepare_params() ran at the top of
+// execute_graph). Anything shared between segment N and N+1 is therefore skipped, and the two
+// tensor sets are disjoint by construction. Belt and braces, the swap itself does not happen
+// on the worker at all -- it happens in finish_stage_prefetch(), after the join.
+//
+// The worker touches: state->tensor->data (READ; host mmap pages, which nothing mutates during
+// a compute), staging_tensor->data (device, written by the main thread before the spawn, owned
+// solely by this prefetch), and CUDA. No manager container, no TensorState field. The
+// spawn/join pair is the entire happens-before edge; no mutex is needed and none is taken.
+//
+// WHY IT IS BIT-EXACT. run_stage_prefetch() calls ggml_backend_tensor_copy(), the same
+// function the synchronous path calls, with the same source pointer and the same destination
+// layout (ggml_dup_tensor of the same tensor). Only the wall-clock arrival time changes.
+// ggml_backend_tensor_copy() on a CUDA destination issues cudaMemcpyAsync on cudaStreamPerThread
+// and synchronises it -- and cudaStreamPerThread is PER THREAD, which is the whole trick: the
+// worker's copies land on a different stream from the main thread's compute, so the DMA can
+// overlap the kernels, while the per-copy synchronise still leaves every byte on the device
+// before the worker returns. The join then orders that against everything the main thread does
+// next. No event, no partial visibility, no reordering of the copies themselves.
+//
+// DELIBERATELY DECLINED: any tensor with a LoRA in play, a split buffer type, or a non-host
+// source. LoRA because apply_loras_to_params() runs a compute graph over the staged copy and
+// fold_loras_into_params() rewrites the params copy in place -- neither may interleave with a
+// running graph, and neither is worth the complexity here. Split buffers because a prefetch
+// spanning devices has more than one stream to reason about. Non-host sources because those
+// are device-to-device copies that would be issued onto a backend stream, not a thread-local
+// one, and would serialise behind the very kernels we are trying to overlap.
+bool ModelManager::begin_stage_prefetch(const std::vector<ggml_tensor*>& tensors) {
+    if (!stage_prefetch_enabled() || tensors.empty()) {
+        return false;
+    }
+    if (pending_stage_prefetch_ != nullptr) {
+        // Depth is 1 by design. A second arm before the first is settled would mean the
+        // segment loop changed shape underneath this code; refuse rather than guess.
+        LOG_WARN("stage prefetch: a prefetch is already pending; skipping");
+        return false;
+    }
+    if (!loras_.empty()) {
+        if (!stage_prefetch_declined_logged_) {
+            LOG_INFO("stage prefetch: DISABLED for this render -- %zu LoRA(s) active", loras_.size());
+            stage_prefetch_declined_logged_ = true;
+        }
+        return false;
+    }
+
+    // Resolved here rather than through resolve_required_tensor_states() on purpose: this is a
+    // speculative, optional optimisation, so an unregistered name must be skipped silently
+    // rather than logged as an error and turned into a failure the caller has to handle.
+    std::vector<TensorState*> required_states;
+    required_states.reserve(tensors.size());
+    {
+        std::unordered_set<TensorState*> seen;
+        for (ggml_tensor* tensor : tensors) {
+            if (tensor == nullptr) {
+                continue;
+            }
+            const char* raw_name = ggml_get_name(tensor);
+            if (raw_name == nullptr || raw_name[0] == '\0') {
+                continue;
+            }
+            auto state_it = tensor_states_by_name_.find(raw_name);
+            if (state_it == tensor_states_by_name_.end() || state_it->second == nullptr) {
+                continue;
+            }
+            if (seen.insert(state_it->second).second) {
+                required_states.push_back(state_it->second);
+            }
+        }
+    }
+
+    ggml_backend_t compute_backend = nullptr;
+    std::vector<TensorState*> candidates;
+    candidates.reserve(required_states.size());
+    for (TensorState* state : required_states) {
+        if (state == nullptr || should_ignore(*state) || is_optional_missing_tensor(state->name)) {
+            continue;
+        }
+        if (state->compute_backend == nullptr || state->params_backend == nullptr) {
+            continue;
+        }
+        // Already on the compute backend -- including everything segment N is using right
+        // now. This is the check that makes the worker's tensor set disjoint from the
+        // running graph's.
+        if (state->compute_backend == state->params_backend || state->staged_to_compute_backend) {
+            continue;
+        }
+        if (!state->loaded_to_params_backend || state->tensor == nullptr || state->tensor->data == nullptr) {
+            // Not resident in the params backend yet. Loading it would mean mmap/alloc work
+            // on a background thread mutating params_storage_blocks_; leave it to the
+            // synchronous path.
+            continue;
+        }
+        if (state->folded_lora_epoch != UINT64_MAX || state->applied_lora_epoch != UINT64_MAX) {
+            continue;
+        }
+        if (split_buffer_type_for(*state) != nullptr) {
+            continue;
+        }
+        if (state->tensor->buffer == nullptr || !ggml_backend_buffer_is_host(state->tensor->buffer)) {
+            continue;
+        }
+        if (compute_backend == nullptr) {
+            compute_backend = state->compute_backend;
+        } else if (compute_backend != state->compute_backend) {
+            // Mixed backends in one segment: not worth splitting the prefetch across streams.
+            return false;
+        }
+        candidates.push_back(state);
+    }
+
+    if (candidates.empty() || compute_backend == nullptr) {
+        return false;
+    }
+
+    size_t bytes = 0;
+    for (TensorState* state : candidates) {
+        bytes += ggml_nbytes(state->tensor);
+    }
+
+    // The whole cost of this feature: one extra segment of staged weights resident while the
+    // previous segment computes. Decline rather than push the render into the driver's
+    // fallback paths -- a prefetch that buys speed and loses the frame budget is a bad trade.
+    size_t free_bytes  = 0;
+    size_t total_bytes = 0;
+    if (ggml_backend_dev_t device = ggml_backend_get_device(compute_backend); device != nullptr) {
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+    }
+    const size_t headroom = stage_prefetch_headroom_bytes();
+    if (free_bytes != 0 && (bytes > free_bytes || free_bytes - bytes < headroom)) {
+        LOG_DEBUG("stage prefetch: declined %.2f MiB (%.2f MiB free, %.2f MiB headroom required)",
+                  bytes / (1024.0 * 1024.0),
+                  free_bytes / (1024.0 * 1024.0),
+                  headroom / (1024.0 * 1024.0));
+        return false;
+    }
+
+    ggml_init_params init_params;
+    init_params.mem_size   = std::max<size_t>(1, candidates.size()) * ggml_tensor_overhead();
+    init_params.mem_buffer = nullptr;
+    init_params.no_alloc   = true;
+
+    ggml_context* staging_ctx = ggml_init(init_params);
+    if (staging_ctx == nullptr) {
+        return false;
+    }
+
+    auto prefetch             = std::make_unique<StagePrefetch>();
+    prefetch->compute_backend = compute_backend;
+    prefetch->staging_ctx     = staging_ctx;
+    prefetch->bytes           = bytes;
+    prefetch->staged_tensors.reserve(candidates.size());
+    for (TensorState* state : candidates) {
+        ggml_tensor* staging_tensor = ggml_dup_tensor(staging_ctx, state->tensor);
+        ggml_set_name(staging_tensor, state->tensor->name);
+        prefetch->staged_tensors.push_back({state, staging_tensor});
+    }
+
+    ggml_backend_buffer_type_t staging_buft = ggml_backend_get_default_buffer_type(compute_backend);
+    prefetch->buffer = ggml_backend_alloc_ctx_tensors_from_buft(staging_ctx, staging_buft);
+    if (prefetch->buffer == nullptr) {
+        // Not an error: the next segment will stage synchronously exactly as it does today.
+        LOG_DEBUG("stage prefetch: alloc of %.2f MiB failed; falling back to synchronous staging",
+                  bytes / (1024.0 * 1024.0));
+        ggml_free(staging_ctx);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(prefetch->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    if (!stage_prefetch_mode_logged_) {
+        LOG_INFO("stage prefetch: ENABLED (depth 1, %.0f MiB headroom floor) -- next segment's "
+                 "weights stream while this segment computes",
+                 headroom / (1024.0 * 1024.0));
+        stage_prefetch_mode_logged_ = true;
+    }
+    LOG_DEBUG("stage prefetch: armed %.2f MiB / %zu tensors for %s (%.2f MiB free)",
+              bytes / (1024.0 * 1024.0),
+              prefetch->staged_tensors.size(),
+              ggml_backend_name(compute_backend),
+              free_bytes / (1024.0 * 1024.0));
+
+    pending_stage_prefetch_ = std::move(prefetch);
+    return true;
+}
+
+// WORKER THREAD. Copies only. See the contract above -- adding anything to this function that
+// touches a manager container, a TensorState field, or a managed ggml_tensor's pointers turns
+// a proven-disjoint design into a data race against the running graph.
+void ModelManager::run_stage_prefetch() {
+    StagePrefetch* prefetch = pending_stage_prefetch_.get();
+    if (prefetch == nullptr) {
+        return;
+    }
+    const int64_t t0 = ggml_time_ms();
+    for (auto& staged_tensor : prefetch->staged_tensors) {
+        TensorState* state          = staged_tensor.first;
+        ggml_tensor* staging_tensor = staged_tensor.second;
+        if (state == nullptr || state->tensor == nullptr || staging_tensor == nullptr) {
+            continue;
+        }
+        ggml_backend_tensor_copy(state->tensor, staging_tensor);
+    }
+    prefetch->copy_ms = ggml_time_ms() - t0;
+    prefetch->copied  = true;
+}
+
+// MAIN THREAD, after the worker has been joined. The join is what makes every copy visible;
+// ggml_backend_tensor_copy() already synchronised each one on the worker's stream.
+void ModelManager::finish_stage_prefetch() {
+    if (pending_stage_prefetch_ == nullptr) {
+        return;
+    }
+    std::unique_ptr<StagePrefetch> prefetch = std::move(pending_stage_prefetch_);
+    if (!prefetch->copied) {
+        // The worker never ran (execute_graph returned early). Nothing was copied, so nothing
+        // may be published; drop the buffer and let the next segment stage synchronously.
+        LOG_DEBUG("stage prefetch: discarding %.2f MiB, worker did not run",
+                  prefetch->bytes / (1024.0 * 1024.0));
+        if (prefetch->buffer != nullptr) {
+            ggml_backend_buffer_free(prefetch->buffer);
+        }
+        if (prefetch->staging_ctx != nullptr) {
+            ggml_free(prefetch->staging_ctx);
+        }
+        return;
+    }
+
+    for (auto& staged_tensor : prefetch->staged_tensors) {
+        TensorState* state          = staged_tensor.first;
+        ggml_tensor* staging_tensor = staged_tensor.second;
+        if (state == nullptr || state->tensor == nullptr || staging_tensor == nullptr) {
+            continue;
+        }
+        ggml_tensor* managed_tensor = state->tensor;
+        std::swap(managed_tensor->buffer, staging_tensor->buffer);
+        std::swap(managed_tensor->data, staging_tensor->data);
+        std::swap(managed_tensor->extra, staging_tensor->extra);
+    }
+
+    const size_t staged_count = prefetch->staged_tensors.size();
+    auto block                = std::make_unique<ComputeStagingBlock>();
+    block->compute_backend    = prefetch->compute_backend;
+    block->buffer             = prefetch->buffer;
+    block->staging_ctx        = prefetch->staging_ctx;
+    block->staged_tensors     = std::move(prefetch->staged_tensors);
+    prefetch->buffer          = nullptr;
+    prefetch->staging_ctx     = nullptr;
+    for (auto& staged_tensor : block->staged_tensors) {
+        TensorState* state               = staged_tensor.first;
+        state->staged_to_compute_backend = true;
+    }
+    compute_staging_blocks_.push_back(std::move(block));
+
+    stage_prefetch_bytes_total_ += prefetch->bytes;
+    stage_prefetch_copy_ms_total_ += prefetch->copy_ms;
+    stage_prefetch_count_++;
+    LOG_DEBUG("stage prefetch: staged %.2f MiB in %lld ms concurrently with compute "
+              "(cumulative %.2f GiB over %zu segments, %lld ms)",
+              prefetch->bytes / (1024.0 * 1024.0),
+              (long long)prefetch->copy_ms,
+              stage_prefetch_bytes_total_ / (1024.0 * 1024.0 * 1024.0),
+              stage_prefetch_count_,
+              (long long)stage_prefetch_copy_ms_total_);
+    if (model_manager_profile_enabled()) {
+        LOG_INFO("[MM_PROFILE] prefetch %.2f MiB / %zu tensors overlapped compute in %lld ms "
+                 "(cumulative %.2f GiB / %zu segments / %lld ms)",
+                 prefetch->bytes / (1024.0 * 1024.0),
+                 staged_count,
+                 (long long)prefetch->copy_ms,
+                 stage_prefetch_bytes_total_ / (1024.0 * 1024.0 * 1024.0),
+                 stage_prefetch_count_,
+                 (long long)stage_prefetch_copy_ms_total_);
+    }
+}
+
+// Only for teardown paths that cannot join a worker (there are none today -- execute_graph's
+// guard always settles -- but release_all() must not leave a device buffer behind if that ever
+// changes).
+void ModelManager::discard_stage_prefetch() {
+    if (pending_stage_prefetch_ == nullptr) {
+        return;
+    }
+    std::unique_ptr<StagePrefetch> prefetch = std::move(pending_stage_prefetch_);
+    if (prefetch->buffer != nullptr) {
+        ggml_backend_buffer_free(prefetch->buffer);
+    }
+    if (prefetch->staging_ctx != nullptr) {
+        ggml_free(prefetch->staging_ctx);
+    }
 }
 
 // Undo fold_loras_into_params(). Not by subtracting the delta back out -- that is not
@@ -1973,6 +2315,7 @@ void ModelManager::release_all() {
         state->applied_lora_epoch   = UINT64_MAX;
         state->folded_lora_epoch    = UINT64_MAX;
     }
+    discard_stage_prefetch();
     release_compute_staging_blocks(true);
     release_params_storage_blocks(true);
     release_fold_loras();
@@ -2222,4 +2565,158 @@ void ModelManager::release_params_backend_params(const std::vector<ggml_tensor*>
     }
     std::unordered_set<TensorState*> target_states(required_states.begin(), required_states.end());
     release_params_storage_blocks(false, &target_states);
+}
+
+// ---------------------------------------------------------------------------------------------
+// RESIDENCY CENSUS.  See the header comment on ModelManager::ParamsResidency.
+//
+// ★ The split that matters is params vs staged, NOT vram vs ram.  A params block on the device is
+// held for the process's life once loaded -- nothing on any normal path frees it -- whereas a
+// staging block lives for one graph.  Reporting them together is what made "the VAE is resident
+// through sampling" unfalsifiable for as long as it was.
+// ---------------------------------------------------------------------------------------------
+ModelManager::ParamsResidency ModelManager::params_residency() const {
+    ParamsResidency out;
+    std::map<std::string, ParamsResidency::Module> by_desc;
+
+    auto module_for = [&by_desc](const std::string& desc) -> ParamsResidency::Module& {
+        auto it = by_desc.find(desc);
+        if (it == by_desc.end()) {
+            ParamsResidency::Module m;
+            m.desc = desc;
+            it     = by_desc.emplace(desc, std::move(m)).first;
+        }
+        return it->second;
+    };
+
+    for (const auto& block : params_storage_blocks_) {
+        if (block == nullptr) {
+            continue;
+        }
+        out.params_blocks++;
+        // An mmap'd block has no ggml buffer at all -- its bytes are file pages the loader owns.
+        // Summing the tensors is the only way to see it, and reporting zero for it would make the
+        // streamed DiT look free.
+        const bool host = block->buffer == nullptr || ggml_backend_buffer_is_host(block->buffer);
+        for (TensorState* state : block->states) {
+            if (state == nullptr || state->tensor == nullptr) {
+                continue;
+            }
+            const size_t bytes                = ggml_nbytes(state->tensor);
+            ParamsResidency::Module& module   = module_for(state->desc);
+            module.params_tensors++;
+            if (host) {
+                module.params_ram += bytes;
+                out.params_ram += bytes;
+            } else {
+                module.params_vram += bytes;
+                out.params_vram += bytes;
+            }
+        }
+    }
+
+    for (const auto& block : compute_staging_blocks_) {
+        if (block == nullptr) {
+            continue;
+        }
+        out.staged_blocks++;
+        for (const auto& staged : block->staged_tensors) {
+            TensorState* state = staged.first;
+            if (state == nullptr || state->tensor == nullptr) {
+                continue;
+            }
+            const size_t bytes              = ggml_nbytes(state->tensor);
+            ParamsResidency::Module& module = module_for(state->desc);
+            module.staged_tensors++;
+            module.staged_vram += bytes;
+            out.staged_vram += bytes;
+        }
+    }
+
+    // The prefetch's buffer is allocated but not yet published as a staging block, so it is
+    // invisible to the loop above -- and it is exactly the extra peak that copy/compute overlap
+    // trades for its throughput.  Counting it is the whole point of making that trade measurable.
+    if (pending_stage_prefetch_ != nullptr) {
+        out.prefetch_vram += pending_stage_prefetch_->bytes;
+    }
+
+    out.modules.reserve(by_desc.size());
+    for (auto& pair : by_desc) {
+        out.modules.push_back(std::move(pair.second));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// PHASE-BOUNDARY MODULE RELEASE.  See the header comment.
+// ---------------------------------------------------------------------------------------------
+size_t ModelManager::release_module_params(const std::set<std::string>& descs) {
+    if (descs.empty()) {
+        return 0;
+    }
+
+    // Any staging block those tensors still own has to go first, or the params block below is
+    // pinned by staged_to_compute_backend and we would silently free nothing.
+    std::unordered_set<TensorState*> target_states;
+    for (const auto& state : tensor_states_) {
+        if (state != nullptr && descs.count(state->desc) > 0) {
+            target_states.insert(state.get());
+        }
+    }
+    if (target_states.empty()) {
+        return 0;
+    }
+    release_compute_staging_blocks(false, &target_states);
+
+    size_t freed = 0;
+    for (auto it = params_storage_blocks_.begin(); it != params_storage_blocks_.end();) {
+        ParamsStorageBlock* block = it->get();
+        if (block == nullptr) {
+            it = params_storage_blocks_.erase(it);
+            continue;
+        }
+
+        bool releasable = !block->states.empty();
+        bool folded     = false;
+        for (TensorState* state : block->states) {
+            if (state == nullptr) {
+                continue;
+            }
+            if (descs.count(state->desc) == 0 ||
+                state->active_prepare_count > 0 ||
+                state->retained_compute_count > 0 ||
+                state->staged_to_compute_backend) {
+                releasable = false;
+                break;
+            }
+            if (state->folded_lora_epoch != UINT64_MAX) {
+                folded = true;
+            }
+        }
+        if (folded) {
+            LOG_INFO("model manager keeping a params block with a folded LoRA; releasing it would "
+                     "not restore pristine weights");
+            releasable = false;
+        }
+        if (!releasable) {
+            ++it;
+            continue;
+        }
+
+        size_t block_bytes = 0;
+        if (block->buffer != nullptr && !ggml_backend_buffer_is_host(block->buffer)) {
+            block_bytes = ggml_backend_buffer_get_size(block->buffer);
+        } else {
+            for (TensorState* state : block->states) {
+                if (state != nullptr && state->tensor != nullptr) {
+                    block_bytes += ggml_nbytes(state->tensor);
+                }
+            }
+        }
+        freed += block_bytes;
+        free_params_storage_block(*block);
+        it = params_storage_blocks_.erase(it);
+    }
+
+    return freed;
 }

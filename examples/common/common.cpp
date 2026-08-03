@@ -515,10 +515,25 @@ ArgOptions SDContextParams::get_options() {
          &n_threads},
     };
 
+    options.float_options = {
+        {"",
+         "--stream-layers-te",
+         "stream the TEXT ENCODER's layers, with its own VRAM budget in GiB (default: 0 = off). "
+         "--stream-layers is diffusion-only; this is the conditioner's switch, because the two "
+         "modules share one backend and therefore one --max-vram number. A positive value both "
+         "enables streaming and becomes the conditioner's graph-cut budget; a negative value "
+         "enables streaming and keeps the --max-vram budget. Requires the text encoder's params "
+         "backend to be cpu (--params-backend te=cpu or --offload-to-cpu) and its compute backend "
+         "to be a device (so NOT --clip-on-cpu)",
+         &stream_layers_te},
+    };
+
     options.bool_options = {
         {"",
          "--stream-layers",
-         "enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram; defaults to false)",
+         "enable residency+prefetch streaming on top of --max-vram for the DIFFUSION module "
+         "(no effect without --max-vram, or unless the diffusion params backend is cpu; defaults to false). "
+         "For the text encoder use --stream-layers-te",
          true, &stream_layers},
         {"",
          "--eager-load",
@@ -832,6 +847,7 @@ std::string SDContextParams::to_string() const {
         << "  offload_params_to_cpu: " << (offload_params_to_cpu ? "true" : "false") << ",\n"
         << "  max_vram: \"" << max_vram << "\",\n"
         << "  stream_layers: " << (stream_layers ? "true" : "false") << ",\n"
+        << "  stream_layers_te: " << stream_layers_te << ",\n"
         << "  eager_load: " << (eager_load ? "true" : "false") << ",\n"
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
@@ -904,6 +920,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.vae_format                      = str_to_vae_format(vae_format);
     sd_ctx_params.max_vram                        = max_vram.c_str();
     sd_ctx_params.stream_layers                   = stream_layers;
+    sd_ctx_params.stream_layers_te                = stream_layers_te;
     sd_ctx_params.eager_load                      = eager_load;
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
@@ -1217,6 +1234,12 @@ ArgOptions SDGenerationParams::get_options() {
          "--relay-steps-frac",
          "fraction of the base schedule that carries the relay mask (default: 1.0)",
          &relay_steps_frac},
+        {"",
+         "--h3-audio-shift",
+         "MiniMax-H3 AUDIO sigma shift (default: 0 = the checkpoint's own 3.0). The video shift is "
+         "--flow-shift and defaults to 12.0; the DiT re-derives the audio schedule from the video "
+         "sigma, so the two are coupled",
+         &minimax_h3_sigma_shift_audio},
         {"",
          "--vae-tile-overlap",
          "tile overlap for vae tiling, in fraction of tile size (default: 0.5)",
@@ -2786,6 +2809,11 @@ sd_vid_gen_params_t SDGenerationParams::to_sd_vid_gen_params_t() {
     params.relay_eps        = relay_eps;
     params.relay_audio_eps  = relay_audio_eps;
     params.relay_steps_frac = relay_steps_frac;
+    // MiniMax-H3. The ref2va reference arrays stay null here: they are built per shot by the
+    // server's job runner (async_jobs.cpp), which is the only caller that has them. A null list
+    // is exactly the t2va/fl2va request shape, so leaving them alone is correct rather than
+    // incomplete -- see the "NOT SUPPORTED" note in examples/cli/main.cpp.
+    params.minimax_h3_sigma_shift_audio = minimax_h3_sigma_shift_audio;
     return params;
 }
 

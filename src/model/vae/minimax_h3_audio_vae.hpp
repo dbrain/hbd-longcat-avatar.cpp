@@ -3,7 +3,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -56,6 +60,40 @@ namespace MiniMaxH3Audio {
     using LTXV::depthwise_conv1d;
     using LTXV::replicate_pad_1d;
     using LTXV::SnakeBeta1D;  // x + sin^2(exp(alpha) x) / (exp(beta) + 1e-9)
+
+    // ---------------------------------------------------------------------
+    // audio_vae/config.json latents_mean / latents_std (32 channels). BYTE-IDENTICAL in the
+    // released FL2VA and Ref2VA variants.
+    //
+    // ⚠️ These are the AUDIO twin of MiniMaxH3Video::LATENTS_MEAN / LATENTS_STD, and for the
+    // same reason: the reference registers them as buffers filled from `config.json`, the
+    // conversion script rejects them as unexpected keys, so they are NOT in the GGUF -- and
+    // `detect_from_weights` therefore sets has_latent_stats = false. Without them decode()
+    // skips `z * std + mean` entirely and the BigVGAN decoder is handed the DiT's NORMALIZED
+    // latents: ~1.5-3.3x too small per channel and offset by up to 0.59. The video path was
+    // given its literals; the audio path was not.
+    //
+    // Reference: comfy/ldm/minimax/audio_vae.py MiniMaxH3AudioVAE.decode (z * std + mean) /
+    // encode ((z - mean) / std); diffusers modular_pipelines/minimax_h3/decoders.py L186-188.
+    static const float LATENTS_MEAN[32] = {
+        -0.020211687488382354f, 0.38764664799505022f, -0.043982797991867668f, -0.28591514936373003f,
+        0.081796862145616711f, -0.35782641352446604f, 0.040623809960919084f, -0.015525345019566039f,
+        -0.223362481667332f, 0.18210068425090911f, 0.2941778783780663f, -0.079011676019708849f,
+        -0.056815072777200999f, -0.36990282218600951f, -0.31616315591624855f, 0.59059513774253913f,
+        -0.052139568068853864f, 0.013673160263486295f, -0.036916478646305768f, 0.097326606532981627f,
+        -0.33946623287884981f, -0.30685677538541667f, -0.24504598907458763f, -0.034698524462007344f,
+        0.028680321847675379f, -0.21217779266454084f, -0.1678263169941987f, 0.32212878890406138f,
+        -0.1223055851554907f, 0.43566049281284641f, -0.050259920223625298f, 0.39792583762117972f};
+
+    static const float LATENTS_STD[32] = {
+        1.6895524230479284f, 2.76263727217653f, 1.7945344281264435f, 1.6801681847309828f,
+        1.6390226546605453f, 2.7788298348882177f, 1.7659090095747236f, 1.6199757612137327f,
+        2.6336525640336896f, 1.8539356672817833f, 2.5056497896915633f, 1.811019237886178f,
+        1.9579657790720237f, 1.6685498243529284f, 1.4922469314453364f, 3.2986701980673732f,
+        1.9491804496832168f, 1.8720003270431442f, 1.8334080103291832f, 1.6488070416529093f,
+        1.6176957696319716f, 1.9131449234774398f, 1.5695245398428617f, 1.6943659940415912f,
+        1.8318420762504692f, 1.5540637421583379f, 1.9344930328968526f, 1.599198216109855f,
+        1.718045989838149f, 1.6307219190837705f, 1.8661226051202384f, 1.5613768203168363f};
 
     struct MiniMaxH3AudioVAEConfig {
         // Reference defaults: comfy audio_vae.py MiniMaxH3AudioVAE.__init__ (L382-413)
@@ -925,6 +963,36 @@ namespace MiniMaxH3Audio {
             std::reverse(up_filter.begin(), up_filter.end());
             upsample_filter_reversed = sd::Tensor<float>::from_vector(std::move(up_filter));
             downsample_filter        = sd::Tensor<float>::from_vector(std::move(down_filter));
+
+            // Latent statistics. The released GGUFs carry no latents_mean/latents_std tensors
+            // (the conversion script drops them; they live in audio_vae/config.json), so without
+            // this block resolve_stats() returns {nullptr, nullptr} and BOTH encode() and decode()
+            // silently run UNNORMALIZED. A round trip stays self-consistent that way, which is
+            // exactly why it never showed up -- but the DiT emits NORMALIZED latents, so the
+            // render path fed the BigVGAN decoder inputs ~1.5-3.3x too small with a per-channel
+            // offset. Mirrors MiniMaxH3VideoVAERunner's constructor, which has always done this.
+            //
+            // MINIMAX_H3_AUDIO_LATENT_STATS=0 restores the old (broken) behaviour for a one-env-var
+            // A/B without a rebuild.
+            const char* stats_env = getenv("MINIMAX_H3_AUDIO_LATENT_STATS");
+            const bool stats_on   = stats_env == nullptr || (stats_env[0] != '0' && stats_env[0] != '\0');
+            if (!config.has_latent_stats && stats_on) {
+                if (config.latent_channels == 32) {
+                    latents_mean_host = sd::Tensor<float>::from_vector(
+                        std::vector<float>(LATENTS_MEAN, LATENTS_MEAN + 32));
+                    latents_std_host = sd::Tensor<float>::from_vector(
+                        std::vector<float>(LATENTS_STD, LATENTS_STD + 32));
+                    LOG_INFO("minimax_h3_audio_vae: checkpoint carries no latents_mean/latents_std; "
+                             "using the released audio_vae/config.json literals (32 channels)");
+                } else {
+                    LOG_WARN("minimax_h3_audio_vae: %d latent channels but the reference statistics "
+                             "cover 32; latents will NOT be de-normalized -- call set_latent_stats()",
+                             config.latent_channels);
+                }
+            } else if (!config.has_latent_stats) {
+                LOG_WARN("minimax_h3_audio_vae: MINIMAX_H3_AUDIO_LATENT_STATS=0, latent "
+                         "normalization DISABLED (decode will see normalized latents)");
+            }
         }
 
         // For checkpoints that keep latents_mean / latents_std outside the
@@ -974,6 +1042,138 @@ namespace MiniMaxH3Audio {
                 }
             }
             return planar;
+        }
+
+        // ------------------------------------------------------------------
+        // Debug artefact writers.
+        //
+        // These exist so the audio path can be JUDGED BY EAR and by numpy instead of by
+        // summary statistics: every H3 audio A/B so far moved L/R correlation and spectral
+        // balance without the result actually sounding right, so the deliverable has to be a
+        // playable file plus the raw latent behind it.
+        // ------------------------------------------------------------------
+
+        // 32-bit float WAV (format 3). Lossless for a [-1, 1] engine buffer -- a PCM16 write
+        // would quantize the thing under test. `samples` frames, `channels` interleaved.
+        static bool write_wav_f32(const std::string& path,
+                                  const float* interleaved,
+                                  int64_t samples,
+                                  int64_t channels,
+                                  int sample_rate) {
+            std::ofstream out(path, std::ios::binary);
+            if (!out.is_open()) {
+                LOG_ERROR("minimax_h3_audio_vae: cannot write '%s'", path.c_str());
+                return false;
+            }
+            const uint32_t data_bytes  = static_cast<uint32_t>(samples * channels * 4);
+            const uint32_t riff_bytes  = 36 + data_bytes;
+            const uint16_t fmt_tag     = 3;  // IEEE float
+            const uint16_t n_channels  = static_cast<uint16_t>(channels);
+            const uint32_t rate        = static_cast<uint32_t>(sample_rate);
+            const uint32_t byte_rate   = rate * n_channels * 4;
+            const uint16_t block_align = static_cast<uint16_t>(n_channels * 4);
+            const uint16_t bits        = 32;
+            const uint32_t fmt_bytes   = 16;
+            auto w32 = [&](uint32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); };
+            auto w16 = [&](uint16_t v) { out.write(reinterpret_cast<const char*>(&v), 2); };
+            out.write("RIFF", 4);
+            w32(riff_bytes);
+            out.write("WAVE", 4);
+            out.write("fmt ", 4);
+            w32(fmt_bytes);
+            w16(fmt_tag);
+            w16(n_channels);
+            w32(rate);
+            w32(byte_rate);
+            w16(block_align);
+            w16(bits);
+            out.write("data", 4);
+            w32(data_bytes);
+            out.write(reinterpret_cast<const char*>(interleaved), static_cast<std::streamsize>(data_bytes));
+            return out.good();
+        }
+
+        // NPY v1.0, '<f4', C-order. sd::Tensor is ne0-FASTEST (fortran-like), so the numpy
+        // shape written here is the REVERSE of tensor.shape() -- i.e. a {T, C, S} latent lands
+        // in numpy as (S, C, T), which is exactly torch's layout in the reference. Load with
+        // `numpy.load(path)`; no header parsing on your side.
+        static bool write_npy_f32(const std::string& path,
+                                  const float* data,
+                                  const std::vector<int64_t>& tensor_shape) {
+            std::ofstream out(path, std::ios::binary);
+            if (!out.is_open()) {
+                LOG_ERROR("minimax_h3_audio_vae: cannot write '%s'", path.c_str());
+                return false;
+            }
+            std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+            int64_t count    = 1;
+            for (size_t i = tensor_shape.size(); i-- > 0;) {
+                dict += std::to_string(tensor_shape[i]);
+                dict += ", ";
+                count *= tensor_shape[i];
+            }
+            dict += "), }";
+            // Header (10 magic+version+len bytes + dict + '\n') must be a multiple of 64.
+            size_t header_len = dict.size() + 1;
+            while ((10 + header_len) % 64 != 0) {
+                dict += ' ';
+                header_len = dict.size() + 1;
+            }
+            dict += '\n';
+            const unsigned char magic[8] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
+            const uint16_t len16         = static_cast<uint16_t>(dict.size());
+            out.write(reinterpret_cast<const char*>(magic), 8);
+            out.write(reinterpret_cast<const char*>(&len16), 2);
+            out.write(dict.data(), static_cast<std::streamsize>(dict.size()));
+            out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count * 4));
+            return out.good();
+        }
+
+        // Per-latent-channel mean / std of a {T, C, S} latent, logged as a compact table.
+        //
+        // This is the single number that tells NORMALIZED latents apart from RAW ones: the
+        // encoder's output after (z - mean) / std is ~N(0, 1) per channel, while the same
+        // latent before normalization has the per-channel std of LATENTS_STD (1.5-3.3). Run it
+        // on the DiT's generated latent and on this encoder's and the two must AGREE.
+        static void log_latent_stats(const char* tag, const sd::Tensor<float>& latent) {
+            if (latent.empty() || latent.dim() < 2) {
+                return;
+            }
+            const int64_t t        = latent.shape()[0];
+            const int64_t channels = latent.shape()[1];
+            const int64_t stereo   = latent.dim() > 2 ? latent.shape()[2] : 1;
+            const float* d         = latent.data();
+            double all_mean = 0.0, all_sq = 0.0;
+            std::string mean_row, std_row;
+            for (int64_t c = 0; c < channels; ++c) {
+                double sum = 0.0, sq = 0.0;
+                for (int64_t s = 0; s < stereo; ++s) {
+                    for (int64_t i = 0; i < t; ++i) {
+                        const double v = d[(s * channels + c) * t + i];
+                        sum += v;
+                        sq += v * v;
+                    }
+                }
+                const double n  = static_cast<double>(t * stereo);
+                const double mu = sum / std::max(1.0, n);
+                const double sd = std::sqrt(std::max(0.0, sq / std::max(1.0, n) - mu * mu));
+                all_mean += mu;
+                all_sq += sd;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%+.3f ", mu);
+                mean_row += buf;
+                snprintf(buf, sizeof(buf), "%.3f ", sd);
+                std_row += buf;
+            }
+            LOG_INFO("%s latent {T=%lld, C=%lld, S=%lld}  mean(avg)=%+.4f  std(avg)=%.4f",
+                     tag,
+                     (long long)t,
+                     (long long)channels,
+                     (long long)stereo,
+                     all_mean / std::max<int64_t>(1, channels),
+                     all_sq / std::max<int64_t>(1, channels));
+            LOG_INFO("%s per-channel mean: %s", tag, mean_row.c_str());
+            LOG_INFO("%s per-channel std : %s", tag, std_row.c_str());
         }
 
         static std::vector<float> planar_to_interleaved(const sd::Tensor<float>& planar) {
@@ -1117,6 +1317,128 @@ namespace MiniMaxH3Audio {
             auto result = restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, false, false, false), 3);
             LOG_INFO("minimax h3 audio vae encode completed, taking %.2fs", (ggml_time_ms() - start) * 1.0f / 1000);
             return result;
+        }
+
+        // ------------------------------------------------------------------
+        // ENCODE -> DECODE round trip on a known-good waveform, with the DiT, the packed
+        // sequence and the muxer all OUT of the loop.
+        //
+        // Why this exists: encode() was only ever reachable through a ref2va reference and
+        // decode() only at the end of a render, so the two were never composed and the VAE was
+        // never testable on its own. Every H3 audio finding so far is end-to-end, which cannot
+        // separate "the VAE is wrong" from "the latents handed to it are wrong".
+        //
+        // READ THE RESULT LIKE THIS:
+        //   * <prefix>.roundtrip.wav sounds like <prefix>.input.wav  ->  the VAE is FINE and the
+        //     defect is in the DiT's audio latents (or in the layout/normalization around them).
+        //   * <prefix>.roundtrip.wav is broken                       ->  the VAE (or its weight
+        //     fusion / stereo split / filters) is the defect and the DiT is exonerated.
+        // Note the round trip is INVARIANT to the latents_mean/std wiring: encode normalizes
+        // and decode de-normalizes with the same numbers, so it stays clean either way. Use
+        // <prefix>.latent.npy and the per-channel std in the log to judge THAT: with the stats
+        // applied the encoder's per-channel std is ~1, without them it is ~1.5-3.3.
+        //
+        // planar_in: {samples, stereo} at output_sample_rate(), in [-1, 1]. The caller owns
+        // resampling and channel duplication -- see encode_minimax_h3_reference_audio().
+        bool roundtrip(int n_threads, const sd::Tensor<float>& planar_in, const std::string& out_prefix) {
+            if (!config.has_encoder) {
+                LOG_ERROR("minimax_h3_audio_vae: round trip needs the encoder half; this checkpoint is decode-only");
+                return false;
+            }
+            if (planar_in.empty() || planar_in.dim() != 2) {
+                LOG_ERROR("minimax_h3_audio_vae: round trip expects a {samples, stereo} planar waveform");
+                return false;
+            }
+            const int64_t in_samples  = planar_in.shape()[0];
+            const int64_t in_channels = planar_in.shape()[1];
+            const int rate            = config.output_sample_rate();
+
+            {
+                auto interleaved = planar_to_interleaved(planar_in);
+                const std::string p = out_prefix + ".input.wav";
+                if (write_wav_f32(p, interleaved.data(), in_samples, in_channels, rate)) {
+                    LOG_INFO("minimax_h3_audio_vae: wrote %s (%lld frames, %lld ch, %d Hz)",
+                             p.c_str(), (long long)in_samples, (long long)in_channels, rate);
+                }
+            }
+
+            auto latent = encode(n_threads, planar_in);
+            if (latent.empty()) {
+                LOG_ERROR("minimax_h3_audio_vae: round trip encode failed");
+                return false;
+            }
+            log_latent_stats("minimax_h3_audio_vae round-trip ENCODED", latent);
+            {
+                const std::string p = out_prefix + ".latent.npy";
+                if (write_npy_f32(p, latent.data(), latent.shape())) {
+                    LOG_INFO("minimax_h3_audio_vae: wrote %s (numpy shape is the REVERSE of the "
+                             "engine shape, i.e. (S, C, T))",
+                             p.c_str());
+                }
+            }
+
+            auto out = decode(n_threads, latent);
+            if (out.empty()) {
+                LOG_ERROR("minimax_h3_audio_vae: round trip decode failed");
+                return false;
+            }
+            const int64_t out_samples  = out.shape()[0];
+            const int64_t out_channels = out.dim() > 1 ? out.shape()[1] : 1;
+            {
+                auto interleaved    = planar_to_interleaved(out);
+                const std::string p = out_prefix + ".roundtrip.wav";
+                if (!write_wav_f32(p, interleaved.data(), out_samples, out_channels, rate)) {
+                    return false;
+                }
+                LOG_INFO("minimax_h3_audio_vae: wrote %s (%lld frames, %lld ch, %d Hz)  <-- LISTEN TO THIS",
+                         p.c_str(), (long long)out_samples, (long long)out_channels, rate);
+            }
+
+            // Numbers are the SECOND opinion here, never the verdict -- but a per-channel
+            // correlation with a best-lag search does separate "reconstructed with a delay"
+            // from "unrelated signal", which is the one thing ears are bad at.
+            const int64_t n = std::min(in_samples, out_samples);
+            for (int64_t c = 0; c < std::min(in_channels, out_channels); ++c) {
+                const float* a = planar_in.data() + c * in_samples;
+                const float* b = out.data() + c * out_samples;
+                double best    = -2.0;
+                int64_t best_lag = 0;
+                for (int64_t lag = -800; lag <= 800; lag += 8) {
+                    double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+                    int64_t cnt = 0;
+                    for (int64_t i = std::max<int64_t>(0, -lag); i < n && i + lag < out_samples; ++i) {
+                        const double x = a[i];
+                        const double y = b[i + lag];
+                        sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y;
+                        ++cnt;
+                    }
+                    if (cnt < 1024) {
+                        continue;
+                    }
+                    const double dn = static_cast<double>(cnt);
+                    const double cov = sab / dn - (sa / dn) * (sb / dn);
+                    const double va  = saa / dn - (sa / dn) * (sa / dn);
+                    const double vb  = sbb / dn - (sb / dn) * (sb / dn);
+                    const double r   = (va > 0 && vb > 0) ? cov / std::sqrt(va * vb) : 0.0;
+                    if (r > best) {
+                        best     = r;
+                        best_lag = lag;
+                    }
+                }
+                double err = 0, sig = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    const double d = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+                    err += d * d;
+                    sig += static_cast<double>(a[i]) * static_cast<double>(a[i]);
+                }
+                LOG_INFO("minimax_h3_audio_vae round trip ch%lld: corr %.4f @ lag %lld, "
+                         "SNR(lag 0) %.2f dB",
+                         (long long)c,
+                         best,
+                         (long long)best_lag,
+                         10.0 * std::log10(std::max(1e-20, sig) / std::max(1e-20, err)));
+            }
+            return true;
         }
 
         void test(const std::string& input_path) {

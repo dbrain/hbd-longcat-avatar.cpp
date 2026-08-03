@@ -2081,6 +2081,15 @@ struct LLMEmbedder : public Conditioner {
             tokenizer = std::make_shared<GPTOSSTokenizer>();
         } else if (arch == LLM::LLMArch::GEMMA2_2B) {
             tokenizer = std::make_shared<Gemma2Tokenizer>();
+        } else if (sd_version_is_minimax_h3(version)) {
+            // H3 ships its own tokenizer_config.json whose additional_special_tokens
+            // put <d> .. <|caption_end|> at 151669-151675, where the shared table has
+            // HiDream-O1's <|boi_token|> block. Ids in that table are positional, so
+            // the two tails are mutually exclusive and this is the only safe way to
+            // give H3 its own -- see Qwen2Tokenizer::SpecialTail. Without it <d>,
+            // the wrapper every dialogue and lyric span is keyed on, byte-BPEs into
+            // ordinary tokens and the trained id is never emitted.
+            tokenizer = std::make_shared<Qwen2Tokenizer>("", Qwen2Tokenizer::SpecialTail::MINIMAX_H3);
         } else {
             tokenizer = std::make_shared<Qwen2Tokenizer>();
         }
@@ -2721,11 +2730,26 @@ struct LLMEmbedder : public Conditioner {
             }
         }
 
-        // The prompt, verbatim. Prompt-attention weighting is this engine's
-        // convention rather than H3's -- with no (word:1.2) in the prompt every
-        // weight is 1.0 and apply_token_weights() is a no-op.
-        auto tokens_weights_mask = tokenize(conditioner_params.text,
-                                            {0, static_cast<int>(conditioner_params.text.size())});
+        // The prompt, VERBATIM -- prompt-attention parsing is DELIBERATELY OFF here.
+        //
+        // Prompt weighting is this engine's own convention, not H3's. H3's prompt is a
+        // Context-IR document in which ( ) [ ] are ordinary characters carrying
+        // structure: `[Shot 1]` block headers, `(from [Shot 1])` in the instruction
+        // line, `(S1)` speaker ids. parse_prompt_attention() reads all of those as
+        // emphasis syntax -- it STRIPS the brackets and reweights the span (`[Shot 1]`
+        // became `['Shot 1', 0.909091]` in every render before this), so the model
+        // never saw the headers the format is built around.
+        //
+        // Disabled outright rather than escaped, for two reasons: escaping would have
+        // to rewrite the caller's text (changing what gets tokenized, and BPE is not
+        // invariant under it), and the parser does not round-trip its own escapes --
+        // only `\(` is unescaped on output, while `\)` `\[` `\]` keep their backslash.
+        // The `{-1, -1}` range is tokenize()'s existing "no attention range" path and
+        // yields one span at weight 1.0, so apply_token_weights() stays a no-op.
+        //
+        // Scope: H3 only. Every other consumer reaches tokenize() through
+        // encode_prompt() with a real range and is untouched.
+        auto tokens_weights_mask = tokenize(conditioner_params.text, {-1, -1});
         presentation.add_text(std::get<0>(tokens_weights_mask), &std::get<1>(tokens_weights_mask));
 
         if (presentation.token_ids.empty()) {

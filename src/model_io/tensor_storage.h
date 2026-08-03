@@ -36,8 +36,13 @@ struct TensorStorage {
     // is_nvfp4_import: `type` is GGML_TYPE_NVFP4 and `offset` points at the packed E2M1
     // nibbles, but the FP8 group scales live at `nvfp4_scale_offset`, in a separate tensor.
     // is_inline_f32:   the value has no file backing at all; `inline_f32` holds it.
+    // nvfp4_comfy_layout: the source is a ComfyUI/comfy-kitchen export -- element 2j is in
+    //                  the HIGH nibble and the group scales are in the cuBLAS blocked
+    //                  swizzle, so both differ from ModelOpt/llm-compressor. Getting this
+    //                  flag wrong is SILENT: same byte counts, plausible-looking output.
     bool is_nvfp4_import        = false;
     bool is_inline_f32          = false;
+    bool nvfp4_comfy_layout     = false;
     uint64_t nvfp4_scale_offset = 0;
     float inline_f32            = 0.0f;
     // -----------------------------------------------------------------------------------
@@ -67,7 +72,15 @@ struct TensorStorage {
         if (is_inline_f32) {
             return 0;
         } else if (is_nvfp4_import) {
-            return nelements() / 2 + nelements() / 16;  // packed nibbles + FP8 group scales
+            // packed nibbles + FP8 group scales. The ComfyUI swizzle pads the scale plane
+            // to 128 rows x 4 group-columns, so it is not simply nelements()/16.
+            const int64_t n = nelements();
+            if (nvfp4_comfy_layout) {
+                const int64_t padded_rows = ((ne[1] + 127) / 128) * 128;
+                const int64_t padded_cols = ((ne[0] / 16 + 3) / 4) * 4;
+                return n / 2 + padded_rows * padded_cols;
+            }
+            return n / 2 + n / 16;
         } else if (is_f8_e4m3 || is_f8_e5m2) {
             return nbytes() / 2;
         } else if (is_f64 || is_i64) {
