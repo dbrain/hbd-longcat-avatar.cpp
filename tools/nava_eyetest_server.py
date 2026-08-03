@@ -129,7 +129,16 @@ def render_card(run):
 
     clip = run["clip"]
     if clip:
-        cdur = _dur(os.path.join(run["dir"], clip))
+        response = m.get("response_202") or {}
+        cdur = response.get("duration_seconds")
+        if cdur is None and m.get("frames"):
+            fps = response.get("fps") or (m.get("result_meta") or {}).get("fps") or 24
+            try:
+                cdur = float(m["frames"]) / float(fps)
+            except (TypeError, ValueError, ZeroDivisionError):
+                cdur = None
+        if cdur is None:
+            cdur = _dur(os.path.join(run["dir"], clip))
         src = "/clip/" + urllib.parse.quote(name) + "/" + urllib.parse.quote(clip)
         video = (f'<video src="{html.escape(src)}" controls loop muted '
                  f'preload="metadata"></video>')

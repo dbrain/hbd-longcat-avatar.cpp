@@ -879,12 +879,14 @@ void register_minimax_h3_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 }
             }
             if (ref_images > kMiniMaxH3MaxRefImages || ref_videos > kMiniMaxH3MaxRefVideos ||
-                ref_audios > kMiniMaxH3MaxRefAudios) {
+                ref_audios > kMiniMaxH3MaxRefAudios ||
+                references.size() > static_cast<size_t>(kMiniMaxH3MaxReferences)) {
                 res.status = 400;
                 res.set_content(json({{"error", "too many references"},
                                       {"max_images", kMiniMaxH3MaxRefImages},
                                       {"max_videos", kMiniMaxH3MaxRefVideos},
-                                      {"max_audios", kMiniMaxH3MaxRefAudios}})
+                                      {"max_audios", kMiniMaxH3MaxRefAudios},
+                                      {"max_total", kMiniMaxH3MaxReferences}})
                                     .dump(),
                                 "application/json");
                 return;
@@ -914,6 +916,26 @@ void register_minimax_h3_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                                            std::find(reference.segments.begin(), reference.segments.end(),
                                                      static_cast<int>(index)) != reference.segments.end();
                                 });
+                const bool has_visual_reference =
+                    std::any_of(references.begin(), references.end(),
+                                [&](const MiniMaxH3JobReference& reference) {
+                                    const bool in_scope =
+                                        !reference.scoped ||
+                                        std::find(reference.segments.begin(), reference.segments.end(),
+                                                  static_cast<int>(index)) != reference.segments.end();
+                                    return in_scope && reference.kind != MiniMaxH3JobReference::Kind::Audio;
+                                });
+                if (has_references && !has_visual_reference) {
+                    res.status = 400;
+                    res.set_content(
+                        json({{"error", "audio references cannot be the only references for segment " +
+                                            std::to_string(index) +
+                                            "; pair them with at least one image or video reference"},
+                              {"segment", static_cast<int>(index)}})
+                            .dump(),
+                        "application/json");
+                    return;
+                }
                 const std::string derived = has_references ? "ref2va" : (has_keyframes ? "fl2va" : "t2va");
                 const std::string stated  = segment.task.empty() ? requested_task : segment.task;
                 if (!stated.empty()) {

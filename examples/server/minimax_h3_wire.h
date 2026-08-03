@@ -74,6 +74,7 @@ constexpr int kMiniMaxH3RefImageShortEdge = 2048;
 constexpr int kMiniMaxH3MaxRefImages = 9;
 constexpr int kMiniMaxH3MaxRefVideos = 3;
 constexpr int kMiniMaxH3MaxRefAudios = 3;
+constexpr int kMiniMaxH3MaxReferences = 12;
 // Guidance-distilled: one forward per step, no CFG, no negative prompt.
 constexpr float kMiniMaxH3SigmaShiftVideo = 12.0f;
 constexpr float kMiniMaxH3SigmaShiftAudio = 3.0f;
@@ -282,6 +283,8 @@ inline nlohmann::json h3_capabilities_json(int requested_width, int requested_he
         {"references", {{"max_images", kMiniMaxH3MaxRefImages},
                         {"max_videos", kMiniMaxH3MaxRefVideos},
                         {"max_audios", kMiniMaxH3MaxRefAudios},
+                        {"max_total", kMiniMaxH3MaxReferences},
+                        {"audio_only", false},
                         {"video_min_frames", 5},
                         {"video_frame_grid", "17n+5"},
                         {"conditioner_sample_fps", kMiniMaxH3QwenSampleFps},

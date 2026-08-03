@@ -1635,7 +1635,7 @@ trusted, so a request naming `ref2va` with no references in scope is a `400` ins
 | --- | --- |
 | `t2va` | prompt only |
 | `fl2va` | `first_frame` and/or `last_frame` (aliases: `init_image` / `end_image`), anchored at frames `0` and `frames - 1` |
-| `ref2va` | at least one `references` entry in scope for that shot |
+| `ref2va` | at least one image or video `references` entry in scope for that shot; audio references may accompany it |
 
 `ref2va` and `fl2va` are different tasks; a shot carrying both forms is a `400`.
 
@@ -1661,13 +1661,14 @@ trusted, so a request naming `ref2va` with no references in scope is a `400` ins
 #### References
 
 A reference is an object with `kind` of `image`, `video` or `audio`. Limits are `9` images, `3`
-videos and `3` audio references. A `video` reference carries its clip at **24 fps, one array
-entry per frame**; it is truncated to the longest shot in the job and then trimmed **down** to
-the same `17n+5` grid (it is VAE-encoded whole), and needs at least `5` frames (~0.2 s). A
-soundtrack may ride on the `video` entry as `audio`, in which case it is labelled `<Audio j>`
-before its own `<Video k>`. Audio may also be uploaded as a multipart file named
-`ref_audio_<i>`, where `<i>` is the reference's **index in the array** — sending both forms for
-one reference is a `400`.
+videos, `3` audio references, and `12` references total. An audio reference cannot be the only
+reference in scope for a shot: the ref2va conditioner's visual `before_encoder` input requires at
+least one image or video. A `video` reference carries its clip at **24 fps, one array entry per
+frame**; it is truncated to the longest shot in the job and then trimmed **down** to the same
+`17n+5` grid (it is VAE-encoded whole), and needs at least `5` frames (~0.2 s). A soundtrack may
+ride on the `video` entry as `audio`, in which case it is labelled `<Audio j>` before its own
+`<Video k>`. Audio may also be uploaded as a multipart file named `ref_audio_<i>`, where `<i>` is
+the reference's **index in the array** — sending both forms for one reference is a `400`.
 
 References are **top-level**, like LTX's `character_refs`, because a reference is a cast member
 or a location rather than a shot. An optional per-entry `"segments": [0, 2]` scopes it, in

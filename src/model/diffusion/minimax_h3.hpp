@@ -1323,7 +1323,20 @@ namespace MiniMaxH3 {
                 // Per-block cut point.  Mandatory rather than nice-to-have at this size: the
                 // activation working set of a single block is multiple gigabytes at production
                 // length, so the graph has to be executable in block-sized pieces.
-                sd::ggml_graph_cut::mark_graph_cut(h, "minimax_h3.blocks." + std::to_string(i), "hidden_states");
+                //
+                // Keep the LAST block and the final heads in one segment.  If block 49 is cut,
+                // the planner hoists only the tiny audio-row slice across the boundary while it
+                // leaves the video head on the producer side.  At long sequence lengths that
+                // asymmetric cached slice is corrupted (audio velocity becomes orthogonal while
+                // video remains bit-close); whether it happens used to depend on weight type and
+                // --max-vram deciding if the final segment happened to merge back.  There is no
+                // memory benefit to that last cut: final-layer scratch is smaller than block 49's
+                // already-live peak.  Making the dependency structural removes the cliff.
+                if (i + 1 < config.num_layers) {
+                    sd::ggml_graph_cut::mark_graph_cut(h,
+                                                      "minimax_h3.blocks." + std::to_string(i),
+                                                      "hidden_states");
+                }
             }
 
             return final_layer->forward(ctx, h, t_emb, plan.video, plan.audio);

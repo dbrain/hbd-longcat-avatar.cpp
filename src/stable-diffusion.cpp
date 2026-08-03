@@ -11287,6 +11287,9 @@ static void minimax_h3_golden_apply_context(sd_ctx_t* sd_ctx, ImageGenerationEmb
     if (!sd_version_is_minimax_h3(sd_ctx->sd->version)) {
         return;
     }
+    if (!minimax_h3_golden::dump_context(embeds.cond.c_crossattn)) {
+        GGML_ABORT("[H3-GOLDEN] MINIMAX_H3_GOLDEN_DUMP_CONTEXT could not be written");
+    }
     if (!minimax_h3_golden::inject_context(embeds.cond.c_crossattn)) {
         GGML_ABORT("[H3-GOLDEN] MINIMAX_H3_GOLDEN_CONTEXT could not be applied; refusing to render "
                    "with our own conditioning under a golden-parity run");
@@ -13040,6 +13043,13 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
 
     int64_t latent_end = ggml_time_ms();
     LOG_INFO("generating latent video completed, taking %.2fs", (latent_end - latent_start) * 1.0f / 1000);
+
+    if (sd_version_is_minimax_h3(sd_ctx->sd->version) &&
+        !minimax_h3_golden::force_final(final_latent,
+                                        latents.minimax_h3_audio_t,
+                                        static_cast<int>(sd_ctx->sd->get_latent_channel()))) {
+        return false;
+    }
 
     // MINIMAX_H3_SAVE_LATENT / MINIMAX_H3_INJECT_AUDIO_LATENT. Placed here, on the packed latent,
     // BEFORE anything unpacks the audio or slices the video: what lands on disk is exactly the

@@ -354,6 +354,33 @@ namespace minimax_h3_golden {
         return true;
     }
 
+    // MINIMAX_H3_GOLDEN_DUMP_CONTEXT=<file.npy> writes the conditioner's raw Qwen hidden states
+    // before an optional golden substitution.  This is the missing control for whole-pipeline
+    // quality comparisons: a DiT parity run can pass perfectly with injected Comfy conditioning
+    // while the production text encoder still hands that same DiT a materially different prompt.
+    inline bool dump_context(const sd::Tensor<float>& c_crossattn) {
+        const std::string path = detail::env_or_empty("MINIMAX_H3_GOLDEN_DUMP_CONTEXT");
+        if (path.empty()) {
+            return true;
+        }
+        if (c_crossattn.empty() || c_crossattn.dim() < 2) {
+            LOG_ERROR("[H3-GOLDEN] cannot dump raw context to %s: expected a non-empty context tensor",
+                      path.c_str());
+            return false;
+        }
+        // Runtime tensors elide the singleton batch dimension and are {D,L}; spell it back into
+        // the file so this is directly comparable to Comfy's (1,L,D) capture.
+        const std::vector<int64_t> shape = {c_crossattn.shape()[0], c_crossattn.shape()[1], 1};
+        if (!detail::write_npy_f32(path, c_crossattn.data(), shape)) {
+            return false;
+        }
+        LOG_INFO("[H3-GOLDEN] raw conditioner context -> %s (%lld tokens x %lld dims)",
+                 path.c_str(),
+                 static_cast<long long>(c_crossattn.shape()[1]),
+                 static_cast<long long>(c_crossattn.shape()[0]));
+        return true;
+    }
+
     // ── 3. sigma schedule ─────────────────────────────────────────────────────────────────────
     //
     // MINIMAX_H3_GOLDEN_SIGMAS=<file.txt> -- one float per line, INCLUDING the trailing 0.
@@ -412,11 +439,17 @@ namespace minimax_h3_golden {
         const std::string base = prefix + ".s" + std::to_string(std::abs(step)) + ".x";
         std::vector<float> v, a;
         std::vector<int64_t> vs, as;
+        {
+            std::ifstream probe(base + ".video.npy", std::ios::binary);
+            if (!probe.good()) {
+                LOG_INFO("[H3-GOLDEN] step %d not forced (no %s.video.npy) -- this step's comparison is "
+                         "NOT independent of the previous one",
+                         step, base.c_str());
+                return;
+            }
+        }
         if (!detail::read_npy_f32(base + ".video.npy", v, vs)) {
-            LOG_INFO("[H3-GOLDEN] step %d not forced (no %s.video.npy) -- this step's comparison is "
-                     "NOT independent of the previous one",
-                     step, base.c_str());
-            return;
+            GGML_ABORT("[H3-GOLDEN] %s.video.npy exists but could not be read", base.c_str());
         }
         if (static_cast<int64_t>(v.size()) != p.video_values) {
             GGML_ABORT("[H3-GOLDEN] %s.video.npy holds %zu floats, this render wants %lld. A forced "
@@ -434,6 +467,45 @@ namespace minimax_h3_golden {
         LOG_INFO("[H3-GOLDEN] step %d: x FORCED from %s.{video,audio}.npy -- this step is now an "
                  "independent forward-pass comparison",
                  step, base.c_str());
+    }
+
+    // Replace the finished packed latent immediately before the VAEs. The capture node writes
+    // ComfyUI's final pair as
+    //   <prefix>0.npy  video (1, 24, T, H, W)
+    //   <prefix>1.npy  audio (1, 32, 2, Ta)
+    // and those payloads are byte-for-byte the two contiguous halves of our packed tensor.
+    // This isolates each decoder from every DiT, sampler and quantisation difference.
+    inline bool force_final(sd::Tensor<float>& packed, int audio_t, int video_channels) {
+        const std::string prefix = detail::env_or_empty("MINIMAX_H3_GOLDEN_FINAL");
+        if (prefix.empty()) {
+            return true;
+        }
+        const detail::Packed p = detail::geometry(packed, audio_t, video_channels);
+        if (!p.ok) {
+            return false;
+        }
+        std::vector<float> video;
+        std::vector<float> audio;
+        std::vector<int64_t> video_shape;
+        std::vector<int64_t> audio_shape;
+        if (!detail::read_npy_f32(prefix + "0.npy", video, video_shape) ||
+            !detail::read_npy_f32(prefix + "1.npy", audio, audio_shape)) {
+            return false;
+        }
+        if (static_cast<int64_t>(video.size()) != p.video_values ||
+            static_cast<int64_t>(audio.size()) != p.audio_values) {
+            LOG_ERROR("[H3-GOLDEN] REFUSING final latent %s{0,1}.npy: got %zu video + %zu audio "
+                      "floats, this render wants %lld + %lld",
+                      prefix.c_str(), video.size(), audio.size(),
+                      (long long)p.video_values, (long long)p.audio_values);
+            return false;
+        }
+        std::copy_n(video.data(), video.size(), packed.data());
+        std::copy_n(audio.data(), audio.size(), packed.data() + p.video_values);
+        LOG_INFO("[H3-GOLDEN] final latent FORCED from %s{0,1}.npy -- both VAEs now decode "
+                 "ComfyUI's exact output",
+                 prefix.c_str());
+        return true;
     }
 
     // ── 5. dumping ────────────────────────────────────────────────────────────────────────────
