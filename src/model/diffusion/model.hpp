@@ -186,6 +186,21 @@ struct MiniT2IDiffusionExtra {
     const sd::Tensor<float>* mask = nullptr;
 };
 
+struct MiniMaxH3DiffusionExtra {
+    // Per-row AdaLN modality tag over the TEXT span (0 video, 1 text, 2 audio), as produced by
+    // the H3 conditioner on SDCondition::c_token_types. Null means "the whole text span is
+    // text", which is right for t2va and wrong for any presentation carrying vision pads.
+    const sd::Tensor<int32_t>* text_token_tags = nullptr;
+
+    // The NEXT step's VIDEO sigma, one element, in the sampler's raw [0, 1] sigma units (NOT
+    // multiplied by 1000 the way `timesteps` is). Same plumbing idea as
+    // HunyuanVideoDiffusionExtra::timestep_r: the DiT needs the step's far end to convert its
+    // audio velocity onto the video schedule by the SECANT rather than by the instantaneous
+    // slope. Null on the final step of a schedule that has no next entry, and on any sampler
+    // that does not supply it -- the DiT then keeps the instantaneous slope.
+    const sd::Tensor<float>* sigma_next = nullptr;
+};
+
 struct HunyuanVideoDiffusionExtra {
     const sd::Tensor<float>* guidance   = nullptr;
     const sd::Tensor<float>* byt5       = nullptr;
@@ -203,6 +218,7 @@ using DiffusionExtraParams = std::variant<std::monostate,
                                           LTXAVDiffusionExtra,
                                           LongCatAvatarDiffusionExtra,
                                           MiniT2IDiffusionExtra,
+                                          MiniMaxH3DiffusionExtra,
                                           HunyuanVideoDiffusionExtra>;
 
 struct DiffusionParams {

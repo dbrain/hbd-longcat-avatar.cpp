@@ -4,6 +4,10 @@
 // For scan_lora_dir / lora_entry_json — the CUDA-free half of the LoRA listing, so the supervisor
 // can answer /sdapi/v1/loras without waking the worker.
 #include "runtime.h"
+// Same idea for MiniMax-H3: the capability document and the bank cleanup are pure arithmetic and
+// pure filesystem, so BOTH the supervisor and the child answer them from this one header. H3's
+// worker is bigger than LTX's, which makes an accidental cold start correspondingly worse.
+#include "minimax_h3_wire.h"
 
 #include <algorithm>
 #include <chrono>
@@ -44,6 +48,7 @@ bool is_generation_request(const httplib::Request& request) {
     if (request.method != "POST") return false;
     return request.path == "/sdcpp/v1/img_gen" || request.path == "/sdcpp/v1/vid_gen" ||
            request.path == "/ltx/v1/generate" || request.path == "/wan/v1/generate" ||
+           request.path == "/h3/v1/generate" ||
            request.path == "/generate" || request.path == "/sdapi/v1/txt2img" ||
            request.path == "/sdapi/v1/img2img" || request.path == "/v1/images/generations" ||
            request.path == "/v1/images/edits";
@@ -700,7 +705,7 @@ bool WorkerSupervisor::proxy(const httplib::Request& request,
 bool worker_isolation_requested() {
     return truthy(std::getenv("SD_SERVER_WORKER_ISOLATION")) || truthy(std::getenv("SD_IMAGE_ISOLATION")) ||
            truthy(std::getenv("LTX_VIDEO_ISOLATION")) || truthy(std::getenv("WAN_VIDEO_ISOLATION")) ||
-           truthy(std::getenv("LONGCAT_AVATAR_WORKER_ISOLATION"));
+           truthy(std::getenv("LONGCAT_AVATAR_WORKER_ISOLATION")) || truthy(std::getenv("MINIMAX_H3_ISOLATION"));
 }
 
 bool worker_isolation_child() {
@@ -835,6 +840,43 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
     };
     server.Delete("/ltx/v1/job", ltx_delete_job);
 
+    // Answered HERE for the same reason as /sdapi/v1/loras: describing MiniMax-H3's frame grid is
+    // integer arithmetic, and proxying it would cold-start a CUDA child that has to resident a
+    // ~20 GB DiT plus a 25B text encoder before it could reply. Koblem reads this while building
+    // the request (to show the snapped duration), i.e. BEFORE it wants a GPU at all. Shared with
+    // the child's own route through h3_capabilities_json(), so both answers are identical.
+    server.Get("/h3/v1/capabilities", [](const httplib::Request& request, httplib::Response& response) {
+        const auto number_param = [&](const char* name) {
+            const std::string value = request.get_param_value(name);
+            return value.empty() ? 0 : atoi(value.c_str());
+        };
+        response.set_content(h3_capabilities_json(number_param("width"),
+                                                  number_param("height"),
+                                                  number_param("frames"))
+                                 .dump(),
+                             "application/json");
+    });
+
+    const auto h3_delete_job = [&supervisor](const httplib::Request& request, httplib::Response& response) {
+        // Filesystem-only, exactly like the LTX cleanup above: a client must be able to drop a
+        // finished job's staged reference audio after /unload without waking the worker.
+        if (supervisor.in_flight() > 0) {
+            response.status = 409;
+            response.set_content(R"({"error":"cannot delete an active MiniMax-H3 job"})", "application/json");
+            return;
+        }
+        bool deleted = false;
+        std::string error;
+        if (!h3_delete_bank(request.get_param_value("id"), deleted, error)) {
+            response.status = 400;
+            response.set_content(json({{"error", error}}).dump(), "application/json");
+            return;
+        }
+        response.set_content(json({{"status", deleted ? "deleted" : "missing"}, {"deleted", deleted}}).dump(),
+                             "application/json");
+    };
+    server.Delete("/h3/v1/job", h3_delete_job);
+
     const auto proxy_request = [&supervisor](const httplib::Request& request, httplib::Response& response) {
         supervisor.proxy(request, response, WorkerSupervisor::request_model(request));
     };
@@ -845,7 +887,7 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
     // handler it is given; the pre-routing hook has to copy them too. Capturing them
     // by reference here crashed the supervisor on the first bodyless request. Each
     // copy still holds &supervisor, which is caller-owned and outlives the server.
-    server.set_pre_routing_handler([admin_drain, admin_load, admin_unload, ltx_delete_job,
+    server.set_pre_routing_handler([admin_drain, admin_load, admin_unload, ltx_delete_job, h3_delete_job,
                                     proxy_request](const httplib::Request& request,
                                                    httplib::Response& response) {
         std::string origin = request.get_header_value("Origin");
@@ -901,6 +943,8 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
                 admin_unload(request, response);
             } else if (request.method == "DELETE" && request.path == "/ltx/v1/job") {
                 ltx_delete_job(request, response);
+            } else if (request.method == "DELETE" && request.path == "/h3/v1/job") {
+                h3_delete_job(request, response);
             } else {
                 proxy_request(request, response);
             }

@@ -57,6 +57,7 @@ enum SDVersion {
     VERSION_SEFI_IMAGE,
     VERSION_KREA2,
     VERSION_MAGE_FLOW,
+    VERSION_MINIMAX_H3,
     VERSION_ESRGAN,
     VERSION_COUNT,
 };
@@ -237,6 +238,13 @@ static inline bool sd_version_is_mage_flow(SDVersion version) {
     return version == VERSION_MAGE_FLOW;
 }
 
+// MiniMax-H3: a single packed-sequence DiT that denoises video and stereo audio jointly.  It
+// brings its own video VAE (3D causal CNN encoder + ViT3D decoder) and its own audio VAE, so it
+// is deliberately absent from every sd_version_uses_*_vae() classifier below.
+static inline bool sd_version_is_minimax_h3(SDVersion version) {
+    return version == VERSION_MINIMAX_H3;
+}
+
 static inline bool sd_version_uses_flux_vae(SDVersion version) {
     if (sd_version_is_flux(version) || sd_version_is_z_image(version) || sd_version_is_boogu_image(version) || sd_version_is_longcat(version)) {
         return true;
@@ -301,7 +309,8 @@ static inline bool sd_version_is_dit(SDVersion version) {
         sd_version_is_ideogram4(version) ||
         sd_version_is_sefi_image(version) ||
         sd_version_is_krea2(version) ||
-        sd_version_is_mage_flow(version)) {
+        sd_version_is_mage_flow(version) ||
+        sd_version_is_minimax_h3(version)) {
         return true;
     }
     return false;

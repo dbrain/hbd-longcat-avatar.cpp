@@ -84,11 +84,34 @@ private:
         std::vector<std::pair<TensorState*, ggml_tensor*>> staged_tensors;
     };
 
+    // One segment's weights, allocated on the compute backend but not yet copied into and
+    // not yet visible as a ComputeStagingBlock. Exists only between begin_stage_prefetch()
+    // and finish_stage_prefetch(); see the long comment above
+    // ModelManager::begin_stage_prefetch() in model_manager.cpp for the threading contract.
+    struct StagePrefetch {
+        ggml_backend_t compute_backend = nullptr;
+        ggml_backend_buffer_t buffer   = nullptr;
+        ggml_context* staging_ctx      = nullptr;
+        std::vector<std::pair<TensorState*, ggml_tensor*>> staged_tensors;
+        size_t bytes    = 0;
+        int64_t copy_ms = 0;
+        // Set by run_stage_prefetch() once every copy has completed. finish_stage_prefetch()
+        // refuses to publish a block without it, so a prefetch whose worker never ran (an
+        // early return out of execute_graph) is discarded rather than swapped in empty.
+        bool copied = false;
+    };
+
     ModelLoader model_loader_;
     std::vector<std::unique_ptr<TensorState>> tensor_states_;
     std::map<std::string, TensorState*> tensor_states_by_name_;
     std::vector<std::unique_ptr<ParamsStorageBlock>> params_storage_blocks_;
     std::vector<std::unique_ptr<ComputeStagingBlock>> compute_staging_blocks_;
+    std::unique_ptr<StagePrefetch> pending_stage_prefetch_;
+    size_t stage_prefetch_bytes_total_    = 0;
+    int64_t stage_prefetch_copy_ms_total_ = 0;
+    size_t stage_prefetch_count_          = 0;
+    bool stage_prefetch_mode_logged_      = false;
+    bool stage_prefetch_declined_logged_  = false;
     std::map<ggml_backend_t, ggml_backend_buffer_type_t> split_buffer_types_;
     bool warned_split_lora_skip_ = false;
     bool warned_gpu_fold_        = false;
@@ -136,6 +159,7 @@ private:
     void release_params_storage_blocks(bool force                                            = false,
                                        const std::unordered_set<TensorState*>* target_states = nullptr);
     void free_compute_staging_block(ComputeStagingBlock& block);
+    void discard_stage_prefetch();
     void free_params_storage_block(ParamsStorageBlock& block);
     void erase_params_storage_block(ParamsStorageBlock* block);
     void reset_lora_applied_params();
@@ -231,6 +255,57 @@ public:
     bool validate_registered_tensors();
     bool load_all_params_eagerly();
 
+    // ---------------------------------------------------------------------------------
+    // RESIDENCY CENSUS -- what this manager is holding, right now, split by module.
+    //
+    // The load-time `total params memory size` line describes PLACEMENT AT REGISTRATION.
+    // It cannot answer "at the sampling peak, how much of the card is weights that this
+    // phase does not touch", because registration says nothing about what has actually
+    // been faulted in (params load LAZILY, per graph, per tensor) nor about the staging
+    // blocks that come and go inside a single step. This does.
+    //
+    // Pure read-only bookkeeping: no device calls, no allocation, no locking. Cheap
+    // enough to call at every graph-cut segment boundary.
+    // ---------------------------------------------------------------------------------
+    struct ParamsResidency {
+        struct Module {
+            std::string desc;
+            size_t params_vram    = 0;
+            size_t params_ram     = 0;
+            size_t staged_vram    = 0;
+            size_t params_tensors = 0;
+            size_t staged_tensors = 0;
+        };
+        std::vector<Module> modules;
+        size_t params_vram   = 0;
+        size_t params_ram    = 0;
+        size_t staged_vram   = 0;
+        size_t prefetch_vram = 0;
+        size_t params_blocks = 0;
+        size_t staged_blocks = 0;
+    };
+
+    ParamsResidency params_residency() const;
+
+    // ---------------------------------------------------------------------------------
+    // Hand a module's PARAMS-BACKEND storage back, keeping its registration intact.
+    //
+    // Distinct from unregister_param_tensors(), which also forgets the tensors and so can
+    // only be used when the module is going away for good. This is the phase-boundary
+    // form: the weights are dropped, the next prepare_params() for that module re-reads
+    // them from the model file exactly as the first one did.
+    //
+    // 🔴 REFUSES a block whose tensors carry a folded LoRA (folded_lora_epoch set). For an
+    // mmap'd block, freeing does NOT restore pristine bytes -- the mapping outlives the
+    // block -- and for an alloc'd one the re-read would silently drop the merged delta.
+    // Either way the caller would get a different model back than it released, which is
+    // the exact class of silent corruption this tree keeps paying for. Skipped, logged.
+    //
+    // Returns the bytes actually freed. Blocks with an active prepare, a live staging
+    // block, or a mixed set of descs are left alone.
+    // ---------------------------------------------------------------------------------
+    size_t release_module_params(const std::set<std::string>& descs);
+
     // A request/window boundary is stronger than a normal graph completion: no
     // runner may still own a staged compute buffer, while CPU/mmap parameter
     // storage must remain intact for the next window.  This deliberately does
@@ -244,6 +319,10 @@ public:
     void release_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void release_retained_compute_backend_params(const std::vector<ggml_tensor*>& tensors) override;
     void release_params_backend_params(const std::vector<ggml_tensor*>& tensors) override;
+
+    bool begin_stage_prefetch(const std::vector<ggml_tensor*>& tensors) override;
+    void run_stage_prefetch() override;
+    void finish_stage_prefetch() override;
 };
 
 #endif  // __MODEL_MANAGER_H__

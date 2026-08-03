@@ -229,7 +229,14 @@ typedef struct {
     bool force_sdxl_vae_conv_scale;
     enum sd_vae_format_t vae_format;
     const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
-    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
+    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram). DIFFUSION MODULE ONLY.
+    // Per-module opt-in for the CONDITIONER/text encoder, in GiB. 0 (default) leaves the text
+    // encoder exactly as it behaves today; > 0 enables the same residency+prefetch streaming the
+    // diffusion module gets under `stream_layers` AND overrides the conditioner's graph-cut VRAM
+    // budget to this value (the text encoder and the DiT share one backend, so they cannot share
+    // one `max_vram` number); < 0 enables streaming and keeps the `max_vram` budget.
+    // Requires the conditioner's params backend to be cpu and its runtime backend to be a device.
+    float stream_layers_te;
     bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
     const char* backend;
     const char* params_backend;
@@ -636,6 +643,59 @@ typedef struct {
                      const sd_image_t* frames, int frame_count, void* user);
     void* on_stage_user;
     int stage_seg_index;
+    // MiniMax-H3 AUDIO flow shift. The VIDEO shift rides sample_params.flow_shift, because that
+    // is the schedule the sampler itself walks; the DiT inverts it back to the shared base grid
+    // and derives the audio stream's schedule from this one. Zero or negative keeps the
+    // checkpoint's own value (3.0), which is what every caller predating this field gets.
+    float minimax_h3_sigma_shift_audio;
+    // ── MiniMax-H3 `ref2va` reference transport ────────────────────────────────────────────
+    //
+    // Same idiom as the LTXAV character_ref_* family above -- ordered per-reference metadata as
+    // parallel flat arrays with an explicit per-reference count -- but H3 needs more from it,
+    // because its references are HETEROGENEOUS and their ORDER IS SEMANTIC:
+    //
+    //   * a reference is an image, a video, a video with a soundtrack, or bare audio, and the
+    //     four are not interchangeable: they contribute different row kinds to the packed
+    //     sequence and different labels to the Qwen3-VL presentation.
+    //   * position in this list assigns the `<Picture i>` / `<Video k>` / `<Audio j>` ordinals
+    //     the prompt refers to AND advances the shared rotary clock, so the same references in
+    //     a different order are a DIFFERENT REQUEST. The engine preserves array order exactly
+    //     and never sorts or groups by kind.
+    //
+    // `minimax_h3_ref_kinds` is one entry per reference and is REQUIRED whenever
+    // `minimax_h3_refs_size` is non-zero -- there is no defaulting, because guessing a kind is
+    // guessing whether a clip has sound.
+    const int* minimax_h3_ref_kinds;  // 0 = image, 1 = video, 2 = audio
+    // Frames, as a concatenation in reference order: reference i owns the
+    // `minimax_h3_ref_frame_counts[i]` entries starting at sum(counts[0..i-1]) -- exactly the
+    // counts/concatenation split character_ref_segments uses. An IMAGE reference owns exactly
+    // one frame; a VIDEO reference owns its WHOLE trimmed clip (17n+5 frames at 24 fps, which
+    // is what the video VAE encodes); an AUDIO reference owns ZERO.
+    //
+    // A count of ZERO is a real value here -- "this reference has no pixels" -- and is never a
+    // synonym for "all", the same distinction character_ref_segment_counts documents. The counts
+    // pointer itself may not be null when there are references at all.
+    const sd_image_t* minimax_h3_ref_frames;
+    const int* minimax_h3_ref_frame_counts;
+    // Which of a VIDEO reference's own frames the CONDITIONER is shown -- every 12th, i.e. 2 fps,
+    // deduplicated. Indices are into that reference's own frame run, not into the flat array.
+    // Same counts/concatenation split. The VAE still encodes every frame; these only select what
+    // Qwen3-VL sees, and they must agree row-for-row with the block timestamps below.
+    const int* minimax_h3_ref_conditioner_frames;
+    const int* minimax_h3_ref_conditioner_frame_counts;
+    // One timestamp in seconds per MERGED 2-frame vision block, i.e. the mean of the pair's two
+    // 2 fps timestamps, with the last repeated when the sampled count is odd. Supplied rather
+    // than derived because the conditioner GGML_ASSERTs that the two counts agree: a caller that
+    // computes them from the same sampling pass cannot slide every later label onto the wrong
+    // block, whereas one that lets the engine re-derive them can.
+    const float* minimax_h3_ref_block_timestamps;
+    const int* minimax_h3_ref_block_timestamp_counts;
+    // Per-reference trusted absolute WAV path, or NULL/empty for a reference that carries no
+    // sound. Set for an AUDIO reference, and for a VIDEO reference with a soundtrack -- in which
+    // case the reference is labelled "<Audio j>: " BEFORE its "<Video k>: ", mirroring the order
+    // its rows are packed in. A null ARRAY means no reference carries audio.
+    const char* const* minimax_h3_ref_audio_paths;
+    int minimax_h3_refs_size;
     bool circular_x;
     bool circular_y;
 } sd_vid_gen_params_t;
@@ -809,6 +869,12 @@ SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
 SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
+// True when the loaded checkpoint is MiniMax-H3. The version is derived from the TENSOR NAMES, so
+// this is only answerable after new_sd_ctx() has read the weights. A front end needs it because
+// H3's request shape is fixed by the model rather than chosen by the caller (24 fps, the 17n+5
+// frame grid, cfg 1.0 with no unconditional branch, video and audio from one pass), and applying
+// those to a non-H3 model would be wrong.
+SD_API bool sd_ctx_is_minimax_h3(const sd_ctx_t* sd_ctx);
 // Replace the registered diffusion-model weights while preserving the
 // architecture-compatible runner and the other model components. The caller
 // must serialize this with generation; the outgoing DiT residency is released
@@ -930,6 +996,56 @@ SD_API bool generate_video_ex(sd_ctx_t* sd_ctx,
                               // holds the shot AS RENDERED and .len records what the timeline kept).
                               // Null when the caller does not care.
                               int* reference_head_trim_out);
+
+// ── MiniMax-H3 staged text encoding ────────────────────────────────────────────────────────────
+//
+// H3's text encoder (~14.5 GB resident at NVFP4) and its DiT (~11 GB) cannot be co-resident on a
+// 16 GB card, so a job that renders N shots pays N text-encoder/DiT swaps unless the prompts are
+// encoded up front. These three calls give the caller LTX's "one residency per stage for the whole
+// job" without an H3-specific chain entry point: the per-shot render stays generate_video().
+//
+//   for each shot:  sd_ctx_minimax_h3_stage_conditioning(ctx, &shot_params, i)
+//   sd_ctx_minimax_h3_reclaim_text_encoder(ctx)
+//   for each shot:  sd_ctx_minimax_h3_use_staged_conditioning(ctx, i); generate_video(...)
+//   sd_ctx_minimax_h3_clear_staged_conditioning(ctx)
+//
+// Staging runs the CONDITIONER only -- it builds the Qwen3-VL presentation, including the
+// references in scope for that shot, and runs no VAE. Entries are keyed by SEGMENT INDEX, never by
+// prompt: two shots may share a prompt and still be conditioned on different references.
+//
+// A missing entry is not an error at render time: the lookup misses and the shot encodes in place,
+// costing a swap. That is the only failure mode, and it is the safe direction.
+//
+// `sd_ctx_minimax_h3_use_staged_conditioning(ctx, -1)` disables the lookup. The cache is process
+// state on the context, so a caller MUST clear it at the end of its job or the next job's shot i
+// would be conditioned on this job's shot i.
+SD_API bool sd_ctx_minimax_h3_stage_conditioning(sd_ctx_t* sd_ctx,
+                                                 const sd_vid_gen_params_t* sd_vid_gen_params,
+                                                 int segment_index);
+SD_API void sd_ctx_minimax_h3_use_staged_conditioning(sd_ctx_t* sd_ctx, int segment_index);
+SD_API void sd_ctx_minimax_h3_clear_staged_conditioning(sd_ctx_t* sd_ctx);
+// Evict the text encoder: hand its staged params back to their params-backend home, drop its cache
+// context/buffer, and trim the text-encoder backend's CUDA pool. Safe to call at any time -- the
+// next encode re-stages from the params backend -- but only worth it when the card is about to be
+// handed to the DiT for a whole job rather than for one shot.
+SD_API void sd_ctx_minimax_h3_reclaim_text_encoder(sd_ctx_t* sd_ctx);
+
+// Diagnostic: encode a known-good 32 kHz waveform with the MiniMax-H3 audio VAE and decode it
+// straight back, with the DiT and the packed sequence out of the loop. Loads ONLY the audio VAE
+// (~600 MB), so it needs no sd_ctx and runs on CPU while the GPU is busy.
+//
+// Writes, next to `output_prefix`:
+//   <prefix>.input.wav      the exact planar buffer that was encoded (32-bit float WAV)
+//   <prefix>.latent.npy     the encoded latent, numpy shape (S, C, T)
+//   <prefix>.roundtrip.wav  the decoded result -- LISTEN TO THIS
+// and logs per-latent-channel mean/std plus a best-lag correlation against the input.
+//
+// `input_wav_path` must be a WAV (demux an mp4 with ffmpeg first). Mono is duplicated to stereo
+// and any sample rate is resampled to the VAE's 32 kHz. n_threads <= 0 means "hardware default".
+SD_API bool sd_minimax_h3_audio_roundtrip(const char* audio_vae_path,
+                                          const char* input_wav_path,
+                                          const char* output_prefix,
+                                          int n_threads);
 
 SD_API bool generate_video_chain(sd_ctx_t*                    sd_ctx,
                                  const sd_vid_gen_params_t*   base_params,

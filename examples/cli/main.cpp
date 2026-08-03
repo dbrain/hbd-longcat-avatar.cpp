@@ -21,6 +21,19 @@
 #include "common/resource_owners.hpp"
 #include "image_metadata.h"
 
+// MiniMax-H3 request shape. ⚠️ THIS IS THE ONLY H3-SPECIFIC HEADER THE CLI MAY INCLUDE, and it is
+// included precisely so that no constant or rule is retyped here: the frame grid, the canvas
+// multiple, the fps and the sigma shifts all come from the same two headers `/h3/v1/generate` and
+// `/h3/v1/capabilities` answer from, and `minimax_h3_wire.h` in turn forwards its arithmetic to
+// `src/model/diffusion/minimax_h3_layout.hpp`, which the DiT itself builds the packed sequence
+// from. The header is deliberately CUDA-free and model-free (see its own banner), so linking it
+// into the CLI costs nothing but json.hpp.
+//
+// The PACKING is not here and must never be: the packed [text | audio | video] sequence is staged
+// by stage_minimax_h3_request() inside generate_video(), for every caller. A second implementation
+// of that layout would be strictly worse than none.
+#include "server/minimax_h3_wire.h"
+
 namespace fs = std::filesystem;
 
 const char* previews_str[] = {
@@ -294,6 +307,30 @@ void print_usage(int argc, const char* argv[], const std::vector<ArgOptions>& op
     options_list[2].print();
 }
 
+// Which of the flags a model-specific default would otherwise overwrite the caller actually typed.
+// parse_options() writes through opaque target pointers, so it cannot report this itself, and
+// comparing the value against the documented default does not work: "--cfg-scale 7" and "nobody
+// said" are the same float.
+struct SuppliedFlags {
+    bool fps       = false;
+    bool cfg_scale = false;
+    bool output    = false;
+};
+
+static SuppliedFlags scan_supplied_flags(int argc, const char** argv) {
+    SuppliedFlags supplied;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fps") == 0) {
+            supplied.fps = true;
+        } else if (std::strcmp(argv[i], "--cfg-scale") == 0) {
+            supplied.cfg_scale = true;
+        } else if (std::strcmp(argv[i], "-o") == 0 || std::strcmp(argv[i], "--output") == 0) {
+            supplied.output = true;
+        }
+    }
+    return supplied;
+}
+
 void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextParams& ctx_params, SDGenerationParams& gen_params) {
     std::vector<ArgOptions> options_vec = {cli_params.get_options(), ctx_params.get_options(), gen_params.get_options()};
 
@@ -302,15 +339,9 @@ void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextP
         exit(cli_params.normal_exit ? 0 : 1);
     }
 
-    // parse_options() writes through opaque target pointers, so it cannot tell us which
-    // flags were actually supplied. Record --fps explicitly: resolve_and_validate() promotes
-    // an unset fps to the avatar's native rate, and must not override a deliberate --fps.
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--fps") == 0) {
-            gen_params.fps_explicit = true;
-            break;
-        }
-    }
+    // Record --fps explicitly: resolve_and_validate() promotes an unset fps to the avatar's
+    // native rate, and must not override a deliberate --fps.
+    gen_params.fps_explicit = scan_supplied_flags(argc, argv).fps;
 
     bool valid = cli_params.resolve_and_validate();
     if (valid && cli_params.mode != METADATA) {
@@ -635,10 +666,192 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
     return true;
 }
 
+// ── MiniMax-H3 ────────────────────────────────────────────────────────────────────────────────
+//
+// H3 renders video AND synchronised stereo audio in ONE denoising pass over one packed
+// [text | audio | video] sequence. The CLI contributes NO packing code: the sequence is staged by
+// stage_minimax_h3_request() inside generate_video(), which is also the only thing the server's
+// job runner calls. This function's whole job is to make sure the request that reaches
+// generate_video() is one H3 can legally stage, and to say so in English when it is not.
+//
+// Everything below mirrors a rule `POST /h3/v1/generate` already enforces over HTTP
+// (examples/server/routes_h3.cpp), and takes its numbers from minimax_h3_wire.h rather than
+// restating them. The differences from the route are deliberate and are documented in the
+// "NOT SUPPORTED" block at the end.
+//
+// ⚠️ CALLED AFTER new_sd_ctx(). The model version is derived from the tensor names, so nothing
+// here is knowable until the weights are read. That costs a model load before a bad request is
+// rejected -- but it rejects before any sampling, and the alternative (guessing H3 from the file
+// name) is the sort of thing that works until someone renames a GGUF.
+static bool apply_minimax_h3_cli_policy(SDCliParams& cli_params,
+                                        const SDContextParams& ctx_params,
+                                        SDGenerationParams& gen_params,
+                                        const SuppliedFlags& supplied) {
+    // ── mode ──────────────────────────────────────────────────────────────────────────────────
+    // The abort this whole function exists to prevent. `-M img_gen` is sd-cli's DEFAULT, and
+    // generate_image() does not stage the packed sequence, so H3 used to walk to the DiT and die
+    // on GGML_ASSERT(minimax_h3_request_staged) -- exit 134, before a single CUDA kernel, which is
+    // why two nsys captures came back empty.
+    if (cli_params.mode != VID_GEN) {
+        LOG_ERROR("MiniMax-H3 is a joint video+audio model and only renders through vid_gen; "
+                  "re-run with -M vid_gen (img_gen is sd-cli's default and cannot stage the "
+                  "packed [text | audio | video] sequence)");
+        return false;
+    }
+
+    // ── the audio half of the model ───────────────────────────────────────────────────────────
+    // Without the audio VAE the audio latent is still generated and packed -- it simply never
+    // gets decoded, and the render finishes with a silent clip and no complaint. That is a wrong
+    // answer delivered as a right one, so refuse it. Half of what H3 does is the audio.
+    if (ctx_params.audio_vae_path.empty()) {
+        LOG_ERROR("MiniMax-H3 generates video and audio in one pass; --audio-vae is required "
+                  "(without it the audio latent is sampled and then silently discarded)");
+        return false;
+    }
+
+    // ── guidance ──────────────────────────────────────────────────────────────────────────────
+    // The checkpoint is guidance-distilled: one forward per step, no unconditional branch. sd-cli
+    // defaults --cfg-scale to 7.0, and any value != img_cfg makes the engine run an uncond pass --
+    // doubling the cost to combine two conditional outputs. Refuse an explicit value the way the
+    // route does; silently correct the default, which nobody chose.
+    if (supplied.cfg_scale) {
+        if (gen_params.sample_params.guidance.txt_cfg != 1.0f) {
+            LOG_ERROR("MiniMax-H3 is guidance-distilled and has no unconditional branch; "
+                      "--cfg-scale must be 1.0 (got %.2f)",
+                      gen_params.sample_params.guidance.txt_cfg);
+            return false;
+        }
+    } else if (gen_params.sample_params.guidance.txt_cfg != 1.0f) {
+        LOG_INFO("MiniMax-H3: setting --cfg-scale to 1.0 (guidance-distilled, one forward per step)");
+        gen_params.sample_params.guidance.txt_cfg = 1.0f;
+    }
+    if (!gen_params.negative_prompt.empty()) {
+        LOG_ERROR("MiniMax-H3 has no unconditional branch; a negative prompt cannot be honoured");
+        return false;
+    }
+    if (gen_params.batch_count != 1) {
+        LOG_ERROR("MiniMax-H3 packs one request into one sequence; --batch-count must be 1 (got %d)",
+                  gen_params.batch_count);
+        return false;
+    }
+
+    // ── fps ───────────────────────────────────────────────────────────────────────────────────
+    // Not a speed dial: the 17n+5 frame grid, the 4x temporal video VAE and the 40 Hz audio latent
+    // rate are ALL defined at 24. sd-cli's generic default is 16, which stage_minimax_h3_request()
+    // rejects outright -- correct, but only after the whole context is up. Adopt 24 when nobody
+    // asked, and explain the refusal when someone did.
+    if (!supplied.fps) {
+        if (gen_params.fps != kMiniMaxH3Fps) {
+            LOG_INFO("MiniMax-H3: setting --fps to %d (the frame grid and the audio latent rate are "
+                     "both defined there)",
+                     kMiniMaxH3Fps);
+            gen_params.fps = kMiniMaxH3Fps;
+        }
+    } else if (gen_params.fps != kMiniMaxH3Fps) {
+        LOG_ERROR("MiniMax-H3 is a fixed-%d fps model: the 17n+5 frame grid, the 4x temporal VAE and "
+                  "the %d Hz audio latent rate are all defined there, so --fps %d would produce audio "
+                  "of the wrong length for its video",
+                  kMiniMaxH3Fps, kMiniMaxH3AudioLatentFps, gen_params.fps);
+        return false;
+    }
+
+    // ── frame grid ────────────────────────────────────────────────────────────────────────────
+    // Named rather than snapped. The route snaps because a UI slider cannot be expected to know
+    // the grid; an argv the operator typed is a stated intention, and quietly rendering 39 frames
+    // when 40 were asked for is how a frame-count A/B becomes unreproducible.
+    if (!h3_frame_count_is_aligned(gen_params.video_frames)) {
+        LOG_ERROR("MiniMax-H3 needs a frame count on the 17n+5 grid at %d fps; --video-frames %d is "
+                  "off-grid (nearest legal value at or above it is %d)",
+                  kMiniMaxH3Fps,
+                  gen_params.video_frames,
+                  h3_align_frame_count(gen_params.video_frames));
+        return false;
+    }
+
+    // ── canvas ────────────────────────────────────────────────────────────────────────────────
+    // 16x spatial VAE then a 2x2 patchify == a 32 px multiple. The area bound is a sanity bound,
+    // not a model constraint (see kMiniMaxH3MaxPixels): VRAM is the real limit.
+    const int width  = gen_params.get_resolved_width();
+    const int height = gen_params.get_resolved_height();
+    if (!h3_canvas_is_legal(width, height)) {
+        int adapted_width  = 0;
+        int adapted_height = 0;
+        h3_adapt_canvas(width, height, adapted_width, adapted_height);
+        LOG_ERROR("MiniMax-H3 canvas %dx%d is not renderable: each axis must be a multiple of %d "
+                  "(16x VAE then a 2x2 patchify) and the area must be at most %d px. The reference's "
+                  "own adaptation of this aspect is %dx%d",
+                  width, height, kMiniMaxH3CanvasMultiple, kMiniMaxH3MaxPixels,
+                  adapted_width, adapted_height);
+        return false;
+    }
+
+    // ── output ────────────────────────────────────────────────────────────────────────────────
+    // sd-cli's default output is `output.png`, which for a video model means a PNG per frame and
+    // the audio dropped on the floor. H3's deliverable is one file with both streams, so default
+    // to the container save_results() already muxes VP9 + Opus into. An explicit -o is untouched:
+    // a `%d` pattern still writes a frame sequence, and the generated audio still lands next to it
+    // as a .wav sidecar (save_results()/get_video_audio_sidecar_path()).
+    if (!supplied.output) {
+        cli_params.output_path = "output.webm";
+        LOG_INFO("MiniMax-H3: defaulting -o to '%s' (VP9 video + Opus audio in one file); pass a "
+                 "'%%d' pattern for a PNG frame sequence plus a .wav sidecar instead",
+                 cli_params.output_path.c_str());
+    }
+
+    // ── what the CLI does NOT do ──────────────────────────────────────────────────────────────
+    // Stated once, loudly, so nobody spends an afternoon looking for the flag.
+    //
+    //   * ref2va references (identity images, reference videos, reference audio). The engine
+    //     supports them -- sd_vid_gen_params_t::minimax_h3_ref_* -- but they arrive as a
+    //     kind-tagged, ORDER-SEMANTIC list with per-reference conditioner frame subsets and block
+    //     timestamps, built in examples/server/async_jobs.cpp. Expressing that on argv is a real
+    //     design job, not a flag, and getting the ORDER wrong renders a different request without
+    //     erroring. Use POST /h3/v1/generate.
+    //   * multi-shot: one sd-cli invocation is one shot. The server chains shots to share one
+    //     text-encoder residency (sd_ctx_minimax_h3_stage_conditioning); a CLI chain would be a
+    //     second implementation of that ordering for no profiling benefit -- one process, one
+    //     capture is exactly what makes the CLI worth having.
+    //   * per-shot seeds/steps, segment previews, the durable bank, resume: server-side job
+    //     machinery with no CLI counterpart.
+    //
+    // SUPPORTED here: t2va, and fl2va via --init-img (pixel frame 0) and --end-img (frame N-1),
+    // which prepare_video_generation_latents() turns into the two legal keyframe anchors.
+    LOG_INFO("MiniMax-H3: %s, %d frames @%d fps (%.2fs), %dx%d, audio shift %s",
+             gen_params.init_image_path.empty() && gen_params.end_image_path.empty() ? "t2va" : "fl2va",
+             gen_params.video_frames,
+             kMiniMaxH3Fps,
+             static_cast<double>(gen_params.video_frames) / kMiniMaxH3Fps,
+             width,
+             height,
+             gen_params.minimax_h3_sigma_shift_audio > 0.f ? "overridden" : "checkpoint default");
+    if (!gen_params.ref_image_paths.empty()) {
+        LOG_WARN("MiniMax-H3: --ref-image is a ref2va control and sd-cli does not wire it; the %zu "
+                 "reference(s) will be IGNORED. Use POST /h3/v1/generate for ref2va",
+                 gen_params.ref_image_paths.size());
+    }
+    return true;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
         return EXIT_SUCCESS;
+    }
+
+    // MiniMax-H3 audio VAE round trip. Deliberately handled BEFORE parse_args: it loads only the
+    // audio VAE and touches no context/generation parameter, so putting it through the normal
+    // mode/validation machinery would only give it ways to fail.
+    //   sd-cli --h3-audio-roundtrip <audio-vae.gguf> <input.wav> [output-prefix]
+    if (argc > 1 && std::string(argv[1]) == "--h3-audio-roundtrip") {
+        if (argc < 4) {
+            std::cerr << "usage: sd-cli --h3-audio-roundtrip <audio-vae.gguf> <input.wav> [output-prefix]\n";
+            return EXIT_FAILURE;
+        }
+        static SDCliParams roundtrip_params;
+        roundtrip_params.verbose = true;
+        sd_set_log_callback(sd_log_cb, (void*)&roundtrip_params);
+        const char* out_prefix = argc > 4 ? argv[4] : argv[3];
+        return sd_minimax_h3_audio_roundtrip(argv[2], argv[3], out_prefix, 0) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     SDCliParams cli_params;
@@ -876,6 +1089,21 @@ int main(int argc, const char* argv[]) {
         if (sd_ctx == nullptr) {
             LOG_INFO("new_sd_ctx_t failed");
             return 1;
+        }
+
+        // MiniMax-H3's request shape is fixed by the model, and the model is only identifiable
+        // once its weights are read. Applied here, before any sampler or scheduler default is
+        // resolved, so the H3 fps and cfg are the ones everything downstream sees.
+        if (sd_ctx_is_minimax_h3(sd_ctx.get())) {
+            if (!apply_minimax_h3_cli_policy(cli_params, ctx_params, gen_params, scan_supplied_flags(argc, argv))) {
+                return 1;
+            }
+            // The preview writer captured the pre-H3 fps above; keep the muxed preview in step
+            // with the render rather than at the generic default.
+            cli_params.preview_fps = gen_params.fps;
+            if (cli_params.preview_method == PREVIEW_PROJ) {
+                cli_params.preview_fps /= 4;
+            }
         }
 
         if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {

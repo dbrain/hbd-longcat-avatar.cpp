@@ -16,6 +16,7 @@
 
 #include "core/util.h"
 #include "model_io/gguf_io.h"
+#include "model_io/nvfp4_import.h"
 #include "model_io/safetensors_io.h"
 #include "model_io/torch_legacy_io.h"
 #include "model_io/torch_zip_io.h"
@@ -315,12 +316,29 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
 bool ModelLoader::init_from_safetensors_file(const std::string& file_path, const std::string& prefix) {
     LOG_DEBUG("init from '%s', prefix = '%s'", file_path.c_str(), prefix.c_str());
 
+    // >>> ComfyUI `comfy_quant` probe (src/model_io/nvfp4_import.h) — must run BEFORE
+    // read_safetensors_file: an int8_tensorwise checkpoint stores I8 weights, which that
+    // reader rejects with a bare "unsupported dtype 'I8'" that explains nothing.
+    std::string comfy_detail;
+    const ComfyQuantScan comfy = comfy_quant_scan_safetensors(file_path, &comfy_detail);
+    if (comfy == ComfyQuantScan::Unsupported || comfy == ComfyQuantScan::Malformed) {
+        LOG_ERROR("%s", comfy_detail.c_str());
+        return false;
+    }
+    // <<<
+
     std::vector<TensorStorage> tensor_storages;
     std::string error;
     if (!read_safetensors_file(file_path, tensor_storages, &error, &metadata_)) {
         LOG_ERROR("%s", error.c_str());
         return false;
     }
+
+    // >>> external NVFP4 checkpoint import (src/model_io/nvfp4_import.h) — no-op otherwise
+    if (!nvfp4_import_rewrite_safetensors(file_path, tensor_storages, comfy)) {
+        return false;
+    }
+    // <<<
 
     size_t file_index = add_file_path(file_path);
 
@@ -539,6 +557,13 @@ SDVersion ModelLoader::get_sd_version() {
         }
         if (tensor_storage.name.find("model.diffusion_model.adaln_single.emb.timestep_embedder.linear_1.bias") != std::string::npos) {
             return VERSION_LTXAV;
+        }
+        // MiniMax-H3 packs video and audio into one sequence and has one input projection per
+        // modality. comfy's model_detection.py keys on exactly this pair; neither name alone is
+        // distinctive enough (an audio-only or video-only DiT would match half of it).
+        if (tensor_storage.name.find("model.diffusion_model.video_patch_proj.weight") != std::string::npos &&
+            tensor_storage_map.find("model.diffusion_model.audio_patch_proj.weight") != tensor_storage_map.end()) {
+            return VERSION_MINIMAX_H3;
         }
         if (tensor_storage.name.find("model.diffusion_model.blocks.0.cross_attn.norm_k.weight") != std::string::npos) {
             is_wan = true;
@@ -933,6 +958,12 @@ std::vector<MmapTensorStore> ModelLoader::mmap_tensors(std::map<std::string, ggm
                 tensor_storage.is_f8_e5m2 ||
                 tensor_storage.is_f64 ||
                 tensor_storage.is_i64 ||
+                // >>> external NVFP4 import: the on-disk bytes are a DIFFERENT layout that
+                // happens to have the same length as block_nvfp4, so the size check below
+                // would pass and map raw nibbles in as blocks. Must be assembled instead.
+                tensor_storage.is_nvfp4_import ||
+                tensor_storage.is_inline_f32 ||
+                // <<<
                 tensor_storage.type != dst_tensor->type) {
                 continue;
             }
@@ -1152,19 +1183,24 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
                     size_t nbytes_to_read = tensor_storage.nbytes_to_read();
 
-                    auto read_data = [&](char* buf, size_t n) -> bool {
+                    // `off` defaults to the tensor's own offset; the NVFP4 import path below
+                    // needs a second read at the offset of its separate scale tensor.
+                    auto read_data = [&](char* buf, size_t n, uint64_t off = UINT64_MAX) -> bool {
+                        if (off == UINT64_MAX) {
+                            off = tensor_storage.offset;
+                        }
                         if (zip != nullptr) {
                             if (zip_entry_openbyindex(zip, tensor_storage.index_in_zip) != 0) {
                                 LOG_ERROR("failed to open zip entry for tensor '%s'", tensor_storage.name.c_str());
                                 return false;
                             }
                             size_t entry_size = zip_entry_size(zip);
-                            if (tensor_storage.offset > entry_size) {
+                            if (off > entry_size) {
                                 LOG_ERROR("tensor '%s' exceeds its zip storage entry", tensor_storage.name.c_str());
                                 zip_entry_close(zip);
                                 return false;
                             }
-                            size_t tensor_offset = static_cast<size_t>(tensor_storage.offset);
+                            size_t tensor_offset = static_cast<size_t>(off);
                             if (n > entry_size - tensor_offset) {
                                 LOG_ERROR("tensor '%s' exceeds its zip storage entry", tensor_storage.name.c_str());
                                 zip_entry_close(zip);
@@ -1193,12 +1229,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                             }
                             zip_entry_close(zip);
                         } else if (mmapped) {
-                            if (!mmapped->copy_data(buf, n, tensor_storage.offset)) {
+                            if (!mmapped->copy_data(buf, n, off)) {
                                 LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
                                 return false;
                             }
                         } else {
-                            file.seekg(tensor_storage.offset);
+                            file.seekg((std::streamoff)off);
                             file.read(buf, n);
                             if (!file) {
                                 LOG_ERROR("read tensor data failed: '%s'", file_path.c_str());
@@ -1207,6 +1243,32 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         }
                         return true;
                     };
+
+                    // >>> external NVFP4 checkpoint import (src/model_io/nvfp4_import.h).
+                    // These tensors are assembled from two disjoint file ranges (or from no
+                    // file at all, for a `.wglobal` sidecar), so they bypass the single
+                    // contiguous read + convert_tensor path entirely.
+                    if (tensor_storage.is_nvfp4_import || tensor_storage.is_inline_f32) {
+                        t0 = ggml_time_ms();
+                        if (!nvfp4_import_materialize(tensor_storage,
+                                                      ggml_nbytes(dst_tensor),
+                                                      read_data,
+                                                      read_buffer,
+                                                      convert_buffer)) {
+                            failed = true;
+                            break;
+                        }
+                        if (dst_tensor->buffer != nullptr && !ggml_backend_buffer_is_host(dst_tensor->buffer)) {
+                            std::lock_guard<std::mutex> lock(backend_tensor_set_mutex);
+                            ggml_backend_tensor_set(dst_tensor, convert_buffer.data(), 0, ggml_nbytes(dst_tensor));
+                        } else {
+                            memcpy(dst_tensor->data, convert_buffer.data(), ggml_nbytes(dst_tensor));
+                        }
+                        read_time_ms.fetch_add(ggml_time_ms() - t0);
+                        bytes_processed.fetch_add((uint64_t)nbytes_to_read);
+                        continue;
+                    }
+                    // <<<
 
                     char* read_buf    = nullptr;
                     char* target_buf  = nullptr;

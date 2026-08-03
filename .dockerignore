@@ -5,3 +5,24 @@ test/
 .cache/
 *.swp
 models/
+
+# 94 MB of upstream demo clips. The compiler never reads them, but they were being
+# shipped to the daemon on every build. src/tokenizers is 233 MB of vocab data that
+# the build DOES need -- do not add it here.
+assets/
+
+# Build/run artefacts of the H3 port. `--output type=local,dest=./out` (the build line
+# documented in docker/minimax-h3-dev/Dockerfile) writes ~460 MB into ./out.
+out/
+*.safetensors
+*.gguf
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.pid
+*.log
+*.webm
+*.mp4
+*.wav
+*.diag.json
+.git/

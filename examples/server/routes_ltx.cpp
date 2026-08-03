@@ -10,10 +10,31 @@
 #include <vector>
 
 #include "async_jobs.h"
+#include "minimax_h3_wire.h"
 
 namespace {
 
 namespace fs = std::filesystem;
+
+// MiniMax-H3 publishes its per-shot partials under the SAME `seg_<n>.webm` name and the SAME
+// `/sdcpp/v1/jobs/{id}/segments/{n}` URL as LTX, so koblem's progressive-delivery machinery needs
+// no fork. httplib dispatches to the FIRST handler whose pattern matches and this file is
+// registered before routes_h3.cpp, so the H3 lookup has to live here -- a second registration of
+// the same pattern would simply never run.
+bool resolve_h3_segment_bank(const std::string& job_id, fs::path& bank_dir) {
+    if (!h3_valid_bank_id(job_id)) {
+        return false;
+    }
+    for (const fs::path& root : h3_bank_roots()) {
+        std::error_code error;
+        const fs::path candidate = root / job_id;
+        if (fs::is_directory(candidate, error)) {
+            bank_dir = candidate;
+            return true;
+        }
+    }
+    return false;
+}
 
 fs::path ltx_bank_root() {
     if (const char* configured = getenv("LTX_JOB_DIR"); configured != nullptr && configured[0] != '\0') {
@@ -1707,9 +1728,9 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         const std::string segment = req.matches[2];
         fs::path bank_dir;
         std::string bank_id;
-        if (!resolve_ltx_bank_dir(job_id, bank_dir, bank_id)) {
+        if (!resolve_ltx_bank_dir(job_id, bank_dir, bank_id) && !resolve_h3_segment_bank(job_id, bank_dir)) {
             res.status = 404;
-            res.set_content(R"({"error":"unknown LTX job"})", "application/json");
+            res.set_content(R"({"error":"unknown job"})", "application/json");
             return;
         }
         fs::path artifact = bank_dir / ("seg_" + segment + ".webm");

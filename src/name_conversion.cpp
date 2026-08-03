@@ -200,6 +200,15 @@ std::string convert_qwen3_vl_vision_name(std::string name) {
         {"ffn_down.", "mlp.linear_fc2."},
         {"ln1.", "norm1."},
         {"ln2.", "norm2."},
+        // DeepStack mergers. llama.cpp mmproj GGUFs spell them `v.deepstack.<vision block>.`
+        // with fc1/fc2; HF checkpoints spell them `deepstack_merger_list.<list position>.`
+        // with linear_fc1/linear_fc2 and pass through untouched. Both spellings survive as
+        // block names -- LLMConfig::detect_from_weights resolves each to a vision block.
+        // The `.` in the fc keys is load-bearing: it stops them from re-firing on the
+        // `linear_fc1.` / `linear_fc2.` that the merger and MLP entries above produce.
+        {"v.deepstack.", "deepstack."},
+        {".fc1.", ".linear_fc1."},
+        {".fc2.", ".linear_fc2."},
     };
     replace_with_name_map(name, qwen3_vl_vision_name_map);
     return name;
@@ -1514,13 +1523,28 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
 
     replace_with_prefix_map(name, prefix_map);
 
-    if (sd_version_is_boogu_image(version) || sd_version_is_krea2(version) || sd_version_is_mage_flow(version)) {
+    if (sd_version_is_boogu_image(version) || sd_version_is_krea2(version) || sd_version_is_mage_flow(version) ||
+        sd_version_is_minimax_h3(version)) {
         const std::string hf_vision_prefix = "text_encoders.llm.model.visual.";
         if (starts_with(name, hf_vision_prefix)) {
             name = "text_encoders.llm.visual." + name.substr(hf_vision_prefix.size());
         }
         if (starts_with(name, "text_encoders.llm.visual.")) {
             name = convert_qwen3_vl_vision_name(std::move(name));
+        }
+        // A Qwen3-VL checkpoint saved by a current transformers nests the decoder under
+        // `model.language_model.` (`model.language_model.layers.0.self_attn.q_proj.weight`), while
+        // this tree's LLM runner -- and the llama.cpp-GGUF names `llm_name_map` rewrites to -- both
+        // expect the flat `model.layers.` spelling.  The `.gguf` route therefore worked and the
+        // safetensors route did not.  Strip the infix here rather than in whatever produced the
+        // file, so both spellings load.
+        //
+        // Scoped to the `text_encoders.llm.` prefix on purpose: HiDream-O1 has its own
+        // `model.language_model.` under the DIFFUSION model (see model_loader.cpp:500), where the
+        // infix is meaningful and must survive.
+        const std::string hf_lm_prefix = "text_encoders.llm.model.language_model.";
+        if (starts_with(name, hf_lm_prefix)) {
+            name = "text_encoders.llm.model." + name.substr(hf_lm_prefix.size());
         }
     }
 

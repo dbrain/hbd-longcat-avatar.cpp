@@ -21,3 +21,21 @@ CLAUDE.local.md
 # Python bytecode from the tools/ scripts
 __pycache__/
 *.pyc
+
+# H3 port artefacts. Each of these has a real near-miss behind it:
+# the Dockerfile's own documented build line is `--output type=local,dest=./out`,
+# which drops ~460 MB of binaries here; h3_export_comfy_dit.py writes an 11.5 GB
+# .safetensors; nsys/ncu captures are tens of MB apiece.
+out/
+*.safetensors
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.pid
+*.webm
+*.mp4
+*.wav
+*.diag.json
+# ...but assets/ holds upstream's tracked demo clips; without this the media patterns
+# above would silently skip a future `git add` of a legitimate asset.
+!assets/**
