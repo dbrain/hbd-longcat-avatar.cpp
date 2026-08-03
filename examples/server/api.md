@@ -1638,6 +1638,9 @@ trusted, so a request naming `ref2va` with no references in scope is a `400` ins
 | `ref2va` | at least one image or video `references` entry in scope for that shot; audio references may accompany it |
 
 `ref2va` and `fl2va` are different tasks; a shot carrying both forms is a `400`.
+They also use different DiT checkpoints. The server selects FL2VA for `t2va`/`fl2va` and the
+configured `ref2va` variant for referenced shots, including automatic swaps inside a mixed
+timeline; callers do not select those checkpoints with `model`.
 
 ```json
 {

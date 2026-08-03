@@ -2225,6 +2225,7 @@ struct LLMEmbedder : public Conditioner {
     // request, discoverable only by reading a warning. Store them together or not at all.
     struct VlmImageEmbed {
         sd::Tensor<float> embed;
+        LLM::VisionBlockGrid grid;
         std::vector<sd::Tensor<float>> deepstack;
     };
 
@@ -2234,14 +2235,15 @@ struct LLMEmbedder : public Conditioner {
     sd::Tensor<float> encode_image_cached(int n_threads,
                                           const sd::Tensor<float>& resized_image,
                                           const ConditionerParams& conditioner_params,
+                                          LLM::VisionBlockGrid* out_grid,
                                           std::vector<sd::Tensor<float>>* out_deepstack) {
         if (resized_image.empty()) {
-            return llm->encode_image(n_threads, resized_image, false, true, true, nullptr, out_deepstack);
+            return llm->encode_image(n_threads, resized_image, false, true, true, out_grid, out_deepstack);
         }
         // Cache disabled: recompute, and do not even hash.
         if (sd_cache::entries_from_env("SD_VLM_IMAGE_EMBED_CACHE_ENTRIES", 4, 64) == 0) {
             LOG_INFO("[CACHE] vlm-embed MISS (disabled)");
-            return llm->encode_image(n_threads, resized_image, false, true, true, nullptr, out_deepstack);
+            return llm->encode_image(n_threads, resized_image, false, true, true, out_grid, out_deepstack);
         }
         const std::string key = sd_cache::tensor_content_key(resized_image) +
                                 "-v" + std::to_string(static_cast<int>(version)) +
@@ -2252,6 +2254,9 @@ struct LLMEmbedder : public Conditioner {
             LOG_INFO("[CACHE] vlm-embed HIT (%lld tokens, %zu deepstack slab(s), no vision-tower pass)",
                      hit->embed.dim() >= 2 ? (long long)hit->embed.shape()[1] : 0LL,
                      hit->deepstack.size());
+            if (out_grid != nullptr) {
+                *out_grid = hit->grid;
+            }
             if (out_deepstack != nullptr) {
                 *out_deepstack = hit->deepstack;
             }
@@ -2264,7 +2269,10 @@ struct LLMEmbedder : public Conditioner {
         // later hit. encode_image() returns none when the checkpoint has no mergers, which is
         // exactly the pre-deepstack behaviour.
         VlmImageEmbed entry;
-        entry.embed = llm->encode_image(n_threads, resized_image, false, true, true, nullptr, &entry.deepstack);
+        entry.embed = llm->encode_image(n_threads, resized_image, false, true, true, &entry.grid, &entry.deepstack);
+        if (out_grid != nullptr) {
+            *out_grid = entry.grid;
+        }
         if (out_deepstack != nullptr) {
             *out_deepstack = entry.deepstack;
         }
@@ -2598,12 +2606,14 @@ struct LLMEmbedder : public Conditioner {
         int h_bar = 0;
         minimax_h3_vision_canvas(image, conditioner_params, w_bar, h_bar);
 
-        // Not routed through encode_image_cached(): that cache's key was audited
-        // for the krea2 path only. It would apply here unchanged -- an fl2va user
-        // re-renders the same keyframes on every seed -- but H3 cannot be
-        // measured yet, so this stays on the majority path.
-        auto image_embed =
-            llm->encode_image(n_threads, clip_preprocess(image, w_bar, h_bar), false, true, true, out_grid, out_deepstack);
+        // H3 Director commonly reuses one identity image across several shots. The
+        // cache stores the merged embedding, deepstack slabs AND the vision grid,
+        // so a hit is the exact same presentation without another vision-tower pass.
+        auto image_embed = encode_image_cached(n_threads,
+                                               clip_preprocess(image, w_bar, h_bar),
+                                               conditioner_params,
+                                               out_grid,
+                                               out_deepstack);
         GGML_ASSERT(!image_embed.empty());
         return image_embed;
     }
@@ -3142,7 +3152,7 @@ struct LLMEmbedder : public Conditioner {
                     // encode is identical code, but each would need its own audit of what
                     // else varies per request, and none of them is the measured 3.30 s.
                     vision_deepstack.emplace_back();
-                    auto image_embed = encode_image_cached(n_threads, resized_image, conditioner_params,
+                    auto image_embed = encode_image_cached(n_threads, resized_image, conditioner_params, nullptr,
                                                           &vision_deepstack.back());
                     GGML_ASSERT(!image_embed.empty());
 

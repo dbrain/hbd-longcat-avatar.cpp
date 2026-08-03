@@ -143,11 +143,12 @@ void h3_check_ltx_top_level(const json& body, H3Compat& compat) {
         }
     }
 
-    // ── one checkpoint, no adapters, no refine chain ─────────────────────────────────────────
+    // ── task-selected checkpoints, no caller override, no adapters or refine chain ───────────
     if (json_present(body, "model") && body["model"].is_string()) {
         const std::string model = body["model"].get<std::string>();
         if (!model.empty() && model != "base") {
-            compat.refuse("MiniMax-H3 ships one DiT; model variant '" + model + "' does not exist here");
+            compat.refuse("MiniMax-H3 selects FL2VA or Ref2VA from each shot's conditioning; "
+                          "caller-selected model variant '" + model + "' is not supported");
         } else if (!model.empty()) {
             compat.ignore("model");
         }
@@ -273,7 +274,8 @@ void h3_check_ltx_segment(const json& entry, size_t index, H3Compat& compat) {
     if (json_present(entry, "model") && entry["model"].is_string()) {
         const std::string model = entry["model"].get<std::string>();
         if (!model.empty() && model != "base") {
-            compat.refuse("MiniMax-H3 ships one DiT; segment model variant '" + model + "' does not exist here");
+            compat.refuse("MiniMax-H3 selects FL2VA or Ref2VA from each shot's conditioning; "
+                          "caller-selected segment model variant '" + model + "' is not supported");
         } else if (!model.empty()) {
             compat.ignore("segments[].model");
         }

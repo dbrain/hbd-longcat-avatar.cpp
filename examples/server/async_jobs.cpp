@@ -1368,10 +1368,48 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
             }
 
             // ── PHASE 3: render every shot against the resident DiT ──────────────────────────
+            //
+            // FL2VA serves t2va + fl2va; Ref2VA is a separate checkpoint. Select it from the
+            // conditioning-derived task rather than trusting a caller-controlled model name.
+            // The staged conditioner cache survives a DiT-only swap, so mixed timelines still
+            // pay one text-encoder residency.
+            const auto h3_variants = runtime_diffusion_model_variants(runtime);
+            std::string h3_active_variant =
+                runtime.gpu_sharing != nullptr ? runtime.gpu_sharing->loaded_variant : "base";
+            const auto swap_h3_variant = [&](const std::string& wanted) {
+                if (wanted == h3_active_variant) {
+                    return true;
+                }
+                const auto variant = h3_variants.find(wanted);
+                if (variant == h3_variants.end()) {
+                    error_message = wanted == "ref2va"
+                                        ? "MiniMax-H3 reference conditioning requires a configured "
+                                          "'ref2va' diffusion-model variant"
+                                        : "unknown MiniMax-H3 diffusion-model variant '" + wanted + "'";
+                    return false;
+                }
+                if (!sd_ctx_swap_diffusion_model(runtime.sd_ctx, variant->second.c_str())) {
+                    error_message = "could not load MiniMax-H3 diffusion-model variant '" + wanted + "'";
+                    return false;
+                }
+                h3_active_variant = wanted;
+                if (runtime.gpu_sharing != nullptr) {
+                    runtime.gpu_sharing->loaded_variant = wanted;
+                }
+                return true;
+            };
             for (size_t segment = 0; segment < segment_count && generated; ++segment) {
                 if (job.cancel_requested) {
                     error_message = "job cancelled by client";
                     generated     = false;
+                    break;
+                }
+                const std::string wanted_variant =
+                    segment < job.h3_segment_tasks.size() && job.h3_segment_tasks[segment] == "ref2va"
+                        ? "ref2va"
+                        : "base";
+                if (!swap_h3_variant(wanted_variant)) {
+                    generated = false;
                     break;
                 }
                 // -1 disables the lookup outright, so an un-staged run cannot half-hit.
@@ -1444,6 +1482,12 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
                         segment_results[frame].data = nullptr;  // ownership moved to `results`
                     }
                 }
+            }
+            // A request ending on Ref2VA must not leak that checkpoint into the next t2va/fl2va
+            // request. Restore even after a failed segment; if restoration itself fails, the
+            // worker is no longer trustworthy and the job must fail.
+            if (h3_active_variant != "base" && !swap_h3_variant("base")) {
+                generated = false;
             }
             // The cache is CONTEXT state, not job state: leaving it behind would condition the
             // next job's shot i on this job's shot i, and the render would look completely normal.
