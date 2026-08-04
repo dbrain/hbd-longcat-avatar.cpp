@@ -4442,11 +4442,12 @@ public:
 };
 
 // Can this Linear's `w @ x` be relied on to apply the registered NVFP4 weight global
-// (ModelOpt weight_scale_2) inside the GEMM itself?  Only the CUDA cuBLASLt FP4 path folds
-// the scalar into the matmul alpha; every other route (MMQ, dequant-cuBLAS, CPU, a
-// pre-Blackwell device, an unregistered tensor) silently multiplies by 1.0.  So this must
-// return false whenever anything is unproven -- a false negative merely keeps the (correct)
-// explicit multiply in the graph, whereas a false positive is wrong pixels with no error.
+// (ModelOpt weight_scale_2) without a graph-level scale node? Only the CUDA cuBLASLt FP4
+// path folds the scalar by registry/name at graph construction time. MMQ instead fuses an
+// explicit `mul_mat -> scalar mul` subgraph at CUDA execution time, so it deliberately
+// returns false here and keeps the scale node available for that optimizer. Other routes
+// execute the explicit multiply normally. A false positive here is wrong pixels with no
+// error, while a false negative merely leaves a correct scale node in the graph.
 //
 // The tensor-shaped preconditions below mirror the bail list at the top of
 // ggml_cuda_nvfp4_cublaslt_mul_mat(); the backend/env/registry ones are proven by
@@ -4562,10 +4563,10 @@ public:
         }
         // ModelOpt's `.wglobal` is a single scalar, but expressing it as a graph node
         // costs a full-size elementwise multiply over every Linear output (plus the
-        // separate bias add it forces).  The CUDA FP4 cuBLASLt GEMM can instead fold the
-        // scalar straight into the matmul alpha for free.  Elide the graph multiply ONLY
-        // when that fold is proven to happen for this exact matmul -- if it is not, the
-        // GEMM multiplies by 1.0 and the output would be silently wrong.
+        // separate bias add it forces). The CUDA FP4 cuBLASLt GEMM can fold the scalar
+        // straight into the matmul alpha. CUDA MMQ consumes the explicit node later and
+        // folds it into write-back. Elide the graph multiply here ONLY when the cuBLASLt
+        // fold is proven for this exact matmul; MMQ needs the node to recognize the fusion.
         // Whether the GEMM folds the scalar is a property of the BACKEND (a name-keyed
         // registry consulted inside ggml_cuda_mul_mat), not of who builds the graph.  A
         // weight adapter cannot un-register it, so this predicate must NOT be conditioned

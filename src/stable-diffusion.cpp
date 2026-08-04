@@ -1142,7 +1142,8 @@ public:
         } else {
             LOG_WARN("%s: %zu NVFP4 weight globals registered but the cuBLASLt GEMM fold is not "
                      "active for the diffusion backend (GGML_NVFP4_CUBLASLT / GGML_FP8_FFN off, "
-                     "non-CUDA, or pre-Blackwell); keeping the graph-level scale",
+                     "non-CUDA, or pre-Blackwell); keeping the graph-level scale "
+                     "(CUDA MMQ fuses eligible bias-free scales into write-back)",
                      context, by_ggml_name.size());
         }
     }

@@ -97,7 +97,7 @@ def e2m1_nearest(t):
     return (s << 3) | np.where(np.abs(LUTm[i] - m) < np.abs(LUTm[lo] - m), i, lo).astype(np.uint8)
 
 
-def quant_nvfp4_unfolded(W, flat=False):
+def quant_nvfp4_unfolded(W, flat=False, wglobal=None):
     """W [out,in] f64 -> (packed ggml block bytes, wglobal).
 
     UNFOLDED (ModelOpt) convention: per-tensor wglobal = amax/(6*448), per-16 e4m3 block scale
@@ -113,10 +113,16 @@ def quant_nvfp4_unfolded(W, flat=False):
     graph-level compensation in ggml_ext_linear cannot save you: it decides at GRAPH BUILD time
     whether to elide the explicit multiply, while MMQ-vs-cuBLASLt is a RUNTIME shape decision it
     cannot see. Krea2 routes 144 of its NVFP4 matmuls through MMQ per step -> saturated colour
-    patches. Emit UNFOLDED only when you have proven every NVFP4 matmul hits cuBLASLt."""
+    patches. Emit UNFOLDED only when the runtime applies wglobal in cuBLASLt or fuses the
+    explicit scale into MMQ write-back."""
     out, inn = W.shape
     amax = float(np.abs(W).max())
-    wg = 1.0 if flat else ((amax / (E2M1_MAX * E4M3_MAX)) if amax > 0 else 1.0)
+    if flat and wglobal is not None:
+        raise ValueError("flat NVFP4 cannot carry an explicit weight global")
+    wg = (float(wglobal) if wglobal is not None else
+          (1.0 if flat else ((amax / (E2M1_MAX * E4M3_MAX)) if amax > 0 else 1.0)))
+    if not np.isfinite(wg) or wg <= 0:
+        raise ValueError(f"invalid NVFP4 weight global {wg}")
     b16 = W.reshape(out, inn // 16, 16)
     sc = np.clip(np.abs(b16).max(axis=2) / (E2M1_MAX * wg), E4M3_MIN_SUB, E4M3_MAX)
     byte = e4m3_enc_pos(sc)                                     # [out, nb16]
