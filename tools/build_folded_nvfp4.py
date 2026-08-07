@@ -97,7 +97,7 @@ def e2m1_nearest(t):
     return (s << 3) | np.where(np.abs(LUTm[i] - m) < np.abs(LUTm[lo] - m), i, lo).astype(np.uint8)
 
 
-def quant_nvfp4_unfolded(W, flat=False, wglobal=None):
+def quant_nvfp4_unfolded(W, flat=False, wglobal=None, scale_search_radius=0):
     """W [out,in] f64 -> (packed ggml block bytes, wglobal).
 
     UNFOLDED (ModelOpt) convention: per-tensor wglobal = amax/(6*448), per-16 e4m3 block scale
@@ -114,8 +114,19 @@ def quant_nvfp4_unfolded(W, flat=False, wglobal=None):
     whether to elide the explicit multiply, while MMQ-vs-cuBLASLt is a RUNTIME shape decision it
     cannot see. Krea2 routes 144 of its NVFP4 matmuls through MMQ per step -> saturated colour
     patches. Emit UNFOLDED only when the runtime applies wglobal in cuBLASLt or fuses the
-    explicit scale into MMQ write-back."""
+    explicit scale into MMQ write-back.
+
+    If scale_search_radius > 0, refine each amax-derived E4M3 scale by evaluating that many
+    neighbouring E4M3 codes on either side and selecting the one with minimum reconstruction
+    MSE. This changes neither the GGUF layout nor runtime cost; it only adds converter work."""
     out, inn = W.shape
+    if inn % 64:
+        raise ValueError(f"NVFP4 input width {inn} is not divisible by 64")
+    if isinstance(scale_search_radius, bool) or int(scale_search_radius) != scale_search_radius:
+        raise ValueError("scale_search_radius must be an integer")
+    scale_search_radius = int(scale_search_radius)
+    if not 0 <= scale_search_radius <= 32:
+        raise ValueError("scale_search_radius must be between 0 and 32")
     amax = float(np.abs(W).max())
     if flat and wglobal is not None:
         raise ValueError("flat NVFP4 cannot carry an explicit weight global")
@@ -126,8 +137,42 @@ def quant_nvfp4_unfolded(W, flat=False, wglobal=None):
     b16 = W.reshape(out, inn // 16, 16)
     sc = np.clip(np.abs(b16).max(axis=2) / (E2M1_MAX * wg), E4M3_MIN_SUB, E4M3_MAX)
     byte = e4m3_enc_pos(sc)                                     # [out, nb16]
-    eff = np.repeat(e4m3_dec_byte(byte), 16, axis=1) * wg        # true-unit step
-    code = e2m1_nearest(np.where(eff > 0, W / eff, 0.0))         # [out, inn] nibbles
+    if scale_search_radius:
+        # Try the amax scale first, then alternating lower/higher neighbours. Keeping the
+        # baseline first means exact MSE ties retain the old encoding. Bound the temporary
+        # candidate plane so callers which hold a complete 14K-wide matrix do not multiply
+        # that already-large allocation by the candidate count.
+        offsets = [0]
+        for distance in range(1, scale_search_radius + 1):
+            offsets.extend((-distance, distance))
+        offsets = np.asarray(offsets, dtype=np.int16)
+        candidate_count = len(offsets)
+        rows_per_search = max(1, 4_000_000 // (
+            (inn // 16) * candidate_count * 16))
+        code = np.empty((out, inn), dtype=np.uint8)
+        for row0 in range(0, out, rows_per_search):
+            row1 = min(row0 + rows_per_search, out)
+            candidate_byte = np.clip(
+                byte[row0:row1, ..., None].astype(np.int16) + offsets,
+                1, 126).astype(np.uint8)
+            candidate_eff = e4m3_dec_byte(candidate_byte) * wg   # [rows, nb16, nc]
+            candidate_code = e2m1_nearest(
+                b16[row0:row1, ..., None, :] /
+                candidate_eff[..., None])                        # [rows, nb16, nc, 16]
+            candidate_value = np.where(
+                candidate_code & 8, -LUTm[candidate_code & 7], LUTm[candidate_code & 7])
+            error = np.square(
+                b16[row0:row1, ..., None, :] -
+                candidate_value * candidate_eff[..., None]).sum(axis=-1)
+            best = np.argmin(error, axis=-1)
+            byte[row0:row1] = np.take_along_axis(
+                candidate_byte, best[..., None], axis=-1)[..., 0]
+            code[row0:row1] = np.take_along_axis(
+                candidate_code, best[..., None, None], axis=-2)[..., 0, :].reshape(
+                    row1 - row0, inn)
+    else:
+        eff = np.repeat(e4m3_dec_byte(byte), 16, axis=1) * wg    # true-unit step
+        code = e2m1_nearest(np.where(eff > 0, W / eff, 0.0))     # [out, inn] nibbles
     nblk = inn // 64
     oc = code.reshape(out, nblk, 64)
     qs = np.empty((out, nblk, 32), dtype=np.uint8)
@@ -213,6 +258,9 @@ def main():
     ap.add_argument("--unfolded", dest="flat", action="store_false",
                     help="force UNFOLDED nvfp4 (+ .wglobal siblings) — only if every NVFP4 "
                          "matmul is proven to hit the cuBLASLt FP4 GEMM")
+    ap.add_argument("--scale-search-radius", type=int, default=0, choices=range(33),
+                    metavar="N", help="MSE-refine each E4M3 group scale over +/- N codes "
+                                     "(default: 0, legacy amax quantizer)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if len(a.lora) != len(a.mult):
@@ -341,7 +389,8 @@ def main():
             folded += 1
         if t == GT_NVFP4:
             assert d[0] == x.shape[1] and d[1] == x.shape[0], f"{n}: dims {d} vs {x.shape}"
-            data, wg = quant_nvfp4_unfolded(x, flat=flat)
+            data, wg = quant_nvfp4_unfolded(
+                x, flat=flat, scale_search_radius=a.scale_search_radius)
             wglobals[n] = wg
         elif t == GT_BF16:
             data = f32_to_bf16(x).tobytes()

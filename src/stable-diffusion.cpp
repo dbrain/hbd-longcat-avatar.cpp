@@ -3708,6 +3708,37 @@ public:
         const bool sa3_step_policy = (sd_version_is_ltxav(version) || sd_version_is_krea2(version) ||
                                       sd_version_is_minimax_h3(version)) &&
                                      (sa3_policy == "first" || sa3_policy == "last" || sa3_policy == "middle");
+        auto sa3_precise_count = [&](const char* name, int fallback) {
+            const char* value = std::getenv(name);
+            if (value == nullptr) {
+                return fallback;
+            }
+            char* end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed < 0) {
+                LOG_WARN("%s=%s is invalid; using %d", name, value, fallback);
+                return fallback;
+            }
+            return std::min<int>(parsed, static_cast<int>(steps));
+        };
+        const int default_precise_first = sa3_policy == "first" || sa3_policy == "middle" ? 1 : 0;
+        const int default_precise_last  = sa3_policy == "last" || sa3_policy == "middle" ? 1 : 0;
+        const int precise_first = sa3_precise_count("GGML_LTX_SA3_PRECISE_FIRST", default_precise_first);
+        const int precise_last  = sa3_precise_count("GGML_LTX_SA3_PRECISE_LAST", default_precise_last);
+
+        // Sol-Attn is a separate approximate attention backend, not an SA3 post-pass.
+        // Its policy is intentionally H3-only and temporarily owns BOTH backend gates:
+        // boundary steps are dense cuDNN, interior steps are Sol, and SA3 is disabled
+        // throughout.  This avoids an accidental static GGML_LTX_SA3=1 turning a
+        // requested dense boundary into SA3, or applying two approximations to one call.
+        const char * sol_policy_env = std::getenv("GGML_H3_SOL_ATTN_POLICY");
+        const std::string sol_policy = sol_policy_env != nullptr ? sol_policy_env : "";
+        const bool sol_step_policy = sd_version_is_minimax_h3(version) &&
+                                     (sol_policy == "first" || sol_policy == "last" || sol_policy == "middle");
+        const int sol_default_first = sol_policy == "first" || sol_policy == "middle" ? 1 : 0;
+        const int sol_default_last  = sol_policy == "last" || sol_policy == "middle" ? 1 : 0;
+        const int sol_precise_first = sa3_precise_count("GGML_H3_SOL_ATTN_PRECISE_FIRST", sol_default_first);
+        const int sol_precise_last  = sa3_precise_count("GGML_H3_SOL_ATTN_PRECISE_LAST", sol_default_last);
         // The precise cuDNN step needs two full-length F16 buffers (converted Q
         // and output).  Tile only that step's independent query rows; the SA3
         // steps retain their one-shot graph and throughput.  The legacy global
@@ -3726,6 +3757,20 @@ public:
                 else unsetenv("GGML_LTX_SA3");
             }
         } sa3_env_restore;
+        struct SolEnvRestore {
+            bool active = false;
+            bool had_sol = false;
+            bool had_sa3 = false;
+            std::string sol;
+            std::string sa3;
+            ~SolEnvRestore() {
+                if (!active) return;
+                if (had_sol) setenv("GGML_H3_SOL_ATTN", sol.c_str(), 1);
+                else unsetenv("GGML_H3_SOL_ATTN");
+                if (had_sa3) setenv("GGML_LTX_SA3", sa3.c_str(), 1);
+                else unsetenv("GGML_LTX_SA3");
+            }
+        } sol_env_restore;
         struct PrecisionQTileEnvRestore {
             bool active = false;
             bool had_value = false;
@@ -3742,7 +3787,21 @@ public:
                 sa3_env_restore.value = e;
             }
             sa3_env_restore.active = true;
-            LOG_INFO("LTX SA3 policy=%s (%zu total sampler steps)", sa3_policy.c_str(), steps);
+            LOG_INFO("LTX SA3 policy=%s (%zu total sampler steps, %d precise first, %d precise last)",
+                     sa3_policy.c_str(), steps, precise_first, precise_last);
+        }
+        if (sol_step_policy) {
+            if (const char * e = std::getenv("GGML_H3_SOL_ATTN")) {
+                sol_env_restore.had_sol = true;
+                sol_env_restore.sol = e;
+            }
+            if (const char * e = std::getenv("GGML_LTX_SA3")) {
+                sol_env_restore.had_sa3 = true;
+                sol_env_restore.sa3 = e;
+            }
+            sol_env_restore.active = true;
+            LOG_INFO("MiniMax-H3 Sol-Attn policy=%s (%zu steps, %d precise first, %d precise last; SA3 disabled)",
+                     sol_policy.c_str(), steps, sol_precise_first, sol_precise_last);
         }
         if (precision_qtile_enabled) {
             if (const char* e = std::getenv("GGML_CUDNN_LTX_QTILE")) {
@@ -3802,9 +3861,8 @@ public:
             // GGML_LTX_SA3_POLICY selected an LTX-AV policy above.
             if (sa3_step_policy) {
                 const int sample_step = std::abs(step);
-                const bool use_sa3 = sa3_policy == "first" ? sample_step > 1
-                                     : sa3_policy == "last" ? sample_step < (int)steps
-                                                            : sample_step > 1 && sample_step < (int)steps;
+                const bool use_sa3 = sample_step > precise_first &&
+                                     sample_step <= static_cast<int>(steps) - precise_last;
                 setenv("GGML_LTX_SA3", use_sa3 ? "1" : "0", 1);
                 if (precision_qtile_enabled) {
                     if (use_sa3) unsetenv("GGML_CUDNN_LTX_QTILE");
@@ -3812,6 +3870,15 @@ public:
                 }
                 LOG_DEBUG("LTX SA3 policy=%s: step %d/%zu -> %s", sa3_policy.c_str(), sample_step, steps,
                           use_sa3 ? "SA3" : "cuDNN");
+            }
+            if (sol_step_policy) {
+                const int sample_step = std::abs(step);
+                const bool use_sol = sample_step > sol_precise_first &&
+                                     sample_step <= static_cast<int>(steps) - sol_precise_last;
+                setenv("GGML_H3_SOL_ATTN", use_sol ? "1" : "0", 1);
+                setenv("GGML_LTX_SA3", "0", 1);
+                LOG_DEBUG("MiniMax-H3 Sol-Attn policy=%s: step %d/%zu -> %s",
+                          sol_policy.c_str(), sample_step, steps, use_sol ? "Sol-Attn" : "cuDNN");
             }
 
             std::vector<float> scaling = denoiser->get_scalings(sigma);
@@ -4567,7 +4634,7 @@ public:
                 MiniMaxH3Diag::emit_schedule(sigmas,
                                              shift_v,
                                              shift_a,
-                                             secant != nullptr && secant[0] != '\0' && secant[0] != '0',
+                                             secant == nullptr || secant[0] == '\0' || atoi(secant) != 0,
                                              h3_runner->request.visual_cond_noise_aug,
                                              h3_runner->request.audio_cond_noise_aug);
                 // The one conditioning invariant that is cheap to state and expensive to notice:

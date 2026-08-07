@@ -125,10 +125,11 @@ uint16_t f8_e5m2_to_f16(uint8_t fp8) {
     return static_cast<uint16_t>(fp8) << 8;
 }
 
-void f8_e4m3_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n) {
+void f8_e4m3_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n, float scale = 1.0f) {
     // support inplace op
     for (int64_t i = n - 1; i >= 0; i--) {
-        dst[i] = f8_e4m3_to_f16(src[i]);
+        const uint16_t value = f8_e4m3_to_f16(src[i]);
+        dst[i] = scale == 1.0f ? value : ggml_fp32_to_fp16(ggml_fp16_to_fp32(value) * scale);
     }
 }
 
@@ -1310,7 +1311,10 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
                     t0 = ggml_time_ms();
                     if (tensor_storage.is_f8_e4m3) {
-                        f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        f8_e4m3_to_f16_vec((uint8_t*)read_buf,
+                                           (uint16_t*)target_buf,
+                                           tensor_storage.nelements(),
+                                           tensor_storage.f8_scale);
                     } else if (tensor_storage.is_f8_e5m2) {
                         f8_e5m2_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_f64) {

@@ -93,6 +93,9 @@ def main():
     ap.add_argument("--donor", required=True, help="BF16/F16/F32 GGUF supplying weights")
     ap.add_argument("--out", required=True)
     ap.add_argument("--rows-per-chunk", type=int, default=32)
+    ap.add_argument("--scale-search-radius", type=int, default=0, choices=range(33),
+                    metavar="N", help="MSE-refine each E4M3 group scale over +/- N codes "
+                                     "(default: 0, legacy amax quantizer)")
     args = ap.parse_args()
     if args.rows_per_chunk <= 0:
         ap.error("--rows-per-chunk must be positive")
@@ -193,7 +196,8 @@ def main():
                     rows = min(args.rows_per_chunk, n - row0)
                     w = read_dense_rows(donor_f, donor_data, dt, row0, rows)
                     packed, wg = quant_nvfp4_unfolded(
-                        w, flat=False, wglobal=item["wglobal"])
+                        w, flat=False, wglobal=item["wglobal"],
+                        scale_search_radius=args.scale_search_radius)
                     if wg != item["wglobal"]:
                         raise SystemExit("internal weight-global drift")
                     out.write(packed)
@@ -206,7 +210,8 @@ def main():
 
     os.replace(temp, args.out)
     print(f"wrote {args.out} ({os.path.getsize(args.out) / 1e9:.2f} GB)")
-    print("recipe: 200 unfolded NVFP4 residual linears, 9 donor-precision protected matrices")
+    print("recipe: 200 unfolded NVFP4 residual linears, 9 donor-precision protected matrices, "
+          f"E4M3 scale MSE search radius {args.scale_search_radius}")
 
 
 if __name__ == "__main__":

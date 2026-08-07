@@ -42,6 +42,9 @@ bool ggml_cuda_nvfp4_weight_global_folded(ggml_backend_t, const char*) {
 bool ggml_cuda_nvfp4_f16_dst_available(ggml_backend_t) {
     return false;
 }
+bool ggml_cuda_int8_convrot_f16_dst_available(ggml_backend_t) {
+    return false;
+}
 }
 
 namespace {

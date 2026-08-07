@@ -221,6 +221,27 @@ def f32_from_gguf(g, name):
     raise SystemExit(f"{name}: {t} is not a plain dtype")
 
 
+def nvfp4_global_scale(g, weight_name):
+    """Return the ModelOpt tensor-global scale for an NVFP4 weight.
+
+    Older flat GGUFs folded the absolute scale into each E4M3 group scale and
+    therefore have no sidecar.  Mixed checkpoints retain ModelOpt's two-level
+    representation as ``X.weight`` + scalar F32 ``X.weight.wglobal``.
+    """
+    sidecar = weight_name + ".wglobal"
+    if sidecar not in g.t:
+        return np.float32(1.0)
+    if g.type_name(sidecar) != "f32" or int(np.prod(g.torch_shape(sidecar))) != 1:
+        raise SystemExit(f"{sidecar}: expected one scalar F32 value")
+    raw = g.raw(sidecar)
+    if len(raw) != 4:
+        raise SystemExit(f"{sidecar}: expected 4 bytes, got {len(raw)}")
+    value = np.frombuffer(raw, "<f4")[0]
+    if not np.isfinite(value) or value <= 0:
+        raise SystemExit(f"{sidecar}: scale must be finite and positive, got {value}")
+    return value
+
+
 # ------------------------------------------------------------------------- verification
 COMFY_REF_DIT = ("/mnt/ssd/h3-staging/comfy-ref/models/diffusion_models/"
                  "minimax_h3_fl2va_pruned_int8_convrot.safetensors")
@@ -273,7 +294,7 @@ def replay_model_detection(hdr):
     return cfg
 
 
-def verify(out_path, gguf_path, sample=4):
+def verify(out_path, gguf_path, sample=0):
     print("\n" + "=" * 78)
     print("VERIFY")
     print("=" * 78)
@@ -312,7 +333,7 @@ def verify(out_path, gguf_path, sample=4):
 
     # --- 3. NVFP4 round-trip against the source GGUF bytes
     quant = sorted(k[: -len(".comfy_quant")] for k in hdr if k.endswith(".comfy_quant"))
-    picks = [quant[i * len(quant) // sample] for i in range(sample)]
+    picks = quant if sample <= 0 else [quant[i * len(quant) // sample] for i in range(sample)]
     permuted = "rope.qk_permuted" in g.t
     head_dim = int(g.torch_shape("blocks.0.attn.q_norm.weight")[0])
     rot_dim = 2 * 3 * int(g.torch_shape("rope.inv_freq")[0])
@@ -345,9 +366,12 @@ def verify(out_path, gguf_path, sample=4):
         else:
             note = ""
         same = bool(np.array_equal(src, back))
-        ok &= same and s2 == np.float32(1.0)
+        expected_s2 = nvfp4_global_scale(g, b + ".weight")
+        same_s2 = np.float32(s2).tobytes() == np.float32(expected_s2).tobytes()
+        ok &= same and same_s2
         print(f"    {b:<44} [{out_f},{in_f}] {conf}")
-        print(f"      bytes identical to source GGUF: {same}   scale_2={s2}{note}")
+        print(f"      packed/scales identical to source GGUF: {same}   "
+              f"scale_2={s2} expected={expected_s2} exact={same_s2}{note}")
 
     # --- 4. an unquantised tensor, byte-exact against comfy's own checkpoint
     if ref is not None:
@@ -386,13 +410,16 @@ def main():
         raise SystemExit(0 if verify(a.out, a.gguf) else 1)
 
     g = GGUF(a.gguf)
-    names = [n for n in g.order if n not in MARKERS]
+    # ``*.weight.wglobal`` is GGUF storage metadata, not a model parameter.
+    # It becomes the corresponding Comfy ``*.weight_scale_2`` scalar below.
+    names = [n for n in g.order if n not in MARKERS and not n.endswith(".weight.wglobal")]
     if a.max_blocks:
         # Smoke-test escape hatch: a few DiT blocks exercise every code path in seconds.
         # The result is NOT loadable by ComfyUI (num_layers would be wrong).
         names = [n for n in names
                  if not n.startswith("blocks.") or int(n.split(".")[1]) < a.max_blocks]
     dropped = [n for n in g.order if n in MARKERS]
+    folded_globals = [n for n in g.order if n.endswith(".weight.wglobal")]
 
     # rot_dim comes from the file, not from a constant: a different inv_freq length would
     # mean a different permutation, and guessing it is exactly the silent-failure mode.
@@ -482,12 +509,13 @@ def main():
                 return cache
 
             base = name[: -len(".weight")]
+            global_scale = nvfp4_global_scale(g, name)
             w.add(name, "U8", [out_f, in_f // 2], out_f * (in_f // 2),
                   lambda c=convert: c().pop("packed"))
             w.add(base + ".weight_scale", "F8_E4M3", [plane_rows, plane_cols],
                   plane_rows * plane_cols, lambda c=convert: c().pop("plane"))
             w.add(base + ".weight_scale_2", "F32", [], 4,
-                  lambda: np.float32(1.0).tobytes())
+                  lambda scale=global_scale: np.float32(scale).tobytes())
             w.add(base + ".comfy_quant", "U8", [len(conf_blob)], len(conf_blob),
                   lambda: conf_blob)
             stats["nvfp4"] += 1
@@ -525,6 +553,7 @@ def main():
         stats["verbatim"] += 1
 
     print(f"dropped    : {dropped}")
+    print(f"globals    : folded {len(folded_globals)} .weight.wglobal sidecars into weight_scale_2")
     print(f"tensors    : {stats['nvfp4']} nvfp4 linears -> 4 entries each, "
           f"{stats['dequantised']} dequantised to bf16, "
           f"{stats['bf16_downcast']} norms downcast to bf16, {stats['verbatim']} verbatim")

@@ -64,7 +64,7 @@
 // not slow, it is silently dropped to the CPU backend.
 //
 // The block AdaLN projection is deliberately NOT part of that check: it consumes `t_emb` (at most
-// four rows, always F32), never the residual stream.  See H3DiTBlock::linears_all_nvfp4().
+// four rows, always F32), never the residual stream.  See H3DiTBlock::linears_accept_f16().
 namespace MiniMaxH3 {
 
     constexpr int MINIMAX_H3_GRAPH_SIZE = 65536;
@@ -95,11 +95,21 @@ namespace MiniMaxH3 {
         return v == 1;
     }
 
-    // Device/backend half of the gate.  True only for CUDA + GGML_NVFP4_CUBLASLT=1 + Blackwell; on
-    // an sm86 card this is false and the well-tested F32 stream runs unchanged.  A weight adapter
-    // that cannot take an F16 activation refuses outright (its delta chain runs against adapter
-    // tensors of unknown type, and an F32 adapter weight against an F16 x is the supports_op
-    // rejection above).
+    // Full F16 residual storage is invalid for the direct I8 H3 checkpoint:
+    // its legitimate late-block residual tails exceed +/-65504.  This narrower
+    // opt-in leaves every residual handoff F32 and stores only QKV/FC1/SwiGLU
+    // temporaries in F16 after their checkpoint row scale has been applied.
+    __STATIC_INLINE__ bool h3_int8_f16_temp_env() {
+        static int v = -1;
+        if (v < 0) {
+            v = h3_env_flag("MINIMAX_H3_INT8_F16_TEMP", false) ? 1 : 0;
+        }
+        return v == 1;
+    }
+
+    // Adapter half of the F16-stream gate. The direct Comfy I8 ConvRot and
+    // NVFP4 base-weight capabilities are selected per Linear below; an adapter
+    // still has to explicitly promise that its own delta chain accepts F16.
     __STATIC_INLINE__ bool h3_dit_f16_device_ok(GGMLRunnerContext* ctx) {
         if (ctx == nullptr) {
             return false;
@@ -107,7 +117,7 @@ namespace MiniMaxH3 {
         if (ctx->weight_adapter != nullptr && !ctx->weight_adapter->supports_f16_activation()) {
             return false;
         }
-        return ggml_cuda_nvfp4_f16_dst_available(ctx->backend);
+        return true;
     }
 
     // FNV-1a over eight independent lanes -- see krea2_bulk_hash.  Used to key the RoPE table cache
@@ -604,7 +614,11 @@ namespace MiniMaxH3 {
             // raw interleave.  The GGUF converter is what normalises it
             // (MINIMAX_H3_QKV_DEINTERLEAVE, stamping `attn.qkv_deinterleaved`); fed an interleaved
             // file this split produces garbage with no error anywhere.
-            ggml_tensor* qkv = qkv_proj->forward(ctx, x);  // [3*inner, L, N]
+            const bool f16_qkv_temp = h3_int8_f16_temp_env() && x->type == GGML_TYPE_F32 &&
+                                      qkv_proj->is_direct_int8_convrot();
+            ggml_tensor* qkv = f16_qkv_temp
+                                  ? qkv_proj->forward_with_direct_i8_dst(ctx, x, GGML_TYPE_F16)
+                                  : qkv_proj->forward(ctx, x);  // [3*inner, L, N]
             auto split       = split_qkv(ctx->ggml_ctx, qkv);
             ggml_tensor* q   = ggml_reshape_4d(ctx->ggml_ctx, split[0], head_dim, heads, L, N);
             ggml_tensor* k   = ggml_reshape_4d(ctx->ggml_ctx, split[1], head_dim, heads, L, N);
@@ -653,12 +667,24 @@ namespace MiniMaxH3 {
             return out_proj->forward(ctx, out);  // [hidden, L, N]
         }
 
-        // See H3DiTBlock::linears_all_nvfp4().
-        bool linears_all_nvfp4() {
+        bool linears_accept_f16(ggml_backend_t backend) {
             for (const char* name : {"qkv_proj", "out_proj"}) {
                 auto linear = std::dynamic_pointer_cast<Linear>(blocks[name]);
-                if (linear == nullptr || linear->get_weight() == nullptr ||
-                    linear->get_weight()->type != GGML_TYPE_NVFP4) {
+                // The direct I8 kernel itself can write half, but an H3 residual-stream
+                // diagnostic captured legitimate F32 values through +/-127356. A full F16
+                // residual stream therefore overflows (first nonfinite MLP/residual at block
+                // 45) and decodes black. Keep its isolated kernel capability, but fail closed
+                // for this model until a selective-temporary path exists.
+                if (linear != nullptr && linear->is_direct_int8_convrot()) {
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        LOG_WARN("minimax_h3: MINIMAX_H3_DIT_F16 declined for direct I8 ConvRot: "
+                                 "F32 residual values exceed F16 range; retaining the F32 stream");
+                    }
+                    return false;
+                }
+                if (linear == nullptr || !linear->supports_f16_stream(backend)) {
                     return false;
                 }
             }
@@ -747,11 +773,10 @@ namespace MiniMaxH3 {
             return out;
         }
 
-        bool linears_all_nvfp4() {
+        bool linears_accept_f16(ggml_backend_t backend) {
             for (const char* name : {"fc1", "fc2"}) {
                 auto linear = std::dynamic_pointer_cast<Linear>(blocks[name]);
-                if (linear == nullptr || linear->get_weight() == nullptr ||
-                    linear->get_weight()->type != GGML_TYPE_NVFP4) {
+                if (linear == nullptr || !linear->supports_f16_stream(backend)) {
                     return false;
                 }
             }
@@ -764,14 +789,18 @@ namespace MiniMaxH3 {
             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
 
-            x = fc1->forward(ctx, x);
+            const bool f16_mlp_temp = h3_int8_f16_temp_env() && x->type == GGML_TYPE_F32 &&
+                                      fc1->is_direct_int8_convrot() && fc2->is_direct_int8_convrot();
+            x = f16_mlp_temp ? fc1->forward_with_direct_i8_dst(ctx, x, GGML_TYPE_F16)
+                             : fc1->forward(ctx, x);
             // gate_first=true: chunk 0 is the SiLU'd gate, chunk 1 is the multiplicand, and the
             // helper emits `mul(up, silu(gate))` with the SiLU as src[1] -- the operand order that
             // lets ggml fuse {UNARY(SILU), MUL} into ggml_cuda_op_unary_mul instead of paying a
             // separate full pass over [ffn x seq].  See the KreaSwiGLU comment for why the order is
             // load-bearing rather than cosmetic.
             x = ggml_ext_silu_act(ctx->ggml_ctx, x, /*gate_first=*/true);
-            return fc2->forward(ctx, x);
+            return f16_mlp_temp ? fc2->forward_with_direct_i8_dst(ctx, x, GGML_TYPE_F32)
+                                : fc2->forward(ctx, x);
         }
     };
 
@@ -944,17 +973,19 @@ namespace MiniMaxH3 {
             return x;
         }
 
-        // True iff every Linear ON THE RESIDUAL STREAM carries an NVFP4 weight.
+        // True iff every Linear ON THE RESIDUAL STREAM has an F16-capable
+        // execution route for its exact stored weight format.
         //
         // `adaln_proj.linear` is deliberately NOT asked about: it consumes `t_emb` (at most four
         // rows, always F32) and never the stream, so its type has no bearing on whether an F16
         // activation is servable.  In the pruned curve-table form the reference even stores it at
         // float32 on purpose.  norm1/norm2 are F32 parameter tensors consumed by rms_norm, which
         // takes an F16 activation against an F32 operand.
-        bool linears_all_nvfp4() {
+        bool linears_accept_f16(ggml_backend_t backend) {
             auto attn = std::dynamic_pointer_cast<H3Attention>(blocks["attn"]);
             auto mlp  = std::dynamic_pointer_cast<H3MLP>(blocks["mlp"]);
-            return attn != nullptr && mlp != nullptr && attn->linears_all_nvfp4() && mlp->linears_all_nvfp4();
+            return attn != nullptr && mlp != nullptr &&
+                   attn->linears_accept_f16(backend) && mlp->linears_accept_f16(backend);
         }
     };
 
@@ -1122,13 +1153,13 @@ namespace MiniMaxH3 {
 
         const MiniMaxH3Config& get_config() const { return config; }
 
-        // Weight half of the F16 stream gate -- see the file header.  All-or-nothing: one
-        // non-NVFP4 weight inside `blocks.*` is an F16 src1 that supports_op refuses, and
+        // Weight/backend half of the F16 stream gate -- see the file header. All-or-nothing: one
+        // stream linear without an F16 route is an F16 src1 that supports_op refuses, and
         // ggml_backend_sched then runs that Linear on the CPU.
-        bool blocks_accept_f16() {
+        bool blocks_accept_f16(ggml_backend_t backend) {
             for (int64_t i = 0; i < config.num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<H3DiTBlock>(blocks["blocks." + std::to_string(i)]);
-                if (block == nullptr || !block->linears_all_nvfp4()) {
+                if (block == nullptr || !block->linears_accept_f16(backend)) {
                     return false;
                 }
             }
@@ -1440,8 +1471,8 @@ namespace MiniMaxH3 {
 
         // The NEXT step's video sigma, in the same [0, 1] units as `timesteps / timestep_scale`.
         // Set per step by the sampler (see MiniMaxH3DiffusionExtra::sigma_next); < 0 means "the
-        // sampler did not say", which forces the instantaneous-slope behaviour regardless of
-        // MINIMAX_H3_AUDIO_SECANT.  Only the AUDIO velocity scale reads it.
+        // sampler did not say", which forces the instantaneous-slope fallback regardless of the
+        // default secant policy.  Only the AUDIO velocity scale reads it.
         float sigma_v_next = -1.f;
 
         // The engine's DiscreteFlowDenoiser hands the DiT `sigma * 1000` (sigma_to_t), which is the
@@ -1613,12 +1644,11 @@ namespace MiniMaxH3 {
             const float shift_v = request.sigma_shift_video > 0.f ? request.sigma_shift_video : config.sigma_shift_video;
             const float shift_a = request.sigma_shift_audio > 0.f ? request.sigma_shift_audio : config.sigma_shift_audio;
             const float sigma_v = timesteps_tensor.data()[0] / request.timestep_scale;
-            // MINIMAX_H3_AUDIO_SECANT=1 -- scale the audio velocity by the DISCRETE
-            // (sigma_a - sigma_a_next)/(sigma_v - sigma_v_next) instead of comfy's instantaneous
-            // d(sigma_a)/d(sigma_v).  That makes one Euler step on the VIDEO schedule advance the
-            // audio stream by exactly the step diffusers' second (audio) scheduler would take.
-            // Default OFF: this changes every audio latent, so it is an A/B, not a silent repair.
-            static const bool audio_secant = h3_env_flag("MINIMAX_H3_AUDIO_SECANT", false);
+            // Default to the DISCRETE secant (sigma_a - sigma_a_next)/(sigma_v - sigma_v_next).
+            // It makes one Euler step on the video schedule advance audio by exactly the step of
+            // diffusers' separate audio scheduler.  Set MINIMAX_H3_AUDIO_SECANT=0 only for the
+            // legacy instantaneous-derivative compatibility A/B.
+            static const bool audio_secant = h3_env_flag("MINIMAX_H3_AUDIO_SECANT", true);
             plan                           = build_timestep_plan(layout,
                                                                  sigma_v,
                                                                  shift_v,
@@ -1629,14 +1659,14 @@ namespace MiniMaxH3 {
                                                                  request.sigma_v_next,
                                                                  audio_secant);
             {
-                // One line per step, not once per run: the whole point of the A/B is watching the
-                // two candidates diverge as sigma falls, and a run-once log hides exactly that.
+                // One line per step, not once per run: a compatibility A/B must show both slopes
+                // as sigma falls, and a run-once log hides exactly that.
                 static bool logged_mode = false;
                 if (!logged_mode) {
                     logged_mode = true;
                     LOG_INFO("minimax_h3: audio velocity scale = %s",
-                             audio_secant ? "SECANT, discrete d(sigma_a)/d(sigma_v) (MINIMAX_H3_AUDIO_SECANT=1)"
-                                          : "INSTANTANEOUS slope (comfy default; set MINIMAX_H3_AUDIO_SECANT=1 to A/B)");
+                             audio_secant ? "SECANT, discrete d(sigma_a)/d(sigma_v) (default; MINIMAX_H3_AUDIO_SECANT=0 opts out)"
+                                          : "INSTANTANEOUS slope (legacy compatibility opt-out: MINIMAX_H3_AUDIO_SECANT=0)");
                 }
                 LOG_DEBUG("minimax_h3: sigma_v %.6f -> %.6f  sigma_a %.6f -> %.6f  slope inst %.4f  secant %.4f%s  using %.4f",
                           plan.sigma_v,
@@ -1651,8 +1681,8 @@ namespace MiniMaxH3 {
                     static bool warned = false;
                     if (!warned) {
                         warned = true;
-                        LOG_WARN("minimax_h3: MINIMAX_H3_AUDIO_SECANT=1 but no next sigma reached the DiT; "
-                                 "falling back to the instantaneous slope (the A/B is a NO-OP).");
+                        LOG_WARN("minimax_h3: secant audio policy has no next sigma at the DiT; "
+                                 "falling back to the instantaneous slope for this step.");
                     }
                 }
             }
@@ -1722,7 +1752,8 @@ namespace MiniMaxH3 {
             }
 
             // ---- F16 stream decision ---------------------------------------------------------
-            const bool dit_f16 = h3_dit_f16_env() && h3_dit_f16_device_ok(&runner_ctx) && model.blocks_accept_f16();
+            const bool dit_f16 = h3_dit_f16_env() && h3_dit_f16_device_ok(&runner_ctx) &&
+                                 model.blocks_accept_f16(runner_ctx.backend);
             {
                 static int logged  = -1;
                 const int decision = dit_f16 ? 1 : 0;
@@ -1811,9 +1842,9 @@ namespace MiniMaxH3 {
             // negation belongs here and the audio slope with it: scaling the audio velocity by
             // d(sigma_a)/d(sigma_v) is what makes the flat ODE the sampler integrates on the VIDEO
             // schedule equal the audio stream's true ODE on its own.  `plan.slope_a` is that
-            // factor; whether it holds comfy's instantaneous derivative or diffusers' per-step
-            // secant is decided above by MINIMAX_H3_AUDIO_SECANT.  The VIDEO branch is untouched
-            // by that switch -- it is on the schedule the sampler is already integrating.
+            // factor; it is the diffusers-equivalent per-step secant by default, with an explicit
+            // legacy instantaneous opt-out above.  The VIDEO branch is untouched by that switch --
+            // it is on the schedule the sampler is already integrating.
             video_out = ggml_scale(compute_ctx, video_out, -1.0f);
 
             ggml_tensor* audio_out = nullptr;

@@ -75,12 +75,17 @@
 //
 // The dispatch therefore keys on `comfy_quant`, NOT on tensor names: a file with any
 // `<L>.comfy_quant` tensor takes the ComfyUI branch, everything else takes the
-// name-sniffing branch.  Format strings other than "nvfp4" are REFUSED, not guessed at.
+// name-sniffing branch.  The canonical MiniMax-H3 checkpoint is mixed: residual
+// matrices are NVFP4 while the 50 AdaLN projections are scaled float8_e4m3fn.
+// Other format strings are REFUSED, not guessed at.
 
 // What a safetensors file's `comfy_quant` tensors say about it.
 enum class ComfyQuantScan {
     None,         // no `.comfy_quant` tensor: not a ComfyUI-quantised checkpoint
     Nvfp4,        // every `.comfy_quant` is exactly {"format": "nvfp4"}
+    Float8,       // every `.comfy_quant` is exactly {"format": "float8_e4m3fn"}
+    Nvfp4Float8,  // a canonical mixture of those two supported formats
+    Int8Convrot,  // int8_tensorwise + group-256 activation ConvRot
     Unsupported,  // at least one names a format/modifier this engine cannot load
     Malformed,    // header or a `comfy_quant` blob could not be read
 };

@@ -1,5 +1,6 @@
 #include "nvfp4_import.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -297,8 +298,9 @@ bool ggml_nvfp4_layout_ok() {
     return true;
 }
 
-// Import every `{"format": "nvfp4"}` linear of a ComfyUI checkpoint.  The caller has
-// already proven, via comfy_quant_scan_safetensors(), that no OTHER format appears.
+// Import every supported ComfyUI-quantised linear. NVFP4 weights are reblocked and
+// receive a `.wglobal` sidecar. Scaled FP8 weights stay on the ordinary safetensors
+// path, with their scalar folded while the reader expands FP8 to F16.
 bool rewrite_comfy_nvfp4(const std::string& file_path, std::vector<TensorStorage>& tensor_storages) {
     if (!ggml_nvfp4_layout_ok()) {
         return false;
@@ -323,15 +325,72 @@ bool rewrite_comfy_nvfp4(const std::string& file_path, std::vector<TensorStorage
 
     std::map<std::string, TensorStorage> imported;
     std::vector<std::string> drop;
+    size_t nvfp4_count = 0;
+    size_t float8_count = 0;
 
     for (const std::string& base : bases) {
         const std::string packed_name = base + ".weight";
         const std::string scale_name  = base + ".weight_scale";
         const std::string global_name = base + ".weight_scale_2";
+        const std::string quant_name  = base + COMFY_QUANT_SUFFIX;
 
         auto packed_it = raw.find(packed_name);
         auto scale_it  = raw.find(scale_name);
         auto global_it = raw.find(global_name);
+        auto quant_it  = raw.find(quant_name);
+        if (quant_it == raw.end()) {
+            LOG_ERROR("comfy_quant import: missing '%s'", quant_name.c_str());
+            return false;
+        }
+        std::ifstream quant_file(file_path, std::ios::binary);
+        std::string quant_blob((size_t)quant_it->second.nbytes, '\0');
+        quant_file.seekg((std::streamoff)quant_it->second.offset);
+        quant_file.read(&quant_blob[0], (std::streamsize)quant_blob.size());
+        nlohmann::json quant_config;
+        try {
+            quant_config = nlohmann::json::parse(quant_blob);
+        } catch (const std::exception&) {
+            LOG_ERROR("comfy_quant import: malformed '%s'", quant_name.c_str());
+            return false;
+        }
+        const std::string format = quant_config["format"].get<std::string>();
+
+        if (format == "float8_e4m3fn") {
+            if (packed_it == raw.end() || scale_it == raw.end()) {
+                LOG_ERROR("comfy_quant import: '%s' is missing one of {%s, %s}",
+                          base.c_str(),
+                          packed_name.c_str(),
+                          scale_name.c_str());
+                return false;
+            }
+            const RawEntry& packed = packed_it->second;
+            const RawEntry& scale  = scale_it->second;
+            if (packed.dtype != "F8_E4M3" || packed.shape.size() != 2 ||
+                scale.dtype != "F32" || scale.nbytes != sizeof(float) || !scale.shape.empty()) {
+                LOG_ERROR("comfy_quant import: malformed scaled-FP8 family '%s'", base.c_str());
+                return false;
+            }
+            float tensor_scale = 0.0f;
+            if (!read_f32_at(file_path, scale.offset, &tensor_scale) ||
+                !(tensor_scale > 0.0f) || !std::isfinite(tensor_scale)) {
+                LOG_ERROR("comfy_quant import: '%s' is not a usable positive F32 scale", scale_name.c_str());
+                return false;
+            }
+            auto storage_it = std::find_if(tensor_storages.begin(), tensor_storages.end(),
+                                           [&](const TensorStorage& storage) {
+                                               return storage.name == packed_name;
+                                           });
+            if (storage_it == tensor_storages.end() || !storage_it->is_f8_e4m3) {
+                LOG_ERROR("comfy_quant import: FP8 weight '%s' was not read as F8_E4M3", packed_name.c_str());
+                return false;
+            }
+            storage_it->f8_scale = tensor_scale;
+            drop.push_back(scale_name);
+            drop.push_back(quant_name);
+            ++float8_count;
+            continue;
+        }
+
         if (packed_it == raw.end() || scale_it == raw.end() || global_it == raw.end()) {
             LOG_ERROR("comfy_quant import: '%s' says format nvfp4 but is missing one of {%s, %s, %s}",
                       base.c_str(),
@@ -435,12 +494,78 @@ bool rewrite_comfy_nvfp4(const std::string& file_path, std::vector<TensorStorage
         // explicitly so this does not depend on that.
         drop.push_back(scale_name);
         drop.push_back(global_name);
-        drop.push_back(base + COMFY_QUANT_SUFFIX);
+        drop.push_back(quant_name);
+        ++nvfp4_count;
     }
 
     splice_tensor_storages(tensor_storages, imported, drop);
-    LOG_INFO("comfy_quant import: %zu ComfyUI-quantised NVFP4 linears in '%s'", bases.size(), file_path.c_str());
+    LOG_INFO("comfy_quant import: %zu NVFP4 + %zu scaled-FP8 ComfyUI linears in '%s'",
+             nvfp4_count,
+             float8_count,
+             file_path.c_str());
     return true;
+}
+
+bool rewrite_comfy_int8_convrot(const std::string& file_path,
+                                std::vector<TensorStorage>& tensor_storages) {
+    std::map<std::string, RawEntry> raw;
+    if (!read_raw_header(file_path, raw)) {
+        LOG_ERROR("comfy int8_convrot import: failed to re-read '%s'", file_path.c_str());
+        return false;
+    }
+
+    std::map<std::string, TensorStorage> imported;
+    std::vector<std::string> drop;
+    size_t count = 0;
+    for (const auto& [name, quant] : raw) {
+        std::string base;
+        if (!strip_suffix(name, COMFY_QUANT_SUFFIX, &base)) {
+            continue;
+        }
+        const std::string weight_name = base + ".weight";
+        const std::string scale_name  = base + ".weight_scale";
+        const auto wit = raw.find(weight_name);
+        const auto sit = raw.find(scale_name);
+        if (wit == raw.end() || sit == raw.end()) {
+            LOG_ERROR("comfy int8_convrot import: '%s' is missing weight or weight_scale", base.c_str());
+            return false;
+        }
+        const RawEntry& weight = wit->second;
+        const RawEntry& scale  = sit->second;
+        if (weight.dtype != "I8" || weight.shape.size() != 2 ||
+            weight.shape[1] % 256 != 0 ||
+            scale.dtype != "F32" || scale.shape.size() != 2 ||
+            scale.shape[0] != weight.shape[0] || scale.shape[1] != 1) {
+            LOG_ERROR("comfy int8_convrot import: malformed family '%s' (expected I8[out,in], "
+                      "in%%256=0, F32[out,1])", base.c_str());
+            return false;
+        }
+        if (weight.nbytes != static_cast<uint64_t>(weight.shape[0]) *
+                                static_cast<uint64_t>(weight.shape[1]) ||
+            scale.nbytes != static_cast<uint64_t>(weight.shape[0]) * sizeof(float)) {
+            LOG_ERROR("comfy int8_convrot import: byte count mismatch in '%s'", base.c_str());
+            return false;
+        }
+
+        // Keep both payloads literally.  Only normalize [out,1] to a 1-D ggml
+        // broadcast vector; this changes tensor metadata, not bytes.
+        auto tsit = std::find_if(tensor_storages.begin(), tensor_storages.end(),
+                                 [&](const TensorStorage& ts) { return ts.name == scale_name; });
+        if (tsit == tensor_storages.end()) {
+            LOG_ERROR("comfy int8_convrot import: shared reader omitted '%s'", scale_name.c_str());
+            return false;
+        }
+        TensorStorage row_scale = *tsit;
+        row_scale.n_dims = 1;
+        row_scale.ne[0]  = weight.shape[0];
+        row_scale.ne[1]  = row_scale.ne[2] = row_scale.ne[3] = row_scale.ne[4] = 1;
+        imported[scale_name] = row_scale;
+        drop.push_back(name);
+        ++count;
+    }
+    splice_tensor_storages(tensor_storages, imported, drop);
+    LOG_INFO("comfy int8_convrot import: %zu direct I8 linears in '%s'", count, file_path.c_str());
+    return count != 0;
 }
 
 }  // namespace
@@ -475,6 +600,9 @@ ComfyQuantScan comfy_quant_scan_safetensors(const std::string& file_path, std::s
         return fail(ComfyQuantScan::Malformed, "comfy_quant: failed to open '" + file_path + "'");
     }
 
+    size_t nvfp4_count = 0;
+    size_t float8_count = 0;
+    size_t int8_convrot_count = 0;
     for (const auto& [name, entry] : blobs) {
         if (entry.dtype != "U8" || entry.nbytes == 0 || entry.nbytes > 4096) {
             return fail(ComfyQuantScan::Malformed,
@@ -499,28 +627,47 @@ ComfyQuantScan comfy_quant_scan_safetensors(const std::string& file_path, std::s
         }
 
         const std::string format = cfg["format"].get<std::string>();
-        if (format != "nvfp4") {
-            // int8_tensorwise+convrot is the common one.  Its weights are quantised AFTER a
-            // Hadamard-style rotation of the input dim, so importing it is not a re-layout:
-            // the rotation has to be undone (or applied to the activations), and nothing in
-            // this engine does either.  REFUSE -- there is no safe fallback path.
+        const bool int8_convrot =
+            format == "int8_tensorwise" &&
+            cfg.value("convrot", false) &&
+            cfg.value("convrot_groupsize", 0) == 256;
+        if (format != "nvfp4" && format != "float8_e4m3fn" && !int8_convrot) {
             return fail(ComfyQuantScan::Unsupported,
                         "comfy_quant: '" + name + "' declares format '" + format +
                             "', which this engine cannot load: " + blob +
-                            "  (only {\"format\": \"nvfp4\"} is supported)");
+                            "  (supported: nvfp4, float8_e4m3fn, and exact "
+                            "int8_tensorwise+convrot_groupsize=256)");
         }
         // An unrecognised MODIFIER on an nvfp4 layer (e.g. a rotation, an activation
         // pre-scale) would change the maths while leaving every shape and dtype intact.
         for (const auto& item : cfg.items()) {
-            if (item.key() != "format") {
+            if (item.key() != "format" &&
+                !(int8_convrot && (item.key() == "convrot" || item.key() == "convrot_groupsize"))) {
                 return fail(ComfyQuantScan::Unsupported,
                             "comfy_quant: '" + name + "' carries the unrecognised key '" + item.key() +
                                 "' on an nvfp4 layer, which would silently change the dequantisation: " + blob);
             }
         }
+        if (format == "nvfp4") {
+            ++nvfp4_count;
+        } else if (format == "float8_e4m3fn") {
+            ++float8_count;
+        } else {
+            ++int8_convrot_count;
+        }
     }
 
-    return ComfyQuantScan::Nvfp4;
+    if (int8_convrot_count != 0) {
+        if (nvfp4_count != 0 || float8_count != 0 || int8_convrot_count != blobs.size()) {
+            return fail(ComfyQuantScan::Unsupported,
+                        "comfy_quant: mixed int8_convrot and other quant formats are not supported");
+        }
+        return ComfyQuantScan::Int8Convrot;
+    }
+    if (nvfp4_count != 0 && float8_count != 0) {
+        return ComfyQuantScan::Nvfp4Float8;
+    }
+    return nvfp4_count != 0 ? ComfyQuantScan::Nvfp4 : ComfyQuantScan::Float8;
 }
 
 bool nvfp4_import_rewrite_safetensors(const std::string& file_path,
@@ -529,8 +676,13 @@ bool nvfp4_import_rewrite_safetensors(const std::string& file_path,
     // 🔴 A ComfyUI nvfp4 export uses ModelOpt's EXACT tensor names with a different byte
     // order (see the header).  Dispatch on comfy_quant first, or the branch below matches
     // it on names and silently imports a wrong model.
-    if (comfy == ComfyQuantScan::Nvfp4) {
+    if (comfy == ComfyQuantScan::Nvfp4 ||
+        comfy == ComfyQuantScan::Float8 ||
+        comfy == ComfyQuantScan::Nvfp4Float8) {
         return rewrite_comfy_nvfp4(file_path, tensor_storages);
+    }
+    if (comfy == ComfyQuantScan::Int8Convrot) {
+        return rewrite_comfy_int8_convrot(file_path, tensor_storages);
     }
     if (comfy != ComfyQuantScan::None) {
         LOG_ERROR("nvfp4 import: refusing '%s' -- its comfy_quant blobs were not accepted", file_path.c_str());

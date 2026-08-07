@@ -1193,13 +1193,26 @@ public:
                                    const std::string& prefix,
                                    WeightAdapter::ForwardParams forward_params,
                                    ggml_tensor* base_output_scale = nullptr) override {
-        w = patch_weight(ctx, backend, w, prefix + "weight", false);
+        // A direct quantized base (currently Comfy INT8 ConvRot) is executable
+        // storage, not a floating tensor to patch.  Keep those bytes untouched:
+        // the base uses its hinted runtime kernel and normal LoRA/LoKr deltas
+        // are accumulated below in floating point.
+        if (forward_params.op_type != ForwardParams::op_type_t::OP_LINEAR ||
+            forward_params.linear.hint == GGML_HINT_NONE) {
+            w = patch_weight(ctx, backend, w, prefix + "weight", false);
+        }
         if (b) {
             b = patch_weight(ctx, backend, b, prefix + "bias", false);
         }
         ggml_tensor* out;
         if (forward_params.op_type == ForwardParams::op_type_t::OP_LINEAR) {
-            out = ggml_ext_linear(ctx, x, w, b, forward_params.linear.force_prec_f32, forward_params.linear.scale);
+            out = ggml_ext_linear(ctx,
+                                  x,
+                                  w,
+                                  b,
+                                  forward_params.linear.force_prec_f32,
+                                  forward_params.linear.scale,
+                                  forward_params.linear.hint);
         } else {  // OP_CONV2D
             out = ggml_ext_conv_2d(ctx,
                                    x,

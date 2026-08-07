@@ -143,7 +143,7 @@ void h3_check_ltx_top_level(const json& body, H3Compat& compat) {
         }
     }
 
-    // ── task-selected checkpoints, no caller override, no adapters or refine chain ───────────
+    // ── task-selected checkpoints, no caller override or refine chain ────────────────────────
     if (json_present(body, "model") && body["model"].is_string()) {
         const std::string model = body["model"].get<std::string>();
         if (!model.empty() && model != "base") {
@@ -153,13 +153,10 @@ void h3_check_ltx_top_level(const json& body, H3Compat& compat) {
             compat.ignore("model");
         }
     }
-    if (json_present(body, "lora") && body["lora"].is_array()) {
-        if (!body["lora"].empty()) {
-            compat.refuse("MiniMax-H3 has no runtime-LoRA path; remove the lora array");
-        } else {
-            compat.ignore("lora");
-        }
-    }
+    // Top-level runtime LoRAs are parsed and resolved by SDGenerationParams below.
+    // They remain active for every independent H3 shot in this request. Per-shot
+    // stacks are still refused in h3_check_ltx_segment(): H3 has no segment model
+    // lease hook and silently ignoring a requested stack would be incorrect.
     if (json_present(body, "hires_chain") && body["hires_chain"].is_array()) {
         if (!body["hires_chain"].empty()) {
             compat.refuse("MiniMax-H3 has no latent-upscale refine chain; hires_chain must be empty or absent");

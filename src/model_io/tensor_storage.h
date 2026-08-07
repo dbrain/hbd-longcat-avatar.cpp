@@ -19,6 +19,9 @@ struct TensorStorage {
     ggml_type expected_type = GGML_TYPE_COUNT;
     bool is_f8_e4m3         = false;
     bool is_f8_e5m2         = false;
+    // Per-tensor scale carried by ComfyUI's `float8_e4m3fn` format. Folded while
+    // expanding the file's FP8 bytes to the in-memory F16 tensor.
+    float f8_scale           = 1.0f;
     bool is_f64             = false;
     bool is_i64             = false;
     int64_t ne[SD_MAX_DIMS] = {1, 1, 1, 1, 1};

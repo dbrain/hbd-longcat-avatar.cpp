@@ -31,6 +31,11 @@ def main():
     parser.add_argument("--donor", required=True, help="GGUF supplying selected tensors")
     parser.add_argument("--out", required=True)
     parser.add_argument("--select", required=True, help="regular expression matched against tensor names")
+    parser.add_argument(
+        "--drop-orphan-wglobal",
+        action="store_true",
+        help="drop a selected weight's base .wglobal sidecar when the donor has none",
+    )
     args = parser.parse_args()
 
     select = re.compile(args.select)
@@ -39,10 +44,18 @@ def main():
     if donor_version != version:
         raise SystemExit(f"GGUF version mismatch: base v{version}, donor v{donor_version}")
     donor_by_name = {tensor["name"]: tensor for tensor in donor_tensors}
+    selected_weight_names = {
+        tensor["name"] for tensor in base_tensors
+        if tensor["name"].endswith(".weight") and select.search(tensor["name"])
+    }
 
     plan = []
     selected = []
     for base_tensor in base_tensors:
+        if (args.drop_orphan_wglobal and base_tensor["name"].endswith(".weight.wglobal") and
+                base_tensor["name"][:-len(".wglobal")] in selected_weight_names and
+                base_tensor["name"] not in donor_by_name):
+            continue
         source_f, source_data, source_tensor = base_f, base_data, base_tensor
         if select.search(base_tensor["name"]):
             donor_tensor = donor_by_name.get(base_tensor["name"])

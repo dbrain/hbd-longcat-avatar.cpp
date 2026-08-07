@@ -1012,7 +1012,9 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
                                                ggml_tensor* w,
                                                ggml_tensor* b,
                                                bool force_prec_f32 = false,
-                                               float scale         = 1.f) {
+                                               float scale         = 1.f,
+                                               enum ggml_op_hint hint = GGML_HINT_NONE,
+                                               enum ggml_type direct_i8_dst = GGML_TYPE_COUNT) {
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
     }
@@ -1024,21 +1026,27 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
     // buys nothing (measured a NET LOSS in that shape historically).
     //
     // The caller is responsible for only feeding an F16 activation on a backend that
-    // advertises it (ggml_cuda_nvfp4_f16_dst_available); this function just honours the type
-    // it is given.
+    // advertises the stored weight's route; this function just honours the type it is given.
     //
-    // Self-gated on (NVFP4 weight + F16 activation): every other model keeps the F32 dst
-    // byte-identically. K % 64 and the 2D shape mirror the FP4 GEMM's own preconditions so we
-    // never REQUEST an F16 dst that ggml_backend_supports_op() would then refuse; the backend
-    // re-checks all of it anyway (ggml_cuda_nvfp4_fp4_gemm_serves).
+    // Self-gated on either NVFP4 or the direct Comfy I8 ConvRot hint with an F16 activation:
+    // every other model keeps the F32 dst byte-identically.  The direct I8 kernel performs its
+    // transform/row-scale reduction in F32 and rounds only when it writes the F16 graph result.
+    // Its 2D/contiguous contract is checked again by the backend.
     ggml_type mm_dst = GGML_TYPE_F32;
     {
         // the matmul's src1 is 2D either because x already is, or because the >1024 branch
         // below reshapes it; anything else keeps a batched src1, which the FP4 path bails on.
         const int64_t x_batch    = x->ne[2] * x->ne[3];
         const bool    src1_is_2d = (x_batch == 1) || (x_batch > 1024);
-        if (!force_prec_f32 && x->type == GGML_TYPE_F16 && w->type == GGML_TYPE_NVFP4 &&
-            src1_is_2d && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[0] % 64 == 0 &&
+        const bool nvfp4_f16 = w->type == GGML_TYPE_NVFP4 && w->ne[0] % 64 == 0;
+        const bool int8_convrot_f16 = w->type == GGML_TYPE_I8 && hint == GGML_HINT_INT8_CONVROT_256 &&
+                                       w->ne[0] % 256 == 0;
+        const bool force_direct_i8_f16 = int8_convrot_f16 && direct_i8_dst == GGML_TYPE_F16;
+        const bool force_direct_i8_f32 = int8_convrot_f16 && direct_i8_dst == GGML_TYPE_F32;
+        if (!force_prec_f32 && (force_direct_i8_f16 ||
+                                (!force_direct_i8_f32 && x->type == GGML_TYPE_F16 &&
+                                 (nvfp4_f16 || int8_convrot_f16))) &&
+            src1_is_2d && w->ne[2] == 1 && w->ne[3] == 1 &&
             ggml_is_contiguous(w) && ggml_is_contiguous(x)) {
             mm_dst = GGML_TYPE_F16;
         }
@@ -1049,12 +1057,18 @@ __STATIC_INLINE__ ggml_tensor* ggml_ext_linear(ggml_context* ctx,
         int64_t ne3 = x->ne[3];
         x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
         x           = ggml_mul_mat_ext(ctx, w, x, mm_dst);
+        if (hint != GGML_HINT_NONE) {
+            ggml_mul_mat_set_hint(x, hint);
+        }
         if (force_prec_f32) {
             ggml_mul_mat_set_prec(x, GGML_PREC_F32);
         }
         x = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
     } else {
         x = ggml_mul_mat_ext(ctx, w, x, mm_dst);
+        if (hint != GGML_HINT_NONE) {
+            ggml_mul_mat_set_hint(x, hint);
+        }
         if (force_prec_f32) {
             ggml_mul_mat_set_prec(x, GGML_PREC_F32);
         }
@@ -1864,6 +1878,10 @@ struct WeightAdapter {
         struct {
             bool force_prec_f32 = false;
             float scale         = 1.f;
+            // Some quantized Linear formats require an activation transform at
+            // execution time.  Runtime LoRA must preserve that base GEMM and
+            // accumulate its floating delta afterwards.
+            enum ggml_op_hint hint = GGML_HINT_NONE;
         } linear;
         struct conv2d_params_t {
             int s0          = 1;
@@ -4511,7 +4529,8 @@ protected:
             enum ggml_type wtype = GGML_TYPE_F32;
             params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);
         }
-        if (allow_weight_scale && tensor_storage_map.find(prefix + "weight_scale") != tensor_storage_map.end()) {
+        if ((allow_weight_scale || wtype == GGML_TYPE_I8) &&
+            tensor_storage_map.find(prefix + "weight_scale") != tensor_storage_map.end()) {
             params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
             has_weight_scale       = true;
         }
@@ -4555,8 +4574,42 @@ public:
     }
     bool get_force_prec_f32() const { return force_prec_f32; }
 
+    bool is_direct_int8_convrot() const {
+        const ggml_tensor* w = get_weight();
+        return w != nullptr && w->type == GGML_TYPE_I8 && has_weight_scale;
+    }
+
+    // Is this exact stored linear format able to preserve an F16 residual
+    // stream on this backend?  The answer is intentionally per-weight: an
+    // H3 checkpoint is either all direct Comfy I8 ConvRot or all NVFP4, and
+    // their device contracts are unrelated.
+    bool supports_f16_stream(ggml_backend_t backend) const {
+        const ggml_tensor* w = get_weight();
+        if (w == nullptr) {
+            return false;
+        }
+        if (w->type == GGML_TYPE_NVFP4) {
+            return ggml_cuda_nvfp4_f16_dst_available(backend);
+        }
+        return w->type == GGML_TYPE_I8 && has_weight_scale &&
+               ggml_cuda_int8_convrot_f16_dst_available(backend);
+    }
+
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        return forward_with_direct_i8_dst(ctx, x, GGML_TYPE_COUNT);
+    }
+
+    // H3's selective temporary path may choose an F16 result for a direct I8
+    // projection without converting the F32 residual activation itself.  F32
+    // requests are equally explicit: an F16 SwiGLU temporary must feed an F32
+    // FC2 branch before the residual add.  Runtime LoRA deliberately declines
+    // this policy and retains its established F32 fallback.
+    ggml_tensor* forward_with_direct_i8_dst(GGMLRunnerContext* ctx,
+                                            ggml_tensor* x,
+                                            enum ggml_type direct_i8_dst) {
         ggml_tensor* w = params["weight"];
+        const bool int8_convrot = w->type == GGML_TYPE_I8;
+        GGML_ASSERT(!int8_convrot || has_weight_scale);
         ggml_tensor* b = nullptr;
         if (bias) {
             b = params["bias"];
@@ -4586,6 +4639,8 @@ public:
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
             forward_params.linear.force_prec_f32 = force_prec_f32;
             forward_params.linear.scale          = scale;
+            forward_params.linear.hint           =
+                int8_convrot ? GGML_HINT_INT8_CONVROT_256 : GGML_HINT_NONE;
             out                                  = ctx->weight_adapter->forward_with_lora(ctx->ggml_ctx,
                                                                                            ctx->backend,
                                                                                            x,
@@ -4593,14 +4648,28 @@ public:
                                                                                            linear_bias,
                                                                                            prefix,
                                                                                            forward_params,
-                                                                                           scale_weight_global_in_graph ? params["weight.wglobal"] : nullptr);
+                                                                                           int8_convrot
+                                                                                               ? params["weight_scale"]
+                                                                                               : (scale_weight_global_in_graph
+                                                                                                      ? params["weight.wglobal"]
+                                                                                                      : nullptr));
         } else {
-            out = ggml_ext_linear(ctx->ggml_ctx, x, w, linear_bias, force_prec_f32, scale);
+            out = ggml_ext_linear(ctx->ggml_ctx,
+                                  x,
+                                  w,
+                                  linear_bias,
+                                  force_prec_f32,
+                                  scale,
+                                  int8_convrot ? GGML_HINT_INT8_CONVROT_256 : GGML_HINT_NONE,
+                                  int8_convrot ? direct_i8_dst : GGML_TYPE_COUNT);
         }
         if (scale_weight_global_in_graph && !ctx->weight_adapter) {
             out = ggml_mul(ctx->ggml_ctx, out, params["weight.wglobal"]);
         }
-        if (has_weight_scale) {
+        // With direct I8 + runtime LoRA, forward_with_lora() applies the row
+        // scale to the base GEMM before adding the floating LoRA delta.  Scaling
+        // the combined result here would incorrectly scale the adapter too.
+        if (has_weight_scale && !(int8_convrot && ctx->weight_adapter)) {
             out = ggml_mul(ctx->ggml_ctx, out, params["weight_scale"]);
         }
         if ((has_weight_scale || scale_weight_global_in_graph) && b != nullptr) {

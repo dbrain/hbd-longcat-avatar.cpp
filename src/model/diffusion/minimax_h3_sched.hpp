@@ -25,9 +25,10 @@
 //     flat ODE dX/dsigma_v; multiplying the audio branch by the slope is what makes that integral
 //     equal the audio stream's true ODE on ITS schedule.  Drop it and the audio simply denoises at
 //     the wrong rate -- no crash, no NaN, just mush.
-//     comfy uses the INSTANTANEOUS derivative here; diffusers PR #14355 runs a second audio
-//     scheduler, which is equivalent to the SECANT over the step.  Both live on TimestepPlan;
-//     which one the graph uses is chosen by the caller (MINIMAX_H3_AUDIO_SECANT).
+//     The engine uses the SECANT over the sampler step by default, matching the separate audio
+//     scheduler formulation in diffusers PR #14355.  The instantaneous derivative remains an
+//     explicit compatibility opt-out (`MINIMAX_H3_AUDIO_SECANT=0`).  Both values live on
+//     TimestepPlan so diagnostics can report the selected one.
 //   * the distinct timesteps are known ANALYTICALLY (there are at most four), so the AdaLN table is
 //     a handful of rows and every packed segment is uniform in (timestep, modality).  That is what
 //     lets the DiT modulate by contiguous slices instead of a per-row gather.
@@ -148,7 +149,7 @@ namespace MiniMaxH3 {
                                             float audio_cond_noise_aug,
                                             const std::vector<int>* text_token_tags,
                                             float sigma_v_next = -1.f,
-                                            bool use_secant    = false) {
+                                            bool use_secant    = true) {
         TimestepPlan plan;
         plan.seq_len = layout.seq_len;
 

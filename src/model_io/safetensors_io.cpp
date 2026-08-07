@@ -91,6 +91,12 @@ static ggml_type safetensors_dtype_to_ggml_type(const std::string& dtype) {
         ttype = GGML_TYPE_F16;
     } else if (dtype == "I32") {
         ttype = GGML_TYPE_I32;
+    } else if (dtype == "I8") {
+        // Comfy's int8_tensorwise checkpoints keep signed bytes as the actual
+        // Linear storage.  The accompanying comfy_quant metadata decides
+        // whether they have executable semantics; do not reinterpret them as
+        // GGML Q8_0 blocks.
+        ttype = GGML_TYPE_I8;
     } else if (dtype == "I64") {
         ttype = GGML_TYPE_I32;
     }
