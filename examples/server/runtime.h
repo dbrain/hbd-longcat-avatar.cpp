@@ -145,6 +145,8 @@ bool assign_output_options(VidGenJobRequest& request,
                            int output_compression,
                            std::string& error_message);
 std::string video_mime_type(const std::string& output_format);
+// Content type for an img_gen result served raw from `…/media?index=n` (B5).
+std::string image_mime_type(const std::string& output_format);
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode);
 std::string unsupported_generation_mode_error(SDMode mode);
 // Scan a LoRA directory and read its `loras.json`. FILESYSTEM ONLY — no CUDA, no model context —

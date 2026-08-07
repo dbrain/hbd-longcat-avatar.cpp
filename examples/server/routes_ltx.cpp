@@ -333,6 +333,22 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", unsupported_generation_mode_error(VID_GEN)}}).dump(), "application/json");
                 return;
             }
+            // `part:<name>` media (`docs/media-transport.md` §4). Registered for this thread
+            // BEFORE anything parses, because the top-level images are decoded during the parse,
+            // and moved onto the job below, because the per-shot ones are decoded on the worker
+            // thread minutes later. The move is the last use — nothing decodes between it and the
+            // end of this scope, where the registration lapses.
+            MediaPartTable media_parts = collect_media_parts(req);
+            if (const std::string bad = first_media_part_hash_mismatch(media_parts); !bad.empty()) {
+                // §9.3: a hash-named part whose bytes do not hash to its name was truncated or
+                // corrupted in transit. One hash to refuse it; accepting it renders something
+                // subtly wrong and returns 200.
+                res.status = 400;
+                res.set_content(json({{"error", "part " + bad + " does not match its content hash"}}).dump(),
+                                "application/json");
+                return;
+            }
+            ScopedMediaParts parts_guard(&media_parts);
             json body;
             if (!extract_ltx_request(req, body)) {
                 res.status = 400;
@@ -1272,6 +1288,7 @@ void register_ltx_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->kind = AsyncJobKind::VidGen;
             job->status = AsyncJobStatus::Queued;
             job->created_at = unix_timestamp_now();
+            job->media_parts = std::move(media_parts);
             job->vid_gen = std::move(request);
             job->ltx_v2v_mode = top_level_v2v_mode;
             job->ltx_relip_ref_tstride = relip_ref_tstride;

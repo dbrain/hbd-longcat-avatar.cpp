@@ -200,6 +200,16 @@ std::string video_mime_type(const std::string& output_format) {
     return "video/x-msvideo";
 }
 
+std::string image_mime_type(const std::string& output_format) {
+    if (output_format == "jpeg" || output_format == "jpg") {
+        return "image/jpeg";
+    }
+    if (output_format == "webp") {
+        return "image/webp";
+    }
+    return "image/png";
+}
+
 bool runtime_supports_generation_mode(const ServerRuntime& runtime, SDMode mode) {
     if (mode == VID_GEN) {
         return sd_ctx_supports_video_generation(runtime.sd_ctx);

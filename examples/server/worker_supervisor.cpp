@@ -730,7 +730,11 @@ void register_worker_supervisor_endpoints(httplib::Server& server, WorkerSupervi
 
     server.Get("/health", [&supervisor](const httplib::Request&, httplib::Response& response) {
         const int in_flight = supervisor.in_flight();
+        // `accepts_part_refs`: see routes_gpu_sharing.cpp. Answered by the SUPERVISOR rather than
+        // proxied, because koblem reads /health while the worker is unloaded — which is most of
+        // the time, and exactly when it is deciding how to build the next request.
         response.set_content(json({{"status", "ok"}, {"busy", in_flight > 0}, {"in_flight", in_flight},
+                                   {"accepts_part_refs", true},
                                    {"draining", supervisor.draining()}, {"loaded", supervisor.loaded()},
                                    {"loaded_model", supervisor.active_model()},
                                    {"worker_pid", supervisor.worker_pid() > 0 ? json(supervisor.worker_pid()) : json(nullptr)}}).dump(),

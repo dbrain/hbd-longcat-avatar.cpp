@@ -108,6 +108,43 @@ struct ArgOptions {
 };
 
 bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list);
+
+// ── `part:<name>` media references ───────────────────────────────────────────
+//
+// A media string in a request may be a base64 payload, a trusted absolute path, or -- since the
+// media-transport work -- `part:<name>`, naming a binary part of the same multipart request. The
+// transport rule is that an artifact never becomes a JSON string; a 194 KiB control frame costs
+// 259 KiB of base64 and there are 65 of them per relip window.
+//
+// Resolution is thread-local rather than threaded through every signature, because the funnel that
+// turns "a string that means an image" into pixels (`decode_base64_image`) is reached from a dozen
+// call sites across four routes and is also called on the WORKER thread long after the HTTP request
+// is gone. So the part bytes are copied into the job record at request time and re-registered by
+// the worker for the duration of the job -- one mechanism, two registration points, no signature
+// churn. httplib serves each request on its own thread and the worker is a single thread, so a
+// thread-local is exactly the right scope.
+using MediaPartTable = std::map<std::string, std::string>;
+
+// RAII: makes `parts` resolvable on THIS thread until it goes out of scope. Nests (the previous
+// table is restored), so a route may register the request's parts around a call that itself
+// registers a job's.
+class ScopedMediaParts {
+public:
+    explicit ScopedMediaParts(const MediaPartTable* parts);
+    ~ScopedMediaParts();
+    ScopedMediaParts(const ScopedMediaParts&)            = delete;
+    ScopedMediaParts& operator=(const ScopedMediaParts&) = delete;
+
+private:
+    const MediaPartTable* previous_ = nullptr;
+};
+
+// True for a string that names a part rather than carrying one.
+bool is_media_part_ref(const std::string& value);
+// The part `value` names, or nullptr when it names nothing registered. `value` may be the whole
+// `part:<name>` string or the bare name.
+const std::string* find_media_part(const std::string& value);
+
 bool decode_base64_image(const std::string& encoded_input,
                          int target_channels,
                          int expected_width,

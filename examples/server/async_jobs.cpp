@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -348,6 +349,11 @@ std::string make_async_job_id(AsyncJobManager& manager) {
     return oss.str();
 }
 
+bool async_job_media_inline_b64() {
+    const char* flag = std::getenv("SDCPP_JOB_MEDIA_B64");
+    return flag == nullptr || std::string(flag) != "0";
+}
+
 bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     auto new_end = std::remove(manager.queue.begin(), manager.queue.end(), job.id);
     if (new_end == manager.queue.end()) {
@@ -357,8 +363,8 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job) {
     manager.queue.erase(new_end, manager.queue.end());
     job.status       = AsyncJobStatus::Cancelled;
     job.completed_at = unix_timestamp_now();
-    job.result_images_b64.clear();
-    job.result_media_b64.clear();
+    job.result_images.clear();
+    job.result_media.clear();
     job.result_media_mime_type.clear();
     job.result_frame_count = 0;
     job.result_fps         = 0;
@@ -410,12 +416,28 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
                 {"mime_type", job.result_media_mime_type},
                 {"fps", job.result_fps},
                 {"frame_count", job.result_frame_count},
-                {"b64_json", job.result_media_b64},
+                {"bytes", static_cast<int64_t>(job.result_media.size())},
             };
+            // §4.1: inlining the artifact as base64 is now opt-OUT rather than the only option.
+            // With `SDCPP_JOB_MEDIA_B64=0` the poll body stays small and the client fetches
+            // `/media`, which serves the very same buffer with no encode, no decode and no copy.
+            // The field is OMITTED rather than sent empty, because an empty `b64_json` and a
+            // deliberately-not-inlined one must not read the same to a client.
+            if (async_job_media_inline_b64()) {
+                result["result"]["b64_json"] = base64_encode(job.result_media);
+            }
         } else {
-            json images = json::array();
-            for (size_t i = 0; i < job.result_images_b64.size(); ++i) {
-                images.push_back({{"index", i}, {"b64_json", job.result_images_b64[i]}});
+            // B5: each image is addressable at `…/media?index=<i>` as raw bytes. `b64_json` is
+            // inlined alongside only while the inline flag is on, so a client can move over
+            // without a flag day and an engine can stop paying for the encode.
+            const bool inline_b64 = async_job_media_inline_b64();
+            json images           = json::array();
+            for (size_t i = 0; i < job.result_images.size(); ++i) {
+                json entry = {{"index", i}, {"bytes", static_cast<int64_t>(job.result_images[i].size())}};
+                if (inline_b64) {
+                    entry["b64_json"] = base64_encode(job.result_images[i]);
+                }
+                images.push_back(std::move(entry));
             }
             result["result"] = {
                 {"output_format", job.img_gen.output_format},
@@ -479,8 +501,12 @@ json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJo
 
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
-                         std::vector<std::string>& output_images,
+                         std::vector<std::vector<uint8_t>>& output_images,
                          std::string& error_message) {
+    // Make this job's binary parts resolvable for the duration of the render: every media string
+    // is decoded HERE, on the worker thread, long after the request that carried the bytes
+    // returned a job id. See MediaPartTable in examples/common/common.h.
+    ScopedMediaParts media_parts(&job.media_parts);
     sd_img_gen_params_t params = job.img_gen.to_sd_img_gen_params_t();
 
     SDImageVec results;
@@ -561,7 +587,7 @@ bool execute_img_gen_job(ServerRuntime& runtime,
         if (image_bytes.empty()) {
             continue;
         }
-        output_images.push_back(base64_encode(image_bytes));
+        output_images.push_back(std::move(image_bytes));
     }
 
     if (output_images.empty()) {
@@ -574,11 +600,12 @@ bool execute_img_gen_job(ServerRuntime& runtime,
 
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
-                         std::string& output_media_b64,
+                         std::vector<uint8_t>& output_media,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,
                          std::string& error_message) {
+    ScopedMediaParts media_parts(&job.media_parts);
     sd_vid_gen_params_t params = job.vid_gen.to_sd_vid_gen_params_t();
     params.audio_fill_gaps = job.ltx_audio_fill_gaps ? 1 : 0;
     // The production LipDub client sends its source frames at the top level,
@@ -1075,7 +1102,7 @@ bool execute_vid_gen_job(ServerRuntime& runtime,
         return false;
     }
 
-    output_media_b64       = base64_encode(video_bytes);
+    output_media           = std::move(video_bytes);
     output_media_mime_type = video_mime_type(job.vid_gen.output_format);
     output_frame_count     = num_results;
     output_fps             = job.vid_gen.gen_params.fps;
@@ -1113,8 +1140,8 @@ void async_job_worker(ServerRuntime& runtime) {
             job->started_at = unix_timestamp_now();
         }
 
-        std::vector<std::string> output_images;
-        std::string output_media_b64;
+        std::vector<std::vector<uint8_t>> output_images;
+        std::vector<uint8_t> output_media;
         std::string output_media_mime_type;
         int output_frame_count = 0;
         int output_fps         = 0;
@@ -1126,7 +1153,7 @@ void async_job_worker(ServerRuntime& runtime) {
         } else if (job->kind == AsyncJobKind::VidGen) {
             ok = execute_vid_gen_job(runtime,
                                      *job,
-                                     output_media_b64,
+                                     output_media,
                                      output_media_mime_type,
                                      output_frame_count,
                                      output_fps,
@@ -1147,15 +1174,15 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->status = AsyncJobStatus::Cancelled;
                 job->error_code = "cancelled";
                 job->error_message = "job cancelled by client";
-                job->result_images_b64.clear();
-                job->result_media_b64.clear();
+                job->result_images.clear();
+                job->result_media.clear();
                 job->result_media_mime_type.clear();
                 job->result_frame_count = 0;
                 job->result_fps = 0;
             } else if (ok) {
                 job->status                 = AsyncJobStatus::Completed;
-                job->result_images_b64      = std::move(output_images);
-                job->result_media_b64       = std::move(output_media_b64);
+                job->result_images          = std::move(output_images);
+                job->result_media           = std::move(output_media);
                 job->result_media_mime_type = std::move(output_media_mime_type);
                 job->result_frame_count     = output_frame_count;
                 job->result_fps             = output_fps;
@@ -1165,8 +1192,8 @@ void async_job_worker(ServerRuntime& runtime) {
                 job->status        = AsyncJobStatus::Failed;
                 job->error_code    = "generation_failed";
                 job->error_message = error_message.empty() ? "unknown generation error" : error_message;
-                job->result_images_b64.clear();
-                job->result_media_b64.clear();
+                job->result_images.clear();
+                job->result_media.clear();
                 job->result_media_mime_type.clear();
                 job->result_frame_count = 0;
                 job->result_fps         = 0;

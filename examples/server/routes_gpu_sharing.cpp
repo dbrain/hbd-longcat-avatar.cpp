@@ -46,6 +46,10 @@ void register_gpu_sharing_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         AsyncJobManager& manager = *runtime->async_job_manager;
         std::lock_guard<std::mutex> lock(manager.mutex);
         const int in_flight = active_jobs(manager);
+        // `accepts_part_refs` is the deploy-order gate (`docs/media-transport.md` §9.4): koblem
+        // may only send `part:<name>` media to an engine that says it understands it. Without a
+        // flag, rolling an engine back while koblem is on the new path turns every marker into a
+        // string that fails to decode — a corrupt request rather than a clean fallback.
         set_json(res,
                  {
                      {"status", "ok"},
@@ -53,6 +57,7 @@ void register_gpu_sharing_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                      {"in_flight", in_flight},
                      {"draining", runtime_is_draining(*runtime)},
                      {"loaded", runtime->gpu_sharing != nullptr && runtime->gpu_sharing->diffusion_loaded.load()},
+                     {"accepts_part_refs", true},
                  });
     });
 

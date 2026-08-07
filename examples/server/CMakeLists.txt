@@ -69,6 +69,7 @@ add_executable(${TARGET}
     main.cpp
     runtime.cpp
     async_jobs.cpp
+    media_parts.cpp
     routes_index.cpp
     routes_openai.cpp
     routes_sdapi.cpp

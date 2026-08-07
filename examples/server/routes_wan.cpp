@@ -133,6 +133,20 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 res.set_content(json({{"error", unsupported_generation_mode_error(VID_GEN)}}).dump(), "application/json");
                 return;
             }
+            // `part:<name>` media (`docs/media-transport.md` §4). Registered for this thread
+            // BEFORE anything parses, because the top-level images are decoded during the parse,
+            // and moved onto the job below for anything decoded later on the worker thread. The
+            // move is the last use — nothing decodes between it and the end of this scope.
+            MediaPartTable media_parts = collect_media_parts(req);
+            if (const std::string bad = first_media_part_hash_mismatch(media_parts); !bad.empty()) {
+                // §9.3: a hash-named part whose bytes do not hash to its name was truncated or
+                // corrupted in transit.
+                res.status = 400;
+                res.set_content(json({{"error", "part " + bad + " does not match its content hash"}}).dump(),
+                                "application/json");
+                return;
+            }
+            ScopedMediaParts parts_guard(&media_parts);
             json body;
             std::vector<uint8_t> anchor;
             if (!extract_wan_request(req, body, anchor)) {
@@ -167,7 +181,12 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 body["video_frames"] = body["frames"];
             }
             if (!anchor.empty()) {
-                body["init_image"] = std::string("data:image/png;base64,") + base64_encode(anchor);
+                // The anchor arrived as binary and is about to be decoded as an image: hand it
+                // over as a part rather than base64ing it into the document and decoding it right
+                // back (§1.3 — the same pure round trip the H3 path had). The name cannot collide
+                // with a caller's: `part:` names come from koblem's hash-derived staging.
+                media_parts["__wan_anchor"] = std::string(anchor.begin(), anchor.end());
+                body["init_image"]          = "part:__wan_anchor";
             }
 
             VidGenJobRequest request;
@@ -182,6 +201,7 @@ void register_wan_video_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->kind = AsyncJobKind::VidGen;
             job->status = AsyncJobStatus::Queued;
             job->created_at = unix_timestamp_now();
+            job->media_parts = std::move(media_parts);
             job->vid_gen = std::move(request);
             job->wan_vace_prompts = std::move(prompts);
             const std::string resume_job_id = body.value("resume_job_id", std::string());

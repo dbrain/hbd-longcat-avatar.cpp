@@ -53,6 +53,17 @@ private:
 };
 
 bool decode_avatar_blob(const std::string& value, std::vector<uint8_t>& bytes) {
+    // `part:<name>` — the WAV rode as a binary part of this request rather than as ~40 MB of
+    // base64 inside it (`docs/media-transport.md` §4/§5: a 3-minute drive track is the single
+    // biggest inline payload on the avatar path).
+    if (is_media_part_ref(value)) {
+        const std::string* part = find_media_part(value);
+        if (part == nullptr || part->empty()) {
+            return false;
+        }
+        bytes.assign(part->begin(), part->end());
+        return true;
+    }
     std::string encoded = value;
     if (encoded.rfind("data:", 0) == 0) {
         const size_t comma = encoded.find(',');
@@ -203,9 +214,14 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
     // supervisor's deliberate "worker is unloaded" branch => the caller sees a mid-render 410.
     // Counting live async jobs closes that hole.
     svr.Get("/health", [runtime](const httplib::Request&, httplib::Response& res) {
+        // `accepts_part_refs` is the deploy-order gate (`docs/media-transport.md` §9.4): koblem
+        // may only send `part:<name>` media to an engine that says it understands it. Without a
+        // flag, rolling an engine back while koblem is on the new path turns every marker into a
+        // string that fails to decode — a corrupt request rather than a clean fallback.
         res.set_content(json({{"status", "ok"},
                               {"busy", avatar_rendering.load() || async_job_in_flight(runtime->async_job_manager)},
                               {"draining", runtime_is_draining(*runtime)},
+                              {"accepts_part_refs", true},
                               {"loaded", runtime->gpu_sharing == nullptr || runtime->gpu_sharing->diffusion_loaded.load()}})
                             .dump(),
                         "application/json");
@@ -228,12 +244,41 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
         } reset_busy;
 
         try {
-            if (req.body.empty()) {
+            if (req.body.empty() && !req.is_multipart_form_data()) {
                 res.status = 400;
                 res.set_content(R"({"error":"empty body"})", "application/json");
                 return;
             }
-            json body = json::parse(req.body);
+            // `part:<name>` media (§4). The avatar path decodes BOTH its inputs during the parse
+            // below — the portrait through the image funnel, the drive WAV through
+            // `decode_avatar_blob` — so the registration only has to span this handler.
+            MediaPartTable media_parts = collect_media_parts(req);
+            if (const std::string bad = first_media_part_hash_mismatch(media_parts); !bad.empty()) {
+                res.status = 400;
+                res.set_content(json({{"error", "part " + bad + " does not match its content hash"}}).dump(),
+                                "application/json");
+                return;
+            }
+            ScopedMediaParts parts_guard(&media_parts);
+            json body;
+            if (req.is_multipart_form_data()) {
+                // A `request` part holds the document; the portrait and the WAV are binary parts
+                // it names. Same shape as /ltx/v1/generate and /h3/v1/generate.
+                std::string document;
+                if (req.form.has_field("request")) {
+                    document = req.form.get_field("request");
+                } else if (req.form.has_file("request")) {
+                    document = req.form.get_file("request").content;
+                }
+                if (document.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"multipart requires a non-empty request part"})", "application/json");
+                    return;
+                }
+                body = json::parse(document);
+            } else {
+                body = json::parse(req.body);
+            }
             const std::string image = body.value("image", std::string());
             const std::string audio = body.value("audio", std::string());
             if (image.empty() || audio.empty()) {
@@ -242,7 +287,9 @@ void register_longcat_avatar_endpoints(httplib::Server& svr, ServerRuntime& rt) 
                 return;
             }
             if (!body.contains("init_image")) {
-                body["init_image"] = image.rfind("data:", 0) == 0
+                // A `part:` reference and a data URI are both passed through untouched; only a
+                // bare base64 payload needs the prefix the image funnel expects.
+                body["init_image"] = (image.rfind("data:", 0) == 0 || is_media_part_ref(image))
                                          ? image
                                          : std::string("data:image/png;base64,") + image;
             }

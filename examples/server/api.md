@@ -736,7 +736,24 @@ Example:
 Any image field accepts:
 
 - a raw base64 string, or
-- a data URL such as `data:image/png;base64,...`
+- a data URL such as `data:image/png;base64,...`, or
+- `part:<name>`, naming a binary part of the SAME multipart request.
+
+`part:` is the preferred form and the reason `/sdcpp/v1/img_gen` and `/sdcpp/v1/vid_gen` accept a
+multipart body at all: send a `request` part holding the JSON document plus one binary part per
+image, and no artifact ever becomes a JSON string. A 194 KiB control frame costs 259 KiB inlined,
+and a relip window carries 65 of them. Base64 stays accepted indefinitely — the two forms may be
+mixed in one request, per field.
+
+Part names are free-form with one convention: a name shaped `a_<16 lowercase hex>` is read as the
+first 16 hex digits of the part's SHA-256, and the server VERIFIES it on receipt. A mismatch is a
+400 naming the part, rather than a subtly wrong render returning 200. Any other name is taken as
+given and not checked.
+
+An unknown part name fails exactly as undecodable base64 does: a 400 naming the field that held it.
+
+Servers that understand `part:` say so in `GET /health` as `"accepts_part_refs": true`. Gate on
+that flag rather than on deploy order — an older engine reads the marker as base64 and fails.
 
 Channel expectations:
 
@@ -899,6 +916,7 @@ Example completed job:
     "images": [
       {
         "index": 0,
+        "bytes": 1483920,
         "b64_json": "iVBORw0KGgoAAA..."
       }
     ]
@@ -906,6 +924,14 @@ Example completed job:
   "error": null
 }
 ```
+
+Every image is also served RAW at `GET /sdcpp/v1/jobs/{id}/media?index=<index>` — same buffer, no
+encode, no decode, a third fewer bytes. `index` defaults to `0`.
+
+`b64_json` is present only while the artifact is inlined; with `SDCPP_JOB_MEDIA_B64=0` in the
+server's environment the field is OMITTED (not empty) and `…/media?index=n` is the way to collect
+a result. `bytes` is always present, so a client can tell "not inlined" from "empty render" without
+fetching anything.
 
 ### Failure Result
 
@@ -1095,7 +1121,24 @@ Example:
 Any image field accepts:
 
 - a raw base64 string, or
-- a data URL such as `data:image/png;base64,...`
+- a data URL such as `data:image/png;base64,...`, or
+- `part:<name>`, naming a binary part of the SAME multipart request.
+
+`part:` is the preferred form and the reason `/sdcpp/v1/img_gen` and `/sdcpp/v1/vid_gen` accept a
+multipart body at all: send a `request` part holding the JSON document plus one binary part per
+image, and no artifact ever becomes a JSON string. A 194 KiB control frame costs 259 KiB inlined,
+and a relip window carries 65 of them. Base64 stays accepted indefinitely — the two forms may be
+mixed in one request, per field.
+
+Part names are free-form with one convention: a name shaped `a_<16 lowercase hex>` is read as the
+first 16 hex digits of the part's SHA-256, and the server VERIFIES it on receipt. A mismatch is a
+400 naming the part, rather than a subtly wrong render returning 200. Any other name is taken as
+given and not checked.
+
+An unknown part name fails exactly as undecodable base64 does: a 400 naming the field that held it.
+
+Servers that understand `part:` say so in `GET /health` as `"accepts_part_refs": true`. Gate on
+that flag rather than on deploy order — an older engine reads the marker as base64 and fails.
 
 Channel expectations:
 
@@ -1233,7 +1276,11 @@ Completed jobs return one encoded container payload, not a list of per-frame ima
 
 Result fields:
 
-- `result.b64_json` contains the whole encoded container file as base64
+- `result.b64_json` contains the whole encoded container file as base64 — present ONLY while the
+  artifact is inlined. `SDCPP_JOB_MEDIA_B64=0` in the server's environment omits it, and the
+  client collects the render from `GET /sdcpp/v1/jobs/{id}/media`, which serves the identical
+  buffer raw. A 220 MB render is a 293 MB JSON string inlined, constructed here and parsed there.
+- `result.bytes` is the size of the container in bytes, present either way
 - `result.mime_type` identifies the media type
 - `result.output_format` echoes the selected container format
 - `result.fps` echoes the effective playback FPS

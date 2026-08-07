@@ -11,6 +11,7 @@
 #include <vector>
 
 
+#include "common/common.h"
 #include "runtime.h"
 
 enum class AsyncJobKind {
@@ -193,8 +194,22 @@ struct AsyncGenerationJob {
     int ltx_resume_from = 0;
     int ltx_cont_latent_frames = 3;
     bool ltx_emit_segments = false;
-    std::vector<std::string> result_images_b64;
-    std::string result_media_b64;
+    // Binary parts of the submitting multipart request, by part name, for every media string in
+    // this job that reads `part:<name>` (`docs/media-transport.md` §4). Copied out of the request
+    // because the request is long gone by the time the worker decodes anything: the HTTP handler
+    // returns a job id immediately, and images are turned into pixels on the worker thread.
+    //
+    // This is the same residency the base64 had -- and a quarter less of it -- for the job's TTL.
+    MediaPartTable media_parts;
+    // Finished images, RAW, in result order. Same reasoning as `result_media` below: base64 is
+    // produced only if the caller wants it inline, and `GET /sdcpp/v1/jobs/{id}/media?index=n`
+    // serves entry n verbatim (`docs/media-transport.md` §4.1, B5).
+    std::vector<std::vector<uint8_t>> result_images;
+    // The finished container, RAW (`docs/media-transport.md` §4.1). It used to be held base64,
+    // which cost a third more residency for the whole 600 s job TTL — ~70 MB per completed job on
+    // a typical render — and made `/media` pay a decode plus a copy on every fetch. Base64 is
+    // produced lazily, and only when the caller has asked for it inline.
+    std::vector<uint8_t> result_media;
     std::string result_media_mime_type;
     int result_frame_count = 0;
     int result_fps         = 0;
@@ -227,11 +242,20 @@ bool cancel_queued_job(AsyncJobManager& manager, AsyncGenerationJob& job);
 json make_async_job_json(const AsyncJobManager& manager, const AsyncGenerationJob& job);
 bool execute_img_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
-                         std::vector<std::string>& output_images,
+                         std::vector<std::vector<uint8_t>>& output_images,
                          std::string& error_message);
+// Is the finished artifact inlined into the poll body as base64?
+//
+// `SDCPP_JOB_MEDIA_B64=0` turns it off; anything else (including unset) leaves it on, so an engine
+// that is upgraded without its deployment being touched behaves exactly as before. Off, the client
+// fetches `GET /sdcpp/v1/jobs/{id}/media` for the same bytes with no encode and no decode
+// (`docs/media-transport.md` §4.1). Read per call rather than cached: it is one getenv on a path
+// that has just encoded a video.
+bool async_job_media_inline_b64();
+
 bool execute_vid_gen_job(ServerRuntime& runtime,
                          AsyncGenerationJob& job,
-                         std::string& output_media_b64,
+                         std::vector<uint8_t>& output_media,
                          std::string& output_media_mime_type,
                          int& output_frame_count,
                          int& output_fps,

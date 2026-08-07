@@ -1702,11 +1702,67 @@ static std::vector<uint8_t> decode_base64_bytes(const std::string& encoded_strin
     return ret;
 }
 
+static const char* const k_media_part_prefix = "part:";
+
+// The table registered for this thread. See ScopedMediaParts in common.h for why it is thread-local
+// rather than a parameter.
+static thread_local const MediaPartTable* g_media_parts = nullptr;
+
+ScopedMediaParts::ScopedMediaParts(const MediaPartTable* parts)
+    : previous_(g_media_parts) {
+    g_media_parts = parts;
+}
+
+ScopedMediaParts::~ScopedMediaParts() {
+    g_media_parts = previous_;
+}
+
+bool is_media_part_ref(const std::string& value) {
+    return value.rfind(k_media_part_prefix, 0) == 0;
+}
+
+const std::string* find_media_part(const std::string& value) {
+    if (g_media_parts == nullptr) {
+        return nullptr;
+    }
+    const std::string name = is_media_part_ref(value) ? value.substr(std::char_traits<char>::length(k_media_part_prefix)) : value;
+    auto it                = g_media_parts->find(name);
+    if (it == g_media_parts->end() || it->second.empty()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
 bool decode_base64_image(const std::string& encoded_input,
                          int target_channels,
                          int expected_width,
                          int expected_height,
                          SDImageOwner& out_image) {
+    // A `part:<name>` reference: the bytes are already bytes, on a binary part of this request.
+    // Nothing is decoded, and the caller's error path is unchanged -- an unknown part name fails
+    // here exactly as undecodable base64 would, and the caller already names the field it was
+    // reading.
+    if (is_media_part_ref(encoded_input)) {
+        const std::string* part = find_media_part(encoded_input);
+        if (part == nullptr) {
+            return false;
+        }
+        int part_width    = 0;
+        int part_height   = 0;
+        uint8_t* raw_part = load_image_from_memory(part->data(),
+                                                   static_cast<int>(part->size()),
+                                                   part_width,
+                                                   part_height,
+                                                   expected_width,
+                                                   expected_height,
+                                                   target_channels);
+        if (raw_part == nullptr) {
+            return false;
+        }
+        out_image.reset({(uint32_t)part_width, (uint32_t)part_height, (uint32_t)target_channels, raw_part});
+        return true;
+    }
+
     std::string encoded = encoded_input;
     auto comma_pos      = encoded.find(',');
     if (comma_pos != std::string::npos) {

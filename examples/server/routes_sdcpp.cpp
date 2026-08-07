@@ -9,6 +9,35 @@
 
 namespace fs = std::filesystem;
 
+// The request document, from either body shape.
+//
+// JSON body: the whole body IS the document, which is every caller before the media-transport
+// work. Multipart: a `request` part holds the document and the binary parts alongside it carry the
+// media that used to be base64 inside it (`docs/media-transport.md` §4). `/ltx/v1/generate` and
+// `/wan/v1/generate` were already multipart; this is what brings `/sdcpp/v1/*` up to them.
+static bool extract_sdcpp_request(const httplib::Request& req, json& out) {
+    if (!req.is_multipart_form_data()) {
+        if (req.body.empty()) {
+            return false;
+        }
+        out = json::parse(req.body);
+        return true;
+    }
+    std::string document;
+    if (req.form.has_field("request")) {
+        document = req.form.get_field("request");
+    } else if (req.form.has_file("request")) {
+        document = req.form.get_file("request").content;
+    } else {
+        return false;
+    }
+    if (document.empty()) {
+        return false;
+    }
+    out = json::parse(document);
+    return true;
+}
+
 static bool parse_cache_mode(const std::string& mode_str, sd_cache_mode_t& mode_out) {
     if (mode_str == "disabled") {
         mode_out = SD_CACHE_DISABLED;
@@ -446,7 +475,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
     svr.Post("/sdcpp/v1/img_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
-            if (req.body.empty()) {
+            if (req.body.empty() && !req.is_multipart_form_data()) {
                 res.status = 400;
                 res.set_content(R"({"error":"empty body"})", "application/json");
                 return;
@@ -457,7 +486,28 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            json body = json::parse(req.body);
+            // `part:<name>` media (`docs/media-transport.md` §4). Registered for this thread
+            // BEFORE anything parses, because the top-level images are decoded during the parse,
+            // and moved onto the job below, because the per-shot ones are decoded on the worker
+            // thread minutes later. The move is the last use — nothing decodes between it and the
+            // end of this scope, where the registration lapses.
+            MediaPartTable media_parts = collect_media_parts(req);
+            if (const std::string bad = first_media_part_hash_mismatch(media_parts); !bad.empty()) {
+                // §9.3: a hash-named part whose bytes do not hash to its name was truncated or
+                // corrupted in transit. One hash to refuse it; accepting it renders something
+                // subtly wrong and returns 200.
+                res.status = 400;
+                res.set_content(json({{"error", "part " + bad + " does not match its content hash"}}).dump(),
+                                "application/json");
+                return;
+            }
+            ScopedMediaParts parts_guard(&media_parts);
+            json body;
+            if (!extract_sdcpp_request(req, body)) {
+                res.status = 400;
+                res.set_content(R"({"error":"missing or invalid request"})", "application/json");
+                return;
+            }
             ImgGenJobRequest request;
             std::string error_message;
             if (!parse_img_gen_request(body, *runtime, request, error_message)) {
@@ -471,6 +521,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->kind                               = AsyncJobKind::ImgGen;
             job->status                             = AsyncJobStatus::Queued;
             job->created_at                         = unix_timestamp_now();
+            job->media_parts = std::move(media_parts);
             job->img_gen                            = std::move(request);
 
             {
@@ -508,7 +559,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
     svr.Post("/sdcpp/v1/vid_gen", [runtime](const httplib::Request& req, httplib::Response& res) {
         try {
-            if (req.body.empty()) {
+            if (req.body.empty() && !req.is_multipart_form_data()) {
                 res.status = 400;
                 res.set_content(R"({"error":"empty body"})", "application/json");
                 return;
@@ -519,7 +570,28 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
                 return;
             }
 
-            json body = json::parse(req.body);
+            // `part:<name>` media (`docs/media-transport.md` §4). Registered for this thread
+            // BEFORE anything parses, because the top-level images are decoded during the parse,
+            // and moved onto the job below, because the per-shot ones are decoded on the worker
+            // thread minutes later. The move is the last use — nothing decodes between it and the
+            // end of this scope, where the registration lapses.
+            MediaPartTable media_parts = collect_media_parts(req);
+            if (const std::string bad = first_media_part_hash_mismatch(media_parts); !bad.empty()) {
+                // §9.3: a hash-named part whose bytes do not hash to its name was truncated or
+                // corrupted in transit. One hash to refuse it; accepting it renders something
+                // subtly wrong and returns 200.
+                res.status = 400;
+                res.set_content(json({{"error", "part " + bad + " does not match its content hash"}}).dump(),
+                                "application/json");
+                return;
+            }
+            ScopedMediaParts parts_guard(&media_parts);
+            json body;
+            if (!extract_sdcpp_request(req, body)) {
+                res.status = 400;
+                res.set_content(R"({"error":"missing or invalid request"})", "application/json");
+                return;
+            }
             VidGenJobRequest request;
             std::string error_message;
             if (!parse_vid_gen_request(body, *runtime, request, error_message)) {
@@ -533,6 +605,7 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             job->kind                               = AsyncJobKind::VidGen;
             job->status                             = AsyncJobStatus::Queued;
             job->created_at                         = unix_timestamp_now();
+            job->media_parts = std::move(media_parts);
             job->vid_gen                            = std::move(request);
 
             {
@@ -592,28 +665,74 @@ void register_sdcpp_api_endpoints(httplib::Server& svr, ServerRuntime& rt) {
 
     svr.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/media)", [runtime](const httplib::Request& req, httplib::Response& res) {
         AsyncJobManager& manager = *runtime->async_job_manager;
-        std::lock_guard<std::mutex> lock(manager.mutex);
-        purge_expired_jobs(manager);
-        const auto it = manager.jobs.find(req.matches[1]);
-        if (it == manager.jobs.end()) {
-            res.status = manager.expired_jobs.count(req.matches[1]) ? 410 : 404;
-            res.set_content(R"({"error":"job not found or expired"})", "application/json");
-            return;
+        // Take a REFERENCE to the job under the lock and let go of it before writing the body
+        // (`docs/media-transport.md` §4.1). With `SDCPP_JOB_MEDIA_B64=0` this becomes the normal
+        // way every render is collected, and `manager.mutex` also serialises every status poll on
+        // the service — holding it across a 70 MB copy would stall the poll loop of any other
+        // in-flight job. The shared_ptr keeps the record alive even if the sweeper drops it.
+        std::shared_ptr<AsyncGenerationJob> job;
+        {
+            std::lock_guard<std::mutex> lock(manager.mutex);
+            purge_expired_jobs(manager);
+            const auto it = manager.jobs.find(req.matches[1]);
+            if (it == manager.jobs.end()) {
+                res.status = manager.expired_jobs.count(req.matches[1]) ? 410 : 404;
+                res.set_content(R"({"error":"job not found or expired"})", "application/json");
+                return;
+            }
+            job = it->second;
         }
-        const auto& job = *it->second;
-        if (job.status != AsyncJobStatus::Completed || job.kind != AsyncJobKind::VidGen) {
+        if (job->status != AsyncJobStatus::Completed) {
             res.status = 409;
-            res.set_content(R"({"error":"video job is not complete"})", "application/json");
+            res.set_content(R"({"error":"job is not complete"})", "application/json");
             return;
         }
-        std::vector<uint8_t> media;
-        if (!base64_decode(job.result_media_b64, media)) {
+        // B5: the same route serves an IMAGE job's output n, so an image result is fetched raw
+        // instead of read out of `result.images[].b64_json`. `index` defaults to 0, which is the
+        // only image on every single-image render.
+        if (job->kind == AsyncJobKind::ImgGen) {
+            size_t index = 0;
+            if (req.has_param("index")) {
+                const std::string raw = req.get_param_value("index");
+                try {
+                    const long long parsed = std::stoll(raw);
+                    if (parsed < 0) throw std::out_of_range("negative");
+                    index = static_cast<size_t>(parsed);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"index must be a non-negative integer"})", "application/json");
+                    return;
+                }
+            }
+            if (index >= job->result_images.size()) {
+                res.status = 404;
+                res.set_content(json({{"error", "no image at index " + std::to_string(index)},
+                                      {"images", job->result_images.size()}})
+                                    .dump(),
+                                "application/json");
+                return;
+            }
+            res.status = 200;
+            res.set_content(reinterpret_cast<const char*>(job->result_images[index].data()),
+                            job->result_images[index].size(),
+                            image_mime_type(job->img_gen.output_format));
+            return;
+        }
+        if (job->kind != AsyncJobKind::VidGen) {
+            res.status = 409;
+            res.set_content(R"({"error":"job has no media"})", "application/json");
+            return;
+        }
+        if (job->result_media.empty()) {
             res.status = 500;
             res.set_content(R"({"error":"stored video result is invalid"})", "application/json");
             return;
         }
+        // Served straight out of the job record: no decode, and no second buffer.
         res.status = 200;
-        res.set_content(reinterpret_cast<const char*>(media.data()), media.size(), job.result_media_mime_type);
+        res.set_content(reinterpret_cast<const char*>(job->result_media.data()),
+                        job->result_media.size(),
+                        job->result_media_mime_type);
     });
 
     svr.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)", [runtime](const httplib::Request& req, httplib::Response& res) {
