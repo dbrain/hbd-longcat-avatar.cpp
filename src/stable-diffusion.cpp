@@ -276,6 +276,14 @@ public:
     // expert loaded under its own prefix.
     std::vector<std::pair<std::string, std::string>> nvfp4_weight_global_legs;
 
+    // Path of the DiT whose params are CURRENTLY registered. Boot sets it; swap_diffusion_model
+    // re-points it. release_diffusion_params()/reacquire_diffusion_params() need it to put back
+    // exactly what they took away -- nvfp4_weight_global_legs cannot serve here because it holds
+    // the BOOT legs and a hot-swap deliberately does not rewrite it.
+    std::string current_diffusion_model_path;
+    // Set while the DiT's parameter buffer has been handed back between sampling and VAE decode.
+    bool diffusion_params_released = false;
+
     std::shared_ptr<Conditioner> cond_stage_model;
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
     std::shared_ptr<DiffusionModelRunner> diffusion_model;
@@ -901,6 +909,69 @@ public:
     // which drops the outgoing CPU/VRAM blocks before the new loader source is
     // made available. This deliberately supports only architecture-compatible
     // variants (the existing tensor metadata validation enforces that).
+    // Hand the DiT's PARAMETER BUFFER back, not just its staging.
+    //
+    // runner_done() is not enough when the DiT is GPU-resident (flux2 runs without
+    // --offload-to-cpu because the NVFP4 cuBLASLt in-place repack is incompatible with it):
+    // it releases *staged* params, and a resident model has none staged, so it frees nothing.
+    // MEASURED on klein-4b @1024^2: request peak was 5594 MiB with and without that call,
+    // because VAE decode -- the single largest allocation in the pipeline -- runs on top of
+    // 2346 MiB of still-resident weights.
+    //
+    // This is the same release half that swap_diffusion_model() performs; the difference is
+    // that nothing is loaded in its place until the next request calls reacquire.
+    // Opt-in per service via SD_RELEASE_DIT_BEFORE_DECODE, because it trades a reload on the
+    // next request (~0.5s from mmap'd nvme) for the peak reduction, which is only the right
+    // trade for a service sized to co-schedule rather than to minimise latency.
+    bool release_diffusion_params() {
+        if (diffusion_params_released || diffusion_model == nullptr || model_manager == nullptr) {
+            return false;
+        }
+        if (current_diffusion_model_path.empty()) {
+            // Without a path to reload from, releasing would be a one-way trip.
+            LOG_WARN("release_diffusion_params: no recorded DiT path; keeping weights resident");
+            return false;
+        }
+        invalidate_weight_dependent_caches();
+        diffusion_model->runner_done();
+        if (!model_manager->unregister_param_tensors("Diffusion model")) {
+            LOG_ERROR("release_diffusion_params: could not release diffusion tensors");
+            return false;
+        }
+        diffusion_params_released = true;
+        return true;
+    }
+
+    // Put back what release_diffusion_params() took. Mirrors the reload half of
+    // swap_diffusion_model() against the SAME file. No-op unless a release is outstanding.
+    bool reacquire_diffusion_params() {
+        if (!diffusion_params_released) {
+            return true;
+        }
+        ModelLoader& loader = model_manager->loader();
+        if (!loader.init_from_file(current_diffusion_model_path, "model.diffusion_model.")) {
+            LOG_ERROR("reacquire_diffusion_params: could not reload '%s'", current_diffusion_model_path.c_str());
+            return false;
+        }
+        if (!register_runner_params("Diffusion model", diffusion_model, SDBackendModule::DIFFUSION)) {
+            LOG_ERROR("reacquire_diffusion_params: could not re-register '%s'", current_diffusion_model_path.c_str());
+            return false;
+        }
+        // The registry is process-global and was cleared of this DiT's scalars on release, so
+        // it has to be rebuilt exactly as the swap path does -- including any leg (a MoE
+        // high-noise expert, an uncond DiT) that this release never touched.
+        std::vector<std::pair<std::string, std::string>> legs = {
+            {current_diffusion_model_path, "model.diffusion_model."}};
+        for (const auto& leg : nvfp4_weight_global_legs) {
+            if (!leg.first.empty() && !leg.second.empty() && leg.second != "model.diffusion_model.") {
+                legs.push_back(leg);
+            }
+        }
+        register_nvfp4_weight_globals(legs, "reacquire_diffusion_params");
+        diffusion_params_released = false;
+        return true;
+    }
+
     bool swap_diffusion_model(const std::string& path) {
         if (path.empty() || diffusion_model == nullptr || model_manager == nullptr) {
             LOG_ERROR("swap_diffusion_model: missing path, diffusion runner, or model manager");
@@ -975,6 +1046,8 @@ public:
             }
         }
         register_nvfp4_weight_globals(legs, "swap_diffusion_model");
+        current_diffusion_model_path = path;
+        diffusion_params_released   = false;
         LOG_INFO("swap_diffusion_model: selected '%s'; weights will load lazily", path.c_str());
         return true;
     }
@@ -1173,6 +1246,9 @@ public:
             if (!model_loader.init_from_file(sd_ctx_params->diffusion_model_path, "model.diffusion_model.")) {
                 LOG_WARN("loading diffusion model from '%s' failed", sd_ctx_params->diffusion_model_path);
             }
+            // Recorded so release_diffusion_params() can put this exact file back later. A
+            // later hot-swap re-points it.
+            current_diffusion_model_path = sd_ctx_params->diffusion_model_path;
         }
 
         if (strlen(SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path)) > 0) {
@@ -7381,6 +7457,16 @@ struct ImageGenerationEmbeds {
     SDCondition img_uncond;
 };
 
+// Opt-in (SD_RELEASE_DIT_BEFORE_DECODE=1): hand the DiT's parameter buffer back between
+// sampling and VAE decode. Read once -- this is hit on every request.
+static bool sd_release_dit_before_decode() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("SD_RELEASE_DIT_BEFORE_DECODE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
+
 struct ConditionerRunnerDoneOnExit {
     Conditioner* conditioner = nullptr;
     ~ConditionerRunnerDoneOnExit() {
@@ -8253,6 +8339,14 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
 
     sd_ctx->sd->reset_cancel_flag();
 
+    // Put the DiT back if the previous request released it before VAE decode. No-op otherwise.
+    // Done here, before conditioning, so the reload overlaps nothing and shows up as its own
+    // cost rather than inflating the sampling timer.
+    if (!sd_ctx->sd->reacquire_diffusion_params()) {
+        LOG_ERROR("generate_image: could not reacquire the released diffusion model");
+        return false;
+    }
+
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
     GenerationRequest request(sd_ctx, sd_img_gen_params);
@@ -8479,6 +8573,33 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
         LOG_INFO("hires fix completed, taking %.2fs", (hires_denoise_end - hires_denoise_start) * 1.0f / 1000);
 
         final_latents = std::move(hires_final_latents);
+    }
+
+    // All sampling (including hires) is done, so the DiT's staged residency is dead weight for
+    // the rest of the request. Mirrors what the conditioner already does for the text encoder
+    // (ConditionerRunnerDoneOnExit, scoped to prepare_image_generation_embeds) and reuses the
+    // same ModelManager path as sd_ctx_free_diffusion_model: a later compute re-stages the
+    // still-registered tensors on demand.
+    //
+    // ⚠️ MEASURE BEFORE EXPECTING A VRAM WIN HERE. On a GPU-RESIDENT DiT this frees nothing,
+    // because runner_done() releases *staged* params and a resident model has nothing staged.
+    // klein-4b @1024^2 (flux2 runs without --offload-to-cpu, so `diffusion_model 2346.40MB(VRAM)`):
+    // request peak was 5594 MiB with and without this call -- VAE decode still stacks on top of
+    // the resident weights. Only unregister_param_tensors() actually returns that 2346 MiB, and
+    // that forces a reload on the next request. This call pays off only where the DiT is
+    // RAM-backed (--offload-to-cpu / params-backend), where the staged copy is real.
+    if (sd_ctx->sd->diffusion_model != nullptr) {
+        sd_ctx->sd->diffusion_model->runner_done();
+    }
+    // Opt-in: actually hand the DiT's parameter buffer back so VAE decode does not run on top
+    // of it. See release_diffusion_params() for why runner_done() alone is not enough on a
+    // GPU-resident DiT. The next request pays a reload; generate_image() reacquires up front.
+    if (sd_release_dit_before_decode()) {
+        int64_t rel_t0 = ggml_time_ms();
+        if (sd_ctx->sd->release_diffusion_params()) {
+            LOG_INFO("released diffusion params before decode, taking %.2fs",
+                     (ggml_time_ms() - rel_t0) * 1.0f / 1000);
+        }
     }
 
     int num_images = 0;

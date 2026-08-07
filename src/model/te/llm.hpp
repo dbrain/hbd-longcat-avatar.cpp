@@ -186,6 +186,17 @@ namespace LLM {
                 if (!starts_with(name, prefix)) {
                     continue;
                 }
+                // An externally-quantised NVFP4 checkpoint carries a `<linear>.weight.wglobal`
+                // F32 scalar beside every packed weight. Every probe below matches with
+                // contains(), and ".../gate_proj.weight.wglobal" CONTAINS ".../gate_proj.weight"
+                // -- so the sidecar matched too and, being a 1-element tensor, overwrote
+                // intermediate_size (and friends) with its own ne[1] == 1. That surfaced as
+                // "tensor ... has wrong shape: got [2560, 9728, 1, 1], expected [2560, 1, 1, 1]"
+                // and made every NVFP4 LLM text encoder unloadable. The sidecars carry no shape
+                // information about the model, so skip them outright.
+                if (ends_with(name, ".wglobal")) {
+                    continue;
+                }
                 size_t pos = name.find("visual.");
                 if (pos != std::string::npos) {
                     config.have_vision_weight = true;
