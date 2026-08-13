@@ -1,0 +1,21 @@
+# Keep only source; ignore generated weights (12GB), refs, and compiled binaries.
+*
+!*.cpp
+!*.hpp
+# CUDA sources. build.sh COMPILES these (nvcc p3sam_heads_cuda.cu for image_to_rig /
+# test_p3sam_segment / p3sam_retopo; svae_cuda.o linked into pixal3d) — without this line the build
+# depends on files git is configured never to see, and a clean clone does not compile.
+!*.cu
+# NOTE: *.md is deliberately NOT whitelisted. This is a public repo, and handoff/status docs go stale
+# in place, then burn an agent's context before it touches anything. Working notes live in the
+# gitignored /notes/ dir at the repo root instead.
+!*.sh
+!*.py
+!.gitignore
+# shootout/ geometry-eval prep (scripts + docker config only; outputs live on /mnt/hdd, not here)
+!shootout/
+!shootout/*.sh
+!shootout/*.py
+!shootout/*.txt
+!shootout/Dockerfile*
+!shootout/*.requirements.txt

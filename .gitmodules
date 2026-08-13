@@ -15,3 +15,13 @@
 [submodule "thirdparty/libwebm"]
 	path = thirdparty/libwebm
 	url = https://github.com/webmproject/libwebm.git
+[submodule "thirdparty/eigen_reference"]
+	path = thirdparty/eigen_reference
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "thirdparty/flash_attention"]
+	# Source for GGML_PIXAL_FA2 (tools/m1_ref image-to-rig rig decoder). ggml's CUDA
+	# CMakeLists applies tools/m1_ref/cpp_port/flash_attention_native.patch to this
+	# checkout at configure time, so it is expected to read dirty once configured.
+	# Needs its own csrc/cutlass submodule (`--recursive`).
+	path = thirdparty/flash_attention
+	url = https://github.com/Dao-AILab/flash-attention.git

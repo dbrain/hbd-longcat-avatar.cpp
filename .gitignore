@@ -21,3 +21,12 @@ CLAUDE.local.md
 # Python bytecode from the tools/ scripts
 __pycache__/
 *.pyc
+
+# Vendored on demand by tools/m1_ref/cpp_port/build_basisu.sh (pinned BASISU_REF) and the
+# retopo helper scripts. All carry a nested .git, so without these lines a `git add -A`
+# silently commits a BROKEN GITLINK STUB (or, for basis_universal, ~380MB of vendor tree)
+# instead of leaving them out.
+thirdparty/basis_universal/
+thirdparty/QuadriFlow/
+thirdparty/ManifoldPlus/
+thirdparty/instant-meshes/
