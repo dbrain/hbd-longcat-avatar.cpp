@@ -188,7 +188,9 @@ if { [ "$BASE" = "avatar_e2e" ] || [ "$BASE" = "avatar_server" ]; } && [ "$MODE"
   "$HOSTCXX" $COMMON -fopenmp $ABI $GEODEFS $PACK_DEFS -DIMAGE_TO_RIG_LIB \
     $INC -I"$VISP/include" -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
     -c "$HERE/image_to_rig.cpp" -o "$HERE/image_to_rig_lib.o"
-  "$HOSTCXX" $COMMON $ABI $INC $SDINC -I"$TOOL/include" -c "$HERE/avatar_pipeline.cpp" -o "$HERE/avatar_pipeline.o"
+  # -fopenmp: rig_weight_cleanup.hpp's per-vertex bone-distance sweep is the only parallel code in
+  # this TU, and it is ~8x faster with it. libgomp is already on the link line (image_to_rig_lib.o).
+  "$HOSTCXX" $COMMON -fopenmp $ABI $INC $SDINC -I"$TOOL/include" -c "$HERE/avatar_pipeline.cpp" -o "$HERE/avatar_pipeline.o"
   # The two drivers. Neither sees ggml, CUDA or glTF — they include avatar_pipeline.hpp and nothing
   # else from the model stack, which is the whole point of the seam. avatar_server additionally uses
   # the vendored cpp-httplib + nlohmann/json headers, both already in thirdparty/ (no new dependency).
@@ -553,6 +555,19 @@ if [ "$BASE" = "rig_pose_gate" ]; then
   CXX="${CXX:-/usr/bin/g++}"
   echo ">> build rig_pose_gate (native pose gate, glb_reader.hpp, OpenMP, no ggml)"
   "$CXX" -O2 -std=c++17 -fopenmp -Wall -Wno-unused-variable "$HERE/rig_pose_gate_main.cpp" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# rig_weight_cleanup: post-process an ALREADY RIGGED GLB to remove the skin "spike" artefact —
+# vertices bound to a joint half a body away, which get flung across the character when it rotates.
+# Re-runnable on any delivered asset: reads rigged.glb, writes cleaned.glb with only its
+# JOINTS_0/WEIGHTS_0 bytes replaced. Header-only (rig_weight_cleanup.hpp + rig_glb_skin_io.hpp +
+# rig_pose_gate.hpp), no ggml, no CUDA, OpenMP for the per-vertex distance sweep.
+if [ "$BASE" = "rig_weight_cleanup" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build rig_weight_cleanup (skin spike cleanup + in-place GLB skin patch, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp -Wall -Wno-unused-variable "$HERE/$SRC" -o "$HERE/$BIN" -lm
   echo ">> built $BIN"
   exit 0
 fi

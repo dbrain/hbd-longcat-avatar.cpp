@@ -17,6 +17,7 @@
 #include "motion_retarget.hpp"
 #include "rig_bone_names.hpp"
 #include "rig_exercise.hpp"
+#include "rig_glb_skin_io.hpp"   // rigio::clean_rigged_glb — the skin "spike" post-process
 #include "rig_stage_report.hpp"
 #include "smpl_rest_joints.hpp"
 
@@ -553,6 +554,16 @@ bool Engine::build_rig(const RigRequest& req, RigResult& out, std::string& err) 
         out.gate.pose_gate_pass      = sr.pose_gate_pass;
         out.gate.pose_gate_worst     = sr.pose_gate_worst;
         out.gate.selector_summary    = sr.summary;
+    }
+
+    // Skin-weight cleanup, in place on the file just written. Never fatal: it either improves the
+    // asset or leaves it byte-identical, and either way it only reports.
+    if (req.skin_cleanup) {
+        std::string ce;
+        rigio::clean_rigged_glb(req.out_glb.c_str(), req.out_glb.c_str(), rigclean::Options{},
+                                out.skin_cleanup, ce);
+        if (cfg.verbose && !out.skin_cleanup.empty())
+            std::printf("  [rig] %s\n", out.skin_cleanup.c_str());
     }
 
     // Read the delivered rig back rather than scraping the stage's stdout: the artifact is the

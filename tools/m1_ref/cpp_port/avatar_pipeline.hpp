@@ -196,6 +196,12 @@ struct RigRequest {
     // 0 = never. It is an OPTIMISATION for a bad run: exhausting it does not fail the request, it
     // just ships the best-ranked draw with its verdict attached.
     int  rig_extra_retries = -1;
+    // Post-process the delivered skin to remove the "spike" artefact — vertices bound to a joint
+    // half a body away, and weight fields that vary faster than the mesh can carry. See
+    // rig_weight_cleanup.hpp. It is an OFFER, not a gate: it verifies itself against the shipped
+    // pose gate and keeps the original skin whenever it cannot prove an improvement, so on a rig
+    // that is already good it is a no-op that costs about a second.
+    bool skin_cleanup = true;
     // Escape hatch onto image_to_rig's full flag surface, for the options this struct does not
     // name. Parsed by image_to_rig's OWN parser, applied ON TOP of the fields above — so a flag
     // here wins, exactly as a later argv element does.
@@ -237,6 +243,7 @@ struct RigResult {
     std::string glb;
     int    joints = 0;        // J, read back off the written GLB (not scraped from a log)
     int    named_core = 0;    // how many of the SMPL-22 core bones got standard names
+    std::string skin_cleanup; // one-line verdict from the skin-weight cleanup ("" = not run)
     double seconds = 0;
     RigGateResult gate;
 };
