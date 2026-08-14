@@ -374,6 +374,17 @@ if [ "$BASE" = "mesh_taubin" ]; then
   exit 0
 fi
 
+# motion_retarget: rigged GLB + motion clip -> animated GLB. Rest-relative ("delta") retargeting,
+# name-based bone mapping with the topology walk as fallback, glTF animation baking. Pure maths +
+# glTF I/O — header-only (motion_retarget.hpp + motion_glb_anim.hpp), no ggml, no CUDA, no Python.
+if [ "$BASE" = "motion_retarget" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build motion_retarget (delta retarget + glTF animation bake, no ggml)"
+  "$CXX" -O2 -std=c++17 -Wall -Wno-unused-variable "$HERE/$SRC" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # ultrashape_mc_test: native marching-cubes surface extractor (ultrashape_mc.hpp) validated vs the
 # cubvh golden + GLB write. Pure CPU, no ggml/CUDA — npy.hpp + glb_writer.hpp only.
 if [ "$BASE" = "ultrashape_mc_test" ]; then

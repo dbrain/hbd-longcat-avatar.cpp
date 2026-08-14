@@ -41,8 +41,8 @@ done
 # One exercise clip on the hero. Because every tier now shares the skeleton, this clip is valid
 # for the whole ladder — which is the point of caching the rig.
 if [ -f "$OUT/hero/rigged.glb" ] && [ -z "${SKIP_ANIM:-}" ]; then
-  "${RIG_POSE_GATE_PYTHON:-/mnt/hdd/3d/avatar-shootout/Pixal3D/.venv/bin/python}" \
-    "$CPP_DIR/rig_exercise_anim.py" "$OUT/hero/rigged.glb" "$OUT/hero/rigged.anim.glb" \
+  # native since 2026-08-14 — see the note in final_e2e_dc_rig.sh
+  "$CPP_DIR/motion_retarget" --exercise "$OUT/hero/rigged.glb" "$OUT/hero/rigged.anim.glb" \
     > "$OUT/hero/anim.log" 2>&1 || echo "  WARN: exercise animation failed (see $OUT/hero/anim.log)"
 fi
 

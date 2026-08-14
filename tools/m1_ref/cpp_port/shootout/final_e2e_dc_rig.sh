@@ -102,7 +102,12 @@ echo "[2/3] rig QC gates (skeleton score / weight health / pose gate)"
 
 if [ -z "${SKIP_ANIM:-}" ]; then
   echo "[3/3] exercise animation (every materially weighted joint swings in turn)"
-  "$QC_PY" rig_exercise_anim.py "$OUT/rigged.glb" "$OUT/rigged.anim.glb" \
+  # NATIVE since 2026-08-14 (rig_exercise.hpp). rig_exercise_anim.py was the last Python on the
+  # DELIVERY path; the port is verified byte-for-byte against it (same 15 channels, same times,
+  # same quats, same buffer length on miku). The Python stays in the tree as the reference — and
+  # rig_weight_health.py / rig_pose_smoke.py above stay Python on purpose: they are fail-closed
+  # publish GATES, and a rewritten gate is a gate that might wrongly pass.
+  ./motion_retarget --exercise "$OUT/rigged.glb" "$OUT/rigged.anim.glb" \
     > "$OUT/04_anim.log" 2>&1 || echo "  WARN: exercise animation failed (see 04_anim.log)"
 fi
 
