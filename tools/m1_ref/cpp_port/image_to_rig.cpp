@@ -79,7 +79,13 @@ static void usage() {
            "                          The decode is deterministic given the cloud, so a fresh DRAW is\n"
            "                          the only way to ask again. Accept = skin weights present AND\n"
            "                          (22-bone gate OR (creature gate AND pose gate)) AND enough named\n"
-           "                          core bones to retarget.)\n"
+           "                          core bones to retarget. FAILING IT IS NOT A REFUSAL: the rig is\n"
+           "                          still written, with the verdict, because a gate-failing rig can\n"
+           "                          still be a decent asset. Only ZERO skin weights fail closed.)\n"
+           "        [--rig-extra-retries N]  (default 1. ONE more draw beyond the --rig-retries budget,\n"
+           "                          spent only when that budget ran out with nothing accepted AND no\n"
+           "                          draw passing the pose gate. Never fires when there is already a\n"
+           "                          pose-passing draw to ship, or when the gate is off.)\n"
            "        [--rig-pose-gate | --no-rig-pose-gate]\n"
            "                         (the native deformation audit (rig_pose_gate.hpp = a port of\n"
            "                          rig_pose_smoke.py --pose-gate --generic-all-influential). Default\n"
@@ -226,6 +232,7 @@ int i2r::parse_args(int argc, char** argv, i2r::Options& o) {
         else if (a == "--rig-seed" && i+1 < argc) o.rig_seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--no-rig-select") o.rig_structural_select = false;
         else if (a == "--rig-retries" && i+1 < argc) o.rig_retries = std::max(0, std::atoi(argv[++i]));
+        else if (a == "--rig-extra-retries" && i+1 < argc) o.rig_extra_retries = std::max(0, std::atoi(argv[++i]));
         else if (a == "--allow-zero-skin") o.allow_zero_skin = true;
         else if (a == "--rig-pose-gate") o.rig_pose_gate = true;
         else if (a == "--no-rig-pose-gate") o.rig_pose_gate = false;
@@ -378,6 +385,16 @@ struct DrawVerdict {
     // STRICT ORDERING, and the reasoning for each rung:
     //  1. skin_ok      — a rig that deforms nothing is never a delivery, whatever else it scores.
     //  2. accept       — a draw that cleared the whole predicate beats one that did not.
+    //  2b. pose_pass   — AMONG DRAWS THAT ALL FAILED THE PREDICATE, prefer one the deformation gate
+    //                    passed. This rung can only ever fire when nothing accepted (rung 2 has
+    //                    already separated those), and it compares only when BOTH draws actually ran
+    //                    the gate — a draw the gate never saw is no evidence either way, and must
+    //                    not beat a measured pass nor lose to a measured fail on absence alone.
+    //                    It sits ABOVE named_core deliberately and only here: once we are shipping a
+    //                    rejected rig, "it deforms without tearing" outranks "it has more standard
+    //                    bone names", because the names on a rig that fails the gate are names on
+    //                    a rig that visibly breaks. Rung 3's argument is about ACCEPTED rigs and is
+    //                    untouched.
     //  3. named_core   — THE TIE-BREAK, and deliberately not the pose-gate number. Both are about
     //                    "will this animate", but the retargeter maps through NAMES: 21/22 named
     //                    with pose 4.127 (miku draw 0) animates better than 14/22 named with a
@@ -390,6 +407,7 @@ struct DrawVerdict {
     bool better_than(const DrawVerdict& o) const {
         if (skin_ok    != o.skin_ok)    return skin_ok;
         if (accept     != o.accept)     return accept;
+        if (pose_ran && o.pose_ran && pose_pass != o.pose_pass) return pose_pass;
         if (named_core != o.named_core) return named_core > o.named_core;
         if (falsifier  != o.falsifier)  return falsifier < o.falsifier;
         if (pose_ran && o.pose_ran && pose_worst != o.pose_worst) return pose_worst < o.pose_worst;
@@ -1162,6 +1180,11 @@ static int i2r_run_body(i2r::Options opt) {
             if (R.J > 0 && R.N > 0 && R.parents.size() == (size_t)R.J &&
                 R.skin_pred.size() == (size_t)R.N * R.J) {
                 R.ok = rig_from_cache = true;
+                // No draw was decoded in THIS run, so the last-run report must not be readable as
+                // if it described this one. rig_stage_report.hpp promises exactly this (`valid` is
+                // false after a cache hit) and without the reset an LOD tier inherits the hero's
+                // verdict — a gate result attributed to a run that never ran a gate.
+                i2r::g_rig_report = rig::StageReport{};
                 printf("  [2/4] rig: loaded cached skeleton J=%d over N=%d skin points from %s"
                        " (shared across tiers; rig stage skipped)\n", R.J, R.N, rig_cache.c_str());
             } else {
@@ -1218,6 +1241,7 @@ static int i2r_run_body(i2r::Options opt) {
         //                                     (its narrow mirrored-right-arm repair form).
         double t_rig = pix::now_s();
         int rig_attempt = 0;
+        int extra_left = opt.rig_extra_retries;   // spent only in the "nothing passed anything" corner
         i2r::DrawVerdict best_v;
         rig::RigResult  best_R;
         rig::PrepResult best_P;
@@ -1281,16 +1305,33 @@ static int i2r_run_body(i2r::Options opt) {
                 }
             }
             v.compute_accept(rig_min_named_core, rig_pose_gate_strict);
-            printf("  [3/4] draw %d/%d: J=%d %s\n", rig_attempt + 1, rig_retries + 1, R.J,
-                   v.describe().c_str());
+            printf("  [3/4] draw %d/%d%s: J=%d %s\n", rig_attempt + 1, rig_retries + 1,
+                   rig_attempt > rig_retries ? " (extra)" : "", R.J, v.describe().c_str());
 
             if (!have_best || v.better_than(best_v)) {
                 best_v = v; best_R = R; best_P = P; have_best = true;
                 best_w = (v.pose_ran && dst_w_valid) ? dst_w : std::vector<float>();
             }
-            if (v.accept || rig_attempt >= rig_retries) break;
-            printf("  [3/4] rig: re-drawing the conditioning cloud (attempt %d/%d)\n",
-                   rig_attempt + 2, rig_retries + 1);
+            if (v.accept) break;
+            if (rig_attempt < rig_retries) {
+                printf("  [3/4] rig: re-drawing the conditioning cloud (attempt %d/%d)\n",
+                       rig_attempt + 2, rig_retries + 1);
+                continue;
+            }
+            // THE EXTRA DRAW. The budget is gone and nothing was accepted. Spend one more ONLY if we
+            // do not even have a draw the deformation gate passed: a rejected-but-pose-passing rig
+            // is a deliverable (the gates are advisory — see the accept comment), so buying another
+            // ~214 s there would be paying for nothing. It also cannot fire when the gate is off,
+            // because then "passes the pose gate" is not a question anyone asked.
+            const bool have_pose_pass = best_v.pose_ran && best_v.pose_pass;
+            if (rig_pose_gate && extra_left > 0 && !have_pose_pass) {
+                --extra_left;
+                printf("  [3/4] rig: %d draw%s, none accepted and none passed the deformation gate "
+                       "— one EXTRA draw (%d left)\n", rig_attempt + 1, rig_attempt ? "s" : "",
+                       extra_left);
+                continue;
+            }
+            break;
         }
         // Ship the BEST draw, not the last one. Before this the loop fell out holding whatever the
         // final attempt produced, so exhausting the retries actively degraded the result: draw 0

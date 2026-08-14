@@ -146,7 +146,11 @@ fi
 #   ./build.sh avatar_e2e cuda
 # Prereq: an sd.cpp CUDA build at $SD_BUILD (default build-hymo), i.e. the one that built the
 # hymotion example. It is not rebuilt here.
-if [ "$BASE" = "avatar_e2e" ] && [ "$MODE" = "cuda" ]; then
+# avatar_server (the HTTP front end) is built by the SAME block: it is avatar_server.o + the same
+# archive, and the archive costs minutes while either link costs seconds. Building them together is
+# also the only way to guarantee the two binaries in one image came from one archive. Either name
+# enters here and BOTH come out.
+if { [ "$BASE" = "avatar_e2e" ] || [ "$BASE" = "avatar_server" ]; } && [ "$MODE" = "cuda" ]; then
   TOOL="${PIXAL3D_CUDA_ROOT:-/mnt/hdd/3d/avatar-shootout/toolchain-cuda13.3}"
   HOSTCXX="${PIXAL3D_HOST_CXX:-/usr/bin/g++-15}"
   TOOLLIB="$TOOL/lib64"; [ -d "$TOOLLIB" ] || TOOLLIB="$TOOL/lib"
@@ -185,7 +189,11 @@ if [ "$BASE" = "avatar_e2e" ] && [ "$MODE" = "cuda" ]; then
     $INC -I"$VISP/include" -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
     -c "$HERE/image_to_rig.cpp" -o "$HERE/image_to_rig_lib.o"
   "$HOSTCXX" $COMMON $ABI $INC $SDINC -I"$TOOL/include" -c "$HERE/avatar_pipeline.cpp" -o "$HERE/avatar_pipeline.o"
+  # The two drivers. Neither sees ggml, CUDA or glTF — they include avatar_pipeline.hpp and nothing
+  # else from the model stack, which is the whole point of the seam. avatar_server additionally uses
+  # the vendored cpp-httplib + nlohmann/json headers, both already in thirdparty/ (no new dependency).
   "$HOSTCXX" $COMMON -c "$HERE/avatar_e2e.cpp" -o "$HERE/avatar_e2e.o"
+  "$HOSTCXX" $COMMON -I"$TP" -c "$HERE/avatar_server.cpp" -o "$HERE/avatar_server.o"
 
   # xatlas / meshopt / the cumesh bridge are plain C++ TUs the image_to_rig lane compiles inline;
   # here they are separate objects so the ABI define is applied uniformly.
@@ -211,16 +219,18 @@ if [ "$BASE" = "avatar_e2e" ] && [ "$MODE" = "cuda" ]; then
   # --start-group: libavatar_pipeline.a and libvisioncpp.a are mutually dependent (image_to_rig's TU
   # instantiates stb, which visioncpp's members reference; visioncpp provides the RMBG matte that
   # image_to_rig calls). A single pass over each archive cannot resolve that.
-  "$HOSTCXX" -O2 -fopenmp -o "$HERE/$BIN" "$HERE/avatar_e2e.o" \
-    -Wl,--start-group \
-      "$HERE/libavatar_pipeline.a" "$VISP/build-sdabi/libvisioncpp.a" "$BU/build/libbasisu_enc.a" \
-      "$SD_BUILD/libstable-diffusion.a" \
-      "$SD_BUILD/ggml/src/libggml.a" "$SD_BUILD/ggml/src/libggml-cpu.a" \
-      "$SD_BUILD/ggml/src/ggml-cuda/libggml-cuda.a" "$SD_BUILD/ggml/src/libggml-base.a" \
-    -Wl,--end-group \
-    -L"$TOOLLIB" -lcudart -lcublas -lcublasLt -L/usr/lib -lcuda -lm -lpthread -ldl -lrt \
-    -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
-  echo ">> built $BIN"
+  for drv in avatar_e2e avatar_server; do
+    "$HOSTCXX" -O2 -fopenmp -o "$HERE/$drv" "$HERE/$drv.o" \
+      -Wl,--start-group \
+        "$HERE/libavatar_pipeline.a" "$VISP/build-sdabi/libvisioncpp.a" "$BU/build/libbasisu_enc.a" \
+        "$SD_BUILD/libstable-diffusion.a" \
+        "$SD_BUILD/ggml/src/libggml.a" "$SD_BUILD/ggml/src/libggml-cpu.a" \
+        "$SD_BUILD/ggml/src/ggml-cuda/libggml-cuda.a" "$SD_BUILD/ggml/src/libggml-base.a" \
+      -Wl,--end-group \
+      -L"$TOOLLIB" -lcudart -lcublas -lcublasLt -L/usr/lib -lcuda -lm -lpthread -ldl -lrt \
+      -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
+    echo ">> built $drv"
+  done
   exit 0
 fi
 

@@ -185,7 +185,17 @@ struct RigRequest {
     // varying) gave J = 37/153/37/161/196/192, and four of the six welded every vertex to one joint.
     // A new subject is a coin flip. Each extra draw costs one rig decode (~20-27 s of a ~450 s
     // request) and the selector keeps the best one. 0 = the historical one-shot path, unchanged.
-    int  rig_retries = 0;
+    //
+    // 🔴 THE DELIVERY DEFAULT IS 2, and the CLI harness's is still 0. A rejected draw is usually a
+    // ~214 s runaway, so 2 bounds the worst case near ~430 s of rig — worth it against a coin flip,
+    // and it also turns the pose gate on (image_to_rig defaults that to `rig_retries > 0`). The
+    // image_to_rig binary keeps its historical 0 so the A/B harness's numbers stay comparable.
+    int  rig_retries = 2;
+    // ONE more draw beyond that budget, and only in the corner where the budget ran out with nothing
+    // accepted AND nothing even passing the deformation gate. -1 = the stage's own default (1),
+    // 0 = never. It is an OPTIMISATION for a bad run: exhausting it does not fail the request, it
+    // just ships the best-ranked draw with its verdict attached.
+    int  rig_extra_retries = -1;
     // Escape hatch onto image_to_rig's full flag surface, for the options this struct does not
     // name. Parsed by image_to_rig's OWN parser, applied ON TOP of the fields above — so a flag
     // here wins, exactly as a later argv element does.
@@ -203,9 +213,15 @@ struct RigGateResult {
 
     // --- the DRAW selector (RigRequest::rig_retries), filled by the rig stage --------------------
     // `accepted == false` means no draw cleared the predicate and the best-ranked one was delivered
-    // anyway. A caller that would rather fail than ship a doubtful rig tests this: it is a verdict
-    // computed before the write and is not recoverable from the GLB afterwards.
+    // anyway. IT IS ADVISORY, NOT A REFUSAL: a rig can fail the deformation gate and still be a
+    // decent asset (char1 reads 25.9 against a limit of 6.0 and moves correctly — the defects are
+    // cosmetic spikes), so the delivery ships with the verdict attached and the caller decides. The
+    // one thing that DOES fail closed is `skin_ok`: a rig with zero weights deforms nothing and
+    // would poison the shared rig cache for every LOD tier.
+    //
+    // This is a verdict computed BEFORE the write, so it is not recoverable from the GLB afterwards.
     int    draws = 0;                 // conditioning draws decoded; 0 = the skeleton came from cache
+    int    accepted_draw = -1;        // which draw was accepted; -1 = none, best-ranked was shipped
     bool   accepted = false;
     bool   skin_ok = false;           // R4 decoded weights at all (false = the rig deforms NOTHING)
     bool   humanoid_gate_ok = false;  // the strict 22-bone anatomy gate accepted

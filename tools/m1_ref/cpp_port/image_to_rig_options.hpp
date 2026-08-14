@@ -72,6 +72,12 @@ struct Options {
     bool     rig_sample = false;
     bool     rig_structural_select = true;   // --no-rig-select
     int      rig_retries = 0;                // extra conditioning DRAWS when the anatomy gate rejects all
+    // --rig-extra-retries: ONE MORE DRAW BEYOND THE BUDGET, granted only when the budget ran out
+    // with NOTHING accepted and nothing even passing the pose gate. "If none pass, is it worth one
+    // more?" — yes, but only in that corner: a rejected draw is typically a ~214 s runaway, so this
+    // is the difference between a worst case of (retries+1) and (retries+2) draws and it must never
+    // fire on a run that already has a usable rig. 0 disables.
+    int      rig_extra_retries = 1;
     bool     allow_zero_skin = false;        // escape hatch for the weightless-rig guard
     // --rig-pose-gate / --no-rig-pose-gate. UNSET = on iff rig_retries > 0: with no re-draw there is
     // no choice to make, so the audit would cost ~4 s and change nothing. It is the deformation term

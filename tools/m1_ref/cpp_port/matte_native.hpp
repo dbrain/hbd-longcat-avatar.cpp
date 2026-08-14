@@ -6,10 +6,17 @@
 // THIS repo's ggml, so the matte runs on the same CUDA context, in the same process, under the
 // same 3060 flock as the rest of image_to_rig.
 //
-// WEIGHTS: RMBG-2.0-F16.gguf. RMBG-2.0 and BiRefNet are the same graph — 585 tensors, identical
-// names and shapes, differing only numerically — so `birefnet_*` loads either file and the model
-// choice is purely which GGUF you point at. Default path below; override with the `gguf` field or
-// the MATTE_NATIVE_GGUF env var. Nothing is ever downloaded at runtime.
+// 🔴 WEIGHTS: RMBG-2.0-F16.gguf, AND THAT IS THE DELIVERY DECISION, not a default to shop around.
+// RMBG-2.0 won the matte A/B against BiRefNet and BiRefNet is off this lane; `birefnet_*` below is
+// the VENDORED GRAPH'S NAME for the shared 585-tensor Swin architecture (RMBG-2.0 and BiRefNet are
+// the same graph, identical names and shapes, differing only numerically), not a second model this
+// path can be pointed at. The A/B lane that still knows how to load the other weights is the shell
+// harness (shootout/matte_cpp.sh) and the standalone make_matte_native CLI — neither is reachable
+// from image_to_rig / avatar_pipeline.
+//
+// The `gguf` field and MATTE_NATIVE_GGUF still select the FILE (the container mounts it at a host
+// path), and resolve_gguf_path() warns loudly if what they name is not an RMBG-2.0 file, because on
+// the delivery lane that is a mistake rather than a choice. Nothing is downloaded at runtime.
 //
 // This header is deliberately C++17-clean and free of both <visp/…> and stb: the implementation
 // (matte_native.cpp) is C++20 and lives in libvisioncpp.a, so a C++17 caller such as

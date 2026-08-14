@@ -56,6 +56,11 @@ static void usage() {
         "  --texsize N           atlas size (default 2048)\n"
         "  --decimate N          target faces (default 220000)\n"
         "  --resolution N        geometry lattice (default: the binary's own)\n"
+        "  --rig-retries N       best-of-N conditioning draws (default 2 on this path; the rig CLI's\n"
+        "                        own default stays 0). A gate failure is advisory: the best-ranked\n"
+        "                        draw ships either way, only a zero-skin rig fails closed\n"
+        "  --rig-extra-retries N one more draw when the budget ends with nothing accepted AND nothing\n"
+        "                        passing the pose gate (default 1; 0 = never)\n"
         "  --variant ID          fix|nofix|base|rot|rotbase (default rotbase)\n"
         "  --smooth N            temporal quaternion smoothing window (default 2)\n"
         "  --no-exercise         skip the skeleton-exercise eye-test track\n"
@@ -110,6 +115,8 @@ int main(int argc, char** argv) {
         else if (a == "--texsize") req.rig.texsize = std::atoi(next().c_str());
         else if (a == "--decimate") req.rig.decimate = std::atoi(next().c_str());
         else if (a == "--resolution") req.rig.resolution = std::atoi(next().c_str());
+        else if (a == "--rig-retries") req.rig.rig_retries = std::atoi(next().c_str());
+        else if (a == "--rig-extra-retries") req.rig.rig_extra_retries = std::atoi(next().c_str());
         else if (a == "--variant") req.variant = next();
         else if (a == "--smooth") req.smooth = std::atoi(next().c_str());
         else if (a == "--no-exercise") req.exercise = false;

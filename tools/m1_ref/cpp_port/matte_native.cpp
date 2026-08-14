@@ -65,13 +65,26 @@ const char* default_gguf_path() {
 }
 
 std::string resolve_gguf_path(const Options& opt) {
+    std::string path;
     if (!opt.gguf.empty()) {
-        return opt.gguf;
+        path = opt.gguf;
+    } else if (const char* e = std::getenv("MATTE_NATIVE_GGUF"); e && *e) {
+        path = e;
+    } else {
+        path = default_gguf_path();
     }
-    if (const char* e = std::getenv("MATTE_NATIVE_GGUF"); e && *e) {
-        return std::string(e);
+    // RMBG-2.0 WON THE MATTE A/B and BiRefNet is not a delivery-lane option. The two are the same
+    // 585-tensor graph, so a BiRefNet file LOADS AND WORKS — it would just quietly be the model
+    // that lost, with no symptom to notice. That is exactly the class of mistake worth one line of
+    // stderr, and a warning rather than a refusal because the standalone A/B CLI shares this code.
+    const std::string base = path.substr(path.find_last_of('/') + 1);
+    if (base.rfind("RMBG", 0) != 0) {
+        std::fprintf(stderr,
+                     "matte_native: WARNING — matting weights '%s' are not an RMBG-2.0 file. RMBG-2.0 "
+                     "is the chosen delivery matte; anything else here is an A/B, not a default.\n",
+                     base.c_str());
     }
-    return std::string(default_gguf_path());
+    return path;
 }
 
 void unload() {

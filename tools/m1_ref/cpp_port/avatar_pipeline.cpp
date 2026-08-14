@@ -512,6 +512,7 @@ bool Engine::build_rig(const RigRequest& req, RigResult& out, std::string& err) 
     if (!req.from_refined.empty()) o.from_refined = req.from_refined;
     if (!req.rig_cache.empty())    o.rig_cache = req.rig_cache;
     if (req.rig_retries > 0)       o.rig_retries = req.rig_retries;
+    if (req.rig_extra_retries >= 0) o.rig_extra_retries = req.rig_extra_retries;
     if (!cfg.rig_r1w.empty())      o.r1w = cfg.rig_r1w;
     if (!cfg.rig_qwen3_w.empty())  o.qwen3_w = cfg.rig_qwen3_w;
     if (!cfg.rig_skin_vae.empty()) o.skinvae = cfg.rig_skin_vae;
@@ -542,6 +543,7 @@ bool Engine::build_rig(const RigRequest& req, RigResult& out, std::string& err) 
     {
         const rig::StageReport& sr = image_to_rig_last_rig_report();
         out.gate.draws               = sr.valid ? sr.draws : 0;
+        out.gate.accepted_draw       = sr.valid ? sr.accepted_draw : -1;
         out.gate.accepted            = sr.accepted;
         out.gate.skin_ok             = sr.skin_ok;
         out.gate.humanoid_gate_ok    = sr.humanoid_gate_ok;
