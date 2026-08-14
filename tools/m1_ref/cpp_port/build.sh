@@ -115,6 +115,102 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "ima
   exit 0
 fi
 
+# avatar_e2e: THE ONE-CALL BINARY. image + prompt -> rigged, animated GLB, in one process.
+#
+# It is the union of three previously separate links:
+#   image_to_rig.cpp (compiled -DIMAGE_TO_RIG_LIB so its main() becomes image_to_rig_main())
+#   + avatar_pipeline.cpp, which also pulls in HY-Motion via libstable-diffusion.a
+#   + avatar_e2e.cpp, the thin driver.
+#
+# THE ONE THING THAT MAKES THIS DELICATE: there must be exactly ONE ggml in the process. The
+# cpp_port lane normally links the SHARED ggml at ggml/build-cuda13; sd.cpp links the STATIC ggml
+# it builds inside build-hymo. Those two are the same source (commit 9847065d) but NOT ABI
+# compatible, because sd.cpp's CMakeLists adds -DGGML_MAX_NAME=160 and that changes
+# sizeof(ggml_tensor). So this target links build-hymo's static ggml and compiles EVERY ggml-aware
+# TU here with the same define — image_to_rig.cpp and the vendored visioncpp included. The .cu
+# objects touch no ggml at all (verified) and are reused as-is.
+#
+#   ./build.sh avatar_e2e cuda
+# Prereq: an sd.cpp CUDA build at $SD_BUILD (default build-hymo), i.e. the one that built the
+# hymotion example. It is not rebuilt here.
+if [ "$BASE" = "avatar_e2e" ] && [ "$MODE" = "cuda" ]; then
+  TOOL="${PIXAL3D_CUDA_ROOT:-/mnt/hdd/3d/avatar-shootout/toolchain-cuda13.3}"
+  HOSTCXX="${PIXAL3D_HOST_CXX:-/usr/bin/g++-15}"
+  TOOLLIB="$TOOL/lib64"; [ -d "$TOOLLIB" ] || TOOLLIB="$TOOL/lib"
+  REPO="$(cd "$HERE/../../.." && pwd)"
+  SD_BUILD="${SD_BUILD:-$REPO/build-hymo}"
+  test -f "$SD_BUILD/libstable-diffusion.a" || { echo "avatar_e2e: no $SD_BUILD/libstable-diffusion.a — build sd.cpp with SD_CUDA=ON first" >&2; exit 1; }
+  SPIKE="$HERE/../../sparse_spike"
+  TP="$REPO/thirdparty"
+  CUMESH="$TP/cumesh_native"
+  BU="$TP/basis_universal"
+  VISP="$TP/visioncpp"
+  # The ABI define, and the backend switches sd.cpp compiles its headers with.
+  ABI="-DGGML_MAX_NAME=160 -DGGML_USE_CPU -DGGML_USE_CUDA -DSD_USE_CUDA"
+  SDINC="-I$REPO/examples -I$REPO/examples/hymotion -I$REPO/src -I$REPO/thirdparty -I$REPO -I$REPO/include -I$GGML/include"
+
+  echo ">> CUDA build avatar_e2e (image_to_rig + HY-Motion + retarget, ONE process)"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -c "$SPIKE/sparse_subm_conv.cu" -o "$HERE/sparse_subm_conv.o"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -c "$HERE/svae_cuda.cu"        -o "$HERE/svae_cuda.o"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -c "$HERE/tex_atlas_cuda.cu"   -o "$HERE/tex_atlas_cuda.o"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -c "$HERE/p3sam_heads_cuda.cu" -o "$HERE/p3sam_heads_cuda.o"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -c "$HERE/rig_philox_race.cu"  -o "$HERE/rig_philox_race.o"
+  "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -c "$HERE/narrow_band_dc_cuda.cu" -o "$HERE/narrow_band_dc.o"
+  mkdir -p "$CUMESH/build"
+  CUMESH_OBJS=""
+  for f in cumesh shared geometry connectivity clean_up simplify atlas native_io; do
+    "$TOOL/bin/nvcc" -O2 -std=c++17 $NVARCH -ccbin "$HOSTCXX" -I"$CUMESH/src" -c "$CUMESH/src/$f.cu" -o "$CUMESH/build/$f.o"
+    CUMESH_OBJS="$CUMESH_OBJS $CUMESH/build/$f.o"
+  done
+  "$HERE/build_basisu.sh"
+  PACK_DEFS="-DPIXAL3D_PACK -DBASISD_SUPPORT_KTX2=1 -DBASISD_SUPPORT_KTX2_ZSTD=1 -DBASISU_SUPPORT_OPENCL=0 -DBASISU_SUPPORT_SSE=1 -msse4.1"
+  # visioncpp, rebuilt with the sd.cpp ggml ABI, into its own dir.
+  CXX="$HOSTCXX" VISP_BUILD_DIR="$VISP/build-sdabi" VISP_EXTRA_CXXFLAGS="-DGGML_MAX_NAME=160" "$HERE/build_visioncpp.sh"
+
+  GEODEFS="-DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH -DTEXATLAS_CUDA_RASTER -DP3SAM_USE_CUDA"
+  "$HOSTCXX" $COMMON -fopenmp $ABI $GEODEFS $PACK_DEFS -DIMAGE_TO_RIG_LIB \
+    $INC -I"$VISP/include" -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
+    -c "$HERE/image_to_rig.cpp" -o "$HERE/image_to_rig_lib.o"
+  "$HOSTCXX" $COMMON $ABI $INC $SDINC -I"$TOOL/include" -c "$HERE/avatar_pipeline.cpp" -o "$HERE/avatar_pipeline.o"
+  "$HOSTCXX" $COMMON -c "$HERE/avatar_e2e.cpp" -o "$HERE/avatar_e2e.o"
+
+  # xatlas / meshopt / the cumesh bridge are plain C++ TUs the image_to_rig lane compiles inline;
+  # here they are separate objects so the ABI define is applied uniformly.
+  EXTRA_OBJS=""
+  for f in "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" "$TP/meshoptimizer/vertexcodec.cpp" \
+           "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" "$HERE/native_cumesh_bridge.cpp"; do
+    o="$HERE/ae_$(basename "${f%.cpp}").o"
+    "$HOSTCXX" $COMMON $ABI $INC -I"$CUMESH/src" -I"$TOOL/include" -c "$f" -o "$o"
+    EXTRA_OBJS="$EXTRA_OBJS $o"
+  done
+
+  # THE DELIVERABLE IS THE ARCHIVE, not the binary: an API links libavatar_pipeline.a and includes
+  # avatar_pipeline.hpp, and needs none of the model stack in its own translation units. avatar_e2e
+  # is then just avatar_e2e.o + this archive, which is also the proof that the archive is complete
+  # (if a symbol were missing from it, this link would fail).
+  rm -f "$HERE/libavatar_pipeline.a"
+  ar rcs "$HERE/libavatar_pipeline.a" \
+    "$HERE/avatar_pipeline.o" "$HERE/image_to_rig_lib.o" $EXTRA_OBJS \
+    "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" "$HERE/tex_atlas_cuda.o" "$HERE/p3sam_heads_cuda.o" \
+    "$HERE/rig_philox_race.o" "$HERE/narrow_band_dc.o" $CUMESH_OBJS
+  echo ">> built libavatar_pipeline.a ($(du -h "$HERE/libavatar_pipeline.a" | cut -f1))"
+
+  # --start-group: libavatar_pipeline.a and libvisioncpp.a are mutually dependent (image_to_rig's TU
+  # instantiates stb, which visioncpp's members reference; visioncpp provides the RMBG matte that
+  # image_to_rig calls). A single pass over each archive cannot resolve that.
+  "$HOSTCXX" -O2 -fopenmp -o "$HERE/$BIN" "$HERE/avatar_e2e.o" \
+    -Wl,--start-group \
+      "$HERE/libavatar_pipeline.a" "$VISP/build-sdabi/libvisioncpp.a" "$BU/build/libbasisu_enc.a" \
+      "$SD_BUILD/libstable-diffusion.a" \
+      "$SD_BUILD/ggml/src/libggml.a" "$SD_BUILD/ggml/src/libggml-cpu.a" \
+      "$SD_BUILD/ggml/src/ggml-cuda/libggml-cuda.a" "$SD_BUILD/ggml/src/libggml-base.a" \
+    -Wl,--end-group \
+    -L"$TOOLLIB" -lcudart -lcublas -lcublasLt -L/usr/lib -lcuda -lm -lpthread -ldl -lrt \
+    -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # make_matte_native: RMBG-2.0 background matting IN-PROCESS. Replaces shootout/matte_cpp.sh, which
 # launched a `docker run … vision-cli` container per image. The graph is vision.cpp's BiRefNet
 # (RMBG-2.0 is the same 585-tensor architecture, different weights), vendored at

@@ -23,14 +23,19 @@
 //
 // Build: ./build.sh image_to_rig cuda   (reuses the pixal3d link recipe: ggml-cuda + spike conv +
 // cumesh + basisu + xatlas + meshopt). CPU build is impractical (geometry needs the GPU).
+#include "image_to_rig_options.hpp"    // the flags as a STRUCT: main() parses into it, a library fills it
+#include "cancel_hook.hpp"             // cooperative cancellation for the long GPU loops
 #include "pixal3d_chain.hpp"
 #include "image_io.hpp"
+#include "matte_native_imgio.hpp"     // in-process RMBG-2.0 matte (replaces the docker/vision-cli hop)
 #include "tex_atlas.hpp"
 #include "tex_project.hpp"             // --tex-project: project the real images into the UV atlas
 #include "glb_textured.hpp"            // encode_png
 #include "glb_rigged_textured.hpp"     // write_rigged_textured_glb
 #include "rig_transfer.hpp"            // transfer_skin
 #include "rig_pipeline.hpp"            // run_rig_pipeline
+#include "rig_pose_gate.hpp"           // native pose gate: the selector's deformation term
+#include "rig_stage_report.hpp"        // what the rig stage decided, for a library caller
 #include "rig_bone_names.hpp"          // name_bones + falsify_bone_names (standard bone naming)
 #include "mesh_sample.hpp"             // prep_mesh_for_rig_inmem, normalize_mesh
 #include "p3sam_segment.hpp"           // P3-SAM part segmentation (native, --part-retopo)
@@ -45,6 +50,8 @@
 #ifdef PIXAL3D_PACK
 #include "glb_packed.hpp"              // packed writer (KTX2+meshopt) — the only textured writer that carries a normal map
 #endif
+#include <functional>
+#include <unordered_map>
 #include <thread>
 #include <algorithm>
 #include "glb_writer.hpp"              // glb::write_glb (intermediate stage artifacts)
@@ -58,13 +65,34 @@
 #include <vector>
 #include <sys/stat.h>
 
-static const float DEF_CAM = 0.7332379387484828f, DEF_DIST = 1.3021559715270996f, DEF_MS = 1.0f;
+// DEF_CAM / DEF_DIST / DEF_MS now live in image_to_rig_options.hpp — they are the DEFAULT VALUES of
+// Options::cam/dist/ms, and a default belongs with the field it defaults.
 
 static void usage() {
     printf("usage: image_to_rig --model <geo_gguf_dir> --image <matte.png> --out <out.glb>\n"
            "        [--fov <deg>] [--cam <ang_rad> <dist> <scale>] [--texsize N] [--decimate F]\n"
            "        [--resolution N] [--seed N] [--fast] [--cpu]\n"
            "        [--r1w <dir>] [--qwen3 <dir>] [--skin-vae <dir>] [--beams N] [--rig-seed N]\n"
+           "        [--rig-retries N]     (default 0. BEST-OF-N over conditioning draws: re-draw the\n"
+           "                          8192-point cloud and decode again, up to N extra times, until a\n"
+           "                          draw passes the selector; the BEST-ranked draw ships either way.\n"
+           "                          The decode is deterministic given the cloud, so a fresh DRAW is\n"
+           "                          the only way to ask again. Accept = skin weights present AND\n"
+           "                          (22-bone gate OR (creature gate AND pose gate)) AND enough named\n"
+           "                          core bones to retarget.)\n"
+           "        [--rig-pose-gate | --no-rig-pose-gate]\n"
+           "                         (the native deformation audit (rig_pose_gate.hpp = a port of\n"
+           "                          rig_pose_smoke.py --pose-gate --generic-all-influential). Default\n"
+           "                          ON iff --rig-retries > 0; with no re-draw there is no choice to\n"
+           "                          make. Turning it OFF means a creature-gate draw can never be\n"
+           "                          accepted, since the pose gate is that branch's safety check.)\n"
+           "        [--rig-pose-gate-strict]  (also require the pose gate on the 22-BONE branch of the\n"
+           "                          accept predicate, not only the creature branch. Off by default; on,\n"
+           "                          a rig that names all 22 bones but shreds a component is rejected.)\n"
+           "        [--rig-min-named-core N]  (default 19. A draw must NAME at least N of the SMPL-22\n"
+           "                          core bones to be accepted: the retargeter maps through names and\n"
+           "                          its topology fallback fails outright on some rigs, so a rig that\n"
+           "                          names 14 animates worse than one that names 21 whatever it scores.)\n"
            "        [--rig-sample]  (stochastic scaffold recipe do_sample=true beams=10; default is\n"
            "                         deterministic beam=20 = fan-free rig)\n"
            "        [--no-bone-names] [--bone-names mixamo|smpl] [--bone-facing +z|-z]\n"
@@ -96,6 +124,14 @@ static void usage() {
            "                          authored for the hero cannot play on the game tier; re-rigging per\n"
            "                          tier also re-rolls the rig's failure modes. Also skips ~16-30s/tier.)\n"
            "        [--stage-dir <dir>]   (emit coarse/refined/decimated GLB intermediates + resume caches)\n"
+           "        [--solid]             (--dc-remesh only, OPT-IN. Sign the field against the decoder\n"
+           "                          occupancy so the inward wall of the shrink-wrap envelope is never\n"
+           "                          contoured, and drop buried cavity shells: ONE watertight solid.\n"
+           "                          The geometry is strictly better, but the auto-rig regresses hard on\n"
+           "                          it (miku maxfan 4->13, rig_score 0.897->0.000; gilly fails the pose\n"
+           "                          gate) because the rigger was tuned on the two-walled cloud -- see the\n"
+           "                          solid_mesh comment. Use it for geometry-only or externally-rigged\n"
+           "                          deliveries. --no-solid is the default.)\n"
            "        [--image-model-ready] (diagnostic only: input already is Pixal's final square/black frame;\n"
            "                          bypass native alpha/crop framing to isolate downstream geometry)\n"
            "        [--from-refined <dir>] (resume: skip geometry+refine, load refined.glb + PBR cache)\n"
@@ -147,6 +183,138 @@ static void usage() {
            "                          field-aligned topology, triangulated for the downstream; shell-out, CPU)\n");
 }
 
+
+// ---------------------------------------------------------------------------
+// argv -> Options. THE ONLY PARSER: main() runs it, the library skips it and fills the struct
+// directly. Flag for flag, message for message, exit code for exit code, this is the loop that
+// used to sit inline in main() with `x =` rewritten as `o.x =`.
+//
+// It APPLIES ONTO whatever `o` already holds, so a caller can fill the typed fields and then hand
+// through an escape-hatch flag list -- later still wins, exactly as a later argv element does.
+// ---------------------------------------------------------------------------
+int i2r::parse_args(int argc, char** argv, i2r::Options& o) {
+    auto nextf = [&](int& i){ return (float)std::atof(argv[++i]); };
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if      (a == "--model" && i+1 < argc) o.model = argv[++i];
+        else if (a == "--image" && i+1 < argc) o.image = argv[++i];
+        else if (a == "--out"   && i+1 < argc) o.out = argv[++i];
+        // cam and dist are THE SAME PARAMETER: DEF_DIST == 0.5/tan(DEF_CAM/2) to 7 d.p. (1.3021560).
+        // DEF_DIST was never a measured constant -- it is the canonical "unit-diameter object exactly
+        // fills the frame" render convention. Setting cam WITHOUT dist breaks the identity and turns a
+        // perspective change into a ZOOM: measured on the soldier, --moge's 46.5deg made the model
+        // +16% BIGGER (extents x1.164/1.159/1.146, shape unchanged to ~1%) and pushed 23,336 verts
+        // through the canonical box floor at Y <= -0.4999 -- a flat plane where the boots should be.
+        // That is what OOM'd the refine (bigger subject -> N1 1227->1701 -> M 12541->18674 -> M^2).
+        else if (a == "--fov"   && i+1 < argc) { o.cam = std::atof(argv[++i]) * (float)M_PI / 180.0f; o.dist = 0.5f / std::tan(o.cam * 0.5f); }
+        else if (a == "--cam"   && i+3 < argc) { o.cam = std::atof(argv[++i]); o.dist = std::atof(argv[++i]); o.ms = std::atof(argv[++i]); }
+        else if (a == "--texsize" && i+1 < argc) { o.texsize = std::atoi(argv[++i]); o.texsize_set = true; }
+        else if (a == "--decimate" && i+1 < argc) { o.decimate = std::atoi(argv[++i]); o.decimate_set = true; }
+        else if ((a == "--resolution" || a == "--res") && i+1 < argc) {
+            const int r = std::atoi(argv[++i]);
+            if (r % 16 != 0) { printf("--resolution must be a multiple of 16\n"); return 1; }
+            o.geo_resolution = r;
+        }
+        else if (a == "--seed" && i+1 < argc) o.geo_seed = std::atoi(argv[++i]);
+        else if (a == "--fast") o.fast = true;
+        else if (a == "--cpu")  o.use_cuda = false;
+        else if (a == "--r1w"   && i+1 < argc) o.r1w = argv[++i];
+        else if (a == "--qwen3" && i+1 < argc) o.qwen3_w = argv[++i];
+        else if (a == "--skin-vae" && i+1 < argc) o.skinvae = argv[++i];
+        else if (a == "--beams" && i+1 < argc) o.num_beams = std::atoi(argv[++i]);
+        else if (a == "--rig-sample") { o.rig_sample = true; if (o.num_beams == 20) o.num_beams = 10; }
+        else if (a == "--rig-seed" && i+1 < argc) o.rig_seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--no-rig-select") o.rig_structural_select = false;
+        else if (a == "--rig-retries" && i+1 < argc) o.rig_retries = std::max(0, std::atoi(argv[++i]));
+        else if (a == "--allow-zero-skin") o.allow_zero_skin = true;
+        else if (a == "--rig-pose-gate") o.rig_pose_gate = true;
+        else if (a == "--no-rig-pose-gate") o.rig_pose_gate = false;
+        else if (a == "--rig-min-named-core" && i+1 < argc) o.rig_min_named_core = std::atoi(argv[++i]);
+        else if (a == "--rig-pose-gate-strict") { o.rig_pose_gate_strict = true; if (!o.rig_pose_gate.set) o.rig_pose_gate = true; }
+        else if (a == "--no-bone-names") o.bone_names = false;
+        else if (a == "--bone-names" && i+1 < argc) { std::string v = argv[++i]; o.bone_names_smpl = (v == "smpl"); }
+        else if (a == "--bone-facing" && i+1 < argc) { o.bone_facing = (argv[++i][0] == '-') ? -1 : +1; }
+        else if (a == "--part-retopo") o.part_retopo = true;
+        else if (a == "--p3sam-weights" && i+1 < argc) o.p3sam_w = argv[++i];
+        else if (a == "--obj-decimate" && i+1 < argc) o.obj_decimate = argv[++i];
+        else if (a == "--moge") o.use_moge = true;
+        else if (a == "--moge-weights" && i+1 < argc) o.moge_w = argv[++i];
+        // ---- UltraShape refine stage ----
+        else if (a == "--refine") { o.refine = true; o.refine_set = true; }
+        else if (a == "--no-refine") { o.refine = false; o.refine_set = true; }
+        else if (a == "--dc-remesh") o.dc_remesh = true;
+        else if (a == "--no-solid") o.solid_mesh = false;
+        else if (a == "--solid") o.solid_mesh = true;
+        else if (a == "--dc-band" && i+1 < argc) o.dc_band = std::atoi(argv[++i]);
+        else if (a == "--dc-taubin" && i+1 < argc) o.dc_taubin = std::atoi(argv[++i]);
+        else if (a == "--us-octree" && i+1 < argc) o.us_octree = std::atoi(argv[++i]);
+        else if (a == "--us-latents" && i+1 < argc) o.us_num_latents = std::atoi(argv[++i]);
+        else if (a == "--us-steps" && i+1 < argc) o.us_steps = std::atoi(argv[++i]);
+        else if (a == "--us-guidance" && i+1 < argc) o.us_guidance = (float)std::atof(argv[++i]);
+        else if (a == "--us-chunk" && i+1 < argc) o.us_chunk = (int64_t)std::atoll(argv[++i]);
+        else if (a == "--us-gguf" && i+1 < argc) o.us_gguf_dir = std::string(argv[++i]);
+        else if (a == "--us-dit-w" && i+1 < argc) o.us_dit_w = std::string(argv[++i]);
+        else if (a == "--us-vae-w" && i+1 < argc) o.us_vae_w = std::string(argv[++i]);
+        else if (a == "--us-cnd-w" && i+1 < argc) o.us_cnd_w = std::string(argv[++i]);
+        else if (a == "--us-meta" && i+1 < argc) o.us_meta = std::string(argv[++i]);
+        else if (a == "--stage-dir" && i+1 < argc) o.stage_dir = argv[++i];
+        else if (a == "--image-model-ready") o.image_model_ready = true;
+        else if (a == "--from-refined" && i+1 < argc) o.from_refined = argv[++i];
+        else if (a == "--tex-snap-volume") o.tex_snap_volume = true;
+        else if (a == "--tex-volume-direct") o.tex_volume_direct = true;
+        else if (a == "--tex-fallback-r" && i+1 < argc) o.tex_fallback_r = std::atoi(argv[++i]);
+        else if (a == "--tex-project") o.tex_project = true;
+        else if (a == "--tex-project-overlay") { o.tex_project = true; o.tex_project_overlay = true; }
+        else if (a == "--tex-front" && i+1 < argc) o.tex_front = argv[++i];
+        else if (a == "--tex-back" && i+1 < argc) o.tex_back = argv[++i];
+        else if (a == "--tex-view" && i+2 < argc) {
+            i2r::TexView vs;
+            vs.yaw_deg = (float)std::atof(argv[++i]);
+            vs.img = argv[++i];
+            // `--tex-view 180 x.png` and `--tex-back x.png` are the same view; route both through tex_back
+            // so exactly one yaw=180 camera exists and Stats' back_* fields stay meaningful.
+            if (std::fmod(vs.yaw_deg, 360.f) == 180.f && o.tex_back.empty()) o.tex_back = vs.img;
+            else if (std::fmod(vs.yaw_deg, 360.f) == 0.f)
+                printf("NOTE: --tex-view %g is the FRONT view (--image); ignoring the duplicate\n", vs.yaw_deg);
+            else o.tex_views.push_back(vs);
+        }
+        // --tex-dit proj|cross: WHICH generative tex DiT paints the PBR volume. `cross` (DEFAULT =
+        // unchanged behaviour) = trellis2_tex_1024, the TRELLIS-2 texturing model the tex_goldens came
+        // from. `proj` = slat_flow_imgshape2tex_1024 = the model pixal3d's OWN Python pipeline runs
+        // (Trellis2TexturingPipeline is dead code there), i.e. the one that painted gilly. Same cond the
+        // geometry stage already computes, same tex_slat normalization, same tex decoder, same bake — so
+        // this is a clean single-variable A/B. --tex-dit-w overrides the weight dir/basename.
+        else if (a == "--tex-dit" && i+1 < argc) {
+            std::string m = argv[++i];
+            if (m == "proj") o.geo_tex_proj = true;
+            else if (m == "cross") o.geo_tex_proj = false;
+            else { printf("--tex-dit must be 'proj' or 'cross' (got '%s')\n", m.c_str()); return 1; }
+        }
+        else if (a == "--tex-dit-w" && i+1 < argc) o.geo_tex_flow_w = std::string(argv[++i]);
+        else if (a == "--quad") o.do_quad = true;
+        else if (a == "--no-quad") o.do_quad = false;
+        else if (a == "--retopo" && i+1 < argc) o.retopo_tool = argv[++i];   // im (default) | quadwild
+        else if (a == "--im-adaptivity" && i+1 < argc) o.im_adaptivity = (float)std::atof(argv[++i]);
+        else if (a == "--im-verts" && i+1 < argc) o.im_target_verts = std::atoi(argv[++i]);
+        else if (a == "--quadwild-repo" && i+1 < argc) o.quad_repo = std::string(argv[++i]);
+        else if (a == "--no-clean") o.clean = false;
+        else if (a == "--mc-stride" && i+1 < argc) o.mc_stride = std::atoi(argv[++i]);
+        else if (a == "--mc-blur" && i+1 < argc) o.mc_blur = std::atoi(argv[++i]);
+        else if (a == "--mc-smooth" && i+1 < argc) o.mc_smooth = std::atoi(argv[++i]);
+        else if (a == "--rig-cache" && i+1 < argc) o.rig_cache = argv[++i];
+        else if (a == "--dump-geo" && i+1 < argc) o.dump_geo = argv[++i];
+        else if (a == "--from-geo" && i+1 < argc) o.from_geo = argv[++i];
+        else if (a == "--no-rig") o.no_rig = true;
+        else if (a == "--geometry-only") o.geometry_only = true;
+        else if (a == "--material-cache-only") o.material_cache_only = true;
+        // geometry sampler knobs (forwarded to ChainInput; defaults already = inference.py)
+        else if (a == "--guidance" && i+1 < argc) { float g=nextf(i); o.geo_guidance = g; }
+        else if (a == "--steps" && i+1 < argc) { int s=std::atoi(argv[++i]); o.geo_steps = s; }
+        else { printf("unknown/incomplete arg: %s\n", a.c_str()); usage(); return 1; }
+    }
+    return -1;   // parsed; carry on
+}
+
 static std::vector<float> load_norm(const std::string& model, const char* kind, const char* which) {
     for (std::string p : {model + "/" + kind + "_norm_" + which + ".npy",
                           std::string("refs/") + kind + "_norm_" + which + ".npy"}) {
@@ -175,13 +343,85 @@ static void bbox_canon_onto(std::vector<float>& v, const std::vector<float>& ref
     for (size_t i=0; i+2 < v.size(); i+=3) for (int c=0;c<3;c++) v[i+c] = (v[i+c]-vc[c])*s + rc[c];
 }
 
-int main(int argc, char** argv) {
-    // A production run can spend many minutes in M4/UltraShape.  When stdout is
-    // redirected to the per-candidate run log, libc otherwise fully buffers
-    // stage lines and leaves the operator unable to tell a live decode from a
-    // dead process.  Preserve every existing message, but make newline-delimited
-    // progress authoritative in the log.
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+// ---------------------------------------------------------------------------
+// The rig-draw selector's verdict on ONE conditioning draw, and the ordering it induces.
+// ---------------------------------------------------------------------------
+namespace i2r {
+
+// Last rig stage's decision, for a caller that got only an int back. See rig_stage_report.hpp for
+// why this is a last-run global and the conditions under which that is well defined.
+static rig::StageReport g_rig_report;
+
+struct DrawVerdict {
+    int  index = 0, J = 0;
+    bool skin_ok = false, humanoid = false, generic = false;
+    bool naming_evaluated = false;
+    int  named_core = 0;
+    int  falsifier = 999;          // 999 = naming failed / not run: ranks below any real count
+    bool pose_ran = false, pose_pass = false;
+    double pose_worst = 0, pose_moved = 0;
+    bool accept = false;
+
+    // `strict` also demands the deformation check on the HUMANOID branch. Default off because the
+    // 22-bone gate is a strong anatomy claim on its own — but it is not a deformation claim, and
+    // char1 is the counter-example: its shipped rig names 22/22, passes the humanoid gate and scores
+    // the HIGHEST rig_score of any subject we ship (0.921), while the pose gate reads 10.454
+    // all-influential and 77.864 on one component (25.877 even on the plain arms-raised pose). The
+    // lenient predicate accepts that rig at draw 0 and never looks further. See the report.
+    void compute_accept(int min_named_core, bool strict) {
+        const bool named_ok = !naming_evaluated || named_core >= min_named_core;
+        const bool deform_ok = !pose_ran || pose_pass;   // no gate run => no evidence against
+        accept = skin_ok && named_ok &&
+                 ((humanoid && (!strict || deform_ok)) || (generic && pose_pass));
+    }
+
+    // STRICT ORDERING, and the reasoning for each rung:
+    //  1. skin_ok      — a rig that deforms nothing is never a delivery, whatever else it scores.
+    //  2. accept       — a draw that cleared the whole predicate beats one that did not.
+    //  3. named_core   — THE TIE-BREAK, and deliberately not the pose-gate number. Both are about
+    //                    "will this animate", but the retargeter maps through NAMES: 21/22 named
+    //                    with pose 4.127 (miku draw 0) animates better than 14/22 named with a
+    //                    prettier score (draw 2), because the missing names are missing bones. So
+    //                    rank on retargetability first and on deformation quality second.
+    //  4. falsifier    — among equally-named rigs prefer the one whose names survive the falsifier.
+    //  5. pose_worst   — then the smaller worst-case LBS seam.
+    //  6. index        — then the EARLIER draw, so the result is deterministic and draw 0 (the exact
+    //                    NumPy-parity path) wins every tie it is in.
+    bool better_than(const DrawVerdict& o) const {
+        if (skin_ok    != o.skin_ok)    return skin_ok;
+        if (accept     != o.accept)     return accept;
+        if (named_core != o.named_core) return named_core > o.named_core;
+        if (falsifier  != o.falsifier)  return falsifier < o.falsifier;
+        if (pose_ran && o.pose_ran && pose_worst != o.pose_worst) return pose_worst < o.pose_worst;
+        return index < o.index;
+    }
+
+    std::string describe() const {
+        char b[512];
+        std::string gate = humanoid ? "humanoid" : (generic ? "generic" : "NO gate (top beam kept)");
+        std::string pose = !pose_ran ? std::string("pose=n/a")
+                                     : (std::string(pose_pass ? "pose PASS " : "pose FAIL ") +
+                                        [&]{ char t[64]; std::snprintf(t, sizeof(t), "%.3f/6.0 moved=%.3f",
+                                                                       pose_worst, pose_moved); return std::string(t); }());
+        std::snprintf(b, sizeof(b), "%s gate=%s core=%d/22 falsifier=%s %s -> %s",
+                      skin_ok ? "skin ok" : "SKIN ZERO", gate.c_str(),
+                      naming_evaluated ? named_core : -1,
+                      falsifier == 999 ? "n/a" : std::to_string(falsifier).c_str(),
+                      pose.c_str(), accept ? "ACCEPT" : "reject");
+        return b;
+    }
+};
+
+}  // namespace i2r
+
+const rig::StageReport& image_to_rig_last_rig_report() { return i2r::g_rig_report; }
+
+// IMAGE_TO_RIG_LIB: this translation unit is BOTH the program and a callable stage, so there is one
+// implementation and not a library copy that can drift from the binary. The stage is
+// i2r::run(Options) — a typed struct, no argv round-trip: avatar::Engine fills the fields it means
+// and calls this directly, and main() (at the bottom of the file) parses argv into the same struct
+// first. Everything below the binding block is the pipeline exactly as it was.
+static int i2r_run_body(i2r::Options opt) {
     // Correctness-first: fp32 matmul accumulation, no TF32 (TF32's ~1e-2 noise flips occupancy-threshold
     // voxels). overwrite=0 so a caller CAN relax it (export NVIDIA_TF32_OVERRIDE=1) for the perf A/B --
     // pixal3d.cpp:67's sibling comment already says "perf phase relaxes". Default stays 0.
@@ -202,243 +442,108 @@ int main(int argc, char** argv) {
     //    is large enough to alter face/clothing geometry.  High-quality production therefore defaults
     //    to dense F32.  Set =1 deliberately for a performance-only run and label it as such.
     setenv("USR_GEO_FLASH",    "0",    0);
-    std::string model, image, out;
-    std::string r1w     = "/home/dbrain/models/3d/rig/r1w_real";
-    std::string qwen3_w = "/home/dbrain/models/3d/rig/qwen3_w";
-    std::string skinvae = "/home/dbrain/models/3d/rig/skin_vae_gguf";
-    float cam = DEF_CAM, dist = DEF_DIST, ms = DEF_MS;
-    bool use_cuda = true, fast = false;
-    // Inline-API rig default = DETERMINISTIC beam (do_sample=false) + beams=20 — the fan-free recipe
-    // (gilly audit). On the canonical standing-Miku input the stochastic scaffold default (sample,
-    // beams=10) hit the runaway attractor (J=178 maxfan=103 rig_score 0.000); deterministic = J=56
-    // maxfan=5 rig_score 0.908. A one-shot API must be robust out of the box. `--rig-sample` restores
-    // the stochastic scaffold recipe (do_sample=true, beams=10) for owner A/B comparison.
-    bool rig_sample = false;
-    // --clean (default ON): MC manifold remesh (de-spike) + precluster atlas bake. The raw dual-grid
-    // O-Voxel mesh is non-manifold (spikey render + a shattered >400s xatlas atlas); the manifold
-    // remesh fixes both and the precluster bake drops to ~18s. `--no-clean` restores the raw path for
-    // A/B comparison.
-    bool clean = true;
-    // MC-remesh recipe (validated on standing-Miku): stride 2 (grid 512) + blur 0 + 1 Taubin iter =
-    // de-spiked manifold that KEEPS thin features (twintails). blur>0 box-bridges thin gaps (fuses the
-    // twintails into one cape); the finer stride-1 grid preserves them too but is ~12x slower for the
-    // same result, so blur=0 at stride 2 is the default. --mc-blur/--mc-stride/--mc-smooth override.
-    int mc_stride = 2, mc_blur = 0, mc_smooth = 1;
-    // --dc-remesh: THE PYTHON-PARITY COARSE PATH (2026-07-25). Instead of MC-soliding the binary
-    // occupancy (a lego staircase), keep the smooth O-Voxel dual-grid decoder mesh and narrow-band
-    // dual-contour THAT — Python's `o_voxel.postprocess.to_glb(remesh=True)` equivalent — then Taubin.
-    // The result IS the parity delivery mesh, so the bake and the rig both run on it in ONE binary
-    // call (shootout/native_ovoxel_dc_parity.sh does the same thing across four processes and stops
-    // before the rig). Implies --no-refine: refine is a GENERATIVE densify whose surface no longer
-    // aligns to the PBR volume, and texturing it reprojects/slides colour. See memory
-    // project_image_to_rig_coarse_parity_ovoxel_dc.
-    bool dc_remesh = false;
-    int   dc_band = 1;        // narrow-band width in voxels (Pixal3D postprocess default)
-    int   dc_taubin = 2;      // Taubin iterations on the DC output (parity wrapper default)
-    int texsize = 1024, decimate = 150000, num_beams = 20;
-    // --dc-remesh raises the texture/decimate defaults to the parity wrapper's (2048 / 220k on a
-    // ~3.4M-face DC mesh); an explicit --texsize/--decimate/--refine still wins.
-    bool texsize_set = false, decimate_set = false, refine_set = false;
-    // --dump-geo/--from-geo: cache the geometry volume (coords1024 + per-voxel PBR) so the cheap
-    // post-geometry stages (MC-remesh + bake + rig, ~3min) can be iterated without re-paying the ~420s
-    // diffusion. --no-rig writes a textured-only GLB (skips the 159s auto-rig) for fast mesh/texture A/B.
-    std::string dump_geo, from_geo;
-    // --rig-cache: generate the skeleton once, then reuse it for every LOD tier so all tiers of an
-    // asset share ONE skeleton (a prerequisite for a clip to play on any tier).
-    std::string rig_cache;
-    bool no_rig = false;
-    bool geometry_only = false;
-    bool material_cache_only = false;
-    uint64_t rig_seed = 0;
-    // Standard bone naming (ON by default -- an anonymous bone_N rig cannot take a Mixamo or
-    // AMASS clip without a human hand-mapping it, which is the whole point of rigging).
-    //   --no-bone-names   keep anonymous bone_N
-    //   --bone-names smpl|mixamo   emit SMPL-H 22 names instead of Mixamo (default mixamo)
-    //   --bone-facing +z|-z        override the auto-derived facing (which decides LEFT/RIGHT)
-    bool bone_names = true, bone_names_smpl = false;
-    int  bone_facing = 0;   // 0 = auto-derive from the feet
-    // --part-retopo: native P3-SAM part segmentation -> region-adaptive per-part decimation
-    // (hands/fingers kept dense, hair/torso crushed) BEFORE texture bake, replacing the flat decimate.
-    // CPU correctness-first port (validated cos 1.0 backbone/heads); GPU port = perf follow-up, so it
-    // is OFF by default and currently slow. See p3sam_retopo.cpp for the standalone path.
-    bool part_retopo = false;
-    std::string p3sam_w = "/mnt/hdd/3d/avatar-shootout/p3sam_goldens/weights_npy";
-    std::string obj_decimate = "./obj_decimate";
-    // --moge: native MoGe-2 camera estimation (image -> FOV) replaces the default/--fov camera, making
-    // the inline API 100% camera-native. Square-matte path (rows=cols=60, AR=1). See moge_cam.hpp.
-    bool use_moge = false;
-    std::string moge_w = "/mnt/hdd/3d/avatar-shootout/moge_goldens/weights_npy";
-    // --refine (default ON): native UltraShape refine between pixal3d geometry and the bake/rig — the
-    // clean/watertight ~7.5x densify. `--no-refine` restores the coarse-only path (fast A/B). Config +
-    // weight dirs via --us-*. The refined mesh is re-canonicalized onto the coarse-mesh bbox so the PBR
-    // volume bakes onto it (RP_CANON_TO_DENSE). See ultrashape_refine.hpp.
-    bool refine = true;
-    usr::RefineCfg uscfg;
-    // Reproject-bake mode (only when refine ran → a coarse shell exists). Default = mesh-attr (barycentric
-    // interp of the shell's per-vertex PBR): best texel coverage (~71% direct vs ~39% for snap+volume on
-    // toy2) → clean uniform texture after inpaint. --tex-snap-volume forces the snap-onto-shell +
-    // volume-grid_sample path, which is steadier on FINE HAIR/STRANDS (no triangle-choice speckle) but
-    // leaves more holes on smooth bodies. See tex_atlas.hpp:969-973.
-    bool tex_snap_volume = false;
-    // --tex-volume-direct: THE FRAY FIX (default OFF — owner A/Bs). Both reproject modes above find the
-    // colour by composing TWO closest-point projections (texel -> coarse shell -> volume), which slides
-    // along the surface and fetches the wrong material at a colour boundary — 9.2% of texels read a voxel
-    // >4 vox away on the model (p99 13.2 vox). Direct mode reads the volume at the TEXEL'S OWN position.
-    // The BLACK-TEXTURE bug that motivated the snap is really --tex-fallback-r being 0 here (see below):
-    // direct sampling is 47.6% wrong at r=0 and 1.34% wrong at r=8, vs RP_ATTR's 4.87%. Measured on
-    // inline_soldier1536; see tex_atlas.hpp's RP_DIRECT comment.
-    bool tex_volume_direct = false;
-    // --tex-fallback-r: `sample_fallback_r` for texatlas::bake — the radius (in voxels) of the
-    // nearest-occupied-voxel search that texgs::sample_one falls back to when all 8 trilinear corners are
-    // empty. -1 = mode default: 0 for the legacy snap modes (TODAY'S BEHAVIOUR, preserved), 8 for
-    // --tex-volume-direct (below r=8 the direct read is starved: r=1 -> 40.4% wrong, r=4 -> 11.9%,
-    // r=8 -> 1.3%). NB the legacy driver tex_reproject.cpp:172 has always defaulted this to 16; only
-    // this production call site passes 0, which is why the direct path "baked black" here.
-    int tex_fallback_r = -1;
-    // --tex-project: after the bake, OVERWRITE the atlas baseColor by projecting the real images onto the
-    // mesh (front = --image, the matte the mesh was built from = the exact camera frame; back = optional
-    // --tex-back, a generated 180deg view). The volume bake's colours are right but carry ZERO detail (the
-    // PBR is generated in a ~64^3 latent → band-limited by design); the projection keeps near-source
-    // detail. metallicRoughness stays from the volume bake. See tex_project.hpp.
-    // Views are generalized to an arbitrary yaw about +Y: --tex-back is sugar for --tex-view 180, and
-    // --tex-view is repeatable (the owner called out SIDE views as a problem area, so adding e.g.
-    // `--tex-view 90 right.png --tex-view -90 left.png` needs no code change here).
-    bool tex_project = false;
-    bool tex_project_overlay = false;
-    std::string tex_back;
-    // --tex-front: use a DIFFERENT image than --image as the front projection source. Geometry and
-    // texturing already consume different tensors (geometry gets the resized + ImageNet-normalized
-    // img512_raw/img1024_raw; projection gets pcfg.front_img -> stbi_load at native res); they share
-    // only this path variable. Splitting it lets the front be de-lit (sd-delight) while geometry keeps
-    // the LIT original it was validated on -- i.e. de-lighting cannot regress TRELLIS by construction.
-    // MUST be the same camera frame as --image (same crop/scale), so in practice: a processed --image.
-    std::string tex_front;
-    std::vector<texproj::ViewSpec> tex_views;
-    // --quad: rung-2 quad retopology (quadwild-bimdf) on the refined mesh -> clean field-aligned topology,
-    // TRIANGULATED for the tri-only bake/rig/glb downstream. Shell-out (no linking). OFF by default while
-    // bringing up; --quadwild-repo overrides the built-repo path. See quad_retopo.hpp.
-    bool do_quad = false;
-    qr::QuadCfg qcfg;
-    // --retopo <im|quadwild>: which retopology tool the --quad stage uses. Default IM (Instant Meshes) —
-    // clean organic quad flow + watertight; quadwild tears organic flat regions (validated on a robot).
-    std::string retopo_tool = "im";
-    imretopo::ImCfg imcfg;
-    // Staging: --stage-dir writes every intermediate GLB (coarse/refined/decimated) as a named artifact
-    // for the eye-test page AND the .bin caches to resume. --from-refined <dir> skips geometry+refine
-    // (loads refined.glb + the cached PBR volume). --from-geo (below) skips only the geometry diffusion.
-    std::string stage_dir, from_refined;
-    bool image_model_ready = false;  // diagnostic only; production always owns the framing contract.
-    pix::ChainInput in;
 
-    auto nextf = [&](int& i){ return (float)std::atof(argv[++i]); };
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
-        if      (a == "--model" && i+1 < argc) model = argv[++i];
-        else if (a == "--image" && i+1 < argc) image = argv[++i];
-        else if (a == "--out"   && i+1 < argc) out = argv[++i];
-        // cam and dist are THE SAME PARAMETER: DEF_DIST == 0.5/tan(DEF_CAM/2) to 7 d.p. (1.3021560).
-        // DEF_DIST was never a measured constant -- it is the canonical "unit-diameter object exactly
-        // fills the frame" render convention. Setting cam WITHOUT dist breaks the identity and turns a
-        // perspective change into a ZOOM: measured on the soldier, --moge's 46.5deg made the model
-        // +16% BIGGER (extents x1.164/1.159/1.146, shape unchanged to ~1%) and pushed 23,336 verts
-        // through the canonical box floor at Y <= -0.4999 -- a flat plane where the boots should be.
-        // That is what OOM'd the refine (bigger subject -> N1 1227->1701 -> M 12541->18674 -> M^2).
-        else if (a == "--fov"   && i+1 < argc) { cam = std::atof(argv[++i]) * (float)M_PI / 180.0f; dist = 0.5f / std::tan(cam * 0.5f); }
-        else if (a == "--cam"   && i+3 < argc) { cam = std::atof(argv[++i]); dist = std::atof(argv[++i]); ms = std::atof(argv[++i]); }
-        else if (a == "--texsize" && i+1 < argc) { texsize = std::atoi(argv[++i]); texsize_set = true; }
-        else if (a == "--decimate" && i+1 < argc) { decimate = std::atoi(argv[++i]); decimate_set = true; }
-        else if ((a == "--resolution" || a == "--res") && i+1 < argc) {
-            in.resolution = std::atoi(argv[++i]);
-            if (in.resolution % 16 != 0) { printf("--resolution must be a multiple of 16\n"); return 1; }
-        }
-        else if (a == "--seed" && i+1 < argc) in.seed = std::atoi(argv[++i]);
-        else if (a == "--fast") fast = true;
-        else if (a == "--cpu")  use_cuda = false;
-        else if (a == "--r1w"   && i+1 < argc) r1w = argv[++i];
-        else if (a == "--qwen3" && i+1 < argc) qwen3_w = argv[++i];
-        else if (a == "--skin-vae" && i+1 < argc) skinvae = argv[++i];
-        else if (a == "--beams" && i+1 < argc) num_beams = std::atoi(argv[++i]);
-        else if (a == "--rig-sample") { rig_sample = true; if (num_beams == 20) num_beams = 10; }
-        else if (a == "--rig-seed" && i+1 < argc) rig_seed = std::strtoull(argv[++i], nullptr, 10);
-        else if (a == "--no-bone-names") bone_names = false;
-        else if (a == "--bone-names" && i+1 < argc) { std::string v = argv[++i]; bone_names_smpl = (v == "smpl"); }
-        else if (a == "--bone-facing" && i+1 < argc) { bone_facing = (argv[++i][0] == '-') ? -1 : +1; }
-        else if (a == "--part-retopo") part_retopo = true;
-        else if (a == "--p3sam-weights" && i+1 < argc) p3sam_w = argv[++i];
-        else if (a == "--obj-decimate" && i+1 < argc) obj_decimate = argv[++i];
-        else if (a == "--moge") use_moge = true;
-        else if (a == "--moge-weights" && i+1 < argc) moge_w = argv[++i];
-        // ---- UltraShape refine stage ----
-        else if (a == "--refine") { refine = true; refine_set = true; }
-        else if (a == "--no-refine") { refine = false; refine_set = true; }
-        else if (a == "--dc-remesh") dc_remesh = true;
-        else if (a == "--dc-band" && i+1 < argc) dc_band = std::atoi(argv[++i]);
-        else if (a == "--dc-taubin" && i+1 < argc) dc_taubin = std::atoi(argv[++i]);
-        else if (a == "--us-octree" && i+1 < argc) uscfg.octree = std::atoi(argv[++i]);
-        else if (a == "--us-latents" && i+1 < argc) uscfg.num_latents = std::atoi(argv[++i]);
-        else if (a == "--us-steps" && i+1 < argc) uscfg.steps = std::atoi(argv[++i]);
-        else if (a == "--us-guidance" && i+1 < argc) uscfg.guidance = (float)std::atof(argv[++i]);
-        else if (a == "--us-chunk" && i+1 < argc) uscfg.chunk = std::atoll(argv[++i]);
-        else if (a == "--us-gguf" && i+1 < argc) uscfg.gguf_dir = argv[++i];
-        else if (a == "--us-dit-w" && i+1 < argc) uscfg.dit_w = argv[++i];
-        else if (a == "--us-vae-w" && i+1 < argc) uscfg.vae_w = argv[++i];
-        else if (a == "--us-cnd-w" && i+1 < argc) uscfg.cnd_w = argv[++i];
-        else if (a == "--us-meta" && i+1 < argc) uscfg.meta = argv[++i];
-        else if (a == "--stage-dir" && i+1 < argc) stage_dir = argv[++i];
-        else if (a == "--image-model-ready") image_model_ready = true;
-        else if (a == "--from-refined" && i+1 < argc) from_refined = argv[++i];
-        else if (a == "--tex-snap-volume") tex_snap_volume = true;
-        else if (a == "--tex-volume-direct") tex_volume_direct = true;
-        else if (a == "--tex-fallback-r" && i+1 < argc) tex_fallback_r = std::atoi(argv[++i]);
-        else if (a == "--tex-project") tex_project = true;
-        else if (a == "--tex-project-overlay") { tex_project = true; tex_project_overlay = true; }
-        else if (a == "--tex-front" && i+1 < argc) tex_front = argv[++i];
-        else if (a == "--tex-back" && i+1 < argc) tex_back = argv[++i];
-        else if (a == "--tex-view" && i+2 < argc) {
-            texproj::ViewSpec vs;
-            vs.yaw_deg = (float)std::atof(argv[++i]);
-            vs.img = argv[++i];
-            // `--tex-view 180 x.png` and `--tex-back x.png` are the same view; route both through tex_back
-            // so exactly one yaw=180 camera exists and Stats' back_* fields stay meaningful.
-            if (std::fmod(vs.yaw_deg, 360.f) == 180.f && tex_back.empty()) tex_back = vs.img;
-            else if (std::fmod(vs.yaw_deg, 360.f) == 0.f)
-                printf("NOTE: --tex-view %g is the FRONT view (--image); ignoring the duplicate\n", vs.yaw_deg);
-            else tex_views.push_back(vs);
-        }
-        // --tex-dit proj|cross: WHICH generative tex DiT paints the PBR volume. `cross` (DEFAULT =
-        // unchanged behaviour) = trellis2_tex_1024, the TRELLIS-2 texturing model the tex_goldens came
-        // from. `proj` = slat_flow_imgshape2tex_1024 = the model pixal3d's OWN Python pipeline runs
-        // (Trellis2TexturingPipeline is dead code there), i.e. the one that painted gilly. Same cond the
-        // geometry stage already computes, same tex_slat normalization, same tex decoder, same bake — so
-        // this is a clean single-variable A/B. --tex-dit-w overrides the weight dir/basename.
-        else if (a == "--tex-dit" && i+1 < argc) {
-            std::string m = argv[++i];
-            if (m == "proj") in.tex_proj = true;
-            else if (m == "cross") in.tex_proj = false;
-            else { printf("--tex-dit must be 'proj' or 'cross' (got '%s')\n", m.c_str()); return 1; }
-        }
-        else if (a == "--tex-dit-w" && i+1 < argc) in.tex_flow_w = argv[++i];
-        else if (a == "--quad") do_quad = true;
-        else if (a == "--no-quad") do_quad = false;
-        else if (a == "--retopo" && i+1 < argc) retopo_tool = argv[++i];   // im (default) | quadwild
-        else if (a == "--im-adaptivity" && i+1 < argc) imcfg.adaptivity = (float)std::atof(argv[++i]);
-        else if (a == "--im-verts" && i+1 < argc) imcfg.target_verts = std::atoi(argv[++i]);
-        else if (a == "--quadwild-repo" && i+1 < argc) qcfg.repo = argv[++i];
-        else if (a == "--no-clean") clean = false;
-        else if (a == "--mc-stride" && i+1 < argc) mc_stride = std::atoi(argv[++i]);
-        else if (a == "--mc-blur" && i+1 < argc) mc_blur = std::atoi(argv[++i]);
-        else if (a == "--mc-smooth" && i+1 < argc) mc_smooth = std::atoi(argv[++i]);
-        else if (a == "--rig-cache" && i+1 < argc) rig_cache = argv[++i];
-        else if (a == "--dump-geo" && i+1 < argc) dump_geo = argv[++i];
-        else if (a == "--from-geo" && i+1 < argc) from_geo = argv[++i];
-        else if (a == "--no-rig") no_rig = true;
-        else if (a == "--geometry-only") geometry_only = true;
-        else if (a == "--material-cache-only") material_cache_only = true;
-        // geometry sampler knobs (forwarded to ChainInput; defaults already = inference.py)
-        else if (a == "--guidance" && i+1 < argc) { float g=nextf(i); in.ss.guidance=g; in.shape.guidance=g; }
-        else if (a == "--steps" && i+1 < argc) { int s=std::atoi(argv[++i]); in.ss.steps=in.shape.steps=in.tex.steps=s; }
-        else { printf("unknown/incomplete arg: %s\n", a.c_str()); usage(); return 1; }
-    }
+    // ---- the option NAMES the pipeline below uses, bound to the struct ------------------------
+    // References, not copies: the body mutates several of these while resolving implied defaults
+    // (--dc-remesh raising texsize, MoGe replacing the camera), and it must keep doing exactly that.
+    // Binding by name is also what keeps this refactor reviewable — the ~700 lines of pipeline that
+    // follow are untouched, and a merge against another agent's edits to them is a clean one.
+    std::string& model   = opt.model;
+    std::string& image   = opt.image;
+    std::string& out     = opt.out;
+    std::string& r1w     = opt.r1w;
+    std::string& qwen3_w = opt.qwen3_w;
+    std::string& skinvae = opt.skinvae;
+    float& cam  = opt.cam;
+    float& dist = opt.dist;
+    float& ms   = opt.ms;
+    bool&  use_cuda = opt.use_cuda;
+    bool&  fast     = opt.fast;
+    bool&  rig_sample = opt.rig_sample;
+    bool&  rig_structural_select = opt.rig_structural_select;
+    int&   rig_retries = opt.rig_retries;
+    bool&  allow_zero_skin = opt.allow_zero_skin;
+    // The pose gate is ON exactly when there is a choice to make. At --rig-retries 0 the loop breaks
+    // on the first draw whatever the verdict, so running a ~4 s deformation audit could only slow
+    // the shipped path down and change nothing — and the default path must stay bit-identical.
+    const bool rig_pose_gate = opt.rig_pose_gate.set ? opt.rig_pose_gate.v : (opt.rig_retries > 0);
+    const int  rig_min_named_core = opt.rig_min_named_core;
+    const bool rig_pose_gate_strict = opt.rig_pose_gate_strict;
+    bool&  clean = opt.clean;
+    int&   mc_stride = opt.mc_stride;
+    int&   mc_blur   = opt.mc_blur;
+    int&   mc_smooth = opt.mc_smooth;
+    bool&  dc_remesh = opt.dc_remesh;
+    int&   dc_band   = opt.dc_band;
+    int&   dc_taubin = opt.dc_taubin;
+    bool&  solid_mesh = opt.solid_mesh;
+    int&   texsize   = opt.texsize;
+    int&   decimate  = opt.decimate;
+    int&   num_beams = opt.num_beams;
+    bool&  texsize_set  = opt.texsize_set;
+    bool&  decimate_set = opt.decimate_set;
+    bool&  refine_set   = opt.refine_set;
+    std::string& dump_geo  = opt.dump_geo;
+    std::string& from_geo  = opt.from_geo;
+    std::string& rig_cache = opt.rig_cache;
+    bool& no_rig = opt.no_rig;
+    bool& geometry_only = opt.geometry_only;
+    bool& material_cache_only = opt.material_cache_only;
+    uint64_t& rig_seed = opt.rig_seed;
+    bool& bone_names = opt.bone_names;
+    bool& bone_names_smpl = opt.bone_names_smpl;
+    int&  bone_facing = opt.bone_facing;
+    bool& part_retopo = opt.part_retopo;
+    std::string& p3sam_w = opt.p3sam_w;
+    std::string& obj_decimate = opt.obj_decimate;
+    bool& use_moge = opt.use_moge;
+    std::string& moge_w = opt.moge_w;
+    bool& refine = opt.refine;
+    bool& tex_snap_volume = opt.tex_snap_volume;
+    bool& tex_volume_direct = opt.tex_volume_direct;
+    int&  tex_fallback_r = opt.tex_fallback_r;
+    bool& tex_project = opt.tex_project;
+    bool& tex_project_overlay = opt.tex_project_overlay;
+    std::string& tex_back  = opt.tex_back;
+    std::string& tex_front = opt.tex_front;
+    bool& do_quad = opt.do_quad;
+    std::string& retopo_tool = opt.retopo_tool;
+    std::string& stage_dir    = opt.stage_dir;
+    std::string& from_refined = opt.from_refined;
+    bool& image_model_ready = opt.image_model_ready;
+
+    // ---- the mirrored options, applied onto the config structs that own their defaults ---------
+    // `.set` is the whole point: an UNSET mirror leaves that struct's own default alone, so each
+    // default lives in exactly one place and the two cannot drift (see image_to_rig_options.hpp).
+    pix::ChainInput in;
+    if (opt.geo_resolution.set)  in.resolution = opt.geo_resolution.v;
+    if (opt.geo_seed.set)        in.seed       = opt.geo_seed.v;
+    if (opt.geo_guidance.set)  { in.ss.guidance = opt.geo_guidance.v; in.shape.guidance = opt.geo_guidance.v; }
+    if (opt.geo_steps.set)     { in.ss.steps = in.shape.steps = in.tex.steps = opt.geo_steps.v; }
+    if (opt.geo_tex_proj.set)    in.tex_proj   = opt.geo_tex_proj.v;
+    if (opt.geo_tex_flow_w.set)  in.tex_flow_w = opt.geo_tex_flow_w.v;
+
+    usr::RefineCfg uscfg;
+    if (opt.us_octree.set)      uscfg.octree      = opt.us_octree.v;
+    if (opt.us_num_latents.set) uscfg.num_latents = opt.us_num_latents.v;
+    if (opt.us_steps.set)       uscfg.steps       = opt.us_steps.v;
+    if (opt.us_guidance.set)    uscfg.guidance    = opt.us_guidance.v;
+    if (opt.us_chunk.set)       uscfg.chunk       = opt.us_chunk.v;
+    if (opt.us_gguf_dir.set)    uscfg.gguf_dir    = opt.us_gguf_dir.v;
+    if (opt.us_dit_w.set)       uscfg.dit_w       = opt.us_dit_w.v;
+    if (opt.us_vae_w.set)       uscfg.vae_w       = opt.us_vae_w.v;
+    if (opt.us_cnd_w.set)       uscfg.cnd_w       = opt.us_cnd_w.v;
+    if (opt.us_meta.set)        uscfg.meta        = opt.us_meta.v;
+
+    qr::QuadCfg qcfg;
+    if (opt.quad_repo.set) qcfg.repo = opt.quad_repo.v;
+    imretopo::ImCfg imcfg;
+    if (opt.im_adaptivity.set)   imcfg.adaptivity   = opt.im_adaptivity.v;
+    if (opt.im_target_verts.set) imcfg.target_verts = opt.im_target_verts.v;
+
+    std::vector<texproj::ViewSpec> tex_views;
+    tex_views.reserve(opt.tex_views.size());
+    for (const auto& v : opt.tex_views) { texproj::ViewSpec s; s.yaw_deg = v.yaw_deg; s.img = v.img; tex_views.push_back(s); }
     if (model.empty() || image.empty() || out.empty()) { usage(); return 1; }
     if ((geometry_only || material_cache_only) && stage_dir.empty()) { printf("--geometry-only/--material-cache-only requires --stage-dir\n"); return 1; }
     if (geometry_only && material_cache_only) { printf("--geometry-only and --material-cache-only are mutually exclusive\n"); return 1; }
@@ -457,6 +562,9 @@ int main(int argc, char** argv) {
     if (dc_remesh)
         printf("  dc-remesh=yes (Python-parity O-Voxel narrow-band DC, band=%d, taubin=%d; refine=%s, texsize=%d, decimate=%d)\n",
                dc_band, dc_taubin, refine ? "ON (explicit)" : "off", texsize, decimate);
+    if (dc_remesh)
+        printf("  solid=%s\n", solid_mesh ? "yes (signed field + buried-shell drop -> ONE watertight manifold solid)"
+                                           : "NO (default: historical two-walled DC envelope -- pass --solid for the signed one-wall solid; it breaks the rig)");
     if (geometry_only) {
         printf("  geometry-only=yes (legacy PBR material, UV bake, and rig are skipped)\n");
     } else if (material_cache_only) {
@@ -499,11 +607,21 @@ int main(int argc, char** argv) {
         }
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [1/4] geometry + texture (in-process, GPU) ----------
     setenv("PIXAL3D_GGUF_DIR", model.c_str(), 1);
     try {
-        in.img512_raw  = image_model_ready ? imgio::load_chw(image, 512) : imgio::load_pixal_matte_chw(image, 512);
-        in.img1024_raw = image_model_ready ? imgio::load_chw(image, 1024) : imgio::load_pixal_matte_chw(image, 1024);
+        // matte_native:: is a DROP-IN for imgio::load_pixal_matte_chw with the same framing contract.
+        // The difference is what happens to an input that is NOT already a matte: the border-flood
+        // heuristic picks a different silhouette than Python's (63.6% stage-1 agreement — a collapse),
+        // so that case used to be handed to a CONTAINER (`docker run … vision-cli`) per image. This
+        // runs RMBG-2.0 in-process instead, under the same 3060 lock as the rest of the pipeline:
+        // 2.4 s -> 0.79 s with the model resident, and identical alpha>0.8 crop box (silhouette
+        // IoU 1.0000) so nothing downstream moves. Inputs already classified rgba-cutout/black-matte
+        // never touch the model at all, which is why the existing corpus is unaffected.
+        in.img512_raw  = image_model_ready ? imgio::load_chw(image, 512) : matte_native::load_pixal_matte_chw(image, 512);
+        in.img1024_raw = image_model_ready ? imgio::load_chw(image, 1024) : matte_native::load_pixal_matte_chw(image, 1024);
+    } catch (const cancelhook::Cancelled&) { throw;   // a cancel is not a load failure
     } catch (const std::exception& e) { printf("image load failed: %s\n", e.what()); return 1; }
     in.cam = cam; in.dist = dist; in.ms = ms; in.use_cuda = use_cuda; in.verbose = true;
     // Keep the established M4 mesh-decode layout (including its auxiliary subdivision output) exactly
@@ -576,10 +694,12 @@ int main(int argc, char** argv) {
         if (dc_remesh) { printf("FAIL: --dc-remesh needs the O-Voxel decoder mesh; --from-geo only caches the occupancy grid\n"); return 1; }
         mesh = pix::build_mc_remesh(coords1024, in.resolution, mc_stride, mc_blur, mc_smooth, true);
     } else {
+        // The occupancy is wanted whenever --dump-geo caches it AND whenever --dc-remesh is going to
+        // sign its distance field with it. It is a plain copy of a vector the decoder already holds.
         mesh = pix::run_geometry(in, &st, nullptr,
                                  geometry_only ? nullptr : &pbr_feats,
                                  geometry_only ? nullptr : &pbr_coords,
-                                 dump_geo.empty() ? nullptr : &coords1024);
+                                 (dump_geo.empty() && !dc_remesh) ? nullptr : &coords1024);
         printf("  [1/4] geometry: N1=%d M=%d verts=%d faces=%d  (%.1fs)\n",
                st.N1, st.M, mesh.N, mesh.F, pix::now_s() - t_geo);
         if (!dump_geo.empty()) {
@@ -594,6 +714,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [1a0/4] --dc-remesh: Python-parity narrow-band DC of the O-Voxel mesh ----------
     // `mesh` here is the raw dual-grid decoder surface (smooth QEF vertices, but non-manifold and
     // ~3.4M faces). Dual-contouring its own narrow-band UDF is what Python's to_glb(remesh=True)
@@ -604,13 +725,97 @@ int main(int argc, char** argv) {
         printf("  [1a0/4] dc-remesh: narrow-band DC of the O-Voxel mesh (%d v / %d f, res=%d band=%d)...\n",
                mesh.N, mesh.F, in.resolution, dc_band);
         shell_verts = mesh.verts; shell_faces = mesh.faces;   // volume-aligned generation surface
+        // SOLID DELIVERY: build the inside/outside oracle from the decoder's own occupancy and hand
+        // it to the DC, which then contours a SIGNED field.  Without it the DC contours {udf == eps}
+        // of an unsigned field -- two level sets, hence the two-walled envelope.  See solid_field.hpp
+        // for why a voxel occupancy is accurate enough (the sign only matters where udf > eps).
+        solidfield::SolidField interior;
+        if (solid_mesh) {
+            if (coords1024.empty()) {
+                printf("  [1a0/4] solid: no occupancy available (resumed geometry?) -- keeping the "
+                       "unsigned two-walled DC. Pass --no-solid to silence this.\n");
+            } else {
+                const double t_sf = pix::now_s();
+                const int seal  = std::getenv("NBDC_SOLID_SEAL")  ? atoi(std::getenv("NBDC_SOLID_SEAL"))  : 1;
+                const int erode = std::getenv("NBDC_SOLID_ERODE") ? atoi(std::getenv("NBDC_SOLID_ERODE")) : 1;
+                interior = solidfield::build(coords1024.data(), (int)(coords1024.size()/4),
+                                             in.resolution, seal, erode, true);
+                printf("  [1a0/4] solid: inside/outside oracle from %zu occupancy voxels (%.1fs)%s\n",
+                       coords1024.size()/4, pix::now_s()-t_sf,
+                       interior.empty() ? "  -- LEAKED, falling back to the unsigned field" : "");
+            }
+        }
         std::vector<float> dcv; std::vector<int64_t> dcf;
-        if (!nbdc::remesh(mesh.verts, mesh.faces, in.resolution, (float)dc_band, dcv, dcf)) {
+        if (!nbdc::remesh(mesh.verts, mesh.faces, in.resolution, (float)dc_band, dcv, dcf, true,
+                          interior.empty() ? nullptr : &interior)) {
             printf("FAIL: --dc-remesh narrow-band dual contour\n"); return 1;
+        }
+        if (!interior.empty()) {
+            // Drop BURIED SHELLS.  What is left of the inward wall comes off as closed components
+            // with INWARD normals, i.e. negative signed volume -- they bound a void inside the body
+            // rather than a body.  That is a containment test, not a size test, which is the point:
+            // "keep the biggest component" would delete the legitimately separate parts of an
+            // articulated subject, whereas a separate part is a real body and its volume is
+            // POSITIVE however small it is.  The DC's winding follows the field's sign globally, so
+            // the test is exact rather than heuristic.
+            const double t_fl = pix::now_s();
+            int64_t dropped_f = 0, dropped_c = 0;
+            {
+                const int64_t V = (int64_t)(dcv.size()/3), F = (int64_t)(dcf.size()/3);
+                std::vector<int64_t> par(V); for (int64_t i=0;i<V;i++) par[i]=i;
+                std::function<int64_t(int64_t)> find = [&](int64_t x){
+                    while (par[x]!=x){ par[x]=par[par[x]]; x=par[x]; } return x; };
+                auto uni=[&](int64_t a,int64_t b){ int64_t ra=find(a),rb=find(b); if(ra!=rb) par[ra]=rb; };
+                for (int64_t t=0;t<F;t++){ uni(dcf[t*3],dcf[t*3+1]); uni(dcf[t*3+1],dcf[t*3+2]); }
+                std::unordered_map<int64_t,double> vol;
+                std::unordered_map<int64_t,int64_t> cnt;
+                for (int64_t t=0;t<F;t++){
+                    const int64_t i0=dcf[t*3],i1=dcf[t*3+1],i2=dcf[t*3+2];
+                    const float *p0=&dcv[i0*3],*p1=&dcv[i1*3],*p2=&dcv[i2*3];
+                    const double cr[3]={ (double)p1[1]*p2[2]-(double)p1[2]*p2[1],
+                                         (double)p1[2]*p2[0]-(double)p1[0]*p2[2],
+                                         (double)p1[0]*p2[1]-(double)p1[1]*p2[0] };
+                    const int64_t root = find(i0);
+                    vol[root] += (p0[0]*cr[0]+p0[1]*cr[1]+p0[2]*cr[2])/6.0;
+                    cnt[root] += 1;
+                }
+                std::vector<int64_t> keep;
+                keep.reserve(dcf.size());
+                for (int64_t t=0;t<F;t++){
+                    const int64_t root = find(dcf[t*3]);
+                    if (vol[root] > 0.0) { keep.push_back(dcf[t*3]); keep.push_back(dcf[t*3+1]); keep.push_back(dcf[t*3+2]); }
+                }
+                for (const auto& kv : vol) if (kv.second <= 0.0) { ++dropped_c; dropped_f += cnt[kv.first]; }
+                dcf.swap(keep);
+                // compact vertices
+                std::vector<int64_t> remap(V, -1); std::vector<float> nv; nv.reserve(dcv.size());
+                for (int64_t& idx : dcf) { int64_t& r = remap[idx];
+                    if (r < 0) { r = (int64_t)(nv.size()/3); nv.push_back(dcv[idx*3]); nv.push_back(dcv[idx*3+1]); nv.push_back(dcv[idx*3+2]); }
+                    idx = r; }
+                dcv.swap(nv);
+            }
+            printf("  [1a0/4] solid: dropped %lld buried shells (%lld faces, inward normals) (%.1fs)\n",
+                   (long long)dropped_c, (long long)dropped_f, pix::now_s()-t_fl);
         }
         if (dc_taubin > 0) meshsmooth::taubin(dcv, dcf, dc_taubin);
         mesh.verts = std::move(dcv); mesh.faces = std::move(dcf);
         mesh.N = (int)(mesh.verts.size()/3); mesh.F = (int)(mesh.faces.size()/3);
+        if (!interior.empty()) {
+            // NO orient_consistent() here.  The DC's winding already follows the sign of the field,
+            // so a signed field yields globally outward normals for free -- measured: main body
+            // +0.0142, every dropped shell negative.  Running svae::orient_consistent on top MAKES
+            // IT WORSE: its BFS propagates orientation across the ~200 remaining non-manifold edges,
+            // where "the neighbour across this edge" is not well defined, and it flipped enough of
+            // the body to cut the enclosed volume from +0.0142 to +0.0059 (miku) and +0.0101 to
+            // +0.0013 (gilly).  Weld only.
+            const mesh_exact_clean::Report r = mesh_exact_clean::clean(mesh.verts, mesh.faces);
+            mesh.N = (int)(mesh.verts.size()/3); mesh.F = (int)(mesh.faces.size()/3);
+            int64_t b = 0, nm = 0; svae::mesh_topology_stats(mesh, b, nm);
+            printf("  [1a0/4] solid: welded (welded %lld, degenerate %lld, duplicate %lld)"
+                   " -> boundary=%lld nonmanifold=%lld\n",
+                   (long long)r.welded_vertices, (long long)r.dropped_degenerate_faces,
+                   (long long)r.dropped_duplicate_faces, (long long)b, (long long)nm);
+        }
         printf("  [1a0/4] dc-remesh: -> %d v / %d f (taubin x%d)  (%.1fs)\n", mesh.N, mesh.F, dc_taubin, pix::now_s()-t_dc);
         if (!stage_dir.empty()) {
             mkdir(stage_dir.c_str(), 0755);
@@ -643,6 +848,7 @@ int main(int argc, char** argv) {
         sv_i32(stage_dir + "/resolution.bin", (int32_t)in.resolution);
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [1a/4] UltraShape refine (native, in-process): clean/watertight ~7.5x densify ----------
     if (refine && !did_refine_load) {
         double t_ref = pix::now_s();
@@ -653,6 +859,7 @@ int main(int argc, char** argv) {
         svae::Mesh refined;
         try {
             refined = usr::refine(mesh.verts, mesh.faces, image, rc, use_cuda);
+        } catch (const cancelhook::Cancelled&) { throw;   // a cancel is not a refine failure
         } catch (const std::exception& e) { printf("FAIL: UltraShape refine: %s\n", e.what()); return 1; }
         // re-canonicalize the ±1 UltraShape mesh onto the coarse-mesh bbox so the PBR volume bakes onto it.
         bbox_canon_onto(refined.verts, coarse_ref);
@@ -703,6 +910,7 @@ int main(int argc, char** argv) {
     std::vector<float>   nrm_src_verts;
     std::vector<int64_t> nrm_src_faces;
 
+    cancelhook::check();   // stage boundary
     // ---------- [1a2/4] quad retopology (rung 2, quadwild-bimdf shell-out; CPU) ----------
     // Runs on the refined mesh (fresh-refine or --from-refined). Produces clean field-aligned quads,
     // TRIANGULATED into `mesh` for the tri-only bake/rig/glb path (the field-aligned edge flow survives
@@ -725,6 +933,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [1b/4] optional P3-SAM part-retopo (native, before bake) ----------
     if (part_retopo) {
         double t_pr = pix::now_s();
@@ -815,6 +1024,7 @@ int main(int argc, char** argv) {
            use_reproject ? " (reproject/shell)" : "", bt.tw, bt.th, bt.chart_count,
            (int)bt.verts.size()/3, bt.faces.size()/3, pix::now_s()-t_bake);
 
+    cancelhook::check();   // stage boundary
     // ---------- [1b/4] tex PROJECTION (--tex-project) ----------
     // Overwrite the volume bake's baseColor with the REAL images projected through the pixal3d camera:
     // front = --image (the matte the mesh was built from = the exact frame, no alignment needed), back =
@@ -880,6 +1090,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [1c/4] normal-map bake (the standard retopo detail lift) ----------
     // The retopo/decimate mesh is intentionally low-poly and drops fine relief (Instant Meshes resamples
     // anime faces to a blank egg; decimation coarsens fingers). Bake a TANGENT-SPACE normal map from the
@@ -920,10 +1131,14 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [2/4] rig cond points (native, in RAM) ----------
     std::vector<int64_t> faces64(bt.faces.begin(), bt.faces.end());
     rig::PrepResult P;
     rig::RigResult  R;
+    // Clear the last-run report here, so a --rig-cache hit (which decodes nothing) cannot leave a
+    // previous request's verdict standing as if it were this one's.
+    i2r::g_rig_report = rig::StageReport{};
 
     // --rig-cache: SHARE ONE SKELETON ACROSS LOD TIERS.
     // Re-running the rig per tier gives every tier a DIFFERENT skeleton (measured on the first
@@ -957,20 +1172,174 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!rig_from_cache) {
-        P = rig::prep_mesh_for_rig_inmem(bt.verts, faces64, 8192, 512, rig_seed);
-        if (!P.ok) { printf("FAIL: mesh prep failed\n"); return 1; }
-        printf("  [2/4] rig prep: N=%d sampled, M=%d FPS queries\n", P.N, P.M);
+    // The delivery mesh in the rig frame. HOISTED above the draw loop because the pose gate must
+    // judge the asset that would actually SHIP — the transferred skin on the textured mesh — not the
+    // 8192 sample points the decoder saw (which have no faces, so no edges, so no stretch).
+    // prep_mesh_for_rig_inmem normalized its own copy the same way, so joints/skin (sampled in
+    // normalized [-1,1]) align with the geometry we write out.
+    std::vector<float> verts_norm = bt.verts;
+    rig::normalize_mesh(verts_norm);
+    std::vector<float> dst_w;
+    bool dst_w_valid = false;
 
-        // ---------- [3/4] auto-rig (R1->R3->R5->R4) ----------
-        rig::RigOpts ro;
-        ro.r1w = r1w; ro.qwen3_w = qwen3_w; ro.skin_vae_gguf = skinvae;
-        ro.use_cuda = use_cuda; ro.num_beams = num_beams; ro.seed = rig_seed; ro.verbose = true;
-        ro.do_sample = rig_sample;   // default false = deterministic fan-free beam (gilly audit)
+    if (!rig_from_cache) {
+        // BEST-OF-N OVER CONDITIONING DRAWS (--rig-retries, default 0 = exactly the shipped
+        // one-shot path). The decode is deterministic given the conditioning cloud, so the ONLY way
+        // to ask the decoder a second time is to draw a second cloud: the 8192 conditioning points
+        // are one area-weighted sample of the surface, and re-drawing them is the same mesh asked
+        // again, not a different asset.
+        //
+        // WHY BEST-OF-N AT ALL. Six draws of the SHIPPED --no-solid miku mesh, same weights, same
+        // beam config, same decode seed, only the draw varying: J = 37/153/37/161/196/192, and FOUR
+        // of the six welded every vertex to one joint (R3 ran to the token cap, no beam reached eos,
+        // R4 never saw a skin token). A new subject is a coin flip, which is exactly what an API
+        // cannot be. The rig stage is only ~20-27 s of a ~450 s pipeline, so a re-draw is cheap.
+        //
+        // THE PREDICATE, and why each term is load-bearing:
+        //   skin_ok                         — a weightless rig is never a delivery. Non-negotiable.
+        //   humanoid OR (generic AND pose)  — keying on the 22-bone gate ALONE would have discarded
+        //                                     miku draw 2 (rig_score 0.915, the best rig measured in
+        //                                     the whole campaign), which passed only the CREATURE
+        //                                     gate, and it can never accept a creature like gilly at
+        //                                     all. The pose gate is the deformation check that makes
+        //                                     letting a non-humanoid through safe: across every rig
+        //                                     in the campaign it read 2.2-4.1 on the good ones and
+        //                                     9.2-46.7 on the bad ones, with no overlap.
+        //   named_core >= N                 — EASY TO MISS AND IT MATTERS. The retargeter maps
+        //                                     through NAMES (mret::derive_map_named) and its
+        //                                     topology fallback fails outright on miku, whose legs
+        //                                     parent to Spine and not to Hips. miku draw 2 scores
+        //                                     0.915 but names only 14/22, while draw 0 scores 0.897
+        //                                     and names 21/22 — the higher-scoring rig ANIMATES
+        //                                     WORSE. Selecting on a score alone quietly degrades
+        //                                     animation, so the floor is a real term, not a polish.
+        //                                     19 is not a new constant: it is the lowest core count
+        //                                     the existing humanoid gate is ever willing to accept
+        //                                     (its narrow mirrored-right-arm repair form).
         double t_rig = pix::now_s();
-        R = rig::run_rig_pipeline(P.vertices, P.normals, P.sampled_pc, P.sampled_feats, ro);
-        if (!R.ok) { printf("FAIL: rig pipeline failed\n"); return 1; }
-        printf("  [3/4] rig: J=%d joints  (%.1fs)\n", R.J, pix::now_s() - t_rig);
+        int rig_attempt = 0;
+        i2r::DrawVerdict best_v;
+        rig::RigResult  best_R;
+        rig::PrepResult best_P;
+        std::vector<float> best_w;
+        bool have_best = false;
+        for (;; ++rig_attempt) {
+            const uint64_t draw_seed = rig_seed + (uint64_t)rig_attempt;
+            P = rig::prep_mesh_for_rig_inmem(bt.verts, faces64, 8192, 512, draw_seed);
+            if (!P.ok) { printf("FAIL: mesh prep failed\n"); return 1; }
+            printf("  [2/4] rig prep: N=%d sampled, M=%d FPS queries%s\n", P.N, P.M,
+                   rig_attempt ? "  (re-draw)" : "");
+
+            // ---------- [3/4] auto-rig (R1->R3->R5->R4) ----------
+            rig::RigOpts ro;
+            ro.r1w = r1w; ro.qwen3_w = qwen3_w; ro.skin_vae_gguf = skinvae;
+            ro.use_cuda = use_cuda; ro.num_beams = num_beams; ro.seed = rig_seed; ro.verbose = true;
+            ro.do_sample = rig_sample;   // default false = deterministic fan-free beam (gilly audit)
+            ro.structural_select = rig_structural_select;
+            R = rig::run_rig_pipeline(P.vertices, P.normals, P.sampled_pc, P.sampled_feats, ro);
+            if (!R.ok) { printf("FAIL: rig pipeline failed\n"); return 1; }
+
+            i2r::DrawVerdict v;
+            v.index    = rig_attempt;
+            v.J        = R.J;
+            v.skin_ok  = R.skin_ok;
+            v.humanoid = R.humanoid_gate_ok;
+            v.generic  = R.generic_gate_ok;
+            v.naming_evaluated = bone_names;
+            if (bone_names) {
+                rig::NameOpts no;
+                no.style = bone_names_smpl ? rig::NameStyle::SmplH : rig::NameStyle::Mixamo;
+                no.facing_override = bone_facing;
+                rig::BoneNaming BN = rig::name_bones(R.joints, R.parents, no);
+                if (BN.ok) {
+                    v.named_core = BN.named_core;
+                    v.falsifier  = rig::falsify_bone_names(R.joints, R.parents, BN, false);
+                }
+            }
+            // The pose gate. Run on the DELIVERY mesh, in the --generic-all-influential form: the
+            // default single-joint pose passed all four assets in the campaign table including the
+            // two bad ones, so it is not a sufficient gate. Skipped when the skin is zero (the
+            // gate's own `moved` term would report 0.000 and we already know why).
+            if (rig_pose_gate && R.skin_ok) {
+                rig::transfer_skin(P.vertices, R.skin_pred, R.J, verts_norm, dst_w, 4);
+                dst_w_valid = true;
+                rigqc::SkinnedRig SR;
+                if (rigqc::pose_gate_from_rig(verts_norm, faces64, R.joints, R.parents, dst_w,
+                                              std::vector<std::string>{}, SR)) {
+                    rigqc::PoseGateOpts po;
+                    po.mode = rigqc::PoseGateOpts::GenericAllInfluential;
+                    rigqc::PoseGateResult PG = rigqc::run_pose_gate(SR, po);
+                    if (PG.ok) {
+                        v.pose_ran   = true;
+                        v.pose_pass  = PG.pass;
+                        v.pose_worst = PG.worst();
+                        v.pose_moved = PG.moved;
+                        printf("  [3/4] %s\n", rigqc::pose_gate_line(PG).c_str());
+                    } else {
+                        printf("  [3/4] pose gate could not run: %s\n", PG.err.c_str());
+                    }
+                }
+            }
+            v.compute_accept(rig_min_named_core, rig_pose_gate_strict);
+            printf("  [3/4] draw %d/%d: J=%d %s\n", rig_attempt + 1, rig_retries + 1, R.J,
+                   v.describe().c_str());
+
+            if (!have_best || v.better_than(best_v)) {
+                best_v = v; best_R = R; best_P = P; have_best = true;
+                best_w = (v.pose_ran && dst_w_valid) ? dst_w : std::vector<float>();
+            }
+            if (v.accept || rig_attempt >= rig_retries) break;
+            printf("  [3/4] rig: re-drawing the conditioning cloud (attempt %d/%d)\n",
+                   rig_attempt + 2, rig_retries + 1);
+        }
+        // Ship the BEST draw, not the last one. Before this the loop fell out holding whatever the
+        // final attempt produced, so exhausting the retries actively degraded the result: draw 0
+        // could be the only usable rig and draw N a 196-joint runaway, and the runaway shipped.
+        R = best_R; P = best_P;
+        if (!best_w.empty()) { dst_w = best_w; dst_w_valid = true; } else { dst_w.clear(); dst_w_valid = false; }
+        i2r::g_rig_report = rig::StageReport{};
+        i2r::g_rig_report.valid            = true;
+        i2r::g_rig_report.draws            = rig_attempt + 1;
+        i2r::g_rig_report.accepted         = best_v.accept;
+        i2r::g_rig_report.accepted_draw    = best_v.accept ? best_v.index : -1;
+        i2r::g_rig_report.skin_ok          = best_v.skin_ok;
+        i2r::g_rig_report.humanoid_gate_ok = best_v.humanoid;
+        i2r::g_rig_report.generic_gate_ok  = best_v.generic;
+        i2r::g_rig_report.named_core       = best_v.named_core;
+        i2r::g_rig_report.falsifier_fails  = best_v.falsifier;
+        i2r::g_rig_report.pose_gate_ran    = best_v.pose_ran;
+        i2r::g_rig_report.pose_gate_pass   = best_v.pose_pass;
+        i2r::g_rig_report.pose_gate_worst  = best_v.pose_worst;
+        i2r::g_rig_report.pose_gate_moved  = best_v.pose_moved;
+        i2r::g_rig_report.J                = best_v.J;
+        i2r::g_rig_report.summary          = best_v.describe();
+        // FAIL CLOSED on a weightless rig. Measured 2026-08-14: five draws of the SHIPPED mesh gave
+        // 3 runaways (J=153/161/196, maxfan up to 138), and every one of them delivered skin_pred all
+        // zeros — an asset that deforms nothing — behind a single WARN. A warning is the wrong
+        // response to that for two reasons:
+        //   1. the GLB is publishable-looking, and both QC gates live in a wrapper script that an API
+        //      caller need not run, so the corruption is silent at this boundary;
+        //   2. worse, the block below banks R.skin_pred into --rig-cache, and every LOD tier then
+        //      REUSES it — one bad draw poisons the whole ladder with zero weights.
+        // There is no case where a rig that deforms nothing is a wanted delivery, so refusing is
+        // strictly safer than emitting. --allow-zero-skin keeps the old behaviour for debugging.
+        if (!R.skin_ok) {
+            if (!allow_zero_skin) {
+                printf("FAIL: rig produced ZERO skin weights (R3 ran away before the skin tokens; "
+                       "J=%d). This asset would not deform, and --rig-cache would propagate it to "
+                       "every LOD tier. Re-draw with --rig-retries N, or pass --allow-zero-skin to "
+                       "write it anyway.\n", R.J);
+                return 1;
+            }
+            printf("  [3/4] rig: WARNING — skin weights are ZERO (R3 ran away before the skin "
+                   "tokens). This asset will not deform. Written only because --allow-zero-skin.\n");
+        }
+        printf("  [3/4] rig: J=%d joints  (%.1fs, %d draw%s%s)\n", R.J, pix::now_s() - t_rig,
+               rig_attempt + 1, rig_attempt ? "s" : "",
+               rig_attempt == 0 ? ""
+                                : (best_v.accept ? (best_v.index ? ", accepted on a re-draw"
+                                                                 : ", the FIRST draw still won")
+                                                 : ", NO draw was accepted — shipping the best-ranked"));
 
         if (!rig_cache.empty()) {
             mkdir(rig_cache.c_str(), 0755);
@@ -986,13 +1355,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    cancelhook::check();   // stage boundary
     // ---------- [4/4] combine: kNN skin-transfer onto the textured mesh + write ----------
-    // Normalize the textured mesh into the rig frame (prep_mesh_for_rig_inmem normalized its copy the
-    // same way), so joints/skin (sampled in normalized [-1,1]) align with the geometry we write out.
-    std::vector<float> verts_norm = bt.verts;
-    rig::normalize_mesh(verts_norm);
-    std::vector<float> dst_w;
-    rig::transfer_skin(P.vertices, R.skin_pred, R.J, verts_norm, dst_w, 4);
+    // verts_norm is hoisted above the rig block (the pose gate needs it). The transfer is skipped
+    // only when the winning draw's transfer is already in hand from the gate — same call, same
+    // inputs, so this is a cache and not a second code path.
+    if (!dst_w_valid) rig::transfer_skin(P.vertices, R.skin_pred, R.J, verts_norm, dst_w, 4);
 
     // ---------- name the bones to a standard humanoid convention (automatic) ----------
     // SkinTokens emits anonymous bone_0..bone_N, which no Mixamo/AMASS clip can retarget
@@ -1039,4 +1407,68 @@ int main(int argc, char** argv) {
     printf("==== DONE -> %s  (verts=%zu faces=%zu J=%d, %.1fs total) ====\n",
            out.c_str(), verts_norm.size()/3, faces64.size()/3, R.J, pix::now_s() - t_geo);
     return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// The stage's public entry point: the pipeline above, plus the cancellation boundary.
+//
+// cancelhook::check() THROWS from deep inside the DiT sampler / the DC ladder / the beam decode
+// (see cancel_hook.hpp for why a return code could not work there). The throw unwinds through
+// M1Harness, whose destructor frees the CUDA weight buffers and the backend — which is what makes a
+// cancel actually give the card back rather than merely stop using it. It is caught HERE, once, at
+// the stage boundary, so no half-run pipeline state escapes.
+//
+// Nothing has been written to `out` at any point a check() can fire: the GLB writers are the last
+// thing the pipeline does and there is no cancellation point inside them.
+// ---------------------------------------------------------------------------
+int i2r::run(i2r::Options opt) {
+    try {
+        return i2r_run_body(std::move(opt));
+    } catch (const cancelhook::Cancelled&) {
+        printf("==== image_to_rig CANCELLED (no output written; GPU buffers released on unwind) ====\n");
+        fflush(stdout);
+        return i2r::RC_CANCELLED;
+    } catch (const std::exception& e) {
+        // THE ONE DELIBERATE DEVIATION FROM THE OLD CLI BEHAVIOUR, and it is why it is here.
+        //
+        // Nothing used to catch here, so a throw from inside the chain reached the top and
+        // std::terminate() ABORTED THE PROCESS. For a program that is fine — the shell driver sees a
+        // non-zero exit either way. For a LIBRARY inside a long-lived service it is fatal: one
+        // request takes the whole service down with it, and every queued request dies too.
+        //
+        // MEASURED, not hypothetical: with `llama-server` (a co-tenant that does NOT take the 3060
+        // flock) holding 8976 MiB, the geometry stage threw `gallocr_alloc_graph failed` out of a
+        // 904 MiB cudaMalloc and the process core-dumped. An engine that shares a card WILL meet
+        // this. Now it is an error return, the stack unwinds through M1Harness (so the partial
+        // allocations are freed), and the service survives to answer the next request.
+        //
+        // Revert = delete this clause. The exit code changes from 134 (SIGABRT) to 1; both are
+        // non-zero, and the ggml diagnostic that precedes it is unchanged, so the A/B drivers'
+        // `EXIT=` checks and log greps read the same either way.
+        printf("FAIL: image_to_rig stage threw: %s\n", e.what());
+        fflush(stdout);
+        return i2r::RC_FAIL;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The program. Parse argv into the struct, then run the stage — so the CLI and the library differ
+// in nothing but how the struct got filled.
+// ---------------------------------------------------------------------------
+#ifdef IMAGE_TO_RIG_LIB
+int image_to_rig_main(int argc, char** argv) {
+#else
+int main(int argc, char** argv) {
+#endif
+    // A production run can spend many minutes in M4/UltraShape.  When stdout is
+    // redirected to the per-candidate run log, libc otherwise fully buffers
+    // stage lines and leaves the operator unable to tell a live decode from a
+    // dead process.  Preserve every existing message, but make newline-delimited
+    // progress authoritative in the log.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    i2r::Options opt;
+    const int rc = i2r::parse_args(argc, argv, opt);
+    if (rc >= 0) return rc;
+    return i2r::run(std::move(opt));
 }
