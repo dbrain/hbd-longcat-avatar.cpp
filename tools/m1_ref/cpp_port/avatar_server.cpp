@@ -600,11 +600,25 @@ bool vram_ok(State& st, std::string& err) {
     const long free_mib = free_vram_mib(st);
     if (free_mib < 0) return true;   // driver would not answer; do not invent a refusal
     if (free_mib >= st.cfg.min_free_mib) return true;
+    // Name OUR OWN retained pool, because after one job it is usually the whole reason we are here
+    // and the old message blamed llama-server unconditionally. ggml's CUDA allocator keeps freed
+    // blocks for reuse, so the driver reports ~1.4 GB used by this process while nothing is loaded;
+    // /v1/admin/unload cannot reclaim it (it only drops the motion DiT) and a container restart is
+    // the only way back to the baseline. That memory IS available to our next job — the driver just
+    // does not say so — which is why the floor must be set against the measured PEAK and not against
+    // free-as-the-driver-sees-it. Measured peaks on this configuration: 6055 MiB (four-tier ladder)
+    // and 6959 MiB (re-rig from cached geometry).
+    const long retained = (long)st.engine->gpu_status().mem_free_mb < 0
+                              ? 0
+                              : (long)st.engine->peak_vram_used_mib() -
+                                    (long)st.engine->baseline_vram_used_mib();
     err = "only " + std::to_string(free_mib) + " MiB free on the pinned card, need >= " +
           std::to_string(st.cfg.min_free_mib) +
-          ". The rig stage peaks ~10.7 GB and DOES NOT DEGRADE — it would OOM minutes in. Free the "
-          "card (kobbler-llama-server-1 holds ~9 GB of the 3060 without taking our lock) or lower "
-          "LONGCAT_RIG_MIN_FREE_MIB.";
+          ". This process has already peaked at " + std::to_string(retained > 0 ? retained : 0) +
+          " MiB above its baseline and ggml keeps that pool for reuse, so part of the shortfall may "
+          "be our own retained memory rather than a co-tenant — check `nvidia-smi` before assuming. "
+          "Otherwise free the card (kobbler-llama-server-1 takes ~9 GB of the 3060 without taking "
+          "our lock) or lower LONGCAT_RIG_MIN_FREE_MIB.";
     return false;
 }
 
