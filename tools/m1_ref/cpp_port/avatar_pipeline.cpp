@@ -474,11 +474,15 @@ GpuStatus Engine::gpu_status() const {
     GpuStatus g;
     g.loaded = impl_->motion_loaded.load();
     if (g.loaded) g.gpu = "cuda:0";
-    g.mem_free_mb = impl_->vram.free_mib();
-    if (g.mem_free_mb == 0) {
-        size_t f = 0, t = 0;
-        g.mem_free_mb = (cudaMemGetInfo(&f, &t) == cudaSuccess) ? (long)(f >> 20) : -1;
-    }
+    // ASK THE DRIVER, do not report the sampler's last tick. The sampler runs on a 250 ms timer and
+    // exists for the PEAK, which needs continuous observation; "how much is free right now" is a
+    // question a caller asks in order to DECIDE something, and a decision made on a 250 ms-stale
+    // number is wrong in exactly the moment it matters. Measured 2026-08-14: a rig request released
+    // the resident 2.1 GB motion DiT and then refused itself on the sampled reading taken before
+    // the release. cudaMemGetInfo costs microseconds; the sampler is only the fallback now.
+    size_t f = 0, t = 0;
+    g.mem_free_mb = (cudaMemGetInfo(&f, &t) == cudaSuccess) ? (long)(f >> 20) : (long)impl_->vram.free_mib();
+    if (g.mem_free_mb == 0) g.mem_free_mb = -1;
     return g;
 }
 

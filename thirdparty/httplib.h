@@ -8197,7 +8197,19 @@ inline bool Server::read_content_core(
               ? (std::min)(payload_max_length_ + 1, static_cast<size_t>(4096))
               : 1;
       std::vector<char> peekbuf(to_peek);
-      ssize_t n = ::recv(s, peekbuf.data(), to_peek, MSG_PEEK);
+      // MSG_DONTWAIT IS LOAD-BEARING. The socket is blocking, so a bare MSG_PEEK
+      // here BLOCKS until a byte arrives or the peer closes -- and for the case
+      // this branch exists to handle (a POST with no Content-Length and no body,
+      // e.g. `curl -X POST .../cancel` or any of the /v1/admin/* endpoints) no
+      // byte is ever coming: the client has sent everything it will send and is
+      // waiting for our response. The request then hangs for the whole read
+      // timeout with an httplib worker thread pinned to it. Measured 2026-08-14:
+      // POST with a body returned in 0.4 ms, the identical POST without one hung
+      // past 10 minutes.
+      // Non-blocking degrades exactly to the SSL branch below (return true, no
+      // body) when nothing has arrived yet, which is correct: this peek is an
+      // oversize GUARD, not the body-reading path.
+      ssize_t n = ::recv(s, peekbuf.data(), to_peek, MSG_PEEK | MSG_DONTWAIT);
       if (n > 0 && static_cast<size_t>(n) > payload_max_length_) {
         // Indicate failure so connection will be closed.
         return false;
