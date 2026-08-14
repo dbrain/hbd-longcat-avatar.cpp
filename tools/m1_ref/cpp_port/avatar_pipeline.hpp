@@ -196,6 +196,18 @@ struct RigRequest {
     // 0 = never. It is an OPTIMISATION for a bad run: exhausting it does not fail the request, it
     // just ships the best-ranked draw with its verdict attached.
     int  rig_extra_retries = -1;
+    // 🔴 THE "TRY AGAIN" KNOB, and the reason it has to be on this struct rather than only in
+    // extra_args. The rig decode is a deterministic function of (mesh, seed): re-running an
+    // unchanged request against a cached geometry reproduced all four draws exactly — same J, same
+    // named core, same pose gate to three decimals. So a caller who re-rigs to escape a bad draw
+    // gets the IDENTICAL bad draw back, having waited for it, unless it moves the seed. The retry
+    // ladder varies its own draws internally (draw_seed = rig_seed + attempt, which redraws the
+    // 8192-point surface sample); a user-initiated retry has to offset rig_seed itself.
+    uint64_t rig_seed = 0;
+    // The GEOMETRY seed, which is a different lottery: it changes the mesh, and therefore costs the
+    // full ~250 s diffusion stage. -1 = the chain's own default. Moving this is how you get a
+    // different CHARACTER shape; moving rig_seed is how you get a different SKELETON on the same one.
+    int  geo_seed = -1;
     // Post-process the delivered skin to remove the "spike" artefact — vertices bound to a joint
     // half a body away, and weight fields that vary faster than the mesh can carry. See
     // rig_weight_cleanup.hpp. It is an OFFER, not a gate: it verifies itself against the shipped

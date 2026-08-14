@@ -518,6 +518,8 @@ bool Engine::build_rig(const RigRequest& req, RigResult& out, std::string& err) 
     if (!req.rig_cache.empty())    o.rig_cache = req.rig_cache;
     if (req.rig_retries > 0)       o.rig_retries = req.rig_retries;
     if (req.rig_extra_retries >= 0) o.rig_extra_retries = req.rig_extra_retries;
+    o.rig_seed = req.rig_seed;                       // 0 is the historical default, not "unset"
+    if (req.geo_seed >= 0) o.geo_seed = req.geo_seed;
     if (!cfg.rig_r1w.empty())      o.r1w = cfg.rig_r1w;
     if (!cfg.rig_qwen3_w.empty())  o.qwen3_w = cfg.rig_qwen3_w;
     if (!cfg.rig_skin_vae.empty()) o.skinvae = cfg.rig_skin_vae;

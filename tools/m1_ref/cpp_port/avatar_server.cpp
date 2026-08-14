@@ -641,7 +641,10 @@ bool validate_common(const json& b, bool needs_prompt, std::string& err) {
     struct { const char* k; double lo, hi; } nums[] = {
         {"seconds", 0.1, 60.0}, {"steps", 1, 500}, {"cfg", 0.0, 50.0},
         {"smooth", 0, 100}, {"texsize", 16, 8192}, {"decimate", 100, 5000000},
-        {"resolution", 0, 4096}, {"rig_retries", 0, 16}, {"rig_extra_retries", -1, 16},
+        {"resolution", 0, 2032}, {"rig_retries", 0, 16}, {"rig_extra_retries", -1, 16},
+        // Seeds are the retry knob (see fill_rig_request), so a negative one must not silently
+        // wrap into a different draw than the caller asked for.
+        {"seed", 0, 4294967295.0}, {"rig_seed", 0, 4294967295.0}, {"geo_seed", 0, 2147483647.0},
     };
     for (const auto& n : nums) {
         if (!b.contains(n.k) || !b[n.k].is_number()) continue;
@@ -649,6 +652,23 @@ bool validate_common(const json& b, bool needs_prompt, std::string& err) {
         if (v < n.lo || v > n.hi) {
             err = std::string("`") + n.k + "` is " + std::to_string(v) + "; expected " +
                   std::to_string(n.lo) + " to " + std::to_string(n.hi);
+            return false;
+        }
+    }
+    // `resolution` has a SHAPE as well as a range, and the typed seam bypasses the CLI parser that
+    // used to enforce it: avatar_pipeline sets `o.geo_resolution` directly, so `--resolution`'s
+    // "multiple of 16" check never runs on an API request. Without this, `resolution: 777` is
+    // accepted, occupies the card for the whole diffusion stage, and dies in the DC — which peels
+    // factors of two off the value and refuses a coarsest level above 128 (narrow_band_dc_cuda.cu:
+    // KEY_MAX_COORD 2047, MAX_LADDER_START 128). Every multiple of 16 in 32..2032 peels to <= 127,
+    // so the multiple-of-16 rule is exactly the DC's admissible set, not an approximation of it.
+    if (b.contains("resolution") && b["resolution"].is_number()) {
+        const int r = b["resolution"].get<int>();
+        if (r != 0 && (r % 16 != 0 || r < 32)) {
+            err = "`resolution` is " + std::to_string(r) +
+                  "; expected 0 (the default lattice) or a multiple of 16 from 32 to 2032. 1024 is "
+                  "the default; 1536 is the only other value with any measured result, and it is "
+                  "per-subject (better geometry, worse rig on some characters).";
             return false;
         }
     }
@@ -709,6 +729,13 @@ void fill_rig_request(State& st, const json& b, const std::string& image, const 
     // gate — an optimisation for a bad run, never a precondition for returning an asset.
     r.rig_retries = b.value("rig_retries", st.cfg.rig_retries);
     r.rig_extra_retries = b.value("rig_extra_retries", -1);   // -1 = the stage's own default
+    // 🔴 A "try again" button MUST send a new `rig_seed` or it is a no-op — the rig decode is
+    // deterministic in (mesh, seed), so re-rigging an unchanged request against a cached geometry
+    // returns the same draw it just rejected. Named here rather than left to `extra_args` precisely
+    // because that is the mistake a client makes silently. `geo_seed` redraws the MESH instead, and
+    // costs the full geometry stage.
+    r.rig_seed = b.value("rig_seed", (uint64_t)0);
+    r.geo_seed = b.value("geo_seed", -1);
     // Skin-weight cleanup: ON, because it verifies itself against the shipped pose gate and keeps
     // the original skin byte-for-byte when it cannot prove an improvement. It removes the vertices
     // bound to a joint half a body away that get flung across the character when it rotates — the
@@ -1489,6 +1516,10 @@ void register_routes(httplib::Server& svr, State& st) {
             "                     {geometry_from:<job|dir>}    re-rig an existing geometry (~60-180s)\n"
             "                     {rig_cache_from:<job|dir>}   reuse the skeleton, re-bake only\n"
             "                     {tiers:[hero,high,medium,game]}   default: all four\n"
+            "                     {rig_seed:N}    A RETRY MUST MOVE THIS. The rig decode is\n"
+            "                                     deterministic in (mesh, seed): re-rigging the same\n"
+            "                                     request returns the draw you just rejected.\n"
+            "                     {geo_seed:N}    redraws the MESH instead (pays the ~250 s geometry)\n"
             "  POST /v1/motion    {prompt}                    -> 202 job (~11 s)\n"
             "  POST /v1/animate   {rig:<job|path>, tier, clips:[<job|path|json>]}  -> 202 job (0.22 s)\n"
             "  POST /v1/render    {image, prompt}             -> 202 job, the whole chain\n"
