@@ -95,11 +95,46 @@ if { [ "$BASE" = "geometry_e2e" ] || [ "$BASE" = "pixal3d" ] || [ "$BASE" = "ima
       -c "$HERE/narrow_band_dc_cuda.cu" -o "$HERE/narrow_band_dc.o"
     NBDC_OBJ="$HERE/narrow_band_dc.o"
   fi
+  # In-process RMBG-2.0 matte (matte_native_imgio.hpp). Vendored vision.cpp, built against THIS
+  # repo's ggml — no second ggml, no container, no runtime download. Only image_to_rig needs it;
+  # the archive is shared with the standalone make_matte_native target below.
+  VISP_LIB=""
+  if [ "$BASE" = "image_to_rig" ]; then
+    VISP="$HERE/../../../thirdparty/visioncpp"
+    CXX="$HOSTCXX" "$HERE/build_visioncpp.sh"
+    VISP_LIB="$VISP/build/libvisioncpp.a"
+    INC="$INC -I$VISP/include"
+  fi
   "$HOSTCXX" $COMMON -fopenmp -DM1_USE_CUDA -DM3A_USE_CUDA -DTEXATLAS_NATIVE_CUMESH -DTEXATLAS_CUDA_RASTER $P3SAM_DEF $PACK_DEFS $INC -I"$TOOL/include" -I"$CUMESH/src" -I"$BU" \
     "$HERE/$SRC" "$TP/xatlas.cpp" "$TP/meshoptimizer/simplifier.cpp" \
     "$TP/meshoptimizer/vertexcodec.cpp" "$TP/meshoptimizer/indexcodec.cpp" "$TP/meshoptimizer/vertexfilter.cpp" \
-    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" "$HERE/tex_atlas_cuda.o" $CUMESH_OBJS $P3SAM_OBJ $RIG_PHILOX_OBJ $NBDC_OBJ \
+    "$HERE/native_cumesh_bridge.cpp" "$HERE/sparse_subm_conv.o" "$HERE/svae_cuda.o" "$HERE/tex_atlas_cuda.o" $CUMESH_OBJS $P3SAM_OBJ $RIG_PHILOX_OBJ $NBDC_OBJ $VISP_LIB \
     $BASISU_LIB -o "$HERE/$BIN" $LIBS $CUDALIBS -lm -lpthread \
+    -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
+  echo ">> built $BIN"
+  exit 0
+fi
+
+# make_matte_native: RMBG-2.0 background matting IN-PROCESS. Replaces shootout/matte_cpp.sh, which
+# launched a `docker run … vision-cli` container per image. The graph is vision.cpp's BiRefNet
+# (RMBG-2.0 is the same 585-tensor architecture, different weights), vendored at
+# thirdparty/visioncpp and compiled by build_visioncpp.sh against THIS repo's ggml — so there is
+# no second ggml, no service, and no runtime download.
+#
+# No nvcc here: the CUDA work is entirely inside the prebuilt libggml-cuda, so this is a plain
+# host link. The same archive is what image_to_rig links to pick up matte_native_imgio.hpp.
+if [ "$BASE" = "make_matte_native" ]; then
+  TOOL="${PIXAL3D_CUDA_ROOT:-/mnt/hdd/3d/avatar-shootout/toolchain-cuda13.3}"
+  HOSTCXX="${PIXAL3D_HOST_CXX:-/usr/bin/g++-15}"
+  TOOLLIB="$TOOL/lib64"; [ -d "$TOOLLIB" ] || TOOLLIB="$TOOL/lib"
+  BUILD="${PIXAL3D_GGML_BUILD:-$GGML/build-cuda13}"
+  VISP="$HERE/../../../thirdparty/visioncpp"
+  CXX="$HOSTCXX" "$HERE/build_visioncpp.sh"
+  echo ">> build make_matte_native (vendored vision.cpp BiRefNet/RMBG-2.0 + ggml-cuda, in-process)"
+  "$HOSTCXX" $COMMON -I"$VISP/include" $INC -I"$TOOL/include" \
+    "$HERE/$SRC" "$VISP/build/libvisioncpp.a" -o "$HERE/$BIN" \
+    -L"$BUILD/src" -L"$BUILD/src/ggml-cuda" -lggml -lggml-base -lggml-cpu -lggml-cuda \
+    -L"$TOOLLIB" -lcudart -lcublas -L/usr/lib -lcuda -lm -lpthread \
     -Wl,-rpath,"$BUILD/src" -Wl,-rpath,"$BUILD/src/ggml-cuda" -Wl,-rpath,"$TOOLLIB" -Wl,-rpath,/usr/lib
   echo ">> built $BIN"
   exit 0
