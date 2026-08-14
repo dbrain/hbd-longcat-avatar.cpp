@@ -3866,6 +3866,25 @@ public:
 public:
     virtual std::string get_desc() = 0;
 
+    // Standalone params allocation, for single-runner example binaries that have no
+    // ModelManager behind them (examples/hymotion). Puts every params_ctx tensor on
+    // `backend` in one buffer and returns it; the caller owns the buffer and must
+    // ggml_backend_buffer_free() it. Because the weights then live ON the compute
+    // backend for the runner's whole life, such a caller pairs this with a
+    // pass-through RunnerWeightManager whose prepare_params() is a no-op -- the
+    // residency the manager exists to arrange is already true.
+    // Returns nullptr if there is nothing to allocate (also the caller's cue that
+    // no buffer needs freeing).
+    ggml_backend_buffer_t alloc_all_params_on(ggml_backend_t backend) {
+        if (params_ctx == nullptr || ggml_tensor_num(params_ctx) == 0) {
+            return nullptr;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(params_ctx, backend);
+        params_tensor_set_dirty_  = true;
+        rebuild_params_tensor_set();
+        return buf;
+    }
+
     GGMLRunner(ggml_backend_t backend,
                std::shared_ptr<RunnerWeightManager> manager = nullptr)
         : runtime_backend(backend),

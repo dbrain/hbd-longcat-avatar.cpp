@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <algorithm>
 #include <random>
 #include <string>
@@ -57,6 +58,33 @@
 #include "model/diffusion/hymotion.hpp"
 #include "model/diffusion/hymotion_decode.hpp"
 #include "model/te/hymotion_text.hpp"
+#include "weight_manager.h"
+
+// ---------------------------------------------------------------------------
+// Pass-through weight manager.
+//
+// Master routes every runner's parameter residency through ModelManager: a
+// GGMLRunner refuses to execute a graph that touches parameter tensors unless a
+// RunnerWeightManager is attached to stage them (ggml_extend.hpp
+// prepare_execute_graph_weights). That machinery exists to move weights between a
+// params backend and a compute backend on demand -- swapping, partial residency,
+// LoRA folding, multi-device splits.
+//
+// This example needs none of it. Each runner here is allocated wholly onto the one
+// compute backend via GGMLRunner::alloc_all_params_on(), stays there for its short
+// life, and is freed outright. So every operation below is already satisfied by
+// construction and the honest implementation is to say so rather than to fake a
+// staging step. The VRAM discipline the spike wanted (8B encoder must not be
+// resident next to the DiT) is enforced the blunt way instead -- by scoping each
+// runner and freeing its buffer -- which is what the original did too.
+struct ResidentWeightManager : public RunnerWeightManager {
+    bool assign_compute_backend(const std::vector<ggml_tensor*>&, ggml_backend_t) override { return true; }
+    bool prepare_params(const std::vector<ggml_tensor*>&) override { return true; }
+    bool retain_compute_backend_params(const std::vector<ggml_tensor*>&) override { return true; }
+    void release_compute_backend_params(const std::vector<ggml_tensor*>&) override {}
+    void release_retained_compute_backend_params(const std::vector<ggml_tensor*>&) override {}
+    void release_params_backend_params(const std::vector<ggml_tensor*>&) override {}
+};
 
 static void usage() {
     printf(
@@ -240,7 +268,7 @@ int main(int argc, char** argv) {
 
     // ---- load ----
     // NB: init_from_file only reads metadata; the DiT weights are not resident until
-    // alloc_params_buffer() below. That is what lets the 8B encoder run first and be
+    // alloc_all_params_on() below. That is what lets the 8B encoder run first and be
     // freed before the DiT ever touches VRAM.
     ModelLoader loader;
     if (!loader.init_from_file(model_path)) {
@@ -269,6 +297,9 @@ int main(int argc, char** argv) {
     }
     (void)force_cpu;
 
+    // Shared by all three runners below; see ResidentWeightManager above.
+    auto weight_manager = std::make_shared<ResidentWeightManager>();
+
     // ---- text encoding (BEFORE the DiT is allocated) -------------------------
     // Order is load -> encode -> free, per encoder. The 3060 has 11906 MiB and other
     // stages of this pipeline already peak near 90% of it; an 8B encoder must never
@@ -296,9 +327,11 @@ int main(int argc, char** argv) {
             }
             qloader.convert_tensors_name();
 
-            LLM::LLMRunner llm(LLM::LLMArch::QWEN3, backend, backend,
-                               qloader.get_tensor_storage_map(), "text_encoders.llm", false);
-            if (!llm.alloc_params_buffer()) {
+            LLM::LLMRunner llm(LLM::LLMArch::QWEN3, backend,
+                               qloader.get_tensor_storage_map(), "text_encoders.llm",
+                               /*enable_vision*/ false, weight_manager);
+            ggml_backend_buffer_t llm_buf = llm.alloc_all_params_on(backend);
+            if (llm_buf == nullptr) {
                 fprintf(stderr, "hymotion: qwen3 alloc failed\n");
                 return 1;
             }
@@ -321,7 +354,7 @@ int main(int argc, char** argv) {
                                            enc_ctxt, enc_ctxt_length, true)) {
                 return 1;
             }
-            llm.free_params_buffer();  // <-- the 8B model leaves VRAM here
+            ggml_backend_buffer_free(llm_buf);  // <-- the 8B model leaves VRAM here
         }
 
         // --- CLIP-L -> vtxt [768] ---
@@ -333,10 +366,12 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "hymotion: failed to load clip-l from %s\n", clip_l_path.c_str());
                 return 1;
             }
-            CLIPTextModelRunner clip(backend, backend, cloader.get_tensor_storage_map(),
+            CLIPTextModelRunner clip(backend, cloader.get_tensor_storage_map(),
                                      "text_model", OPENAI_CLIP_VIT_L_14,
-                                     /*with_final_ln*/ true, /*force_clip_f32*/ false);
-            if (!clip.alloc_params_buffer()) {
+                                     /*with_final_ln*/ true, /*force_clip_f32*/ false,
+                                     weight_manager);
+            ggml_backend_buffer_t clip_buf = clip.alloc_all_params_on(backend);
+            if (clip_buf == nullptr) {
                 fprintf(stderr, "hymotion: clip-l alloc failed\n");
                 return 1;
             }
@@ -351,7 +386,7 @@ int main(int argc, char** argv) {
                                            enc_vtxt, true)) {
                 return 1;
             }
-            clip.free_params_buffer();
+            ggml_backend_buffer_free(clip_buf);
         }
 
         if (!dump_cond.empty()) {
@@ -375,12 +410,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    // GGMLRunner asserts BOTH backends are non-null (ggml_extend.hpp:4054-4055): this fork keeps a
-    // separate params_backend so weights can live somewhere other than the compute backend (that is
-    // what --offload-to-cpu is). Passing the same backend for both = weights resident on the compute
-    // device, which is what we want here (the DiT is only ~2.1GB f16).
-    HYMotion::HYMotionRunner runner(backend, backend, p, loader.get_tensor_storage_map());
-    runner.alloc_params_buffer();
+    // The spike passed a second backend here (params_backend) because its GGMLRunner
+    // kept weights and compute separately -- that is what --offload-to-cpu was. Master
+    // moved that decision into the weight manager. The DiT is only ~2.1 GB at f16 and
+    // the encoders are already gone by now, so weights simply live on the compute
+    // device: allocate them there and hand the runner the pass-through manager.
+    HYMotion::HYMotionRunner runner(backend, weight_manager, p, loader.get_tensor_storage_map());
+    ggml_backend_buffer_t dit_buf = runner.alloc_all_params_on(backend);
+    if (dit_buf == nullptr) {
+        fprintf(stderr, "hymotion: DiT alloc failed\n");
+        return 1;
+    }
     std::map<std::string, ggml_tensor*> tensors;
     runner.get_param_tensors(tensors, "");
 

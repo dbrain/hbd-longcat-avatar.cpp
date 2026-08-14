@@ -470,7 +470,12 @@ namespace HYMotion {
             auto k = ggml_concat(ctx0, m_qkv[1], t_qkv[1], 2);
             auto v = ggml_concat(ctx0, m_qkv[2], t_qkv[2], 2);
 
-            auto attn = Rope::attention(ctx, q, k, v, pe, mask, 1.0f, /*rope_interleaved*/ true, /*flash*/ false);
+            // The spike passed a per-call /*flash*/ false here. Master's Rope::attention
+            // dropped that parameter and reads ctx->flash_attn_enabled instead, which is
+            // off unless a runner turns it on -- and HYMotionRunner never does. Same
+            // behaviour, one fewer knob; if flash is ever enabled on this runner, the
+            // masked branch needs re-checking before trusting it.
+            auto attn = Rope::attention(ctx, q, k, v, pe, mask, 1.0f, /*rope_interleaved*/ true);
             // attn: [C, L_m + L_t, N]
             auto m_attn = ggml_view_3d(ctx0, attn, attn->ne[0], L_m, N, attn->nb[1], attn->nb[2], 0);
             auto t_attn = ggml_view_3d(ctx0, attn, attn->ne[0], L_t, N, attn->nb[1], attn->nb[2], (size_t)L_m * attn->nb[1]);
@@ -537,7 +542,7 @@ namespace HYMotion {
             auto k = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"])->forward(ctx, slice(1));
             auto v = slice(2);
 
-            auto attn = Rope::attention(ctx, q, k, v, pe, mask, 1.0f, true, /*flash*/ false);  // [C, L, N]
+            auto attn = Rope::attention(ctx, q, k, v, pe, mask, 1.0f, true);  // [C, L, N]
 
             auto mlp = ggml_view_3d(ctx0, qkv_mlp, mlp_hidden, L, N, qkv_mlp->nb[1], qkv_mlp->nb[2],
                                     (size_t)3 * feat_dim * qkv_mlp->nb[0]);
@@ -764,11 +769,16 @@ namespace HYMotion {
         std::vector<float> x_vec, ctxt_vec, vtxt_vec;
         int64_t L_m = 0, L_t = 0, N = 1;
 
+        // Master's GGMLRunner takes (compute backend, weight manager) -- the second
+        // backend the spike passed here (params_backend, i.e. "where the weights live")
+        // is now the weight manager's business, not the runner's. The DiT is only
+        // ~2.1 GB at f16, so the example allocates the params straight onto the compute
+        // backend and passes a pass-through manager; see examples/hymotion/main.cpp.
         HYMotionRunner(ggml_backend_t backend,
-                       ggml_backend_t params_backend,
+                       std::shared_ptr<RunnerWeightManager> weight_manager,
                        const Params& params,
                        const String2TensorStorage& tensor_storage_map = {})
-            : GGMLRunner(backend, params_backend), p(params), dit(params) {
+            : GGMLRunner(backend, weight_manager), p(params), dit(params) {
             dit.init(params_ctx, tensor_storage_map, "");
         }
 
@@ -838,14 +848,11 @@ namespace HYMotion {
             set_backend_tensor_data(mask_r, mask_r_vec.data());
 
             auto rc = get_context();
-            // ggml_rope_pe (the fused interleaved-RoPE kernel Rope::apply_rope prefers)
-            // is CUDA-only -- there is no CPU implementation, and the CPU backend
-            // aborts with "ggml_get_n_tasks: op not implemented: ROPE_PE". Fall back
-            // to the equivalent cont+mul+add chain whenever we are not on CUDA, so
-            // --cpu works without the LONGCAT_NO_FUSED_ROPE=1 env opt-out.
-            if (ggml_backend_is_cpu(rc.backend)) {
-                rc.allow_fused_rope = false;
-            }
+            // The spike forced rc.allow_fused_rope = false on CPU here: its
+            // Rope::apply_rope preferred the CUDA-only fused ggml_rope_pe kernel and
+            // the CPU backend aborted with "op not implemented: ROPE_PE". Master's
+            // rope.hpp has no fused path and no allow_fused_rope flag -- apply_rope is
+            // always the cont+mul+add chain -- so there is nothing to switch off.
             if (getenv("HYMOTION_NO_MASK")) { mask_d = nullptr; mask_r = nullptr; }
             auto out = dit.forward(&rc, x, ctxt, vtxt, tsin_main, tsin_ref, mean_w, pe, mask_d, mask_d, mask_r);
             ggml_build_forward_expand(gf, out);
