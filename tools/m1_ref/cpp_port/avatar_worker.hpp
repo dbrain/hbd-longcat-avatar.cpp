@@ -34,6 +34,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -189,8 +190,17 @@ public:
     Worker(std::string exe, std::vector<std::string> args, std::function<void(const char*)> log)
         : exe_(std::move(exe)), args_(std::move(args)), log_(std::move(log)) {
         last_active_.store(mono());
+        spawner_ = std::thread([this] { spawner_loop(); });
     }
-    ~Worker() { std::lock_guard<std::mutex> lk(mx_); (void)kill_locked(); }
+    ~Worker() {
+        { std::lock_guard<std::mutex> lk(mx_); (void)kill_locked(); }
+        {
+            std::lock_guard<std::mutex> lk(smx_);
+            spawn_stop_ = true;
+        }
+        scv_.notify_all();
+        if (spawner_.joinable()) spawner_.join();
+    }
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
 
@@ -274,7 +284,13 @@ private:
         const pid_t waited = ::waitpid(pid_, &status, WNOHANG);
         if (waited == 0) return false;
         if (waited == pid_ || (waited < 0 && errno == ECHILD)) {
-            say("worker pid " + std::to_string(pid_) + " exited on its own");
+            // SAY HOW, not just that. A worker that vanishes looks the same from here whether it
+            // OOMed, hit a CUDA fault, or was signalled by something we did to ourselves — and the
+            // first bug this supervisor had was exactly the last of those (see spawner_loop).
+            std::string how = "reason unknown";
+            if (WIFEXITED(status))        how = "exit " + std::to_string(WEXITSTATUS(status));
+            else if (WIFSIGNALED(status)) how = "signal " + std::to_string(WTERMSIG(status));
+            say("worker pid " + std::to_string(pid_) + " exited on its own (" + how + ")");
             clear_locked();
             return true;
         }
@@ -369,24 +385,8 @@ private:
         args.push_back("--min-free-mib");
         args.push_back("0");
 
-        const pid_t me = ::getpid();
-        const pid_t pid = ::fork();
+        const pid_t pid = spawn_on_spawner_thread(args);
         if (pid < 0) { err = "fork failed"; port_ = 0; return false; }
-        if (pid == 0) {
-            // A parent that crashes must not leave a CUDA-owning orphan holding 10 GB of a shared
-            // card. PID 1 is a normal parent inside a Docker PID namespace, so compare against the
-            // pre-fork pid exactly rather than treating 1 as orphaned.
-            if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) ::_exit(125);
-            if (::getppid() != me) ::_exit(126);
-            ::setenv("AVATAR_SERVER_WORKER_CHILD", "1", 1);
-            std::vector<char*> argv;
-            argv.reserve(args.size() + 2);
-            argv.push_back(const_cast<char*>(exe_.c_str()));
-            for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-            argv.push_back(nullptr);
-            ::execv(exe_.c_str(), argv.data());
-            ::_exit(127);
-        }
         pid_ = (int)pid;
         publish_locked();
         spawns_.fetch_add(1);
@@ -396,10 +396,76 @@ private:
         return true;
     }
 
+    // ---- the spawner thread ------------------------------------------------------------------
+    // 🔴 PR_SET_PDEATHSIG IS KEYED TO THE FORKING **THREAD**, NOT THE PROCESS. Linux delivers the
+    // parent-death signal when the thread that called fork() exits, and a supervisor is a threaded
+    // program — so forking from the per-job thread that happens to need the worker means the worker
+    // is SIGKILLed the instant that job's thread returns.
+    //
+    // MEASURED, on the first build of this change: a motion job completed normally, the parent
+    // logged the result, and the very next line was "worker pid 140 exited on its own". Every job
+    // therefore paid a cold start, idle-unload had nothing left to unload, and /health reported no
+    // worker seconds after a successful render. The symptom looks exactly like a crash and is not
+    // one, which is why it is written down here rather than merely fixed.
+    //
+    // So every fork happens on ONE thread that lives as long as the process does. PDEATHSIG then
+    // means what it is there to mean: if the SUPERVISOR dies, the CUDA-owning child dies with it,
+    // and never leaves 10 GB of a shared card to an orphan.
+    void spawner_loop() {
+        std::unique_lock<std::mutex> lk(smx_);
+        for (;;) {
+            scv_.wait(lk, [this] { return spawn_want_ || spawn_stop_; });
+            if (spawn_stop_) return;
+            spawn_want_ = false;
+            const std::vector<std::string> args = spawn_args_;
+            lk.unlock();
+            const pid_t pid = fork_exec(args);
+            lk.lock();
+            spawn_pid_ = pid;
+            spawn_done_ = true;
+            sdone_.notify_all();
+        }
+    }
+
+    pid_t spawn_on_spawner_thread(const std::vector<std::string>& args) {
+        std::unique_lock<std::mutex> lk(smx_);
+        spawn_args_ = args;
+        spawn_done_ = false;
+        spawn_want_ = true;
+        scv_.notify_one();
+        sdone_.wait(lk, [this] { return spawn_done_; });
+        return spawn_pid_;
+    }
+
+    pid_t fork_exec(const std::vector<std::string>& args) {
+        const pid_t me = ::getpid();
+        const pid_t pid = ::fork();
+        if (pid != 0) return pid;
+        // A parent that crashes must not leave a CUDA-owning orphan holding 10 GB of a shared card.
+        // PID 1 is a normal parent inside a Docker PID namespace, so compare against the pre-fork
+        // pid exactly rather than treating 1 as universally orphaned.
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) ::_exit(125);
+        if (::getppid() != me) ::_exit(126);
+        ::setenv("AVATAR_SERVER_WORKER_CHILD", "1", 1);
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 2);
+        argv.push_back(const_cast<char*>(exe_.c_str()));
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execv(exe_.c_str(), argv.data());
+        ::_exit(127);
+    }
+
     std::string exe_;
     std::vector<std::string> args_;
     std::function<void(const char*)> log_;
     std::mutex mx_;
+    std::thread spawner_;
+    std::mutex smx_;
+    std::condition_variable scv_, sdone_;
+    std::vector<std::string> spawn_args_;
+    pid_t spawn_pid_ = -1;
+    bool spawn_want_ = false, spawn_done_ = false, spawn_stop_ = false;
     int pid_ = -1;
     int port_ = 0;
     // Lock-free mirrors of pid_/port_ for the status readers. Written only under mx_.
