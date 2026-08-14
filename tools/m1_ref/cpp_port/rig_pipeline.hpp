@@ -15,6 +15,7 @@
 #include "rig_beam_generate_batched.hpp"
 #include "rig_sample.hpp"
 #include "rig_grammar.hpp"
+#include "rig_structural_select.hpp"
 #include "detok_r5.hpp"
 #include "rig_skin_decoder.hpp"
 #include "rig_fsq.hpp"
@@ -45,6 +46,15 @@ struct RigOpts {
     bool  do_sample = true;
     uint64_t seed = 0;
     bool  verbose = true;
+    // Pick the skeleton out of the COMPLETED beam pool by anatomy instead of by score. This is the
+    // same gate rig_texture_chain.sh has always run through skintokens_e2e's `structural-select`;
+    // the inline path used to take the top-normscore hypothesis unconditionally, so the two
+    // production entry points into one decoder disagreed. Measured no-op on a healthy mesh (miku
+    // pre-fix: candidate 1/20 accepted, byte-identical J=37 rig), and it rejects the head-fan /
+    // runaway class outright. Unlike the chain this NEVER fails the run: humanoid gate, then the
+    // size-aware generic gate, then the top beam with a loud warning — image_to_rig must still
+    // deliver a rig for a non-humanoid.
+    bool  structural_select = true;
 };
 
 struct RigResult {
@@ -53,6 +63,23 @@ struct RigResult {
     std::vector<float> skin_pred;  // [N,J] row-major
     int J = 0, N = 0;
     bool ok = false;
+    // Did the STRICT humanoid anatomy gate accept one of the decoded hypotheses? This is the only
+    // honest "the skeleton is a biped" signal the pipeline has, and it is what a caller must test
+    // before deciding to re-draw the conditioning cloud and decode again. `false` covers both the
+    // creature-gate fallback and the ungated top-beam fallback, neither of which asserts anatomy.
+    bool humanoid_gate_ok = false;
+    // Did the size-aware CREATURE gate accept instead? This is not a weaker humanoid signal, it is a
+    // DIFFERENT one: a well-formed tree with a plausible fan for its size, which is the only gate a
+    // non-humanoid can ever pass. A selector that keys on `humanoid_gate_ok` alone throws away the
+    // best rig in the campaign (miku draw 2: generic gate, rig_score 0.915) and can never accept a
+    // creature at all, so callers need to see the two separately.
+    bool generic_gate_ok = false;
+    // Did R4 actually decode skin weights? A runaway R3 eats the whole token budget, so the skin
+    // group tokens never arrive and `skin_pred` is left ZERO — a rig that deforms nothing. That
+    // still returns ok=true (joints/parents are real), so callers could not previously tell, and a
+    // weightless asset shipped behind one WARN line. Observed on the SHIPPED --no-solid mesh at
+    // draw seed 1.
+    bool skin_ok = false;
 };
 
 // host FourierEmbedder (exact; mirrors skintokens_e2e::e2e_fourier_embed). [in_dim, Npts].
@@ -134,6 +161,7 @@ inline RigResult run_rig_pipeline(const std::vector<float>& verts, const std::ve
 
     // ================= R3: AR generate (beam-sample, HF-official) ===============================
     std::vector<int> tokens;
+    std::vector<RigHyp> completed_beams;   // the whole finished pool, best-normscore first
     {
         NpyArray embed_a = npy_load(opt.qwen3_w + "/transformer.model.embed_tokens.weight.npy");
         if ((int)embed_a.shape[0] != qcfg.vocab || (int)embed_a.shape[1] != hidden) {
@@ -158,22 +186,54 @@ inline RigResult run_rig_pipeline(const std::vector<float>& verts, const std::ve
                          /*length_penalty=*/1.0f, /*repetition_penalty=*/opt.reppen,
                          /*do_sample=*/opt.do_sample, /*temperature=*/opt.temp,
                          /*top_k=*/opt.topk, /*top_p=*/opt.topp, /*seed=*/opt.seed,
-                         /*verbose=*/opt.verbose);
+                         /*verbose=*/opt.verbose, &completed_beams);
         else
             tokens = rig::rig_beam_generate_batched(Hq, qcfg, embed_table.data(), mesh_cond.data(), n_cond, start_tokens, gspec,
                          /*num_beams=*/opt.num_beams, /*max_new_tokens=*/opt.max_new,
                          /*length_penalty=*/1.0f, /*repetition_penalty=*/opt.reppen,
                          /*do_sample=*/opt.do_sample, /*temperature=*/opt.temp,
                          /*top_k=*/opt.topk, /*top_p=*/opt.topp, /*seed=*/opt.seed,
-                         /*verbose=*/opt.verbose);
+                         /*verbose=*/opt.verbose, &completed_beams);
     }
     log("[rig R3] generated %zu tokens (last=%d)\n", tokens.size(), tokens.empty() ? -1 : tokens.back());
 
     // ================= R5: detokenize -> joints + parents ======================================
-    std::vector<int64_t> tok64(tokens.begin(), tokens.end());
     detok::Spec dspec = detok::load_spec("");   // missing path -> golden-matching defaults
+
+    // Pick by ANATOMY, not by language-model score. The top-normscore hypothesis is not
+    // automatically a valid skeleton: the decoder periodically stutters out a run of near-duplicate
+    // joints, which the de-tokenizer's nearest-parent rule then collapses into one star ("head fan"
+    // / runaway). rig_texture_chain.sh has always defended against that with skintokens_e2e's
+    // `structural-select`; this path did not, which is the divergence this closes. Falling back
+    // rather than failing: image_to_rig has to deliver a rig for a creature too.
+    bool took_generic = false;
+    if (opt.structural_select && !completed_beams.empty()) {
+        StructuralPick pick = structural_select(completed_beams, dspec, /*generic=*/false, -1, opt.verbose);
+        if (pick.index < 0)
+            pick = structural_select(completed_beams, dspec, /*generic=*/true, -1, opt.verbose);
+        if (pick.index >= 0) {
+            tokens = pick.tokens;
+            took_generic = pick.used_generic;
+            RR.humanoid_gate_ok = !pick.used_generic;
+            RR.generic_gate_ok  = pick.used_generic;
+            log("[rig R3] structural-select: took hypothesis %d/%zu (J=%d, normscore=%.5f)\n",
+                pick.index, completed_beams.size(), pick.J, pick.normscore);
+        } else {
+            fprintf(stderr, "[rig] WARN: no completed hypothesis passed the humanoid OR the generic "
+                            "structural gate; keeping the top-score beam. The skeleton is very "
+                            "likely fanned/runaway — check rig_score maxfan before shipping it.\n");
+        }
+    }
+    std::vector<int64_t> tok64(tokens.begin(), tokens.end());
     detok::Skeleton sk = detok::detokenize(tok64.data(), (int64_t)tok64.size(), dspec);
     if (!sk.ok) { fprintf(stderr, "[rig] R5 detok failed: %s\n", sk.err.c_str()); return RR; }
+    if (took_generic) {
+        // The creature gate judged the NORMALIZED tree, so the delivered tree has to carry the same
+        // deterministic re-parent or the accepted maxfan is not the one that ships.
+        std::string normalized;
+        if (normalize_generic_parent_fan(sk.joints, sk.parents, &normalized))
+            log("[rig R5] %s\n", normalized.c_str());
+    }
     const int J = sk.J;
     RR.joints = sk.joints;
     RR.parents = sk.parents;
@@ -293,6 +353,7 @@ inline RigResult run_rig_pipeline(const std::vector<float>& verts, const std::ve
     }
 
     RR.ok = true;
+    RR.skin_ok = true;
     return RR;
 }
 

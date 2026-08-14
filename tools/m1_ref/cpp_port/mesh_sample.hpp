@@ -370,11 +370,24 @@ inline PrepResult prep_mesh_for_rig_inmem(std::vector<float> verts, const std::v
     std::vector<float> pre;          // K*3 candidate subset
     std::vector<int>   pre_idx(K);   // original surface-sample index of each candidate (-> normals)
     if (K <= N) {
-        if (seed != 0) {
-            std::fprintf(stderr, "prep_mesh_for_rig: exact NumPy PCG64 query path currently requires seed=0\n");
-            return R;
+        // seed 0 is the SHIPPED path: the exact NumPy PCG64 choice, bit-for-bit with
+        // capture_vecset_r0.py. A non-zero seed is only ever used to draw an INDEPENDENT
+        // conditioning cloud from the same mesh (the rig retry loop) — there is no Python
+        // reference to match there, so a plain shuffle is the right generator. This used to
+        // hard-fail, which made "sample the same mesh again" impossible.
+        std::vector<int> perm;
+        if (seed == 0) {
+            perm = numpy_choice_seed0_without_replacement(N, K);
+        } else {
+            perm.resize(N);
+            for (int i = 0; i < N; ++i) perm[i] = i;
+            std::mt19937_64 qrng(seed * 0x9E3779B97F4A7C15ull + 0xD1B54A32D192ED03ull);
+            for (int i = N - 1; i >= 1; --i) {
+                std::uniform_int_distribution<int> D(0, i);
+                std::swap(perm[(size_t)i], perm[(size_t)D(qrng)]);
+            }
+            perm.resize(K);
         }
-        const std::vector<int> perm = numpy_choice_seed0_without_replacement(N, K);
         if ((int)perm.size() != K) return R;
         pre.resize((size_t)K * 3);
         for (int i = 0; i < K; ++i) {

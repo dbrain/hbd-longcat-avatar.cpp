@@ -415,6 +415,18 @@ if [ "$BASE" = "rig_grammar_test" ]; then
   exit 0
 fi
 
+# rig_pose_gate: the NATIVE pose gate (rig_pose_gate.hpp) on a rigged GLB — a port of
+# rig_pose_smoke.py --pose-gate, printing the same line character for character so the two can be
+# diffed. Header-only (glb_reader.hpp JSON + glb_rigged.hpp encodings), no ggml, OpenMP for the
+# per-joint audit. The PIPELINE calls the header directly; this binary exists to falsify the port.
+if [ "$BASE" = "rig_pose_gate" ]; then
+  CXX="${CXX:-/usr/bin/g++}"
+  echo ">> build rig_pose_gate (native pose gate, glb_reader.hpp, OpenMP, no ggml)"
+  "$CXX" -O2 -std=c++17 -fopenmp -Wall -Wno-unused-variable "$HERE/rig_pose_gate_main.cpp" -o "$HERE/$BIN" -lm
+  echo ">> built $BIN"
+  exit 0
+fi
+
 # rig_score: skeleton-quality scorer for a rigged GLB (joint/symmetry/coverage/depth metrics).
 # Header-only (reuses glb_reader.hpp JSON parser + read_glb), no ggml. Used for best-of-N + A/B ranking.
 if [ "$BASE" = "rig_score" ]; then
