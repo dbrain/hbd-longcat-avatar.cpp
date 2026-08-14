@@ -576,6 +576,11 @@ void fill_rig_request(State& st, const json& b, const std::string& image, const 
     // gate — an optimisation for a bad run, never a precondition for returning an asset.
     r.rig_retries = b.value("rig_retries", st.cfg.rig_retries);
     r.rig_extra_retries = b.value("rig_extra_retries", -1);   // -1 = the stage's own default
+    // Skin-weight cleanup: ON, because it verifies itself against the shipped pose gate and keeps
+    // the original skin byte-for-byte when it cannot prove an improvement. It removes the vertices
+    // bound to a joint half a body away that get flung across the character when it rotates — the
+    // "spears off the arms" defect — and on a rig that is already good it is a ~1 s no-op.
+    r.skin_cleanup = b.value("skin_cleanup", true);
     if (b.contains("extra_args") && b["extra_args"].is_array())
         for (const auto& a : b["extra_args"])
             if (a.is_string()) r.extra_args.push_back(a.get<std::string>());
@@ -619,6 +624,9 @@ bool build_ladder(State& st, JobPtr j, const json& b, const std::string& image,
             {"tier", tiers[i].name}, {"decimate", tiers[i].decimate},
             {"glb", rr.glb}, {"joints", rr.joints}, {"named_core", rr.named_core},
             {"seconds", rr.seconds},
+            // "" = the cleanup did not run. Otherwise the one-line verdict, including the case where
+            // it found nothing to improve and kept the original skin.
+            {"skin_cleanup", rr.skin_cleanup},
             {"result_url", "/v1/jobs/" + j->id + "/result?tier=" + tiers[i].name},
         };
         // The gate verdict belongs to the DRAW, so it is reported on the tier that decoded it. Tiers
