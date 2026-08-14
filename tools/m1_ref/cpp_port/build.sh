@@ -7,16 +7,29 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GGML="$HERE/../../../ggml"
 BASE="${1%.cpp}"; MODE="${2:-cpu}"
-# CUDA SASS targets for every nvcc call below. Default 86 = RTX 3060 (Ampere), which is the only
-# card this pipeline has ever been validated on.
+# CUDA SASS targets for every nvcc call below.
+#   86  = RTX 3060      (Ampere)   — the ONLY card this pipeline has ever been VALIDATED on.
+#   120 = RTX 5060 Ti   (Blackwell) — COMPILED FOR, NOT VALIDATED. See the warning below.
 #
-# TO RUN ON ANOTHER CARD (e.g. the 5060 Ti = Blackwell = sm_120) SETTING THIS IS NOT ENOUGH: ggml
-# is the bigger half of the link and its build-cuda13 is configured CMAKE_CUDA_ARCHITECTURES=86,
-# so it must be rebuilt for the same arch list or every kernel launch fails with "no kernel image
-# is available for execution on the device". Build both, then re-validate: this stack has a
-# history of arch-specific behaviour, so a clean compile is not evidence of a correct render.
-#   PIXAL3D_CUDA_ARCHS="86;120" ./build.sh image_to_rig cuda
-PIXAL3D_CUDA_ARCHS="${PIXAL3D_CUDA_ARCHS:-86}"
+# The other half of the link is ggml: ggml/build-cuda13 must be configured with the SAME arch
+# list or every kernel launch fails with "no kernel image is available for execution on the
+# device".  Both trees are now 86;120:
+#   cmake -S ggml -B ggml/build-cuda13 -DCMAKE_CUDA_ARCHITECTURES="86;120"   (ggml rewrites 120 -> 120a)
+#   cmake -S .    -B build-hymo        -DCMAKE_CUDA_ARCHITECTURES="86;120"   (sd.cpp/HY-Motion half)
+#
+# 🔴 CARRYING sm_120 SASS IS NOT EVIDENCE THAT sm_120 IS CORRECT.  Nothing in this pipeline has
+# been numerically validated on Blackwell.  Known hazards on this exact box: CuMesh's
+# remesh_narrow_band_dc silently returns ~13k disconnected components on sm_120 with no error
+# raised, and F16 flash-attention on sm_120 garbled qwen3-tts output — and the rig decoder runs
+# bf16/KV-f16 through a custom FA2 kernel.  Kernels needing numeric revalidation before anyone
+# trusts a Blackwell render: narrow_band_dc_cuda.cu, sparse_subm_conv.cu, svae_cuda.cu,
+# tex_atlas_cuda.cu, p3sam_heads_cuda.cu, rig_philox_race.cu, ggml's fattn-pixal-fa2.cu.
+# Note rig_philox_race.cu sizes its grid from multiProcessorCount, so its RNG stream is
+# device-dependent BY CONSTRUCTION — a 3060 golden cannot reproduce bit-exactly on any other card.
+#
+# Build for one arch only (e.g. to shrink the binary) with:
+#   PIXAL3D_CUDA_ARCHS="86" ./build.sh image_to_rig cuda
+PIXAL3D_CUDA_ARCHS="${PIXAL3D_CUDA_ARCHS:-86;120}"
 NVARCH=""
 IFS=';' read -ra _archs <<< "$PIXAL3D_CUDA_ARCHS"
 for _a in "${_archs[@]}"; do NVARCH="$NVARCH -gencode=arch=compute_${_a},code=sm_${_a}"; done

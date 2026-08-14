@@ -1,0 +1,63 @@
+diff --git a/csrc/flash_attn/src/flash.h b/csrc/flash_attn/src/flash.h
+index 8ffbb62..438388e 100644
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -9,7 +9,20 @@
+ #include <cuda.h>
+ #include <vector>
+ 
+-#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
++#include <cstdint>
++
++// Pixal's native inference backend only runs the no-dropout forward kernel.
++// Keep the tiny ABI-compatible Philox state here rather than depending on
++// libtorch just for a field that is unused in that mode.
++namespace at {
++struct PhiloxCudaState {
++    union Payload { uint64_t val; int64_t * ptr; } seed_{}, offset_{};
++    uint32_t offset_intragraph_ = 0;
++    bool captured_ = false;
++    PhiloxCudaState() = default;
++    PhiloxCudaState(uint64_t seed, uint64_t offset) { seed_.val = seed; offset_.val = offset; }
++};
++}
+ 
+ namespace FLASH_NAMESPACE {
+ constexpr int TOTAL_DIM = 0;
+diff --git a/csrc/flash_attn/src/flash_fwd_launch_template.h b/csrc/flash_attn/src/flash_fwd_launch_template.h
+index 227f3c2..5960433 100644
+--- a/csrc/flash_attn/src/flash_fwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
+@@ -4,7 +4,11 @@
+ 
+ #pragma once
+ #include "namespace_config.h"
+-#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
++#include <cstdio>
++#include <cstdlib>
++#define C10_CUDA_CHECK(expr) do { const cudaError_t _fa_err = (expr); if (_fa_err != cudaSuccess) { \
++    std::fprintf(stderr, "FlashAttention CUDA error: %s\\n", cudaGetErrorString(_fa_err)); std::abort(); } } while (0)
++#define C10_CUDA_KERNEL_LAUNCH_CHECK() C10_CUDA_CHECK(cudaGetLastError())
+ 
+ #include "static_switch.h"
+ #include "hardware_info.h"
+diff --git a/csrc/flash_attn/src/philox_unpack.cuh b/csrc/flash_attn/src/philox_unpack.cuh
+index 3a54f45..986a777 100644
+--- a/csrc/flash_attn/src/philox_unpack.cuh
++++ b/csrc/flash_attn/src/philox_unpack.cuh
+@@ -1,4 +1,12 @@
+-// This is purely so that it works with torch 2.1. For torch 2.2+ we can include ATen/cuda/PhiloxUtils.cuh
+-
++// Native no-dropout forward integration: keep FlashAttention's Philox ABI
++// without pulling libtorch into the renderer.  `flash.h` provides the state.
+ #pragma once
+-#include <ATen/cuda/detail/UnpackRaw.cuh>
++#include <tuple>
++namespace at::cuda::philox {
++__host__ __device__ __forceinline__ std::tuple<uint64_t, uint64_t>
++unpack(at::PhiloxCudaState arg) {
++    return arg.captured_
++        ? std::make_tuple(static_cast<uint64_t>(*arg.seed_.ptr), static_cast<uint64_t>(*arg.offset_.ptr) + arg.offset_intragraph_)
++        : std::make_tuple(arg.seed_.val, arg.offset_.val);
++}
++}

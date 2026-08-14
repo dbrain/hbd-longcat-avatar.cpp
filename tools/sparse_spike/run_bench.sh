@@ -6,6 +6,10 @@
 # Uses the toolchain nvcc-built standalone binary (sm_86) — no docker needed for the
 # spike bench. (Docker build applies later, when the sparse subsystem is integrated
 # into longcat-avatar.cpp proper.)
+#
+# sm_86 ONLY, deliberately: $T is the CUDA 12.4 toolchain, whose nvcc has no compute_120.
+# The pipeline lane (tools/m1_ref/cpp_port/build.sh) builds this same .cu for 86;120 with the
+# CUDA 13.3 toolchain — this bench is a 3060-only fixture and is not part of that link.
 set -e
 T=/mnt/hdd/3d/avatar-shootout/toolchain
 cd "$(dirname "$0")"

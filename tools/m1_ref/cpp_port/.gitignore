@@ -6,6 +6,13 @@
 # test_p3sam_segment / p3sam_retopo; svae_cuda.o linked into pixal3d) — without this line the build
 # depends on files git is configured never to see, and a clean clone does not compile.
 !*.cu
+# Patches applied to a SUBMODULE at configure time. ggml/src/ggml-cuda/CMakeLists.txt applies
+# flash_attention_native.patch to thirdparty/flash_attention by absolute path when
+# GGML_PIXAL_FA2=ON (which is how ggml/build-cuda13 and build-hymo are both configured), and
+# FATAL_ERRORs if the tree is neither pristine nor already patched. Without this line the patch is
+# untracked, a fresh clone has no file to apply, and the CUDA configure step dies — the same class
+# of clean-clone break the *.cu line above exists to prevent.
+!*.patch
 # NOTE: *.md is deliberately NOT whitelisted. This is a public repo, and handoff/status docs go stale
 # in place, then burn an agent's context before it touches anything. Working notes live in the
 # gitignored /notes/ dir at the repo root instead.

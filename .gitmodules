@@ -23,5 +23,10 @@
 	# CMakeLists applies tools/m1_ref/cpp_port/flash_attention_native.patch to this
 	# checkout at configure time, so it is expected to read dirty once configured.
 	# Needs its own csrc/cutlass submodule (`--recursive`).
+	# `ignore = dirty` because that configure-time patch dirties the checkout on EVERY build:
+	# without it `git status` in this repo permanently reports a modified submodule, which trains
+	# the reader to ignore the one line that would matter if the PIN ever moved. The pin itself is
+	# still tracked and still shows up when it changes.
+	ignore = dirty
 	path = thirdparty/flash_attention
 	url = https://github.com/Dao-AILab/flash-attention.git
