@@ -1434,6 +1434,12 @@ int main(int argc, char** argv) {
     svr.set_read_timeout(60 * 60, 0);
     svr.set_write_timeout(60 * 60, 0);
     svr.set_idle_interval(1, 0);
+    // 🔴 A `?wait=1` rig OCCUPIES ITS HTTPLIB WORKER for the whole ladder — a quarter of an hour.
+    // httplib's default pool is 8, so eight patient clients would leave /health with no thread to
+    // answer on, and a service that stops answering /health while it is working perfectly is a
+    // service that looks dead to every probe on the box. The work itself is still single-flight
+    // (the Engine's queue decides that, not this number); these threads are almost all asleep.
+    svr.new_task_queue = [] { return new httplib::ThreadPool(64); };
     svr.set_exception_handler([](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
         std::string what = "unknown exception";
         try { std::rethrow_exception(ep); }
