@@ -4,6 +4,7 @@
 // and the standalone probe run the SAME code. It owns a compact native CUDA BVH so the narrow-band
 // UDF can be computed without Python, Torch, or the fragile CuBVH extension.
 #include "narrow_band_dc.hpp"
+#include "cancel_hook.hpp"   // cooperative cancellation between ladder levels
 
 #include <cuda_runtime.h>
 
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,8 +24,11 @@ namespace {
 
 struct Coord { int x, y, z; };
 
-// Coordinates are in [0, 1024], so 11 bits per component is sufficient for both voxel and
-// grid-vertex maps.  Keeping this representation native makes the sparse topology deterministic.
+// 11 bits per component, so coordinates must fit [0, 2047] -- grid vertices reach `resolution`
+// INCLUSIVE (cell corner c+1 of the last cell), hence the hard KEY_MAX_COORD ceiling below.
+// 1024 and 1536 both fit; 2048 does NOT (it would alias onto y=0 of the next component).
+// Keeping this representation native makes the sparse topology deterministic.
+constexpr int KEY_MAX_COORD = 2047;
 uint64_t key(int x, int y, int z) {
     return (uint64_t)(uint32_t)x | ((uint64_t)(uint32_t)y << 11) | ((uint64_t)(uint32_t)z << 22);
 }
@@ -158,9 +163,28 @@ namespace nbdc {
 bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_faces,
             int resolution, float band,
             std::vector<float>& out_verts_arg, std::vector<int64_t>& out_faces_arg,
-            bool verbose) {
-    if (resolution < 32 || (resolution & (resolution - 1)) != 0 || band <= 0) {
-        std::fprintf(stderr, "[narrow-band] resolution must be a power of two >= 32 and band must be positive\n");
+            bool verbose, const solidfield::SolidField* interior) {
+    // The refinement ladder below starts on a coarse grid and DOUBLES until it reaches
+    // `resolution`, so the only structural requirement is that `resolution` be reachable by
+    // doubling from a grid that is (a) at least 32 and (b) small enough to enumerate densely.
+    // That is NOT the same as "power of two" -- the old guard was over-strict and locked out 1536.
+    //
+    // Peel factors of two off `resolution` while the coarse grid stays >= 32.  For every power of
+    // two >= 32 this lands on exactly 32, so `ladder_start`/`levels` reproduce the old hardcoded
+    // `int r = 32` bit-for-bit (1024 -> 32 with 5 doublings).  1536 lands on 48 (1536, 768, 384,
+    // 192, 96, 48), likewise 5 doublings back up.  `ladder_start << levels == resolution` holds by
+    // construction, so the loop always terminates exactly on `resolution`.
+    int ladder_start = resolution, levels = 0;
+    while ((ladder_start & 1) == 0 && (ladder_start >> 1) >= 32) { ladder_start >>= 1; ++levels; }
+    // The coarsest level is enumerated densely (ladder_start^3 cells), so a `resolution` with too
+    // few factors of two (e.g. an odd one) is refused rather than allowed to eat host RAM.  Every
+    // multiple of 16 below 2048 -- which is all image_to_rig will pass -- peels to <= 127.
+    constexpr int MAX_LADDER_START = 128;
+    if (resolution < 32 || resolution > KEY_MAX_COORD || band <= 0 || ladder_start > MAX_LADDER_START) {
+        std::fprintf(stderr,
+                     "[narrow-band] resolution must be in [32, %d] and reach a coarse grid of "
+                     "<= %d by halving (got %d -> %d), and band must be positive\n",
+                     KEY_MAX_COORD, MAX_LADDER_START, resolution, ladder_start);
         return false;
     }
     if (in_verts.empty() || in_faces.empty()) {
@@ -169,11 +193,25 @@ bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_f
     }
     try {
         Udf udf(in_verts, in_faces, verbose);
+        // Both derived quantities are ratios in `resolution` with no power-of-two dependence:
+        // `scale` widens the [-0.5, 0.5] cube by 1.5 band-widths per side and `eps` is the band
+        // offset expressed in that widened frame.  They stay exact at 1536.
         const float scale = (float)(resolution + 3 * band) / resolution;  // Pixal3D postprocess.py exactly
         const float eps = band * scale / resolution;
-        int r = 32;
+        // Only meaningful when the field is signed; 0 keeps the historical cell set exactly.
+        // 4 is measured, not guessed: at 2 the dropped-quad counter below still fires (miku 2660
+        // boundary edges, gilly 536) because the interior flag's boundary can sit a couple of voxels
+        // off the eps level set; at 4 it reaches zero on both heroes.
+        const int grow = (interior && !interior->empty())
+                       ? (std::getenv("NBDC_BAND_GROW") ? atoi(std::getenv("NBDC_BAND_GROW")) : 4) : 0;
+        int r = ladder_start;
         std::vector<Coord> cells = all_cells(r);
         while (true) {
+            // CANCELLATION POINT — one per ladder level. The quantum is a whole level's UDF query,
+            // and the levels grow 8x in cells as the grid doubles, so the LAST level dominates the
+            // worst case. Everything live here is a std::vector or the RAII BVH, so the throw is
+            // safe; it is re-thrown past the catch below rather than reported as a DC failure.
+            cancelhook::check();
             if (verbose) std::fprintf(stderr, "[narrow-band] querying %zu cell centres at %d^3\n", cells.size(), r);
             std::vector<float> d = udf.distances(cells, r, scale, /*cell_centres=*/true);
             std::vector<Coord> kept;
@@ -182,7 +220,7 @@ bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_f
             for (size_t i = 0; i < cells.size(); ++i) if (std::fabs(d[i] - eps) < limit) kept.push_back(cells[i]);
             cells.swap(kept);
             if (verbose) std::fprintf(stderr, "[narrow-band] kept %zu active cells\n", cells.size());
-            if (r == resolution) break;
+            if (r >= resolution) break;   // == by construction; >= so a bad ladder cannot run away
             r *= 2;
             std::vector<Coord> children;
             children.reserve(cells.size() * 8);
@@ -191,6 +229,35 @@ bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_f
             cells.swap(children);
         }
         if (cells.empty()) throw std::runtime_error("narrow band unexpectedly contains no cells");
+
+        // BAND EXPANSION.  A quad is emitted only when all four cells around its grid edge are in
+        // the band; otherwise it is silently dropped, which tears a boundary edge.  With the
+        // UNSIGNED field that never fires -- every sign change sits within 0.87 voxels of the eps
+        // level set, so its four cells are in the band by construction, and the delivered mesh has
+        // boundary == 0.  SIGNING moves some crossings off that level set (the interior flag's
+        // boundary is where they land), so the band has to be grown to cover them.  Growing it
+        // cannot change the unsigned result: the added cells contain no sign change, so they emit
+        // nothing and compact_mesh drops their unreferenced dual vertices.
+        if (grow > 0) {
+            std::unordered_set<uint64_t> have;
+            have.reserve(cells.size() * 2);
+            for (const Coord& c : cells) have.insert(key(c.x, c.y, c.z));
+            for (int g = 0; g < grow; ++g) {
+                std::vector<Coord> added;
+                for (const Coord& c : cells) {
+                    const int nb[6][3] = {{c.x + 1, c.y, c.z}, {c.x - 1, c.y, c.z},
+                                          {c.x, c.y + 1, c.z}, {c.x, c.y - 1, c.z},
+                                          {c.x, c.y, c.z + 1}, {c.x, c.y, c.z - 1}};
+                    for (const auto& q : nb) {
+                        if (q[0] < 0 || q[1] < 0 || q[2] < 0) continue;
+                        if (q[0] >= resolution || q[1] >= resolution || q[2] >= resolution) continue;
+                        if (have.insert(key(q[0], q[1], q[2])).second) added.push_back({q[0], q[1], q[2]});
+                    }
+                }
+                cells.insert(cells.end(), added.begin(), added.end());
+            }
+            if (verbose) std::fprintf(stderr, "[narrow-band] band grown by %d -> %zu cells\n", grow, cells.size());
+        }
 
         std::unordered_map<uint64_t, int> cell_index;
         cell_index.reserve(cells.size() * 2);
@@ -210,9 +277,107 @@ bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_f
             value_index.emplace(k, (int)grid_vertices.size());
             grid_vertices.push_back(c);
         }
+        cancelhook::check();   // before the single biggest query: every grid vertex of the band
         if (verbose) std::fprintf(stderr, "[narrow-band] querying %zu deduplicated grid vertices\n", grid_vertices.size());
         std::vector<float> values = udf.distances(grid_vertices, resolution, scale, /*cell_centres=*/false);
         for (float& d : values) d -= eps;
+
+        // SIGN THE FIELD (opt-in; `interior == nullptr` leaves everything above and below exactly
+        // as it was).  Only values that are still POSITIVE can flip, and a positive value means the
+        // vertex is more than `eps` from the input surface -- so the flip never touches a crossing
+        // that defines the outward wall.  What it removes is the deep-interior positive region, and
+        // with it the inward wall that region's boundary was.
+        //
+        // The oracle is a VOXEL set closed with box morphology, so its boundary wanders about a
+        // voxel either side of the true surface.  Two ways that hurts, and they are not symmetric:
+        //   * flagging an OUTSIDE vertex interior pushes the outward wall out by a fraction of a
+        //     voxel -- harmless, and with erode >= 1 the flag does not reach a positive vertex at
+        //     all (a vertex less than eps outside is already negative and cannot flip);
+        //   * MISSING an inside vertex leaves a positive island buried in the body, which contours
+        //     into a stray closed sheet.  Measured raw: 8013 components and 106k boundary edges.
+        // So the raw labels are median-filtered over the {f > 0} vertex graph, which erases isolated
+        // misses without moving the large-scale boundary.  (A single vote per connected {f > 0}
+        // region was tried first and is WRONG: gilly's interior and exterior positive regions are
+        // joined through a hole in the O-Voxel surface, so one vote decides both and the whole
+        // inward wall survives -- 25k flips instead of 900k.)
+        if (interior && !interior->empty()) {
+            const size_t nv = values.size();
+            const int smooth = std::getenv("NBDC_SIGN_SMOOTH") ? atoi(std::getenv("NBDC_SIGN_SMOOTH")) : 3;
+            std::vector<uint8_t> lab(nv, 0), pos(nv, 0);
+            for (size_t i = 0; i < nv; ++i) {
+                if (values[i] <= 0.f) continue;
+                pos[i] = 1;
+                const Coord& c = grid_vertices[i];
+                lab[i] = interior->inside(c.x, c.y, c.z) ? 1 : 0;
+            }
+            // 6-neighbour adjacency among the positive vertices, materialised once (CSR).
+            std::vector<int32_t> off(nv + 1, 0), adj;
+            adj.reserve(nv * 3);
+            for (size_t i = 0; i < nv; ++i) {
+                off[i] = (int32_t)adj.size();
+                if (!pos[i]) continue;
+                const Coord& c = grid_vertices[i];
+                const int nb[6][3] = {{c.x + 1, c.y, c.z}, {c.x - 1, c.y, c.z},
+                                      {c.x, c.y + 1, c.z}, {c.x, c.y - 1, c.z},
+                                      {c.x, c.y, c.z + 1}, {c.x, c.y, c.z - 1}};
+                for (const auto& q : nb) {
+                    if (q[0] < 0 || q[1] < 0 || q[2] < 0) continue;
+                    if (q[0] > KEY_MAX_COORD || q[1] > KEY_MAX_COORD || q[2] > KEY_MAX_COORD) continue;
+                    auto it = value_index.find(key(q[0], q[1], q[2]));
+                    if (it != value_index.end() && pos[(size_t)it->second]) adj.push_back(it->second);
+                }
+            }
+            off[nv] = (int32_t)adj.size();
+            int64_t changed_total = 0;
+            for (int pass = 0; pass < smooth; ++pass) {
+                std::vector<uint8_t> next = lab;
+                int64_t changed = 0;
+                for (size_t i = 0; i < nv; ++i) {
+                    if (!pos[i]) continue;
+                    int in = lab[i] ? 1 : 0, tot = 1;
+                    for (int32_t k = off[i]; k < off[i + 1]; ++k) { in += lab[(size_t)adj[k]] ? 1 : 0; ++tot; }
+                    const uint8_t v = (uint8_t)(2 * in > tot ? 1 : 0);
+                    if (v != lab[i]) ++changed;
+                    next[i] = v;
+                }
+                lab.swap(next);
+                changed_total += changed;
+                if (!changed) break;
+            }
+            // DIAGNOSTIC (NBDC_SIGN_DEBUG=1): the connected {f>0} regions with their oracle vote.
+            // This is what tells you whether a bad result is a mislabelled region or two regions
+            // that should be separate having merged.
+            if (std::getenv("NBDC_SIGN_DEBUG")) {
+                std::vector<int32_t> parent(nv);
+                for (size_t i = 0; i < nv; ++i) parent[i] = (int32_t)i;
+                std::function<int32_t(int32_t)> find = [&](int32_t x) {
+                    while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+                for (size_t i = 0; i < nv; ++i) if (pos[i])
+                    for (int32_t k = off[i]; k < off[i + 1]; ++k) {
+                        const int32_t ra = find((int32_t)i), rb = find(adj[k]); if (ra != rb) parent[ra] = rb; }
+                std::unordered_map<int32_t, std::pair<int64_t,int64_t>> vote;
+                for (size_t i = 0; i < nv; ++i) if (pos[i]) {
+                    auto& t = vote[find((int32_t)i)];
+                    const Coord& c = grid_vertices[i];
+                    if (interior->inside(c.x, c.y, c.z)) ++t.first; else ++t.second; }
+                std::vector<std::pair<int64_t,std::pair<int64_t,int64_t>>> big;
+                for (const auto& kv : vote) big.push_back({kv.second.first + kv.second.second, kv.second});
+                std::sort(big.begin(), big.end(), [](auto& a, auto& b){ return a.first > b.first; });
+                std::fprintf(stderr, "[narrow-band] sign-debug: %zu positive regions; largest:\n", vote.size());
+                for (size_t i = 0; i < big.size() && i < 8; ++i)
+                    std::fprintf(stderr, "    n=%-9lld  interior-flagged=%-9lld outside-flagged=%-9lld -> %s\n",
+                                 (long long)big[i].first, (long long)big[i].second.first,
+                                 (long long)big[i].second.second,
+                                 big[i].second.first > big[i].second.second ? "INTERIOR" : "exterior");
+            }
+            int64_t flipped = 0;
+            for (size_t i = 0; i < nv; ++i) if (pos[i] && lab[i]) { values[i] = -values[i]; ++flipped; }
+            if (verbose)
+                std::fprintf(stderr,
+                             "[narrow-band] signed field: flipped %lld of %zu grid vertices to "
+                             "interior-negative (%lld labels changed by %d median passes)\n",
+                             (long long)flipped, nv, (long long)changed_total, smooth);
+        }
 
         std::vector<float> dual(cells.size() * 3);
         std::vector<int8_t> crossings(cells.size() * 3, 0);
@@ -242,6 +407,7 @@ bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_f
         const int S1N[6] = {0,1,2,0,2,3}, S1P[6] = {0,2,1,0,3,2}, S2N[6] = {0,1,3,3,1,2}, S2P[6] = {0,3,1,3,2,1};
         std::vector<int64_t> out_faces;
         out_faces.reserve(cells.size() * 6);
+        int64_t dropped_quads = 0;
         auto align = [&](const int q[4], const int s[6]) {
             auto n = [&](int a, int b, int c, float out[3]) {
                 const float *p = &out_verts[(size_t)q[a] * 3], *u = &out_verts[(size_t)q[b] * 3], *v = &out_verts[(size_t)q[c] * 3];
@@ -256,18 +422,24 @@ bool remesh(const std::vector<float>& in_verts, const std::vector<int64_t>& in_f
                 const Coord& c = cells[i]; auto it = cell_index.find(key(c.x + OFF[e][j][0], c.y + OFF[e][j][1], c.z + OFF[e][j][2]));
                 if (it == cell_index.end()) { ok = false; break; } q[j] = it->second;
             }
-            if (!ok) continue;
+            if (!ok) { ++dropped_quads; continue; }
             const bool pos = crossings[i * 3 + e] > 0;
             const int* a = pos ? S1P : S1N; const int* b = pos ? S2P : S2N;
             const int* s = align(q, a) > align(q, b) ? a : b;
             for (int j = 0; j < 6; ++j) out_faces.push_back(q[s[j]]);
         }
         compact_mesh(out_verts, out_faces);
+        if (verbose && dropped_quads)
+            std::fprintf(stderr, "[narrow-band] *** %lld quads dropped (a crossing whose 4 cells are "
+                                 "not all in the band) -- each one tears boundary edges ***\n",
+                         (long long)dropped_quads);
         if (verbose) std::fprintf(stderr, "[narrow-band] result V=%zu F=%zu (raw V=%zu F=%zu)\n",
                                   out_verts.size()/3, out_faces.size()/3, in_verts.size()/3, in_faces.size()/3);
         out_verts_arg.swap(out_verts);
         out_faces_arg.swap(out_faces);
         return true;
+    } catch (const cancelhook::Cancelled&) {
+        throw;   // a cancel is not a DC failure: let it reach the stage boundary
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[narrow-band] failed: %s\n", e.what());
         return false;

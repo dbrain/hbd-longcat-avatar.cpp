@@ -66,6 +66,15 @@ fi
 if [ -n "${RIG_CACHE:-}" ]; then
   RESUME_ARGS+=(--rig-cache "$RIG_CACHE")
 fi
+# RES / DC_BAND: HR cascade lattice + narrow-band width. Both UNSET by default, in which case NO
+# flag is added and the command line is byte-identical to the 1024 corpus this driver produced.
+# RES=1536 is the finer-lattice path (finer voxels -> thinner separable features, i.e. fingers).
+if [ -n "${RES:-}" ]; then
+  RESUME_ARGS+=(--resolution "$RES")
+fi
+if [ -n "${DC_BAND:-}" ]; then
+  RESUME_ARGS+=(--dc-band "$DC_BAND")
+fi
 
 echo "[1/3] image_to_rig --dc-remesh (geometry -> DC parity mesh -> bake -> rig)  [3060]"
 SAMPLER=$(bash "$CPP_DIR/shootout/gpu_sample.sh" start "$OUT/vram.csv")
