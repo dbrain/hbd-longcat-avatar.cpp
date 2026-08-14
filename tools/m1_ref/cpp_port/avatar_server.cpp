@@ -74,11 +74,45 @@
 //   * at RUN, once we hold the session and the flock, immediately before build_rig().
 // Both fail with `error_code: "insufficient_vram"` and a message naming the number. The point is
 // that the operator learns this in milliseconds instead of as a CUDA OOM seven minutes in.
+//
+// ============================================================================================
+// WORKER ISOLATION — THE PROCESS IS TWO PROCESSES NOW. Read avatar_worker.hpp first.
+// ============================================================================================
+// ggml's CUDA allocator pools every block it ever frees, so `release_gpu()` — and therefore
+// /v1/admin/unload — could never return VRAM to the driver: measured, 122 MiB fresh, 1558 MiB after
+// ONE job with `loaded: false`, and a container restart the only way back. So this binary now runs
+// as a PAIR, exactly as the sd.cpp fork's GPU gate does:
+//
+//   PARENT (the default)   this file, with `engine == nullptr`. It never constructs avatar::Engine,
+//                          so it never creates a CUDA context and holds ZERO MiB on the card. It
+//                          owns the public listener, the job manager, admission, the VRAM floor
+//                          (read via NVML — see the 🔴 in avatar_worker.hpp), idle-unload, and
+//                          every route. Each GPU job is ONE synchronous `?wait=1` request proxied
+//                          to the child, whose result it records as its own.
+//   CHILD  (--worker)      this file, with `engine != nullptr`: today's server, byte for byte the
+//                          same code path, on a private loopback port. It owns the Engine, the CUDA
+//                          context, the ggml pools, and the GPU flock.
+//
+// `POST /v1/admin/unload` SIGKILLs the child. That is a real context teardown, so the card comes
+// back to the parent-only baseline of 0 MiB.
+//
+// WHY THE PARENT KEEPS THE JOBS rather than proxying /v1/jobs as well: killing the child must not
+// erase job history. `geometry_from: <job id>`, `rig_cache_from`, `animate {rig: <job id>}` and
+// `GET /v1/jobs/{id}/result` all have to keep working across an unload, and the artifacts are on a
+// shared volume that outlives any child. The parent therefore MINTS the job id and hands it to the
+// child as `_job_id`, so both processes name the same job and the same `/out/jobs/<id>/` directory,
+// and every path the child publishes is one the parent can serve afterwards.
+//
+// LONGCAT_RIG_WORKER_ISOLATION=0 (or --no-worker-isolation) restores the single-process behaviour,
+// pooled VRAM and all. It exists to bisect against, not to run.
 #include "avatar_pipeline.hpp"
 
 #include "httplib.h"
 #include "json.hpp"
 
+#include "avatar_worker.hpp"
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -113,6 +147,10 @@ double now_s() {
 }
 double wall_now() { return (double)::time(nullptr); }
 
+// Parent and child both log to the same inherited stderr, so they say which one they are. Without
+// this every `docker logs` line is ambiguous the moment isolation is on.
+const char* g_log_tag = "avatar-server";
+
 void log_line(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_line(const char* fmt, ...) {
     char buf[2048];
@@ -120,7 +158,7 @@ void log_line(const char* fmt, ...) {
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    std::fprintf(stderr, "[avatar-server] %s\n", buf);
+    std::fprintf(stderr, "[%s] %s\n", g_log_tag, buf);
     std::fflush(stderr);
 }
 
@@ -335,6 +373,10 @@ json job_public(const Job& j) {
     if (!j.result.is_null()) b["result"] = j.result;
     if (!j.result_path.empty()) {
         b["result_path"] = j.result_path;
+        // Published because the isolation parent has to reproduce it: it records a child's finished
+        // job as its own, and the artifact's media type is not derivable from the job kind alone
+        // (a `render` delivers a GLB, a `motion` delivers clip JSON, and a future stage may differ).
+        b["result_mime"] = j.result_mime;
         // The bytes are fetched, never inlined: a rigged GLB is tens of MB and base64 in a poll
         // body is the transport mistake `docs/media-transport.md` exists to undo.
         b["result_url"] = "/v1/jobs/" + j.id + "/result";
@@ -380,11 +422,20 @@ struct Config {
     int         max_pending = 32;
 };
 
+// EXACTLY ONE of `engine` and `worker` is set, and which one it is IS the mode:
+//   engine != nullptr  we own the CUDA context: the --worker child, or the whole service when
+//                      isolation is switched off.
+//   worker != nullptr  we are the CUDA-free parent and the context lives in a child process.
 struct State {
-    avatar::Engine* engine = nullptr;
+    avatar::Engine*  engine = nullptr;
+    avsup::Worker*   worker = nullptr;
+    bool worker_mode = false;          // we are the child (accept `_job_id` from our parent)
+    int  idle_unload_seconds = 0;      // parent-owned when `worker` is set
     Config cfg;
     Manager jm;
     std::atomic<bool> stopping{false};
+    std::atomic<bool> draining{false}; // parent-side admission gate (the child has the Engine's)
+    double started_s = 0;
 };
 
 State* g_state = nullptr;
@@ -404,8 +455,64 @@ int live_jobs(Manager& m) {
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// The backend, whichever process actually owns the card
+// ---------------------------------------------------------------------------
+
+// GET something small off the child. Short timeouts: these are status reads on a loopback socket,
+// and /health in particular is answered by the child without taking any lock, even mid-render.
+bool worker_get(State& st, const char* path, json& out) {
+    if (!st.worker) return false;
+    const int port = st.worker->port();
+    if (port <= 0) return false;
+    httplib::Client c("127.0.0.1", port);
+    c.set_connection_timeout(1, 0);
+    c.set_read_timeout(3, 0);
+    const auto r = c.Get(path);
+    if (!r || r->status != 200) return false;
+    try { out = json::parse(r->body); } catch (...) { return false; }
+    return true;
+}
+
 // Free VRAM on the pinned card, as the driver sees it right now. -1 = could not ask.
-long free_vram_mib(State& st) { return st.engine->gpu_status().mem_free_mb; }
+//
+// 🔴 The parent asks NVML, NEVER the engine: Engine::gpu_status() calls cudaMemGetInfo, and that
+// call alone creates the CUDA primary context (~122 MiB) in a process whose entire purpose is not
+// to have one.
+long free_vram_mib(State& st) {
+    if (st.engine) return st.engine->gpu_status().mem_free_mb;
+    return avsup::nvml_free_mib();
+}
+
+// /health's fields, from whichever process can answer them. In parent mode the card-facing
+// half (busy / queued / waiting_for_gpu_lock) comes from the child, because the child's Engine is
+// the thing that queues and the thing that takes the flock; the rest is ours.
+avatar::Health backend_health(State& st) {
+    if (st.engine) return st.engine->health();
+    avatar::Health h;
+    h.draining = st.draining.load();
+    // `loaded` now means "a CUDA-owning worker exists". That is the honest reading in this mode and
+    // it is what /v1/admin/unload acts on — the motion DiT's residency is no longer a thing the
+    // parent can see, or a thing anyone can act on separately.
+    h.loaded = st.worker && st.worker->alive();
+    json ch;
+    if (h.loaded && worker_get(st, "/health", ch)) {
+        h.busy                 = ch.value("busy", false);
+        h.queued               = ch.value("queued", 0);
+        h.in_flight            = ch.value("in_flight", 0);
+        h.waiting_for_gpu_lock = ch.value("waiting_for_gpu_lock", false);
+        h.loaded_model         = ch.value("loaded_model", std::string());
+        h.renders_done         = ch.value("renders_done", (long)0);
+        h.last_render_sec      = ch.value("last_render_sec", 0.0);
+        h.fatal                = ch.value("fatal", std::string());
+    }
+    h.uptime_sec = now_s() - st.started_s;
+    h.idle_sec = st.worker ? st.worker->idle_seconds() : 0.0;
+    h.idle_unload_seconds = st.idle_unload_seconds;
+    h.keep_resident = true;
+    h.status = h.fatal.empty() ? "ok" : "degraded";
+    return h;
+}
 
 }  // namespace
 
@@ -597,9 +704,33 @@ void finish(State& st, JobPtr j, bool ok, const std::string& err, const std::str
 // The VRAM floor, checked with the card in hand. `where` is only for the message.
 bool vram_ok(State& st, std::string& err) {
     if (st.cfg.min_free_mib <= 0) return true;
-    const long free_mib = free_vram_mib(st);
+    long free_mib = free_vram_mib(st);
     if (free_mib < 0) return true;   // driver would not answer; do not invent a refusal
     if (free_mib >= st.cfg.min_free_mib) return true;
+
+    // ---- the parent's second look --------------------------------------------------------------
+    // This is what worker isolation BUYS at admission time, and it is the answer to the failure
+    // that made this floor a brick: an idle child still shows every block ggml ever pooled as used,
+    // so the shortfall may be entirely ours. The parent can now settle that instead of guessing —
+    // kill the idle worker (a real CUDA teardown) and re-read the card. If the memory was ours we
+    // now fit, and the next request pays a ~seconds cold start instead of a 503 it did not deserve.
+    // Nothing is killed while a lease is held, so this can never touch a running render.
+    if (!st.engine && st.worker && st.worker->kill_if_idle()) {
+        const long after = free_vram_mib(st);
+        log_line("VRAM floor: %ld MiB free < %d — killed the idle worker; %ld MiB free now",
+                 free_mib, st.cfg.min_free_mib, after);
+        if (after >= st.cfg.min_free_mib) return true;
+        if (after >= 0) free_mib = after;
+    }
+    if (!st.engine) {
+        err = "only " + std::to_string(free_mib) + " MiB free on the pinned card, need >= " +
+              std::to_string(st.cfg.min_free_mib) +
+              ". This process holds no CUDA context and its GPU worker has already been killed and "
+              "re-measured, so the shortfall is a CO-TENANT, not us — kobbler-llama-server-1 takes "
+              "~9 GB of the 3060 without taking our lock. Free the card or lower "
+              "LONGCAT_RIG_MIN_FREE_MIB.";
+        return false;
+    }
     // Name OUR OWN retained pool, because after one job it is usually the whole reason we are here
     // and the old message blamed llama-server unconditionally. ggml's CUDA allocator keeps freed
     // blocks for reuse, so the driver reports ~1.4 GB used by this process while nothing is loaded;
@@ -1053,12 +1184,138 @@ void run_render(State& st, JobPtr j, const json& b, const std::string& image) {
     finish(st, j, true, "", "");
 }
 
+// ---------------------------------------------------------------------------
+// The stage, run in the CUDA child — the parent's version of run_rig/run_motion/...
+// ---------------------------------------------------------------------------
+// ONE synchronous `?wait=1` request per job. The child is the same binary with the same handlers,
+// so what happens on the far side of this call is exactly the in-process path above; the only
+// difference is which process the CUDA context belongs to.
+//
+// `_job_id` is why the parent can keep the job history: the child mints nothing, adopts our id, and
+// therefore writes into the SAME /out/jobs/<id>/ directory and publishes the same `result_url`s and
+// the same `stage_dir` / `rig_cache` handles. Kill the child afterwards and every one of those
+// still resolves, because they were only ever paths on a shared volume.
+void run_proxy(State& st, JobPtr j, const std::string& path, json body, bool needs_rig_vram) {
+    if (j->cancel->cancelled()) { finish(st, j, false, "cancelled", "cancelled"); return; }
+    // THE SECOND FLOOR CHECK, and the parent's replacement for the one run_rig used to make with
+    // the card in hand. A job can sit in the queue for a quarter of an hour, so the number that
+    // mattered at submit is not the number that matters now.
+    //
+    // Only when NOTHING OF OURS is on the card (`leases() == 0`), which is the same rule the old
+    // in-process check followed and for the same reason: if one of our renders is running then low
+    // free VRAM IS that render, and the request must queue behind it rather than be refused. When
+    // we are idle, vram_ok() may kill the worker and re-measure, so the refusal that survives that
+    // names a genuine co-tenant.
+    if (needs_rig_vram && st.worker->leases() == 0) {
+        std::string verr;
+        if (!vram_ok(st, verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
+    }
+    body["_job_id"] = j->id;
+    // Already resolved by the parent against the parent's job table; the child has no job table to
+    // resolve them against and would only reject them.
+    body.erase("geometry_from");
+    body.erase("rig_cache_from");
+
+    // The lease both spawns the worker and pins it: nothing can unload it under us.
+    avsup::Worker::Lease lease = st.worker->lease();
+    if (!lease.ok()) { finish(st, j, false, "GPU worker unavailable: " + lease.error(), "unavailable"); return; }
+    {
+        std::lock_guard<std::mutex> lk(st.jm.mx);
+        j->status = "running";
+        j->started_at = wall_now();
+    }
+
+    // A cancel has to REACH the child, and it may be tripped at any point — including in the window
+    // between our POST leaving and the child registering the job, which is why this retries until
+    // the child acknowledges rather than firing once. Cancellation stays a <= 7 s promise.
+    std::atomic<bool> settled{false};
+    const int port = lease.port();
+    const std::string jid = j->id;
+    std::thread canceller([&settled, j, port, jid] {
+        bool sent = false;
+        while (!settled.load()) {
+            if (!sent && j->cancel->cancelled()) {
+                httplib::Client c("127.0.0.1", port);
+                c.set_connection_timeout(2, 0);
+                c.set_read_timeout(5, 0);
+                const auto r = c.Post("/v1/jobs/" + jid + "/cancel", "{}", "application/json");
+                if (r && r->status == 200) sent = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_connection_timeout(10, 0);
+    // A four-tier ladder is ~15 minutes and a /v1/render measured 576.7 s. httplib's 5 s default
+    // would drop the socket mid-render and turn a healthy job into a failure.
+    cli.set_read_timeout(6 * 60 * 60, 0);
+    cli.set_write_timeout(10 * 60, 0);
+    const double t0 = now_s();
+    const auto resp = cli.Post(path + "?wait=1", body.dump(), "application/json");
+    const double took = now_s() - t0;
+    settled.store(true);
+    canceller.join();
+
+    if (!resp) {
+        j->seconds = took;
+        // A forced unload SIGKILLs the worker out from under a job it has already cancelled. That
+        // is a cancellation, not a failure, and calling it a failure would make `force` look broken.
+        if (j->cancel->cancelled()) { finish(st, j, false, "cancelled", "cancelled"); return; }
+        // Otherwise the worker died on us — an OOM kill, or a crash.
+        finish(st, j, false,
+               "the GPU worker did not answer (" + httplib::to_string(resp.error()) +
+                   ") — it may have died mid-job; see the container log",
+               "worker_failed");
+        return;
+    }
+    json rb = json::object();
+    try { rb = json::parse(resp->body); } catch (...) {}
+    if (resp->status == 200) {
+        const std::string mime = rb.value("result_mime", std::string("application/octet-stream"));
+        publish(st, j, rb.value("result", json()), rb.value("result_path", std::string()),
+                mime.c_str(), rb.value("seconds", took));
+        finish(st, j, true, "", "");
+        return;
+    }
+    j->seconds = rb.value("seconds", took);
+    const std::string code = rb.value("error_code",
+                                      std::string(resp->status == 499 ? "cancelled" : "worker_failed"));
+    finish(st, j, false,
+           rb.value("error", "the GPU worker returned " + std::to_string(resp->status)), code);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Submission
 // ---------------------------------------------------------------------------
 namespace {
+
+// The job id. In the CHILD it is our parent's, adopted verbatim so that both processes name one
+// job and one job directory (see run_proxy). Everywhere else it is minted here as before.
+//
+// The hex check is not cosmetic: this id is concatenated into `jobs_dir` by make_job_dir(), so it
+// has to be incapable of naming anything outside it.
+std::string mint_job_id(State& st, json& b) {
+    std::string adopted;
+    if (b.contains("_job_id") && b["_job_id"].is_string()) {
+        adopted = b["_job_id"].get<std::string>();
+        b.erase("_job_id");
+    }
+    std::lock_guard<std::mutex> lk(st.jm.mx);
+    if (st.worker_mode && !adopted.empty() && adopted.size() <= 32 &&
+        adopted.find_first_not_of("0123456789abcdef") == std::string::npos) {
+        st.jm.next_id++;      // keep our own counter moving, so a locally minted id cannot collide
+        return adopted;
+    }
+    return new_job_id(st.jm);
+}
+
+// Cancelling a job means cancelling it wherever it is running. The token is the whole story in
+// single-process mode; under isolation run_proxy's canceller thread watches the same token and
+// relays it to the child, so this stays one call for every caller.
+void cancel_job(JobPtr j) { j->cancel->cancel(); }
 
 // Everything a submit handler shares: admission, the job record, the thread, and `?wait=1`.
 // `work` is the stage body, already bound to its parsed request.
@@ -1093,7 +1350,7 @@ void submit(State& st, const httplib::Request& req, httplib::Response& res, cons
             // a shared 12 GB card spent on nothing. CancelToken lands in <= 7 s.
             if (req.is_connection_closed()) {
                 log_line("job %s: client disconnected — cancelling", j->id.c_str());
-                j->cancel->cancel();
+                cancel_job(j);
                 return;   // nothing to write; the socket is gone
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -1117,16 +1374,18 @@ void submit(State& st, const httplib::Request& req, httplib::Response& res, cons
 // — including motion ones that would have fitted — until idle-unload fired 300 s later. A guard
 // that bricks the service after one successful job is worse than the OOM it was guarding against.
 bool admit(State& st, httplib::Response& res, bool needs_rig_vram) {
-    const avatar::Health h = st.engine->health();
+    const avatar::Health h = backend_health(st);
     if (h.draining) {
         std::lock_guard<std::mutex> lk(st.jm.mx);
         st.jm.rejected++;
         set_json(res, {{"error", "service draining — not accepting new requests"}, {"error_code", "draining"}}, 503);
         return false;
     }
+    int live = 0;
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
-        if (live_jobs(st.jm) >= st.cfg.max_pending) {
+        live = live_jobs(st.jm);
+        if (live >= st.cfg.max_pending) {
             st.jm.rejected++;
             set_json(res, {{"error", "queue full"}, {"error_code", "queue_full"},
                            {"max_pending", st.cfg.max_pending}}, 503);
@@ -1138,7 +1397,14 @@ bool admit(State& st, httplib::Response& res, bool needs_rig_vram) {
     // back before the rig stage (run_rig calls release_gpu), so raw free VRAM here is not the
     // number that matters. In both cases the authoritative check is the one inside the job, made
     // with the card in hand and after the release.
-    if (needs_rig_vram && h.in_flight == 0 && !h.loaded) {
+    //
+    // Under worker isolation the `!h.loaded` half is DROPPED, and deliberately: `loaded` there
+    // means "a CUDA worker exists", and skipping the floor whenever one exists would skip it
+    // permanently. The check is safe to run in that mode because vram_ok() can kill an idle worker
+    // and re-measure, so a resident-weights reading can no longer produce a false refusal.
+    const bool idle_enough = st.engine ? (h.in_flight == 0 && !h.loaded)
+                                       : (h.in_flight == 0 && live == 0);
+    if (needs_rig_vram && idle_enough) {
         std::string verr;
         if (!vram_ok(st, verr)) {
             std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1220,12 +1486,8 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
     if (!admit(st, res, /*needs_rig_vram=*/true)) return;
 
-    std::string id, dir;
-    {
-        std::lock_guard<std::mutex> lk(st.jm.mx);
-        id = new_job_id(st.jm);
-    }
-    dir = make_job_dir(st, id);
+    const std::string id = mint_job_id(st, b);
+    const std::string dir = make_job_dir(st, id);
     std::string image;
     if (!resolve_image(req, b, dir, image, err)) { set_json(res, {{"error", err}}, 400); return; }
     b["image"] = image;
@@ -1235,7 +1497,10 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
     echo["tiers"] = json::array();
     for (const auto& t : probe) echo["tiers"].push_back(json{{"name", t.name}, {"decimate", t.decimate}});
     submit(st, req, res, "rig", echo,
-           [&st, b, image](JobPtr j) { run_rig(st, j, b, image); }, dir, id);
+           [&st, b, image](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/rig", b, /*needs_rig_vram=*/true);
+               else           run_rig(st, j, b, image);
+           }, dir, id);
 }
 
 void handle_motion(State& st, const httplib::Request& req, httplib::Response& res) {
@@ -1246,14 +1511,13 @@ void handle_motion(State& st, const httplib::Request& req, httplib::Response& re
     // needs_rig_vram=false: the motion stage is nowhere near the rig's 10.7 GB, and holding it to
     // that floor refuses work that fits (see admit()).
     if (!admit(st, res, /*needs_rig_vram=*/false)) return;
-    std::string id, dir;
-    {
-        std::lock_guard<std::mutex> lk(st.jm.mx);
-        id = new_job_id(st.jm);
-    }
-    dir = make_job_dir(st, id);
+    const std::string id = mint_job_id(st, b);
+    const std::string dir = make_job_dir(st, id);
     submit(st, req, res, "motion", b,
-           [&st, b](JobPtr j) { run_motion(st, j, b); }, dir, id);
+           [&st, b](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/motion", b, /*needs_rig_vram=*/false);
+               else           run_motion(st, j, b);
+           }, dir, id);
 }
 
 void handle_animate(State& st, const httplib::Request& req, httplib::Response& res) {
@@ -1303,16 +1567,25 @@ void handle_animate(State& st, const httplib::Request& req, httplib::Response& r
     }
     // needs_card=false: the retarget never touches the GPU, so it must not be refused for VRAM.
     if (!admit(st, res, /*needs_rig_vram=*/false)) return;
-    std::string id, dir;
-    {
-        std::lock_guard<std::mutex> lk(st.jm.mx);
-        id = new_job_id(st.jm);
-    }
-    dir = make_job_dir(st, id);
+    const std::string id = mint_job_id(st, b);
+    const std::string dir = make_job_dir(st, id);
     json echo = b;
     echo["rig"] = rig_glb;
+    // 🔴 The retarget is CPU-only, and it STILL goes to the child under isolation, because it is a
+    // method on avatar::Engine and constructing one is precisely what the parent must never do. The
+    // cost is a worker cold start (~seconds, no weights) when a bare /v1/animate arrives with no
+    // child up; the alternative — a CUDA context in the parent forever — is the bug being fixed.
+    json cb = b;
+    cb["rig"] = rig_glb;
+    cb.erase("tier");                      // already applied when we resolved the tier's GLB
+    cb["clips"] = json::array();
+    for (const auto& p : paths) cb["clips"].push_back(p);
+    for (const auto& t : texts) cb["clips"].push_back(t);
     submit(st, req, res, "animate", echo,
-           [&st, b, rig_glb, texts, paths](JobPtr j) { run_animate(st, j, b, rig_glb, texts, paths); },
+           [&st, b, cb, rig_glb, texts, paths](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/animate", cb, /*needs_rig_vram=*/false);
+               else           run_animate(st, j, b, rig_glb, texts, paths);
+           },
            dir, id);
 }
 
@@ -1328,18 +1601,17 @@ void handle_render(State& st, const httplib::Request& req, httplib::Response& re
     std::vector<Tier> probe;
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
     if (!admit(st, res, /*needs_rig_vram=*/true)) return;
-    std::string id, dir;
-    {
-        std::lock_guard<std::mutex> lk(st.jm.mx);
-        id = new_job_id(st.jm);
-    }
-    dir = make_job_dir(st, id);
+    const std::string id = mint_job_id(st, b);
+    const std::string dir = make_job_dir(st, id);
     std::string image;
     if (!resolve_image(req, b, dir, image, err)) { set_json(res, {{"error", err}}, 400); return; }
     b["image"] = image;
     json echo = b;
     submit(st, req, res, "render", echo,
-           [&st, b, image](JobPtr j) { run_render(st, j, b, image); }, dir, id);
+           [&st, b, image](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/render", b, /*needs_rig_vram=*/true);
+               else           run_render(st, j, b, image);
+           }, dir, id);
 }
 
 void register_routes(httplib::Server& svr, State& st) {
@@ -1353,7 +1625,7 @@ void register_routes(httplib::Server& svr, State& st) {
     // `waiting_for_gpu_lock` = we hold our own slot but ANOTHER PROCESS on this box owns the card;
     // without it an operator cannot tell "our render is slow" from "we have not started".
     svr.Get("/health", [&st](const httplib::Request&, httplib::Response& res) {
-        const avatar::Health h = st.engine->health();
+        const avatar::Health h = backend_health(st);
         int jobs_queued = 0, jobs_running = 0;
         {
             std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1383,18 +1655,48 @@ void register_routes(httplib::Server& svr, State& st) {
             {"min_free_mib", st.cfg.min_free_mib},
             {"rig_retries_default", st.cfg.rig_retries},
             {"fatal", h.fatal},
+            // Which of the two processes is answering, so an operator reading a log or a probe can
+            // tell a CUDA-free parent from the worker it supervises without guessing.
+            {"worker_isolation", st.worker != nullptr},
+            {"worker_pid", st.worker ? st.worker->pid() : 0},
+            {"worker_spawns", st.worker ? st.worker->spawns() : 0},
+            {"role", st.worker ? "parent" : (st.worker_mode ? "worker" : "single-process")},
         });
     });
 
     svr.Get("/v1/gpu/status", [&st](const httplib::Request&, httplib::Response& res) {
-        const avatar::GpuStatus g = st.engine->gpu_status();
-        json b = {
-            {"loaded", g.loaded},
-            {"gpu", g.gpu.empty() ? json(nullptr) : json(g.gpu)},
-            {"mem_free_mb", g.mem_free_mb},
-            {"peak_vram_used_mib", (long)st.engine->peak_vram_used_mib()},
-            {"baseline_vram_used_mib", (long)st.engine->baseline_vram_used_mib()},
-        };
+        // In parent mode `loaded` means a CUDA-owning worker exists, and the free-VRAM number comes
+        // from NVML — never from cudaMemGetInfo, which would create the very context this process
+        // exists in order not to have. Peak/baseline are the WORKER's, and they reset with it: a
+        // fresh child starts a fresh watermark, which is the honest thing to report given the pool
+        // it is measuring no longer survives an unload.
+        json b;
+        if (st.engine) {
+            const avatar::GpuStatus g = st.engine->gpu_status();
+            b = {
+                {"loaded", g.loaded},
+                {"gpu", g.gpu.empty() ? json(nullptr) : json(g.gpu)},
+                {"mem_free_mb", g.mem_free_mb},
+                {"peak_vram_used_mib", (long)st.engine->peak_vram_used_mib()},
+                {"baseline_vram_used_mib", (long)st.engine->baseline_vram_used_mib()},
+                {"vram_source", "cudaMemGetInfo"},
+            };
+        } else {
+            json cg;
+            const bool got = worker_get(st, "/v1/gpu/status", cg);
+            b = {
+                {"loaded", st.worker && st.worker->alive()},
+                {"gpu", got && cg.contains("gpu") ? cg["gpu"] : json(nullptr)},
+                {"mem_free_mb", avsup::nvml_free_mib()},
+                {"mem_total_mb", avsup::nvml_total_mib()},
+                {"peak_vram_used_mib", got ? cg.value("peak_vram_used_mib", (long)0) : (long)0},
+                {"baseline_vram_used_mib", got ? cg.value("baseline_vram_used_mib", (long)0) : (long)0},
+                {"vram_source", "nvml"},
+                {"nvml", avsup::nvml_note()},
+                {"worker_pid", st.worker ? st.worker->pid() : 0},
+                {"worker_spawns", st.worker ? st.worker->spawns() : 0},
+            };
+        }
         if (const char* v = std::getenv("CUDA_VISIBLE_DEVICES"); v && *v) b["cuda_visible_devices"] = v;
         set_json(res, b);
     });
@@ -1476,51 +1778,94 @@ void register_routes(httplib::Server& svr, State& st) {
             if (it != st.jm.jobs.end()) j = it->second;
         }
         if (!j) { set_json(res, {{"error", "job_not_found"}}, 404); return; }
-        j->cancel->cancel();   // returns immediately; the render stops at its next cancellation point
+        cancel_job(j);   // returns immediately; the render stops at its next cancellation point
         set_json(res, {{"id", j->id}, {"status", j->status}, {"cancel_requested", true}});
     });
 
     // ---- admin, the fleet's names ----------------------------------------------------------------
     svr.Post("/v1/admin/drain", [&st](const httplib::Request&, httplib::Response& res) {
-        st.engine->drain();
-        const avatar::Health h = st.engine->health();
+        // The parent's own admission gate. It is NOT forwarded to the child: draining the child's
+        // Engine would refuse the very proxied requests that are already in flight, and "in-flight
+        // work finishes" is the whole meaning of a drain.
+        if (st.engine) st.engine->drain();
+        else           st.draining.store(true);
+        const avatar::Health h = backend_health(st);
         set_json(res, {{"status", "draining"}, {"busy", h.busy}, {"in_flight", h.in_flight}, {"queued", h.queued}});
     });
 
     svr.Post("/v1/admin/load", [&st](const httplib::Request&, httplib::Response& res) {
         // Undrain only. Weights reload lazily on the next request, exactly as the fleet's
         // /v1/admin/load does — an eager load here would grab the card while it is still contested.
-        st.engine->undrain();
-        set_json(res, {{"status", "ok"}, {"loaded", st.engine->health().loaded}});
+        // Under isolation it also does NOT spawn a worker, for the same reason: the CUDA context is
+        // the expensive thing now, and it is created by the first request that needs it.
+        if (st.engine) st.engine->undrain();
+        else           st.draining.store(false);
+        set_json(res, {{"status", "ok"}, {"loaded", backend_health(st).loaded}});
     });
 
+    // 🔴 WHAT `unloaded` MEANS NOW. Under worker isolation it is the fleet's WorkerSupervisor
+    // contract: TRUE means this process can PROVE no CUDA-owning worker of ours remains — the
+    // context, every ggml pool and the GPU flock are gone with it — and is therefore the only
+    // answer on which a caller may admit competing GPU work. FALSE means the kill or the wait
+    // failed and the card may still be held. It is true when there was nothing to kill, because the
+    // claim is about the end state, not about whether work was done; `worker_killed` says which.
+    //
+    // This is a deliberate change from the old `{"status":"idle","unloaded":false}`, which was
+    // literally true (the motion DiT was not resident) and operationally useless: nothing was
+    // freed either way, because release_gpu() cannot reach a pooled allocator.
     svr.Post("/v1/admin/unload", [&st](const httplib::Request& req, httplib::Response& res) {
         bool force = false;
         if (!req.body.empty()) {
             try { force = json::parse(req.body).value("force", false); } catch (...) {}
         }
-        const avatar::Health before = st.engine->health();
-        if (before.in_flight > 0 && !force) {
+        const avatar::Health before = backend_health(st);
+        int live = 0;
+        {
+            std::lock_guard<std::mutex> lk(st.jm.mx);
+            live = live_jobs(st.jm);
+        }
+        const int busy = st.engine ? before.in_flight : std::max(before.in_flight, live);
+        if (busy > 0 && !force) {
             set_json(res, {{"status", "busy (pass force=true to cancel + unload)"},
-                           {"in_flight", before.in_flight}, {"queued", before.queued}}, 409);
+                           {"in_flight", busy}, {"queued", before.queued}}, 409);
             return;
         }
         if (force) {
             std::lock_guard<std::mutex> lk(st.jm.mx);
             for (auto& [_, j] : st.jm.jobs)
-                if (!j->done.load()) j->cancel->cancel();
+                if (!j->done.load()) cancel_job(j);
         }
-        // release_gpu() touches the CUDA context, so it must not race a render: take the card
-        // non-blockingly and say so if we could not.
-        auto s = st.engine->try_session();
-        if (!s.ok()) {
-            set_json(res, {{"status", "busy"}, {"error", s.error()}}, 409);
+        if (st.engine) {
+            // release_gpu() touches the CUDA context, so it must not race a render: take the card
+            // non-blockingly and say so if we could not.
+            auto s = st.engine->try_session();
+            if (!s.ok()) {
+                set_json(res, {{"status", "busy"}, {"error", s.error()}}, 409);
+                return;
+            }
+            const bool was_loaded = before.loaded;
+            st.engine->release_gpu();
+            st.engine->undrain();
+            set_json(res, {{"status", was_loaded ? "unloaded" : "idle"}, {"unloaded", was_loaded},
+                           {"worker_killed", false},
+                           {"note", "single-process mode: ggml's CUDA pools are NOT returned to the "
+                                    "driver by this call. Only a process exit does that."}});
             return;
         }
-        const bool was_loaded = before.loaded;
-        st.engine->release_gpu();
-        st.engine->undrain();
-        set_json(res, {{"status", was_loaded ? "unloaded" : "idle"}, {"unloaded", was_loaded}});
+        // A forced unload has to outrun the cancels it just issued: a cancel lands in <= 7 s, and
+        // waiting that long turns "force" into a promise the SIGKILL would keep anyway.
+        if (force) {
+            for (int i = 0; i < 35 && st.worker->leases() > 0; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        const int pid = st.worker->pid();
+        const bool ok = st.worker->kill_worker();
+        st.draining.store(false);
+        set_json(res, {{"status", ok ? (pid > 0 ? "unloaded" : "idle") : "failed"},
+                       {"unloaded", ok},
+                       {"worker_killed", ok && pid > 0},
+                       {"worker_pid", pid}},
+                 ok ? 200 : 500);
     });
 
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
@@ -1541,7 +1886,12 @@ void register_routes(httplib::Server& svr, State& st) {
             "  GET  /v1/jobs/{id}                   GET /v1/jobs/{id}/result[?tier=game]\n"
             "  POST /v1/jobs/{id}/cancel\n"
             "  GET  /health   /v1/gpu/status   /v1/metrics\n"
-            "  POST /v1/admin/drain | /v1/admin/load | /v1/admin/unload\n",
+            "  POST /v1/admin/drain | /v1/admin/load | /v1/admin/unload\n"
+            "\n"
+            "  The GPU runs in a SUPERVISED CHILD PROCESS; this one holds no CUDA context and no\n"
+            "  VRAM. /v1/admin/unload SIGKILLs that child, which is what actually returns the card\n"
+            "  (ggml pools every block it frees, so an in-process release never could). Jobs and\n"
+            "  their artifacts survive it: they live here and on /out, not in the child.\n",
             "text/plain");
     });
 }
@@ -1555,10 +1905,16 @@ void usage() {
         "  --min-free-mib N      refuse a GPU stage below this much free VRAM (0 = never)\n"
         "  --rig-retries N       default best-of-N conditioning draws per rig (default 2)\n"
         "  --max-pending N       admitted-but-unfinished job cap (default 32)\n"
-        "  --idle-unload S       drop resident weights after S idle seconds (0 = never)\n"
-        "  --lock [PATH]         cross-process GPU flock (default off)\n"
+        "  --idle-unload S       kill the idle GPU worker after S idle seconds (0 = never)\n"
+        "  --lock [PATH]         cross-process GPU flock (default off; held by the WORKER)\n"
         "  --geo-model DIR --hymotion PATH --llm PATH --clip-l PATH   weight overrides\n"
-        "  --cpu                 no CUDA (diagnostics only)\n");
+        "  --cpu                 no CUDA (diagnostics only)\n"
+        "  --worker              INTERNAL: run as the CUDA-owning child of a supervisor parent.\n"
+        "                        Spawned automatically; never pass this by hand.\n"
+        "  --no-worker-isolation own the CUDA context in THIS process (the pre-isolation shape).\n"
+        "                        ggml pools freed VRAM, so /v1/admin/unload frees NOTHING in this\n"
+        "                        mode and only a restart returns the card. To bisect against, not\n"
+        "                        to run. Env: LONGCAT_RIG_WORKER_ISOLATION=0.\n");
 }
 
 void on_signal(int) {
@@ -1593,6 +1949,14 @@ int main(int argc, char** argv) {
     cfg.rig_retries = getenv_int("LONGCAT_RIG_RETRIES", 2);
     cfg.max_pending = getenv_int("LONGCAT_RIG_MAX_PENDING", 32);
 
+    // Our own argv, verbatim, kept before the parser touches it: it is what the child is launched
+    // with, plus the overrides avatar_worker.hpp appends. Every weight path, --lock, --min-free-mib
+    // and --jobs-dir therefore reaches the worker unchanged, and so does the whole environment
+    // (fork inherits it, CUDA_VISIBLE_DEVICES and every LONGCAT_RIG_* with it).
+    const std::vector<std::string> original_args(argv + 1, argv + argc);
+    bool worker_mode = std::getenv("AVATAR_SERVER_WORKER_CHILD") != nullptr;
+    bool isolation = getenv_int("LONGCAT_RIG_WORKER_ISOLATION", 1) != 0;
+
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1615,6 +1979,8 @@ int main(int argc, char** argv) {
         else if (a == "--llm") ecfg.llm_gguf = next();
         else if (a == "--clip-l") ecfg.clip_l_gguf = next();
         else if (a == "--cpu") ecfg.use_cuda = false;
+        else if (a == "--worker") worker_mode = true;
+        else if (a == "--no-worker-isolation") isolation = false;
         else if (a == "--serve") { /* accepted and ignored: the entrypoint's own flag */ }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); usage(); return 2; }
@@ -1622,14 +1988,45 @@ int main(int argc, char** argv) {
 
     mkdirs(cfg.jobs_dir);
 
-    // ONE Engine for the process. Constructing it is cheap: weights become resident on first use
-    // (the fleet's LAZY_LOAD shape), and the idle watchdog gives them back after
-    // idle_unload_seconds with in_flight == 0.
-    avatar::Engine engine(ecfg);
+    // The child is a supervised process, never a service in its own right: it must not be reachable
+    // from outside the container even by accident, and it must not inherit the public port.
+    if (worker_mode) {
+        g_log_tag = "avatar-worker";
+        if (cfg.host != "127.0.0.1") cfg.host = "127.0.0.1";
+    }
+    const bool supervise = isolation && !worker_mode;
+
     State st;
-    st.engine = &engine;
     st.cfg = cfg;
+    st.worker_mode = worker_mode;
+    st.idle_unload_seconds = ecfg.idle_unload_seconds;
+    st.started_s = now_s();
     g_state = &st;
+
+    // ONE Engine, in whichever process owns the card. Constructing it is cheap in wall time but it
+    // is NOT free on the GPU: it creates the CUDA primary context (~122 MiB, measured). That is the
+    // single reason the supervising parent below never constructs one.
+    std::unique_ptr<avatar::Engine> engine;
+    std::unique_ptr<avsup::Worker> worker;
+    if (!supervise) {
+        engine = std::make_unique<avatar::Engine>(ecfg);
+        st.engine = engine.get();
+    } else {
+        // /proc/self/exe, not argv[0]: it is the path the kernel actually loaded, so it survives a
+        // PATH lookup, a relative invocation and a rename.
+        char exe[4096];
+        const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        std::string exe_path = (n > 0) ? std::string(exe, (size_t)n) : std::string(argv[0]);
+        worker = std::make_unique<avsup::Worker>(exe_path, original_args,
+                                                 [](const char* m) { log_line("%s", m); });
+        st.worker = worker.get();
+        log_line("worker isolation ON — this process owns NO CUDA context; NVML device %s",
+                 avsup::nvml_note().c_str());
+        if (avsup::nvml_free_mib() < 0 && cfg.min_free_mib > 0)
+            log_line("WARN: NVML cannot be read, so the %d MiB VRAM floor cannot be enforced at "
+                     "submit time. The worker still enforces it with the card in hand.",
+                     cfg.min_free_mib);
+    }
 
     httplib::Server svr;
     g_svr = &svr;
@@ -1660,22 +2057,58 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGINT, on_signal);
 
-    log_line("listening on http://%s:%d  (jobs %s, idle-unload %ds, rig-retries %d, min-free %d MiB%s)",
+    // ---- idle unload, which now means "kill the CUDA worker" ---------------------------------
+    // 🔴 THE PARENT OWNS THIS. The Engine's own watchdog only ever dropped the motion DiT, and the
+    // child is launched with --idle-unload 0 so the two cannot both act. Killing the process is
+    // what actually returns the card, so this is the only idle-unload that has ever been true to
+    // its name. It takes the worker's lock and refuses to kill anything with a lease outstanding,
+    // so it can never evict a running render.
+    std::thread idle_watchdog;
+    if (supervise) {
+        idle_watchdog = std::thread([&st, &worker, idle = ecfg.idle_unload_seconds] {
+            while (!st.stopping.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (st.stopping.load()) break;
+                worker->poll();          // reap a child that died on its own, so it is not a zombie
+                if (idle <= 0) continue; // 0 = never unload; the reap above still has to happen
+                if (!worker->alive() || worker->leases() > 0) continue;
+                if (worker->idle_seconds() < (double)idle) continue;
+                {
+                    std::lock_guard<std::mutex> lk(st.jm.mx);
+                    if (live_jobs(st.jm) > 0) continue;
+                }
+                log_line("idle %ds — killing the GPU worker (this is what returns the VRAM)", idle);
+                (void)worker->kill_worker();
+            }
+        });
+    }
+
+    log_line("listening on http://%s:%d  (jobs %s, idle-unload %ds, rig-retries %d, min-free %d MiB%s, %s)",
              cfg.host.c_str(), cfg.port, cfg.jobs_dir.c_str(), ecfg.idle_unload_seconds,
              cfg.rig_retries, cfg.min_free_mib,
-             ecfg.gpu_lock_path.empty() ? ", no flock" : ", flock held per request");
-    if (!svr.listen(cfg.host, cfg.port)) {
+             ecfg.gpu_lock_path.empty() ? ", no flock" : ", flock held per request",
+             supervise ? "worker isolation" : (worker_mode ? "CUDA worker" : "single process"));
+    const bool bound = svr.listen(cfg.host, cfg.port);
+    st.stopping.store(true);
+    if (idle_watchdog.joinable()) idle_watchdog.join();
+    if (!bound) {
         log_line("FATAL: could not bind %s:%d", cfg.host.c_str(), cfg.port);
+        if (worker) (void)worker->kill_worker();
         return 1;
     }
     // A SIGTERM during a 450 s render: refuse new work, then let the in-flight one give the card
     // back. Docker's 10 s grace is shorter than that, so cancel rather than pretend.
-    engine.drain();
+    if (engine) engine->drain();
+    else        st.draining.store(true);
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
         for (auto& [_, j] : st.jm.jobs)
-            if (!j->done.load()) j->cancel->cancel();
+            if (!j->done.load()) cancel_job(j);
     }
+    // And then take the card back for real. PR_SET_PDEATHSIG covers a parent that is killed
+    // outright; this covers the orderly exit, and does it before the process teardown that would
+    // otherwise leave a worker briefly re-parented to init still holding 10 GB.
+    if (worker) (void)worker->kill_worker();
     log_line("stopped");
     return 0;
 }
