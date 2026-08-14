@@ -14,6 +14,7 @@
 // run_pipeline.sh's RP_CANON_TO_DENSE=1). VALIDATED PARITY (ultrashape_e2e.cpp, 2026-06-18/07-16):
 // final_latents cos 0.9999, grid cos 0.99995, Chamfer 0.03% bbox-diag; lossless decode-hoist fix banked.
 #pragma once
+#include "cancel_hook.hpp"   // cooperative cancellation in the refine sampler + dense decode
 #include "ultrashape_dit.hpp"
 #include "ultrashape_vae.hpp"
 #include "ultrashape_mc.hpp"
@@ -209,6 +210,12 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
         const bool prof = std::getenv("PIXAL3D_NSYS_REFINE") != nullptr;  // nsys/ncu --capture-range=cudaProfilerApi
         if (prof) cudaProfilerStart();
         for (int i = 0; i < steps; i++) {
+            // CANCELLATION POINT — the refine DiT's flow-matching loop. This is a SECOND diffusion
+            // sampler (geometry_e2e::flow_sampler is the other) and refine is ON by default on the
+            // non-dc-remesh path, ~172 s of it, so leaving it unhooked would leave the default
+            // non-parity pipeline nearly uninterruptible. M1Harness owns the weights here too, so
+            // the throw frees them.
+            cancelhook::check();
             float tnorm = sigmas[i];   // t/num_train == sigmas[i] (shift=1)
             std::vector<float> ts = us_timesteps_embed(tnorm, hidden);
             // cond pass — re-upload ALL inputs before each compute (gallocr input-clobber, PERF note).
@@ -341,6 +348,7 @@ static inline svae::Mesh refine(const std::vector<float>& coarse_verts,
     std::vector<float> got((size_t)CHUNK);              // ~198k heap allocs over a prod run
     auto decode_indices = [&](const std::vector<int64_t>& idx) {
         for (size_t s = 0; s < idx.size(); s += (size_t)CHUNK) {
+            cancelhook::check();   // the dense decode is ~198k chunks; the chunk is the quantum
             const size_t n = std::min((size_t)CHUNK, idx.size() - s);
             double a = now_s();
             std::fill(qchunk.begin(), qchunk.end(), 0.0f);

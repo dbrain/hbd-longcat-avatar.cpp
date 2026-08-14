@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <set>
 #include <array>
+#include "cancel_hook.hpp"   // cooperative cancellation inside the Euler loop
 
 namespace geo {
 
@@ -129,11 +130,23 @@ static inline std::vector<float> flow_sampler(int NEL, const std::vector<float>&
     for (int i=0;i<=STEPS;i++){ double lt=1.0-(double)i/STEPS; tseq[i]=RT*lt/(1+(RT-1)*lt); }
     const bool cfg_off = (GS == 1.0f);  // tex: GS1.0/GR0 -> CFG branch == cond-only; skip neg forward
     for (int s=0;s<STEPS;s++){
+        // CANCELLATION POINT. Every geometry DiT (SS / M2 / M3b / tex) runs through this one loop,
+        // so this single line makes all four interruptible. It throws; the throw unwinds through the
+        // M1Harness that owns this stage's weights, whose destructor frees the CUDA buffers. Cost is
+        // one relaxed atomic load per Euler step. Worst-case latency to stop = ONE step (which at
+        // 1024 on the 3060 is the biggest quantum in the pipeline — see the API-shape notes).
+        cancelhook::check();
         double t=tseq[s], tp=tseq[s+1];
         bool in_iv = (t>=IV0 && t<=IV1) && !cfg_off;
         std::vector<float> v;
         if (in_iv){
-            std::vector<float> vp=forward(x,(float)(1000.0*t),true), vn=forward(x,(float)(1000.0*t),false);
+            // A CFG step is TWO DiT forwards. Checking between them halves the worst-case cancel
+            // latency of the whole pipeline: m3b's step was MEASURED at 6.84 s, and it is the
+            // largest quantum anywhere in the chain. Splitting the declaration is behaviour-
+            // preserving — the two initialisers were already sequenced left-to-right.
+            std::vector<float> vp=forward(x,(float)(1000.0*t),true);
+            cancelhook::check();
+            std::vector<float> vn=forward(x,(float)(1000.0*t),false);
             std::vector<float> pred(NEL); for(int i=0;i<NEL;i++) pred[i]=GS*vp[i]+(1-GS)*vn[i];
             std::vector<float> x0p=pred_to_x0(x,(float)t,vp), x0c=pred_to_x0(x,(float)t,pred);
             double r = vstd(x0p)/vstd(x0c);

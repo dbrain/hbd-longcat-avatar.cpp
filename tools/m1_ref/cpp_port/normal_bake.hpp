@@ -8,6 +8,7 @@
 // point on the dense shell and interpolate the dense NORMAL Nd there. Encode Nd in the texel's tangent
 // basis (T,B,N) → RGB. Uncovered/gutter texels get flat (128,128,255) then a small dilation.
 #pragma once
+#include "cancel_hook.hpp"
 #include "tex_reproject.hpp"     // texrp::DenseHash
 #include "tex_atlas.hpp"         // texatlas::vert_normals
 #include <vector>
@@ -37,6 +38,15 @@ inline std::vector<uint8_t> bake_normal_map(
     const uint32_t F = (uint32_t)faces.size()/3;
 
     for (uint32_t f=0; f<F; f++) {
+        // CANCELLATION POINT. This loop is the longest UNINTERRUPTIBLE span on the resume
+        // (--from-refined) path — 115.7 s of the 155 s run, against a 22.9 s rig stage — so a
+        // cancel that skipped it would be a cancel that mostly does not work on that path. Every
+        // Every 256 triangles: MEASURED at 4096 this quantum was 2.03 s (220k faces over 115.7 s),
+        // which was the second-worst point in the pipeline; 256 puts it near 0.13 s. The check is one
+        // relaxed atomic load, so ~860 of them across the whole bake is unmeasurable. Nothing here is
+        // raw-allocated and the loop is serial — no OpenMP region to throw out of, which would call
+        // std::terminate.
+        if ((f & 255u) == 0) cancelhook::check();
         uint32_t ia=faces[f*3], ib=faces[f*3+1], ic=faces[f*3+2];
         const float *Pa=&verts[ia*3], *Pb=&verts[ib*3], *Pc=&verts[ic*3];
         const float *Na=&normals[ia*3], *Nb=&normals[ib*3], *Nc=&normals[ic*3];

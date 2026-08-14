@@ -615,6 +615,12 @@ inline std::vector<int> rig_beam_generate_batched(M1Harness& H, const Qwen3Cfg& 
         };
 
         for (int step = 1; step < max_new_tokens; ++step) {
+            // CANCELLATION POINT — the rig's skeleton decode, the pipeline's other long loop.
+            // It goes BETWEEN token steps and not inside run_batched(): that lambda builds a RAW
+            // ggml_context + gallocr and frees them by hand at the end, so a throw from inside it
+            // would leak them. Here, everything live (the KV caches, the beam pool) is owned by a
+            // destructor. One relaxed atomic load per token; the token is the quantum.
+            cancelhook::check();
             const int gen_len = step + 1;
             int active = (int)beams.size();
             if (active == 0) break;
