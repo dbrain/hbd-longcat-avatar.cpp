@@ -151,6 +151,76 @@ bool write_file(const std::string& p, const std::string& bytes) {
     return (bool)f;
 }
 
+// ---------------------------------------------------------------------------
+// Submit-time validation
+// ---------------------------------------------------------------------------
+// THE RULE: anything the caller can fix by changing the request is a 400 WITH THE REASON, decided
+// before a job exists. Not a job that starts, occupies the card, and fails.
+//
+// This is not tidiness. The product is a step-wise pipeline a person drives — upload, look, re-run
+// a stage — so the person IS the caller, and "rc 1" arriving after a delay with the real reason in
+// a container log they cannot read is a dead end for them. Measured the hard way: a mislabelled
+// file (`miku.png`, actually WebP) reached the geometry stage and died there with `unknown image
+// type` visible only in `docker logs`.
+//
+// Everything here is cheap and GPU-free: magic bytes, not a decode; a stat, not a read.
+
+// What the image actually IS, by magic bytes. stb_image — which is what the pipeline loads with —
+// reads PNG/JPEG/BMP/PSD/TGA/GIF/HDR/PIC/PNM and nothing else, so the useful answer names both the
+// format found and whether it can be used.
+struct ImageKind {
+    std::string name;       // "PNG", "WebP", ...; "" = unrecognised
+    bool supported = false;
+};
+ImageKind detect_image(const std::string& d) {
+    auto has = [&](size_t off, const char* sig, size_t n) {
+        return d.size() >= off + n && std::memcmp(d.data() + off, sig, n) == 0;
+    };
+    if (has(0, "\x89PNG\r\n\x1a\n", 8))                      return {"PNG", true};
+    if (has(0, "\xff\xd8\xff", 3))                           return {"JPEG", true};
+    if (has(0, "BM", 2))                                     return {"BMP", true};
+    if (has(0, "GIF87a", 6) || has(0, "GIF89a", 6))          return {"GIF", true};
+    if (has(0, "8BPS", 4))                                   return {"PSD", true};
+    if (has(0, "#?RADIANCE", 10) || has(0, "#?RGBE", 6))     return {"Radiance HDR", true};
+    if (d.size() >= 3 && d[0] == 'P' && d[1] >= '1' && d[1] <= '6') return {"PNM", true};
+    // The ones that will NOT load, named explicitly — a caller who sent one needs to know which.
+    if (has(0, "RIFF", 4) && has(8, "WEBP", 4))              return {"WebP", false};
+    if (has(4, "ftypavif", 8) || has(4, "ftypavis", 8))      return {"AVIF", false};
+    if (has(4, "ftypheic", 8) || has(4, "ftypheix", 8) ||
+        has(4, "ftypmif1", 8))                               return {"HEIC", false};
+    if (has(0, "II*\0", 4) || has(0, "MM\0*", 4))            return {"TIFF", false};
+    if (has(0, "<?xml", 5) || has(0, "<svg", 4))             return {"SVG", false};
+    if (has(0, "%PDF", 4))                                   return {"PDF", false};
+    if (has(0, "\x1a\x45\xdf\xa3", 4))                       return {"Matroska/WebM video", false};
+    return {"", false};
+}
+
+// The first bytes of a file, for the magic check. Also answers "is it readable at all".
+bool read_header(const std::string& path, std::string& out, size_t n = 32) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    out.resize(n);
+    f.read(&out[0], (std::streamsize)n);
+    out.resize((size_t)f.gcount());
+    return true;
+}
+
+// Reject what stb_image cannot read, naming what it actually is.
+bool image_bytes_ok(const std::string& head, const std::string& what, std::string& err) {
+    if (head.empty()) { err = what + " is empty"; return false; }
+    const ImageKind k = detect_image(head);
+    if (k.supported) return true;
+    if (!k.name.empty()) {
+        err = what + " is a " + k.name + " file, which this pipeline cannot read. Send PNG, JPEG, "
+              "BMP, GIF, PSD, TGA, HDR or PNM. (A file NAMED .png is not necessarily a PNG — "
+              "convert it, do not rename it.)";
+        return false;
+    }
+    err = what + " is not a recognised image (first bytes match no supported format). Send PNG, "
+          "JPEG, BMP, GIF, PSD, TGA, HDR or PNM.";
+    return false;
+}
+
 // Is this media field a trusted absolute PATH rather than a base64 payload?
 //
 // Lifted verbatim in spirit from the fleet's `ltx_source_is_path` (examples/server/async_jobs.h),
@@ -379,25 +449,44 @@ bool resolve_image(const httplib::Request& req, const json& body, const std::str
                    std::string& out_path, std::string& err) {
     if (req.form.has_file("image")) {
         const auto f = req.form.get_file("image");
+        if (!image_bytes_ok(f.content, "the uploaded image", err)) return false;
         out_path = job_dir + "/input";
         if (!write_file(out_path, f.content)) { err = "cannot write " + out_path; return false; }
         return true;
     }
     if (body.contains("image") && body["image"].is_string()) {
         const std::string s = body["image"].get<std::string>();
-        if (s.empty()) { err = "image is empty"; return false; }
-        if (source_is_path(s)) { out_path = s; return true; }
-        std::string bytes;
-        if (!base64_decode(s, bytes)) {
-            err = "image is neither a readable absolute path nor decodable base64";
+        if (s.empty()) { err = "`image` is an empty string"; return false; }
+        // A string that MEANS a path gets a path's error message. Falling through to "could not
+        // decode base64" for a typo'd filename sends the caller looking in the wrong place —
+        // base64 never starts with '/', so this is a safe thing to be definite about.
+        const bool looks_like_path = s[0] == '/' && s.size() < 4096 && s.find('\n') == std::string::npos;
+        if (looks_like_path && !is_regular_file(s)) {
+            err = "no such file inside the container: " + s +
+                  " (paths are resolved in the CONTAINER's filesystem — /out is the job volume; "
+                  "send base64 or a multipart part for a file the container cannot see)";
             return false;
         }
+        if (source_is_path(s)) {
+            std::string head;
+            if (!read_header(s, head)) { err = "cannot read " + s; return false; }
+            if (!image_bytes_ok(head, s, err)) return false;
+            out_path = s;
+            return true;
+        }
+        std::string bytes;
+        if (!base64_decode(s, bytes)) {
+            err = "`image` is neither a readable absolute path nor decodable base64";
+            return false;
+        }
+        if (!image_bytes_ok(bytes, "the decoded image", err)) return false;
         out_path = job_dir + "/input";
         if (!write_file(out_path, bytes)) { err = "cannot write " + out_path; return false; }
         return true;
     }
     const std::string ct = req.get_header_value("Content-Type");
     if (!req.body.empty() && ct.compare(0, 6, "image/") == 0) {
+        if (!image_bytes_ok(req.body, "the request body", err)) return false;
         out_path = job_dir + "/input";
         if (!write_file(out_path, req.body)) { err = "cannot write " + out_path; return false; }
         return true;
@@ -532,6 +621,50 @@ const std::vector<Tier>& default_tiers() {
         {"hero", 220000}, {"high", 100000}, {"medium", 40000}, {"game", 15000},
     };
     return t;
+}
+
+// The rest of the caller-fixable surface, checked before a job exists. Each one of these otherwise
+// fails INSIDE a stage: an unknown variant after the retarget has loaded the rig, a zero step count
+// as a sampler that produces nothing, an empty prompt as a clip of noise.
+bool validate_common(const json& b, bool needs_prompt, std::string& err) {
+    if (needs_prompt && !b.value("uncond", false)) {
+        if (!b.contains("prompt") || !b["prompt"].is_string()) {
+            err = "`prompt` is required (or `uncond: true` for the checkpoint's trained null conditioning)";
+            return false;
+        }
+        std::string p = b["prompt"].get<std::string>();
+        const size_t s = p.find_first_not_of(" \t\r\n");
+        if (s == std::string::npos) { err = "`prompt` is empty"; return false; }
+    }
+    // Ranges, named with the value that was sent — a bare "invalid" makes the caller guess which
+    // field. The bounds are generous: this is a guard against 0 and typos, not a policy.
+    struct { const char* k; double lo, hi; } nums[] = {
+        {"seconds", 0.1, 60.0}, {"steps", 1, 500}, {"cfg", 0.0, 50.0},
+        {"smooth", 0, 100}, {"texsize", 16, 8192}, {"decimate", 100, 5000000},
+        {"resolution", 0, 4096}, {"rig_retries", 0, 16}, {"rig_extra_retries", -1, 16},
+    };
+    for (const auto& n : nums) {
+        if (!b.contains(n.k) || !b[n.k].is_number()) continue;
+        const double v = b[n.k].get<double>();
+        if (v < n.lo || v > n.hi) {
+            err = std::string("`") + n.k + "` is " + std::to_string(v) + "; expected " +
+                  std::to_string(n.lo) + " to " + std::to_string(n.hi);
+            return false;
+        }
+    }
+    return true;
+}
+
+// The retarget variants, checked here because animate() only learns the name is wrong after it has
+// loaded the rig and the clips.
+bool validate_variant(const json& b, std::string& err) {
+    if (!b.contains("variant")) return true;
+    if (!b["variant"].is_string()) { err = "`variant` must be a string"; return false; }
+    const std::string v = b["variant"].get<std::string>();
+    for (const char* k : {"fix", "nofix", "base", "rot", "rotbase"})
+        if (v == k) return true;
+    err = "unknown variant '" + v + "' (fix | nofix | base | rot | rotbase)";
+    return false;
 }
 
 // `tiers` may be omitted (all four), a list of names, or a list of {name, decimate} objects.
@@ -1040,6 +1173,7 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
     json b;
     std::string err;
     if (!parse_body(req, b, err)) { set_json(res, {{"error", err}}, 400); return; }
+    if (!validate_common(b, /*needs_prompt=*/false, err)) { set_json(res, {{"error", err}}, 400); return; }
     if (!resolve_reruns(st, b, err)) { set_json(res, {{"error", err}}, 400); return; }
     std::vector<Tier> probe;
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
@@ -1067,10 +1201,7 @@ void handle_motion(State& st, const httplib::Request& req, httplib::Response& re
     json b;
     std::string err;
     if (!parse_body(req, b, err)) { set_json(res, {{"error", err}}, 400); return; }
-    if (!b.contains("prompt") && !b.value("uncond", false)) {
-        set_json(res, {{"error", "motion needs a `prompt` (or uncond:true for the checkpoint's trained null conditioning)"}}, 400);
-        return;
-    }
+    if (!validate_common(b, /*needs_prompt=*/true, err)) { set_json(res, {{"error", err}}, 400); return; }
     // needs_rig_vram=false: the motion stage is nowhere near the rig's 10.7 GB, and holding it to
     // that floor refuses work that fits (see admit()).
     if (!admit(st, res, /*needs_rig_vram=*/false)) return;
@@ -1088,6 +1219,10 @@ void handle_animate(State& st, const httplib::Request& req, httplib::Response& r
     json b;
     std::string err;
     if (!parse_body(req, b, err)) { set_json(res, {{"error", err}}, 400); return; }
+    if (!validate_common(b, /*needs_prompt=*/false, err) || !validate_variant(b, err)) {
+        set_json(res, {{"error", err}}, 400);
+        return;
+    }
 
     std::string rig_glb;
     if (!resolve_rig(st, b.value("rig", std::string()), b.value("tier", std::string()), rig_glb, err)) {
@@ -1144,8 +1279,8 @@ void handle_render(State& st, const httplib::Request& req, httplib::Response& re
     json b;
     std::string err;
     if (!parse_body(req, b, err)) { set_json(res, {{"error", err}}, 400); return; }
-    if (!b.contains("prompt") && !b.value("uncond", false)) {
-        set_json(res, {{"error", "render needs a `prompt`"}}, 400);
+    if (!validate_common(b, /*needs_prompt=*/true, err) || !validate_variant(b, err)) {
+        set_json(res, {{"error", err}}, 400);
         return;
     }
     if (!resolve_reruns(st, b, err)) { set_json(res, {{"error", err}}, 400); return; }
