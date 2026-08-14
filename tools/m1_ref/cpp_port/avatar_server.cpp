@@ -656,6 +656,13 @@ void run_rig(State& st, JobPtr j, const json& b, const std::string& image) {
         finish(st, j, false, sess.error(), sess.status_code() == 499 ? "cancelled" : "unavailable");
         return;
     }
+    // 🔴 GIVE THE MOTION DiT BACK FIRST. Engine::run() does this between its own stages and says
+    // why: the rig stage peaks near 10.7 GB of the 3060's 11.9 GB, so the ~2.1 GB motion DiT must
+    // not be resident across it. This endpoint drives the stages itself, so it owes the same
+    // release — without it a /v1/rig that follows a /v1/motion runs the biggest stage in the
+    // pipeline with our own weights still on the card. Safe here and only here: we hold the
+    // session, so nothing else is using the CUDA context.
+    st.engine->release_gpu();
     std::string verr;
     if (!vram_ok(st, verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
 
@@ -882,7 +889,7 @@ namespace {
 // Everything a submit handler shares: admission, the job record, the thread, and `?wait=1`.
 // `work` is the stage body, already bound to its parsed request.
 void submit(State& st, const httplib::Request& req, httplib::Response& res, const std::string& kind,
-            const json& request_echo, bool needs_card,
+            const json& request_echo,
             std::function<void(JobPtr)> work, const std::string& job_dir, const std::string& job_id) {
     JobPtr j = std::make_shared<Job>();
     j->id = job_id;
@@ -903,7 +910,6 @@ void submit(State& st, const httplib::Request& req, httplib::Response& res, cons
         // A job whose body returned without calling finish() would hang a waiter forever.
         if (!j->done.load()) finish(st, j, false, "stage returned without a verdict", "internal");
     }).detach();
-    (void)needs_card;
 
     // `?wait=1` — the synchronous shape spar3d offers. It is the SAME job underneath, so a client
     // that times out can still poll the id it was given.
@@ -927,9 +933,16 @@ void submit(State& st, const httplib::Request& req, httplib::Response& res, cons
     set_json(res, job_public(*j), 202);
 }
 
-// Admission checks common to every submit: draining, the pending cap, and — for GPU stages only —
-// the VRAM floor when nothing of ours is running.
-bool admit(State& st, httplib::Response& res, bool needs_card) {
+// Admission checks common to every submit: draining, the pending cap, and — for the RIG stage only
+// — the VRAM floor.
+//
+// ⚠️ `needs_rig_vram` IS NOT "touches the GPU". The floor is ~10.7 GB because that is what the RIG
+// stage peaks at; a motion request needs a fraction of it. Applying the rig's floor to every GPU
+// stage is not conservative, it is wrong: measured 2026-08-14, the motion DiT stays resident by
+// design (~2.1 GB), which drops free VRAM to ~9.6 GB, which then refused EVERY subsequent request
+// — including motion ones that would have fitted — until idle-unload fired 300 s later. A guard
+// that bricks the service after one successful job is worse than the OOM it was guarding against.
+bool admit(State& st, httplib::Response& res, bool needs_rig_vram) {
     const avatar::Health h = st.engine->health();
     if (h.draining) {
         std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -946,9 +959,12 @@ bool admit(State& st, httplib::Response& res, bool needs_card) {
             return false;
         }
     }
-    // Only when WE are idle: if one of our renders holds the card, low free VRAM is us, and the
-    // right answer is to queue.
-    if (needs_card && h.in_flight == 0) {
+    // Only when WE are idle AND holding nothing: if one of our renders has the card, low free VRAM
+    // is us and the request must queue; if our weights are merely RESIDENT, the job will hand them
+    // back before the rig stage (run_rig calls release_gpu), so raw free VRAM here is not the
+    // number that matters. In both cases the authoritative check is the one inside the job, made
+    // with the card in hand and after the release.
+    if (needs_rig_vram && h.in_flight == 0 && !h.loaded) {
         std::string verr;
         if (!vram_ok(st, verr)) {
             std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1027,7 +1043,7 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
     if (!resolve_reruns(st, b, err)) { set_json(res, {{"error", err}}, 400); return; }
     std::vector<Tier> probe;
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
-    if (!admit(st, res, /*needs_card=*/true)) return;
+    if (!admit(st, res, /*needs_rig_vram=*/true)) return;
 
     std::string id, dir;
     {
@@ -1043,7 +1059,7 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
     echo["rig_retries"] = b.value("rig_retries", st.cfg.rig_retries);
     echo["tiers"] = json::array();
     for (const auto& t : probe) echo["tiers"].push_back(json{{"name", t.name}, {"decimate", t.decimate}});
-    submit(st, req, res, "rig", echo, true,
+    submit(st, req, res, "rig", echo,
            [&st, b, image](JobPtr j) { run_rig(st, j, b, image); }, dir, id);
 }
 
@@ -1055,14 +1071,16 @@ void handle_motion(State& st, const httplib::Request& req, httplib::Response& re
         set_json(res, {{"error", "motion needs a `prompt` (or uncond:true for the checkpoint's trained null conditioning)"}}, 400);
         return;
     }
-    if (!admit(st, res, /*needs_card=*/true)) return;
+    // needs_rig_vram=false: the motion stage is nowhere near the rig's 10.7 GB, and holding it to
+    // that floor refuses work that fits (see admit()).
+    if (!admit(st, res, /*needs_rig_vram=*/false)) return;
     std::string id, dir;
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
         id = new_job_id(st.jm);
     }
     dir = make_job_dir(st, id);
-    submit(st, req, res, "motion", b, true,
+    submit(st, req, res, "motion", b,
            [&st, b](JobPtr j) { run_motion(st, j, b); }, dir, id);
 }
 
@@ -1108,7 +1126,7 @@ void handle_animate(State& st, const httplib::Request& req, httplib::Response& r
         return;
     }
     // needs_card=false: the retarget never touches the GPU, so it must not be refused for VRAM.
-    if (!admit(st, res, /*needs_card=*/false)) return;
+    if (!admit(st, res, /*needs_rig_vram=*/false)) return;
     std::string id, dir;
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1117,7 +1135,7 @@ void handle_animate(State& st, const httplib::Request& req, httplib::Response& r
     dir = make_job_dir(st, id);
     json echo = b;
     echo["rig"] = rig_glb;
-    submit(st, req, res, "animate", echo, false,
+    submit(st, req, res, "animate", echo,
            [&st, b, rig_glb, texts, paths](JobPtr j) { run_animate(st, j, b, rig_glb, texts, paths); },
            dir, id);
 }
@@ -1133,7 +1151,7 @@ void handle_render(State& st, const httplib::Request& req, httplib::Response& re
     if (!resolve_reruns(st, b, err)) { set_json(res, {{"error", err}}, 400); return; }
     std::vector<Tier> probe;
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
-    if (!admit(st, res, /*needs_card=*/true)) return;
+    if (!admit(st, res, /*needs_rig_vram=*/true)) return;
     std::string id, dir;
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1144,7 +1162,7 @@ void handle_render(State& st, const httplib::Request& req, httplib::Response& re
     if (!resolve_image(req, b, dir, image, err)) { set_json(res, {{"error", err}}, 400); return; }
     b["image"] = image;
     json echo = b;
-    submit(st, req, res, "render", echo, true,
+    submit(st, req, res, "render", echo,
            [&st, b, image](JobPtr j) { run_render(st, j, b, image); }, dir, id);
 }
 
