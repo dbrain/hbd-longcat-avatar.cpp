@@ -41,6 +41,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -63,10 +64,15 @@ namespace avsup {
 // ---------------------------------------------------------------------------
 // 🔴 NVML DOES NOT HONOUR CUDA_VISIBLE_DEVICES. An index-based lookup here would read whichever
 // card the driver enumerates first, which on this box is not necessarily ours — and reading the
-// 5060 Ti's free VRAM to decide whether a 3060 job fits is a wrong answer that looks right. The
-// compose block pins us by UUID (CUDA_VISIBLE_DEVICES=GPU-3b9ac5cf-…), so the UUID is what we look
-// up. A numeric CUDA_VISIBLE_DEVICES is honoured as an NVML index only as a fallback, and said so
-// out loud, because CUDA's device order and NVML's agree only under CUDA_DEVICE_ORDER=PCI_BUS_ID.
+// 5060 Ti's free VRAM to decide whether a 3060 job fits is a wrong answer that looks right. So
+// every lookup here is BY UUID. A numeric CUDA_VISIBLE_DEVICES is honoured as an NVML index only as
+// a fallback for the default card, and said so out loud, because CUDA's device order and NVML's
+// agree only under CUDA_DEVICE_ORDER=PCI_BUS_ID.
+//
+// 🔴 SINCE PLACEMENT, THE CARD IS A PARAMETER, NOT A SINGLETON. The worker can be spawned on any
+// card in `LONGCAT_RIG_GPUS`, so "free VRAM" is only a question you can ask ABOUT A CARD — asking
+// it about "the pinned card" is what the single-device version of this file did, and it is exactly
+// the reading that would admit a job onto a card it does not fit. Handles are cached per UUID.
 //
 // dlopen rather than -lnvidia-ml: libnvidia-ml.so.1 is injected by the NVIDIA container runtime and
 // is absent from the build image entirely. A link-time dependency would make the binary refuse to
@@ -80,10 +86,14 @@ struct NvmlMemory {
 
 struct NvmlState {
     void* lib = nullptr;
-    void* device = nullptr;                              // nvmlDevice_t, an opaque pointer
     int (*get_memory)(void*, NvmlMemory*) = nullptr;
-    bool ready = false;
+    int (*by_uuid)(const char*, void**) = nullptr;
+    int (*by_index)(unsigned, void**) = nullptr;
+    void* fallback_device = nullptr;   // the container's own CUDA_VISIBLE_DEVICES, resolved once
+    bool ready = false;                // the LIBRARY is usable; a given UUID may still not resolve
     std::string note = "not initialised";
+    std::mutex mx;                     // guards `cache` only
+    std::vector<std::pair<std::string, void*>> cache;
 };
 
 inline NvmlState& nvml_state() {
@@ -93,36 +103,32 @@ inline NvmlState& nvml_state() {
         s.lib = ::dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
         if (!s.lib) s.lib = ::dlopen("libnvidia-ml.so", RTLD_LAZY | RTLD_LOCAL);
         if (!s.lib) { s.note = "libnvidia-ml.so.1 not loadable (no NVIDIA driver mounted?)"; return; }
-        auto init      = (int (*)())::dlsym(s.lib, "nvmlInit_v2");
-        auto by_uuid   = (int (*)(const char*, void**))::dlsym(s.lib, "nvmlDeviceGetHandleByUUID");
-        auto by_index  = (int (*)(unsigned, void**))::dlsym(s.lib, "nvmlDeviceGetHandleByIndex_v2");
-        s.get_memory   = (int (*)(void*, NvmlMemory*))::dlsym(s.lib, "nvmlDeviceGetMemoryInfo");
-        if (!init || !s.get_memory || (!by_uuid && !by_index)) {
+        auto init    = (int (*)())::dlsym(s.lib, "nvmlInit_v2");
+        s.by_uuid    = (int (*)(const char*, void**))::dlsym(s.lib, "nvmlDeviceGetHandleByUUID");
+        s.by_index   = (int (*)(unsigned, void**))::dlsym(s.lib, "nvmlDeviceGetHandleByIndex_v2");
+        s.get_memory = (int (*)(void*, NvmlMemory*))::dlsym(s.lib, "nvmlDeviceGetMemoryInfo");
+        if (!init || !s.get_memory || (!s.by_uuid && !s.by_index)) {
             s.note = "libnvidia-ml.so.1 is missing the symbols we need";
             return;
         }
         if (init() != 0) { s.note = "nvmlInit_v2 failed"; return; }
+        s.ready = true;
 
         const char* env = std::getenv("CUDA_VISIBLE_DEVICES");
         const std::string pin = (env && *env) ? std::string(env) : std::string();
         // Only the FIRST entry: a comma list means CUDA device 0 is the first one, and device 0 is
         // the card every stage in this pipeline uses.
         const std::string first = pin.substr(0, pin.find(','));
-        if (by_uuid && (first.rfind("GPU-", 0) == 0 || first.rfind("MIG-", 0) == 0)) {
-            if (by_uuid(first.c_str(), &s.device) == 0) {
-                s.ready = true;
-                s.note = "by UUID " + first;
-                return;
-            }
+        if (s.by_uuid && (first.rfind("GPU-", 0) == 0 || first.rfind("MIG-", 0) == 0)) {
+            if (s.by_uuid(first.c_str(), &s.fallback_device) == 0) { s.note = "by UUID " + first; return; }
             s.note = "nvmlDeviceGetHandleByUUID(" + first + ") failed";
             return;
         }
-        if (!by_index) { s.note = "no index lookup available"; return; }
+        if (!s.by_index) { s.note = "no index lookup available"; return; }
         unsigned idx = 0;
         if (!first.empty() && first.find_first_not_of("0123456789") == std::string::npos)
             idx = (unsigned)std::atoi(first.c_str());
-        if (by_index(idx, &s.device) == 0) {
-            s.ready = true;
+        if (s.by_index(idx, &s.fallback_device) == 0) {
             s.note = "by INDEX " + std::to_string(idx) +
                      " — CUDA_VISIBLE_DEVICES is not a UUID, so this may be the WRONG CARD unless "
                      "CUDA_DEVICE_ORDER=PCI_BUS_ID";
@@ -133,28 +139,61 @@ inline NvmlState& nvml_state() {
     return s;
 }
 
-}  // namespace detail
+// The NVML handle for a UUID, or the container-default device when `uuid` is empty. nullptr = the
+// card could not be resolved, which callers must treat as "cannot ask" and never as a refusal.
+inline void* nvml_device(const std::string& uuid) {
+    NvmlState& s = nvml_state();
+    if (!s.ready) return nullptr;
+    if (uuid.empty()) return s.fallback_device;
+    std::lock_guard<std::mutex> lk(s.mx);
+    for (const auto& [k, d] : s.cache)
+        if (k == uuid) return d;
+    void* dev = nullptr;
+    // A UUID that does not resolve is cached as nullptr on purpose: it is a config error (a card
+    // this host does not have, or one the container was not given), and re-asking NVML about it on
+    // every admission would turn a typo into a per-request syscall.
+    if (s.by_uuid && s.by_uuid(uuid.c_str(), &dev) != 0) dev = nullptr;
+    s.cache.emplace_back(uuid, dev);
+    return dev;
+}
 
-// Free VRAM on the pinned card, in MiB. -1 = could not ask, which every caller must treat as
-// "no opinion" and NOT as a refusal.
-inline long nvml_free_mib() {
-    detail::NvmlState& s = detail::nvml_state();
-    if (!s.ready) return -1;
-    detail::NvmlMemory m;
-    if (s.get_memory(s.device, &m) != 0) return -1;
+// Free VRAM on `uuid` (empty = the container default), in MiB. -1 = could not ask, which every
+// caller must treat as "no opinion" and NOT as a refusal.
+inline long nvml_free_mib(const std::string& uuid) {
+    NvmlState& s = nvml_state();
+    void* dev = nvml_device(uuid);
+    if (!dev) return -1;
+    NvmlMemory m;
+    if (s.get_memory(dev, &m) != 0) return -1;
     return (long)(m.free >> 20);
 }
 
-// Total VRAM on the pinned card, MiB. -1 = could not ask.
-inline long nvml_total_mib() {
-    detail::NvmlState& s = detail::nvml_state();
-    if (!s.ready) return -1;
-    detail::NvmlMemory m;
-    if (s.get_memory(s.device, &m) != 0) return -1;
+inline long nvml_total_mib(const std::string& uuid) {
+    NvmlState& s = nvml_state();
+    void* dev = nvml_device(uuid);
+    if (!dev) return -1;
+    NvmlMemory m;
+    if (s.get_memory(dev, &m) != 0) return -1;
     return (long)(m.total >> 20);
 }
 
-// How the device was resolved (or why it was not), for /v1/gpu/status and the boot log.
+}  // namespace detail
+
+// Free / total VRAM on a named card, MiB. -1 = could not ask.
+inline long nvml_free_mib(const std::string& uuid) { return detail::nvml_free_mib(uuid); }
+inline long nvml_total_mib(const std::string& uuid) { return detail::nvml_total_mib(uuid); }
+
+// The same, for the container's own CUDA_VISIBLE_DEVICES. Kept because /v1/gpu/status and the boot
+// preflight report the container's default card whether or not placement is in use.
+inline long nvml_free_mib() { return detail::nvml_free_mib(std::string()); }
+inline long nvml_total_mib() { return detail::nvml_total_mib(std::string()); }
+
+// True if NVML can actually answer for this card — i.e. the UUID names a GPU this host has. The
+// admission path uses it to reject a bad `gpu` field with a 400 instead of silently placing the
+// worker on the default card, which is the failure mode that makes a scheduler untrustworthy.
+inline bool nvml_knows(const std::string& uuid) { return detail::nvml_device(uuid) != nullptr; }
+
+// How the default device was resolved (or why it was not), for /v1/gpu/status and the boot log.
 inline const std::string& nvml_note() { return detail::nvml_state().note; }
 
 // ---------------------------------------------------------------------------
@@ -204,13 +243,73 @@ public:
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
 
+    // The card an un-targeted request lands on (WORKER_DEFAULT_GPU). Empty = whatever the
+    // container's CUDA_VISIBLE_DEVICES already says, which is the pre-placement behaviour and the
+    // reason this whole change is backward compatible: no default and no `gpu` field ⇒ no setenv
+    // ⇒ the child inherits the container pin exactly as it always did.
+    void set_default_gpu(std::string uuid) {
+        std::lock_guard<std::mutex> lk(mx_);
+        default_gpu_ = std::move(uuid);
+    }
+    std::string default_gpu() const {
+        std::lock_guard<std::mutex> lk(mx_);
+        return default_gpu_;
+    }
+
+    // 🔴 THE GPU FLOCK IS PER CARD, AND THE CONFIGURED ONE BELONGS TO EXACTLY ONE OF THEM. `--lock`
+    // names a real file that the HOST-SIDE shell drivers also take (its default is literally
+    // `.3060-image-to-rig.lock`), so it arbitrates one physical GPU. Once the worker can be placed,
+    // taking that same lock for a render on the OTHER card would be wrong twice over: it would block
+    // a host driver waiting for the card we are not using — for up to the 7200 s lock timeout, which
+    // looks exactly like a hang — while not excluding anything at all on the card we ARE using.
+    //
+    // So: `home_card` keeps the configured path (that is the card the lock was always about), and
+    // every other card gets its own sibling lock file. `base` empty = no flock, unchanged.
+    void set_lock_policy(std::string base, std::string home_card) {
+        std::lock_guard<std::mutex> lk(mx_);
+        lock_base_ = std::move(base);
+        lock_home_card_ = std::move(home_card);
+    }
+
+    // The card the resident worker is actually on. Empty when there is no worker — never a guess,
+    // because "where would it go" and "where is it" are different questions and only the second one
+    // may be used to decide whether a relocation is needed.
+    std::string worker_gpu() const {
+        std::lock_guard<std::mutex> lk(gmx_);
+        return pid_a_.load() > 0 ? worker_gpu_ : std::string();
+    }
+
     // Spawn the child if it is not already up, and hold it for the caller. Blocking (the readiness
     // wait), but only ever for the ~seconds a cold start costs: constructing avatar::Engine is
     // lazy, so this is process exec + the CUDA primary context, not a weight load.
-    Lease lease() {
-        std::lock_guard<std::mutex> lk(mx_);
+    //
+    // `want_gpu` is the placement target: empty means the default. A resident worker on the WRONG
+    // card is killed and respawned on the right one — an in-flight job never migrates, so this can
+    // only happen while nothing holds a lease (see ensure_locked).
+    Lease lease(const std::string& want_gpu = std::string()) {
+        std::unique_lock<std::mutex> lk(mx_);
+        const std::string target = want_gpu.empty() ? default_gpu_ : want_gpu;
+        // 🔴 A RELOCATION WAITS FOR THE OTHER CARD'S RENDER, IT DOES NOT REFUSE IT. Relocating
+        // needs an idle worker, and more than one job can hold a lease at once — the parent runs a
+        // thread per admitted job and the FIFO that actually serialises them lives in the child. So
+        // a second submit naming the other card arrives while the first is still running, which is
+        // ordinary, not an error: without this wait it would fail on a queue it should simply have
+        // joined. `wait_for` drops mx_ while it waits, so /health, poll() and the release itself
+        // all keep working.
+        //
+        // The bound matches the flock's own 7200 s timeout — the other thing in this engine that
+        // waits for a card — so a stuck render surfaces as one message, not two different ones.
+        const bool ready = relocate_cv_.wait_for(lk, std::chrono::seconds(7200), [&] {
+            return pid_ <= 0 || worker_gpu_ == target || leases_.load() == 0;
+        });
+        if (!ready) {
+            return Lease(nullptr, 0,
+                         "waited 7200 s for the GPU worker to go idle so it could be moved to " +
+                             (target.empty() ? std::string("the container default card") : target) +
+                             ", and it never did");
+        }
         std::string err;
-        if (!ensure_locked(err)) return Lease(nullptr, 0, err);
+        if (!ensure_locked(err, want_gpu)) return Lease(nullptr, 0, err);
         leases_.fetch_add(1);
         return Lease(this, port_, std::string());
     }
@@ -270,12 +369,24 @@ private:
     }
     void say(const std::string& s) { if (log_) log_(s.c_str()); }
 
+    // No mx_ here, deliberately: a lease is released from the job thread and taking the supervisor
+    // lock would make every completion queue behind a cold start. The notify is what lets a lease()
+    // blocked on a relocation notice that the card just went idle.
     void release_lease() {
         last_active_.store(mono());
         leases_.fetch_sub(1);
+        relocate_cv_.notify_all();
     }
 
-    void clear_locked() { pid_ = -1; port_ = 0; publish_locked(); }
+    // Called under mx_ whenever the child is gone. worker_gpu_ is cleared with it: "which card is
+    // the worker on" must have no answer when there is no worker, or the next ensure_locked() would
+    // compare its target against a dead process's card and skip a spawn it needs.
+    void clear_locked() {
+        pid_ = -1;
+        port_ = 0;
+        { std::lock_guard<std::mutex> glk(gmx_); worker_gpu_.clear(); }
+        publish_locked();
+    }
     void publish_locked() { pid_a_.store(pid_); port_a_.store(port_); }
 
     bool reap_locked() {
@@ -353,9 +464,28 @@ private:
         return false;
     }
 
-    bool ensure_locked(std::string& err) {
+    bool ensure_locked(std::string& err, const std::string& want_gpu) {
         reap_locked();
-        if (pid_ > 0) return true;
+        const std::string target = want_gpu.empty() ? default_gpu_ : want_gpu;
+        if (pid_ > 0) {
+            // 🔴 THE REUSE CHECK IS (alive AND same card), never just (alive). Reusing a worker
+            // that is on the other GPU is how a placement decision becomes a lie: the gate reserved
+            // VRAM on one card and the render would run on another, so both cards' accounting is
+            // wrong and the one actually used was never checked against the floor.
+            if (worker_gpu_ == target) return true;
+            // An in-flight render does NOT migrate. Nothing here may touch a worker under a lease —
+            // that is the same rule kill_if_idle() follows, and for the same reason.
+            if (leases_.load() > 0) {
+                err = "the GPU worker is busy on " + (worker_gpu_.empty() ? std::string("its default card")
+                                                                          : worker_gpu_) +
+                      " and a render cannot migrate mid-flight; retry once it finishes";
+                return false;
+            }
+            say("relocating the CUDA worker from " +
+                (worker_gpu_.empty() ? std::string("the container default") : worker_gpu_) + " to " +
+                (target.empty() ? std::string("the container default") : target));
+            if (!kill_locked()) { err = "could not kill the resident worker to relocate it"; return false; }
+        }
         port_ = reserve_loopback_port();
         if (port_ == 0) { err = "could not reserve a worker loopback port"; return false; }
 
@@ -384,13 +514,28 @@ private:
         // submit and again immediately before dispatch; see vram_ok() and run_proxy().
         args.push_back("--min-free-mib");
         args.push_back("0");
+        // Last-wins parsing is what lets this override the entrypoint's own --lock. Only when the
+        // worker is going somewhere other than the card the configured lock belongs to.
+        if (!lock_base_.empty() && !target.empty() && target != lock_home_card_) {
+            // A short, stable suffix: the UUID tail is unique across the cards in one box and does
+            // not turn the path into something no human can read in an `ls`.
+            const std::string tail = target.size() > 8 ? target.substr(target.size() - 8) : target;
+            args.push_back("--lock");
+            args.push_back(lock_base_ + "." + tail);
+        }
 
-        const pid_t pid = spawn_on_spawner_thread(args);
+        const pid_t pid = spawn_on_spawner_thread(args, target);
         if (pid < 0) { err = "fork failed"; port_ = 0; return false; }
         pid_ = (int)pid;
+        {
+            std::lock_guard<std::mutex> glk(gmx_);
+            worker_gpu_ = target;
+        }
         publish_locked();
         spawns_.fetch_add(1);
-        say("spawned CUDA worker pid " + std::to_string(pid_) + " on 127.0.0.1:" + std::to_string(port_));
+        say("spawned CUDA worker pid " + std::to_string(pid_) + " on 127.0.0.1:" +
+            std::to_string(port_) +
+            (target.empty() ? std::string(" (container default card)") : (" on card " + target)));
         if (!wait_until_ready_locked(err)) { (void)kill_locked(); return false; }
         last_active_.store(mono());
         return true;
@@ -418,8 +563,9 @@ private:
             if (spawn_stop_) return;
             spawn_want_ = false;
             const std::vector<std::string> args = spawn_args_;
+            const std::string gpu = spawn_gpu_;
             lk.unlock();
-            const pid_t pid = fork_exec(args);
+            const pid_t pid = fork_exec(args, gpu);
             lk.lock();
             spawn_pid_ = pid;
             spawn_done_ = true;
@@ -427,9 +573,10 @@ private:
         }
     }
 
-    pid_t spawn_on_spawner_thread(const std::vector<std::string>& args) {
+    pid_t spawn_on_spawner_thread(const std::vector<std::string>& args, const std::string& gpu) {
         std::unique_lock<std::mutex> lk(smx_);
         spawn_args_ = args;
+        spawn_gpu_ = gpu;
         spawn_done_ = false;
         spawn_want_ = true;
         scv_.notify_one();
@@ -437,7 +584,7 @@ private:
         return spawn_pid_;
     }
 
-    pid_t fork_exec(const std::vector<std::string>& args) {
+    pid_t fork_exec(const std::vector<std::string>& args, const std::string& gpu) {
         const pid_t me = ::getpid();
         const pid_t pid = ::fork();
         if (pid != 0) return pid;
@@ -447,6 +594,16 @@ private:
         if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) ::_exit(125);
         if (::getppid() != me) ::_exit(126);
         ::setenv("AVATAR_SERVER_WORKER_CHILD", "1", 1);
+        // 🔴 THIS LINE IS THE ENTIRE PLACEMENT MECHANISM. The parent is CUDA-free by construction
+        // (that is what worker isolation is FOR), so nothing here has read CUDA_VISIBLE_DEVICES
+        // yet — the child's first CUDA call does, after execv, and lands on this card. No
+        // `main_gpu` plumbing, no ggml change: every stage still calls ggml_backend_cuda_init(0),
+        // and device 0 is now whichever card we named.
+        //
+        // ⚠️ UUID, NEVER AN INDEX. CUDA enumerates fastest-first, which on this box is the OPPOSITE
+        // of nvidia-smi's order, so "1" means different cards to different tools. A wrong index
+        // here would not fail — it would rig on the other card and report success.
+        if (!gpu.empty()) ::setenv("CUDA_VISIBLE_DEVICES", gpu.c_str(), 1);
         std::vector<char*> argv;
         argv.reserve(args.size() + 2);
         argv.push_back(const_cast<char*>(exe_.c_str()));
@@ -459,11 +616,22 @@ private:
     std::string exe_;
     std::vector<std::string> args_;
     std::function<void(const char*)> log_;
-    std::mutex mx_;
+    mutable std::mutex mx_;
+    // Where an un-targeted request goes, and where the resident worker actually is. `worker_gpu_`
+    // has its own mutex so worker_gpu() can be read by /health without queueing behind a cold
+    // start, which is the same reason pid_/port_ are mirrored into atomics.
+    std::string default_gpu_;
+    std::string lock_base_, lock_home_card_;
+    // Signalled when a lease is released, so a lease() waiting to relocate wakes on the card going
+    // idle rather than on a timer.
+    std::condition_variable relocate_cv_;
+    mutable std::mutex gmx_;
+    std::string worker_gpu_;
     std::thread spawner_;
     std::mutex smx_;
     std::condition_variable scv_, sdone_;
     std::vector<std::string> spawn_args_;
+    std::string spawn_gpu_;
     pid_t spawn_pid_ = -1;
     bool spawn_want_ = false, spawn_done_ = false, spawn_stop_ = false;
     int pid_ = -1;

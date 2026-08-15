@@ -314,6 +314,35 @@ int getenv_int(const char* k, int dflt) {
     return (v && *v) ? std::atoi(v) : dflt;
 }
 
+// A comma/space separated list, trimmed, empties dropped. Used for the GPU UUID set, where a stray
+// space around a comma is the difference between a card that resolves and one that silently does
+// not.
+std::vector<std::string> split_list(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    auto flush = [&] {
+        const size_t a = cur.find_first_not_of(" \t");
+        const size_t b = cur.find_last_not_of(" \t");
+        if (a != std::string::npos) out.push_back(cur.substr(a, b - a + 1));
+        cur.clear();
+    };
+    for (const char c : s) {
+        if (c == ',' || c == ' ' || c == '\t') flush();
+        else cur.push_back(c);
+    }
+    flush();
+    return out;
+}
+
+std::string join_str(const std::vector<std::string>& v, const char* sep) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) out += sep;
+        out += v[i];
+    }
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -420,6 +449,25 @@ struct Config {
     int         min_free_mib = 0;      // 0 = do not check
     int         rig_retries = 2;       // the shipped default; see the block at parse time
     int         max_pending = 32;
+    // ---- placement (LONGCAT_RIG_GPUS / WORKER_DEFAULT_GPU) --------------------------------------
+    // Every card this service may spawn its worker on, and the one an un-targeted request gets.
+    // BOTH EMPTY IS THE PRE-PLACEMENT BEHAVIOUR and stays supported: no set, no default, no `gpu`
+    // field ⇒ nothing ever calls setenv, and the child inherits the container's CUDA_VISIBLE_DEVICES
+    // exactly as it did before this existed.
+    //
+    // ⚠️ THE CONTAINER MUST ACTUALLY BE GIVEN EVERY CARD IN `gpus`. Listing a UUID the runtime did
+    // not expose does not fail loudly — CUDA_VISIBLE_DEVICES naming an invisible device matches
+    // nothing and falls back to the CPU IN SILENCE, which here would look like a rig that took
+    // twenty times as long rather than an error. Compose must pair this with `count: all` or a
+    // device_ids list covering the set.
+    std::vector<std::string> gpus;
+    std::string default_gpu;
+    // Pick a card ourselves when the caller named none and the default one is below the floor.
+    // The scheduler in koblem is meant to be the brain (it is the only thing that can see the OTHER
+    // services' reservations), so this is deliberately a fallback and NOT a second opinion: an
+    // explicit `gpu` is always obeyed and never second-guessed. Set LONGCAT_RIG_AUTO_PLACE=0 to
+    // leave placement entirely to the caller.
+    bool auto_place = true;
 };
 
 // EXACTLY ONE of `engine` and `worker` is set, and which one it is IS the mode:
@@ -479,9 +527,11 @@ bool worker_get(State& st, const char* path, json& out) {
 // 🔴 The parent asks NVML, NEVER the engine: Engine::gpu_status() calls cudaMemGetInfo, and that
 // call alone creates the CUDA primary context (~122 MiB) in a process whose entire purpose is not
 // to have one.
-long free_vram_mib(State& st) {
+// `uuid` empty = the container's own default card, which is also the only card an Engine-owning
+// process can be asked about (its context is already on one).
+long free_vram_mib(State& st, const std::string& uuid = std::string()) {
     if (st.engine) return st.engine->gpu_status().mem_free_mb;
-    return avsup::nvml_free_mib();
+    return avsup::nvml_free_mib(uuid);
 }
 
 // /health's fields, from whichever process can answer them. In parent mode the card-facing
@@ -701,10 +751,21 @@ void finish(State& st, JobPtr j, bool ok, const std::string& err, const std::str
              j->error.empty() ? "" : (" — " + j->error).c_str());
 }
 
-// The VRAM floor, checked with the card in hand. `where` is only for the message.
-bool vram_ok(State& st, std::string& err) {
+// A card's name for a human: the UUID, or "the container's card" when placement is not in use.
+std::string card_name(const std::string& uuid) {
+    return uuid.empty() ? std::string("the pinned card") : uuid;
+}
+
+// The VRAM floor, checked against THE CARD THE JOB WILL ACTUALLY RUN ON. `target` empty = the
+// container default.
+//
+// 🔴 THE TARGET IS A PARAMETER AND MUST STAY ONE. This check used to read "the pinned card" because
+// there was only one; with placement, measuring the default card and then spawning the worker on
+// the other one would be a floor that guards the wrong GPU — it would admit a job onto a card it
+// does not fit and refuse one that does.
+bool vram_ok(State& st, const std::string& target, std::string& err) {
     if (st.cfg.min_free_mib <= 0) return true;
-    long free_mib = free_vram_mib(st);
+    long free_mib = free_vram_mib(st, target);
     if (free_mib < 0) return true;   // driver would not answer; do not invent a refusal
     if (free_mib >= st.cfg.min_free_mib) return true;
 
@@ -716,19 +777,30 @@ bool vram_ok(State& st, std::string& err) {
     // now fit, and the next request pays a ~seconds cold start instead of a 503 it did not deserve.
     // Nothing is killed while a lease is held, so this can never touch a running render.
     if (!st.engine && st.worker && st.worker->kill_if_idle()) {
-        const long after = free_vram_mib(st);
-        log_line("VRAM floor: %ld MiB free < %d — killed the idle worker; %ld MiB free now",
-                 free_mib, st.cfg.min_free_mib, after);
+        const long after = free_vram_mib(st, target);
+        log_line("VRAM floor: %ld MiB free on %s < %d — killed the idle worker; %ld MiB free now",
+                 free_mib, card_name(target).c_str(), st.cfg.min_free_mib, after);
         if (after >= st.cfg.min_free_mib) return true;
         if (after >= 0) free_mib = after;
     }
     if (!st.engine) {
-        err = "only " + std::to_string(free_mib) + " MiB free on the pinned card, need >= " +
-              std::to_string(st.cfg.min_free_mib) +
+        err = "only " + std::to_string(free_mib) + " MiB free on " + card_name(target) +
+              ", need >= " + std::to_string(st.cfg.min_free_mib) +
               ". This process holds no CUDA context and its GPU worker has already been killed and "
-              "re-measured, so the shortfall is a CO-TENANT, not us — kobbler-llama-server-1 takes "
-              "~9 GB of the 3060 without taking our lock. Free the card or lower "
-              "LONGCAT_RIG_MIN_FREE_MIB.";
+              "re-measured, so the shortfall is a CO-TENANT, not us.";
+        // Say what the OTHER cards look like, because with placement on, "this card is full" and
+        // "there is nowhere to run" stopped being the same sentence — and the caller (or the
+        // reader of a log) can act on the difference.
+        for (const auto& g : st.cfg.gpus) {
+            if (g == target) continue;
+            const long other = avsup::nvml_free_mib(g);
+            if (other >= 0)
+                err += " " + g + " has " + std::to_string(other) + " MiB free" +
+                       (other >= st.cfg.min_free_mib ? " and WOULD fit — send `gpu` to place the "
+                                                       "render there."
+                                                     : ".");
+        }
+        err += " Free the card or lower LONGCAT_RIG_MIN_FREE_MIB.";
         return false;
     }
     // Name OUR OWN retained pool, because after one job it is usually the whole reason we are here
@@ -743,14 +815,126 @@ bool vram_ok(State& st, std::string& err) {
                               ? 0
                               : (long)st.engine->peak_vram_used_mib() -
                                     (long)st.engine->baseline_vram_used_mib();
-    err = "only " + std::to_string(free_mib) + " MiB free on the pinned card, need >= " +
-          std::to_string(st.cfg.min_free_mib) +
+    err = "only " + std::to_string(free_mib) + " MiB free on " + card_name(target) +
+          ", need >= " + std::to_string(st.cfg.min_free_mib) +
           ". This process has already peaked at " + std::to_string(retained > 0 ? retained : 0) +
           " MiB above its baseline and ggml keeps that pool for reuse, so part of the shortfall may "
           "be our own retained memory rather than a co-tenant — check `nvidia-smi` before assuming. "
-          "Otherwise free the card (kobbler-llama-server-1 takes ~9 GB of the 3060 without taking "
-          "our lock) or lower LONGCAT_RIG_MIN_FREE_MIB.";
+          "Otherwise free the card or lower LONGCAT_RIG_MIN_FREE_MIB. (This process owns a CUDA "
+          "context, so it cannot be placed on another card: relocation needs worker isolation.)";
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Placement — which card this request runs on
+// ---------------------------------------------------------------------------
+// The contract is the fleet's, not ours: `WORKER_DEFAULT_GPU` for the static home and a per-request
+// `gpu` field (a GPU UUID) for the scheduler's target. See HANDOFF-multi-gpu-scheduler.md §5.
+//
+// 🔴 THE `gpu` FIELD MUST BE READ FROM ALL THREE PLACES A CLIENT CAN PUT IT. A rig submit is often
+// multipart (the image is a file part), and cpp-httplib files a multipart part as a FIELD or as a
+// FILE depending on whether it carries a filename — reqwest's `Form::text()`, which is what koblem
+// uses for `gpu` on every other service, sends NO filename. Reading only `has_file` would therefore
+// ignore the gate's placement silently and rig on the default card while koblem believed it had
+// placed the job elsewhere: both cards' accounting wrong, no error anywhere. This service has
+// already been bitten by exactly that bug on its `json` part.
+std::string request_gpu(const httplib::Request& req, const json& body) {
+    if (req.form.has_field("gpu")) return req.form.get_field("gpu");
+    if (req.form.has_file("gpu")) return req.form.get_file("gpu").content;
+    if (body.contains("gpu") && body["gpu"].is_string()) return body["gpu"].get<std::string>();
+    return std::string();
+}
+
+// Resolve the card for this request. Returns false with `err` set (a 400) for a card we cannot use;
+// on success `chosen` is the UUID to place the worker on, empty meaning "the container default".
+bool resolve_gpu(State& st, const httplib::Request& req, const json& body, bool needs_rig_vram,
+                 std::string& chosen, std::string& err) {
+    const std::string want = request_gpu(req, body);
+    const bool placeable = st.worker != nullptr;   // only a CUDA-free parent can choose
+
+    if (!want.empty()) {
+        // An explicit target is OBEYED, never second-guessed: the caller that sent it is the gate,
+        // and it is the only party that can see what the other services have reserved. We validate
+        // that we CAN honour it and otherwise refuse loudly — the one thing we must never do is
+        // quietly run somewhere else.
+        if (!placeable) {
+            err = "this process owns the CUDA context (worker isolation is off), so `gpu` cannot be "
+                  "honoured — it can only run on the card the container was started with";
+            return false;
+        }
+        if (!st.cfg.gpus.empty() &&
+            std::find(st.cfg.gpus.begin(), st.cfg.gpus.end(), want) == st.cfg.gpus.end()) {
+            err = "`gpu` names a card this service was not given: " + want +
+                  ". Accepted: " + join_str(st.cfg.gpus, ", ") +
+                  " (set LONGCAT_RIG_GPUS, and give the container the card in compose)";
+            return false;
+        }
+        // ⚠️ The set is config; NVML is the ground truth. A UUID that no card on this host answers
+        // to would reach CUDA_VISIBLE_DEVICES and match nothing — which does not fail, it falls
+        // back to the CPU in silence and turns a 450 s rig into an all-day one.
+        if (!avsup::nvml_knows(want)) {
+            err = "`gpu` names a card the driver does not know about: " + want +
+                  " (a UUID the container was not given matches nothing and would fall back to the "
+                  "CPU in silence, so this is refused rather than run)";
+            return false;
+        }
+        chosen = want;
+        return true;
+    }
+
+    // No worker to place ⇒ no card to name. Reporting the configured default here would put a UUID
+    // into refusal messages for a process that is pinned to whatever its container was given and
+    // could not have run anywhere else.
+    if (!placeable) {
+        chosen.clear();
+        return true;
+    }
+    chosen = st.cfg.default_gpu;
+
+    // 🔴 A STAGE THAT DOES NOT NEED THE CARD MUST NEVER MOVE THE WORKER. /v1/animate is a ~0.22 s
+    // CPU retarget that still goes to the child (constructing an Engine is what the parent must not
+    // do), and /v1/motion is far under the rig floor. If either asked for the default card while a
+    // worker sat on the other one, lease() would SIGKILL a warm CUDA context and pay a cold start
+    // to do arithmetic on the CPU. Whatever is already up is the right answer for them.
+    const std::string resident = st.worker->worker_gpu();
+    if (!needs_rig_vram) {
+        if (!resident.empty()) chosen = resident;
+        return true;
+    }
+    if (!st.cfg.auto_place || st.cfg.gpus.size() < 2 || st.cfg.min_free_mib <= 0) return true;
+
+    // ---- nobody chose, so choose the card that fits ---------------------------------------------
+    // Only when the caller expressed no preference, and only on the stage that has a floor to miss.
+    // Preference order is the configured order with the default first, so a fleet that has set a
+    // home card keeps it whenever it fits and spills only when it does not.
+    //
+    // A worker we already have counts as fitting: relocating a resident worker off a card that has
+    // room would cost a cold start to gain nothing. (Its own pooled VRAM reads as USED here, which
+    // makes this check pessimistic, never optimistic — the worst case is a spill to the other card,
+    // not an admission onto a full one.)
+    if (!resident.empty() && free_vram_mib(st, resident) >= st.cfg.min_free_mib) {
+        chosen = resident;
+        return true;
+    }
+    std::vector<std::string> order;
+    if (!chosen.empty()) order.push_back(chosen);
+    for (const auto& g : st.cfg.gpus)
+        if (std::find(order.begin(), order.end(), g) == order.end()) order.push_back(g);
+    for (const auto& g : order) {
+        const long f = free_vram_mib(st, g);
+        if (f >= st.cfg.min_free_mib) {
+            if (g != chosen)
+                log_line("placement: %s has %ld MiB free (< %d), placing this render on %s instead",
+                         card_name(chosen).c_str(), free_vram_mib(st, chosen), st.cfg.min_free_mib,
+                         g.c_str());
+            chosen = g;
+            return true;
+        }
+    }
+    // Nothing fits. Keep the default and let vram_ok() produce the refusal — it is the one place
+    // that may first kill our own idle worker and re-measure, which is how a shortfall that is
+    // OURS stops looking like a co-tenant.
+    return true;
 }
 
 // The LOD ladder. One skeleton, four decimation targets — a clip authored on the hero plays on the
@@ -969,7 +1153,9 @@ void run_rig(State& st, JobPtr j, const json& b, const std::string& image) {
     // session, so nothing else is using the CUDA context.
     st.engine->release_gpu();
     std::string verr;
-    if (!vram_ok(st, verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
+    // Empty target: this path only runs where an Engine owns the context, and a process with a CUDA
+    // context is already on its card — there is nothing to place.
+    if (!vram_ok(st, std::string(), verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
 
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1102,7 +1288,9 @@ void run_render(State& st, JobPtr j, const json& b, const std::string& image) {
         return;
     }
     std::string verr;
-    if (!vram_ok(st, verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
+    // Empty target: this path only runs where an Engine owns the context, and a process with a CUDA
+    // context is already on its card — there is nothing to place.
+    if (!vram_ok(st, std::string(), verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
         j->status = "running";
@@ -1195,7 +1383,8 @@ void run_render(State& st, JobPtr j, const json& b, const std::string& image) {
 // therefore writes into the SAME /out/jobs/<id>/ directory and publishes the same `result_url`s and
 // the same `stage_dir` / `rig_cache` handles. Kill the child afterwards and every one of those
 // still resolves, because they were only ever paths on a shared volume.
-void run_proxy(State& st, JobPtr j, const std::string& path, json body, bool needs_rig_vram) {
+void run_proxy(State& st, JobPtr j, const std::string& path, json body, bool needs_rig_vram,
+               const std::string& gpu) {
     if (j->cancel->cancelled()) { finish(st, j, false, "cancelled", "cancelled"); return; }
     // THE SECOND FLOOR CHECK, and the parent's replacement for the one run_rig used to make with
     // the card in hand. A job can sit in the queue for a quarter of an hour, so the number that
@@ -1208,16 +1397,22 @@ void run_proxy(State& st, JobPtr j, const std::string& path, json body, bool nee
     // names a genuine co-tenant.
     if (needs_rig_vram && st.worker->leases() == 0) {
         std::string verr;
-        if (!vram_ok(st, verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
+        if (!vram_ok(st, gpu, verr)) { finish(st, j, false, verr, "insufficient_vram"); return; }
     }
     body["_job_id"] = j->id;
     // Already resolved by the parent against the parent's job table; the child has no job table to
     // resolve them against and would only reject them.
     body.erase("geometry_from");
     body.erase("rig_cache_from");
+    // Placement is the PARENT's decision and it has already been made — by the time the child is
+    // running, its CUDA_VISIBLE_DEVICES is the answer. Forwarding `gpu` would only give the child a
+    // card to validate against a set it cannot act on.
+    body.erase("gpu");
 
-    // The lease both spawns the worker and pins it: nothing can unload it under us.
-    avsup::Worker::Lease lease = st.worker->lease();
+    // The lease both spawns the worker and pins it (nothing can unload it under us) AND places it:
+    // a worker resident on the wrong card is killed and respawned on `gpu` here, which is safe
+    // precisely because we hold no lease yet.
+    avsup::Worker::Lease lease = st.worker->lease(gpu);
     if (!lease.ok()) { finish(st, j, false, "GPU worker unavailable: " + lease.error(), "unavailable"); return; }
     {
         std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1373,7 +1568,7 @@ void submit(State& st, const httplib::Request& req, httplib::Response& res, cons
 // design (~2.1 GB), which drops free VRAM to ~9.6 GB, which then refused EVERY subsequent request
 // — including motion ones that would have fitted — until idle-unload fired 300 s later. A guard
 // that bricks the service after one successful job is worse than the OOM it was guarding against.
-bool admit(State& st, httplib::Response& res, bool needs_rig_vram) {
+bool admit(State& st, httplib::Response& res, bool needs_rig_vram, const std::string& gpu) {
     const avatar::Health h = backend_health(st);
     if (h.draining) {
         std::lock_guard<std::mutex> lk(st.jm.mx);
@@ -1406,11 +1601,12 @@ bool admit(State& st, httplib::Response& res, bool needs_rig_vram) {
                                        : (h.in_flight == 0 && live == 0);
     if (needs_rig_vram && idle_enough) {
         std::string verr;
-        if (!vram_ok(st, verr)) {
+        if (!vram_ok(st, gpu, verr)) {
             std::lock_guard<std::mutex> lk(st.jm.mx);
             st.jm.rejected++;
             set_json(res, {{"error", verr}, {"error_code", "insufficient_vram"},
-                           {"free_mib", free_vram_mib(st)}, {"min_free_mib", st.cfg.min_free_mib}}, 503);
+                           {"gpu", gpu}, {"free_mib", free_vram_mib(st, gpu)},
+                           {"min_free_mib", st.cfg.min_free_mib}}, 503);
             return false;
         }
     }
@@ -1484,7 +1680,12 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
     if (!resolve_reruns(st, b, err)) { set_json(res, {{"error", err}}, 400); return; }
     std::vector<Tier> probe;
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
-    if (!admit(st, res, /*needs_rig_vram=*/true)) return;
+    std::string gpu;
+    if (!resolve_gpu(st, req, b, /*needs_rig_vram=*/true, gpu, err)) {
+        set_json(res, {{"error", err}, {"error_code", "bad_gpu"}}, 400);
+        return;
+    }
+    if (!admit(st, res, /*needs_rig_vram=*/true, gpu)) return;
 
     const std::string id = mint_job_id(st, b);
     const std::string dir = make_job_dir(st, id);
@@ -1494,11 +1695,12 @@ void handle_rig(State& st, const httplib::Request& req, httplib::Response& res) 
 
     json echo = b;
     echo["rig_retries"] = b.value("rig_retries", st.cfg.rig_retries);
+    echo["gpu"] = gpu;
     echo["tiers"] = json::array();
     for (const auto& t : probe) echo["tiers"].push_back(json{{"name", t.name}, {"decimate", t.decimate}});
     submit(st, req, res, "rig", echo,
-           [&st, b, image](JobPtr j) {
-               if (st.worker) run_proxy(st, j, "/v1/rig", b, /*needs_rig_vram=*/true);
+           [&st, b, image, gpu](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/rig", b, /*needs_rig_vram=*/true, gpu);
                else           run_rig(st, j, b, image);
            }, dir, id);
 }
@@ -1510,12 +1712,17 @@ void handle_motion(State& st, const httplib::Request& req, httplib::Response& re
     if (!validate_common(b, /*needs_prompt=*/true, err)) { set_json(res, {{"error", err}}, 400); return; }
     // needs_rig_vram=false: the motion stage is nowhere near the rig's 10.7 GB, and holding it to
     // that floor refuses work that fits (see admit()).
-    if (!admit(st, res, /*needs_rig_vram=*/false)) return;
+    std::string gpu;
+    if (!resolve_gpu(st, req, b, /*needs_rig_vram=*/false, gpu, err)) {
+        set_json(res, {{"error", err}, {"error_code", "bad_gpu"}}, 400);
+        return;
+    }
+    if (!admit(st, res, /*needs_rig_vram=*/false, gpu)) return;
     const std::string id = mint_job_id(st, b);
     const std::string dir = make_job_dir(st, id);
     submit(st, req, res, "motion", b,
-           [&st, b](JobPtr j) {
-               if (st.worker) run_proxy(st, j, "/v1/motion", b, /*needs_rig_vram=*/false);
+           [&st, b, gpu](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/motion", b, /*needs_rig_vram=*/false, gpu);
                else           run_motion(st, j, b);
            }, dir, id);
 }
@@ -1566,7 +1773,12 @@ void handle_animate(State& st, const httplib::Request& req, httplib::Response& r
         return;
     }
     // needs_card=false: the retarget never touches the GPU, so it must not be refused for VRAM.
-    if (!admit(st, res, /*needs_rig_vram=*/false)) return;
+    std::string gpu;
+    if (!resolve_gpu(st, req, b, /*needs_rig_vram=*/false, gpu, err)) {
+        set_json(res, {{"error", err}, {"error_code", "bad_gpu"}}, 400);
+        return;
+    }
+    if (!admit(st, res, /*needs_rig_vram=*/false, gpu)) return;
     const std::string id = mint_job_id(st, b);
     const std::string dir = make_job_dir(st, id);
     json echo = b;
@@ -1582,8 +1794,8 @@ void handle_animate(State& st, const httplib::Request& req, httplib::Response& r
     for (const auto& p : paths) cb["clips"].push_back(p);
     for (const auto& t : texts) cb["clips"].push_back(t);
     submit(st, req, res, "animate", echo,
-           [&st, b, cb, rig_glb, texts, paths](JobPtr j) {
-               if (st.worker) run_proxy(st, j, "/v1/animate", cb, /*needs_rig_vram=*/false);
+           [&st, b, cb, rig_glb, texts, paths, gpu](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/animate", cb, /*needs_rig_vram=*/false, gpu);
                else           run_animate(st, j, b, rig_glb, texts, paths);
            },
            dir, id);
@@ -1600,16 +1812,22 @@ void handle_render(State& st, const httplib::Request& req, httplib::Response& re
     if (!resolve_reruns(st, b, err)) { set_json(res, {{"error", err}}, 400); return; }
     std::vector<Tier> probe;
     if (!parse_tiers(b, probe, err)) { set_json(res, {{"error", err}}, 400); return; }
-    if (!admit(st, res, /*needs_rig_vram=*/true)) return;
+    std::string gpu;
+    if (!resolve_gpu(st, req, b, /*needs_rig_vram=*/true, gpu, err)) {
+        set_json(res, {{"error", err}, {"error_code", "bad_gpu"}}, 400);
+        return;
+    }
+    if (!admit(st, res, /*needs_rig_vram=*/true, gpu)) return;
     const std::string id = mint_job_id(st, b);
     const std::string dir = make_job_dir(st, id);
     std::string image;
     if (!resolve_image(req, b, dir, image, err)) { set_json(res, {{"error", err}}, 400); return; }
     b["image"] = image;
     json echo = b;
+    echo["gpu"] = gpu;
     submit(st, req, res, "render", echo,
-           [&st, b, image](JobPtr j) {
-               if (st.worker) run_proxy(st, j, "/v1/render", b, /*needs_rig_vram=*/true);
+           [&st, b, image, gpu](JobPtr j) {
+               if (st.worker) run_proxy(st, j, "/v1/render", b, /*needs_rig_vram=*/true, gpu);
                else           run_render(st, j, b, image);
            }, dir, id);
 }
@@ -1661,6 +1879,20 @@ void register_routes(httplib::Server& svr, State& st) {
             {"worker_pid", st.worker ? st.worker->pid() : 0},
             {"worker_spawns", st.worker ? st.worker->spawns() : 0},
             {"role", st.worker ? "parent" : (st.worker_mode ? "worker" : "single-process")},
+            // ---- placement ----------------------------------------------------------------------
+            // 🔴 `gpus` IS THE CONTRACT koblem CHECKS ITS GATE ALLOCATION AGAINST before it submits,
+            // exactly as it already does for spar3d. Publishing the accepted set here is what stops
+            // a scheduler row naming a card this service cannot reach from becoming a reservation
+            // on a card the render never runs on. Empty = single-pin, pre-placement behaviour.
+            {"gpus", st.cfg.gpus},
+            // Where an UN-TARGETED submit would go — the supervisor's own default, not a hard pin.
+            {"gpu_uuid", st.cfg.default_gpu.empty() ? json(nullptr) : json(st.cfg.default_gpu)},
+            // Where the worker actually is right now. null when no worker is up: "where would it
+            // go" and "where is it" are different questions and only the second one is evidence.
+            {"worker_gpu", st.worker && !st.worker->worker_gpu().empty()
+                               ? json(st.worker->worker_gpu())
+                               : json(nullptr)},
+            {"auto_place", st.cfg.auto_place},
         });
     });
 
@@ -1684,18 +1916,38 @@ void register_routes(httplib::Server& svr, State& st) {
         } else {
             json cg;
             const bool got = worker_get(st, "/v1/gpu/status", cg);
+            // `mem_free_mb` stays the WORKER's card when there is one, and the default card when
+            // there is not. A single number that silently meant a different GPU depending on
+            // placement would be worse than no number: this one always names its card below.
+            const std::string measured =
+                st.worker && !st.worker->worker_gpu().empty() ? st.worker->worker_gpu()
+                                                              : st.cfg.default_gpu;
             b = {
                 {"loaded", st.worker && st.worker->alive()},
                 {"gpu", got && cg.contains("gpu") ? cg["gpu"] : json(nullptr)},
-                {"mem_free_mb", avsup::nvml_free_mib()},
-                {"mem_total_mb", avsup::nvml_total_mib()},
+                {"mem_free_mb", avsup::nvml_free_mib(measured)},
+                {"mem_total_mb", avsup::nvml_total_mib(measured)},
+                {"measured_gpu", measured.empty() ? json(nullptr) : json(measured)},
                 {"peak_vram_used_mib", got ? cg.value("peak_vram_used_mib", (long)0) : (long)0},
                 {"baseline_vram_used_mib", got ? cg.value("baseline_vram_used_mib", (long)0) : (long)0},
                 {"vram_source", "nvml"},
                 {"nvml", avsup::nvml_note()},
                 {"worker_pid", st.worker ? st.worker->pid() : 0},
                 {"worker_spawns", st.worker ? st.worker->spawns() : 0},
+                {"worker_gpu", st.worker && !st.worker->worker_gpu().empty()
+                                   ? json(st.worker->worker_gpu())
+                                   : json(nullptr)},
             };
+            // Every card we may place on, so "is there anywhere for a rig to run" is answerable in
+            // one call — which is the question an operator actually has when a submit 503s.
+            json cards = json::array();
+            for (const auto& g : st.cfg.gpus)
+                cards.push_back({{"uuid", g},
+                                 {"mem_free_mb", avsup::nvml_free_mib(g)},
+                                 {"mem_total_mb", avsup::nvml_total_mib(g)},
+                                 {"fits", avsup::nvml_free_mib(g) >= st.cfg.min_free_mib},
+                                 {"resident", st.worker && st.worker->worker_gpu() == g}});
+            if (!cards.empty()) b["cards"] = cards;
         }
         if (const char* v = std::getenv("CUDA_VISIBLE_DEVICES"); v && *v) b["cuda_visible_devices"] = v;
         set_json(res, b);
@@ -1909,6 +2161,18 @@ void usage() {
         "  --lock [PATH]         cross-process GPU flock (default off; held by the WORKER)\n"
         "  --geo-model DIR --hymotion PATH --llm PATH --clip-l PATH   weight overrides\n"
         "  --cpu                 no CUDA (diagnostics only)\n"
+        "\n"
+        "  Placement (env only; the fleet contract, see HANDOFF-multi-gpu-scheduler.md):\n"
+        "    LONGCAT_RIG_GPUS      comma list of GPU UUIDs this service may place its worker on.\n"
+        "                          Defaults to CUDA_VISIBLE_DEVICES; fewer than two = no placement.\n"
+        "                          The container must actually BE GIVEN every card listed.\n"
+        "    WORKER_DEFAULT_GPU    the home card for an un-targeted request (must be in the set)\n"
+        "    LONGCAT_RIG_AUTO_PLACE=0  never pick a card ourselves; obey `gpu` or use the default\n"
+        "    LONGCAT_RIG_LOCK_GPU  which card --lock is ABOUT (default: CUDA_VISIBLE_DEVICES[0]).\n"
+        "                          Other cards get `<lock>.<uuid-tail>` so a render on one GPU\n"
+        "                          cannot block a host driver waiting for the other.\n"
+        "    per-request `gpu`     a GPU UUID, in the JSON body or as a multipart field. Relocates\n"
+        "                          the worker (kill + respawn) when it names the other card.\n"
         "  --worker              INTERNAL: run as the CUDA-owning child of a supervisor parent.\n"
         "                        Spawned automatically; never pass this by hand.\n"
         "  --no-worker-isolation own the CUDA context in THIS process (the pre-isolation shape).\n"
@@ -1948,6 +2212,27 @@ int main(int argc, char** argv) {
     cfg.min_free_mib = getenv_int("LONGCAT_RIG_MIN_FREE_MIB", 0);
     cfg.rig_retries = getenv_int("LONGCAT_RIG_RETRIES", 2);
     cfg.max_pending = getenv_int("LONGCAT_RIG_MAX_PENDING", 32);
+
+    // ---- placement config ---------------------------------------------------------------------
+    // `LONGCAT_RIG_GPUS` defaults to the container's own CUDA_VISIBLE_DEVICES, which makes the
+    // no-config case exactly the old one: a single card, no relocation, nothing to get wrong.
+    // `WORKER_DEFAULT_GPU` is the fleet-wide name for the home card (HANDOFF-multi-gpu-scheduler §5)
+    // and is checked FIRST against the set, because a default outside the set is a config error that
+    // would otherwise show up as an unexplained refusal on a card nobody asked for.
+    cfg.gpus = split_list(getenv_str("LONGCAT_RIG_GPUS", getenv_str("CUDA_VISIBLE_DEVICES", "")));
+    cfg.default_gpu = getenv_str("WORKER_DEFAULT_GPU", "");
+    cfg.auto_place = getenv_int("LONGCAT_RIG_AUTO_PLACE", 1) != 0;
+    // A single-entry set is not placement, it is the container pin — drop it so nothing downstream
+    // treats it as a choice, and so /health reports `gpus: []` (the honest "I cannot relocate").
+    if (cfg.gpus.size() < 2) cfg.gpus.clear();
+    if (!cfg.default_gpu.empty() && !cfg.gpus.empty() &&
+        std::find(cfg.gpus.begin(), cfg.gpus.end(), cfg.default_gpu) == cfg.gpus.end()) {
+        std::fprintf(stderr,
+                     "WORKER_DEFAULT_GPU=%s is not in LONGCAT_RIG_GPUS=%s — refusing to start rather "
+                     "than defaulting to a card that was not offered\n",
+                     cfg.default_gpu.c_str(), join_str(cfg.gpus, ",").c_str());
+        return 2;
+    }
 
     // Our own argv, verbatim, kept before the parser touches it: it is what the child is launched
     // with, plus the overrides avatar_worker.hpp appends. Every weight path, --lock, --min-free-mib
@@ -2019,6 +2304,17 @@ int main(int argc, char** argv) {
         std::string exe_path = (n > 0) ? std::string(exe, (size_t)n) : std::string(argv[0]);
         worker = std::make_unique<avsup::Worker>(exe_path, original_args,
                                                  [](const char* m) { log_line("%s", m); });
+        worker->set_default_gpu(cfg.default_gpu);
+        // Which card the configured flock is ABOUT. It is a real file shared with host-side shell
+        // drivers, so it arbitrates one physical GPU and only that one; every other placement gets
+        // its own sibling lock (see set_lock_policy). Explicit env rather than "the first entry of
+        // CUDA_VISIBLE_DEVICES", because that made a correctness property depend on the ORDER of an
+        // unrelated variable — reorder the list to change the default card and you would silently
+        // move which GPU the host drivers interlock with.
+        const std::vector<std::string> visible = split_list(getenv_str("CUDA_VISIBLE_DEVICES", ""));
+        worker->set_lock_policy(
+            ecfg.gpu_lock_path,
+            getenv_str("LONGCAT_RIG_LOCK_GPU", visible.empty() ? std::string() : visible[0]));
         st.worker = worker.get();
         log_line("worker isolation ON — this process owns NO CUDA context; NVML device %s",
                  avsup::nvml_note().c_str());
@@ -2026,6 +2322,19 @@ int main(int argc, char** argv) {
             log_line("WARN: NVML cannot be read, so the %d MiB VRAM floor cannot be enforced at "
                      "submit time. The worker still enforces it with the card in hand.",
                      cfg.min_free_mib);
+        // ⚠️ A CARD IN THE SET THAT NVML CANNOT RESOLVE IS A SILENT CPU FALLBACK WAITING TO HAPPEN,
+        // so say it once at boot rather than discovering it as a 20× slow render. Not fatal: the
+        // per-request check refuses that card, and the other one may be perfectly good.
+        for (const auto& g : cfg.gpus)
+            if (!avsup::nvml_knows(g))
+                log_line("WARN: placement card %s is not a GPU this container was given — requests "
+                         "naming it will be refused (check compose device_ids / count: all)",
+                         g.c_str());
+        if (!cfg.gpus.empty())
+            log_line("placement ON — cards %s, default %s, auto-place %s",
+                     join_str(cfg.gpus, ",").c_str(),
+                     cfg.default_gpu.empty() ? "(container pin)" : cfg.default_gpu.c_str(),
+                     cfg.auto_place ? "on" : "off");
     }
 
     httplib::Server svr;
