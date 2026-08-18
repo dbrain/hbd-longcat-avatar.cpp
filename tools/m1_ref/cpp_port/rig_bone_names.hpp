@@ -23,17 +23,39 @@
 //   skeleton is the FEET: toes lie forward of ankles.
 //
 //     forward = sign( sum over both feet of (toe.z - ankle.z) )      [+1 => faces +Z]
-//     right   = up x forward = yhat x (f * zhat) = f * xhat          [so right_sign = f]
+//     right   = forward x up = (f * zhat) x yhat = -f * xhat         [so right_sign = -f]
+//
+//   *** FIXED 2026-08-18. This line used to read `right = up x forward`, giving
+//   *** right_sign = +f -- the cross product taken in the wrong order. EVERY rig this
+//   *** namer has ever produced therefore carries Left/Right SWAPPED on all 16 sided
+//   *** joints. glTF 2.0 section 3.5 states the convention outright: right-handed, +Y up,
+//   *** +Z forward, and -X RIGHT. Check it physically: a character facing +Z faces the
+//   *** camera at +Z, and when you face someone their right hand is on your left, which
+//   *** is -X. Note motion_retarget.hpp's body_side_frame() has always used
+//   *** `right = cross(fwd, UP)` -- the two files disagreed, and that one was correct.
+//   ***
+//   *** MEASURED on the shipped miku_rigged.glb: LeftToeBase.z=+0.121 > LeftFoot.z=+0.043
+//   *** and Head.z=+0.309 > Neck.z=+0.285, so she faces +Z and her own right is -X --
+//   *** and the joint named RightFoot sat at x=+0.223. The user saw it in the koblem rig
+//   *** editor before this file did.
+//   ***
+//   *** WHY IT SURVIVED: falsify_bone_names()'s C0 cross-checks the FACING against a
+//   *** second cue, but nothing checked the facing -> side RULE, and C3/C4 measure sides
+//   *** against R.right_sign itself (their own comment says so). Downstream, the motion
+//   *** retarget's decide_lr_swap() measures which side the rig's "L" joints really sit on
+//   *** and swaps if it disagrees with the source clip -- so takes animated CORRECTLY off
+//   *** mirrored names, and only a human reading the names could catch it. Fixing this
+//   *** flips that swap decision to match; motion is unaffected either way.
 //
 //   MEASURED, NOT ASSUMED: this is NOT a constant of the SkinTokens output.
-//     soldier1536_rigged.glb : faces +Z  (char right = +X)
-//     gilly_rigged.glb       : faces -Z  (char right = -X)
+//     soldier1536_rigged.glb : faces +Z  (char right = -X)
+//     gilly_rigged.glb       : faces -Z  (char right = +X)
 //   Both were confirmed independently by rendering the mesh from +Z and -Z and looking
-//   at which side the face is on. The toe cue agreed with the render on both.
+//   at which side the face is on. The toe cue agreed with the render on both. (The render
+//   confirmed the FACING; the char-right column is the rule above applied to it.)
 //
-//   => bonemap.py's hardcoded `char-left = -X` is WRONG for gilly, and the gilly map in
-//      MIXAMO_REPORT.md is consequently L/R-MIRRORED. That is why this file derives
-//      facing per-character instead of hardcoding it.
+//   => bonemap.py's hardcoded `char-left = -X` is right for gilly and WRONG for soldier.
+//      That is why this file derives facing per-character instead of hardcoding it.
 //
 //   Override: RIG_BONE_FACING=+z|-z  (or NameOpts::facing_override).
 // ---------------------------------------------------------------------------------------
@@ -549,8 +571,9 @@ inline BoneNaming name_bones(const std::vector<float>& joints,
         if (R.facing_margin < 0.03f)
             R.notes.push_back("facing margin < 3% of body height — chirality is weakly determined");
     }
-    // right = up x forward = yhat x (f*zhat) = f*xhat
-    R.right_sign = R.facing;
+    // right = forward x up = (f*zhat) x yhat = -f*xhat.  See the CHIRALITY block at the top
+    // of this file: the opposite order shipped for months and mirrored every rig it named.
+    R.right_sign = -R.facing;
 
     // ---- 5. now that chirality is known, bind the arms/legs to sides.
     // armA sits at -X, armB at +X.
@@ -1150,6 +1173,19 @@ inline int falsify_bone_names(const std::vector<float>& joints,
                          R.facing_from_override ? " [facing was OVERRIDDEN]" : ""));
         }
     }
+
+    // --- C0b: the facing -> SIDE rule itself.
+    //
+    // Tautological against the one line that sets right_sign, and that is exactly the point:
+    // C0 above checks that the FACING is right, C3/C4 below measure sides against right_sign
+    // and are circular, so from 2026-08-18 back to the beginning NOTHING checked the rule in
+    // between -- and it was inverted the whole time. This is the tripwire for that line.
+    //
+    // glTF 2.0 section 3.5: right-handed, +Y up, +Z forward, -X right. So a character facing
+    // +Z has its own right at -X, and right_sign == -facing. Do not "simplify" this away.
+    CHECK(R.right_sign == -R.facing, "right-is-minus-facing",
+          bn_fmt("facing=%+dZ -> char-right=%+dX by glTF 2.0 3.5; right_sign=%+d",
+                 R.facing, -R.facing, R.right_sign));
 
     // --- C1: the Head's subtree contains the highest joint in the skeleton.
     // Never used by the naming (which only compares ROOT-CHILD subtree maxima).

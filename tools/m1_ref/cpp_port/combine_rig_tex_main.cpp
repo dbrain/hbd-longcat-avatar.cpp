@@ -221,9 +221,13 @@ static bool repair_soldier_right_toe_arm_seam(const std::vector<float>& verts,
         return false;
     }
     const rig::BoneNaming named = rig::name_bones(joints, parents);
+    // 🔴 `right_sign == -1` for a +Z-facing character, NOT +1. This gate read `+1` while
+    // rig_bone_names.hpp computed `right = up x forward`; that sign was fixed on 2026-08-18 (see
+    // the CHIRALITY block there), and left unchanged this condition became unsatisfiable and the
+    // repair silently stopped running. The SMPL slots below moved with it — see the note there.
     if (!named.ok || named.named_core != rig::SMPL_N || named.n_extra != 0 ||
-        named.facing != +1 || named.right_sign != +1 || named.facing_margin < .18f) {
-        std::printf("  Soldier toe-arm seam audit: rejected naming ok=%d core=%d extra=%d facing=%d right=%d margin=%.4f (need ok, core=22, extra=0, +1Z, +1X, margin>=0.18)\n",
+        named.facing != +1 || named.right_sign != -1 || named.facing_margin < .18f) {
+        std::printf("  Soldier toe-arm seam audit: rejected naming ok=%d core=%d extra=%d facing=%d right=%d margin=%.4f (need ok, core=22, extra=0, +1Z, -1X, margin>=0.18)\n",
                     named.ok, named.named_core, named.n_extra, named.facing,
                     named.right_sign, named.facing_margin);
         return false;
@@ -275,7 +279,12 @@ static bool repair_soldier_right_toe_arm_seam(const std::vector<float>& verts,
         return false;
     }
 
-    const int toe = slot[11], arm = slot[17], forearm = slot[19], hand = slot[21];
+    // ⚠️ The SIDE these slots name is the +X half of the body, which is what the per-vertex filter
+    // below selects (`p[0] - cx > .10 * height`) — the two must agree or nothing matches. On a
+    // character facing +Z, +X is the character's own LEFT, so these are the L_* slots (16/18/20 and
+    // L_foot 10). They were the R_* slots until the chirality fix of 2026-08-18 renamed that half
+    // of the body; the physical side being repaired is unchanged.
+    const int toe = slot[10], arm = slot[16], forearm = slot[18], hand = slot[20];
     // Soldier's arms rest close to shoulder height, not in the head band.
     // This starts above the pelvis/hip mass while still including its actual
     // upper-arm surface.
@@ -322,7 +331,9 @@ static bool repair_soldier_right_toe_arm_seam(const std::vector<float>& verts,
     if (detail) {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "suppressed impossible RightToeBase mass on %d right upper-arm vertices; reassigned %.3f only across existing RightArm/ForeArm/Hand support",
+                      // Same physical (+X) side this always repaired; those joints were called
+                      // Right* before the 2026-08-18 chirality fix renamed that half of the body.
+                      "suppressed impossible LeftToeBase mass on %d +X upper-arm vertices; reassigned %.3f only across existing LeftArm/ForeArm/Hand support",
                       moved_rows, moved_mass);
         *detail = msg;
     }
