@@ -143,6 +143,30 @@ struct M1Harness {
         wcache[key] = t;
         return t;
     }
+    // Host-side F32 fetch of a small stored table (the rope phase/period tables). These are
+    // consumed by the CPU to build persistent cos/sin constants, so they never pass through
+    // weight() — but they are still WEIGHTS, and must follow the same source: the GGUF when the
+    // bundle is packed, the .npy only when it is not. Loading them straight from wdir made the
+    // whole geometry chain silently depend on a per-tensor .npy tree that the GGUF bundle was
+    // supposed to have replaced.
+    std::vector<float> host_f32(const std::string& key) {
+        if (use_gguf) {
+            ggml_tensor* src = ggml_get_tensor(gctx_data, key.c_str());
+            if (!src) throw std::runtime_error("gguf tensor not found: " + key);
+            const int64_t n = ggml_nelements(src);
+            std::vector<float> out((size_t)n);
+            if (src->type == GGML_TYPE_F32) {
+                std::memcpy(out.data(), src->data, (size_t)n * sizeof(float));
+            } else if (src->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t*)src->data, out.data(), (int)n);
+            } else {
+                throw std::runtime_error("gguf host_f32: unsupported type for " + key);
+            }
+            return out;
+        }
+        NpyArray a = npy_load(wdir + "/" + key + ".npy");
+        return std::vector<float>(a.f32(), a.f32() + a.numel());
+    }
     bool is_cuda() const {
 #ifdef M1_USE_CUDA
         return ggml_backend_is_cuda(backend);

@@ -84,8 +84,8 @@ static inline ggml_tensor* to_head(ggml_context* ctx, ggml_tensor* x, int d, int
 // axial RoPE on x [W,H,256,1]. periods loaded from wdir host. COS/SIN persistent consts.
 static inline ggml_tensor* rope(ggml_context* ctx, M1Harness& H, ggml_tensor* x, int IMG) {
     // periods [16] (host)
-    NpyArray pe = npy_load(H.wdir + "/image_encoder.rope.periods.npy");
-    const float* per = pe.f32();
+    std::vector<float> pe = H.host_f32("image_encoder.rope.periods");
+    const float* per = pe.data();
     const int64_t HW = (int64_t)IMG * IMG;
     std::vector<float> cosb((size_t)DR * HW), sinb((size_t)DR * HW);
     for (int h = 0; h < IMG; h++) {

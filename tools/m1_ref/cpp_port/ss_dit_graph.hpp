@@ -85,7 +85,7 @@ static inline ggml_tensor* rope_inter(ggml_context* ctx, ggml_tensor* t, ggml_te
 
 // host helpers for COS/SIN/freqs (defined below)
 static inline void fill_freqs(std::vector<float>& fr);
-static inline void fill_cos_sin(const std::string& rope_npy, std::vector<float>& cosb, std::vector<float>& sinb);
+static inline void fill_cos_sin(M1Harness& H, std::vector<float>& cosb, std::vector<float>& sinb);
 
 // Inputs: xin [token,8], tin [1] (t_scaled), gin [1024,5], pin [1024,token].
 // rope COS/SIN/freqs are created internally as PERSISTENT constants (survive recompute).
@@ -98,7 +98,7 @@ static inline ggml_tensor* build_ss_dit_forward(ggml_context* ctx, M1Harness& H,
     const bool bf16 = use_native_bf16();
     // rope constants (persistent — NOT gallocr-managed inputs)
     std::vector<float> frb; fill_freqs(frb);
-    std::vector<float> cosb, sinb; fill_cos_sin(H.wdir + "/rope_phases.npy", cosb, sinb);
+    std::vector<float> cosb, sinb; fill_cos_sin(H, cosb, sinb);
     int64_t fr_ne[4] = {TE_HALF, 1, 1, 1};
     ggml_tensor* freqs = H.const_tensor("rope_freqs", 1, fr_ne, std::move(frb));
     int64_t cs_ne[4] = {HD, 1, SEQ, 1};
@@ -196,9 +196,9 @@ static inline void fill_freqs(std::vector<float>& fr) {
     fr.resize(TE_HALF);
     for (int i = 0; i < TE_HALF; i++) fr[i] = std::exp(-std::log(10000.0f) * i / TE_HALF);
 }
-static inline void fill_cos_sin(const std::string& rope_npy, std::vector<float>& cosb, std::vector<float>& sinb) {
-    NpyArray rp = npy_load(rope_npy);  // [4096,64,2]
-    const float* rpf = rp.f32();
+static inline void fill_cos_sin(M1Harness& H, std::vector<float>& cosb, std::vector<float>& sinb) {
+    std::vector<float> rp = H.host_f32("rope_phases");  // [4096,64,2]
+    const float* rpf = rp.data();
     cosb.assign((size_t)HD * SEQ, 0.f); sinb.assign((size_t)HD * SEQ, 0.f);
     for (int t = 0; t < SEQ; t++)
         for (int p = 0; p < HD / 2; p++) {

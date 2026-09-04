@@ -56,6 +56,10 @@ _STATE = {
 _SHAPE_COND_NAMES = ['stage2_cond', 'stage3b_cond', 'stage4_cond']
 
 
+class Stage1TraceComplete(RuntimeError):
+    """Intentional early exit after a stage-1 transformer checkpoint capture."""
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -81,6 +85,10 @@ def _np_raw(t):
 def _save(stage, name, arr):
     if arr is None:
         return None
+    # Some Pixal tensors are transposed views.  Persist C-order arrays so the
+    # native oracle reader sees the same linear element sequence without
+    # needing a Python-only Fortran-order NPY decoder.
+    arr = np.ascontiguousarray(arr)
     d = os.path.join(_STATE['out_dir'], stage)
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, name + '.npy')
@@ -161,6 +169,42 @@ def install(out_dir='golden_stages'):
 
     from pixal3d.pipelines.pixal3d_image_to_3d import Pixal3DImageTo3DPipeline as P
 
+    # Optional, narrow image-conditioner boundary capture.  Stage boundaries alone
+    # show that the native and Python projection tensors differ, but cannot say
+    # whether the DINO encoder or the projection grid created the delta.  Keep
+    # this opt-in: a normal reference capture should remain compact.
+    if os.getenv('PIXAL3D_DINO_BOUNDARY_TRACE'):
+        from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import \
+            DinoV3ProjFeatureExtractor
+        _orig_extract_features = DinoV3ProjFeatureExtractor.extract_features
+        _dino_calls = {'count': 0}
+
+        def _trace_extract_features(self, image, _orig=_orig_extract_features):
+            features = _orig(self, image)
+            call = _dino_calls['count']
+            _dino_calls['count'] = call + 1
+            # The first conditioner is exactly stage-1: 512px, no NAF.  The
+            # tensor is already ImageNet-normalized and cast to the encoder's
+            # input dtype, so it is the authoritative native/Python boundary.
+            if call == 0:
+                try:
+                    prefix = 1 + int(getattr(self.model.config, 'num_register_tokens', 4))
+                    side = int(getattr(self, 'patch_number'))
+                    info = {
+                        'normalized_input': _save('stage1_dino', 'normalized_input', _np(image)),
+                        'features': _save('stage1_dino', 'features', _np(features)),
+                        'global': _save('stage1_dino', 'global', _np(features[:, :prefix])),
+                        'patchmap': _save('stage1_dino', 'patchmap',
+                                          _np(features[:, prefix:].reshape(features.shape[0], side, side, -1))),
+                        'call': call,
+                    }
+                    _record('stage1_dino', **info)
+                except Exception as e:
+                    print(f'[stage_hook] stage1 DINO boundary capture skipped: {e}', flush=True)
+            return features
+
+        DinoV3ProjFeatureExtractor.extract_features = _trace_extract_features
+
     # ---- copy the config files for ground-truth port reference ----
     _copy_configs(out_dir)
 
@@ -234,14 +278,79 @@ def install(out_dir='golden_stages'):
             dec.forward = dec_fwd
             dec._stage_hooked = True
 
-        with _Vram('stage1'):
-            coords = _orig_sample_ss(self, cond, resolution, num_samples, sampler_params)
+        # Pixal3D creates stage-1 noise on CPU and then moves it to CUDA.  Capture
+        # exactly that tensor, scoped to this one call, so the native MT19937
+        # compatibility claim can be checked before blaming the flow model.
+        import torch
+        flow = self.models.get('sparse_structure_flow_model')
+        # Optional, bounded precision diagnosis: retain selected block outputs
+        # from the *first* stage-1 model invocation (conditional, t=1.0).  This
+        # keeps the artefact under ~200 MiB instead of writing all 30 blocks
+        # over all 20 conditional/unconditional calls.  It is never enabled by
+        # the normal golden capture or production inference.
+        trace_env = os.getenv('PIXAL3D_STAGE1_BLOCK_TRACE')
+        trace_handles = []
+        trace_counts = {}
+        if trace_env and flow is not None:
+            try:
+                trace_blocks = {int(v) for v in trace_env.split(',') if v.strip()}
+            except ValueError as e:
+                raise ValueError('PIXAL3D_STAGE1_BLOCK_TRACE must be comma-separated block indices') from e
+            for bi, block in enumerate(flow.blocks):
+                if bi not in trace_blocks:
+                    continue
+                trace_counts[bi] = 0
+
+                def _trace(_module, _args, output, _bi=bi):
+                    call = trace_counts[_bi]
+                    trace_counts[_bi] = call + 1
+                    if call == 0:
+                        _save('stage1_block_trace', f'block_{_bi:02d}', _np(output))
+
+                trace_handles.append(block.register_forward_hook(_trace))
+        expected_shape = None
+        if flow is not None:
+            expected_shape = (num_samples, flow.in_channels, flow.resolution,
+                              flow.resolution, flow.resolution)
+        captured_noise = {}
+        original_randn = torch.randn
+
+        def capture_randn(*shape, **kwargs):
+            value = original_randn(*shape, **kwargs)
+            actual_shape = tuple(shape)
+            if expected_shape is not None and actual_shape == expected_shape and 'value' not in captured_noise:
+                captured_noise['value'] = value
+            return value
+
+        torch.randn = capture_randn
+        try:
+            with _Vram('stage1'):
+                coords = _orig_sample_ss(self, cond, resolution, num_samples, sampler_params)
+        finally:
+            torch.randn = original_randn
+            for handle in trace_handles:
+                handle.remove()
+        try:
+            if 'value' in captured_noise:
+                _save('stage1_noise', 'noise', _np(captured_noise['value']))
+                _record('stage1_noise', noise=[list(captured_noise['value'].shape),
+                                               str(captured_noise['value'].dtype)])
+            else:
+                print('[stage_hook] stage1 noise capture missed expected torch.randn call')
+        except Exception as e:
+            print(f"[stage_hook] stage1_noise capture skipped: {e}")
         try:
             sh = _save('stage1_out', 'coords', _np_raw(coords).astype(np.int32))
             _record('stage1_out', coords=sh, n_voxels=int(coords.shape[0]),
                     resolution=int(resolution))
         except Exception as e:
             print(f"[stage_hook] stage1_out capture skipped: {e}")
+        if trace_env:
+            _record('stage1_block_trace', captured_blocks=sorted(trace_counts),
+                    invocation='first conditional stage-1 forward at t=1.0',
+                    calls_per_captured_block=trace_counts)
+            if os.getenv('PIXAL3D_STAGE1_TRACE_ONLY'):
+                raise Stage1TraceComplete('stage-1 block trace captured; stopping before downstream stages')
         return coords
 
     P.sample_sparse_structure = sample_sparse_structure
@@ -350,6 +459,24 @@ def install(out_dir='golden_stages'):
         return slat
 
     P.sample_tex_slat = sample_tex_slat
+
+    # ---- STAGE 4b: decode the texture latent to the sparse PBR volume ----
+    # The final rendered atlas can hide whether an artefact was introduced by the UV bake or
+    # already exists in M6's decoded volume.  Retain this boundary for a native-vs-reference
+    # diagnostic only; it does not alter inference or the production native path.
+    _orig_decode_tex = P.decode_tex_slat
+
+    def decode_tex_slat(self, slat, subs):
+        with _Vram('stage4b_pbr_decode'):
+            pbr = _orig_decode_tex(self, slat, subs)
+        try:
+            info = _dump_sparse('stage4b_pbr', 'pbr', pbr)
+            _record('stage4b_pbr', **info)
+        except Exception as e:
+            print(f"[stage_hook] stage4b_pbr capture skipped: {e}")
+        return pbr
+
+    P.decode_tex_slat = decode_tex_slat
 
     # ---- STAGE 5 final: decode_latent (post fill_holes) ----
     _orig_decode_latent = P.decode_latent

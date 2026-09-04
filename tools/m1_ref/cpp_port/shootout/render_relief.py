@@ -66,18 +66,26 @@ def main() -> int:
     if len(sys.argv) < 3:
         raise SystemExit(f"usage: {sys.argv[0]} <out.png> <label=mesh.glb> ...")
     out = sys.argv[1]
-    entries = [a.split("=", 1) for a in sys.argv[2:]]
+    args = sys.argv[2:]
+    # Front-facing yaw is PER SUBJECT (miku 180, soldier 0), so a fixed camera renders some
+    # subjects from behind and the A/B silently compares a back to a back.
+    yaw_deg = 180.0
+    if "--yaw" in args:
+        i = args.index("--yaw")
+        yaw_deg = float(args[i + 1])
+        del args[i:i + 2]
+    entries = [a.split("=", 1) for a in args]
 
     cols = []
     for label, path in entries:
         mesh = load_normalized(path)
         lo, hi = mesh.vertices.min(0), mesh.vertices.max(0)
-        body = render(mesh, [0, 0, 0], 1.5, 180)
+        body = render(mesh, [0, 0, 0], 1.5, yaw_deg)
         # Torso/upper-body crop: for a standing figure the very top of the bbox is hair, so aim a
         # little lower — that band holds the face, collar and chest folds, i.e. the detail that
         # either survives a remesh or does not.
         head_y = lo[1] + 0.78 * (hi[1] - lo[1])
-        head = render(mesh, [0, head_y, 0], 0.42, 180)
+        head = render(mesh, [0, head_y, 0], 0.42, yaw_deg)
         col = Image.new("RGB", (W, H * 2), (12, 12, 16))
         col.paste(body, (0, 0)); col.paste(head, (0, H))
         d = ImageDraw.Draw(col)

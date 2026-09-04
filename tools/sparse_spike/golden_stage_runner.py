@@ -34,6 +34,8 @@ sys.path.insert(0, HERE)  # golden_stage_hook
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pixal3d', default='/mnt/hdd/3d/avatar-shootout/Pixal3D')
+    ap.add_argument('--model', default=None,
+                    help='Pixal3D checkpoint directory or repo; pin a local HF snapshot for an exact oracle')
     ap.add_argument('--image', default='/mnt/hdd/3d/avatar-shootout/assets/miku.png')
     ap.add_argument('--out', default=os.path.join(HERE, 'golden_stages'))
     ap.add_argument('--resolution', type=int, default=1024)
@@ -58,10 +60,12 @@ def main():
             image_path=args.image,
             output_path=glb_out,
             seed=args.seed, manual_fov=args.fov,
-            model_path=inference.MODEL_PATH,
+            model_path=args.model or inference.MODEL_PATH,
             low_vram=True, resolution=args.resolution,
         )
         print('[stage_runner] full decode + GLB export finished')
+    except golden_stage_hook.Stage1TraceComplete as e:
+        print('[stage_runner]', e)
     except Exception as e:
         import traceback
         print('[stage_runner] decode raised (geometry goldens already saved):', e)
